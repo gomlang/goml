@@ -1,0 +1,118 @@
+package lsp;
+
+use module::query;
+use std::fs;
+use std::json;
+use std::testing;
+
+fn write_watched_fixture(path: string, source: string) -> () {
+    if let Err(error) = fs::write_file_structured(path, source) {
+        testing::fail(error.to_string())
+    }
+}
+
+fn watched_document(server: Server, root: string, source: string) -> Document {
+    if let Err(error) = fs::create_dir_all(root + "/lib") {
+        testing::fail(error.to_string())
+    }
+    write_watched_fixture(root + "/goml.toml", "[module]\npath = \"watched::app\"\n");
+    let path = root + "/main.gom";
+    write_watched_fixture(path, "package main; fn main() -> () { () }");
+    let document = Document {
+        uri: path_to_uri(path),
+        path,
+        text: source,
+        version: 1,
+        line_index: line_index(source),
+    };
+    open_document(server, document);
+    document
+}
+
+fn notify_watched_file(server: Server, path: string, kind: isize) -> () {
+    let change = json::Value::Object(
+        Vec::from_array(
+            [
+                ("uri", json::Value::String(path_to_uri(path))),
+                ("type", json::Value::Number(kind.to_string())),
+            ],
+        ),
+    );
+    let params = json::Value::Object(
+        Vec::from_array([("changes", json::Value::Array(Vec::from_array([change])))]),
+    );
+    let output = handle_json(server, rpc_notification(DID_CHANGE_WATCHED_FILES_METHOD, params));
+    testing::assert(output.is_empty())
+}
+
+fn watched_completion_has(server: Server, document: Document, expected: string) -> bool {
+    let analysis = document_analysis(server, document);
+    for item in query::completions(analysis, document.text.byte_len() - " }".byte_len()) {
+        if item.label == expected {
+            return true
+        }
+    }
+    false
+}
+
+#[test]
+fn refreshes_unopened_dependencies_after_watched_changes() -> () {
+    let server = new_server();
+    let root = "/tmp/gomllsp-watched-dependency";
+    let source = "package main; use watched::app::lib; fn main() -> () { lib:: }";
+    let document = watched_document(server, root, source);
+    let dependency = root + "/lib/lib.gom";
+    write_watched_fixture(dependency, "package lib; pub fn old_value() -> isize { 1 }");
+    testing::assert(watched_completion_has(server, document, "old_value"));
+    let _ = source_line_index(server, dependency, "package lib;");
+    write_watched_fixture(dependency, "package lib; pub fn new_value() -> isize { 2 }");
+    notify_watched_file(server, dependency, 2);
+    testing::assert(server.analyses.is_empty());
+    testing::assert(server.line_indexes.is_empty());
+    testing::assert(watched_completion_has(server, document, "new_value"));
+    testing::assert(!watched_completion_has(server, document, "old_value"));
+    match server_document(server, document.uri) {
+        Some(current) => testing::assert_eq(current.text, source),
+        None => testing::fail("expected unsaved document to remain open"),
+    }
+}
+
+#[test]
+fn refreshes_package_sources_after_watched_creation_and_deletion() -> () {
+    let server = new_server();
+    let root = "/tmp/gomllsp-watched-package-files";
+    let document = watched_document(server, root, "package main; fn main() -> () { () }");
+    let extra = root + "/extra.gom";
+    write_watched_fixture(extra, "package main; pub fn helper() -> () { () }");
+    let _ = document_analysis(server, document);
+    if let Err(error) = fs::remove_file(extra) {
+        testing::fail(error.to_string())
+    }
+    notify_watched_file(server, extra, 3);
+    let without_extra = document_analysis(server, document);
+    for source in without_extra.sources {
+        testing::assert(source.path != extra)
+    }
+    write_watched_fixture(extra, "package main; pub fn helper() -> () { () }");
+    notify_watched_file(server, extra, 1);
+    let with_extra = document_analysis(server, document);
+    let mut found = false;
+    for source in with_extra.sources {
+        if source.path == extra {
+            found = true;
+        }
+    }
+    testing::assert(found)
+}
+
+#[test]
+fn refreshes_module_identity_after_watched_manifest_changes() -> () {
+    let server = new_server();
+    let root = "/tmp/gomllsp-watched-manifest";
+    let document = watched_document(server, root, "package main; fn main() -> () { () }");
+    testing::assert_eq(document_analysis(server, document).package_name, "watched::app");
+    let manifest = root + "/goml.toml";
+    write_watched_fixture(manifest, "[module]\npath = \"watched::renamed\"\n");
+    notify_watched_file(server, manifest, 2);
+    testing::assert_eq(document_analysis(server, document).package_name, "watched::renamed")
+}
