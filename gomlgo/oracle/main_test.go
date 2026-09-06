@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"runtime"
 	"testing"
 )
 
@@ -102,12 +103,12 @@ func TestInvalidFileReturnsPartialASTAndDiagnostics(t *testing.T) {
 	}
 }
 
-func TestVersionReportsPinnedToolchain(t *testing.T) {
+func TestVersionReportsRunningToolchain(t *testing.T) {
 	response := execute("version", nil)
-	if response.GoVersion != "go1.26.5" {
+	if response.GoVersion != runtime.Version() {
 		t.Fatalf("got %q", response.GoVersion)
 	}
-	if response.GOROOT != "/usr/lib/go-1.26" {
+	if response.GOROOT != runtime.GOROOT() {
 		t.Fatalf("got %q", response.GOROOT)
 	}
 }
