@@ -1,0 +1,429 @@
+package go_backend;
+
+struct RecordProjection {
+    root: string,
+    position: isize,
+}
+
+struct RecordUpdate {
+    root: string,
+    position: isize,
+    changed: isize,
+}
+
+fn record_type_name(ty: Type) -> string {
+    match ty {
+        Named { name } => name,
+        _ => "",
+    }
+}
+
+fn record_pure_expr(value: Expr) -> bool {
+    match value {
+        Nil | Unit | Var { .. } | Bool { .. } | Int { .. } | Float { .. } | String { .. } => true,
+        Field { expr, .. } | Cast { expr, .. } | Convert { expr, .. } => record_pure_expr(expr),
+        Unary { op, expr } => match op {
+            Address => false,
+            _ => record_pure_expr(expr),
+        },
+        Binary { lhs, rhs, .. } => record_pure_expr(lhs) && record_pure_expr(rhs),
+        _ => false,
+    }
+}
+
+fn record_projection(
+    stmts: Vec[Stmt],
+    definitions: HashMap[string, isize],
+    value: Expr,
+    field: string,
+) -> Option[RecordProjection] {
+    let name = match value {
+        Var { name } => name,
+        _ => return Option::None,
+    };
+    let position = definitions[name]?;
+    match stmts[position] {
+        Var { value: Some(Expr::Field { expr: Expr::Var { name: root }, field_name }), .. } if field_name
+            == field => Option::Some(RecordProjection { root, position }),
+        _ => Option::None,
+    }
+}
+
+fn record_projection_root(
+    stmts: Vec[Stmt],
+    definitions: HashMap[string, isize],
+    field: (string, Expr),
+) -> string {
+    match record_projection(stmts, definitions, field.1, field.0) {
+        Some(value) => value.root,
+        None => "",
+    }
+}
+
+fn find_record_update(
+    stmts: Vec[Stmt],
+    definitions: HashMap[string, isize],
+    structures: HashMap[string, Vec[string]],
+    name: string,
+    ty: Type,
+    fields: Vec[(string, Expr)],
+) -> Option[RecordUpdate] {
+    let type_name = record_type_name(ty);
+    if name == "_" || type_name == "" || fields.len() < 3 {
+        return Option::None
+    }
+    let expected = structures[type_name]?;
+    if fields.len() != expected.len() {
+        return Option::None
+    }
+    for index in 0..fields.len() {
+        if fields[index].0 != expected[index] {
+            return Option::None
+        }
+    }
+    let first = record_projection_root(stmts, definitions, fields[0]);
+    let second = record_projection_root(stmts, definitions, fields[1]);
+    let third = record_projection_root(stmts, definitions, fields[2]);
+    let root = if first != "" && (first == second || first == third) {
+        first
+    } else if second != "" && second == third {
+        second
+    } else {
+        return Option::None
+    };
+    let position = definitions[root]?;
+    match stmts[position] {
+        Var { ty: root_ty, .. } if record_type_name(root_ty) == type_name => {},
+        _ => return Option::None,
+    }
+    for index in position + 1..stmts.len() {
+        match stmts[index] {
+            Var { value: Some(value), .. } if record_pure_expr(value) => {},
+            Var { value: None, .. } => {},
+            _ => return Option::None,
+        }
+    }
+    let mut changed = -1;
+    for index in 0..fields.len() {
+        let unchanged = match record_projection(
+            stmts,
+            definitions,
+            fields[index].1,
+            fields[index].0,
+        ) {
+            Some(value) => value.root == root && value.position > position,
+            None => false,
+        };
+        if !unchanged {
+            if changed >= 0 {
+                return Option::None
+            }
+            changed = index;
+        }
+    }
+    if changed < 0 {
+        return Option::None
+    }
+    match fields[changed].1 {
+        Var { name: value } if value != name => {},
+        Nil | Unit | Bool { .. } | Int { .. } | Float { .. } | String { .. } => {},
+        _ => return Option::None,
+    }
+    Option::Some(RecordUpdate { root, position, changed })
+}
+
+fn record_local(locals: Vec[string], name: string) -> bool {
+    for local in locals {
+        if local == name {
+            return true
+        }
+    }
+    false
+}
+
+fn record_update_target(
+    stmts: Vec[Stmt],
+    update: RecordUpdate,
+    locals: Vec[string],
+    name: string,
+    next: Option[Stmt],
+) -> Option[string] {
+    let origin = match stmts[update.position] {
+        Var { value: Some(Expr::Var { name }), .. } => name,
+        _ => return Option::None,
+    };
+    if origin == "_" || origin == name || origin == update.root || !record_local(locals, origin) {
+        return Option::None
+    }
+    match next {
+        Some(Stmt::Assign { name: target, value: Expr::Var { name: source } }) if target == origin
+            && source == name => {},
+        _ => return Option::None,
+    }
+    for index in update.position + 1..stmts.len() {
+        if let Stmt::Var { name: local, .. } = stmts[index] {
+            if local == origin {
+                return Option::None
+            }
+        }
+    }
+    Option::Some(origin)
+}
+
+fn record_restore_locals(locals: Vec[string], start: isize) -> () {
+    while locals.len() > start {
+        let _ = locals.pop();
+    }
+}
+
+fn record_update_nested(
+    value: Stmt,
+    structures: HashMap[string, Vec[string]],
+    locals: Vec[string],
+    changed: Ref[bool],
+) -> Stmt {
+    match value {
+        If { cond, then_, else_ } => Stmt::If {
+            cond,
+            then_: record_update_block(then_, structures, locals, changed),
+            else_: else_.map(|body| record_update_block(body, structures, locals, changed)),
+        },
+        Loop { body } => Stmt::Loop { body: record_update_block(body, structures, locals, changed) },
+        LabeledLoop { label, body } => Stmt::LabeledLoop {
+            label,
+            body: record_update_block(body, structures, locals, changed),
+        },
+        Range { names, expr, body } => {
+            let start = locals.len();
+            for name in names {
+                locals.push(name)
+            }
+            let body = record_update_block(body, structures, locals, changed);
+            record_restore_locals(locals, start);
+            Stmt::Range { names, expr, body }
+        },
+        Switch { expr, cases, default } => {
+            let lowered: Vec[SwitchCase] = Vec::with_capacity(cases.len());
+            for case in cases {
+                lowered.push(
+                    SwitchCase {
+                        value: case.value,
+                        body: record_update_block(case.body, structures, locals, changed),
+                    },
+                )
+            }
+            Stmt::Switch {
+                expr,
+                cases: lowered,
+                default: default.map(|body| record_update_block(body, structures, locals, changed)),
+            }
+        },
+        TypeSwitch { binding, expr, cases, default } => {
+            let start = locals.len();
+            if let Some(name) = binding {
+                locals.push(name)
+            }
+            let lowered: Vec[TypeSwitchCase] = Vec::with_capacity(cases.len());
+            for case in cases {
+                lowered.push(
+                    TypeSwitchCase {
+                        ty: case.ty,
+                        body: record_update_block(case.body, structures, locals, changed),
+                    },
+                )
+            }
+            let default = default.map(|body| record_update_block(body, structures, locals, changed));
+            record_restore_locals(locals, start);
+            Stmt::TypeSwitch { binding, expr, cases: lowered, default }
+        },
+        Select { cases, default } => {
+            let lowered: Vec[SelectCase] = Vec::with_capacity(cases.len());
+            for case in cases {
+                let start = locals.len();
+                if let SelectOperation::Receive { names, .. } = case.operation {
+                    for name in names {
+                        locals.push(name)
+                    }
+                }
+                let body = record_update_block(case.body, structures, locals, changed);
+                record_restore_locals(locals, start);
+                lowered.push(SelectCase { operation: case.operation, body })
+            }
+            Stmt::Select {
+                cases: lowered,
+                default: default.map(|body| record_update_block(body, structures, locals, changed)),
+            }
+        },
+        _ => value,
+    }
+}
+
+fn record_update_block(
+    value: Block,
+    structures: HashMap[string, Vec[string]],
+    locals: Vec[string],
+    changed: Ref[bool],
+) -> Block {
+    let start = locals.len();
+    let output: Vec[Stmt] = Vec::with_capacity(value.stmts.len());
+    let definitions: HashMap[string, isize] = HashMap::new();
+    let mut index = 0;
+    while index < value.stmts.len() {
+        let stmt = record_update_nested(value.stmts[index], structures, locals, changed);
+        let mut handled = false;
+        if let Stmt::Var { name, ty, value: Some(Expr::StructLiteral { ty: literal_ty, fields }) } = stmt {
+            if record_type_name(ty) != "" && record_type_name(ty) == record_type_name(literal_ty) {
+                if let Some(update) = find_record_update(
+                    output,
+                    definitions,
+                    structures,
+                    name,
+                    ty,
+                    fields,
+                ) {
+                    let next = if index + 1 < value.stmts.len() {
+                        Option::Some(value.stmts[index + 1])
+                    } else {
+                        Option::None
+                    };
+                    let target = record_update_target(output, update, locals, name, next);
+                    if let Some(origin) = target {
+                        let known = structures[record_type_name(ty)].unwrap_or(Vec::new());
+                        for position in update.position + 1..output.len() {
+                            if let Stmt::Var {
+                                name: field_name,
+                                ty: field_ty,
+                                value: Some(Expr::Field {
+                                    expr: Expr::Var { name: root },
+                                    field_name: field,
+                                }),
+                            } = output[position] {
+                                if root == update.root {
+                                    if record_local(known, field) {
+                                        output[position] = Stmt::Var {
+                                            name: field_name,
+                                            ty: field_ty,
+                                            value: Option::Some(
+                                                Expr::Field {
+                                                    expr: Expr::Var { name: origin },
+                                                    field_name: field,
+                                                },
+                                            ),
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                        definitions[name] = output.len();
+                        output.push(stmt);
+                        output.push(
+                            Stmt::FieldAssign {
+                                target: Expr::Var { name: origin },
+                                field_name: fields[update.changed].0,
+                                value: fields[update.changed].1,
+                            },
+                        );
+                        index += 1;
+                    } else {
+                        definitions[name] = output.len();
+                        output.push(
+                            Stmt::Var {
+                                name,
+                                ty,
+                                value: Option::Some(Expr::Var { name: update.root }),
+                            },
+                        );
+                        output.push(
+                            Stmt::FieldAssign {
+                                target: Expr::Var { name },
+                                field_name: fields[update.changed].0,
+                                value: fields[update.changed].1,
+                            },
+                        );
+                    }
+                    locals.push(name);
+                    changed.set(true);
+                    handled = true;
+                }
+            }
+        }
+        if !handled {
+            if let Stmt::Var { name, .. } = stmt {
+                definitions[name] = output.len();
+                locals.push(name);
+            }
+            output.push(stmt);
+        }
+        index += 1;
+    }
+    record_restore_locals(locals, start);
+    Block { stmts: output }
+}
+
+fn record_function_body(
+    body: Block,
+    structures: HashMap[string, Vec[string]],
+    params: Vec[(string, Type)],
+) -> Block {
+    let locals: Vec[string] = Vec::new();
+    for param in params {
+        locals.push(param.0)
+    }
+    let changed = Ref::new(false);
+    let result = record_update_block(body, structures, locals, changed);
+    if changed.get() {
+        eliminate_dead_vars(result)
+    } else {
+        body
+    }
+}
+
+fn simplify_record_updates(value: File) -> File {
+    let structures: HashMap[string, Vec[string]] = HashMap::new();
+    for item in value.items {
+        let shape = match item {
+            Struct(definition) => Option::Some((definition.name, definition.fields)),
+            TypeDef(TypeDef { name, ty: Type::Struct { fields } }) => Option::Some((name, fields)),
+            _ => Option::None,
+        };
+        if let Some(shape) = shape {
+            let fields: Vec[string] = Vec::with_capacity(shape.1.len());
+            for field in shape.1 {
+                fields.push(field.0)
+            }
+            structures[shape.0] = fields;
+        }
+    }
+    let items: Vec[Item] = Vec::with_capacity(value.items.len());
+    for item in value.items {
+        items.push(
+            match item {
+                Function(function) => Item::Function(
+                    Function {
+                        name: function.name,
+                        params: function.params,
+                        ret_ty: function.ret_ty,
+                        body: record_function_body(function.body, structures, function.params),
+                    },
+                ),
+                Method(method) => {
+                    let params: Vec[(string, Type)] = Vec::from_array([method.receiver]);
+                    for param in method.params {
+                        params.push(param)
+                    }
+                    Item::Method(
+                        Method {
+                            receiver: method.receiver,
+                            name: method.name,
+                            params: method.params,
+                            ret_ty: method.ret_ty,
+                            body: record_function_body(method.body, structures, params),
+                        },
+                    )
+                },
+                _ => item,
+            },
+        );
+    }
+    File { items }
+}
