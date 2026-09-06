@@ -10,6 +10,28 @@ import (
 	"syscall"
 )
 
+func LockImageBuild(path string) (int, string) {
+	file, err := syscall.Open(path, syscall.O_CREAT|syscall.O_RDWR|syscall.O_CLOEXEC, 0o600)
+	if err != nil {
+		return -1, err.Error()
+	}
+	for {
+		err = syscall.Flock(file, syscall.LOCK_EX)
+		if err != syscall.EINTR {
+			break
+		}
+	}
+	if err != nil {
+		syscall.Close(file)
+		return -1, err.Error()
+	}
+	return file, ""
+}
+
+func UnlockImageBuild(file int) {
+	syscall.Close(file)
+}
+
 func ReplaceProcess(program string, arguments []string, environmentKey string, environmentValue string) string {
 	previous, present := os.LookupEnv(environmentKey)
 	if err := os.Setenv(environmentKey, environmentValue); err != nil {
