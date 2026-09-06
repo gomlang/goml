@@ -20,7 +20,10 @@ pub struct ParseResult {
 
 struct Parser {
     tokens: Vec[token::Token],
+    scanner_cursor: Option[scanner::Scanner],
+    scan_finished: Ref[bool],
     cursor: Ref[isize],
+    buffer_offset: Ref[isize],
     previous_end: Ref[isize],
     fuel: Ref[isize],
     nesting: Ref[isize],
@@ -38,10 +41,37 @@ struct Parser {
 
 fn parser_new_with_mode(source: bytes::Bytes, retain_comments: bool, skip_function_bodies: bool) -> Parser {
     let source_len = source.len();
-    let scanned = scanner::scan_bytes(source);
+    let scanner_cursor = if retain_comments {
+        Option::None
+    } else {
+        Option::Some(scanner::new_cursor(source))
+    };
+    let scanned = match scanner_cursor {
+        Some(_) => scanner::ScanResult { tokens: Vec::with_capacity(64), diagnostics: Vec::new() },
+        None => scanner::scan_bytes(source),
+    };
     let comment_infos: Vec[CommentInfo] = Vec::new();
     let comment_nodes: Vec[ast::Node] = Vec::new();
-    let (go_version, comment_limit) = token_metadata(scanned.tokens);
+    let (go_version, comment_limit) = match scanner_cursor {
+        Some(cursor) => {
+            let mut version = "";
+            loop {
+                let value = scanner::next_token(cursor);
+                if token::equal(value.kind, token::Kind::Comment) {
+                    let found = build_constraint_version(value.literal);
+                    if found != "" {
+                        version = found;
+                    }
+                } else {
+                    scanned.tokens.push(value);
+                    break
+                }
+            }
+            let metadata = (version, 0);
+            metadata
+        },
+        None => token_metadata(scanned.tokens),
+    };
     if retain_comments && comment_limit > 0 {
         let comments = analyze_comments(source, scanned.tokens);
         for value in comments.infos {
@@ -68,7 +98,12 @@ fn parser_new_with_mode(source: bytes::Bytes, retain_comments: bool, skip_functi
     }
     Parser {
         tokens: scanned.tokens,
+        scanner_cursor,
+        scan_finished: Ref::new(
+            token::equal(scanned.tokens[scanned.tokens.len() - 1].kind, token::Kind::Eof),
+        ),
         cursor: Ref::new(0),
+        buffer_offset: Ref::new(0),
         previous_end: Ref::new(0),
         fuel: Ref::new(CURSOR_FUEL),
         nesting: Ref::new(0),
@@ -89,13 +124,35 @@ fn parser_new(source: bytes::Bytes) -> Parser {
     parser_new_with_mode(source, true, false)
 }
 
+fn fill_tokens(parser: Parser, index: isize) -> () {
+    if let Some(cursor) = parser.scanner_cursor {
+        let target = (index / 64 + 1) * 64;
+        while parser.tokens.len() < target && !parser.scan_finished.get() {
+            let value = scanner::next_token(cursor);
+            if token::equal(value.kind, token::Kind::Eof) {
+                parser.scan_finished.set(true)
+            }
+            if !token::equal(value.kind, token::Kind::Comment) {
+                parser.tokens.push(value)
+            }
+        }
+    }
+}
+
 fn significant_index(parser: Parser, distance: isize) -> isize {
     let index = parser.cursor.get() + distance;
+    if index >= parser.tokens.len() && !parser.scan_finished.get() {
+        fill_tokens(parser, index)
+    }
     if index < parser.tokens.len() {
         index
     } else {
         parser.tokens.len()
     }
+}
+
+fn cursor_position(parser: Parser) -> isize {
+    parser.buffer_offset.get() + significant_index(parser, 0)
 }
 
 fn eof_token(parser: Parser) -> token::Token {
@@ -170,6 +227,19 @@ fn advance(parser: Parser) -> token::Token {
         parser.previous_end.set(result.end)
     }
     parser.fuel.set(CURSOR_FUEL);
+    if parser.scanner_cursor.is_some() && parser.cursor.get() >= 64
+        && parser.cursor.get() * 2 >= parser.tokens.len() {
+        let consumed = parser.cursor.get();
+        let remaining = parser.tokens.len() - consumed;
+        for index in 0..remaining {
+            parser.tokens[index] = parser.tokens[index + consumed];
+        }
+        while parser.tokens.len() > remaining {
+            let _ = parser.tokens.pop();
+        }
+        parser.buffer_offset.set(parser.buffer_offset.get() + consumed);
+        parser.cursor.set(0)
+    }
     result
 }
 
@@ -227,7 +297,7 @@ fn leave_nesting(parser: Parser) -> () {
 }
 
 fn ensure_progress(parser: Parser, before: isize, context: string) -> bool {
-    let after = significant_index(parser, 0);
+    let after = cursor_position(parser);
     if after > before || eof(parser) {
         true
     } else {
@@ -286,6 +356,33 @@ fn compare_diagnostic(left: diagnostic::Diagnostic, right: diagnostic::Diagnosti
 }
 
 fn result(parser: Parser, root: Option[ast::Node]) -> ParseResult {
-    collections::stable_sort_by(parser.diagnostics, compare_diagnostic);
-    ParseResult { root, diagnostics: parser.diagnostics }
+    let diagnostics = match parser.scanner_cursor {
+        Some(cursor) => {
+            while !parser.scan_finished.get() {
+                let value = scanner::next_token(cursor);
+                if token::equal(value.kind, token::Kind::Eof) {
+                    parser.scan_finished.set(true)
+                }
+            }
+            let scanned = scanner::cursor_diagnostics(cursor);
+            let available = if scanned.len() < DIAGNOSTIC_LIMIT {
+                DIAGNOSTIC_LIMIT - scanned.len()
+            } else {
+                0
+            };
+            for index in 0..parser.diagnostics.len() {
+                let value = parser.diagnostics[index];
+                if index < available {
+                    scanned.push(value)
+                } else {
+                    scanned.push(diagnostic::make("too many parser diagnostics", value.offset));
+                    break
+                }
+            }
+            scanned
+        },
+        None => parser.diagnostics,
+    };
+    collections::stable_sort_by(diagnostics, compare_diagnostic);
+    ParseResult { root, diagnostics }
 }
