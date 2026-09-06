@@ -1132,8 +1132,8 @@ func _goml_m_inherent_i_std_p_fs_p_Error_i_std_p_fs_p_Error_i_new(kind__0 _goml_
     return t1
 }
 
-func _goml_m_trait__impl_i_ToString_i_std_p_fs_p_Error_i_to__string(self__0 _goml_m_std_p_fs_p_Error) string {
-    var t0 _goml_m_std_p_io_p_ErrorDetails = self__0.details
+func _goml_m_trait__impl_i_ToString_i_std_p_fs_p_Error_i_to__string(self__0 *_goml_m_std_p_fs_p_Error) string {
+    var t0 _goml_m_std_p_io_p_ErrorDetails = (*self__0).details
     var inline0 Option__string = t0.context_value
     switch inline0._tag {
     case 0:
@@ -1368,7 +1368,7 @@ func main0() struct{} {
         t1 = inline24
     case _goml_m_Result____string____std_p_fs_p_Error_Err:
         var inline25 _goml_m_std_p_fs_p_Error = t0.(_goml_m_Result____string____std_p_fs_p_Error_Err)._0
-        var inline26 string = _goml_m_trait__impl_i_ToString_i_std_p_fs_p_Error_i_to__string(inline25)
+        var inline26 string = _goml_m_trait__impl_i_ToString_i_std_p_fs_p_Error_i_to__string(&inline25)
         var inline27 string = "err " + inline26
         t1 = inline27
     default:
@@ -1413,7 +1413,7 @@ func main0() struct{} {
         t5 = inline5
     case _goml_m_Result____Vec_l_string_r_____std_p_fs_p_Error_Err:
         var inline6 _goml_m_std_p_fs_p_Error = t4.(_goml_m_Result____Vec_l_string_r_____std_p_fs_p_Error_Err)._0
-        var inline7 string = _goml_m_trait__impl_i_ToString_i_std_p_fs_p_Error_i_to__string(inline6)
+        var inline7 string = _goml_m_trait__impl_i_ToString_i_std_p_fs_p_Error_i_to__string(&inline6)
         var inline8 string = "err " + inline7
         t5 = inline8
     default:

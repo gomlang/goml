@@ -1100,8 +1100,8 @@ func _goml_m_inherent_i_std_p_fs_p_Error_i_std_p_fs_p_Error_i_new(kind__0 _goml_
     return t1
 }
 
-func _goml_m_trait__impl_i_ToString_i_std_p_fs_p_Error_i_to__string(self__0 _goml_m_std_p_fs_p_Error) string {
-    var t0 _goml_m_std_p_io_p_ErrorDetails = self__0.details
+func _goml_m_trait__impl_i_ToString_i_std_p_fs_p_Error_i_to__string(self__0 *_goml_m_std_p_fs_p_Error) string {
+    var t0 _goml_m_std_p_io_p_ErrorDetails = (*self__0).details
     var inline0 Option__string = t0.context_value
     switch inline0._tag {
     case 0:
@@ -1274,7 +1274,7 @@ func main0() struct{} {
         t2 = "ok"
     case _goml_m_Result_____o__q_____std_p_fs_p_Error_Err:
         var inline26 _goml_m_std_p_fs_p_Error = t1.(_goml_m_Result_____o__q_____std_p_fs_p_Error_Err)._0
-        var inline27 string = _goml_m_trait__impl_i_ToString_i_std_p_fs_p_Error_i_to__string(inline26)
+        var inline27 string = _goml_m_trait__impl_i_ToString_i_std_p_fs_p_Error_i_to__string(&inline26)
         var inline28 string = "err " + inline27
         t2 = inline28
     default:
@@ -1294,7 +1294,7 @@ func main0() struct{} {
         t4 = "ok"
     case _goml_m_Result_____o__q_____std_p_fs_p_Error_Err:
         var inline17 _goml_m_std_p_fs_p_Error = t3.(_goml_m_Result_____o__q_____std_p_fs_p_Error_Err)._0
-        var inline18 string = _goml_m_trait__impl_i_ToString_i_std_p_fs_p_Error_i_to__string(inline17)
+        var inline18 string = _goml_m_trait__impl_i_ToString_i_std_p_fs_p_Error_i_to__string(&inline17)
         var inline19 string = "err " + inline18
         t4 = inline19
     default:
@@ -1333,7 +1333,7 @@ func main0() struct{} {
         t6 = inline2
     case _goml_m_Result____string____std_p_fs_p_Error_Err:
         var inline3 _goml_m_std_p_fs_p_Error = t5.(_goml_m_Result____string____std_p_fs_p_Error_Err)._0
-        var inline4 string = _goml_m_trait__impl_i_ToString_i_std_p_fs_p_Error_i_to__string(inline3)
+        var inline4 string = _goml_m_trait__impl_i_ToString_i_std_p_fs_p_Error_i_to__string(&inline3)
         var inline5 string = "err " + inline4
         t6 = inline5
     default:
