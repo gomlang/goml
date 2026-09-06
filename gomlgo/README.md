@@ -8,6 +8,8 @@ The parser is organized as declarations/files, types, expressions, statements, c
 
 The type checker lowers the parser AST into a strongly typed syntax arena with stable file and node IDs. Types, objects, packages, scopes, constants, selections, instances, and initialization dependencies use ID-based arenas and side tables. It supports package and file scopes, declarations, imports, named and alias types, interfaces and method sets, constants, expressions and builtins, generics and inference, statements and control flow, initialization ordering, and Go 1.26 `new(expr)` behavior. Constants use arbitrary-precision integers and rationals plus a 512-bit binary floating representation for values that exceed the exact rational resource boundary.
 
+Syntax paths are opaque, immutable handles. Use `node.path.to_string()` to render them and `syntax::empty_path()` or `syntax::text_path(value)` when constructing syntax nodes.
+
 The source importer evaluates `//go:build` and `// +build` constraints, GOOS/GOARCH and release tags, custom tags, cgo selection, platform filename suffixes, import cycles, and source dependencies. It selects ordinary, internal-test, and external-test package sources separately. Its default target is `linux/amd64`, cgo disabled, with `/usr/lib/go-1.26/src` as the source root.
 
 `checker::CheckConfig` exposes `go_version`, target `sizes`, `ignore_func_bodies`, `fake_import_c`, `disable_unused_import_check`, `enable_alias`, and explicit import availability/failure inputs. The default is Go 1.26, gc/amd64 sizes, function bodies enabled, cgo import emulation disabled, unused-import checks enabled, and materialized aliases.
