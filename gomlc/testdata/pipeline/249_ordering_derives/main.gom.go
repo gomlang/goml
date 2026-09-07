@@ -1495,29 +1495,9 @@ func main0() struct{} {
 }
 
 func _goml_m_trait__impl_i_PartialEq_i_Ordering_i_eq(self__0 Ordering, other__0 Ordering) bool {
-    switch self__0 {
-    case Less:
-        switch other__0 {
-        case Less:
-            return true
-        default:
-            return false
-        }
-    case Equal:
-        switch other__0 {
-        case Equal:
-            return true
-        default:
-            return false
-        }
-    case Greater:
-        switch other__0 {
-        case Greater:
-            return true
-        default:
-            return false
-        }
-    default:
+    if self__0 <= Greater {
+        return other__0 == self__0
+    } else {
         panic("non-exhaustive match")
     }
 }
