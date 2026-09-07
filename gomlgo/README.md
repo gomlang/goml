@@ -10,6 +10,8 @@ The type checker lowers the parser AST into a strongly typed syntax arena with s
 
 Syntax paths are opaque, immutable handles. Use `node.path.to_string()` to render them and `syntax::empty_path()` or `syntax::text_path(value)` when constructing syntax nodes.
 
+Type facts retain independent constant snapshots. `FactConstant::SmallInt(i64)` stores signed 64-bit integers directly; larger values retain copied arbitrary-precision storage. Use `type_fact_constant` and `type_fact_constant_kind` to read the exact value and kind across storage variants.
+
 The source importer evaluates `//go:build` and `// +build` constraints, GOOS/GOARCH and release tags, custom tags, cgo selection, platform filename suffixes, import cycles, and source dependencies. It selects ordinary, internal-test, and external-test package sources separately. Its default target is `linux/amd64`, cgo disabled, with `/usr/lib/go-1.26/src` as the source root.
 
 `checker::CheckConfig` exposes `go_version`, target `sizes`, `ignore_func_bodies`, `fake_import_c`, `disable_unused_import_check`, `enable_alias`, and explicit import availability/failure inputs. The default is Go 1.26, gc/amd64 sizes, function bodies enabled, cgo import emulation disabled, unused-import checks enabled, and materialized aliases.
