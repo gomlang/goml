@@ -1,0 +1,219 @@
+package main;
+
+use module::artifact;
+use module::artifact::core_codec;
+use module::artifact::interface_codec;
+use module::core;
+use module::tast;
+use module::mono;
+use module::repr;
+use module::lift;
+use module::anf;
+use module::go_backend;
+use std::fs;
+use std::path;
+use std::process;
+use std::testing;
+use std::utf8;
+use utf8::BytesUtf8;
+
+fn external_identity_function(ty: core::Type) -> core::Function {
+    core::Function {
+        name: "echo",
+        origin: core::FunctionOrigin::Source,
+        root: false,
+        generics: Vec::from_array(["T"]),
+        predicates: Vec::new(),
+        trait_impl: Option::None,
+        params: Vec::from_array([("value", ty)]),
+        ret_ty: ty,
+        body: core::Block {
+            stmts: Vec::new(),
+            tail: Option::Some(core::Expr::Var { name: "value", ty }),
+        },
+    }
+}
+
+fn external_pipeline_core() -> core::File {
+    let generic = core::Type::External {
+        import_path: "unique",
+        name: "Handle",
+        args: Vec::from_array([core::Type::Param { name: "T" }]),
+    };
+    let concrete = core::substitute_type(generic, Vec::from_array([("T", core::Type::Int64)]));
+    let make = core::Expr::Call {
+        func: core::Expr::Callable {
+            callable: core::Callable::GoForeign {
+                binding: "",
+                import_path: "unique",
+                symbol: "Make",
+            },
+            ty: core::Type::Func { params: Vec::from_array([core::Type::Int64]), ret_ty: concrete },
+        },
+        args: Vec::from_array(
+            [
+                core::Expr::Prim {
+                    value: core::Primitive::Int64 { value: "42" },
+                    ty: core::Type::Int64,
+                },
+            ],
+        ),
+        ty: concrete,
+    };
+    let echo = core::Expr::Call {
+        func: core::Expr::Callable {
+            callable: core::Callable::Function("echo"),
+            ty: core::Type::Func { params: Vec::from_array([concrete]), ret_ty: concrete },
+        },
+        args: Vec::from_array([core::Expr::Var { name: "handle", ty: concrete }]),
+        ty: concrete,
+    };
+    let main = core::Function {
+        name: "main",
+        origin: core::FunctionOrigin::Source,
+        root: true,
+        generics: Vec::new(),
+        predicates: Vec::new(),
+        trait_impl: Option::None,
+        params: Vec::new(),
+        ret_ty: core::Type::Unit,
+        body: core::Block {
+            stmts: Vec::from_array(
+                [
+                    core::LetStmt { name: "handle", value: make, ty: concrete },
+                    core::LetStmt { name: "echoed", value: echo, ty: concrete },
+                ],
+            ),
+            tail: Option::Some(
+                core::Expr::Prim { value: core::Primitive::Unit, ty: core::Type::Unit },
+            ),
+        },
+    };
+    core::File {
+        functions: Vec::from_array([external_identity_function(generic), main]),
+        enums: Vec::new(),
+        structs: Vec::new(),
+        type_instances: Vec::new(),
+        constants: Vec::new(),
+        statics: Vec::new(),
+    }
+}
+
+fn exercise_external_type_pipeline(directory: string) -> Result[(), string] {
+    fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    let original = external_pipeline_core();
+    let unit = artifact::ArtifactCoreUnit {
+        source_origins: Vec::new(),
+        external_applications: Vec::new(),
+        foreign_types: Option::None,
+        package_name: "main",
+        declared_name: "main",
+        interface_hash: "external-test",
+        exports: interface_codec::empty_exports(),
+        core_ir: original,
+        deps: Vec::new(),
+        sources: Vec::new(),
+        tests: Vec::new(),
+    };
+    let restored = core_codec::decode_binary(core_codec::encode_binary(unit)?)?.core_ir;
+    if !(core::types_equal(restored.functions[0].params[0].1, original.functions[0].params[0].1)) {
+        testing::fail("gomlc/cmd/gomlc/external_type_pipeline_test.gom assertion 1")
+    }
+    let specialized = mono::lower_checked(restored);
+    if let Some(error) = specialized.error {
+        return Result::Err(error)
+    }
+    let lifted = lift::lower_checked(specialized.file)?;
+    let normalized = anf::lower(lifted);
+    let generated = go_backend::lower(normalized)?;
+    let ty = go_backend::lower_type(
+        repr::Type::External {
+            import_path: "unique",
+            name: "Handle",
+            args: Vec::from_array([repr::Type::Int64]),
+        },
+    );
+    let go_backend::Type::Apply { base: go_backend::Type::Named { name }, args: _ } = ty else {
+        return Result::Err("missing applied Go type")
+    };
+    let source = go_backend::encode(generated) + "\nfunc externalMethodProof(h " + name
+        + "[int64]) int64 { return h.Value() }\n";
+    if !(source.contains("Handle[int64]")) {
+        testing::fail("gomlc/cmd/gomlc/external_type_pipeline_test.gom assertion 2")
+    }
+    if !(source.contains("\"unique\"")) {
+        testing::fail("gomlc/cmd/gomlc/external_type_pipeline_test.gom assertion 3")
+    }
+    fs::write_file_structured(path::join(directory, "main.go"), source).map_err(
+        |error| error.to_string(),
+    )?;
+    let output = process::Command::new("go").args(Vec::from_array(["run", "main.go"])).current_dir(
+        directory,
+    ).env("GOWORK", "off").env("GO111MODULE", "off").output_structured().map_err(
+        |error| error.to_string(),
+    )?;
+    if !output.status().success() {
+        return Result::Err(output.stderr().to_string_utf8().unwrap_or("invalid Go output"))
+    }
+    Result::Ok(())
+}
+
+#[test]
+fn external_type_identity_survives_artifacts_specialization_and_go_emission() -> () {
+    let temporary = temp_go_path("external-types.gom", "external-pipeline");
+    let result = exercise_external_type_pipeline(path::parent(temporary).unwrap_or(""));
+    cleanup_temp_directory(temporary);
+    if let Err(error) = result {
+        testing::fail(error)
+    }
+}
+
+fn external_type_interface(ty: core::Type) -> artifact::ArtifactInterfaceUnit {
+    let exports = interface_codec::empty_exports();
+    exports.type_aliases.push(
+        tast::TypeAliasInfo {
+            go_comparable: Option::None,
+            applications: Option::None,
+            name: "external::api::Handle",
+            generics: Vec::from_array(["T"]),
+            ty: core::type_to_tast(ty),
+        },
+    );
+    interface_codec::new_unit(
+        "external::api",
+        exports,
+        artifact::ArtifactPackageInterface {
+            package_name: "external::api",
+            name: "api",
+            value_exports: Vec::new(),
+            enum_variants: Vec::new(),
+        },
+        Vec::new(),
+    )
+}
+
+fn exercise_external_type_interface() -> Result[(), string] {
+    let ty = core::Type::External {
+        import_path: "unique",
+        name: "Handle",
+        args: Vec::from_array([core::Type::Param { name: "T" }]),
+    };
+    let unit = external_type_interface(ty);
+    let restored = interface_codec::decode_binary(interface_codec::encode_binary(unit)?)?;
+    testing::assert_eq(restored.exports.type_aliases.len(), 1);
+    testing::assert(core::types_equal(core::lower_type(restored.exports.type_aliases[0].ty), ty));
+    let invalid = external_type_interface(
+        core::Type::External { import_path: "", name: "Handle", args: Vec::new() },
+    );
+    testing::assert(
+        interface_codec::decode_binary(interface_codec::encode_binary(invalid)?).is_err(),
+    );
+    Result::Ok(())
+}
+
+#[test]
+fn external_type_interfaces_roundtrip_arguments_and_reject_missing_identity() -> () {
+    if let Err(error) = exercise_external_type_interface() {
+        testing::fail(error)
+    }
+}

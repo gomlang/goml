@@ -1,0 +1,431 @@
+package main;
+
+use module::ffi;
+use module::artifact;
+use module::artifact::interface_codec as interface_codec;
+use module::artifact::core_codec as core_codec;
+use module::tast;
+use std::env;
+use std::fs;
+use std::json;
+use std::path;
+use std::testing;
+
+fn ffi_driver_fixture(directory: string) -> Result[(), string] {
+    fs::create_dir_all(path::join(directory, "gen")).map_err(|error| error.to_string())?;
+    fs::create_dir_all(path::join(directory, "shim")).map_err(|error| error.to_string())?;
+    fs::write_file_structured(
+        path::join(directory, "go.mod"),
+        "module example.com/host\n\ngo 1.25.0\n",
+    ).map_err(|error| error.to_string())?;
+    fs::write_file_structured(
+        path::join(directory, "shim/shim.go"),
+        "package shim\nimport \"time\"\nfunc Value(x int64) int64 { return x }\ntype Delay = time.Duration\ntype Box[T any] struct { Value T; Next *Box[T] }\ntype Pair[A, B any] struct { First A; Second B }\ntype Reverse[A, B any] = Pair[B, *A]\nfunc Duration() time.Duration { return 1 }\nfunc EchoDuration(v time.Duration) time.Duration { return v }\nfunc MakeBox[T any](v T) Box[T] { return Box[T]{Value: v} }\nfunc EchoBox[T any](v Box[T]) Box[T] { return v }\ntype Numeric[T ~int64] struct { Value T }\nfunc MakeNumeric[T ~int64](v T) Numeric[T] { return Numeric[T]{Value: v} }\n",
+    ).map_err(|error| error.to_string())
+}
+
+fn ffi_driver_bindings() -> Result[Vec[ffi::ForeignBinding], string] {
+    let exports = interface_codec::empty_exports();
+    exports.functions.push(
+        artifact::ArtifactFnScheme {
+            name: "demo::calc::private_unused",
+            comptime: tast::ComptimeCapability::RuntimeOnly,
+            type_params: Vec::new(),
+            constraints: Vec::new(),
+            ty: tast::Type::Func {
+                params: Vec::from_array([tast::Type::Int64]),
+                ret_ty: tast::Type::Int64,
+            },
+            body: tast::Callable::GoForeign {
+                binding: "",
+                import_path: "example.com/host/shim",
+                symbol: "Value",
+            },
+        },
+    );
+    let unit = artifact::ArtifactCoreUnit {
+        source_origins: Vec::new(),
+        external_applications: Vec::new(),
+        foreign_types: Option::None,
+        package_name: "demo::calc",
+        declared_name: "calc",
+        interface_hash: "test",
+        exports,
+        core_ir: empty_core_file(),
+        deps: Vec::new(),
+        sources: Vec::from_array(["calc.gom"]),
+        tests: Vec::new(),
+    };
+    let restored = core_codec::decode_binary(core_codec::encode_binary(unit)?)?;
+    let before = foreign_artifact_bindings("demo::calc", exports)?;
+    let after = foreign_artifact_bindings(restored.package_name, restored.exports)?;
+    testing::assert_eq(before.len(), 1);
+    testing::assert_eq(after.len(), 1);
+    testing::assert_eq(before[0].binding_id, after[0].binding_id);
+    testing::assert_eq(before[0].import_path, after[0].import_path);
+    testing::assert_eq(before[0].symbol, after[0].symbol);
+    Result::Ok(after)
+}
+
+fn exercise_foreign_driver(directory: string) -> Result[(), string] {
+    ffi_driver_fixture(directory)?;
+    let context = resolve_foreign_build_context("go", directory)?;
+    let context = ffi::decode_build_context(json::encode(ffi::build_context_json(context)))?;
+    let compiler = env::var_structured("GOML_TEST_GOMLC").unwrap_or("../stage2/bin/gomlc");
+    let compiler = path::absolute_structured(compiler).map_err(|error| error.to_string())?;
+    let helper = path::join(
+        path::parent(compiler).ok_or("missing compiler directory")?,
+        "goml-go-meta",
+    );
+    let caller = ffi::CallerContext {
+        generated_source: Option::None,
+        load_mode: "package",
+        import_path: "example.com/host/gen",
+        directory: path::join(directory, "gen"),
+        package_name: "gen",
+    };
+    exercise_foreign_type_instances(helper, context, caller)?;
+    let type_queries = Vec::from_array(
+        [
+            ffi::TypeDeclarationQuery { type_id: "duration", import_path: "time", name: "Duration" },
+            ffi::TypeDeclarationQuery { type_id: "reader", import_path: "io", name: "Reader" },
+            ffi::TypeDeclarationQuery {
+                type_id: "delay",
+                import_path: "example.com/host/shim",
+                name: "Delay",
+            },
+            ffi::TypeDeclarationQuery {
+                type_id: "box",
+                import_path: "example.com/host/shim",
+                name: "Box",
+            },
+            ffi::TypeDeclarationQuery {
+                type_id: "reverse",
+                import_path: "example.com/host/shim",
+                name: "Reverse",
+            },
+        ],
+    );
+    let types = run_foreign_type_declarations(helper, context, caller, type_queries)?;
+    let persisted = ffi::encode_foreign_type_metadata(
+        ffi::ForeignTypeMetadata {
+            instances: Vec::new(),
+            queries: type_queries,
+            declarations: types,
+        },
+    )?;
+    let restored = ffi::decode_foreign_type_metadata(persisted)?;
+    exercise_foreign_type_artifacts(restored)?;
+    testing::assert_eq(ffi::encode_foreign_type_metadata(restored)?, persisted);
+    let types = restored.declarations;
+    testing::assert_eq(types.declarations.len(), 5);
+    testing::assert(types.go_world_identity != "");
+    testing::assert(types.nodes.len() > 2);
+    let duration = ffi::resolve_go_type_template(types, "duration")?;
+    let reader = ffi::resolve_go_type_template(types, "reader")?;
+    let delay = ffi::resolve_go_type_template(types, "delay")?;
+    testing::assert_eq(
+        ffi::go_type_identity_key(delay.identity),
+        ffi::go_type_identity_key(duration.identity),
+    );
+    let box_type = ffi::resolve_go_type_template(types, "box")?;
+    testing::assert_eq(box_type.parameter_constraints.len(), 1);
+    let box_instance = ffi::substitute_go_type_template(
+        box_type,
+        Vec::from_array([duration.identity]),
+    )?;
+    testing::assert_eq(
+        ffi::go_type_identity_key(box_instance),
+        ffi::go_type_identity_key(
+            ffi::GoTypeIdentity::Named {
+                import_path: "example.com/host/shim",
+                name: "Box",
+                arguments: Vec::from_array([duration.identity]),
+            },
+        ),
+    );
+    let reverse = ffi::resolve_go_type_template(types, "reverse")?;
+    let reversed = ffi::substitute_go_type_template(
+        reverse,
+        Vec::from_array([duration.identity, ffi::GoTypeIdentity::Basic("bool")]),
+    )?;
+    testing::assert_eq(
+        ffi::go_type_identity_key(reversed),
+        ffi::go_type_identity_key(
+            ffi::GoTypeIdentity::Named {
+                import_path: "example.com/host/shim",
+                name: "Pair",
+                arguments: Vec::from_array(
+                    [
+                        ffi::GoTypeIdentity::Basic("bool"),
+                        ffi::GoTypeIdentity::Pointer(duration.identity),
+                    ],
+                ),
+            },
+        ),
+    );
+    testing::assert_eq(duration.underlying_kind, "basic");
+    testing::assert_eq(reader.underlying_kind, "interface");
+    testing::assert_eq(
+        ffi::go_type_identity_key(duration.identity),
+        ffi::go_type_identity_key(
+            ffi::GoTypeIdentity::Named {
+                import_path: "time",
+                name: "Duration",
+                arguments: Vec::new(),
+            },
+        ),
+    );
+    testing::assert_eq(
+        ffi::go_type_identity_key(reader.identity),
+        ffi::go_type_identity_key(
+            ffi::GoTypeIdentity::Named { import_path: "io", name: "Reader", arguments: Vec::new() },
+        ),
+    );
+    testing::assert(
+        run_foreign_type_declarations("missing-helper", context, caller, Vec::new()).is_ok(),
+    );
+    testing::assert(
+        run_foreign_type_declarations("missing-helper", context, caller, type_queries).is_err(),
+    );
+    testing::assert(!fs::is_file(path::join(directory, "gen/goml_type_query_0.go")));
+    exercise_named_bridge_validation(helper, context, caller)?;
+    let bindings = ffi_driver_bindings()?;
+    match run_foreign_validation(ffi::CheckMode::Required, helper, context, caller, bindings)? {
+        Verified { go_world_identity } => testing::assert(go_world_identity != ""),
+        _ => return Result::Err("required validation was not verified"),
+    }
+    fs::write_file_structured(
+        path::join(directory, "shim/shim.go"),
+        "package shim\nfunc Value(x string) string { return x }\n",
+    ).map_err(|error| error.to_string())?;
+    match run_foreign_validation(ffi::CheckMode::Required, helper, context, caller, bindings) {
+        Err(message) => {
+            testing::assert(message.contains("ffi-signature-mismatch"));
+            testing::assert(message.contains("private_unused"))
+        },
+        _ => return Result::Err("changed Go signature was not rejected"),
+    }
+    match run_foreign_validation(ffi::CheckMode::Off, "missing-helper", context, caller, bindings)? {
+        Unverified => (),
+        _ => return Result::Err("off mode claimed verification"),
+    }
+    testing::assert(
+        run_foreign_validation(
+            ffi::CheckMode::Required,
+            path::join(directory, "missing-helper"),
+            context,
+            caller,
+            bindings,
+        ).is_err(),
+    );
+    testing::assert(!fs::is_file(path::join(directory, "go.sum")));
+    testing::assert(!fs::is_file(path::join(directory, "gen/goml_ffi_witness_0.go")));
+    Result::Ok(())
+}
+
+#[test]
+fn foreign_driver_checks_private_artifact_bindings_and_go_source_changes() -> () {
+    let temporary = temp_go_path("ffi-driver.gom", "foreign-driver");
+    let directory = path::parent(temporary).unwrap_or("");
+    let result = exercise_foreign_driver(directory);
+    cleanup_temp_directory(temporary);
+    match result {
+        Ok(()) => (),
+        Err(message) => testing::fail(message),
+    }
+}
+
+fn named_bridge_binding(name: string, parameters: Vec[tast::Type], result: tast::Type) -> Result[
+    ffi::ForeignBinding,
+    string,
+] {
+    let scheme = tast::FunctionScheme {
+        def_id: Option::None,
+        name,
+        comptime: tast::ComptimeCapability::RuntimeOnly,
+        generics: Vec::new(),
+        predicates: Vec::new(),
+        params: parameters,
+        ret_ty: result,
+        callable: tast::Callable::GoForeign {
+            binding: "",
+            import_path: "example.com/host/shim",
+            symbol: name,
+        },
+    };
+    tast::foreign_binding(name, scheme, Vec::new())?.ok_or("missing named foreign binding")
+}
+
+fn exercise_named_bridge_validation(
+    helper: string,
+    context: ffi::GoBuildContext,
+    caller: ffi::CallerContext,
+) -> Result[(), string] {
+    let duration = tast::Type::External { import_path: "time", name: "Duration", args: Vec::new() };
+    let box_type = tast::Type::External {
+        import_path: "example.com/host/shim",
+        name: "Box",
+        args: Vec::from_array([duration]),
+    };
+    let bindings = Vec::from_array(
+        [
+            named_bridge_binding("Duration", Vec::new(), duration)?,
+            named_bridge_binding("EchoDuration", Vec::from_array([duration]), duration)?,
+            named_bridge_binding("MakeBox", Vec::from_array([duration]), box_type)?,
+            named_bridge_binding("EchoBox", Vec::from_array([box_type]), box_type)?,
+        ],
+    );
+    let verification = run_foreign_validation(
+        ffi::CheckMode::Required,
+        helper,
+        context,
+        caller,
+        bindings,
+    )?;
+    match verification {
+        Verified { go_world_identity } => testing::assert(go_world_identity != ""),
+        _ => return Result::Err("named foreign types were not verified"),
+    }
+    let wrong_scalar = named_bridge_binding(
+        "EchoDuration",
+        Vec::from_array([tast::Type::Int64]),
+        tast::Type::Int64,
+    )?;
+    testing::assert(
+        run_foreign_validation(
+            ffi::CheckMode::Required,
+            helper,
+            context,
+            caller,
+            Vec::from_array([wrong_scalar]),
+        ).is_err(),
+    );
+    let wrong_argument = tast::Type::External {
+        import_path: "example.com/host/shim",
+        name: "Box",
+        args: Vec::from_array([tast::Type::Int64]),
+    };
+    let mismatched = named_bridge_binding("EchoBox", Vec::from_array([box_type]), wrong_argument)?;
+    testing::assert(
+        run_foreign_validation(
+            ffi::CheckMode::Required,
+            helper,
+            context,
+            caller,
+            Vec::from_array([mismatched]),
+        ).is_err(),
+    );
+    let invalid_constraint = tast::Type::External {
+        import_path: "example.com/host/shim",
+        name: "Numeric",
+        args: Vec::from_array([tast::Type::Bool]),
+    };
+    let constrained = named_bridge_binding(
+        "MakeNumeric",
+        Vec::from_array([tast::Type::Bool]),
+        invalid_constraint,
+    )?;
+    testing::assert(
+        run_foreign_validation(
+            ffi::CheckMode::Required,
+            helper,
+            context,
+            caller,
+            Vec::from_array([constrained]),
+        ).is_err(),
+    );
+    Result::Ok(())
+}
+
+fn exercise_function_bridge_driver(directory: string) -> Result[(), string] {
+    ffi_driver_fixture(directory)?;
+    fs::write_file_structured(
+        path::join(directory, "shim/function.go"),
+        "package shim\ntype Callback[T any] = func(T) (T, error)\nfunc EchoCallback(value func(int64) (int64, error)) func(int64) (int64, error) { return value }\n",
+    ).map_err(|error| error.to_string())?;
+    let context = resolve_foreign_build_context("go", directory)?;
+    let compiler = path::absolute_structured(
+        env::var_structured("GOML_TEST_GOMLC").unwrap_or("../stage2/bin/gomlc"),
+    ).map_err(|error| error.to_string())?;
+    let helper = path::join(
+        path::parent(compiler).ok_or("missing compiler directory")?,
+        "goml-go-meta",
+    );
+    let caller = ffi::CallerContext {
+        generated_source: Option::None,
+        load_mode: "package",
+        import_path: "example.com/host/gen",
+        directory: path::join(directory, "gen"),
+        package_name: "gen",
+    };
+    let integer = ffi::BridgeType::Scalar("int64");
+    let callback = ffi::BridgeType::Function {
+        parameters: Vec::from_array([integer]),
+        results: Vec::from_array(
+            [
+                integer,
+                ffi::BridgeType::Named { import_path: "", name: "error", arguments: Vec::new() },
+            ],
+        ),
+    };
+    let binding = ffi::ForeignBinding {
+        call_mode: ffi::ForeignCallMode::Ordinary,
+        binding_id: "test::callback",
+        import_path: "example.com/host/shim",
+        symbol: "EchoCallback",
+        parameters: Vec::from_array([callback]),
+        results: Vec::from_array([callback]),
+    };
+    match run_foreign_validation(
+        ffi::CheckMode::Required,
+        helper,
+        context,
+        caller,
+        Vec::from_array([binding]),
+    )? {
+        Verified { .. } => (),
+        _ => return Result::Err("callback signature was not verified"),
+    }
+    let declaration = ffi::TypeDeclarationQuery {
+        type_id: "callback",
+        import_path: "example.com/host/shim",
+        name: "Callback",
+    };
+    let metadata = run_foreign_type_declarations(
+        helper,
+        context,
+        caller,
+        Vec::from_array([declaration]),
+    )?;
+    let template = ffi::resolve_go_type_template(metadata, "callback")?;
+    let concrete = ffi::substitute_go_type_template(
+        template,
+        Vec::from_array([ffi::GoTypeIdentity::Basic("int64")]),
+    )?;
+    let instances = run_foreign_type_instances(
+        helper,
+        context,
+        caller,
+        Vec::from_array(
+            [ffi::TypeInstanceQuery { declaration, arguments: Vec::from_array([integer]) }],
+        ),
+    )?;
+    testing::assert_eq(instances.instances.len(), 1);
+    testing::assert_eq(
+        ffi::go_type_identity_key(concrete),
+        ffi::go_type_identity_key(instances.instances[0].identity),
+    );
+    testing::assert(!fs::is_file(path::join(directory, "gen/goml_ffi_witness_0.go")));
+    Result::Ok(())
+}
+
+#[test]
+fn function_bridge_validates_with_real_helper_and_generic_aliases() -> () {
+    let temporary = temp_go_path("ffi-function.gom", "function-bridge");
+    let result = exercise_function_bridge_driver(path::parent(temporary).unwrap_or(""));
+    cleanup_temp_directory(temporary);
+    if let Err(error) = result {
+        testing::fail(error)
+    }
+}

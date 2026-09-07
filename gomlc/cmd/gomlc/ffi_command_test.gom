@@ -1,0 +1,206 @@
+package main;
+
+use module::ffi;
+use std::env;
+use std::fs;
+use std::json;
+use std::path;
+use std::process;
+use std::testing;
+use std::utf8;
+use utf8::BytesUtf8;
+
+fn foreign_artifact_cli_output(
+    compiler: string,
+    directory: string,
+    mode: string,
+    context_path: string,
+) -> Result[process::Output, string] {
+    process::Command::new(compiler).args(
+        Vec::from_array(
+            [
+                "__ffi-check-artifacts",
+                "--interface-path",
+                path::join(directory, "calc.interface"),
+                "--context",
+                context_path,
+                "--caller-directory",
+                path::join(directory, "gen"),
+                "--caller-import-path",
+                "example.com/host/gen",
+                "--caller-mode",
+                "package",
+                "--caller-package",
+                "gen",
+                "--ffi-check",
+                mode,
+            ],
+        ),
+    ).current_dir(directory).output_structured().map_err(|error| error.to_string())
+}
+
+fn exercise_foreign_artifact_cli(directory: string) -> Result[(), string] {
+    ffi_driver_fixture(directory)?;
+    let context = resolve_foreign_build_context("go", directory)?;
+    let context_path = path::join(directory, "context.json");
+    fs::write_file_structured(context_path, json::encode(ffi::build_context_json(context))).map_err(
+        |error| error.to_string(),
+    )?;
+    let compiler = env::var_structured("GOML_TEST_GOMLC").unwrap_or("../stage2/bin/gomlc");
+    let compiler = path::absolute_structured(compiler).map_err(|error| error.to_string())?;
+    let interface_path = path::join(directory, "calc.interface");
+    let unit = compile_private_foreign_interface(directory, "Abs")?;
+    write_artifact_interface(interface_path, unit)?;
+    let output = foreign_artifact_cli_output(compiler, directory, "required", context_path)?;
+    if !output.status().success() {
+        return Result::Err(output.stderr().to_string_utf8().unwrap_or("invalid helper output"))
+    }
+    let invalid = compile_private_foreign_interface(directory, "MissingFunction")?;
+    write_artifact_interface(interface_path, invalid)?;
+    let output = foreign_artifact_cli_output(compiler, directory, "required", context_path)?;
+    testing::assert(!output.status().success());
+    let diagnostic = output.stderr().to_string_utf8().unwrap_or("");
+    testing::assert(diagnostic.contains("ffi-symbol-not-found"));
+    testing::assert(diagnostic.contains("unused_private"));
+    let missing_context = path::join(directory, "missing-context.json");
+    let output = foreign_artifact_cli_output(compiler, directory, "off", missing_context)?;
+    testing::assert(output.status().success());
+    testing::assert(output.stderr().to_string_utf8().unwrap_or("").contains("ffi-unverified"));
+    write_artifact_interface(interface_path, binary_interface_fixture())?;
+    let output = foreign_artifact_cli_output(compiler, directory, "required", missing_context)?;
+    testing::assert(output.status().success());
+    testing::assert_eq(output.stderr().len(), 0);
+    Result::Ok(())
+}
+
+#[test]
+fn foreign_artifact_cli_validates_private_interfaces_and_reports_off() -> () {
+    let temporary = temp_go_path("ffi-command.gom", "artifact-command");
+    let result = exercise_foreign_artifact_cli(path::parent(temporary).unwrap_or(""));
+    cleanup_temp_directory(temporary);
+    match result {
+        Ok(()) => (),
+        Err(message) => testing::fail(message),
+    }
+}
+
+#[test]
+fn foreign_artifact_cli_requires_explicit_context_and_policy() -> () {
+    let args = Vec::from_array(
+        [
+            "gomlc",
+            "__ffi-check-artifacts",
+            "--interface-path",
+            "file.interface",
+            "--context",
+            "context.json",
+            "--caller-directory",
+            "/tmp/caller",
+            "--caller-import-path",
+            "example.com/caller",
+            "--caller-mode",
+            "package",
+            "--caller-package",
+            "caller",
+        ],
+    );
+    testing::assert(parse_foreign_artifact_command(args).is_err());
+    args.push("--ffi-check");
+    args.push("required");
+    testing::assert(parse_foreign_artifact_command(args).is_ok());
+    args.push("--ffi-check");
+    args.push("off");
+    testing::assert(parse_foreign_artifact_command(args).is_err())
+}
+
+fn exercise_foreign_context_cli(directory: string) -> Result[(), string] {
+    ffi_driver_fixture(directory)?;
+    let compiler = env::var_structured("GOML_TEST_GOMLC").unwrap_or("../stage2/bin/gomlc");
+    let compiler = path::absolute_structured(compiler).map_err(|error| error.to_string())?;
+    let config = path::join(directory, "go-env");
+    fs::write_file_structured(config, "GOFLAGS=-tags=ffi_saved\n").map_err(
+        |error| error.to_string(),
+    )?;
+    let destination = path::join(directory, "build-context.json");
+    let output = process::Command::new(compiler).args(
+        Vec::from_array(
+            [
+                "__ffi-build-context",
+                "--go",
+                "go",
+                "--module-directory",
+                directory,
+                "--output",
+                destination,
+            ],
+        ),
+    ).env("GOENV", config).env("GOFLAGS", "").output_structured().map_err(|error| error.to_string())?;
+    if !output.status().success() {
+        return Result::Err(output.stderr().to_string_utf8().unwrap_or("context command failed"))
+    }
+    let source = fs::read_file_structured(destination).map_err(|error| error.to_string())?;
+    let context = ffi::decode_build_context(source)?;
+    testing::assert_eq(context.goflags, "-tags=ffi_saved");
+    testing::assert_eq(context.module_dir, directory);
+    let value = json::parse(source).map_err(|error| error.to_string())?;
+    testing::assert_eq(
+        json::as_string(json::field(value, "module_import_path").unwrap_or(json::Value::Null)).unwrap_or(
+            "",
+        ),
+        "example.com/host",
+    );
+    testing::assert(!fs::is_file(path::join(directory, "go.sum")));
+    Result::Ok(())
+}
+
+#[test]
+fn foreign_context_cli_honors_saved_go_flags_and_reads_module_identity() -> () {
+    let temporary = temp_go_path("ffi-context.gom", "context-command");
+    let result = exercise_foreign_context_cli(path::parent(temporary).unwrap_or(""));
+    cleanup_temp_directory(temporary);
+    match result {
+        Ok(()) => (),
+        Err(message) => testing::fail(message),
+    }
+}
+
+fn exercise_foreign_method_artifact_cli(directory: string) -> Result[(), string] {
+    ffi_driver_fixture(directory)?;
+    let context = resolve_foreign_build_context("go", directory)?;
+    let context_path = path::join(directory, "context.json");
+    fs::write_file_structured(context_path, json::encode(ffi::build_context_json(context))).map_err(
+        |error| error.to_string(),
+    )?;
+    let compiler = env::var_structured("GOML_TEST_GOMLC").unwrap_or("../stage2/bin/gomlc");
+    let compiler = path::absolute_structured(compiler).map_err(|error| error.to_string())?;
+    for symbol in Vec::from_array(["Seconds", "MissingMethod"]) {
+        write_artifact_interface(
+            path::join(directory, "calc.interface"),
+            method_foreign_interface(symbol, true, ""),
+        )?;
+        let output = foreign_artifact_cli_output(compiler, directory, "required", context_path)?;
+        if symbol == "Seconds" {
+            if !output.status().success() {
+                return Result::Err(
+                    output.stderr().to_string_utf8().unwrap_or("invalid helper output"),
+                )
+            }
+        } else {
+            testing::assert(!output.status().success());
+            let diagnostic = output.stderr().to_string_utf8().unwrap_or("");
+            testing::assert(diagnostic.contains("ffi-symbol-not-found"));
+            testing::assert(diagnostic.contains("audit::value::seconds"))
+        }
+    }
+    Result::Ok(())
+}
+
+#[test]
+fn foreign_method_artifacts_reach_the_real_go_checker() -> () {
+    let temporary = temp_go_path("ffi-command.gom", "method-artifact-command");
+    let result = exercise_foreign_method_artifact_cli(path::parent(temporary).unwrap_or(""));
+    cleanup_temp_directory(temporary);
+    if let Err(error) = result {
+        testing::fail(error)
+    }
+}

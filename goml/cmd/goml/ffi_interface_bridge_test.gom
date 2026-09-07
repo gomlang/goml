@@ -1,0 +1,166 @@
+package main;
+
+use module::test_support;
+use std::path;
+use std::process;
+use std::testing;
+
+#[test]
+fn project_go_interface_bridge_library_preserves_async_reentry_and_panic() -> () {
+    let root = ffi_project_fixture("ffi_trait_reader_library");
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\nimport \"io\"\ntype Reader interface { io.Reader; Reset() }\nvar retained Reader\nfunc Retain(value Reader) { retained = value }\nfunc Take() Reader { value := retained; retained = nil; return value }\nvar Hook func(int)\nvar Token = &struct{ Message string }{\"bridge panic\"}\nfunc Step(n int) { if Hook != nil { Hook(n) } }\nfunc Fail() { panic(Token) }\nfunc EOF() error { return io.EOF }\n",
+    );
+    test_support::write_file(
+        path::join(root, "raw/raw.gom"),
+        "package raw;\n#[go_type(\"example.com/ffi-demo/shim\", \"Reader\")] pub extern type RawReader;\n",
+    );
+    test_support::write_file(
+        path::join(root, "api/api.gom"),
+        "package api;\nuse std::ffi;\nuse module::raw;\n#[go_interface(raw::RawReader, ReaderAdapter, read = \"Read\", reset = \"Reset\")]\npub trait Reader {\n    fn reset(self: Self) -> ();\n    fn read(self: Self, buffer: ffi::RawSlice[u8]) -> (isize, ffi::Error);\n}\n",
+    );
+    test_support::write_file(
+        path::join(root, "lib/lib.gom"),
+        "package lib;\nuse std::ffi;\nuse module::raw;\nuse module::api;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Retain\")] extern fn retain(value: raw::RawReader) -> ();\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Step\")] extern fn step(n: isize) -> ();\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Fail\")] extern fn fail() -> ();\n#[go_ffi(\"example.com/ffi-demo/shim\", \"EOF\")] extern fn eof() -> ffi::Error;\nstruct Counter { calls: Ref[isize] }\nimpl api::Reader for Counter {\n    fn reset(self: Counter) -> () { self.calls.set(0) }\n    fn read(self: Counter, buffer: ffi::RawSlice[u8]) -> (isize, ffi::Error) {\n        if buffer.len() == 0 { fail(); }\n        let count = self.calls.get() + 1;\n        self.calls.set(count);\n        step(count);\n        buffer.set(0, count.to_u8());\n        (1, eof())\n    }\n}\n#[go_export(\"InstallReader\")]\npub fn install_reader() -> () {\n    retain(api::ReaderAdapter::from_trait(Counter { calls: Ref::new(0) } as dyn api::Reader).into_go())\n}\n",
+    );
+    test_support::write_file(
+        path::join(root, "host/host_test.go"),
+        "package host_test\nimport (\n    \"io\"\n    \"runtime\"\n    \"sync\"\n    \"testing\"\n    \"example.com/ffi-demo/gen\"\n    \"example.com/ffi-demo/shim\"\n)\nvar registration sync.Mutex\nfunc newReader() shim.Reader {\n    registration.Lock()\n    defer registration.Unlock()\n    gen.InstallReader()\n    return shim.Take()\n}\nfunc read(t *testing.T, r io.Reader, want byte) {\n    t.Helper()\n    b := make([]byte, 1)\n    n, err := r.Read(b)\n    if n != 1 || err != io.EOF || b[0] != want { t.Errorf(\"read: %d %v %d, want %d\", n, err, b[0], want) }\n}\nfunc TestRetainedAsyncReader(t *testing.T) {\n    r := newReader()\n    if r == nil { t.Fatal(\"nil bridge\") }\n    runtime.GC()\n    done := make(chan struct{})\n    go func() { defer close(done); read(t, r, 1); read(t, r, 2); r.Reset(); read(t, r, 1) }()\n    <-done\n    r = nil\n    runtime.GC()\n    var group sync.WaitGroup\n    for i := 0; i < 8; i++ {\n        group.Add(1)\n        go func() { defer group.Done(); own := newReader(); read(t, own, 1); own.Reset(); read(t, own, 1) }()\n    }\n    group.Wait()\n}\nfunc TestReentrantReader(t *testing.T) {\n    r := newReader()\n    shim.Hook = func(n int) { if n == 1 { read(t, r, 2) } }\n    defer func() { shim.Hook = nil }()\n    read(t, r, 1)\n    read(t, r, 3)\n}\nfunc TestPanicIdentity(t *testing.T) {\n    defer func() { if got := recover(); got != shim.Token { t.Errorf(\"panic identity: %v\", got) } }()\n    newReader().Read(nil)\n    t.Fatal(\"panic was swallowed\")\n}\n",
+    );
+    let mut previous = "";
+    for mode in Vec::from_array(["required", "off"]) {
+        for attempt in 0..2 {
+            test_support::assert_success(
+                test_support::project_command(
+                    "export-go",
+                    "",
+                    Vec::from_array(
+                        [
+                            "./lib",
+                            "--import-path",
+                            "example.com/ffi-demo/gen",
+                            "--out",
+                            "./gen",
+                            "--ffi-check",
+                            mode,
+                        ],
+                    ),
+                    root,
+                ),
+            );
+            let generated = test_support::read_file(path::join(root, "gen/goml_generated.go"));
+            test_support::assert_contains(generated, "var _ ");
+            test_support::assert_contains(generated, "api.gom");
+            testing::assert(!generated.contains(root));
+            if previous != "" {
+                testing::assert_eq(generated, previous);
+            }
+            previous = generated;
+            match process::Command::new("go").args(
+                Vec::from_array(["test", "-race", "-count=1", "./host"]),
+            ).current_dir(root).env("GOWORK", "off").env("GOTOOLCHAIN", "local").env(
+                "GOPROXY",
+                "off",
+            ).env("GOSUMDB", "off").output_structured() {
+                Ok(output) => test_support::assert_success(output),
+                Err(error) => testing::fail(error.to_string()),
+            }
+        }
+    }
+}
+
+#[test]
+fn project_go_interface_bridge_rejects_stale_and_private_method_sets() -> () {
+    let root = ffi_project_fixture("ffi_trait_reader_stale");
+    let valid = "package shim\nimport \"io\"\ntype Reader interface { io.Reader }\n";
+    test_support::write_file(path::join(root, "main.gom"), "package main; fn main() -> () {}");
+    let declaration = "package api; use std::ffi; use module::raw; #[go_interface(raw::RawReader, ReaderAdapter, read = \"Read\")] pub trait Reader { fn read(self: Self, buffer: ffi::RawSlice[u8]) -> (isize, ffi::Error); }";
+    for mode in Vec::from_array(["required", "off"]) {
+        test_support::write_file(
+            path::join(root, "raw/raw.gom"),
+            "package raw; #[go_type(\"example.com/ffi-demo/shim\", \"Reader\")] pub extern type RawReader;",
+        );
+        test_support::write_file(path::join(root, "shim/shim.go"), valid);
+        test_support::write_file(path::join(root, "api/api.gom"), declaration);
+        test_support::assert_success(
+            test_support::project_command("check", "", Vec::from_array(["--ffi-check", mode]), root),
+        );
+        test_support::write_file(
+            path::join(root, "shim/shim.go"),
+            "package shim\nimport \"io\"\ntype Reader interface { io.Reader; Reset() }\n",
+        );
+        let stale = test_support::project_command(
+            "check",
+            "",
+            Vec::from_array(["--ffi-check", mode]),
+            root,
+        );
+        test_support::assert_failure(stale);
+        test_support::assert_contains(test_support::stderr(stale), "Go declaration changed");
+        test_support::write_file(
+            path::join(root, "shim/shim.go"),
+            "package shim\nimport \"io\"\ntype Reader interface { io.Reader; hidden() }\n",
+        );
+        test_support::write_file(
+            path::join(root, "api/api.gom"),
+            "package api; use std::ffi; use module::raw; #[go_interface(raw::RawReader, ReaderAdapter, read = \"Read\", hidden = \"Hidden\")] pub trait Reader { fn read(self: Self, buffer: ffi::RawSlice[u8]) -> (isize, ffi::Error); fn hidden(self: Self) -> (); }",
+        );
+        test_support::write_file(
+            path::join(root, "raw/raw.gom"),
+            "package raw; #[go_type(\"example.com/ffi-demo/shim\", \"Reader\")] pub extern type RawReader;\n",
+        );
+        let private = test_support::project_command(
+            "check",
+            "",
+            Vec::from_array(["--ffi-check", mode]),
+            root,
+        );
+        test_support::assert_failure(private);
+        test_support::assert_contains(test_support::stderr(private), "unexported Go method hidden");
+    }
+}
+
+#[test]
+fn project_go_interface_bridge_rejects_unsupported_trait_shapes() -> () {
+    let root = interface_reader_project("ffi_trait_reader_invalid");
+    test_support::write_file(path::join(root, "main.gom"), "package main; fn main() -> () {}");
+    for entry in Vec::from_array(
+        [
+            (
+                "pub trait Reader { type Item; fn read(self: Self, buffer: ffi::RawSlice[u8]) -> (isize, ffi::Error); }",
+                "without supertraits or associated types",
+            ),
+            (
+                "pub trait Reader[T] { fn read(self: Self, buffer: ffi::RawSlice[u8]) -> (isize, ffi::Error); }",
+                "non-generic trait",
+            ),
+            (
+                "pub trait Reader { fn read(buffer: ffi::RawSlice[u8]) -> (isize, ffi::Error); }",
+                "non-generic instance methods",
+            ),
+            (
+                "pub trait Reader { fn read[T](self: Self, buffer: ffi::RawSlice[u8]) -> (isize, ffi::Error); }",
+                "non-generic instance methods",
+            ),
+        ],
+    ) {
+        test_support::write_file(
+            path::join(root, "api/api.gom"),
+            "package api; use std::ffi; use module::raw; #[go_interface(raw::RawReader, ReaderAdapter, read = \"Read\")] "
+                + entry.0,
+        );
+        for mode in Vec::from_array(["required", "off"]) {
+            let output = test_support::project_command(
+                "check",
+                "",
+                Vec::from_array(["--ffi-check", mode]),
+                root,
+            );
+            test_support::assert_failure(output);
+            test_support::assert_contains(test_support::stderr(output), entry.1);
+            test_support::assert_contains(test_support::stderr(output), "api/api.gom");
+            testing::assert(!test_support::stderr(output).contains("panic:"));
+        }
+    }
+}

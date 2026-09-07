@@ -1,0 +1,241 @@
+package main;
+
+use module::test_support;
+use std::path;
+use std::fs;
+use std::testing;
+use std::process;
+
+#[test]
+fn project_go_interface_bridge_retains_trait_state_and_partial_results() -> () {
+    let root = interface_reader_project("ffi_trait_reader_bridge");
+    let shim = test_support::read_file(path::join(root, "shim/shim.go")).replace(
+        "import \"io\"",
+        "import (\"io\"; \"runtime\")",
+    );
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        shim
+            + "var retained io.Reader\nfunc Retain(value io.Reader) { retained=value }\nfunc Invoke() (int,error,byte) { runtime.GC(); buffer:=make([]byte,1); n,e:=retained.Read(buffer); return n,e,buffer[0] }\nfunc EOF() error { return io.EOF }\nfunc Release() { retained=nil }\nfunc RetainedIsNil() bool { return retained==nil }\n",
+    );
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use std::ffi; use module::raw; use module::api; #[go_ffi(\"example.com/ffi-demo/shim\", \"Retain\")] extern fn retain(value: raw::RawReader) -> (); #[go_ffi(\"example.com/ffi-demo/shim\", \"Invoke\")] extern fn invoke() -> (isize, ffi::Error, u8); #[go_ffi(\"example.com/ffi-demo/shim\", \"EOF\")] extern fn eof() -> ffi::Error; #[go_ffi(\"example.com/ffi-demo/shim\", \"IsEOF\")] extern fn is_eof(value: ffi::Error) -> bool; #[go_ffi(\"example.com/ffi-demo/shim\", \"Release\")] extern fn release() -> (); #[go_ffi(\"example.com/ffi-demo/shim\", \"RetainedIsNil\")] extern fn retained_is_nil() -> bool; struct Counter { calls: Ref[isize] } impl api::Reader for Counter { fn read(self: Counter, buffer: ffi::RawSlice[u8]) -> (isize, ffi::Error) { self.calls.set(self.calls.get() + 1); buffer.set(0, 65); (1, eof()) } } fn make(calls: Ref[isize]) -> raw::RawReader { api::ReaderAdapter::from_trait(Counter { calls } as dyn api::Reader).into_go() } fn main() -> () { let calls = Ref::new(0); retain(make(calls)); for attempt in 0..2 { let (n, error, byte) = invoke(); println(n); println(is_eof(error)); println(byte); println(calls.get()); } release(); println(retained_is_nil()); }",
+    );
+    for mode in Vec::from_array(["required", "off"]) {
+        for attempt in 0..2 {
+            test_support::assert_success(
+                test_support::project_command(
+                    "check",
+                    "",
+                    Vec::from_array(["--ffi-check", mode]),
+                    root,
+                ),
+            );
+            let output = test_support::project_command(
+                "run",
+                "",
+                Vec::from_array(["--ffi-check", mode]),
+                root,
+            );
+            test_support::assert_success(output);
+            testing::assert_eq(
+                test_support::stdout(output),
+                "1\ntrue\n65\n1\n1\ntrue\n65\n2\ntrue\n",
+            );
+            let generated = test_support::read_file(
+                path::join(root, "_artifact/build/pkg/ffi_demo/goml_generated.go"),
+            );
+            test_support::assert_contains(generated, "var _ ");
+            test_support::assert_contains(generated, "api.gom");
+        }
+    }
+}
+
+#[test]
+fn project_go_interface_adapter_survives_library_linking() -> () {
+    let root = interface_reader_project("ffi_reader_adapter_library");
+    test_support::write_file(
+        path::join(root, "lib/lib.gom"),
+        "package lib; use std::ffi; use module::raw; use module::api; use api::Reader; #[go_ffi(\"example.com/ffi-demo/shim\", \"Reader\")] extern fn reader() -> raw::RawReader; #[go_ffi(\"example.com/ffi-demo/shim\", \"IsEOF\")] extern fn is_eof(value: ffi::Error) -> bool; #[go_export(\"Read\")] pub fn read() -> (isize, bool, u8) { let adapter = api::ReaderAdapter::from_go(reader()) as dyn api::Reader; let storage: Vec[u8] = Vec::from_array([0, 0, 0]); let (n, error) = adapter.read(ffi::slice_shared(storage)); (n, is_eof(error), storage[2]) }",
+    );
+    test_support::write_file(
+        path::join(root, "host/host_test.go"),
+        "package host_test\nimport (\"testing\"; \"example.com/ffi-demo/gen\")\nfunc TestReader(t *testing.T) { for i:=0;i<3;i++ { n,eof,last:=gen.Read(); if n!=3 || !eof || last!=99 { t.Fatalf(\"read: %d %v %d\",n,eof,last) } } }\n",
+    );
+    let mut previous = "";
+    for mode in Vec::from_array(["required", "off"]) {
+        for attempt in 0..2 {
+            test_support::assert_success(
+                test_support::project_command(
+                    "export-go",
+                    "",
+                    Vec::from_array(
+                        [
+                            "./lib",
+                            "--import-path",
+                            "example.com/ffi-demo/gen",
+                            "--out",
+                            "./gen",
+                            "--ffi-check",
+                            mode,
+                        ],
+                    ),
+                    root,
+                ),
+            );
+            let generated = test_support::read_file(path::join(root, "gen/goml_generated.go"));
+            test_support::assert_contains(generated, "api.gom");
+            testing::assert(!generated.contains(root));
+            if previous != "" {
+                testing::assert_eq(generated, previous);
+            }
+            previous = generated;
+            match process::Command::new("go").args(Vec::from_array(["test", "./host"])).current_dir(
+                root,
+            ).env("GOWORK", "off").env("GOTOOLCHAIN", "local").env("GOPROXY", "off").env(
+                "GOSUMDB",
+                "off",
+            ).output_structured() {
+                Ok(output) => test_support::assert_success(output),
+                Err(error) => testing::fail(error.to_string()),
+            }
+        }
+    }
+}
+
+fn interface_reader_project(name: string) -> string {
+    let root = ffi_project_fixture(name);
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\nimport \"io\"\ntype reader struct { calls int64 }\nfunc (value *reader) Read(buffer []byte) (int, error) { if value == nil { return 0, io.EOF }; value.calls++; n := copy(buffer, []byte{97, 98, 99}); return n, io.EOF }\nfunc Reader() io.Reader { return &reader{} }\nfunc NilReader() io.Reader { return nil }\nfunc TypedNilReader() io.Reader { var value *reader; return value }\nfunc IsNil(value io.Reader) bool { return value == nil }\nfunc IsEOF(value error) bool { return value == io.EOF }\nfunc Calls(value io.Reader) int64 { return value.(*reader).calls }\n",
+    );
+    test_support::write_file(
+        path::join(root, "raw/raw.gom"),
+        "package raw; #[go_type(\"io\", \"Reader\")] pub extern type RawReader;",
+    );
+    test_support::write_file(
+        path::join(root, "api/api.gom"),
+        "package api; use std::ffi; use module::raw; #[go_interface(raw::RawReader, ReaderAdapter, read = \"Read\")] pub trait Reader { fn read(self: Self, buffer: ffi::RawSlice[u8]) -> (isize, ffi::Error); }",
+    );
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use std::ffi; use module::raw; use module::api; use api::Reader; #[go_ffi(\"example.com/ffi-demo/shim\", \"Reader\")] extern fn reader() -> raw::RawReader; #[go_ffi(\"example.com/ffi-demo/shim\", \"NilReader\")] extern fn nil_reader() -> raw::RawReader; #[go_ffi(\"example.com/ffi-demo/shim\", \"TypedNilReader\")] extern fn typed_nil_reader() -> raw::RawReader; #[go_ffi(\"example.com/ffi-demo/shim\", \"IsNil\")] extern fn is_nil(value: raw::RawReader) -> bool; #[go_ffi(\"example.com/ffi-demo/shim\", \"IsEOF\")] extern fn is_eof(value: ffi::Error) -> bool; #[go_ffi(\"example.com/ffi-demo/shim\", \"Calls\")] extern fn calls(value: raw::RawReader) -> i64; fn main() -> () { let adapter = api::ReaderAdapter::from_go(reader()); let storage: Vec[u8] = Vec::from_array([0, 0, 0]); let buffer = ffi::slice_shared(storage); let (n, error) = adapter.read(buffer); println(n); println(is_eof(error)); println(storage[0]); println(storage[1]); println(storage[2]); let dynamic = adapter as dyn api::Reader; let (n2, error2) = dynamic.read(buffer); println(n2); println(is_eof(error2)); println(calls(adapter.into_go())); let empty = api::ReaderAdapter::from_go(nil_reader()); println(is_nil(empty.into_go())); let typed = api::ReaderAdapter::from_go(typed_nil_reader()); println(is_nil(typed.into_go())); let (n3, error3) = typed.read(buffer); println(n3); println(is_eof(error3)); }",
+    );
+    root
+}
+
+#[test]
+fn project_go_interface_adapter_preserves_reader_identity_and_partial_results() -> () {
+    let root = interface_reader_project("ffi_reader_adapter");
+    for mode in Vec::from_array(["required", "off"]) {
+        for attempt in 0..2 {
+            test_support::assert_success(
+                test_support::project_command(
+                    "check",
+                    "",
+                    Vec::from_array(["--ffi-check", mode]),
+                    root,
+                ),
+            );
+            let output = test_support::project_command(
+                "run",
+                "",
+                Vec::from_array(["--ffi-check", mode]),
+                root,
+            );
+            test_support::assert_success(output);
+            test_support::assert_contains(
+                test_support::read_file(
+                    path::join(root, "_artifact/build/pkg/ffi_demo/goml_generated.go"),
+                ),
+                "api.gom",
+            );
+            testing::assert_eq(
+                test_support::stdout(output),
+                "3\ntrue\n97\n98\n99\n3\ntrue\n2\ntrue\nfalse\n0\ntrue\n",
+            );
+        }
+    }
+}
+
+#[test]
+fn project_go_interface_adapter_rejects_invalid_mappings_before_publication() -> () {
+    let root = interface_reader_project("ffi_reader_adapter_invalid");
+    test_support::assert_success(test_support::project_command("check", "", Vec::new(), root));
+    let interface_path = path::join(root, "_artifact/check/pkg/ffi_demo/api/api.interface");
+    let original = fs::sha256_file(interface_path).unwrap_or("");
+    testing::assert(original != "");
+    for entry in Vec::from_array(
+        [
+            (
+                "#[go_interface(raw::RawReader, ReaderAdapter, read = \"Read\")] pub trait Reader { fn read(self: Self, buffer: ffi::RawSlice[u8]) -> isize; }",
+                "Reader",
+                "",
+                "go_interface signature mismatch",
+            ),
+            (
+                "#[go_interface(raw::RawReader, ReaderAdapter, read = \"Missing\")] pub trait Reader { fn read(self: Self, buffer: ffi::RawSlice[u8]) -> (isize, ffi::Error); }",
+                "Reader",
+                "",
+                "go_interface target method does not exist",
+            ),
+            (
+                "#[go_interface(raw::RawReader, ReaderAdapter, read = \"Read\")] pub trait Reader { fn read(self: Self, buffer: ffi::RawSlice[u8]) -> (isize, ffi::Error); }",
+                "ReadCloser",
+                "",
+                "complete one-to-one method mapping",
+            ),
+            (
+                "#[go_interface(raw::RawReader, ReaderAdapter, read = \"Read\")] pub trait Reader { fn read(self: Self, buffer: Slice[u8]) -> (isize, ffi::Error); }",
+                "Reader",
+                "",
+                "slice boundaries require ffi::RawSlice",
+            ),
+            (
+                "#[go_interface(raw::RawReader, ReaderAdapter, read = \"Read\")] pub trait Reader { fn read(self: Self, buffer: ffi::RawSlice[u8]) -> (isize, ffi::Error); }",
+                "Reader",
+                "struct ReaderAdapter {}",
+                "generated declaration collides",
+            ),
+            (
+                "#[go_interface(raw::RawReader, ReaderAdapter, read = \"Read\")] pub trait Reader { fn read(self: Self, buffer: ffi::RawSlice[u8]) -> (isize, ffi::Error); }",
+                "Reader",
+                "impl ReaderAdapter { pub fn into_go(self: ReaderAdapter) -> raw::RawReader { self.raw } }",
+                "generated member collides",
+            ),
+            (
+                "#[go_interface(raw::RawReader, ReaderAdapter, read = \"Read\")] pub trait Reader { fn read(self: Self, buffer: ffi::RawSlice[u8]) -> (isize, ffi::Error); }",
+                "SectionReader",
+                "",
+                "target is not a Go interface",
+            ),
+        ],
+    ) {
+        test_support::write_file(
+            path::join(root, "raw/raw.gom"),
+            "package raw; #[go_type(\"io\", \"" + entry.1 + "\")] pub extern type RawReader;",
+        );
+        test_support::write_file(
+            path::join(root, "api/api.gom"),
+            "package api; use std::ffi; use module::raw; " + entry.0,
+        );
+        test_support::write_file(
+            path::join(root, "api/collision.gom"),
+            "package api; use module::raw; " + entry.2,
+        );
+        for mode in Vec::from_array(["required", "off"]) {
+            let output = test_support::project_command(
+                "check",
+                "",
+                Vec::from_array(["--ffi-check", mode]),
+                root,
+            );
+            test_support::assert_failure(output);
+            test_support::assert_contains(test_support::stderr(output), entry.3);
+            test_support::assert_contains(test_support::stderr(output), "primary: api/api.gom:");
+            testing::assert(!fs::is_file(interface_path));
+            testing::assert(!fs::is_file(path::with_extension(interface_path, "core")));
+        }
+    }
+}

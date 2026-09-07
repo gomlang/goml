@@ -1,0 +1,105 @@
+package main;
+
+use module::ffi;
+use std::fs;
+use std::json;
+use std::path;
+use std::testing;
+
+fn library_check_args(directory: string) -> Vec[string] {
+    Vec::from_array(
+        [
+            "gomlc",
+            "__check-go-library",
+            "--context",
+            path::join(directory, "context.json"),
+            "--input",
+            path::join(directory, ".stage/new.go"),
+            "--directory",
+            path::join(directory, "gen"),
+            "--import-path",
+            "example.com/host/gen",
+            "--overlay",
+            path::join(directory, ".stage/overlay.json"),
+        ],
+    )
+}
+
+fn exercise_go_library_overlay(directory: string) -> Result[(), string] {
+    for subdirectory in Vec::from_array(["gen", "shim", ".stage"]) {
+        fs::create_dir_all(path::join(directory, subdirectory)).map_err(|error| error.to_string())?
+    }
+    let manifest = "module example.com/host\n\ngo 1.25\n";
+    fs::write_file_structured(path::join(directory, "go.mod"), manifest).map_err(
+        |error| error.to_string(),
+    )?;
+    let context = resolve_foreign_build_context("go", directory)?;
+    fs::write_file_structured(
+        path::join(directory, "context.json"),
+        json::encode(ffi::build_context_json(context)),
+    ).map_err(|error| error.to_string())?;
+    let old = "package gen\nfunc Value() int64 { return 99 }\n";
+    let target = path::join(directory, "gen/goml_generated.go");
+    let input = path::join(directory, ".stage/new.go");
+    fs::write_file_structured(target, old).map_err(|error| error.to_string())?;
+    fs::write_file_structured(
+        path::join(directory, "gen/handwritten.go"),
+        "package gen\nfunc Twice() int64 { return Value()*2 }\n",
+    ).map_err(|error| error.to_string())?;
+    fs::write_file_structured(input, "package gen\nfunc Value() int64 { return 7 }\n").map_err(
+        |error| error.to_string(),
+    )?;
+    check_go_library_command(library_check_args(directory))?;
+    fs::remove_file(target).map_err(|error| error.to_string())?;
+    check_go_library_command(library_check_args(directory))?;
+    testing::assert(!fs::exists(target));
+    fs::write_file_structured(target, old).map_err(|error| error.to_string())?;
+    fs::write_file_structured(input, "package gen\nfunc Value() int64 { return missing }\n").map_err(
+        |error| error.to_string(),
+    )?;
+    match check_go_library_command(library_check_args(directory)) {
+        Err(message) => testing::assert(message.contains("undefined")),
+        Ok(()) => testing::fail("stale output masked invalid staged source"),
+    }
+    fs::write_file_structured(
+        input,
+        "package gen\nfunc Value() int64 { return 7 }\nfunc Twice() int64 { return 1 }\n",
+    ).map_err(|error| error.to_string())?;
+    match check_go_library_command(library_check_args(directory)) {
+        Err(message) => testing::assert(message.contains("redeclared")),
+        Ok(()) => testing::fail("handwritten Go collision accepted"),
+    }
+    fs::write_file_structured(
+        path::join(directory, "shim/shim.go"),
+        "package shim\nimport \"example.com/host/gen\"\nfunc Value() int64 { return gen.Value() }\n",
+    ).map_err(|error| error.to_string())?;
+    for dependency in Vec::from_array(["shim", "gen"]) {
+        fs::write_file_structured(
+            input,
+            "package gen\nimport other \"example.com/host/" + dependency
+                + "\"\nfunc Value() int64 { return other.Value() }\n",
+        ).map_err(|error| error.to_string())?;
+        match check_go_library_command(library_check_args(directory)) {
+            Err(message) => testing::assert(message.contains("import cycle")),
+            Ok(()) => testing::fail("generated Go import cycle accepted"),
+        }
+    }
+    testing::assert_eq(fs::read_file_structured(target).map_err(|error| error.to_string())?, old);
+    testing::assert_eq(
+        fs::read_file_structured(path::join(directory, "go.mod")).map_err(|error| error.to_string())?,
+        manifest,
+    );
+    testing::assert(!fs::exists(path::join(directory, "go.sum")));
+    Result::Ok(())
+}
+
+#[test]
+fn go_library_overlay_checks_new_source_handwritten_files_and_import_cycles() -> () {
+    let temporary = temp_go_path("go-library.gom", "overlay");
+    let result = exercise_go_library_overlay(path::parent(temporary).unwrap_or(""));
+    cleanup_temp_directory(temporary);
+    match result {
+        Ok(()) => (),
+        Err(message) => testing::fail(message),
+    }
+}

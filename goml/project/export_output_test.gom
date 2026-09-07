@@ -1,0 +1,163 @@
+package project;
+
+use module::test_support;
+use std::fs;
+use std::json;
+use std::path;
+use std::task;
+use std::testing;
+
+fn export_test_product(source: string) -> GoExportProduct {
+    GoExportProduct {
+        source,
+        package_name: "calc",
+        import_path: "example.com/host/calc",
+        api: Vec::from_array(
+            [json::object(Vec::from_array([("name", json::Value::String("Add"))]))],
+        ),
+        prerequisites: json::object(Vec::from_array([("go", json::Value::String("1.25"))])),
+    }
+}
+
+fn exercise_export_output(directory: string) -> Result[(), string] {
+    let handwritten = path::join(directory, "handwritten.go");
+    fs::write_file_structured(handwritten, "package calc\n").map_err(|error| error.to_string())?;
+    let product = export_test_product("package calc\nfunc Add(a, b int64) int64 { return a+b }\n");
+    with_export_output(directory, |_| Result::Ok(product))?;
+    let first = export_read_previous(directory)?;
+    with_export_output(directory, |_| Result::Ok(product))?;
+    let repeated = export_read_previous(directory)?;
+    testing::assert(first.source == repeated.source);
+    testing::assert(first.manifest == repeated.manifest);
+    testing::assert_eq(
+        fs::read_file_structured(handwritten).map_err(|error| error.to_string())?,
+        "package calc\n",
+    );
+    let failed = with_export_output(directory, |_| Result::Err("validation failed"));
+    testing::assert(failed.is_err());
+    testing::assert(export_read_previous(directory)?.source == first.source);
+    testing::assert(export_read_previous(directory)?.manifest == first.manifest);
+    let second = export_test_product("package calc\nfunc Add(a, b int64) int64 { return a+b+1 }\n");
+    with_export_output(directory, |_| Result::Ok(second))?;
+    testing::assert(export_read_previous(directory)?.source == Option::Some(second.source));
+    let source_path = path::join(directory, "goml_generated.go");
+    fs::write_file_structured(source_path, "user edit").map_err(|error| error.to_string())?;
+    testing::assert(with_export_output(directory, |_| Result::Ok(product)).is_err());
+    testing::assert_eq(
+        fs::read_file_structured(source_path).map_err(|error| error.to_string())?,
+        "user edit",
+    );
+    fs::write_file_structured(source_path, second.source).map_err(|error| error.to_string())?;
+    let manifest_path = path::join(directory, "goml_exports.json");
+    let modified = export_manifest(second) + " ";
+    fs::write_file_structured(manifest_path, modified).map_err(|error| error.to_string())?;
+    testing::assert(with_export_output(directory, |_| Result::Ok(product)).is_err());
+    testing::assert_eq(
+        fs::read_file_structured(manifest_path).map_err(|error| error.to_string())?,
+        modified,
+    );
+    testing::assert(!fs::exists(path::join(directory, ".goml-export-lock")));
+    Result::Ok(())
+}
+
+#[test]
+fn export_output_preserves_user_files_and_rejects_modified_artifacts() -> () {
+    let root = test_support::workspace("export_output_ownership");
+    match exercise_export_output(root) {
+        Ok(()) => (),
+        Err(error) => testing::fail(error),
+    }
+}
+
+#[test]
+fn export_output_rejects_unowned_files_and_changes_during_validation() -> () {
+    let root = test_support::workspace("export_output_unowned");
+    let source = path::join(root, "goml_generated.go");
+    testing::assert(fs::write_file_structured(source, "user file").is_ok());
+    let product = export_test_product("package calc\n");
+    testing::assert(with_export_output(root, |_| Result::Ok(product)).is_err());
+    testing::assert_eq(fs::read_file_structured(source).unwrap_or(""), "user file");
+    testing::assert(fs::remove_file(source).is_ok());
+    let changed = with_export_output(
+        root,
+        |_| {
+            fs::write_file_structured(source, "concurrent user edit").map_err(
+                |error| error.to_string(),
+            )?;
+            Result::Ok(product)
+        },
+    );
+    testing::assert(changed.is_err());
+    testing::assert_eq(fs::read_file_structured(source).unwrap_or(""), "concurrent user edit");
+    testing::assert(!fs::exists(path::join(root, "goml_exports.json")));
+}
+
+#[test]
+fn export_output_rejects_concurrent_generators() -> () {
+    let root = test_support::workspace("export_output_concurrent");
+    let started: Channel[()] = Channel::new(1);
+    let release: Channel[()] = Channel::new(1);
+    let result: Result[Vec[()], Vec[string]] = task::scope(
+        |scope: task::Scope| {
+            let jobs: Vec[task::Task[Result[(), string]]] = Vec::new();
+            jobs.push(
+                scope.spawn(
+                    |_: task::CancelToken| with_export_output(
+                        root,
+                        |_| {
+                            started.send(());
+                            let _ = release.recv();
+                            Result::Ok(export_test_product("package calc\n"))
+                        },
+                    ),
+                ),
+            );
+            jobs.push(
+                scope.spawn(
+                    |_: task::CancelToken| {
+                        let _ = started.recv();
+                        let competing = with_export_output(
+                            root,
+                            |_| Result::Ok(export_test_product("replacement")),
+                        );
+                        release.send(());
+                        match competing {
+                            Err(message) => if message.contains("locked") {
+                                Result::Ok(())
+                            } else {
+                                Result::Err(message)
+                            },
+                            Ok(()) => Result::Err("concurrent export entered the lock"),
+                        }
+                    },
+                ),
+            );
+            task::join_all_results(jobs)
+        },
+    );
+    testing::assert(result.is_ok());
+    testing::assert_eq(
+        fs::read_file_structured(path::join(root, "goml_generated.go")).unwrap_or(""),
+        "package calc\n",
+    );
+}
+
+#[test]
+fn export_output_rolls_back_source_when_manifest_publication_fails() -> () {
+    let root = test_support::workspace("export_output_rollback");
+    let staging = path::join(root, "staging");
+    testing::assert(fs::create_dir(staging).is_ok());
+    let source = path::join(root, "goml_generated.go");
+    let staged = path::join(staging, "new.go");
+    let missing = path::join(staging, "missing.json");
+    testing::assert(fs::write_file_structured(source, "old").is_ok());
+    testing::assert(fs::write_file_structured(staged, "new").is_ok());
+    testing::assert(
+        export_commit_files(root, staging, staged, missing, Option::Some("old")).is_err(),
+    );
+    testing::assert_eq(fs::read_file_structured(source).unwrap_or(""), "old");
+    testing::assert(fs::remove_file(source).is_ok());
+    testing::assert(fs::write_file_structured(staged, "new").is_ok());
+    testing::assert(export_commit_files(root, staging, staged, missing, Option::None).is_err());
+    testing::assert(!fs::exists(source));
+}

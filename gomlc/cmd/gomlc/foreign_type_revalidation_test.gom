@@ -1,0 +1,179 @@
+package main;
+
+use module::ffi;
+use module::artifact;
+use module::artifact::interface_codec as interface_codec;
+use std::env;
+use std::fs;
+use std::json;
+use std::path;
+use std::process;
+use std::testing;
+use std::utf8;
+use utf8::BytesUtf8;
+
+fn foreign_type_artifact_output(compiler: string, directory: string, mode: string, core: bool) -> Result[
+    process::Output,
+    string,
+] {
+    process::Command::new(compiler).args(
+        Vec::from_array(
+            [
+                "__ffi-check-artifacts",
+                if core {
+                    "--core-path"
+                } else {
+                    "--interface-path"
+                },
+                path::join(
+                    directory,
+                    if core {
+                        "calc.core"
+                    } else {
+                        "calc.interface"
+                    },
+                ),
+                "--context",
+                path::join(directory, "context.json"),
+                "--caller-directory",
+                path::join(directory, "gen"),
+                "--caller-import-path",
+                "example.com/host/gen",
+                "--caller-mode",
+                "package",
+                "--caller-package",
+                "gen",
+                "--ffi-check",
+                mode,
+            ],
+        ),
+    ).current_dir(directory).output_structured().map_err(|error| error.to_string())
+}
+
+fn exercise_foreign_type_artifact_revalidation(directory: string) -> Result[(), string] {
+    ffi_driver_fixture(directory)?;
+    let context = resolve_foreign_build_context("go", directory)?;
+    fs::write_file_structured(
+        path::join(directory, "context.json"),
+        json::encode(ffi::build_context_json(context)),
+    ).map_err(|error| error.to_string())?;
+    let compiler = path::absolute_structured(
+        env::var_structured("GOML_TEST_GOMLC").unwrap_or("../stage2/bin/gomlc"),
+    ).map_err(|error| error.to_string())?;
+    let helper = path::join(path::parent(compiler).unwrap_or(""), "goml-go-meta");
+    let caller = ffi::CallerContext {
+        generated_source: Option::None,
+        load_mode: "package",
+        import_path: "example.com/host/gen",
+        directory: path::join(directory, "gen"),
+        package_name: "gen",
+    };
+    let queries = Vec::from_array(
+        [
+            ffi::TypeDeclarationQuery {
+                type_id: "audit::value::PrivateDelay",
+                import_path: "example.com/host/shim",
+                name: "Delay",
+            },
+        ],
+    );
+    queries.push(
+        ffi::TypeDeclarationQuery {
+            type_id: "audit::value::Numeric",
+            import_path: "example.com/host/shim",
+            name: "Numeric",
+        },
+    );
+    let instances = Vec::from_array(
+        [
+            host_instance_query(
+                "audit::value::Numeric_i64",
+                "Numeric",
+                Vec::from_array([ffi::BridgeType::Scalar("int64")]),
+            ),
+        ],
+    );
+    let metadata = ffi::ForeignTypeMetadata {
+        instances,
+        queries,
+        declarations: run_foreign_type_declarations(helper, context, caller, queries)?,
+    };
+    exercise_foreign_type_artifacts(metadata)?;
+    let interface = interface_codec::with_foreign_types(binary_interface_fixture(), metadata)?;
+    write_artifact_interface(path::join(directory, "calc.interface"), interface)?;
+    let core = artifact::ArtifactCoreUnit {
+        source_origins: Vec::new(),
+        external_applications: Vec::new(),
+        foreign_types: Option::Some(metadata),
+        package_name: "audit::value",
+        declared_name: "value",
+        interface_hash: interface.interface_hash,
+        exports: interface_codec::empty_exports(),
+        core_ir: empty_core_file(),
+        deps: Vec::new(),
+        sources: Vec::new(),
+        tests: Vec::new(),
+    };
+    write_artifact_core(path::join(directory, "calc.core"), core)?;
+    for core in Vec::from_array([false, true]) {
+        for mode in Vec::from_array(["required", "off"]) {
+            let output = foreign_type_artifact_output(compiler, directory, mode, core)?;
+            if !output.status().success() {
+                return Result::Err(
+                    output.stderr().to_string_utf8().unwrap_or("type artifact validation failed"),
+                )
+            }
+        }
+    }
+    let invalid_metadata = ffi::ForeignTypeMetadata {
+        queries: metadata.queries,
+        declarations: metadata.declarations,
+        instances: Vec::from_array(
+            [
+                host_instance_query(
+                    "audit::value::Numeric_bool",
+                    "Numeric",
+                    Vec::from_array([ffi::BridgeType::Scalar("bool")]),
+                ),
+            ],
+        ),
+    };
+    let invalid_interface = interface_codec::with_foreign_types(
+        binary_interface_fixture(),
+        invalid_metadata,
+    )?;
+    write_artifact_interface(path::join(directory, "calc.interface"), invalid_interface)?;
+    for mode in Vec::from_array(["required", "off"]) {
+        let output = foreign_type_artifact_output(compiler, directory, mode, false)?;
+        testing::assert(!output.status().success());
+        let error = output.stderr().to_string_utf8().unwrap_or("");
+        testing::assert(error.contains("Numeric_bool"));
+        testing::assert(error.contains("satisfy") || error.contains("constraint"));
+    }
+    write_artifact_interface(path::join(directory, "calc.interface"), interface)?;
+    fs::write_file_structured(
+        path::join(directory, "shim/shim.go"),
+        "package shim\nimport \"time\"\ntype Delay = time.Time\ntype Numeric[T ~int64] struct { Value T }\n",
+    ).map_err(|error| error.to_string())?;
+    for core in Vec::from_array([false, true]) {
+        for mode in Vec::from_array(["required", "off"]) {
+            let output = foreign_type_artifact_output(compiler, directory, mode, core)?;
+            testing::assert(!output.status().success());
+            let error = output.stderr().to_string_utf8().unwrap_or("");
+            testing::assert(error.contains("Go declaration changed"));
+            testing::assert(error.contains("PrivateDelay"));
+            testing::assert(error.contains("audit::value"));
+        }
+    }
+    Result::Ok(())
+}
+
+#[test]
+fn foreign_type_only_artifacts_revalidate_without_sources_in_required_and_off_modes() -> () {
+    let temporary = temp_go_path("ffi-types.gom", "type-revalidation");
+    let result = exercise_foreign_type_artifact_revalidation(path::parent(temporary).unwrap_or(""));
+    cleanup_temp_directory(temporary);
+    if let Err(error) = result {
+        testing::fail(error)
+    }
+}

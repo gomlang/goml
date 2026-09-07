@@ -1,0 +1,1531 @@
+package main;
+
+use module::test_support;
+use std::bytes;
+use std::fs;
+use std::path;
+use std::process;
+use std::testing;
+
+fn ffi_project_fixture(name: string) -> string {
+    let root = test_support::workspace(name);
+    test_support::write_file(path::join(root, "goml.toml"), "[module]\npath = \"ffi_demo\"\n");
+    test_support::write_file(
+        path::join(root, "go.mod"),
+        "module example.com/ffi-demo\n\ngo 1.25.0\n",
+    );
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\nfunc Value(x int64) int64 { return x + 1 }\n",
+    );
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; #[go_ffi(\"example.com/ffi-demo/shim\", \"Value\")] extern fn value(x: i64) -> i64; fn main() -> () { println(value(41)) } #[test] fn smoke() -> () { println(value(1)) }",
+    );
+    root
+}
+
+#[test]
+fn project_ffi_rechecks_cached_sources_against_changed_go() -> () {
+    let root = ffi_project_fixture("ffi_cached_sources");
+    let manifest = test_support::read_file(path::join(root, "go.mod"));
+    test_support::assert_success(cli_check(root));
+    let interface = path::join(root, "_artifact/check/pkg/ffi_demo/ffi_demo.interface");
+    let before = fs::sha256_file(interface).unwrap_or("");
+    testing::assert(before != "");
+    test_support::assert_success(cli_check(root));
+    testing::assert_eq(fs::sha256_file(interface).unwrap_or(""), before);
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\nfunc Value(x string) string { return x }\n",
+    );
+    let invalid = cli_check(root);
+    test_support::assert_failure(invalid);
+    test_support::assert_contains(test_support::stderr(invalid), "ffi-signature-mismatch");
+    test_support::assert_contains(test_support::stderr(invalid), "primary: main.gom:1:");
+    test_support::assert_contains(test_support::stderr(invalid), "arg0 = x");
+    testing::assert_eq(fs::sha256_file(interface).unwrap_or(""), before);
+    let unchecked = test_support::project_command(
+        "check",
+        "",
+        Vec::from_array(["--ffi-check", "off"]),
+        root,
+    );
+    test_support::assert_success(unchecked);
+    test_support::assert_contains(test_support::stderr(unchecked), "ffi-unverified");
+    testing::assert_eq(test_support::read_file(path::join(root, "go.mod")), manifest);
+    testing::assert(!fs::is_file(path::join(root, "go.sum")));
+}
+
+#[test]
+fn project_ffi_build_run_and_test_share_validation_context() -> () {
+    let root = ffi_project_fixture("ffi_execution");
+    let output = test_support::project_command("run", "", Vec::new(), root);
+    test_support::assert_success(output);
+    test_support::assert_contains(test_support::stdout(output), "42");
+    test_support::assert_success(
+        test_support::project_command("test", "", Vec::from_array(["--kind", "internal"]), root),
+    );
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\nfunc Value(x int64) int64 { return x + 2 }\n",
+    );
+    let output = test_support::project_command("run", "", Vec::new(), root);
+    test_support::assert_success(output);
+    test_support::assert_contains(test_support::stdout(output), "43");
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\nfunc Value(x string) string { return x }\n",
+    );
+    for command in Vec::from_array(["build", "run", "test"]) {
+        let output = test_support::project_command(command, "", Vec::new(), root);
+        test_support::assert_failure(output);
+        test_support::assert_contains(test_support::stderr(output), "ffi-signature-mismatch");
+    }
+}
+
+#[test]
+fn project_ffi_required_failure_prevents_first_publication() -> () {
+    let root = ffi_project_fixture("ffi_first_failure");
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; #[go_ffi(\"math\", \"MissingFunction\")] extern fn unused_private(x: f64) -> f64; fn main() -> () {}",
+    );
+    let output = cli_check(root);
+    test_support::assert_failure(output);
+    test_support::assert_contains(test_support::stderr(output), "unused_private");
+    test_support::assert_contains(test_support::stderr(output), "primary: main.gom:1:");
+    testing::assert(
+        !fs::is_file(path::join(root, "_artifact/check/pkg/ffi_demo/ffi_demo.interface")),
+    );
+}
+
+#[test]
+fn project_without_ffi_checks_without_go_on_path() -> () {
+    let root = test_support::workspace("ffi_no_go");
+    test_support::write_basic_project(root, "no_ffi");
+    match process::Command::new(test_support::goml_binary()).args(
+        Vec::from_array(["check", "--compiler", test_support::gomlc_binary()]),
+    ).env("PATH", path::join(root, "empty-path")).current_dir(root).output_structured() {
+        Ok(output) => test_support::assert_success(output),
+        Err(message) => testing::fail(message.to_string()),
+    }
+    testing::assert(!fs::is_file(path::join(root, "_artifact/ffi-build-context.json")));
+}
+
+#[test]
+fn project_ffi_cli_policy_defaults_and_errors() -> () {
+    for command in Vec::from_array(["check", "build", "run", "test"]) {
+        match parse_cli(Vec::from_array(["goml", command])) {
+            Ok(parsed) => testing::assert_eq(parsed.ffi_check, "required"),
+            Err(message) => testing::fail(message),
+        }
+        testing::assert(parse_cli(Vec::from_array(["goml", command, "--ffi-check=off"])).is_ok());
+        testing::assert(
+            parse_cli(Vec::from_array(["goml", command, "--ffi-check", "maybe"])).is_err(),
+        );
+        testing::assert(
+            parse_cli(
+                Vec::from_array(["goml", command, "--ffi-check", "off", "--ffi-check", "required"]),
+            ).is_err(),
+        );
+    }
+}
+
+#[test]
+fn project_ffi_off_checks_without_go_and_does_not_create_context() -> () {
+    let root = ffi_project_fixture("ffi_off_no_go");
+    match process::Command::new(test_support::goml_binary()).args(
+        Vec::from_array(["check", "--compiler", test_support::gomlc_binary(), "--ffi-check", "off"]),
+    ).env("PATH", path::join(root, "empty-path")).current_dir(root).output_structured() {
+        Ok(output) => {
+            test_support::assert_success(output);
+            test_support::assert_contains(test_support::stderr(output), "ffi-unverified");
+        },
+        Err(message) => testing::fail(message.to_string()),
+    }
+    testing::assert(!fs::is_file(path::join(root, "_artifact/ffi-build-context.json")));
+}
+
+#[test]
+fn project_external_types_resolve_unused_declarations_before_typechecking() -> () {
+    let root = ffi_project_fixture("ffi_external_types");
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\ntype Box[T any] struct { Value T }\n",
+    );
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; #[go_type(\"time\", \"MissingType\")] extern type Missing; fn main() -> () {}",
+    );
+    let missing = cli_check(root);
+    test_support::assert_failure(missing);
+    test_support::assert_contains(test_support::stderr(missing), "MissingType");
+    test_support::assert_contains(test_support::stderr(missing), "primary: main.gom:1:");
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; #[go_type(\"time\", \"Duration\")] extern type Duration[T]; fn main() -> () {}",
+    );
+    for mode in Vec::from_array(["required", "off"]) {
+        let invalid = test_support::project_command(
+            "check",
+            "",
+            Vec::from_array(["--ffi-check", mode]),
+            root,
+        );
+        test_support::assert_failure(invalid);
+        test_support::assert_contains(test_support::stderr(invalid), "declares 1 type parameters");
+        test_support::assert_contains(test_support::stderr(invalid), "time.Duration requires 0");
+    }
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; #[go_type(\"example.com/ffi-demo/shim\", \"Box\")] extern type Box; fn main() -> () {}",
+    );
+    for mode in Vec::from_array(["required", "off"]) {
+        let invalid = test_support::project_command(
+            "check",
+            "",
+            Vec::from_array(["--ffi-check", mode]),
+            root,
+        );
+        test_support::assert_failure(invalid);
+        test_support::assert_contains(test_support::stderr(invalid), "declares 0 type parameters");
+        test_support::assert_contains(test_support::stderr(invalid), "Box requires 1");
+    }
+    testing::assert(
+        !fs::is_file(path::join(root, "_artifact/check/pkg/ffi_demo/ffi_demo.interface")),
+    );
+    testing::assert(!fs::is_file(path::join(root, "go.sum")));
+}
+
+#[test]
+fn project_external_types_build_across_packages_and_revalidate_cached_aliases() -> () {
+    let root = ffi_project_fixture("external_type_values");
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\nimport \"time\"\ntype Delay = time.Duration\nfunc Value() time.Duration { return 42 }\nfunc Nanos(v time.Duration) int64 { return int64(v) }\n",
+    );
+    test_support::write_file(
+        path::join(root, "clock/clock.gom"),
+        "package clock; #[go_type(\"time\", \"Duration\")] pub extern type Delay; pub fn identity(value: Delay) -> Delay { value }",
+    );
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use ffi_demo::clock; #[go_type(\"time\", \"Duration\")] extern type Duration; #[go_type(\"example.com/ffi-demo/shim\", \"Delay\")] extern type PrivateUnused; #[go_ffi(\"example.com/ffi-demo/shim\", \"Value\")] extern fn value() -> Duration; #[go_ffi(\"example.com/ffi-demo/shim\", \"Nanos\")] extern fn nanos(value: Duration) -> i64; fn main() -> () { println(nanos(clock::identity(value()))) }",
+    );
+    test_support::assert_success(cli_check(root));
+    test_support::assert_success(cli_build(root));
+    let output = test_support::project_command("run", "", Vec::new(), root);
+    test_support::assert_success(output);
+    testing::assert_eq(test_support::stdout(output), "42\n");
+    test_support::assert_success(cli_check(root));
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\nimport \"time\"\ntype Delay = time.Time\nfunc Value() time.Duration { return 42 }\nfunc Nanos(v time.Duration) int64 { return int64(v) }\n",
+    );
+    for mode in Vec::from_array(["required", "off"]) {
+        let output = test_support::project_command(
+            "check",
+            "",
+            Vec::from_array(["--ffi-check", mode]),
+            root,
+        );
+        test_support::assert_failure(output);
+        test_support::assert_contains(test_support::stderr(output), "Go declaration changed");
+        test_support::assert_contains(test_support::stderr(output), "PrivateUnused");
+    }
+}
+
+#[test]
+fn project_generic_external_types_validate_imported_and_erased_arguments() -> () {
+    let root = ffi_project_fixture("generic_external_values");
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\ntype Numeric[T ~int64] struct { Value T }\ntype Erased[T ~int64] = int64\nfunc Value() Numeric[int64] { return Numeric[int64]{Value: 42} }\nfunc Read(v Numeric[int64]) int64 { return v.Value }\n",
+    );
+    test_support::write_file(
+        path::join(root, "types/types.gom"),
+        "package types; #[go_type(\"example.com/ffi-demo/shim\", \"Numeric\")] pub extern type Numeric[T]; #[go_type(\"example.com/ffi-demo/shim\", \"Erased\")] pub extern type Erased[T];",
+    );
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use ffi_demo::types; #[go_type(\"example.com/ffi-demo/shim\", \"Numeric\")] extern type Local[T]; fn convert(value: types::Numeric[i64]) -> Local[i64] { value } #[go_ffi(\"example.com/ffi-demo/shim\", \"Value\")] extern fn value() -> types::Numeric[i64]; #[go_ffi(\"example.com/ffi-demo/shim\", \"Read\")] extern fn read(value: types::Numeric[i64]) -> i64; fn main() -> () { println(read(convert(value()))) }",
+    );
+    test_support::assert_success(cli_check(root));
+    let output = test_support::project_command("run", "", Vec::new(), root);
+    test_support::assert_success(output);
+    testing::assert_eq(test_support::stdout(output), "42\n");
+    test_support::assert_success(cli_check(root));
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use ffi_demo::types; pub fn invalid(value: types::Erased[bool]) -> i64 { value } fn main() -> () {}",
+    );
+    for mode in Vec::from_array(["required", "off"]) {
+        let output = test_support::project_command(
+            "check",
+            "",
+            Vec::from_array(["--ffi-check", mode]),
+            root,
+        );
+        test_support::assert_failure(output);
+        test_support::assert_contains(test_support::stderr(output), "Erased");
+        let error = test_support::stderr(output);
+        testing::assert(error.contains("satisfy") || error.contains("constraint"));
+    }
+}
+
+fn traced_ffi_command(root: string, command: string) -> process::Output {
+    let args = Vec::from_array([command, "--compiler", path::join(root, "bin/compiler-wrapper")]);
+    if command == "test" {
+        args.push("--kind");
+        args.push("internal")
+    }
+    match process::Command::new(test_support::goml_binary()).args(args).env(
+        "GOML_REAL_COMPILER",
+        test_support::gomlc_binary(),
+    ).env("GOML_COMPILER_TRACE", path::join(root, "compiler.trace")).current_dir(root).output_structured() {
+        Ok(output) => output,
+        Err(error) => {
+            testing::fail(error.to_string());
+            test_support::project_command(command, "", Vec::new(), root)
+        },
+    }
+}
+
+#[test]
+fn project_ffi_forwards_link_context_and_rechecks_cached_specialization() -> () {
+    let root = ffi_project_fixture("ffi_cached_specialization");
+    test_support::write_file(
+        path::join(root, "main_test.gom"),
+        "package main; #[test] fn cached_smoke() -> () { println(value(1)) }",
+    );
+    let wrapper = path::join(root, "bin/compiler-wrapper");
+    test_support::write_file(
+        wrapper,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GOML_COMPILER_TRACE\"\nexec \"$GOML_REAL_COMPILER\" \"$@\"\n",
+    );
+    match process::Command::new("chmod").args(Vec::from_array(["+x", wrapper])).output_structured() {
+        Ok(output) => test_support::assert_success(output),
+        Err(error) => testing::fail(error.to_string()),
+    }
+    let compiler_directory = path::parent(test_support::gomlc_binary()).unwrap_or("");
+    let resources = path::join(path::parent(compiler_directory).unwrap_or(""), "lib");
+    match process::Command::new("ln").args(
+        Vec::from_array(["-s", resources, path::join(root, "lib")]),
+    ).output_structured() {
+        Ok(output) => test_support::assert_success(output),
+        Err(error) => testing::fail(error.to_string()),
+    }
+    for command in Vec::from_array(["build", "test"]) {
+        test_support::write_file(path::join(root, "compiler.trace"), "");
+        test_support::assert_success(traced_ffi_command(root, command));
+        let fresh = test_support::read_file(path::join(root, "compiler.trace"));
+        let link_name = if command == "build" {
+            "link"
+        } else {
+            "test-link"
+        };
+        let mut linked = false;
+        for line in fresh.split("\n") {
+            if line.starts_with(link_name + " ") {
+                testing::assert(line.contains("--ffi-check required"));
+                testing::assert(line.contains("--context "));
+                testing::assert(line.contains("--caller-directory "));
+                linked = true;
+            }
+        }
+        testing::assert(linked);
+        test_support::write_file(path::join(root, "compiler.trace"), "");
+        test_support::assert_success(traced_ffi_command(root, command));
+        let cached = test_support::read_file(path::join(root, "compiler.trace"));
+        testing::assert(cached.contains("__ffi-check-" + link_name + " "));
+        for line in cached.split("\n") {
+            testing::assert(!line.starts_with(link_name + " "));
+        }
+    }
+}
+
+#[test]
+fn project_external_pointer_aliases_preserve_identity_sharing_and_nullable_payloads() -> () {
+    let root = ffi_project_fixture("ffi_pointer_aliases");
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\ntype Cell struct { Value int64 }\ntype Handle = *Cell\nfunc New() Handle { return &Cell{Value: 1} }\nfunc Nil() Handle { return nil }\nfunc IsNil(value Handle) bool { return value == nil }\nfunc Read(value Handle) int64 { return value.Value }\nfunc Write(value Handle, next int64) { value.Value = next }\nfunc Same(a, b Handle) bool { return a == b }\n",
+    );
+    test_support::write_file(
+        path::join(root, "pointers/pointers.gom"),
+        "package pointers; #[go_type(\"example.com/ffi-demo/shim\", \"Handle\")] pub extern type Handle; pub fn identity(value: Handle) -> Handle { value }",
+    );
+    let declarations = "package main; use ffi_demo::pointers; #[go_type(\"example.com/ffi-demo/shim\", \"Handle\")] extern type Handle; #[go_ffi(\"example.com/ffi-demo/shim\", \"New\")] extern fn create() -> Handle; #[go_ffi(\"example.com/ffi-demo/shim\", \"Nil\")] extern fn null() -> Handle; #[go_ffi(\"example.com/ffi-demo/shim\", \"IsNil\")] extern fn is_nil(value: Handle) -> bool; #[go_ffi(\"example.com/ffi-demo/shim\", \"Read\")] extern fn read(value: Handle) -> i64; #[go_ffi(\"example.com/ffi-demo/shim\", \"Write\")] extern fn write(value: Handle, next: i64) -> (); #[go_ffi(\"example.com/ffi-demo/shim\", \"Same\")] extern fn same(a: Handle, b: Handle) -> bool; fn identity[T](value: T) -> T { value } ";
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        declarations
+            + "fn main() -> () { let pointer = identity(pointers::identity(create())); let alias = pointer; let closure = || read(alias); write(pointer, 42); println(closure()); println(same(pointer, alias)); let optional: Option[Handle] = Option::Some(null()); println(match optional { Some(value) => is_nil(value), None => false }); }",
+    );
+    let output = test_support::project_command("run", "", Vec::new(), root);
+    test_support::assert_success(output);
+    testing::assert_eq(test_support::stdout(output), "42\ntrue\ntrue\n");
+    test_support::assert_success(cli_check(root));
+    for body in Vec::from_array(
+        [
+            "fn main() -> () { let value: Handle = Ref::new(1); }",
+            "fn main() -> () { let value: Handle = 0; }",
+            "fn main() -> () { let value = Handle {}; }",
+        ],
+    ) {
+        test_support::write_file(path::join(root, "main.gom"), declarations + body);
+        test_support::assert_failure(cli_check(root));
+    }
+}
+
+#[test]
+fn project_public_ffi_pointers_preserve_nil_and_go_alias_identity() -> () {
+    let root = ffi_project_fixture("ffi_public_pointers");
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\ntype Cell struct { Value int64 }\ntype Handle = *Cell\nfunc New() Handle { return &Cell{Value: 42} }\nfunc Read(value Handle) int64 { return value.Value }\nfunc IsNil(value Handle) bool { return value == nil }\n",
+    );
+    let declarations = "package main; use std::ffi; #[go_type(\"example.com/ffi-demo/shim\", \"Cell\")] extern type Cell; #[go_type(\"example.com/ffi-demo/shim\", \"Handle\")] extern type Handle; #[go_ffi(\"example.com/ffi-demo/shim\", \"New\")] extern fn create() -> ffi::Ptr[Cell]; #[go_ffi(\"example.com/ffi-demo/shim\", \"Read\")] extern fn read(value: Handle) -> i64; #[go_ffi(\"example.com/ffi-demo/shim\", \"IsNil\")] extern fn go_is_nil(value: ffi::Ptr[Cell]) -> bool; ";
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        declarations
+            + "fn main() -> () { let empty: ffi::Ptr[Cell] = ffi::null(); let is_nil: (ffi::Ptr[Cell]) -> bool = ffi::is_nil; println(is_nil(empty)); println(go_is_nil(empty)); let pointer = create(); println(is_nil(pointer)); println(read(pointer)); let optional: Option[ffi::Ptr[Cell]] = Option::Some(empty); println(match optional { Some(value) => ffi::is_nil(value), None => false }); let nested: ffi::Ptr[ffi::Ptr[Cell]] = ffi::null(); println(ffi::is_nil(nested)); }",
+    );
+    let output = test_support::project_command("run", "", Vec::new(), root);
+    test_support::assert_success(output);
+    testing::assert_eq(test_support::stdout(output), "true\ntrue\nfalse\n42\ntrue\ntrue\n");
+    test_support::assert_success(cli_check(root));
+    for body in Vec::from_array(
+        [
+            "fn main() -> () { let value: ffi::Ptr[Cell] = Ref::new(1); }",
+            "fn main() -> () { let value: ffi::Ptr[Cell] = 0; }",
+            "fn main() -> () { let value: ffi::Ptr[Cell] = Cell {}; }",
+            "fn main() -> () { let value = ffi::Ptr {}; }",
+        ],
+    ) {
+        test_support::write_file(path::join(root, "main.gom"), declarations + body);
+        test_support::assert_failure(cli_check(root));
+    }
+}
+
+#[test]
+fn project_go_methods_preserve_pointer_identity_nil_and_function_values() -> () {
+    let root = ffi_project_fixture("ffi_methods");
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\ntype Cell struct { Value int64 }\nfunc New() *Cell { return &Cell{Value: 1} }\nfunc (c Cell) Read() int64 { return c.Value }\nfunc (c *Cell) Write(value int64) { c.Value = value }\nfunc (c *Cell) IsNil() bool { return c == nil }\n",
+    );
+    test_support::write_file(
+        path::join(root, "cells/cells.gom"),
+        "package cells; use std::ffi; #[go_type(\"example.com/ffi-demo/shim\", \"Cell\")] pub extern type Cell; #[go_method(\"Read\")] pub extern fn read(value: ffi::Ptr[Cell]) -> i64;",
+    );
+    let declarations = "package main; use std::ffi; use ffi_demo::cells; #[go_ffi(\"example.com/ffi-demo/shim\", \"New\")] extern fn create() -> ffi::Ptr[cells::Cell]; #[go_method(\"Write\")] extern fn write(value: ffi::Ptr[cells::Cell], next: i64) -> (); #[go_method(\"IsNil\")] extern fn is_nil(value: ffi::Ptr[cells::Cell]) -> bool; fn identity[T](value: T) -> T { value } ";
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        declarations
+            + "fn main() -> () { let value = create(); let alias = value; let read = identity(cells::read); let captured = || read(alias); write(value, 42); println(captured()); println(is_nil(ffi::null())); println(is_nil(value)); }",
+    );
+    for attempt in 0..2 {
+        let output = test_support::project_command("run", "", Vec::new(), root);
+        test_support::assert_success(output);
+        testing::assert_eq(test_support::stdout(output), "42\ntrue\nfalse\n");
+    }
+    for extra in Vec::from_array(
+        [
+            "#[go_method(\"Write\")] extern fn bad(value: cells::Cell, next: i64) -> ();",
+            "#[go_method(\"Missing\")] extern fn bad(value: ffi::Ptr[cells::Cell]) -> ();",
+            "#[go_method(\"Read\")] extern fn bad(value: ffi::Ptr[cells::Cell]) -> bool;",
+            "#[go_method(\"Read\")] extern fn bad() -> i64;",
+            "#[comptime] fn bad() -> bool { is_nil(ffi::null()) }",
+            "#[go_method(\"Read\")] extern fn bad[T](value: T) -> i64;",
+            "#[go_method(\"Read\")] #[go_ffi(\"math\", \"Abs\")] extern fn bad(value: f64) -> f64;",
+        ],
+    ) {
+        test_support::write_file(
+            path::join(root, "main.gom"),
+            declarations + extra + " fn main() -> () {}",
+        );
+        test_support::assert_failure(cli_check(root));
+    }
+}
+
+#[test]
+fn project_raw_go_errors_preserve_typed_nil_chains_and_partial_values() -> () {
+    let root = ffi_project_fixture("ffi_raw_errors");
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\nimport (\"errors\"; \"fmt\")\ntype Raw = error\ntype Problem struct {}\nfunc (p *Problem) Error() string { if p == nil { return \"typed nil\" }; return \"problem\" }\nvar sentinel = errors.New(\"sentinel\")\nfunc TypedNil() error { var p *Problem; return p }\nfunc Sentinel() error { return sentinel }\nfunc Wrap(value error) error { return fmt.Errorf(\"wrapped: %w\", value) }\nfunc Partial() (int64, error) { return 3, sentinel }\n",
+    );
+    test_support::write_file(
+        path::join(root, "errors/errors.gom"),
+        "package errors; use std::ffi; pub fn identity(value: ffi::Error) -> ffi::Error { value }",
+    );
+    let declarations = "package main; use std::ffi; use ffi_demo::errors; #[go_type(\"example.com/ffi-demo/shim\", \"Raw\")] extern type Raw; fn pass(value: Raw) -> ffi::Error { value } #[go_ffi(\"example.com/ffi-demo/shim\", \"TypedNil\")] extern fn typed_nil() -> ffi::Error; #[go_ffi(\"example.com/ffi-demo/shim\", \"Sentinel\")] extern fn sentinel() -> ffi::Error; #[go_ffi(\"example.com/ffi-demo/shim\", \"Wrap\")] extern fn wrap(value: ffi::Error) -> ffi::Error; #[go_ffi(\"example.com/ffi-demo/shim\", \"Partial\")] extern fn partial() -> (i64, ffi::Error); #[go_ffi(\"errors\", \"Is\")] extern fn matches(value: ffi::Error, target: ffi::Error) -> bool; #[go_method(\"Error\")] extern fn describe(value: ffi::Error) -> string; fn identity[T](value: T) -> T { value } ";
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        declarations
+            + "fn main() -> () { let empty = ffi::nil_error(); println(ffi::error_is_nil(empty)); let typed = identity(errors::identity(pass(typed_nil()))); let captured = || typed; println(ffi::error_is_nil(captured())); println(describe(typed)); let original = sentinel(); println(matches(errors::identity(wrap(original)), original)); let (count, error) = partial(); println(count); println(matches(error, original)); let outcome = ffi::Outcome::new(count, error); println(outcome.value); println(match outcome.into_result_discarding_value_on_error() { Err(non_nil) => matches(non_nil.as_error(), original), Ok(_) => false }); println(match ffi::NonNilError::from_error(empty) { None => true, Some(_) => false }); let optional: Option[ffi::Error] = Option::Some(empty); println(match optional { Some(value) => ffi::error_is_nil(value), None => false }); }",
+    );
+    for attempt in 0..2 {
+        let output = test_support::project_command("run", "", Vec::new(), root);
+        test_support::assert_success(output);
+        testing::assert_eq(
+            test_support::stdout(output),
+            "true\nfalse\ntyped nil\ntrue\n3\ntrue\n3\ntrue\ntrue\ntrue\n",
+        );
+    }
+    for body in Vec::from_array(
+        [
+            "fn main() -> () { let value: ffi::Error = 0; }",
+            "fn main() -> () { let value: ffi::Error = \"error\"; }",
+            "fn main() -> () { let value = ffi::Error {}; }",
+            "fn main() -> () { let value: ffi::Error = GoError {}; }",
+            "fn main() -> () { let value: ffi::Error = (); }",
+            "fn main() -> () { let value = ffi::NonNilError { value: ffi::nil_error() }; }",
+            "fn main() -> () { let value: Result[i64, ffi::NonNilError] = Result::Err(ffi::nil_error()); }",
+        ],
+    ) {
+        test_support::write_file(path::join(root, "main.gom"), declarations + body);
+        let checked = cli_check(root);
+        if checked.status().success() {
+            testing::fail("accepted invalid error construction: " + body)
+        }
+    }
+}
+
+#[test]
+fn project_error_results_cross_go_boundary_with_explicit_failure_values() -> () {
+    let root = ffi_project_fixture("ffi_error_results");
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\nimport \"errors\"\nvar sentinel = errors.New(\"sentinel\")\ntype Problem struct {}\nfunc (*Problem) Error() string { return \"problem\" }\nfunc Sentinel() error { return sentinel }\nfunc TypedNil() error { var p *Problem; return p }\nfunc IsTypedNil(value error) bool { p, ok := value.(*Problem); return ok && p == nil }\nfunc Verify(value int64, failure error, expected int64) bool { return value == expected && errors.Is(failure, sentinel) }\nfunc Success(value int64, failure error) bool { return value == 11 && failure == nil }\n",
+    );
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use std::ffi; #[go_ffi(\"example.com/ffi-demo/shim\", \"Sentinel\")] extern fn sentinel() -> ffi::Error; #[go_ffi(\"example.com/ffi-demo/shim\", \"TypedNil\")] extern fn typed_nil() -> ffi::Error; #[go_ffi(\"example.com/ffi-demo/shim\", \"IsTypedNil\")] extern fn is_typed_nil(value: ffi::Error) -> bool; #[go_ffi(\"example.com/ffi-demo/shim\", \"Verify\")] extern fn verify(value: i64, error: ffi::Error, expected: i64) -> bool; #[go_ffi(\"example.com/ffi-demo/shim\", \"Success\")] extern fn success(value: i64, error: ffi::Error) -> bool; fn roundtrip(value: Result[ffi::Outcome[i64], ffi::BoundaryError], expected: i64) -> bool { match value { Ok(outcome) => { let (value, error) = outcome.into_tuple(); verify(value, error, expected) }, Err(_) => false } } fn main() -> () { let failure: Result[i64, ffi::Error] = Result::Err(sentinel()); println(roundtrip(ffi::Outcome::from_raw_result(failure, 7), 7)); let non_nil = match ffi::NonNilError::from_error(sentinel()) { Some(value) => value, None => return }; let wrapped: Result[i64, ffi::NonNilError] = Result::Err(non_nil); println(roundtrip(ffi::Outcome::from_result(wrapped, 9), 9)); let ok: Result[i64, ffi::Error] = Result::Ok(11); println(match ffi::Outcome::from_raw_result(ok, 99) { Ok(outcome) => { let (value, error) = outcome.into_tuple(); success(value, error) }, Err(_) => false }); let invalid: Result[i64, ffi::Error] = Result::Err(ffi::nil_error()); println(match ffi::Outcome::from_raw_result(invalid, 0) { Err(error) => error.to_string(), Ok(_) => \"incorrect success\" }); let typed: Result[i64, ffi::Error] = Result::Err(typed_nil()); println(match ffi::Outcome::from_raw_result(typed, 17) { Ok(outcome) => outcome.value == 17 && is_typed_nil(outcome.error) && !ffi::error_is_nil(outcome.error), Err(_) => false }); }",
+    );
+    for attempt in 0..2 {
+        let output = test_support::project_command("run", "", Vec::new(), root);
+        test_support::assert_success(output);
+        testing::assert_eq(
+            test_support::stdout(output),
+            "true\ntrue\ntrue\nGo FFI boundary rejected Err(nil)\ntrue\n",
+        );
+    }
+}
+
+#[test]
+fn project_file_methods_close_shared_handles_and_preserve_partial_reads() -> () {
+    let root = ffi_project_fixture("ffi_file_resources");
+    test_support::write_file(path::join(root, "data.txt"), "abc");
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\nimport (\"errors\"; \"io\")\ntype Reader struct {}\nfunc NewReader() *Reader { return &Reader{} }\nfunc (*Reader) Read(buffer []byte) (int, error) { return copy(buffer, []byte(\"xyz\")), io.EOF }\nfunc IsEOF(value error) bool { return errors.Is(value, io.EOF) }\n",
+    );
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use std::ffi; #[go_type(\"os\", \"File\")] extern type File; #[go_type(\"example.com/ffi-demo/shim\", \"Reader\")] extern type Reader; #[go_ffi(\"os\", \"Open\")] extern fn open(name: string) -> (ffi::Ptr[File], ffi::Error); #[go_method(\"Read\")] extern fn read(file: ffi::Ptr[File], buffer: MutSlice[byte]) -> (isize, ffi::Error); #[go_method(\"Close\")] extern fn close(file: ffi::Ptr[File]) -> ffi::Error; #[go_ffi(\"example.com/ffi-demo/shim\", \"NewReader\")] extern fn new_reader() -> ffi::Ptr[Reader]; #[go_method(\"Read\")] extern fn partial_read(reader: ffi::Ptr[Reader], buffer: MutSlice[byte]) -> (isize, ffi::Error); #[go_ffi(\"example.com/ffi-demo/shim\", \"IsEOF\")] extern fn is_eof(error: ffi::Error) -> bool; fn main() -> () { let (file, error) = open(\"data.txt\"); println(!ffi::is_nil(file) && ffi::error_is_nil(error)); let alias = file; let buffer: Vec[byte] = Vec::from_array([0, 0, 0, 0]); let view = mut_slice(buffer, 0, 4); let (count, error) = read(file, view); println(count == 3 && ffi::error_is_nil(error)); println(buffer[0] == b'a' && buffer[2] == b'c'); println(ffi::error_is_nil(close(alias))); let (count, error) = read(file, view); println(count == 0 && !ffi::error_is_nil(error)); println(!ffi::error_is_nil(close(ffi::null()))); let (count, error) = partial_read(new_reader(), view); let outcome = ffi::Outcome::new(count, error); println(outcome.value == 3 && is_eof(outcome.error)); println(buffer[0] == b'x' && buffer[2] == b'z'); println(match outcome.into_result_discarding_value_on_error() { Err(error) => is_eof(error.as_error()), Ok(_) => false }); }",
+    );
+    for attempt in 0..2 {
+        let output = test_support::project_command("run", "", Vec::new(), root);
+        test_support::assert_success(output);
+        testing::assert_eq(
+            test_support::stdout(output),
+            "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n",
+        );
+    }
+}
+
+#[test]
+fn project_public_error_messages_validate_utf8_and_matching_preserves_go_semantics() -> () {
+    let root = ffi_project_fixture("ffi_error_messages");
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\nimport (\"errors\"; \"fmt\")\nvar sentinel = errors.New(\"sentinel\")\nfunc Sentinel() error { return sentinel }\nfunc Other() error { return errors.New(\"sentinel\") }\nfunc Wrapped() error { return fmt.Errorf(\"context: %w\", sentinel) }\nfunc Valid() error { return errors.New(\"héllo\") }\nfunc Invalid() error { return errors.New(string([]byte{255, 97})) }\ntype CustomError struct {}\nfunc (CustomError) Error() string { return \"custom\" }\nfunc (CustomError) Is(target error) bool { return target == sentinel }\nfunc Custom() error { return CustomError{} }\ntype NilProblem struct {}\nfunc (*NilProblem) Error() string { return \"typed nil\" }\nfunc TypedNil() error { var p *NilProblem; return p }\n",
+    );
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use std::ffi; #[go_ffi(\"example.com/ffi-demo/shim\", \"Sentinel\")] extern fn sentinel() -> ffi::Error; #[go_ffi(\"example.com/ffi-demo/shim\", \"Other\")] extern fn other() -> ffi::Error; #[go_ffi(\"example.com/ffi-demo/shim\", \"Wrapped\")] extern fn wrapped() -> ffi::Error; #[go_ffi(\"example.com/ffi-demo/shim\", \"Valid\")] extern fn valid() -> ffi::Error; #[go_ffi(\"example.com/ffi-demo/shim\", \"Invalid\")] extern fn invalid() -> ffi::Error; #[go_ffi(\"example.com/ffi-demo/shim\", \"Custom\")] extern fn custom() -> ffi::Error; #[go_ffi(\"example.com/ffi-demo/shim\", \"TypedNil\")] extern fn typed_nil() -> ffi::Error; fn main() -> () { let target = sentinel(); let check = ffi::error_matches; println(check(wrapped(), target)); println(check(custom(), target)); println(!check(other(), target)); println(check(ffi::nil_error(), ffi::nil_error())); println(!check(target, ffi::nil_error())); let Some(value) = ffi::NonNilError::from_error(wrapped()) else { return }; println(value.matches(target)); println(value.message().unwrap_or(\"invalid\")); let Some(text) = ffi::NonNilError::from_error(valid()) else { return }; println(text.message().unwrap_or(\"invalid\")); let Some(raw_error) = ffi::NonNilError::from_error(invalid()) else { return }; let raw = raw_error.message_bytes(); println(raw.len() == 2 && raw.values[0] == 255 && raw.values[1] == b'a'); raw.values[0] = b'z'; println(raw_error.message_bytes().values[0] == 255); println(match raw_error.message() { Err(error) => error.valid_up_to() == 0, Ok(_) => false }); let Some(typed) = ffi::NonNilError::from_error(typed_nil()) else { return }; println(typed.message().unwrap_or(\"invalid\")); println(!check(typed.as_error(), ffi::nil_error())); }",
+    );
+    for attempt in 0..2 {
+        let output = test_support::project_command("run", "", Vec::new(), root);
+        test_support::assert_success(output);
+        testing::assert_eq(
+            test_support::stdout(output),
+            "true\ntrue\ntrue\ntrue\ntrue\ntrue\ncontext: sentinel\nhéllo\ntrue\ntrue\ntrue\ntyped nil\ntrue\n",
+        );
+    }
+}
+
+#[test]
+fn project_raw_go_strings_preserve_bytes_and_require_explicit_text_conversion() -> () {
+    let root = ffi_project_fixture("ffi_raw_strings");
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\ntype Raw = string\nfunc Invalid() Raw { return string([]byte{255, 0, 97}) }\nfunc Echo(value string) string { return value }\n",
+    );
+    test_support::write_file(
+        path::join(root, "transport/transport.gom"),
+        "package transport; use std::ffi; pub fn pass(value: ffi::String) -> ffi::String { value }",
+    );
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use std::ffi; use std::bytes; use module::transport;\n#[go_type(\"example.com/ffi-demo/shim\", \"Raw\")] extern type Raw;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Invalid\")] extern fn invalid() -> Raw;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Echo\")] extern fn echo(value: ffi::String) -> ffi::String;\nfn id[T](value: T) -> T { value }\nfn main() -> () {\n let value: ffi::String = invalid();\n let captured = || transport::pass(id(value));\n let raw = ffi::string_bytes(echo(captured()));\n println(raw.len() == 3 && raw.values[0] == 255 && raw.values[1] == 0 && raw.values[2] == b'a');\n raw.values[0] = b'z';\n println(ffi::string_bytes(value).values[0] == 255);\n println(match ffi::string_text(value) { Err(error) => error.valid_up_to() == 0, Ok(_) => false });\n let buffer = bytes::Bytes::from_vec(Vec::from_array([b'a', 0, b'b']));\n let convert = ffi::string_from_bytes;\n let copied = convert(buffer);\n buffer.values[0] = b'z';\n println(ffi::string_bytes(echo(copied)).values[0] == b'a');\n println(ffi::string_text(echo(ffi::string_from_text(\"héllo\"))).unwrap_or(\"invalid\"));\n println(ffi::string_bytes(ffi::string_from_text(\"\")).len() == 0);\n}",
+    );
+    for attempt in 0..2 {
+        let output = test_support::project_command("run", "", Vec::new(), root);
+        test_support::assert_success(output);
+        testing::assert_eq(test_support::stdout(output), "true\ntrue\ntrue\ntrue\nhéllo\ntrue\n");
+    }
+    for body in Vec::from_array(
+        [
+            "let value: ffi::String = \"text\";",
+            "let value: string = ffi::string_from_text(\"text\");",
+            "let value: ffi::String = ();",
+            "let value = ffi::String {};",
+            "let value = GoString {};",
+        ],
+    ) {
+        test_support::write_file(
+            path::join(root, "main.gom"),
+            "package main; use std::ffi; fn main() -> () { " + body + " }",
+        );
+        let output = test_support::project_command("check", "", Vec::new(), root);
+        test_support::assert_failure(output);
+    }
+}
+
+#[test]
+fn project_raw_go_runes_validate_unicode_without_replacing_values() -> () {
+    let root = ffi_project_fixture("ffi_raw_runes");
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\ntype Raw = rune\nfunc Echo(value rune) Raw { return value }\n",
+    );
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use std::ffi;\n#[go_type(\"example.com/ffi-demo/shim\", \"Raw\")] extern type Raw;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Echo\")] extern fn echo(value: ffi::Rune) -> Raw;\nfn id[T](value: T) -> T { value }\nfn main() -> () {\n for value in Vec::from_array([-2147483648, -1, 0xd800, 0xdfff, 0x110000, 2147483647]) {\n  let raw: ffi::Rune = echo(id(value));\n  println(raw == value);\n  println(match ffi::rune_char(raw) { Err(ffi::BoundaryError::InvalidRune(original)) => original == value, _ => false });\n }\n for value in Vec::from_array([0, 0xd7ff, 0xe000, 0x10ffff, 0x1f600]) {\n  println(match ffi::rune_char(echo(value)) { Ok(character) => ffi::rune_from_char(character) == value, Err(_) => false });\n }\n let convert = ffi::rune_char;\n println(convert(echo(ffi::rune_from_char('a'))).unwrap_or('z') == 'a');\n println(match convert(-1) { Err(error) => error.to_string(), Ok(_) => \"unexpected\" });\n}",
+    );
+    for attempt in 0..2 {
+        let output = test_support::project_command("run", "", Vec::new(), root);
+        test_support::assert_success(output);
+        testing::assert_eq(
+            test_support::stdout(output),
+            "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\nGo FFI boundary rejected invalid rune -1\n",
+        );
+    }
+}
+
+#[test]
+fn project_raw_go_slices_preserve_headers_and_explicit_alias_policies() -> () {
+    let root = ffi_project_fixture("ffi_raw_slices");
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\ntype Raw = []int64\nfunc Empty() Raw { return make([]int64, 0) }\nfunc Buffer() Raw { return make([]int64, 1, 3) }\nfunc Put(values []int64, value int64) { values[0] = value }\nfunc Append(values []int64, value int64) []int64 { return append(values, value) }\ntype Cell struct { Value int64 }\nfunc Cells() []*Cell { return []*Cell{{Value: 7}} }\nfunc Set(value *Cell, n int64) { value.Value = n }\nfunc Get(value *Cell) int64 { return value.Value }\n",
+    );
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use std::ffi;\n#[go_type(\"example.com/ffi-demo/shim\", \"Raw\")] extern type Raw;\n#[go_type(\"example.com/ffi-demo/shim\", \"Cell\")] extern type Cell;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Empty\")] extern fn empty() -> Raw;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Buffer\")] extern fn buffer() -> Raw;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Put\")] extern fn put(values: ffi::RawSlice[i64], value: i64) -> ();\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Append\")] extern fn append(values: Raw, value: i64) -> Raw;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Cells\")] extern fn cells() -> ffi::RawSlice[ffi::Ptr[Cell]];\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Set\")] extern fn set(value: ffi::Ptr[Cell], n: i64) -> ();\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Get\")] extern fn get(value: ffi::Ptr[Cell]) -> i64;\nfn id[T](value: T) -> T { value }\nfn main() -> () {\n let nil: ffi::RawSlice[i64] = ffi::slice_nil();\n println(ffi::slice_is_nil(nil) && nil.len() == 0 && ffi::slice_capacity(nil) == 0);\n println(!ffi::slice_is_nil(empty()) && empty().len() == 0);\n let original = id(buffer());\n println(original.len() == 1 && ffi::slice_capacity(original) == 3);\n let alias = original;\n put(alias, 9);\n println(original[0] == 9);\n let appended = append(original, 11);\n println(original.len() == 1 && appended.len() == 2 && appended[1] == 11);\n let local_append = |value| ffi::slice_append(value, 12);\n let extended = local_append(appended);\n println(appended.len() == 2 && extended.len() == 3 && extended[2] == 12);\n let reallocated = ffi::slice_append(extended, 13);\n put(reallocated, 77);\n println(extended[0] == 9 && reallocated[0] == 77 && extended.len() == 3 && reallocated.len() == 4);\n println(!ffi::slice_is_nil(ffi::slice_copy(nil)));\n let copied = ffi::slice_copy(original);\n put(copied, 99);\n println(original[0] == 9 && copied[0] == 99);\n let vector = Vec::from_array([1, 2]);\n let shared = ffi::slice_shared(vector);\n put(shared, 8);\n println(vector[0] == 8);\n vector.push(3);\n println(shared.len() == 2 && vector.len() == 3);\n let detached = ffi::slice_from_vec_copy(vector);\n put(detached, 10);\n println(vector[0] == 8);\n let back = ffi::slice_to_vec_copy(shared);\n back[0] = 20;\n println(shared[0] == 8);\n let readonly = ffi::slice_trusted_readonly(ffi::slice_copy(shared));\n println(readonly.len() == 2 && readonly[0] == 8);\n let objects = cells();\n let shallow = ffi::slice_copy(objects);\n set(shallow[0], 42);\n println(get(objects[0]) == 42);\n shallow[0] = ffi::null();\n println(!ffi::is_nil(objects[0]) && ffi::is_nil(shallow[0]));\n let grown = ffi::slice_append(nil, 5);\n println(!ffi::slice_is_nil(grown) && grown.len() == 1 && ffi::slice_is_nil(nil));\n}",
+    );
+    for attempt in 0..2 {
+        let output = test_support::project_command("run", "", Vec::new(), root);
+        test_support::assert_success(output);
+        testing::assert_eq(
+            test_support::stdout(output),
+            "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n",
+        );
+    }
+}
+
+#[test]
+fn project_raw_go_maps_preserve_identity_nil_and_shared_storage() -> () {
+    let root = ffi_project_fixture("ffi_raw_maps");
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\ntype Raw = map[int64]int64\nfunc New() Raw { return make(Raw) }\nfunc Set(value Raw, key int64, item int64) { value[key] = item }\nfunc Get(value Raw, key int64) (int64, bool) { item, ok := value[key]; return item, ok }\nfunc Echo(value Raw) Raw { return value }\nfunc Size(value Raw) int { return len(value) }\n",
+    );
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use std::ffi; use module::transport;\n#[go_type(\"example.com/ffi-demo/shim\", \"Raw\")] extern type Raw;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"New\")] extern fn new_map() -> Raw;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Set\")] extern fn set(value: ffi::RawMap[i64, i64], key: i64, item: i64) -> ();\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Get\")] extern fn get(value: Raw, key: i64) -> (i64, bool);\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Echo\")] extern fn echo(value: Raw) -> Raw;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Size\")] extern fn size(value: Raw) -> isize;\nfn id[T](value: T) -> T { value }\nfn main() -> () {\n let nil: ffi::RawMap[i64, i64] = ffi::map_nil();\n println(ffi::map_is_nil(echo(nil)) && size(nil) == 0);\n let present: Option[ffi::RawMap[i64, i64]] = Option::Some(nil);\n println(match present { Some(value) => ffi::map_is_nil(value), None => false });\n let value: ffi::RawMap[i64, i64] = new_map();\n println(!ffi::map_is_nil(value) && size(value) == 0);\n let alias = transport::pass(id(value));\n let capture = || echo(alias);\n set(capture(), 7, 42);\n println(get(value, 7) == (42, true));\n println(get(value, 9) == (0, false));\n println(size(value) == 1);\n}",
+    );
+    test_support::write_file(
+        path::join(root, "transport/transport.gom"),
+        "package transport; use std::ffi; pub fn pass[K, V](value: ffi::RawMap[K, V]) -> ffi::RawMap[K, V] { value }",
+    );
+    for attempt in 0..2 {
+        let output = test_support::project_command("run", "", Vec::new(), root);
+        test_support::assert_success(output);
+        testing::assert_eq(test_support::stdout(output), "true\ntrue\ntrue\ntrue\ntrue\ntrue\n");
+    }
+    for body in Vec::from_array(
+        [
+            "let value: ffi::RawMap[i64, i64] = HashMap::new();",
+            "let value: HashMap[i64, i64] = ffi::map_nil();",
+            "let value: ffi::RawMap[i64, i64] = ();",
+            "let value = ffi::RawMap {};",
+            "let value = GoMap {};",
+        ],
+    ) {
+        test_support::write_file(
+            path::join(root, "main.gom"),
+            "package main; use std::ffi; fn main() -> () { " + body + " }",
+        );
+        test_support::assert_failure(test_support::project_command("check", "", Vec::new(), root));
+    }
+}
+
+#[test]
+fn project_raw_map_operations_preserve_presence_nil_and_shallow_copy() -> () {
+    let root = ffi_project_fixture("ffi_map_operations");
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\nimport \"math\"\ntype Cell struct { Value int64 }\nfunc CellValue(value *Cell) int64 { return value.Value }\nfunc SetCell(value *Cell, n int64) { value.Value = n }\nfunc CellMap() map[int64]*Cell { return map[int64]*Cell{1: {Value: 7}, 2: nil} }\nfunc NaNs() map[float64]int64 { m := make(map[float64]int64); m[math.NaN()] = 3; m[math.NaN()] = 5; return m }\nfunc Sum(value map[float64]int64) int64 { var total int64; for _, item := range value { total += item }; return total }\nfunc Read(value map[int64]int64, key int64) int64 { return value[key] }\n",
+    );
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use std::ffi;\n#[go_type(\"example.com/ffi-demo/shim\", \"Cell\")] extern type Cell;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"CellValue\")] extern fn cell_value(value: ffi::Ptr[Cell]) -> i64;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"SetCell\")] extern fn set_cell(value: ffi::Ptr[Cell], n: i64) -> ();\n#[go_ffi(\"example.com/ffi-demo/shim\", \"CellMap\")] extern fn cell_map() -> ffi::RawMap[i64, ffi::Ptr[Cell]];\n#[go_ffi(\"example.com/ffi-demo/shim\", \"NaNs\")] extern fn nans() -> ffi::RawMap[f64, i64];\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Sum\")] extern fn sum(value: ffi::RawMap[f64, i64]) -> i64;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Read\")] extern fn read(value: ffi::RawMap[i64, i64], key: i64) -> i64;\nfn main() -> () {\n let nil: ffi::RawMap[i64, i64] = ffi::map_nil();\n println(ffi::map_len(nil) == 0 && ffi::map_get(nil, 1).is_none());\n ffi::map_delete(nil, 1);\n println(ffi::map_is_nil(ffi::map_copy(nil)));\n let value: ffi::RawMap[i64, i64] = ffi::map_new();\n println(!ffi::map_is_nil(value) && ffi::map_len(value) == 0);\n let alias = value;\n let put = |key, item| ffi::map_set(alias, key, item);\n put(1, 7);\n put(2, 0);\n println(ffi::map_get(value, 2) == Option::Some(0) && ffi::map_get(value, 3).is_none());\n put(1, 8);\n println(ffi::map_len(value) == 2 && read(value, 1) == 8);\n let copy_fn = ffi::map_copy;\n let copied = copy_fn(value);\n ffi::map_set(copied, 1, 10);\n ffi::map_delete(copied, 2);\n println(ffi::map_get(value, 1) == Option::Some(8) && ffi::map_len(value) == 2 && ffi::map_len(copied) == 1);\n let objects = cell_map();\n let shallow = ffi::map_copy(objects);\n let Some(pointer) = ffi::map_get(shallow, 1) else { return };\n set_cell(pointer, 42);\n let Some(original) = ffi::map_get(objects, 1) else { return };\n println(cell_value(original) == 42);\n ffi::map_delete(shallow, 1);\n println(ffi::map_get(objects, 1).is_some() && ffi::map_get(shallow, 1).is_none());\n println(match ffi::map_get(objects, 2) { Some(pointer) => ffi::is_nil(pointer), None => false });\n let special = nans();\n let cloned = ffi::map_copy(special);\n println(ffi::map_len(cloned) == 2 && sum(cloned) == 8);\n}",
+    );
+    for attempt in 0..2 {
+        let output = test_support::project_command("run", "", Vec::new(), root);
+        test_support::assert_success(output);
+        testing::assert_eq(
+            test_support::stdout(output),
+            "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n",
+        );
+    }
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use std::ffi; fn main() -> () { let value: ffi::RawMap[i64, i64] = ffi::map_nil(); ffi::map_set(value, 1, 2); }",
+    );
+    let failure = test_support::project_command("run", "", Vec::new(), root);
+    test_support::assert_failure(failure);
+    test_support::assert_contains(test_support::stderr(failure), "assignment to entry in nil map");
+}
+
+#[test]
+fn project_external_map_keys_check_private_fields_and_imported_metadata() -> () {
+    let root = ffi_project_fixture("ffi_external_map_keys");
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\ntype Good struct { hidden int64; Pointer *[]int }\ntype Bad struct { hidden []int }\ntype BadFunction func()\ntype BadArray [0][]int\ntype Anything interface{}\ntype GenericBad[T any] struct { Value T; hidden []int }\n",
+    );
+    test_support::write_file(
+        path::join(root, "types/types.gom"),
+        "package types; #[go_type(\"example.com/ffi-demo/shim\", \"Good\")] pub extern type Good;  #[go_type(\"example.com/ffi-demo/shim\", \"Bad\")] pub extern type Bad;  #[go_type(\"example.com/ffi-demo/shim\", \"BadFunction\")] pub extern type BadFunction;  #[go_type(\"example.com/ffi-demo/shim\", \"BadArray\")] pub extern type BadArray;  #[go_type(\"example.com/ffi-demo/shim\", \"Anything\")] pub extern type Anything;  #[go_type(\"example.com/ffi-demo/shim\", \"GenericBad\")] pub extern type GenericBad[T]; ",
+    );
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use std::ffi; use module::types; fn main() -> () { let a: ffi::RawMap[types::Good, i64] = ffi::map_new(); let b: ffi::RawMap[types::Anything, i64] = ffi::map_new(); let c: ffi::RawMap[ffi::Ptr[types::Bad], i64] = ffi::map_new(); println(ffi::map_len(a) + ffi::map_len(b) + ffi::map_len(c) == 0); }",
+    );
+    for attempt in 0..2 {
+        let output = test_support::project_command("run", "", Vec::new(), root);
+        test_support::assert_success(output);
+        testing::assert_eq(test_support::stdout(output), "true\n");
+    }
+    for key in Vec::from_array(
+        [
+            "types::Bad",
+            "types::BadFunction",
+            "types::BadArray",
+            "types::GenericBad[i64]",
+            "[types::Bad; 0]",
+        ],
+    ) {
+        test_support::write_file(
+            path::join(root, "main.gom"),
+            "package main; use std::ffi; use module::types; fn main() -> () { let value: ffi::RawMap["
+                + key
+                + ", i64] = ffi::map_new(); let _ = ffi::map_len(value); }",
+        );
+        for flags in Vec::from_array([Vec::new(), Vec::from_array(["--ffi-check", "off"])]) {
+            let output = test_support::project_command("check", "", flags, root);
+            test_support::assert_failure(output);
+            test_support::assert_contains(
+                test_support::stderr(output),
+                "Go map key is not comparable",
+            );
+        }
+    }
+}
+
+#[test]
+fn project_generic_external_map_keys_substitute_comparability_requirements() -> () {
+    let root = ffi_project_fixture("ffi_generic_map_keys");
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\ntype Box[T any] struct { Value T }\ntype Nested[T any] struct { Value Box[T] }\ntype Pointer[T any] struct { Value *T }\ntype Reordered[A, B any] = Box[B]\ntype Bad struct { Values []int }\n",
+    );
+    test_support::write_file(
+        path::join(root, "types/types.gom"),
+        "package types; #[go_type(\"example.com/ffi-demo/shim\", \"Box\")] pub extern type Box[T]; #[go_type(\"example.com/ffi-demo/shim\", \"Nested\")] pub extern type Nested[T]; #[go_type(\"example.com/ffi-demo/shim\", \"Pointer\")] pub extern type Pointer[T]; #[go_type(\"example.com/ffi-demo/shim\", \"Reordered\")] pub extern type Reordered[A, B]; #[go_type(\"example.com/ffi-demo/shim\", \"Bad\")] pub extern type Bad;",
+    );
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use std::ffi; use module::types; fn main() -> () { let a: ffi::RawMap[types::Box[i64], i64] = ffi::map_new(); let b: ffi::RawMap[types::Nested[i64], i64] = ffi::map_new(); let c: ffi::RawMap[types::Pointer[ffi::RawSlice[i64]], i64] = ffi::map_new(); let d: ffi::RawMap[types::Reordered[ffi::RawSlice[i64], i64], i64] = ffi::map_new(); println(ffi::map_len(a) + ffi::map_len(b) + ffi::map_len(c) + ffi::map_len(d) == 0); }",
+    );
+    for attempt in 0..2 {
+        let output = test_support::project_command("run", "", Vec::new(), root);
+        test_support::assert_success(output);
+        testing::assert_eq(test_support::stdout(output), "true\n");
+    }
+    for key in Vec::from_array(
+        [
+            "types::Box[ffi::RawSlice[i64]]",
+            "types::Nested[ffi::RawSlice[i64]]",
+            "types::Box[types::Bad]",
+            "types::Reordered[i64, ffi::RawSlice[i64]]",
+            "types::Box[types::Box[ffi::RawSlice[i64]]]",
+        ],
+    ) {
+        test_support::write_file(
+            path::join(root, "main.gom"),
+            "package main; use std::ffi; use module::types; fn main() -> () { let value: ffi::RawMap["
+                + key
+                + ", i64] = ffi::map_new(); let _ = ffi::map_len(value); }",
+        );
+        for flags in Vec::from_array([Vec::new(), Vec::from_array(["--ffi-check", "off"])]) {
+            let output = test_support::project_command("check", "", flags, root);
+            test_support::assert_failure(output);
+            test_support::assert_contains(
+                test_support::stderr(output),
+                "Go map key is not comparable",
+            );
+        }
+    }
+}
+
+#[test]
+fn project_deferred_map_keys_validate_specialized_struct_fields() -> () {
+    let root = ffi_project_fixture("ffi_deferred_map_keys");
+    test_support::write_file(
+        path::join(root, "library/library.gom"),
+        "package library; use std::ffi;\nstruct Key[T] { value: T }\nfn leaf[T](value: T) -> () { let map: ffi::RawMap[Key[T], i64] = ffi::map_new(); let _ = ffi::map_len(map); }\npub fn invoke[T](value: T) -> () { let nested = || leaf(value); nested(); }\n",
+    );
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use std::ffi; use module::library; fn main() -> () { library::invoke(1); let pointer: ffi::Ptr[ffi::RawSlice[i64]] = ffi::null(); library::invoke(pointer); let values: Vec[i64] = Vec::new(); library::invoke(values); println(\"ok\"); }",
+    );
+    for attempt in 0..2 {
+        let output = test_support::project_command("run", "", Vec::new(), root);
+        test_support::assert_success(output);
+        testing::assert_eq(test_support::stdout(output), "ok\n");
+    }
+    for expression in Vec::from_array(["slice", "(1, slice)", "[slice]"]) {
+        test_support::write_file(
+            path::join(root, "main.gom"),
+            "package main; use std::ffi; use module::library; fn main() -> () { let slice: ffi::RawSlice[i64] = ffi::slice_nil(); let _ = slice; library::invoke("
+                + expression
+                + "); }",
+        );
+        let output = test_support::project_command("check", "", Vec::new(), root);
+        test_support::assert_failure(output);
+        test_support::assert_contains(test_support::stderr(output), "Go map key is not comparable");
+    }
+}
+
+#[test]
+fn file_read_example_preserves_partial_results_and_closes_handles() -> () {
+    let root = test_support::workspace("ffi_file_read_example");
+    let source = path::join(test_support::repository_root(), "examples/ffi-file-read");
+    for name in Vec::from_array(["goml.toml", "go.mod", "main.gom", "shim/shim.go", "data.txt"]) {
+        test_support::write_file(
+            path::join(root, name),
+            test_support::read_file(path::join(source, name)),
+        );
+    }
+    for attempt in 0..2 {
+        let output = test_support::project_command("run", "", Vec::new(), root);
+        test_support::assert_success(output);
+        testing::assert_eq(
+            test_support::stdout(output),
+            "read: 3\npartial data: abc\nGo round-trip preserved partial read: true\nread error: unexpected EOF\nexplicit close succeeded: true\noriginal handle is closed: true\n",
+        );
+    }
+    for entry in Vec::from_array(
+        [
+            (
+                "abcdef",
+                "read: 4\npartial data: abcd\nGo round-trip preserved partial read: false\nexplicit close succeeded: true\noriginal handle is closed: true\n",
+            ),
+            (
+                "",
+                "read: 0\npartial data: \nGo round-trip preserved partial read: false\nread error: EOF\nexplicit close succeeded: true\noriginal handle is closed: true\n",
+            ),
+        ],
+    ) {
+        test_support::write_file(path::join(root, "data.txt"), entry.0);
+        let output = test_support::project_command("run", "", Vec::new(), root);
+        test_support::assert_success(output);
+        testing::assert_eq(test_support::stdout(output), entry.1);
+    }
+    testing::assert(
+        fs::write_bytes_structured(
+            path::join(root, "data.txt"),
+            bytes::Bytes::from_vec(Vec::from_array([255, 0, b'a'])),
+        ).is_ok(),
+    );
+    let invalid_text = test_support::project_command("run", "", Vec::new(), root);
+    test_support::assert_success(invalid_text);
+    testing::assert_eq(
+        test_support::stdout(invalid_text),
+        "read: 3\npartial data is not UTF-8\nGo round-trip preserved partial read: true\nread error: unexpected EOF\nexplicit close succeeded: true\noriginal handle is closed: true\n",
+    );
+    testing::assert(fs::remove_file(path::join(root, "data.txt")).is_ok());
+    let missing = test_support::project_command("run", "", Vec::new(), root);
+    test_support::assert_success(missing);
+    test_support::assert_contains(test_support::stdout(missing), "open failed: ");
+    testing::assert(!test_support::stdout(missing).contains("read: "));
+    testing::assert(!test_support::stdout(missing).contains("close succeeded: "));
+}
+
+#[test]
+fn project_raw_go_functions_preserve_nil_signatures_and_captured_state() -> () {
+    let root = ffi_project_fixture("ffi_raw_functions");
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\ntype Callback = func(int64) (int64, error)\nfunc NewCallback() Callback { n := int64(10); return func(x int64) (int64, error) { n += x; return n, nil } }\nfunc EchoCallback(value Callback) Callback { return value }\nfunc Invoke(value Callback, x int64) (int64, error) { return value(x) }\nfunc Unit() func() { return func() {} }\nfunc RunUnit(value func()) bool { value(); return true }\n",
+    );
+    test_support::write_file(
+        path::join(root, "transport/transport.gom"),
+        "package transport; pub fn pass[T](value: T) -> T { value }",
+    );
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use std::ffi; use module::transport; #[go_type(\"example.com/ffi-demo/shim\", \"Callback\")] extern type Callback; #[go_ffi(\"example.com/ffi-demo/shim\", \"NewCallback\")] extern fn new_callback() -> Callback; #[go_ffi(\"example.com/ffi-demo/shim\", \"EchoCallback\")] extern fn echo(value: ffi::Func[(i64) -> (i64, ffi::Error)]) -> Callback; #[go_ffi(\"example.com/ffi-demo/shim\", \"Invoke\")] extern fn invoke(value: Callback, x: i64) -> (i64, ffi::Error); #[go_ffi(\"example.com/ffi-demo/shim\", \"Unit\")] extern fn unit() -> ffi::Func[() -> ()]; #[go_ffi(\"example.com/ffi-demo/shim\", \"RunUnit\")] extern fn run_unit(value: ffi::Func[() -> ()]) -> bool; fn main() -> () { let nil: ffi::Func[(i64) -> (i64, ffi::Error)] = ffi::func_nil(); println(ffi::func_is_nil(echo(nil))); let present: Option[Callback] = Option::Some(nil); println(match present { Some(value) => ffi::func_is_nil(value), None => false }); let original = new_callback(); let capture = || transport::pass(original); println(!ffi::func_is_nil(capture())); let (first, error) = invoke(echo(capture()), 2); println(first == 12 && ffi::error_is_nil(error)); let (second, error) = invoke(original, 3); println(second == 15 && ffi::error_is_nil(error)); let empty: ffi::Func[() -> ()] = ffi::func_nil(); println(ffi::func_is_nil(empty)); println(run_unit(transport::pass(unit()))); }",
+    );
+    for attempt in 0..2 {
+        let output = test_support::project_command("run", "", Vec::new(), root);
+        test_support::assert_success(output);
+        testing::assert_eq(
+            test_support::stdout(output),
+            "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n",
+        );
+    }
+    for body in Vec::from_array(
+        [
+            "let value: ffi::Func[i64] = ffi::func_nil();",
+            "let value: ffi::Func[(i64) -> i64] = |x| x;",
+            "let value: (i64) -> i64 = ffi::func_nil();",
+            "let value = ffi::Func {};",
+            "let value = GoFunc {};",
+            "let value: ffi::Func[(i64) -> i64] = ffi::func_nil(); let _ = value(1);",
+            "let value: ffi::RawMap[ffi::Func[() -> ()], i64] = ffi::map_new();",
+        ],
+    ) {
+        test_support::write_file(
+            path::join(root, "main.gom"),
+            "package main; use std::ffi; fn main() -> () { " + body + " }",
+        );
+        let output = test_support::project_command("check", "", Vec::new(), root);
+        if output.status().success() {
+            testing::fail("accepted invalid raw function use: " + body)
+        }
+    }
+}
+
+#[test]
+fn project_callback_conversions_preserve_captures_results_and_nil() -> () {
+    let root = ffi_project_fixture("ffi_callback_conversions");
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\nimport \"errors\"\nvar sentinel = errors.New(\"callback\")\nfunc Apply(f func(int64) int64, x int64) int64 { return f(x) }\nfunc Return() func(int64) int64 { n := int64(100); return func(x int64) int64 { n += x; return n } }\nfunc Pair(f func(int64) (int64, error), x int64) (int64, error) { return f(x) }\nfunc ReturnPair() func(int64) (int64, error) { return func(x int64) (int64, error) { return x + 5, sentinel } }\nfunc IsSentinel(e error) bool { return e == sentinel }\nfunc Run(f func()) { f() }\nfunc Text(f func(string) string) bool { value := string([]byte{255, 0, 97}); return f(value) == value }\n",
+    );
+    test_support::write_file(
+        path::join(root, "transport/transport.gom"),
+        "package transport; use std::ffi; pub fn wrap[F](value: F) -> ffi::Func[F] { ffi::func_from_closure(value) }",
+    );
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use std::ffi; use module::transport; type Unary = (i64) -> i64; type Pair = (i64) -> (i64, ffi::Error); #[go_ffi(\"example.com/ffi-demo/shim\", \"Apply\")] extern fn apply(f: ffi::Func[Unary], x: i64) -> i64; #[go_ffi(\"example.com/ffi-demo/shim\", \"Return\")] extern fn returned() -> ffi::Func[Unary]; #[go_ffi(\"example.com/ffi-demo/shim\", \"Pair\")] extern fn pair(f: ffi::Func[Pair], x: i64) -> (i64, ffi::Error); #[go_ffi(\"example.com/ffi-demo/shim\", \"ReturnPair\")] extern fn returned_pair() -> ffi::Func[Pair]; #[go_ffi(\"example.com/ffi-demo/shim\", \"IsSentinel\")] extern fn is_sentinel(e: ffi::Error) -> bool; #[go_ffi(\"example.com/ffi-demo/shim\", \"Run\")] extern fn run(f: ffi::Func[() -> ()]) -> (); #[go_ffi(\"example.com/ffi-demo/shim\", \"Text\")] extern fn text(f: ffi::Func[(ffi::String) -> ffi::String]) -> bool; fn main() -> () { let cell: Ref[i64] = Ref::new(10); let inc: Unary = |x| { cell.set(cell.get() + x); cell.get() }; let times: Unary = |x| x * 2; let a = transport::wrap(inc); let b = ffi::func_from_closure(times); println(apply(a, 2) == 12 && apply(b, 3) == 6 && apply(a, 4) == 16); let Some(back) = ffi::func_to_closure(a) else { return }; println(back(1) == 17 && cell.get() == 17); println(apply(ffi::func_from_closure(back), 3) == 20); let Some(native) = ffi::func_to_closure(returned()) else { return }; println(native(1) == 101 && native(2) == 103); let nil: ffi::Func[Unary] = ffi::func_nil(); println(ffi::func_to_closure(nil).is_none()); let action: () -> () = || cell.set(42); let raw_action = ffi::func_from_closure(action); run(raw_action); let Some(restored_action) = ffi::func_to_closure(raw_action) else { return }; cell.set(0); restored_action(); println(cell.get() == 42); let make_pair: Pair = |x| (x + 1, ffi::nil_error()); let (n, e) = pair(ffi::func_from_closure(make_pair), 3); println(n == 4 && ffi::error_is_nil(e)); let Some(raw_pair) = ffi::func_to_closure(returned_pair()) else { return }; let (n, e) = raw_pair(5); println(n == 10 && is_sentinel(e)); let (n, e) = pair(ffi::func_from_closure(raw_pair), 7); println(n == 12 && is_sentinel(e)); let echo: (ffi::String) -> ffi::String = |value| value; println(text(ffi::func_from_closure(echo))); }",
+    );
+    for attempt in 0..2 {
+        let output = test_support::project_command("run", "", Vec::new(), root);
+        test_support::assert_success(output);
+        testing::assert_eq(
+            test_support::stdout(output),
+            "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n",
+        );
+    }
+    for body in Vec::from_array(
+        [
+            "let f: (string) -> string = |value| value; let _ = ffi::func_from_closure(f);",
+            "let raw: ffi::Func[(char) -> char] = ffi::func_nil(); let _ = ffi::func_to_closure(raw);",
+        ],
+    ) {
+        test_support::write_file(
+            path::join(root, "main.gom"),
+            "package main; use std::ffi; fn main() -> () { " + body + " }",
+        );
+        let output = test_support::project_command("build", "", Vec::new(), root);
+        test_support::assert_failure(output);
+        test_support::assert_contains(
+            test_support::stderr(output),
+            "Go callback conversions require ffi::String and ffi::Rune",
+        );
+    }
+}
+
+#[test]
+fn callback_example_retains_unregisters_and_reenters_without_races() -> () {
+    let root = test_support::workspace("ffi_callback_lifetime_example");
+    let source = path::join(test_support::repository_root(), "examples/ffi-callbacks");
+    for name in Vec::from_array(["goml.toml", "go.mod", "main.gom", "shim/shim.go"]) {
+        test_support::write_file(
+            path::join(root, name),
+            test_support::read_file(path::join(source, name)),
+        );
+    }
+    let expected = "deferred until release: true\nconcurrent retained callbacks: true\nunregistered callbacks stopped: true\nrecursive reentry: true\ncallback can unregister itself: true\nregistration stress balanced: true\n";
+    let generated = path::join(root, "_artifact/build/pkg/ffi_callbacks/goml_generated.go");
+    let mut previous = "";
+    for attempt in 0..2 {
+        let output = test_support::project_command("run", "", Vec::new(), root);
+        test_support::assert_success(output);
+        testing::assert_eq(test_support::stdout(output), expected);
+        let current = test_support::read_file(generated);
+        if attempt == 0 {
+            previous = current;
+        } else {
+            testing::assert_eq(current, previous);
+        }
+    }
+    match process::Command::new("go").args(Vec::from_array(["run", "-race", generated])).current_dir(
+        root,
+    ).env("CGO_ENABLED", "1").env("GOWORK", "off").env("GOTOOLCHAIN", "local").env("GOPROXY", "off").env(
+        "GOSUMDB",
+        "off",
+    ).output_structured() {
+        Ok(output) => {
+            test_support::assert_success(output);
+            testing::assert_eq(test_support::stdout(output), expected);
+            testing::assert(!test_support::stderr(output).contains("DATA RACE"));
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn callback_panics_preserve_identity_unwind_and_survive_pruning() -> () {
+    let root = ffi_project_fixture("ffi_callback_panics");
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\n\nimport \"runtime\"\n\ntype token struct{}\nfunc (*token) Error() string { return \"original-callback-panic\" }\nvar original = &token{}\nvar unwound int64\nfunc Raise() {\n    defer func() { unwound++ }()\n    panic(original)\n}\nfunc Returned() func() { return Raise }\nfunc Catch(callback func()) (same bool) {\n    defer func() { same = recover() == original }()\n    callback()\n    return false\n}\nfunc CatchPair(callback func() (int64, error)) (same bool) {\n    defer func() { same = recover() == original }()\n    callback()\n    return false\n}\nfunc CatchRuntime(callback func()) (same bool) {\n    defer func() { _, same = recover().(runtime.Error) }()\n    callback()\n    return false\n}\nfunc Unwound() int64 { return unwound }\nfunc Invoke(callback func()) { callback() }\nfunc Async(callback func()) {\n    done := make(chan struct{})\n    go func() { callback(); close(done) }()\n    <-done\n}\n",
+    );
+    test_support::write_file(
+        path::join(root, "transport/transport.gom"),
+        "package transport;\nuse std::ffi;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Raise\")]\nextern fn raise() -> ();\nfn captured(cell: Ref[i64]) -> () {\n    cell.set(cell.get() + 1);\n    raise()\n}\npub fn retained(cell: Ref[i64]) -> ffi::Func[() -> ()] {\n    ffi::func_from_closure(|| captured(cell))\n}\nfn unused() -> () { println(\"callback-dead-helper-must-disappear\") }\n",
+    );
+    let declarations = "package main;\nuse std::ffi;\nuse module::transport;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Raise\")] extern fn raise() -> ();\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Returned\")] extern fn returned() -> ffi::Func[() -> ()];\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Catch\")] extern fn catch(callback: ffi::Func[() -> ()]) -> bool;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"CatchPair\")] extern fn catch_pair(callback: ffi::Func[() -> (i64, ffi::Error)]) -> bool;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"CatchRuntime\")] extern fn catch_runtime(callback: ffi::Func[() -> ()]) -> bool;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Unwound\")] extern fn unwound() -> i64;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Invoke\")] extern fn invoke(callback: ffi::Func[() -> ()]) -> ();\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Async\")] extern fn async_invoke(callback: ffi::Func[() -> ()]) -> ();\n";
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        declarations
+            + "fn main() -> () {\n    let cell: Ref[i64] = Ref::new(0);\n    println(catch(transport::retained(cell)) && cell.get() == 1);\n    let Some(native) = ffi::func_to_closure(returned()) else { return };\n    let roundtrip: () -> () = || { cell.set(cell.get() + 1); native() };\n    println(catch(ffi::func_from_closure(roundtrip)) && cell.get() == 2);\n    let pair: () -> (i64, ffi::Error) = || { raise(); (123, ffi::nil_error()) };\n    println(catch_pair(ffi::func_from_closure(pair)));\n    let bad_map: ffi::RawMap[i64, i64] = ffi::map_nil();\n    println(catch_runtime(ffi::func_from_closure(|| ffi::map_set(bad_map, 1, 2))));\n    println(unwound() == 3);\n}\n",
+    );
+    let mut previous = "";
+    for attempt in 0..2 {
+        let output = test_support::project_command("run", "", Vec::new(), root);
+        test_support::assert_success(output);
+        testing::assert_eq(test_support::stdout(output), "true\ntrue\ntrue\ntrue\ntrue\n");
+        let generated = test_support::read_file(
+            path::join(root, "_artifact/build/pkg/ffi_demo/goml_generated.go"),
+        );
+        testing::assert(!generated.contains("callback-dead-helper-must-disappear"));
+        if attempt == 0 {
+            previous = generated;
+        } else {
+            testing::assert_eq(generated, previous);
+        }
+    }
+    for call in Vec::from_array(["invoke", "async_invoke"]) {
+        test_support::write_file(
+            path::join(root, "main.gom"),
+            declarations + "fn main() -> () { " + call
+                + "(transport::retained(Ref::new(0))); println(\"unexpected-normal-return\") }",
+        );
+        let output = test_support::project_command("run", "", Vec::new(), root);
+        test_support::assert_failure(output);
+        test_support::assert_contains(
+            test_support::stderr(output),
+            "panic: original-callback-panic",
+        );
+        testing::assert(!test_support::stdout(output).contains("unexpected-normal-return"));
+    }
+}
+
+#[test]
+fn project_generated_callback_origins_match_go_declarations_and_sources() -> () {
+    let root = ffi_project_fixture("ffi_generated_origins");
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main;\nuse std::ffi;\nuse module::mapper;\nuse module::methods;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Apply\")]\nextern fn apply(f: ffi::Func[(i64) -> i64], n: i64) -> i64;\nfn first(n: i64) -> ffi::Func[(i64) -> i64] {\n    ffi::func_from_closure(|x| x + n)\n}\nfn second(n: i64) -> ffi::Func[(i64) -> i64] {\n    ffi::func_from_closure(|x| x * n)\n}\nfn dead() -> () { println(\"unreachable-origin\") }\npub fn main() -> () {\n    let _ = echo_text(\"ok\");\n    let _ = echo_raw(ffi::string_from_text(\"ok\"));\n    let _ = counter_value(new_counter());\n    println(methods::total(3));\n    println(apply(first(3), 4));\n    println(apply(second(3), 4));\n    println(apply(mapper::callback(5, |base, n| base + n), 4));\n}\n\npub fn calculate(n: i64) -> i64 { apply(first(n), 4) + apply(second(n), 4) + apply(mapper::callback(n, |a, b| a + b), 4) + methods::total(n) + counter_value(new_counter()) }\n\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Apply\")] extern fn unused_apply(f: ffi::Func[(i64) -> i64], n: i64) -> i64;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Echo\")] extern fn echo_text(value: string) -> string;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Echo\")] extern fn echo_raw(value: ffi::String) -> ffi::String;\n#[go_type(\"example.com/ffi-demo/shim\", \"Counter\")] extern type Counter;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"NewCounter\")] extern fn new_counter() -> ffi::Ptr[Counter];\n#[go_method(\"Value\")] extern fn counter_value(counter: ffi::Ptr[Counter]) -> i64;\n#[go_method(\"Value\")] extern fn unused_counter_value(counter: ffi::Ptr[Counter]) -> i64;\n",
+    );
+    test_support::write_file(
+        path::join(root, "mapper/mapper.gom"),
+        "package mapper;\nuse std::ffi;\npub fn callback[T](value: T, f: (T, i64) -> i64) -> ffi::Func[(i64) -> i64] {\n    ffi::func_from_closure(|n| { let inner: () -> i64 = || f(value, n); inner() })\n}\n",
+    );
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\nfunc Apply(f func(int64) int64, n int64) int64 { return f(n) }\nfunc Echo(value string) string { return value }\ntype Counter struct{}\nfunc NewCounter() *Counter { return &Counter{} }\nfunc (*Counter) Value() int64 { return 0 }\n",
+    );
+    test_support::write_file(
+        path::join(root, "inspect/main.go"),
+        "package main\nimport (\n \"encoding/json\"\n \"fmt\"\n \"go/ast\"\n \"go/parser\"\n \"go/token\"\n \"os\"\n \"path/filepath\"\n \"strconv\"\n \"strings\"\n \"unicode/utf8\"\n)\ntype entry struct {\n Generated string `json:\"generated_symbol\"`\n Source string `json:\"source_symbol\"`\n Package string `json:\"source_package\"`\n File string `json:\"source_file\"`\n Start int `json:\"start\"`\n End int `json:\"end\"`\n Line int `json:\"line\"`\n Column int `json:\"column\"`\n}\nfunc main() {\n file, err := parser.ParseFile(token.NewFileSet(), os.Args[1], nil, 0)\n if err != nil { panic(err) }\n names := map[string]bool{}\n var encoded string\n for _, decl := range file.Decls {\n  if fn, ok := decl.(*ast.FuncDecl); ok {\n   name := fn.Name.Name\n   if fn.Recv != nil { name = fn.Recv.List[0].Type.(*ast.Ident).Name + \".\" + name }\n   names[name] = true\n  }\n  if group, ok := decl.(*ast.GenDecl); ok && group.Tok == token.CONST {\n   for _, spec := range group.Specs {\n    value := spec.(*ast.ValueSpec)\n    if value.Names[0].Name == \"_goml_source_origins\" {\n     encoded, err = strconv.Unquote(value.Values[0].(*ast.BasicLit).Value)\n     if err != nil { panic(err) }\n    }\n   }\n  }\n }\n var metadata struct { Version int `json:\"version\"`; Scope string `json:\"scope\"`; Entries []entry `json:\"entries\"` }\n if err := json.Unmarshal([]byte(encoded), &metadata); err != nil { panic(err) }\n if metadata.Version != 1 || metadata.Scope != \"enclosing-declaration\" || len(metadata.Entries) == 0 { panic(\"missing origin records\") }\n groups := map[string]map[string]bool{}\n generic := 0\n previous := \"\"\n for _, value := range metadata.Entries {\n  if !names[value.Generated] { panic(\"missing generated declaration: \" + value.Generated) }\n  key := value.Generated + \"\\x00\" + value.Source\n  if previous != \"\" && key <= previous { panic(\"unordered or duplicate origin\") }\n  previous = key\n  if value.Source == \"ffi_demo::unused_apply\" || value.Source == \"ffi_demo::unused_counter_value\" { panic(\"unused foreign binding origin retained\") }\n  if value.Source == \"ffi_demo::dead\" { panic(\"dead origin retained\") }\n  if filepath.Base(value.File) != value.File { panic(\"nonrelative source path\") }\n  relative := strings.TrimPrefix(value.Package, \"ffi_demo\")\n  if relative != \"\" && !strings.HasPrefix(relative, \"::\") { panic(\"unexpected source package\") }\n  sourceFile := filepath.Join(strings.ReplaceAll(strings.TrimPrefix(relative, \"::\"), \"::\", \"/\"), value.File)\n  source, err := os.ReadFile(sourceFile)\n  if err != nil { panic(err) }\n  sourceName := value.Source[strings.LastIndex(value.Source, \"::\")+2:]\n  if strings.HasPrefix(value.Source, \"inherent#\") || strings.HasPrefix(value.Source, \"trait_impl#\") { sourceName = value.Source[strings.LastIndex(value.Source, \"#\")+1:] }\n  if value.Start < 0 || value.End > len(source) || value.End <= value.Start || string(source[value.Start:value.End]) != sourceName { panic(\"incorrect byte range\") }\n  prefix := string(source[:value.Start])\n  line := strings.Count(prefix, \"\\n\") + 1\n  column := utf8.RuneCountInString(prefix[strings.LastIndex(prefix, \"\\n\")+1:]) + 1\n  if line != value.Line || column != value.Column { panic(\"incorrect source position\") }\n  if groups[value.Generated] == nil { groups[value.Generated] = map[string]bool{} }\n  groups[value.Generated][value.Source] = true\n  if value.Source == \"ffi_demo::mapper::callback\" && strings.Contains(value.Generated, \"apply\") { generic++ }\n }\n methodSources := map[string]bool{}\n for _, value := range metadata.Entries {\n  if strings.Contains(strings.ToLower(value.Generated), \"apply\") && strings.HasSuffix(value.Source, \"#make\") && value.Package == \"ffi_demo::methods\" { methodSources[value.Source] = true }\n }\n if len(methodSources) != 3 { panic(fmt.Sprintf(\"expected three distinct method origins, got %v\", methodSources)) }\n firstCapture := false\n secondCapture := false\n for _, value := range metadata.Entries {\n  if strings.Contains(strings.ToLower(value.Generated), \"apply\") && value.Source == \"ffi_demo::first\" { firstCapture = true }\n  if strings.Contains(strings.ToLower(value.Generated), \"apply\") && value.Source == \"ffi_demo::second\" { secondCapture = true }\n }\n if !firstCapture || !secondCapture { panic(\"missing captured closure origins\") }\n shared := false\n testCallback := false\n externalCallback := false\n for generated, sources := range groups {\n  if strings.HasSuffix(generated, \".Apply\") && sources[\"ffi_demo::tests::external_callback\"] { externalCallback = true }\n  if strings.HasSuffix(generated, \".Apply\") && sources[\"ffi_demo::mapped_callback\"] { testCallback = true }\n  if strings.HasSuffix(generated, \".Apply\") && len(sources) >= 2 { shared = true }\n }\n if generic < 2 || !shared { panic(fmt.Sprintf(\"missing generic/shared origins: %v %v\", generic, shared)) }\n if os.Args[2] == \"tests\" && !testCallback { panic(\"missing test callback origin\") }\n if os.Args[2] == \"external\" && !externalCallback { panic(\"missing external callback origin\") }\n if os.Args[2] == \"library\" && !groups[\"Calculate\"][\"ffi_demo::lib::run\"] { panic(\"missing export wrapper origin\") }\n sharedBinding := false\n receiverBinding := false\n textBinding := \"\"\n rawBinding := \"\"\n for generated, sources := range groups {\n  if sources[\"ffi_demo::apply\"] && sources[\"ffi_demo::methods::invoke\"] { sharedBinding = true }\n  if sources[\"ffi_demo::counter_value\"] { receiverBinding = true }\n  if sources[\"ffi_demo::echo_text\"] { textBinding = generated }\n  if sources[\"ffi_demo::echo_raw\"] { rawBinding = generated }\n }\n if !sharedBinding || !receiverBinding { panic(\"missing direct foreign binding origins\") }\n if os.Args[2] != \"library\" && (textBinding == \"\" || rawBinding == \"\" || textBinding == rawBinding) { panic(\"foreign signatures were conflated\") }\n fmt.Println(\"origins verified\")\n}\n",
+    );
+    test_support::write_file(
+        path::join(root, "main_test.gom"),
+        "package main;\nuse std::ffi;\n#[test]\nfn mapped_callback() -> () { main(); let n: i64 = 6; println(apply(ffi::func_from_closure(|x| x + n), 1)) }\n",
+    );
+    test_support::write_file(
+        path::join(root, "tests/tests.gom"),
+        "package tests;\nuse std::ffi;\nuse ffi_demo as app;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Apply\")] extern fn apply(f: ffi::Func[(i64) -> i64], n: i64) -> i64;\n#[test]\nfn external_callback() -> () { app::main(); let n: i64 = 8; println(apply(ffi::func_from_closure(|x| x + n), 1)) }\n",
+    );
+    test_support::write_file(
+        path::join(root, "methods/methods.gom"),
+        "package methods;\nuse std::ffi;\npub type Unary = (i64) -> i64;\n#[go_ffi(\"example.com/ffi-demo/shim\", \"Apply\")] extern fn invoke(f: ffi::Func[Unary], n: i64) -> i64;\npub struct Holder[T] { pub value: T }\nimpl[T] Holder[T] {\n    pub fn make(self: Holder[T], f: (T, i64) -> i64) -> ffi::Func[Unary] {\n        ffi::func_from_closure(|n| f(self.value, n))\n    }\n}\npub trait Make { fn make(self: Self) -> ffi::Func[Unary]; }\nimpl Make for Holder[i64] {\n    fn make(self: Holder[i64]) -> ffi::Func[Unary] { ffi::func_from_closure(|n| self.value + n + 10) }\n}\nstruct Other { value: i64 }\nimpl Other {\n    fn make(self: Other) -> ffi::Func[Unary] { ffi::func_from_closure(|n| self.value + n + 20) }\n}\nfn via_trait[T: Make](value: T) -> ffi::Func[Unary] { value.make() }\npub fn total(n: i64) -> i64 {\n    let combine: (i64, i64) -> i64 = |base, x| base + x;\n    invoke(Holder { value: n }.make(combine), 1)\n        + invoke(via_trait(Holder { value: n }), 1)\n        + invoke(Other { value: n }.make(), 1)\n}\n",
+    );
+    let generated = path::join(root, "_artifact/build/pkg/ffi_demo/goml_generated.go");
+    let mut previous = "";
+    for attempt in 0..2 {
+        let output = test_support::project_command("run", "", Vec::new(), root);
+        test_support::assert_success(output);
+        testing::assert_eq(test_support::stdout(output), "42\n7\n12\n9\n");
+        let current = test_support::read_file(generated);
+        testing::assert(!current.contains(root));
+        if attempt == 0 {
+            previous = current;
+        } else {
+            testing::assert_eq(current, previous);
+        }
+    }
+    let test_generated = path::join(root, "_artifact/test/internal/goml_generated.go");
+    let external_generated = path::join(root, "_artifact/test/external/goml_generated.go");
+    let mut previous_external = "";
+    let mut previous_test = "";
+    for attempt in 0..2 {
+        let output = test_support::project_command("test", "", Vec::new(), root);
+        test_support::assert_success(output);
+        test_support::assert_contains(test_support::stdout(output), "mapped_callback ... ok");
+        test_support::assert_contains(test_support::stdout(output), "external_callback ... ok");
+        let external = test_support::read_file(external_generated);
+        if attempt == 0 {
+            previous_external = external;
+        } else {
+            testing::assert_eq(external, previous_external);
+        }
+        let current = test_support::read_file(test_generated);
+        testing::assert(!current.contains(root));
+        if attempt == 0 {
+            previous_test = current;
+        } else {
+            testing::assert_eq(current, previous_test);
+        }
+    }
+    test_support::write_file(
+        path::join(root, "lib/lib.gom"),
+        "package lib;\nuse ffi_demo as app;\n#[go_export(\"Calculate\")]\npub fn run(n: i64) -> i64 { app::calculate(n) }\n",
+    );
+    let library_generated = path::join(root, "gen/goml_generated.go");
+    let mut previous_library = "";
+    for attempt in 0..2 {
+        let output = test_support::project_command(
+            "export-go",
+            "",
+            Vec::from_array(
+                ["./lib", "--import-path", "example.com/ffi-demo/gen", "--out", "./gen"],
+            ),
+            root,
+        );
+        test_support::assert_success(output);
+        let current = test_support::read_file(library_generated);
+        testing::assert(!current.contains(root));
+        if attempt == 0 {
+            previous_library = current;
+        } else {
+            testing::assert_eq(current, previous_library);
+        }
+    }
+    test_support::write_file(
+        path::join(root, "host/main.go"),
+        "package main\nimport (\"fmt\"; gen \"example.com/ffi-demo/gen\")\nfunc main() { fmt.Println(gen.Calculate(3)) }\n",
+    );
+    match process::Command::new("go").args(Vec::from_array(["run", "./host"])).current_dir(root).env(
+        "GOWORK",
+        "off",
+    ).env("GOTOOLCHAIN", "local").env("GOPROXY", "off").env("GOSUMDB", "off").output_structured() {
+        Ok(output) => {
+            test_support::assert_success(output);
+            testing::assert_eq(test_support::stdout(output), "68\n");
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+    for file in Vec::from_array(
+        [
+            (generated, "program"),
+            (test_generated, "tests"),
+            (external_generated, "external"),
+            (library_generated, "library"),
+        ],
+    ) {
+        match process::Command::new("go").args(
+            Vec::from_array(["run", "./inspect", file.0, file.1]),
+        ).current_dir(root).env("GOWORK", "off").env("GOTOOLCHAIN", "local").env("GOPROXY", "off").env(
+            "GOSUMDB",
+            "off",
+        ).output_structured() {
+            Ok(output) => {
+                test_support::assert_success(output);
+                testing::assert_eq(test_support::stdout(output), "origins verified\n");
+            },
+            Err(error) => testing::fail(error.to_string()),
+        }
+    }
+}
+
+#[test]
+fn deferred_external_map_keys_validate_metadata_after_specialization() -> () {
+    let root = ffi_project_fixture("ffi_deferred_external_keys");
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\ntype Box[T any] struct { Value T }\ntype Pointer[T any] struct { Value *T }\ntype Reordered[A, B any] = Box[B]\ntype Bad struct { hidden []int }\n",
+    );
+    test_support::write_file(
+        path::join(root, "types/types.gom"),
+        "package types; #[go_type(\"example.com/ffi-demo/shim\", \"Box\")] pub extern type Box[T]; #[go_type(\"example.com/ffi-demo/shim\", \"Pointer\")] pub extern type Pointer[T]; #[go_type(\"example.com/ffi-demo/shim\", \"Reordered\")] pub extern type Reordered[A, B]; #[go_type(\"example.com/ffi-demo/shim\", \"Bad\")] pub extern type Bad;",
+    );
+    test_support::write_file(
+        path::join(root, "library/library.gom"),
+        "package library; use std::ffi; struct Key[T] { value: T } fn leaf[T](value: ffi::Ptr[T]) -> isize { let map: ffi::RawMap[Key[T], i64] = ffi::map_new(); ffi::map_len(map) } pub fn invoke[T](value: ffi::Ptr[T]) -> isize { let nested = || leaf(value); nested() }",
+    );
+    for key in Vec::from_array(
+        [
+            "types::Box[i64]",
+            "types::Pointer[types::Bad]",
+            "types::Reordered[ffi::RawSlice[i64], i64]",
+        ],
+    ) {
+        test_support::write_file(
+            path::join(root, "main.gom"),
+            "package main; use std::ffi; use module::types; use module::library; fn main() -> () { let value: ffi::Ptr["
+                + key
+                + "] = ffi::null(); println(library::invoke(value)); }",
+        );
+        for attempt in 0..2 {
+            let output = test_support::project_command("run", "", Vec::new(), root);
+            test_support::assert_success(output);
+            testing::assert_eq(test_support::stdout(output), "0\n");
+        }
+    }
+    for key in Vec::from_array(
+        [
+            "types::Bad",
+            "types::Box[ffi::RawSlice[i64]]",
+            "types::Box[types::Bad]",
+            "types::Box[types::Box[ffi::RawSlice[i64]]]",
+            "types::Reordered[i64, ffi::RawSlice[i64]]",
+        ],
+    ) {
+        test_support::write_file(
+            path::join(root, "main.gom"),
+            "package main; use std::ffi; use module::types; use module::library; fn main() -> () { let value: ffi::Ptr["
+                + key
+                + "] = ffi::null(); println(library::invoke(value)); }",
+        );
+        for flags in Vec::from_array([Vec::new(), Vec::from_array(["--ffi-check", "off"])]) {
+            let output = test_support::project_command("check", "", flags, root);
+            test_support::assert_failure(output);
+            test_support::assert_contains(
+                test_support::stderr(output),
+                "Go map key is not comparable",
+            );
+            testing::assert(!test_support::stderr(output).contains("invalid map key type"));
+        }
+    }
+}
+
+#[test]
+fn generic_map_requirements_cross_files_function_values_and_cached_packages() -> () {
+    let root = ffi_project_fixture("ffi_map_requirement_propagation");
+    test_support::write_file(
+        path::join(root, "library/a.gom"),
+        "package library; pub fn invoke[T](value: T) -> isize { let call = leaf; let nested = || call(value); nested() }",
+    );
+    test_support::write_file(
+        path::join(root, "library/z.gom"),
+        "package library; use std::ffi; struct Key[T] { value: T } fn leaf[T](value: T) -> isize { let map: ffi::RawMap[Key[T], i64] = ffi::map_new(); ffi::map_len(map) }",
+    );
+    test_support::write_file(
+        path::join(root, "bridge/bridge.gom"),
+        "package bridge; use module::library; pub fn relay[T](value: T) -> isize { library::invoke(value) }",
+    );
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use std::ffi; use module::bridge; fn main() -> () { let pointer: ffi::Ptr[ffi::RawSlice[i64]] = ffi::null(); println(bridge::relay(1) + bridge::relay(pointer)); }",
+    );
+    for attempt in 0..2 {
+        test_support::assert_success(test_support::project_command("check", "", Vec::new(), root));
+        let output = test_support::project_command("run", "", Vec::new(), root);
+        test_support::assert_success(output);
+        testing::assert_eq(test_support::stdout(output), "0\n");
+    }
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use std::ffi; use module::bridge; fn main() -> () { let key: ffi::RawSlice[i64] = ffi::slice_nil(); println(bridge::relay(key)); }",
+    );
+    for attempt in 0..2 {
+        let output = test_support::project_command("check", "", Vec::new(), root);
+        test_support::assert_failure(output);
+        test_support::assert_contains(test_support::stderr(output), "Go map key is not comparable");
+    }
+}
+
+#[test]
+fn project_opaque_map_keys_preserve_private_field_requirements() -> () {
+    let root = ffi_project_fixture("ffi_opaque_map_key_requirements");
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use std::ffi; use module::library; fn main() -> () { let value: ffi::RawMap[library::Key, i64] = ffi::map_new(); ffi::map_set(value, library::make(), 1); println(ffi::map_len(value)); }",
+    );
+    for valid in Vec::from_array([true, false, true]) {
+        test_support::write_file(
+            path::join(root, "library/library.gom"),
+            "package library; use std::ffi; "
+                + if valid {
+                    "pub struct Key { storage: ffi::Ptr[ffi::RawSlice[i64]] } pub fn make() -> Key { Key { storage: ffi::null() } }"
+                } else {
+                    "pub struct Key { storage: ffi::RawSlice[i64] } pub fn make() -> Key { Key { storage: ffi::slice_nil() } }"
+                },
+        );
+        for attempt in 0..2 {
+            let output = test_support::project_command("check", "", Vec::new(), root);
+            if valid {
+                test_support::assert_success(output);
+                let execution = test_support::project_command("run", "", Vec::new(), root);
+                test_support::assert_success(execution);
+                testing::assert_eq(test_support::stdout(execution), "1\n");
+            } else {
+                test_support::assert_failure(output);
+                test_support::assert_contains(
+                    test_support::stderr(output),
+                    "Go map key is not comparable",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn project_nominal_map_storage_requires_valid_type_arguments() -> () {
+    let root = ffi_project_fixture("ffi_nominal_map_storage_requirements");
+    for declaration in Vec::from_array(
+        [
+            "pub struct Table[T] { storage: ffi::RawMap[T, i64] }",
+            "type Storage[T] = ffi::RawMap[T, i64]; pub struct Table[T] { storage: Storage[T] }",
+            "pub enum Table[T] { Entry(ffi::RawMap[T, i64]) }",
+            "pub enum Table[T] { Next(ffi::Ptr[Cell[T]]), Entry(ffi::RawMap[T, i64]) } pub struct Cell[T] { table: ffi::Ptr[Table[T]] }",
+        ],
+    ) {
+        test_support::write_file(
+            path::join(root, "library/library.gom"),
+            "package library; use std::ffi; " + declaration
+                + " pub fn accept[T](value: Option[Table[T]]) -> () {}",
+        );
+        for valid in Vec::from_array([true, false, true]) {
+            test_support::write_file(
+                path::join(root, "main.gom"),
+                "package main; use std::ffi; use module::library; fn main() -> () { let value: Option[library::Table["
+                    + if valid {
+                        "ffi::Ptr[ffi::RawSlice[i64]]"
+                    } else {
+                        "ffi::RawSlice[i64]"
+                    }
+                    + "]] = Option::None; library::accept(value); }",
+            );
+            for attempt in 0..2 {
+                let output = test_support::project_command("check", "", Vec::new(), root);
+                if valid {
+                    test_support::assert_success(output);
+                    test_support::assert_success(
+                        test_support::project_command("build", "", Vec::new(), root),
+                    );
+                } else {
+                    test_support::assert_failure(output);
+                    test_support::assert_contains(
+                        test_support::stderr(output),
+                        "Go map key is not comparable",
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn project_default_method_map_requirements_preserve_explicit_overrides() -> () {
+    let root = ffi_project_fixture("ffi_default_method_map_requirements");
+    for entry in Vec::from_array(
+        [
+            (true, true, false, true, "0\n"),
+            (true, false, true, true, "42\n"),
+            (true, false, false, false, ""),
+            (false, false, false, true, "0\n"),
+            (true, false, false, false, ""),
+        ],
+    ) {
+        test_support::write_file(
+            path::join(root, "behavior/behavior.gom"),
+            "package behavior; use std::ffi; pub trait Size { fn size(self: Self) -> isize { "
+                + if entry.0 {
+                    "let map: ffi::RawMap[Self, i64] = ffi::map_new(); ffi::map_len(map)"
+                } else {
+                    "0"
+                }
+                + " } }",
+        );
+        test_support::write_file(
+            path::join(root, "main.gom"),
+            "package main; use std::ffi; use module::behavior; use behavior::Size; struct Key { value: "
+                + if entry.1 {
+                    "ffi::Ptr[ffi::RawSlice[i64]]"
+                } else {
+                    "ffi::RawSlice[i64]"
+                }
+                + " } impl Size for Key { "
+                + if entry.2 {
+                    "fn size(self: Key) -> isize { 42 }"
+                } else {
+                    ""
+                }
+                + " } fn main() -> () { println(Key { value: "
+                + if entry.1 {
+                    "ffi::null()"
+                } else {
+                    "ffi::slice_nil()"
+                }
+                + " }.size()); }",
+        );
+        for attempt in 0..2 {
+            let output = test_support::project_command("check", "", Vec::new(), root);
+            if entry.3 {
+                test_support::assert_success(output);
+                let execution = test_support::project_command("run", "", Vec::new(), root);
+                test_support::assert_success(execution);
+                testing::assert_eq(test_support::stdout(execution), entry.4);
+            } else {
+                test_support::assert_failure(output);
+                test_support::assert_contains(
+                    test_support::stderr(output),
+                    "Go map key is not comparable",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn project_default_method_map_requirements_substitute_associated_types() -> () {
+    let root = ffi_project_fixture("ffi_default_associated_map_requirements");
+    test_support::write_file(
+        path::join(root, "behavior/behavior.gom"),
+        "package behavior; use std::ffi; pub trait Size { type Item; fn size(self: Self) -> isize { let map: ffi::RawMap[Self::Item, i64] = ffi::map_new(); ffi::map_len(map) } }",
+    );
+    for entry in Vec::from_array(
+        [
+            ("i64", false, true, "0\n"),
+            ("ffi::RawSlice[i64]", false, false, ""),
+            ("ffi::RawSlice[i64]", true, true, "42\n"),
+            ("ffi::Ptr[ffi::RawSlice[i64]]", false, true, "0\n"),
+        ],
+    ) {
+        test_support::write_file(
+            path::join(root, "main.gom"),
+            "package main; use std::ffi; use module::behavior; use behavior::Size; struct Key {} impl behavior::Size for Key { type Item = "
+                + entry.0
+                + "; "
+                + if entry.1 {
+                    "fn size(self: Key) -> isize { 42 }"
+                } else {
+                    ""
+                }
+                + " } fn main() -> () { println(Key {}.size()); }",
+        );
+        for attempt in 0..2 {
+            let output = test_support::project_command("check", "", Vec::new(), root);
+            if entry.2 {
+                test_support::assert_success(output);
+                let execution = test_support::project_command("run", "", Vec::new(), root);
+                test_support::assert_success(execution);
+                testing::assert_eq(test_support::stdout(execution), entry.3);
+            } else {
+                test_support::assert_failure(output);
+                test_support::assert_contains(
+                    test_support::stderr(output),
+                    "Go map key is not comparable",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn project_external_runtime_interfaces_reject_constraints() -> () {
+    for constrained in Vec::from_array([false, true]) {
+        let root = ffi_project_fixture(
+            if constrained {
+                "ffi_constraint_interface"
+            } else {
+                "ffi_runtime_interface"
+            },
+        );
+        test_support::write_file(
+            path::join(root, "shim/shim.go"),
+            "package shim\ntype Value interface { "
+                + if constrained {
+                    "~int"
+                } else {
+                    ""
+                }
+                + " }\n"
+                + if constrained {
+                    ""
+                } else {
+                    "type Cell struct {}\nfunc Empty() Value { return nil }\nfunc TypedNil() Value { var value *Cell; return value }\nfunc IsNil(value Value) bool { return value == nil }\n"
+                },
+        );
+        test_support::write_file(
+            path::join(root, "main.gom"),
+            "package main; #[go_type(\"example.com/ffi-demo/shim\", \"Value\")] extern type Value; fn identity(value: Value) -> Value { value } "
+                + if constrained {
+                    "fn main() -> () {}"
+                } else {
+                    "#[go_ffi(\"example.com/ffi-demo/shim\", \"Empty\")] extern fn empty() -> Value; #[go_ffi(\"example.com/ffi-demo/shim\", \"TypedNil\")] extern fn typed_nil() -> Value; #[go_ffi(\"example.com/ffi-demo/shim\", \"IsNil\")] extern fn is_nil(value: Value) -> bool; fn main() -> () { println(is_nil(identity(empty()))); println(is_nil(identity(typed_nil()))); }"
+                },
+        );
+        for mode in Vec::from_array(["required", "off"]) {
+            for attempt in 0..2 {
+                let output = test_support::project_command(
+                    "check",
+                    "",
+                    Vec::from_array(["--ffi-check", mode]),
+                    root,
+                );
+                if constrained {
+                    test_support::assert_failure(output);
+                    test_support::assert_contains(
+                        test_support::stderr(output),
+                        "outside a type constraint",
+                    );
+                } else {
+                    test_support::assert_success(output);
+                    let execution = test_support::project_command(
+                        "run",
+                        "",
+                        Vec::from_array(["--ffi-check", mode]),
+                        root,
+                    );
+                    test_support::assert_success(execution);
+                    testing::assert_eq(test_support::stdout(execution), "true\nfalse\n");
+                }
+            }
+        }
+    }
+}

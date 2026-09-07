@@ -1,0 +1,165 @@
+package main;
+
+use module::go_backend;
+use std::fs;
+use std::json;
+use std::path;
+use std::process;
+use std::testing;
+use std::utf8;
+use utf8::BytesUtf8;
+
+fn exercise_go_library_emission(directory: string) -> Result[(), string] {
+    fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    let source =
+        \\package calc;
+        \\#[go_ffi("math", "Abs")] extern fn abs(value: f64) -> f64;
+        \\#[go_ffi("strings", "ToUpper")] extern fn upper(value: string) -> string;
+        \\#[go_export("Abs")] pub fn absolute(value: f64) -> f64 { abs(value) }
+        \\static CELL: OnceCell[Ref[i64]] = OnceCell::new();
+        \\#[go_export("Add")] pub fn add(a: i64, b: i64) -> i64 { a + b }
+        \\#[go_export("Pair")] pub fn pair(a: i64) -> (i64, bool) { (a + 1, a > 0) }
+        \\#[go_export("Array")] pub fn array(a: [i64; 2]) -> [i64; 2] { a }
+        \\#[go_export("Next")] pub fn next() -> i64 {
+        \\    let value = CELL.get_or_init(|| Ref::new(0));
+        \\    value.set(value.get() + 1);
+        \\    value.get()
+        \\}
+        \\#[go_export("Touch")] pub fn touch() -> () { let _ = next(); }
+        \\#[go_export("Divide")] pub fn divide(a: i64, b: i64) -> i64 { a / b }
+    ;
+    let compiled = compile_go_library_piece(directory, "calc", source, Vec::new())?;
+    let world = test_package_world();
+    let linked = link_go_library_core(world, Vec::from_array([compiled.core_unit]), "demo::calc")?;
+    let api = go_library_api(linked.exports)?;
+    let api_entries = json::as_array(json::field(api, "exports").ok_or("missing exports")?).ok_or(
+        "invalid exports",
+    )?;
+    testing::assert_eq(api_entries.len(), 7);
+    for entry in api_entries {
+        let name = json::field(entry, "name").and_then(|value| json::as_string(value)).unwrap_or("");
+        let results = json::field(entry, "results").and_then(|value| json::as_array(value)).ok_or(
+            "missing API results",
+        )?;
+        if name == "Pair" {
+            testing::assert_eq(results.len(), 2)
+        }
+        if name == "Touch" {
+            testing::assert_eq(results.len(), 0)
+        }
+        if name == "Array" {
+            testing::assert_eq(results.len(), 1);
+            testing::assert(
+                json::field(results[0], "tag").and_then(|value| json::as_string(value))
+                    == Option::Some("array"),
+            );
+        }
+    }
+    let mono_value = lower_mono_or_fail(linked.core_value);
+    let anf_value = lower_anf_stage(lower_lift_stage(mono_value, world.counter), world.counter);
+    let declarations: Vec[(string, string)] = Vec::new();
+    for exported in linked.exports {
+        declarations.push((exported.symbol, exported.go_name))
+    }
+    let generated = go_backend::lower_library(anf_value, declarations)?;
+    let go_source = go_backend::encode_package(generated, "calc");
+    testing::assert(!go_source.contains("func main("));
+    testing::assert(go_source.contains("\"math\""));
+    testing::assert(!go_source.contains("\"strings\""));
+    fs::write_file_structured(path::join(directory, "goml_generated.go"), go_source).map_err(
+        |error| error.to_string(),
+    )?;
+    fs::write_file_structured(
+        path::join(directory, "go.mod"),
+        "module example.com/calc\n\ngo 1.25\n",
+    ).map_err(|error| error.to_string())?;
+    let host_test =
+        \\package calc_test
+        \\import (
+        \\    "testing"
+        \\    "go/ast"
+        \\    "go/parser"
+        \\    "go/token"
+        \\    calc "example.com/calc"
+        \\)
+        \\func TestExports(t *testing.T) {
+        \\    if calc.Abs(-3.5) != 3.5 { t.Fatal("foreign call") }
+        \\    if calc.Add(19, 23) != 42 { t.Fatal("add") }
+        \\    var pair func(int64) (int64, bool) = calc.Pair
+        \\    a, b := pair(5)
+        \\    if a != 6 || !b { t.Fatal("pair") }
+        \\    array := [2]int64{3, 7}
+        \\    if calc.Array(array) != array { t.Fatal("array") }
+        \\    if calc.Next() != 1 || calc.Next() != 2 { t.Fatal("static") }
+        \\    var touch func() = calc.Touch
+        \\    touch()
+        \\    if calc.Next() != 4 { t.Fatal("unit or repeated initialization") }
+        \\}
+        \\func TestPublicNamespace(t *testing.T) {
+        \\    file, err := parser.ParseFile(token.NewFileSet(), "goml_generated.go", nil, 0)
+        \\    if err != nil { t.Fatal(err) }
+        \\    expected := map[string]bool{"Add": true, "Pair": true, "Array": true, "Next": true, "Touch": true, "Divide": true, "Abs": true}
+        \\    found := 0
+        \\    check := func(name string) {
+        \\        if ast.IsExported(name) {
+        \\            if !expected[name] { t.Errorf("unexpected public name %s", name) }
+        \\            found++
+        \\        }
+        \\    }
+        \\    for _, declaration := range file.Decls {
+        \\        switch value := declaration.(type) {
+        \\        case *ast.FuncDecl:
+        \\            if value.Recv == nil { check(value.Name.Name) }
+        \\        case *ast.GenDecl:
+        \\            for _, spec := range value.Specs {
+        \\                switch value := spec.(type) {
+        \\                case *ast.TypeSpec: check(value.Name.Name)
+        \\                case *ast.ValueSpec:
+        \\                    for _, name := range value.Names { check(name.Name) }
+        \\                }
+        \\            }
+        \\        }
+        \\    }
+        \\    if found != len(expected) { t.Fatalf("public API: got %d names", found) }
+        \\}
+        \\func TestPanic(t *testing.T) {
+        \\    defer func() { if recover() == nil { t.Fatal("panic swallowed") } }()
+        \\    calc.Divide(1, 0)
+        \\}
+    ;
+    fs::write_file_structured(path::join(directory, "host_test.go"), host_test).map_err(
+        |error| error.to_string(),
+    )?;
+    let output = process::Command::new("go").args(Vec::from_array(["test", "./..."])).current_dir(
+        directory,
+    ).env("GOWORK", "off").env("GOTOOLCHAIN", "local").env("GOPROXY", "off").output_structured().map_err(
+        |error| error.to_string(),
+    )?;
+    if !output.status().success() {
+        return Result::Err(
+            output.stdout().to_string_utf8().unwrap_or("")
+                + output.stderr().to_string_utf8().unwrap_or(""),
+        )
+    }
+    testing::assert(
+        go_backend::lower_library(
+            anf_value,
+            Vec::from_array([("demo::calc::add", "Add"), ("demo::calc::next", "Add")]),
+        ).is_err(),
+    );
+    testing::assert(
+        go_backend::lower_library(anf_value, Vec::from_array([("missing", "Missing")])).is_err(),
+    );
+    Result::Ok(())
+}
+
+#[test]
+fn go_library_exports_are_callable_from_an_external_go_package() -> () {
+    let temporary = temp_go_path("go-library.gom", "emission");
+    let result = exercise_go_library_emission(path::parent(temporary).unwrap_or(""));
+    cleanup_temp_directory(temporary);
+    match result {
+        Ok(()) => (),
+        Err(message) => testing::fail(message),
+    }
+}

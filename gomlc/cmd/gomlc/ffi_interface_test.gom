@@ -1,0 +1,556 @@
+package main;
+
+use module::artifact::interface_codec as interface_codec;
+use module::artifact;
+use module::artifact::core_codec;
+use module::ffi;
+use module::tast;
+use std::fs;
+use std::path;
+use std::testing;
+
+fn compile_private_foreign_interface(directory: string, symbol: string) -> Result[
+    artifact::ArtifactInterfaceUnit,
+    string,
+] {
+    let source_path = path::join(directory, "calc.gom");
+    fs::write_file_structured(
+        source_path,
+        "package calc; #[go_ffi(\"math\", \"" + symbol
+            + "\")] extern fn unused_private(value: f64) -> f64; pub fn visible() -> bool { true }",
+    ).map_err(|error| error.to_string())?;
+    let command = PackageCommandArgs {
+        foreign_validation: Option::None,
+        package_name: "demo::calc",
+        module_name: "demo::calc",
+        inputs: Vec::from_array([source_path]),
+        interface_paths: Vec::new(),
+        output: path::join(directory, "calc"),
+        world: Option::None,
+    };
+    let compiled = compile_artifact_package(test_package_world(), command, false, false)?;
+    Result::Ok(compiled.interface_unit)
+}
+
+fn exercise_private_foreign_interface(directory: string) -> Result[(), string] {
+    let unit = compile_private_foreign_interface(directory, "Abs")?;
+    testing::assert_eq(unit.foreign_bindings.len(), 1);
+    testing::assert(unit.foreign_bindings[0].binding_id.contains("unused_private"));
+    testing::assert_eq(unit.foreign_bindings[0].symbol, "Abs");
+    for function in unit.exports.functions {
+        testing::assert(!function.name.contains("unused_private"))
+    }
+    for export in unit.package_interface.value_exports {
+        testing::assert(!export.0.contains("unused_private"))
+    }
+    let decoded = interface_codec::decode_binary(interface_codec::encode_binary(unit)?)?;
+    testing::assert_eq(decoded.foreign_bindings.len(), 1);
+    testing::assert_eq(decoded.foreign_bindings[0].binding_id, unit.foreign_bindings[0].binding_id);
+    testing::assert_eq(decoded.interface_hash, unit.interface_hash);
+    let changed = compile_private_foreign_interface(directory, "Floor")?;
+    testing::assert_ne(changed.interface_hash, unit.interface_hash);
+    Result::Ok(())
+}
+
+#[test]
+fn foreign_interface_keeps_unused_private_bindings_outside_public_api() -> () {
+    let temporary = temp_go_path("ffi-interface.gom", "private-interface");
+    let result = exercise_private_foreign_interface(path::parent(temporary).unwrap_or(""));
+    cleanup_temp_directory(temporary);
+    match result {
+        Ok(()) => (),
+        Err(message) => testing::fail(message),
+    }
+}
+
+#[test]
+fn foreign_interface_rejects_unknown_bridge_shapes() -> () {
+    let base = binary_interface_fixture();
+    let binding = ffi::ForeignBinding {
+        call_mode: ffi::ForeignCallMode::Ordinary,
+        binding_id: "audit::value:invalid",
+        import_path: "math",
+        symbol: "Abs",
+        parameters: Vec::from_array([ffi::BridgeType::Scalar("unknown")]),
+        results: Vec::new(),
+    };
+    let unit = interface_codec::new_unit_with_foreign_bindings(
+        base.package_name,
+        base.exports,
+        base.package_interface,
+        base.comptime,
+        base.deps,
+        Vec::from_array([binding]),
+    );
+    match interface_codec::encode_binary(unit) {
+        Ok(bytes) => testing::assert(interface_codec::decode_binary(bytes).is_err()),
+        Err(message) => testing::fail(message),
+    }
+}
+
+#[test]
+fn foreign_interface_checks_public_callables_against_metadata() -> () {
+    let base = binary_interface_fixture();
+    base.exports.functions.push(
+        artifact::ArtifactFnScheme {
+            name: "audit::value::abs",
+            comptime: tast::ComptimeCapability::RuntimeOnly,
+            type_params: Vec::new(),
+            constraints: Vec::new(),
+            ty: tast::Type::Func {
+                params: Vec::from_array([tast::Type::Float64]),
+                ret_ty: tast::Type::Float64,
+            },
+            body: tast::Callable::GoForeign { binding: "", import_path: "math", symbol: "Abs" },
+        },
+    );
+    let public = match foreign_interface_bindings(base, Vec::new()) {
+        Ok(bindings) => bindings,
+        Err(message) => {
+            testing::fail(message);
+            Vec::new()
+        },
+    };
+    testing::assert_eq(public.len(), 1);
+    let binding = public[0];
+    base.foreign_bindings.push(
+        ffi::ForeignBinding {
+            call_mode: ffi::ForeignCallMode::Ordinary,
+            binding_id: binding.binding_id,
+            import_path: binding.import_path,
+            symbol: "Floor",
+            parameters: binding.parameters,
+            results: binding.results,
+        },
+    );
+    testing::assert(foreign_interface_bindings(base, Vec::new()).is_err())
+}
+
+#[test]
+fn foreign_callable_artifacts_cannot_be_comptime() -> () {
+    let base = binary_interface_fixture();
+    base.exports.functions.push(
+        artifact::ArtifactFnScheme {
+            name: "audit::value::abs",
+            comptime: tast::ComptimeCapability::Capable,
+            type_params: Vec::new(),
+            constraints: Vec::new(),
+            ty: tast::Type::Func {
+                params: Vec::from_array([tast::Type::Float64]),
+                ret_ty: tast::Type::Float64,
+            },
+            body: tast::Callable::GoForeign { binding: "", import_path: "math", symbol: "Abs" },
+        },
+    );
+    let unit = interface_codec::new_unit(
+        base.package_name,
+        base.exports,
+        base.package_interface,
+        base.deps,
+    );
+    match interface_codec::encode_binary(unit) {
+        Ok(bytes) => testing::assert(interface_codec::decode_binary(bytes).is_err()),
+        Err(message) => testing::fail(message),
+    }
+}
+
+fn exercise_foreign_binding_artifact_origins(directory: string) -> Result[(), string] {
+    fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    let interfaces: Vec[artifact::ArtifactInterfaceUnit] = Vec::new();
+    let cores: Vec[artifact::ArtifactCoreUnit] = Vec::new();
+    for name in Vec::from_array(["left", "right"]) {
+        let compiled = compile_go_library_piece(
+            directory,
+            name,
+            "package " + name
+                + "; #[go_ffi(\"math\", \"MissingFunction\")] pub extern fn same(value: f64) -> f64;",
+            Vec::new(),
+        )?;
+        interfaces.push(
+            interface_codec::decode_binary(interface_codec::encode_binary(compiled.interface_unit)?)?,
+        );
+        cores.push(core_codec::decode_binary(core_codec::encode_binary(compiled.core_unit)?)?);
+    }
+    let bindings = foreign_unit_bindings(interfaces, cores)?;
+    testing::assert_eq(bindings.len(), 2);
+    testing::assert_ne(bindings[0].binding_id, bindings[1].binding_id);
+    for unit in cores {
+        let locations = foreign_source_locations(unit.package_name, unit.sources, bindings);
+        testing::assert_eq(locations.len(), 1);
+        let id = unit.package_name + ":" + unit.package_name + "::same";
+        let location = locations[id].ok_or("missing declaration origin")?;
+        testing::assert(location.contains(unit.sources[0]));
+        testing::assert(location.contains("MissingFunction"));
+    }
+    Result::Ok(())
+}
+
+#[test]
+fn foreign_artifact_duplicates_preserve_distinct_package_declaration_origins() -> () {
+    let temporary = temp_go_path("ffi-interface.gom", "artifact-origins");
+    let result = exercise_foreign_binding_artifact_origins(path::parent(temporary).unwrap_or(""));
+    cleanup_temp_directory(temporary);
+    match result {
+        Ok(()) => (),
+        Err(message) => testing::fail(message),
+    }
+}
+
+fn exercise_named_foreign_interface() -> Result[(), string] {
+    let base = binary_interface_fixture();
+    let duration = ffi::BridgeType::Named {
+        import_path: "time",
+        name: "Duration",
+        arguments: Vec::new(),
+    };
+    let box_type = ffi::BridgeType::Named {
+        import_path: "host",
+        name: "Box",
+        arguments: Vec::from_array([duration]),
+    };
+    let binding = ffi::ForeignBinding {
+        call_mode: ffi::ForeignCallMode::Ordinary,
+        binding_id: "audit::value:box",
+        import_path: "host",
+        symbol: "Echo",
+        parameters: Vec::from_array([box_type]),
+        results: Vec::from_array([box_type]),
+    };
+    let unit = interface_codec::new_unit_with_foreign_bindings(
+        base.package_name,
+        base.exports,
+        base.package_interface,
+        base.comptime,
+        base.deps,
+        Vec::from_array([binding]),
+    );
+    let restored = interface_codec::decode_binary(interface_codec::encode_binary(unit)?)?;
+    testing::assert_eq(restored.foreign_bindings.len(), 1);
+    testing::assert(ffi::bindings_equal(restored.foreign_bindings[0], binding));
+    for invalid in Vec::from_array(
+        [
+            ffi::BridgeType::Named { import_path: "", name: "Box", arguments: Vec::new() },
+            ffi::BridgeType::Named { import_path: "host", name: "Box[bad]", arguments: Vec::new() },
+            ffi::BridgeType::Named {
+                import_path: "host",
+                name: "Box",
+                arguments: Vec::from_array([ffi::BridgeType::Scalar("any")]),
+            },
+        ],
+    ) {
+        let invalid_binding = ffi::ForeignBinding {
+            call_mode: ffi::ForeignCallMode::Ordinary,
+            binding_id: "audit::value:invalid",
+            import_path: "host",
+            symbol: "Echo",
+            parameters: Vec::from_array([invalid]),
+            results: Vec::new(),
+        };
+        let invalid_unit = interface_codec::new_unit_with_foreign_bindings(
+            base.package_name,
+            base.exports,
+            base.package_interface,
+            base.comptime,
+            base.deps,
+            Vec::from_array([invalid_binding]),
+        );
+        testing::assert(
+            interface_codec::decode_binary(interface_codec::encode_binary(invalid_unit)?).is_err(),
+        );
+    }
+    Result::Ok(())
+}
+
+#[test]
+fn foreign_named_bridge_roundtrips_interface_metadata() -> () {
+    if let Err(error) = exercise_named_foreign_interface() {
+        testing::fail(error)
+    }
+}
+
+#[test]
+fn foreign_interface_preserves_pointer_shapes_and_rejects_pointer_markers() -> () {
+    let base = binary_interface_fixture();
+    let pointer = ffi::BridgeType::Pointer {
+        element: ffi::BridgeType::Named { import_path: "os", name: "File", arguments: Vec::new() },
+    };
+    for value in Vec::from_array(
+        [
+            pointer,
+            ffi::BridgeType::Pointer { element: pointer },
+            ffi::BridgeType::Pointer { element: ffi::BridgeType::Scalar("any") },
+        ],
+    ) {
+        let unit = interface_codec::new_unit_with_foreign_bindings(
+            base.package_name,
+            base.exports,
+            base.package_interface,
+            base.comptime,
+            base.deps,
+            Vec::from_array(
+                [
+                    ffi::ForeignBinding {
+                        call_mode: ffi::ForeignCallMode::Ordinary,
+                        binding_id: "audit::value::pointer",
+                        import_path: "example.com/shim",
+                        symbol: "Echo",
+                        parameters: Vec::from_array([value]),
+                        results: Vec::from_array([value]),
+                    },
+                ],
+            ),
+        );
+        let encoded = match interface_codec::encode_binary(unit) {
+            Ok(value) => value,
+            Err(error) => {
+                testing::fail(error);
+                return
+            },
+        };
+        let result = interface_codec::decode_binary(encoded);
+        if ffi::bridge_types_equal(
+            value,
+            ffi::BridgeType::Pointer { element: ffi::BridgeType::Scalar("any") },
+        ) {
+            testing::assert(result.is_err());
+        } else {
+            match result {
+                Ok(decoded) => testing::assert(
+                    ffi::bridge_types_equal(decoded.foreign_bindings[0].parameters[0], value),
+                ),
+                Err(error) => testing::fail(error),
+            }
+        }
+    }
+}
+
+fn method_foreign_interface(symbol: string, receiver: bool, import_path: string) -> artifact::ArtifactInterfaceUnit {
+    let base = binary_interface_fixture();
+    let parameters: Vec[ffi::BridgeType] = Vec::new();
+    if receiver {
+        parameters.push(
+            ffi::BridgeType::Named { import_path: "time", name: "Duration", arguments: Vec::new() },
+        )
+    }
+    interface_codec::new_unit_with_foreign_bindings(
+        base.package_name,
+        base.exports,
+        base.package_interface,
+        base.comptime,
+        base.deps,
+        Vec::from_array(
+            [
+                ffi::ForeignBinding {
+                    call_mode: ffi::ForeignCallMode::Method,
+                    binding_id: "audit::value::seconds",
+                    import_path,
+                    symbol,
+                    parameters,
+                    results: Vec::from_array([ffi::BridgeType::Scalar("float64")]),
+                },
+            ],
+        ),
+    )
+}
+
+#[test]
+fn foreign_method_interface_preserves_mode_and_rejects_missing_receiver() -> () {
+    let unit = method_foreign_interface("Seconds", true, "");
+    match interface_codec::encode_binary(unit) {
+        Ok(bytes) => match interface_codec::decode_binary(bytes) {
+            Ok(restored) => {
+                testing::assert_eq(restored.foreign_bindings.len(), 1);
+                testing::assert(
+                    ffi::bindings_equal(restored.foreign_bindings[0], unit.foreign_bindings[0]),
+                );
+                testing::assert(
+                    restored.foreign_bindings[0].call_mode == ffi::ForeignCallMode::Method,
+                )
+            },
+            Err(error) => testing::fail(error),
+        },
+        Err(error) => testing::fail(error),
+    }
+    for invalid in Vec::from_array(
+        [
+            method_foreign_interface("Seconds", false, ""),
+            method_foreign_interface("Seconds", true, "time"),
+        ],
+    ) {
+        match interface_codec::encode_binary(invalid) {
+            Ok(bytes) => testing::assert(interface_codec::decode_binary(bytes).is_err()),
+            Err(error) => testing::fail(error),
+        }
+    }
+}
+
+#[test]
+fn foreign_method_callable_artifacts_reject_invalid_symbols_receivers_and_comptime() -> () {
+    for invalid in Vec::from_array(
+        [
+            ("Read;panic", true, tast::ComptimeCapability::RuntimeOnly),
+            ("Read", false, tast::ComptimeCapability::RuntimeOnly),
+            ("Read", true, tast::ComptimeCapability::Capable),
+        ],
+    ) {
+        let base = binary_interface_fixture();
+        let params: Vec[tast::Type] = Vec::new();
+        if invalid.1 {
+            params.push(tast::Type::Float64)
+        }
+        base.exports.functions.push(
+            artifact::ArtifactFnScheme {
+                name: "audit::value::read",
+                comptime: invalid.2,
+                type_params: Vec::new(),
+                constraints: Vec::new(),
+                ty: tast::Type::Func { params, ret_ty: tast::Type::Float64 },
+                body: tast::Callable::GoMethod { binding: "", symbol: invalid.0 },
+            },
+        );
+        let unit = interface_codec::new_unit(
+            base.package_name,
+            base.exports,
+            base.package_interface,
+            base.deps,
+        );
+        match interface_codec::encode_binary(unit) {
+            Ok(bytes) => testing::assert(interface_codec::decode_binary(bytes).is_err()),
+            Err(error) => testing::fail(error),
+        }
+    }
+}
+
+#[test]
+fn foreign_interface_preserves_map_shapes_and_rejects_map_markers() -> () {
+    let base = binary_interface_fixture();
+    let pointer = ffi::BridgeType::Map {
+        key: ffi::BridgeType::Scalar("string"),
+        element: ffi::BridgeType::Named { import_path: "os", name: "File", arguments: Vec::new() },
+    };
+    for value in Vec::from_array(
+        [
+            pointer,
+            ffi::BridgeType::Map { key: ffi::BridgeType::Scalar("int64"), element: pointer },
+            ffi::BridgeType::Map { key: ffi::BridgeType::Scalar("any"), element: pointer },
+        ],
+    ) {
+        let unit = interface_codec::new_unit_with_foreign_bindings(
+            base.package_name,
+            base.exports,
+            base.package_interface,
+            base.comptime,
+            base.deps,
+            Vec::from_array(
+                [
+                    ffi::ForeignBinding {
+                        call_mode: ffi::ForeignCallMode::Ordinary,
+                        binding_id: "audit::value::map",
+                        import_path: "example.com/shim",
+                        symbol: "Echo",
+                        parameters: Vec::from_array([value]),
+                        results: Vec::from_array([value]),
+                    },
+                ],
+            ),
+        );
+        let encoded = match interface_codec::encode_binary(unit) {
+            Ok(value) => value,
+            Err(error) => {
+                testing::fail(error);
+                return
+            },
+        };
+        let result = interface_codec::decode_binary(encoded);
+        if ffi::bridge_types_equal(
+            value,
+            ffi::BridgeType::Map { key: ffi::BridgeType::Scalar("any"), element: pointer },
+        ) {
+            testing::assert(result.is_err());
+        } else {
+            match result {
+                Ok(decoded) => testing::assert(
+                    ffi::bridge_types_equal(decoded.foreign_bindings[0].parameters[0], value),
+                ),
+                Err(error) => testing::fail(error),
+            }
+        }
+    }
+}
+
+fn exercise_function_foreign_interface() -> Result[(), string] {
+    let base = binary_interface_fixture();
+    let scalar = ffi::BridgeType::Scalar("int64");
+    let callback = ffi::BridgeType::Function {
+        parameters: Vec::from_array([scalar]),
+        results: Vec::from_array(
+            [
+                scalar,
+                ffi::BridgeType::Named { import_path: "", name: "error", arguments: Vec::new() },
+            ],
+        ),
+    };
+    let nested = ffi::BridgeType::Function {
+        parameters: Vec::from_array([callback]),
+        results: Vec::from_array([callback]),
+    };
+    for value in Vec::from_array(
+        [
+            callback,
+            nested,
+            ffi::BridgeType::Function { parameters: Vec::new(), results: Vec::new() },
+        ],
+    ) {
+        let binding = ffi::ForeignBinding {
+            call_mode: ffi::ForeignCallMode::Ordinary,
+            binding_id: "audit::value:callback",
+            import_path: "host",
+            symbol: "Echo",
+            parameters: Vec::from_array([value]),
+            results: Vec::from_array([value]),
+        };
+        let unit = interface_codec::new_unit_with_foreign_bindings(
+            base.package_name,
+            base.exports,
+            base.package_interface,
+            base.comptime,
+            base.deps,
+            Vec::from_array([binding]),
+        );
+        let restored = interface_codec::decode_binary(interface_codec::encode_binary(unit)?)?;
+        testing::assert_eq(restored.foreign_bindings.len(), 1);
+        testing::assert(ffi::bindings_equal(restored.foreign_bindings[0], binding));
+    }
+    let invalid = ffi::ForeignBinding {
+        call_mode: ffi::ForeignCallMode::Ordinary,
+        binding_id: "audit::value:invalid",
+        import_path: "host",
+        symbol: "Echo",
+        parameters: Vec::from_array(
+            [
+                ffi::BridgeType::Function {
+                    parameters: Vec::new(),
+                    results: Vec::from_array([ffi::BridgeType::Scalar("any")]),
+                },
+            ],
+        ),
+        results: Vec::new(),
+    };
+    let unit = interface_codec::new_unit_with_foreign_bindings(
+        base.package_name,
+        base.exports,
+        base.package_interface,
+        base.comptime,
+        base.deps,
+        Vec::from_array([invalid]),
+    );
+    testing::assert(interface_codec::decode_binary(interface_codec::encode_binary(unit)?).is_err());
+    Result::Ok(())
+}
+
+#[test]
+fn function_bridge_roundtrips_interface_artifacts() -> () {
+    if let Err(error) = exercise_function_foreign_interface() {
+        testing::fail(error)
+    }
+}

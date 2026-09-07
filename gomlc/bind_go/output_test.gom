@@ -1,0 +1,179 @@
+package bind_go;
+
+use std::fs;
+use std::path;
+use std::process;
+use std::testing;
+
+fn output_test_fixture(name: string) -> Result[Outputs, string] {
+    let root = path::absolute_structured("../_artifact/bind-go-output-" + name).map_err(
+        |error| error.to_string(),
+    )?;
+    if fs::exists(root) {
+        fs::remove_dir_all(root).map_err(|error| error.to_string())?;
+    }
+    fs::create_dir_all(root).map_err(|error| error.to_string())?;
+    let config = parse_config(config_source())?;
+    resolve_outputs(root, path::join(root, "bindings.json"), config)
+}
+
+fn output_test_product(value: string) -> Generated {
+    Generated {
+        goml_source: "package bindings;\n" + value,
+        go_source: "package native_bindings\n" + value,
+    }
+}
+
+fn exercise_owned_outputs() -> Result[(), string] {
+    let outputs = output_test_fixture("owned")?;
+    let first = output_test_product("");
+    publish(outputs, || Result::Ok(first))?;
+    let previous = read_outputs(outputs)?;
+    let modified = fs::symlink_metadata(outputs.goml).map_err(|error| error.to_string())?.modified_unix_nanoseconds();
+    publish(outputs, || Result::Ok(first))?;
+    testing::assert(same_outputs(previous, read_outputs(outputs)?));
+    testing::assert_eq(
+        fs::symlink_metadata(outputs.goml).map_err(|error| error.to_string())?.modified_unix_nanoseconds(),
+        modified,
+    );
+    let second = output_test_product("\n");
+    publish(outputs, || Result::Ok(second))?;
+    let baseline = read_outputs(outputs)?;
+    testing::assert(baseline[0] == Option::Some(second.goml_source));
+    for index in 0..3 {
+        let file = output_files(outputs)[index];
+        let original = baseline[index].unwrap_or("");
+        fs::write_file_structured(file, original + "user edit").map_err(|error| error.to_string())?;
+        testing::assert(publish(outputs, || Result::Ok(first)).is_err());
+        testing::assert(optional_output(file)? == Option::Some(original + "user edit"));
+        fs::write_file_structured(file, original).map_err(|error| error.to_string())?;
+    }
+    testing::assert(!fs::exists(path::join(outputs.root, ".goml-bind-go-lock")));
+    Result::Ok(())
+}
+
+#[test]
+fn bind_go_output_preserves_edits_and_identical_file_timestamps() -> () {
+    if let Err(error) = exercise_owned_outputs() {
+        testing::fail(error);
+    }
+}
+
+fn exercise_output_conflicts() -> Result[(), string] {
+    let outputs = output_test_fixture("conflicts")?;
+    fs::create_dir_all(path::parent(outputs.goml).unwrap_or("")).map_err(|error| error.to_string())?;
+    fs::write_file_structured(outputs.goml, "handwritten").map_err(|error| error.to_string())?;
+    testing::assert(publish(outputs, || Result::Ok(output_test_product(""))).is_err());
+    testing::assert(optional_output(outputs.goml)? == Option::Some("handwritten"));
+    fs::remove_file(outputs.goml).map_err(|error| error.to_string())?;
+    testing::assert(publish(outputs, || Result::Err("query failed")).is_err());
+    testing::assert(optional_output(outputs.manifest)? == Option::None);
+    let result = publish(
+        outputs,
+        || {
+            testing::assert(publish(outputs, || Result::Ok(output_test_product(""))).is_err());
+            fs::write_file_structured(outputs.goml, "concurrent edit").map_err(
+                |error| error.to_string(),
+            )?;
+            Result::Ok(output_test_product(""))
+        },
+    );
+    testing::assert(result.is_err());
+    testing::assert(optional_output(outputs.goml)? == Option::Some("concurrent edit"));
+    testing::assert(optional_output(outputs.go_file)? == Option::None);
+    testing::assert(optional_output(outputs.manifest)? == Option::None);
+    Result::Ok(())
+}
+
+#[test]
+fn bind_go_output_rejects_unowned_files_and_concurrent_changes() -> () {
+    if let Err(error) = exercise_output_conflicts() {
+        testing::fail(error);
+    }
+}
+
+fn exercise_output_rollback() -> Result[(), string] {
+    for existing in Vec::from_array([false, true]) {
+        let outputs = output_test_fixture(
+            if existing {
+                "rollback-existing"
+            } else {
+                "rollback-new"
+            },
+        )?;
+        if existing {
+            publish(outputs, || Result::Ok(output_test_product("old")))?;
+        } else {
+            fs::create_dir_all(path::parent(outputs.goml).unwrap_or("")).map_err(
+                |error| error.to_string(),
+            )?;
+            fs::create_dir_all(path::parent(outputs.go_file).unwrap_or("")).map_err(
+                |error| error.to_string(),
+            )?;
+        }
+        let before = read_outputs(outputs)?;
+        let staging = path::join(outputs.root, "staging");
+        fs::create_dir(staging).map_err(|error| error.to_string())?;
+        for index in 0..2 {
+            fs::write_file_structured(
+                path::join(staging, "new_" + index.to_string()),
+                "replacement",
+            ).map_err(|error| error.to_string())?;
+        }
+        let preserve = Ref::new(false);
+        testing::assert(commit_outputs(output_files(outputs), before, staging, preserve).is_err());
+        testing::assert(!preserve.get());
+        testing::assert(same_outputs(before, read_outputs(outputs)?));
+    }
+    Result::Ok(())
+}
+
+#[test]
+fn bind_go_output_rolls_back_both_sources_when_manifest_commit_fails() -> () {
+    if let Err(error) = exercise_output_rollback() {
+        testing::fail(error);
+    }
+}
+
+fn exercise_output_paths() -> Result[(), string] {
+    let outputs = output_test_fixture("paths")?;
+    let config = parse_config(config_source())?;
+    let config_file = path::join(outputs.root, "bindings.json");
+    for output in Vec::from_array(
+        [
+            "../escape.gom",
+            ".goml-bind-go-lock/generated.gom",
+            "native/.goml-bind-go-query/generated.gom",
+            "/tmp/escape.gom",
+            "../" + path::file_name(outputs.root).unwrap_or("") + "/inside.gom",
+        ],
+    ) {
+        let changed = Config { output, ..config };
+        testing::assert(resolve_outputs(outputs.root, config_file, changed).is_err());
+    }
+    let nested = path::join(outputs.root, "bindings");
+    fs::create_dir_all(nested).map_err(|error| error.to_string())?;
+    fs::write_file_structured(path::join(nested, "go.mod"), "module nested\n").map_err(
+        |error| error.to_string(),
+    )?;
+    testing::assert(resolve_outputs(outputs.root, config_file, config).is_err());
+    fs::remove_file(path::join(nested, "go.mod")).map_err(|error| error.to_string())?;
+    fs::write_file_structured(path::join(nested, "generated.gom"), "user").map_err(
+        |error| error.to_string(),
+    )?;
+    testing::assert(resolve_outputs(outputs.root, config_file, config).is_ok());
+    fs::remove_dir_all(nested).map_err(|error| error.to_string())?;
+    let link = process::Command::new("ln").args(Vec::from_array(["-s", outputs.root, nested])).output_structured().map_err(
+        |error| error.to_string(),
+    )?;
+    testing::assert(link.status().success());
+    testing::assert(resolve_outputs(outputs.root, config_file, config).is_err());
+    Result::Ok(())
+}
+
+#[test]
+fn bind_go_output_paths_reject_traversal_and_nested_modules() -> () {
+    if let Err(error) = exercise_output_paths() {
+        testing::fail(error);
+    }
+}

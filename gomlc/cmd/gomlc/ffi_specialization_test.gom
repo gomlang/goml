@@ -1,0 +1,302 @@
+package main;
+
+use module::artifact;
+use module::core;
+use module::ffi;
+use std::env;
+use std::fs;
+use std::json;
+use std::path;
+use std::process;
+use std::testing;
+use std::utf8;
+use utf8::BytesUtf8;
+
+fn specialized_library_args(directory: string, core_path: string, mode: string) -> Vec[string] {
+    let args = go_library_cli_args(core_path, path::join(directory, "gen/goml_generated.go"), "gen");
+    for value in Vec::from_array(
+        [
+            "--input",
+            path::join(directory, "helpers.core"),
+            "--ffi-check",
+            mode,
+            "--context",
+            path::join(directory, "context.json"),
+            "--caller-mode",
+            "package",
+            "--caller-directory",
+            path::join(directory, "gen"),
+            "--caller-import-path",
+            "example.com/host/gen",
+            "--caller-package",
+            "gen",
+        ],
+    ) {
+        args.push(value)
+    }
+    args
+}
+
+fn exercise_linked_external_specialization(directory: string) -> Result[(), string] {
+    ffi_driver_fixture(directory)?;
+    let context = resolve_foreign_build_context("go", directory)?;
+    let caller = ffi::CallerContext {
+        generated_source: Option::None,
+        load_mode: "package",
+        import_path: "example.com/host/gen",
+        directory: path::join(directory, "gen"),
+        package_name: "gen",
+    };
+    let compiler = path::absolute_structured(
+        env::var_structured("GOML_TEST_GOMLC").unwrap_or("../stage2/bin/gomlc"),
+    ).map_err(|error| error.to_string())?;
+    let helper = path::join(
+        path::parent(compiler).ok_or("missing compiler directory")?,
+        "goml-go-meta",
+    );
+    let query = ffi::TypeDeclarationQuery {
+        type_id: "demo::helpers::Numeric",
+        import_path: "example.com/host/shim",
+        name: "Numeric",
+    };
+    let queries = Vec::from_array([query]);
+    let metadata = ffi::ForeignTypeMetadata {
+        queries,
+        instances: Vec::new(),
+        declarations: run_foreign_type_declarations(helper, context, caller, queries)?,
+    };
+    fs::write_file_structured(
+        path::join(directory, "context.json"),
+        json::encode(ffi::build_context_json(context)),
+    ).map_err(|error| error.to_string())?;
+    let helpers = compile_go_library_piece(
+        directory,
+        "helpers",
+        "package helpers; pub fn erase[T](value: T) -> i64 { 0 } fn unused() -> i64 { erase(false) }",
+        Vec::new(),
+    )?;
+    let base = helpers.core_unit;
+    let helper_core = artifact::ArtifactCoreUnit {
+        source_origins: Vec::new(),
+        external_applications: Vec::from_array(
+            [
+                core::ExternalTypeApplication {
+                    function_name: "demo::helpers::erase",
+                    declaration: query,
+                    arguments: Vec::from_array([core::Type::Param { name: "T" }]),
+                },
+            ],
+        ),
+        foreign_types: Option::Some(metadata),
+        package_name: base.package_name,
+        declared_name: base.declared_name,
+        interface_hash: base.interface_hash,
+        exports: base.exports,
+        core_ir: core::without_roots(base.core_ir),
+        deps: base.deps,
+        sources: Vec::new(),
+        tests: base.tests,
+    };
+    write_artifact_core(path::join(directory, "helpers.core"), helper_core)?;
+    let interface_path = path::join(directory, "helpers.interface");
+    write_artifact_interface(interface_path, helpers.interface_unit)?;
+    let valid = compile_go_library_piece(
+        directory,
+        "calc",
+        "package calc; use demo::helpers; #[go_export(\"Value\")] pub fn value() -> i64 { let value: i64 = 42; helpers::erase(value) + helpers::erase(value) }",
+        Vec::from_array([interface_path]),
+    )?;
+    let invalid = compile_go_library_piece(
+        directory,
+        "calc",
+        "package calc; use demo::helpers; #[go_export(\"Value\")] pub fn value() -> i64 { helpers::erase(false) }",
+        Vec::from_array([interface_path]),
+    )?;
+    let valid_path = path::join(directory, "valid.core");
+    let invalid_path = path::join(directory, "invalid.core");
+    write_artifact_core(valid_path, valid.core_unit)?;
+    write_artifact_core(invalid_path, invalid.core_unit)?;
+    let executable_valid = compile_go_library_piece(
+        directory,
+        "calc",
+        "package main; use demo::helpers; fn main() -> () { let value: i64 = 42; println(helpers::erase(value)) }",
+        Vec::from_array([interface_path]),
+    )?;
+    let executable_invalid = compile_go_library_piece(
+        directory,
+        "calc",
+        "package main; use demo::helpers; fn main() -> () { println(helpers::erase(false)) }",
+        Vec::from_array([interface_path]),
+    )?;
+    let executable_valid_path = path::join(directory, "executable-valid.core");
+    let executable_invalid_path = path::join(directory, "executable-invalid.core");
+    write_artifact_core(executable_valid_path, executable_valid.core_unit)?;
+    write_artifact_core(executable_invalid_path, executable_invalid.core_unit)?;
+    fs::remove_file(path::join(directory, "helpers.gom")).map_err(|error| error.to_string())?;
+    fs::remove_file(path::join(directory, "calc.gom")).map_err(|error| error.to_string())?;
+    for mode in Vec::from_array(["required", "off"]) {
+        let output = process::Command::new(compiler).args(
+            specialized_library_args(directory, valid_path, mode),
+        ).output_structured().map_err(|error| error.to_string())?;
+        if !output.status().success() {
+            return Result::Err(
+                output.stderr().to_string_utf8().unwrap_or("valid specialized library failed"),
+            )
+        }
+        let output_path = path::join(directory, "gen/goml_generated.go");
+        let generated = fs::read_file_structured(output_path).map_err(|error| error.to_string())?;
+        testing::assert(generated.contains("func Value("));
+        fs::write_file_structured(
+            path::join(directory, "gen/generated_test.go"),
+            "package gen\nimport \"testing\"\nfunc TestValue(t *testing.T) { if Value() != 0 { t.Fatal(\"value\") } }\n",
+        ).map_err(|error| error.to_string())?;
+        let execution = foreign_go_process(context, Vec::from_array(["test", "./gen"])).output_structured().map_err(
+            |error| error.to_string(),
+        )?;
+        if !execution.status().success() {
+            return Result::Err(
+                execution.stderr().to_string_utf8().unwrap_or(
+                    "specialized Go library execution failed",
+                ),
+            )
+        }
+        let output = process::Command::new(compiler).args(
+            specialized_library_args(directory, invalid_path, mode),
+        ).output_structured().map_err(|error| error.to_string())?;
+        testing::assert(!output.status().success());
+        let diagnostic = output.stderr().to_string_utf8().unwrap_or("");
+        testing::assert(diagnostic.contains("Numeric"));
+        testing::assert(diagnostic.contains("constraint") || diagnostic.contains("satisfy"));
+        testing::assert_eq(
+            fs::read_file_structured(output_path).map_err(|error| error.to_string())?,
+            generated,
+        );
+    }
+    for mode in Vec::from_array(["required", "off"]) {
+        let output = process::Command::new(compiler).args(
+            specialized_executable_args(directory, executable_valid_path, mode),
+        ).output_structured().map_err(|error| error.to_string())?;
+        if !output.status().success() {
+            return Result::Err(
+                output.stderr().to_string_utf8().unwrap_or("valid specialized executable failed"),
+            )
+        }
+        let output_path = path::join(directory, "program.go");
+        let generated = fs::read_file_structured(output_path).map_err(|error| error.to_string())?;
+        let execution = foreign_go_process(context, Vec::from_array(["run", output_path])).output_structured().map_err(
+            |error| error.to_string(),
+        )?;
+        if !execution.status().success() {
+            return Result::Err(
+                execution.stderr().to_string_utf8().unwrap_or("specialized executable failed"),
+            )
+        }
+        testing::assert_eq(execution.stdout().to_string_utf8().unwrap_or(""), "0\n");
+        let output = process::Command::new(compiler).args(
+            specialized_executable_args(directory, executable_invalid_path, mode),
+        ).output_structured().map_err(|error| error.to_string())?;
+        testing::assert(!output.status().success());
+        let diagnostic = output.stderr().to_string_utf8().unwrap_or("");
+        testing::assert(diagnostic.contains("Numeric"));
+        testing::assert(diagnostic.contains("constraint") || diagnostic.contains("satisfy"));
+        testing::assert_eq(
+            fs::read_file_structured(output_path).map_err(|error| error.to_string())?,
+            generated,
+        );
+    }
+    for mode in Vec::from_array(["required", "off"]) {
+        for test_link in Vec::from_array([false, true]) {
+            let checked_output = path::join(directory, "checked.go");
+            let checked_manifest = path::join(directory, "checked.json");
+            for valid in Vec::from_array([true, false]) {
+                let core_path = if valid {
+                    executable_valid_path
+                } else {
+                    executable_invalid_path
+                };
+                let args = specialized_executable_args(directory, core_path, mode);
+                args.set(
+                    0,
+                    if test_link {
+                        "__ffi-check-test-link"
+                    } else {
+                        "__ffi-check-link"
+                    },
+                );
+                for index in range(0, args.len() - 1) {
+                    if args[index] == "--output" {
+                        args.set(index + 1, checked_output)
+                    }
+                    if test_link && args[index] == "--entry" {
+                        args.set(index, "--package")
+                    }
+                }
+                if test_link {
+                    args.push("--manifest");
+                    args.push(checked_manifest)
+                }
+                let output = process::Command::new(compiler).args(args).output_structured().map_err(
+                    |error| error.to_string(),
+                )?;
+                if valid && !output.status().success() {
+                    return Result::Err(
+                        output.stderr().to_string_utf8().unwrap_or(
+                            "cached specialization check failed",
+                        ),
+                    )
+                }
+                if !valid {
+                    testing::assert(!output.status().success());
+                    testing::assert(
+                        output.stderr().to_string_utf8().unwrap_or("").contains("Numeric"),
+                    );
+                }
+                testing::assert(!fs::is_file(checked_output));
+                testing::assert(!fs::is_file(checked_manifest));
+            }
+        }
+    }
+    Result::Ok(())
+}
+
+#[test]
+fn linked_external_constraints_specialize_source_free_dependencies_before_go_output() -> () {
+    let temporary = temp_go_path("ffi-specialization.gom", "linked-external");
+    let result = exercise_linked_external_specialization(path::parent(temporary).unwrap_or(""));
+    cleanup_temp_directory(temporary);
+    if let Err(error) = result {
+        testing::fail(error)
+    }
+}
+
+fn specialized_executable_args(directory: string, core_path: string, mode: string) -> Vec[string] {
+    let args = Vec::from_array(
+        [
+            "link",
+            "--input",
+            core_path,
+            path::join(directory, "helpers.core"),
+            "--entry",
+            "demo::calc",
+            "--output",
+            path::join(directory, "program.go"),
+            "--ffi-check",
+            mode,
+            "--context",
+            path::join(directory, "context.json"),
+            "--caller-mode",
+            "files",
+            "--caller-directory",
+            directory,
+            "--caller-import-path",
+            "command-line-arguments",
+            "--caller-package",
+            "main",
+        ],
+    );
+    if let Ok(world) = env::var_structured("GOML_TEST_COMPILER_WORLD") {
+        args.push("--world");
+        args.push(world)
+    }
+    args
+}

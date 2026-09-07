@@ -1,0 +1,357 @@
+package main;
+
+use module::test_support;
+use std::fs;
+use std::path;
+use std::testing;
+
+fn binding_cli_config() -> string {
+    "{\"version\":1,\"package\":\"bindings\",\"output\":\"bindings/generated.gom\",\"go_package\":\"native\",\"go_output\":\"native/generated.go\",\"go_import_path\":\"example.com/bindings/native\",\"functions\":[{\"name\":\"count\",\"import_path\":\"strings\",\"symbol\":\"Count\"},{\"name\":\"parse\",\"import_path\":\"strconv\",\"symbol\":\"Atoi\"}]}"
+}
+
+fn binding_cli_fixture(name: string) -> string {
+    let root = test_support::workspace(name);
+    test_support::write_file(
+        path::join(root, "goml.toml"),
+        "[module]\npath = \"bindings_example\"\n",
+    );
+    test_support::write_file(
+        path::join(root, "go.mod"),
+        "module example.com/bindings\n\ngo 1.25.0\n",
+    );
+    test_support::write_file(path::join(root, "bindings.json"), binding_cli_config());
+    root
+}
+
+#[test]
+fn bind_go_cli_generates_checked_stdlib_bindings_and_preserves_edits() -> () {
+    let root = binding_cli_fixture("bind_go_stdlib");
+    let before = test_support::read_file(path::join(root, "go.mod"));
+    let dry = test_support::project_command(
+        "bind-go",
+        "",
+        Vec::from_array(["bindings.json", "--dry-run"]),
+        root,
+    );
+    test_support::assert_success(dry);
+    test_support::assert_contains(test_support::stdout(dry), "Ownership manifest:");
+    testing::assert(!fs::exists(path::join(root, "bindings")));
+    testing::assert(!fs::exists(path::join(root, ".goml-bind-go-lock")));
+    for attempt in 0..2 {
+        test_support::assert_success(
+            test_support::project_command("bind-go", "", Vec::from_array(["bindings.json"]), root),
+        );
+    }
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use module::bindings; use std::ffi; fn main() -> () { println(bindings::count(ffi::string_from_text(\"banana\"), ffi::string_from_text(\"a\"))); let (value, error) = bindings::parse(ffi::string_from_text(\"42\")); println(value); println(ffi::error_is_nil(error)); }",
+    );
+    test_support::assert_success(test_support::project_command("check", "", Vec::new(), root));
+    let run = test_support::project_command("run", "", Vec::new(), root);
+    test_support::assert_success(run);
+    testing::assert_eq(test_support::stdout(run), "3\n42\ntrue\n");
+    testing::assert_eq(test_support::read_file(path::join(root, "go.mod")), before);
+    testing::assert(!fs::exists(path::join(root, "go.sum")));
+    let generated = path::join(root, "bindings/generated.gom");
+    let original = test_support::read_file(generated);
+    test_support::write_file(generated, original + "\nfn handwritten() -> () {}\n");
+    let failed = test_support::project_command(
+        "bind-go",
+        "",
+        Vec::from_array(["bindings.json"]),
+        root,
+    );
+    test_support::assert_failure(failed);
+    test_support::assert_contains(test_support::stderr(failed), "refusing to overwrite");
+    testing::assert(test_support::read_file(generated).contains("handwritten"));
+}
+
+#[test]
+fn bind_go_cli_rejects_invalid_paths_and_import_identity_without_outputs() -> () {
+    let root = binding_cli_fixture("bind_go_invalid_paths");
+    for config in Vec::from_array(
+        [
+            binding_cli_config().replace("example.com/bindings/native", "example.com/wrong/native"),
+            binding_cli_config().replace("bindings/generated.gom", "../escaped.gom"),
+            binding_cli_config().replace("\"symbol\":\"Count\"", "\"symbol\":\"Missing\""),
+        ],
+    ) {
+        test_support::write_file(path::join(root, "bindings.json"), config);
+        test_support::assert_failure(
+            test_support::project_command("bind-go", "", Vec::from_array(["bindings.json"]), root),
+        );
+        testing::assert(!fs::exists(path::join(root, "bindings/generated.gom")));
+        testing::assert(!fs::exists(path::join(root, "native/generated.go")));
+        testing::assert(!fs::exists(path::join(root, "bindings.json.goml-bind.json")));
+    }
+}
+
+#[test]
+fn bind_go_cli_regenerates_stale_wrappers_without_executing_init() -> () {
+    let root = binding_cli_fixture("bind_go_stale_native");
+    let config = binding_cli_config().replace(
+        "\"import_path\":\"strings\",\"symbol\":\"Count\"",
+        "\"import_path\":\"example.com/bindings/shim\",\"symbol\":\"Value\"",
+    );
+    test_support::write_file(path::join(root, "bindings.json"), config);
+    let native = path::join(root, "shim/value.go");
+    test_support::write_file(
+        native,
+        "package shim\nfunc init() { panic(\"initializer must not execute\") }\nfunc Value(value int64) int64 { return value }\n",
+    );
+    test_support::assert_success(
+        test_support::project_command("bind-go", "", Vec::from_array(["bindings.json"]), root),
+    );
+    test_support::write_file(
+        native,
+        "package shim\nfunc init() { panic(\"initializer must not execute\") }\nfunc Value() int64 { return 42 }\n",
+    );
+    test_support::assert_success(
+        test_support::project_command("bind-go", "", Vec::from_array(["bindings.json"]), root),
+    );
+    test_support::assert_contains(
+        test_support::read_file(path::join(root, "bindings/generated.gom")),
+        "fn count() -> i64;",
+    );
+}
+
+#[test]
+fn bind_go_cli_checks_finite_generic_constraints_before_publication() -> () {
+    let root = binding_cli_fixture("bind_go_generic");
+    let config = "{\"version\":1,\"package\":\"bindings\",\"output\":\"bindings/generated.gom\",\"go_package\":\"native\",\"go_output\":\"native/generated.go\",\"go_import_path\":\"example.com/bindings/native\",\"functions\":[{\"name\":\"make\",\"import_path\":\"example.com/bindings/shim\",\"symbol\":\"Make\",\"type_arguments\":[{\"tag\":\"int64\"}]},{\"name\":\"read\",\"import_path\":\"example.com/bindings/shim\",\"symbol\":\"Read\"}],\"types\":[{\"name\":\"Number\",\"import_path\":\"example.com/bindings/shim\",\"symbol\":\"Numeric\",\"type_arguments\":[{\"tag\":\"int64\"}]}]}";
+    test_support::write_file(path::join(root, "bindings.json"), config);
+    test_support::write_file(
+        path::join(root, "shim/numeric.go"),
+        "package shim\ntype Numeric[T ~int64] struct { Value T }\nfunc Make[T ~int64](value T) Numeric[T] { return Numeric[T]{Value:value} }\nfunc Read(value Numeric[int64]) int64 { return value.Value }\n",
+    );
+    test_support::assert_success(
+        test_support::project_command("bind-go", "", Vec::from_array(["bindings.json"]), root),
+    );
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use module::bindings; fn main() -> () { println(bindings::read(bindings::make(42))); }",
+    );
+    test_support::assert_success(test_support::project_command("check", "", Vec::new(), root));
+    let run = test_support::project_command("run", "", Vec::new(), root);
+    test_support::assert_success(run);
+    testing::assert_eq(test_support::stdout(run), "42\n");
+    let go_file = path::join(root, "native/generated.go");
+    let goml_file = path::join(root, "bindings/generated.gom");
+    let previous_go = test_support::read_file(go_file);
+    let previous_goml = test_support::read_file(goml_file);
+    test_support::write_file(
+        path::join(root, "bindings.json"),
+        config.replace("\"tag\":\"int64\"", "\"tag\":\"string\""),
+    );
+    test_support::assert_failure(
+        test_support::project_command("bind-go", "", Vec::from_array(["bindings.json"]), root),
+    );
+    testing::assert_eq(test_support::read_file(go_file), previous_go);
+    testing::assert_eq(test_support::read_file(goml_file), previous_goml);
+}
+
+#[test]
+fn bind_go_cli_uses_native_output_internal_import_permissions() -> () {
+    for permitted in Vec::from_array([true, false]) {
+        let root = binding_cli_fixture(
+            if permitted {
+                "bind_go_internal_allowed"
+            } else {
+                "bind_go_internal_denied"
+            },
+        );
+        let native = if permitted {
+            "owner/native"
+        } else {
+            "outside/native"
+        };
+        let config = binding_cli_config().replace("native/generated.go", native + "/generated.go").replace(
+            "example.com/bindings/native",
+            "example.com/bindings/" + native,
+        ).replace(
+            "\"import_path\":\"strings\",\"symbol\":\"Count\"",
+            "\"import_path\":\"example.com/bindings/owner/internal/secret\",\"symbol\":\"Value\"",
+        );
+        test_support::write_file(path::join(root, "bindings.json"), config);
+        test_support::write_file(
+            path::join(root, "owner/internal/secret/secret.go"),
+            "package secret\nfunc Value() int64 { return 42 }\n",
+        );
+        let output = test_support::project_command(
+            "bind-go",
+            "",
+            Vec::from_array(["bindings.json"]),
+            root,
+        );
+        if permitted {
+            test_support::assert_success(output);
+            test_support::write_file(
+                path::join(root, "main.gom"),
+                "package main; use module::bindings; fn main() -> () { println(bindings::count()); }",
+            );
+            test_support::assert_success(
+                test_support::project_command("check", "", Vec::new(), root),
+            );
+            let run = test_support::project_command("run", "", Vec::new(), root);
+            test_support::assert_success(run);
+            testing::assert_eq(test_support::stdout(run), "42\n");
+        } else {
+            test_support::assert_failure(output);
+            test_support::assert_contains(test_support::stderr(output), "internal");
+            testing::assert(!fs::exists(path::join(root, "bindings/generated.gom")));
+        }
+        testing::assert(!fs::exists(path::join(path::join(root, native), ".goml-bind-go-query")));
+    }
+}
+
+#[test]
+fn bind_go_cli_preserves_preexisting_query_directories() -> () {
+    let root = binding_cli_fixture("bind_go_query_conflict");
+    let user_file = path::join(root, "native/.goml-bind-go-query/handwritten.txt");
+    test_support::write_file(user_file, "keep");
+    let output = test_support::project_command(
+        "bind-go",
+        "",
+        Vec::from_array(["bindings.json"]),
+        root,
+    );
+    test_support::assert_failure(output);
+    test_support::assert_contains(test_support::stderr(output), "query directory already exists");
+    testing::assert_eq(test_support::read_file(user_file), "keep");
+    testing::assert(!fs::exists(path::join(root, "native/generated.go")));
+    testing::assert(!fs::exists(path::join(root, ".goml-bind-go-lock")));
+}
+
+#[test]
+fn bind_go_cli_same_package_types_and_stale_wrappers_regenerate() -> () {
+    let root = binding_cli_fixture("bind_go_same_package");
+    let config = "{\"version\":1,\"package\":\"bindings\",\"output\":\"bindings/generated.gom\",\"go_package\":\"native\",\"go_output\":\"native/generated.go\",\"go_import_path\":\"example.com/bindings/native\",\"functions\":[{\"name\":\"make\",\"import_path\":\"example.com/bindings/native\",\"symbol\":\"Make\",\"type_arguments\":[{\"tag\":\"int64\"}]},{\"name\":\"read\",\"import_path\":\"example.com/bindings/native\",\"symbol\":\"Read\"}],\"types\":[{\"name\":\"Number\",\"import_path\":\"example.com/bindings/native\",\"symbol\":\"Numeric\",\"type_arguments\":[{\"tag\":\"int64\"}]}]}";
+    test_support::write_file(path::join(root, "bindings.json"), config);
+    let source = "package native\ntype Numeric[T ~int64] struct { Value T }\nfunc Make[T ~int64](value T) Numeric[T] { return Numeric[T]{Value:value} }\nfunc Read(value Numeric[int64]) int64 { return value.Value }\n";
+    let native = path::join(root, "native/numeric.go");
+    test_support::write_file(native, source);
+    for changed in Vec::from_array([false, true]) {
+        if changed {
+            test_support::write_file(
+                native,
+                source.replace("(value T) Numeric[T]", "(value T, extra T) Numeric[T]"),
+            );
+        }
+        test_support::assert_success(
+            test_support::project_command("bind-go", "", Vec::from_array(["bindings.json"]), root),
+        );
+        let args = if changed {
+            "40, 2"
+        } else {
+            "40"
+        };
+        test_support::write_file(
+            path::join(root, "main.gom"),
+            "package main; use module::bindings; fn main() -> () { println(bindings::read(bindings::make("
+                + args
+                + "))); }",
+        );
+        test_support::assert_success(test_support::project_command("check", "", Vec::new(), root));
+        let run = test_support::project_command("run", "", Vec::new(), root);
+        test_support::assert_success(run);
+        testing::assert_eq(test_support::stdout(run), "40\n");
+        let generated = test_support::read_file(path::join(root, "native/generated.go"));
+        testing::assert(!generated.contains("\"example.com/bindings/native\""));
+        test_support::assert_contains(generated, "Numeric[int64]");
+        test_support::assert_contains(generated, "Make[int64](");
+    }
+}
+
+#[test]
+fn bind_go_cli_candidate_conflicts_preserve_previous_outputs() -> () {
+    let root = binding_cli_fixture("bind_go_candidate_conflict");
+    test_support::assert_success(
+        test_support::project_command("bind-go", "", Vec::from_array(["bindings.json"]), root),
+    );
+    let previous = test_support::read_file(path::join(root, "native/generated.go"));
+    let conflict = path::join(root, "native/handwritten.go");
+    test_support::write_file(conflict, "package native\nfunc GomlBind_count() {}\n");
+    test_support::assert_failure(
+        test_support::project_command("bind-go", "", Vec::from_array(["bindings.json"]), root),
+    );
+    testing::assert_eq(test_support::read_file(path::join(root, "native/generated.go")), previous);
+    testing::assert(test_support::read_file(conflict).contains("func GomlBind_count"));
+}
+
+#[test]
+fn bind_go_cli_type_only_outputs_validate_native_package_before_publication() -> () {
+    let root = binding_cli_fixture("bind_go_type_only");
+    let config = "{\"version\":1,\"package\":\"bindings\",\"output\":\"bindings/generated.gom\",\"go_package\":\"native\",\"go_output\":\"native/generated.go\",\"go_import_path\":\"example.com/bindings/native\",\"types\":[{\"name\":\"Duration\",\"import_path\":\"time\",\"symbol\":\"Duration\"}]}";
+    test_support::write_file(path::join(root, "bindings.json"), config);
+    test_support::assert_success(
+        test_support::project_command("bind-go", "", Vec::from_array(["bindings.json"]), root),
+    );
+    test_support::assert_success(test_support::project_command("check", "", Vec::new(), root));
+    let go_file = path::join(root, "native/generated.go");
+    let previous = test_support::read_file(go_file);
+    test_support::write_file(path::join(root, "native/handwritten.go"), "package different\n");
+    test_support::assert_failure(
+        test_support::project_command("bind-go", "", Vec::from_array(["bindings.json"]), root),
+    );
+    testing::assert_eq(test_support::read_file(go_file), previous);
+}
+
+#[test]
+fn bind_go_cli_candidate_import_cycles_do_not_replace_outputs() -> () {
+    let root = binding_cli_fixture("bind_go_candidate_cycle");
+    test_support::assert_success(
+        test_support::project_command("bind-go", "", Vec::from_array(["bindings.json"]), root),
+    );
+    let previous = test_support::read_file(path::join(root, "native/generated.go"));
+    test_support::write_file(
+        path::join(root, "native/handwritten.go"),
+        "package native\nfunc Value() int64 { return 42 }\n",
+    );
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\nimport \"example.com/bindings/native\"\nfunc Value() int64 { return native.Value() }\n",
+    );
+    let config = binding_cli_config().replace(
+        "\"import_path\":\"strings\",\"symbol\":\"Count\"",
+        "\"import_path\":\"example.com/bindings/shim\",\"symbol\":\"Value\"",
+    );
+    test_support::write_file(path::join(root, "bindings.json"), config);
+    let output = test_support::project_command(
+        "bind-go",
+        "",
+        Vec::from_array(["bindings.json"]),
+        root,
+    );
+    test_support::assert_failure(output);
+    test_support::assert_contains(test_support::stderr(output), "import cycle");
+    testing::assert_eq(test_support::read_file(path::join(root, "native/generated.go")), previous);
+}
+
+#[test]
+fn bind_go_cli_explicit_variadic_instances_pass_candidate_validation() -> () {
+    let root = binding_cli_fixture("bind_go_variadic");
+    let config = binding_cli_config().replace(
+        "\"import_path\":\"strings\",\"symbol\":\"Count\"",
+        "\"import_path\":\"example.com/bindings/shim\",\"symbol\":\"Sum\",\"type_arguments\":[{\"tag\":\"int64\"}]",
+    );
+    test_support::write_file(path::join(root, "bindings.json"), config);
+    test_support::write_file(
+        path::join(root, "shim/sum.go"),
+        "package shim\nfunc Sum[T ~int64](values ...T) T { var sum T; for _, value := range values { sum += value }; return sum }\n",
+    );
+    test_support::assert_success(
+        test_support::project_command("bind-go", "", Vec::from_array(["bindings.json"]), root),
+    );
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main; use module::bindings; use std::ffi; fn main() -> () { let values: Vec[i64] = Vec::from_array([1, 2, 3]); println(bindings::count(ffi::slice_shared(values))); }",
+    );
+    test_support::assert_success(test_support::project_command("check", "", Vec::new(), root));
+    let run = test_support::project_command("run", "", Vec::new(), root);
+    test_support::assert_success(run);
+    testing::assert_eq(test_support::stdout(run), "6\n");
+    test_support::assert_contains(
+        test_support::read_file(path::join(root, "native/generated.go")),
+        "Sum[int64](p0...)",
+    );
+}

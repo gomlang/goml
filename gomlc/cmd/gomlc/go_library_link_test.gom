@@ -1,0 +1,145 @@
+package main;
+
+use module::artifact;
+use module::artifact::core_codec;
+use module::core;
+use module::mono;
+use std::fs;
+use std::path;
+use std::testing;
+
+fn compile_go_library_piece(
+    directory: string,
+    name: string,
+    source: string,
+    interfaces: Vec[string],
+) -> Result[ArtifactCompiledPackage, string] {
+    let source_path = path::join(directory, name + ".gom");
+    fs::write_file_structured(source_path, source).map_err(|error| error.to_string())?;
+    compile_artifact_package(
+        test_package_world(),
+        PackageCommandArgs {
+            foreign_validation: Option::None,
+            package_name: "demo::" + name,
+            module_name: "demo",
+            inputs: Vec::from_array([source_path]),
+            interface_paths: interfaces,
+            output: path::join(directory, name),
+            world: Option::None,
+        },
+        true,
+        false,
+    )
+}
+
+fn exercise_go_library_roots(directory: string) -> Result[(), string] {
+    fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    let helpers = compile_go_library_piece(
+        directory,
+        "helpers",
+        "package helpers; fn identity[T](value: T) -> T { value } pub fn help(value: i64) -> i64 { identity(value) } #[go_export(\"Unselected\")] pub fn unselected() -> i64 { 99 } fn dead() -> i64 { 0 }",
+        Vec::new(),
+    )?;
+    let interface_path = path::join(directory, "helpers.interface");
+    write_artifact_interface(interface_path, helpers.interface_unit)?;
+    let calc = compile_go_library_piece(
+        directory,
+        "calc",
+        "package calc; use demo::helpers; static CELL: OnceCell[i64] = OnceCell::new(); #[go_export(\"Add\")] pub fn add(value: i64) -> i64 { helpers::help(value) + CELL.get_or_init(|| 2) } pub fn unused() -> i64 { 0 }",
+        Vec::from_array([interface_path]),
+    )?;
+    let units = Vec::from_array(
+        [
+            core_codec::decode_binary(core_codec::encode_binary(helpers.core_unit)?)?,
+            core_codec::decode_binary(core_codec::encode_binary(calc.core_unit)?)?,
+        ],
+    );
+    let linked = link_go_library_core(test_package_world(), units, "demo::calc")?;
+    testing::assert_eq(linked.exports.len(), 1);
+    testing::assert_eq(linked.exports[0].go_name, "Add");
+    let mut roots = 0;
+    for function in linked.core_value.functions {
+        if function.root {
+            roots += 1;
+            testing::assert_eq(function.name, "demo::calc::add");
+        }
+    }
+    testing::assert_eq(roots, 1);
+    let pruned = eliminate_core_dead_code(linked.core_value);
+    let mut helper = false;
+    let mut generic = false;
+    for function in pruned.functions {
+        if function.name.contains("unselected") {
+            return Result::Err("unexpected retained function: " + function.name)
+        }
+        if function.name.contains("unused") {
+            return Result::Err("unexpected retained function: " + function.name)
+        }
+        if function.name.contains("::dead") {
+            return Result::Err("unexpected retained function: " + function.name)
+        }
+        helper = helper || function.name == "demo::helpers::help";
+        generic = generic || function.name == "demo::helpers::identity";
+    }
+    if !helper {
+        return Result::Err("library assertion failed: helper")
+    }
+    if !generic {
+        return Result::Err("library assertion failed: generic")
+    }
+    let lowered = mono::lower_checked(pruned);
+    if let Some(message) = lowered.error {
+        return Result::Err(message)
+    }
+    let mono_value = mono::dce(lowered.file);
+    mono::validate(mono_value)?;
+    let mut retained = false;
+    for function in mono_value.functions {
+        retained = retained || function.name.contains("identity");
+        if function.name == "main" {
+            return Result::Err("unexpected Mono main")
+        }
+    }
+    if !retained {
+        return Result::Err("library assertion failed: retained")
+    }
+    let lifted = lower_lift_stage(mono_value, test_package_world().counter);
+    let anf_value = lower_anf_stage(lifted, test_package_world().counter);
+    let mut exported = false;
+    for function in anf_value.functions {
+        exported = exported || function.name == "demo::calc::add";
+    }
+    if !exported {
+        return Result::Err("library assertion failed: exported")
+    }
+    if anf_value.statics.is_empty() {
+        return Result::Err("library static was removed")
+    }
+    if core::with_function_roots(linked.core_value, Vec::from_array(["missing"])).is_ok() {
+        return Result::Err("missing root accepted")
+    }
+    if core::with_function_roots(linked.core_value, Vec::from_array(["demo::helpers::identity"])).is_ok() {
+        return Result::Err("generic root accepted")
+    }
+    if core::with_function_roots(
+        linked.core_value,
+        Vec::from_array(["demo::calc::add", "demo::calc::add"]),
+    ).is_ok() {
+        return Result::Err("duplicate root accepted")
+    }
+    if link_go_library_core(test_package_world(), units, "missing").is_ok() {
+        return Result::Err("missing package accepted")
+    }
+    Result::Ok(())
+}
+
+#[test]
+fn go_library_roots_preserve_only_selected_exports_and_their_dependencies() -> () {
+    let temporary = temp_go_path("go-library.gom", "roots");
+    let result = exercise_go_library_roots(path::parent(temporary).unwrap_or(""));
+    cleanup_temp_directory(temporary);
+    match result {
+        Ok(()) => (),
+        Err(message) => testing::fail(message),
+    }
+}

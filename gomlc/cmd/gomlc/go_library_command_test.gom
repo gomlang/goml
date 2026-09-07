@@ -1,0 +1,289 @@
+package main;
+
+use module::ffi;
+use module::go_backend;
+use std::json;
+use std::env;
+use std::fs;
+use std::path;
+use std::process;
+use std::testing;
+use std::utf8;
+use utf8::BytesUtf8;
+
+fn go_library_cli_args(core_path: string, output: string, go_package: string) -> Vec[string] {
+    let args = Vec::from_array(
+        [
+            "__link-go-library",
+            "--input",
+            core_path,
+            "--package",
+            "demo::calc",
+            "--go-package",
+            go_package,
+            "--output",
+            output,
+        ],
+    );
+    if let Ok(world) = env::var_structured("GOML_TEST_COMPILER_WORLD") {
+        args.push("--world");
+        args.push(world)
+    }
+    args
+}
+
+fn exercise_go_library_command(directory: string) -> Result[(), string] {
+    fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    let compiled = compile_go_library_piece(
+        directory,
+        "calc",
+        "package calc; #[go_export(\"Add\")] pub fn add(a: i64, b: i64) -> i64 { a + b }",
+        Vec::new(),
+    )?;
+    let core_path = path::join(directory, "calc.core");
+    write_artifact_core(core_path, compiled.core_unit)?;
+    let output_path = path::join(directory, "goml_generated.go");
+    let compiler = env::var_structured("GOML_TEST_GOMLC").unwrap_or("../stage2/bin/gomlc");
+    let output = process::Command::new(compiler).args(
+        go_library_cli_args(core_path, output_path, "calclib"),
+    ).output_structured().map_err(|error| error.to_string())?;
+    if !output.status().success() {
+        return Result::Err(output.stderr().to_string_utf8().unwrap_or("Go library command failed"))
+    }
+    let generated = fs::read_file_structured(output_path).map_err(|error| error.to_string())?;
+    testing::assert(generated.starts_with("package calclib\n"));
+    testing::assert(generated.contains("func Add("));
+    testing::assert(!generated.contains("func main("));
+    let output = process::Command::new(compiler).args(
+        go_library_cli_args(core_path, output_path, "main"),
+    ).output_structured().map_err(|error| error.to_string())?;
+    testing::assert(!output.status().success());
+    testing::assert_eq(
+        fs::read_file_structured(output_path).map_err(|error| error.to_string())?,
+        generated,
+    );
+    let foreign = compile_go_library_piece(
+        directory,
+        "calc",
+        "package calc; #[go_ffi(\"math\", \"Abs\")] extern fn abs(value: f64) -> f64; #[go_export(\"Abs\")] pub fn absolute(value: f64) -> f64 { abs(value) }",
+        Vec::new(),
+    )?;
+    write_artifact_core(core_path, foreign.core_unit)?;
+    let output = process::Command::new(compiler).args(
+        go_library_cli_args(core_path, output_path, "calclib"),
+    ).output_structured().map_err(|error| error.to_string())?;
+    testing::assert(!output.status().success());
+    testing::assert(output.stderr().to_string_utf8().unwrap_or("").contains("explicit --ffi-check"));
+    testing::assert_eq(
+        fs::read_file_structured(output_path).map_err(|error| error.to_string())?,
+        generated,
+    );
+    let validated_args = go_library_cli_args(core_path, output_path, "calclib");
+    let api_output = path::join(directory, "api.json");
+    validated_args.push("--api-output");
+    validated_args.push(api_output);
+    let context_path = path::join(directory, "context.json");
+    for value in Vec::from_array(
+        [
+            "--ffi-check",
+            "required",
+            "--context",
+            context_path,
+            "--caller-mode",
+            "package",
+            "--caller-directory",
+            directory,
+            "--caller-import-path",
+            "example.com/calclib",
+            "--caller-package",
+            "calclib",
+        ],
+    ) {
+        validated_args.push(value)
+    }
+    fs::write_file_structured(
+        path::join(directory, "go.mod"),
+        "module example.com/calclib\n\ngo 1.25\n",
+    ).map_err(|error| error.to_string())?;
+    let context = resolve_foreign_build_context("go", directory)?;
+    fs::write_file_structured(context_path, json::encode(ffi::build_context_json(context))).map_err(
+        |error| error.to_string(),
+    )?;
+    let output = process::Command::new(compiler).args(validated_args).output_structured().map_err(
+        |error| error.to_string(),
+    )?;
+    if !output.status().success() {
+        return Result::Err(
+            output.stderr().to_string_utf8().unwrap_or("required library verification failed"),
+        )
+    }
+    let verified = fs::read_file_structured(output_path).map_err(|error| error.to_string())?;
+    testing::assert(verified.contains("func Abs("));
+    let api = json::parse(fs::read_file_structured(api_output).map_err(|error| error.to_string())?)?;
+    let entries = json::as_array(json::field(api, "exports").ok_or("missing API exports")?).ok_or(
+        "invalid API exports",
+    )?;
+    testing::assert_eq(entries.len(), 1);
+    testing::assert(
+        json::field(entries[0], "name").and_then(|value| json::as_string(value))
+            == Option::Some("Abs"),
+    );
+    testing::assert(json::encode(entries[0]).contains("float64"));
+    Result::Ok(())
+}
+
+#[test]
+fn go_library_compiler_command_emits_selected_exports_and_preserves_output_on_failure() -> () {
+    let temporary = temp_go_path("go-library.gom", "command");
+    let result = exercise_go_library_command(path::parent(temporary).unwrap_or(""));
+    cleanup_temp_directory(temporary);
+    match result {
+        Ok(()) => (),
+        Err(message) => testing::fail(message),
+    }
+}
+
+#[test]
+fn go_library_command_rejects_invalid_and_repeated_options() -> () {
+    for name in Vec::from_array(["main", "_", "package", "bad-name", "9name", "name\npackage main"]) {
+        let args = Vec::from_array(["gomlc"]);
+        for argument in go_library_cli_args("calc.core", "output.go", name) {
+            args.push(argument)
+        }
+        testing::assert(parse_go_library_command(args).is_err());
+    }
+    let args = Vec::from_array(["gomlc"]);
+    for argument in go_library_cli_args("calc.core", "output.go", "calclib") {
+        args.push(argument)
+    }
+    testing::assert(parse_go_library_command(args).is_ok());
+    args.push("--go-package");
+    args.push("calclib");
+    testing::assert(parse_go_library_command(args).is_err());
+}
+
+fn exercise_go_library_source_artifact_equivalence(directory: string) -> Result[(), string] {
+    fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    let repository = env::var_structured("GOML_REPO").unwrap_or("..");
+    let source = fs::read_file_structured(
+        path::join(repository, "tools/release/testdata/go-export/calc.gom"),
+    ).map_err(|error| error.to_string())?;
+    let compiled = compile_go_library_piece(directory, "calc", source, Vec::new())?;
+    let core_path = path::join(directory, "calc.core");
+    write_artifact_core(core_path, compiled.core_unit)?;
+    let world = test_package_world();
+    let linked = link_go_library_core(world, Vec::from_array([compiled.core_unit]), "demo::calc")?;
+    let source_api = json::encode(go_library_api(linked.exports)?);
+    let mono_value = lower_mono_or_fail(linked.core_value);
+    let anf_value = lower_anf_stage(lower_lift_stage(mono_value, world.counter), world.counter);
+    let declarations: Vec[(string, string)] = Vec::new();
+    for exported in linked.exports {
+        declarations.push((exported.symbol, exported.go_name))
+    }
+    let generated = go_backend::encode_package(
+        go_backend::lower_library(anf_value, declarations)?,
+        "calclib",
+    );
+    let direct_directory = path::join(directory, "direct");
+    let artifact_directory = path::join(directory, "encoded");
+    fs::create_dir_all(direct_directory).map_err(|error| error.to_string())?;
+    fs::create_dir_all(artifact_directory).map_err(|error| error.to_string())?;
+    fs::write_file_structured(path::join(direct_directory, "goml_generated.go"), generated).map_err(
+        |error| error.to_string(),
+    )?;
+    fs::remove_file(path::join(directory, "calc.gom")).map_err(|error| error.to_string())?;
+    fs::write_file_structured(
+        path::join(directory, "go.mod"),
+        "module example.com/equivalence\n\ngo 1.25\n",
+    ).map_err(|error| error.to_string())?;
+    let context_path = path::join(directory, "context.json");
+    let context = resolve_foreign_build_context("go", directory)?;
+    fs::write_file_structured(context_path, json::encode(ffi::build_context_json(context))).map_err(
+        |error| error.to_string(),
+    )?;
+    let api_path = path::join(directory, "api.json");
+    let args = go_library_cli_args(
+        core_path,
+        path::join(artifact_directory, "goml_generated.go"),
+        "calclib",
+    );
+    for argument in Vec::from_array(
+        [
+            "--api-output",
+            api_path,
+            "--ffi-check",
+            "required",
+            "--context",
+            context_path,
+            "--caller-mode",
+            "files",
+            "--caller-import-path",
+            "command-line-arguments",
+            "--caller-directory",
+            artifact_directory,
+            "--caller-package",
+            "calclib",
+        ],
+    ) {
+        args.push(argument)
+    }
+    let compiler = env::var_structured("GOML_TEST_GOMLC").unwrap_or("../stage2/bin/gomlc");
+    let output = process::Command::new(compiler).args(args).output_structured().map_err(
+        |error| error.to_string(),
+    )?;
+    if !output.status().success() {
+        return Result::Err(output.stderr().to_string_utf8().unwrap_or("artifact linking failed"))
+    }
+    let artifact_api = json::parse(
+        fs::read_file_structured(api_path).map_err(|error| error.to_string())?,
+    )?;
+    testing::assert_eq(json::encode(artifact_api), source_api);
+    let host =
+        \\package equivalence_test
+        \\import (
+        \\    "testing"
+        \\    direct "example.com/equivalence/direct"
+        \\    encoded "example.com/equivalence/encoded"
+        \\)
+        \\func TestEquivalentLibraries(t *testing.T) {
+        \\    for _, add := range []func(int64, int64) int64{direct.Add, encoded.Add} {
+        \\        if add(19, 23) != 42 { t.Fatal("Add") }
+        \\    }
+        \\    for _, abs := range []func(float64) float64{direct.AbsPlusOne, encoded.AbsPlusOne} {
+        \\        if abs(-3) != 4 { t.Fatal("AbsPlusOne") }
+        \\    }
+        \\    for _, pair := range []func(int64) (int64, int64){direct.Pair, encoded.Pair} {
+        \\        a, b := pair(7)
+        \\        if a != 7 || b != 8 { t.Fatal("Pair") }
+        \\    }
+        \\}
+    ;
+    fs::write_file_structured(path::join(directory, "host_test.go"), host).map_err(
+        |error| error.to_string(),
+    )?;
+    let output = process::Command::new("go").args(Vec::from_array(["test", "./..."])).current_dir(
+        directory,
+    ).env("GOWORK", "off").env("GOTOOLCHAIN", "local").env("GOPROXY", "off").output_structured().map_err(
+        |error| error.to_string(),
+    )?;
+    if !output.status().success() {
+        return Result::Err(
+            output.stdout().to_string_utf8().unwrap_or("")
+                + output.stderr().to_string_utf8().unwrap_or(""),
+        )
+    }
+    Result::Ok(())
+}
+
+#[test]
+fn go_library_complete_fixture_has_equal_source_and_artifact_apis_and_results() -> () {
+    let temporary = temp_go_path("go-library.gom", "equivalence");
+    let result = exercise_go_library_source_artifact_equivalence(
+        path::parent(temporary).unwrap_or(""),
+    );
+    cleanup_temp_directory(temporary);
+    match result {
+        Ok(()) => (),
+        Err(message) => testing::fail(message),
+    }
+}

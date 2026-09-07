@@ -1,0 +1,220 @@
+package main;
+
+use module::artifact;
+use module::artifact::interface_codec;
+use module::core;
+use module::ffi;
+use module::tast;
+use std::env;
+use std::fs;
+use std::json;
+use std::path;
+use std::testing;
+use std::utf8;
+use utf8::BytesUtf8;
+
+fn imported_bridge_constructor() -> tast::Type {
+    tast::Type::Func {
+        params: Vec::from_array(
+            [
+                tast::Type::Func {
+                    params: Vec::from_array([tast::Type::MutSlice { elem: tast::Type::Uint8 }]),
+                    ret_ty: tast::Type::Tuple {
+                        items: Vec::from_array(
+                            [
+                                tast::Type::Int,
+                                tast::Type::External {
+                                    import_path: "",
+                                    name: "error",
+                                    args: Vec::new(),
+                                },
+                            ],
+                        ),
+                    },
+                },
+            ],
+        ),
+        ret_ty: tast::Type::External { import_path: "io", name: "Reader", args: Vec::new() },
+    }
+}
+
+fn write_imported_bridge_units(
+    directory: string,
+    method: string,
+    metadata: ffi::ForeignTypeMetadata,
+) -> Result[(), string] {
+    let ty = imported_bridge_constructor();
+    let binding = "audit::value::bridge";
+    let callable = tast::Callable::GoInterfaceBridge { binding, methods: Vec::from_array([method]) };
+    let exports = interface_codec::empty_exports();
+    exports.functions.push(
+        artifact::ArtifactFnScheme {
+            name: binding,
+            comptime: tast::ComptimeCapability::RuntimeOnly,
+            type_params: Vec::new(),
+            constraints: Vec::new(),
+            ty,
+            body: callable,
+        },
+    );
+    let interface = interface_codec::new_unit(
+        "audit::value",
+        exports,
+        artifact::ArtifactPackageInterface {
+            package_name: "audit::value",
+            name: "value",
+            value_exports: Vec::new(),
+            enum_variants: Vec::new(),
+        },
+        Vec::new(),
+    );
+    let interface = interface_codec::with_foreign_types(interface, metadata)?;
+    write_artifact_interface(path::join(directory, "calc.interface"), interface)?;
+    let core_ty = core::lower_type(ty);
+    let file = empty_core_file();
+    file.functions.push(
+        core::Function {
+            name: "audit::value::hidden",
+            origin: core::FunctionOrigin::Source,
+            root: false,
+            generics: Vec::new(),
+            predicates: Vec::new(),
+            trait_impl: Option::None,
+            params: Vec::new(),
+            ret_ty: core_ty,
+            body: core::Block {
+                stmts: Vec::new(),
+                tail: Option::Some(
+                    core::Expr::Block {
+                        ty: core_ty,
+                        block: core::Block {
+                            stmts: Vec::new(),
+                            tail: Option::Some(
+                                core::Expr::Callable {
+                                    callable: core::lower_callable(callable),
+                                    ty: core_ty,
+                                },
+                            ),
+                        },
+                    },
+                ),
+            },
+        },
+    );
+    write_artifact_core(
+        path::join(directory, "calc.core"),
+        artifact::ArtifactCoreUnit {
+            source_origins: Vec::new(),
+            external_applications: Vec::new(),
+            foreign_types: Option::Some(metadata),
+            package_name: "audit::value",
+            declared_name: "value",
+            interface_hash: interface.interface_hash,
+            exports: interface_codec::empty_exports(),
+            core_ir: file,
+            deps: Vec::new(),
+            sources: Vec::new(),
+            tests: Vec::new(),
+        },
+    )
+}
+
+fn exercise_imported_bridge_validation(directory: string) -> Result[(), string] {
+    let directory = path::absolute_structured(directory).map_err(|error| error.to_string())?;
+    ffi_driver_fixture(directory)?;
+    let context = resolve_foreign_build_context("go", directory)?;
+    fs::write_file_structured(
+        path::join(directory, "context.json"),
+        json::encode(ffi::build_context_json(context)),
+    ).map_err(|error| error.to_string())?;
+    let compiler = path::absolute_structured(
+        env::var_structured("GOML_TEST_GOMLC").unwrap_or("../stage2/bin/gomlc"),
+    ).map_err(|error| error.to_string())?;
+    let helper = path::join(path::parent(compiler).unwrap_or(""), "goml-go-meta");
+    let caller = ffi::CallerContext {
+        generated_source: Option::None,
+        load_mode: "package",
+        import_path: "example.com/host/gen",
+        directory: path::join(directory, "gen"),
+        package_name: "gen",
+    };
+    let queries = Vec::from_array(
+        [
+            ffi::TypeDeclarationQuery {
+                type_id: "audit::value::Reader",
+                import_path: "io",
+                name: "Reader",
+            },
+        ],
+    );
+    let metadata = ffi::ForeignTypeMetadata {
+        queries,
+        instances: Vec::new(),
+        declarations: run_foreign_type_declarations(helper, context, caller, queries)?,
+    };
+    testing::assert(
+        ffi::encode_foreign_type_metadata(
+            ffi::ForeignTypeMetadata {
+                queries: Vec::new(),
+                instances: Vec::new(),
+                declarations: metadata.declarations,
+            },
+        ).is_err(),
+    );
+    for variant in 0..3 {
+        let metadata = if variant == 2 {
+            ffi::ForeignTypeMetadata {
+                queries: Vec::new(),
+                instances: Vec::new(),
+                declarations: ffi::TypeDeclarations {
+                    go_world_identity: metadata.declarations.go_world_identity,
+                    declarations: Vec::new(),
+                    nodes: HashMap::new(),
+                },
+            }
+        } else {
+            metadata
+        };
+        write_imported_bridge_units(
+            directory,
+            if variant == 1 {
+                "Write"
+            } else {
+                "Read"
+            },
+            metadata,
+        )?;
+        for core in Vec::from_array([false, true]) {
+            for mode in Vec::from_array(["required", "off"]) {
+                let output = foreign_type_artifact_output(compiler, directory, mode, core)?;
+                let error = output.stderr().to_string_utf8().unwrap_or("");
+                if variant == 0 {
+                    if !output.status().success() {
+                        return Result::Err(error)
+                    }
+                } else {
+                    if output.status().success() {
+                        return Result::Err("invalid imported bridge unexpectedly passed")
+                    }
+                    let expected = if variant == 1 {
+                        "target method does not exist"
+                    } else {
+                        "verified native interface metadata"
+                    };
+                    if !error.contains(expected) {
+                        return Result::Err(error)
+                    }
+                }
+            }
+        }
+    }
+    Result::Ok(())
+}
+
+#[test]
+fn go_interface_bridge_imports_require_current_complete_metadata() -> () {
+    match exercise_imported_bridge_validation("_artifact/go-interface-import-validation") {
+        Ok(_) => (),
+        Err(error) => testing::fail(error),
+    }
+}

@@ -1,0 +1,519 @@
+package tast;
+
+use module::ast;
+use module::ffi;
+use module::hir;
+use module::parser;
+use std::json;
+use std::testing;
+
+fn external_type_test_metadata(requests: Vec[ExternalTypeRequest]) -> ffi::TypeDeclarations {
+    let declarations: Vec[ffi::TypeDeclaration] = Vec::new();
+    let nodes: HashMap[string, json::Value] = HashMap::new();
+    nodes["basic"] = json::object(
+        Vec::from_array(
+            [("tag", json::Value::String("basic")), ("name", json::Value::String("int64"))],
+        ),
+    );
+    for request in requests {
+        let id = request.query.type_id;
+        declarations.push(ffi::TypeDeclaration { type_id: id, kind: "defined", declared_type: id });
+        nodes[id] = json::object(
+            Vec::from_array(
+                [
+                    ("tag", json::Value::String("named")),
+                    ("name", json::Value::String(request.query.name)),
+                    ("import_path", json::Value::String(request.query.import_path)),
+                    ("underlying", json::Value::String("basic")),
+                ],
+            ),
+        );
+    }
+    ffi::TypeDeclarations { go_world_identity: "test-world", declarations, nodes }
+}
+
+fn exercise_external_type_environment() -> Result[(), string] {
+    let first = dependency_hir(
+        "package api; #[go_type(\"time\", \"Duration\")] pub extern type Delay;",
+        "alice::api",
+    );
+    let second = dependency_hir(
+        "package api; #[go_type(\"time\", \"Duration\")] extern type Duration;",
+        "bob::api",
+    );
+    let requests = external_type_requests(Vec::from_array([first, second]))?;
+    testing::assert_eq(requests.len(), 2);
+    testing::assert_eq(requests[0].query.type_id, "alice::api::Delay");
+    testing::assert_eq(requests[1].query.type_id, "bob::api::Duration");
+    let environment = resolve_external_type_environment(
+        requests,
+        external_type_test_metadata(requests),
+    )?;
+    testing::assert_eq(environment.types.len(), 2);
+    testing::assert_eq(environment.types[0].source_path, first.source_path);
+    testing::assert_eq(
+        environment.types[0].declaration.name_span.start,
+        requests[0].declaration.name_span.start,
+    );
+    testing::assert_eq(
+        ffi::go_type_identity_key(environment.types[0].template.identity),
+        ffi::go_type_identity_key(environment.types[1].template.identity),
+    );
+    testing::assert(external_type_requests(Vec::from_array([first, first])).is_err());
+    let generic = dependency_hir(
+        "package api; #[go_type(\"time\", \"Duration\")] extern type Duration[T];",
+        "test::api",
+    );
+    let generic_requests = external_type_requests(Vec::from_array([generic]))?;
+    match resolve_external_type_environment(
+        generic_requests,
+        external_type_test_metadata(generic_requests),
+    ) {
+        Err(error) => {
+            testing::assert(error.contains("test::api::Duration"));
+            testing::assert(error.contains("declares 1 type parameters"));
+            testing::assert(error.contains("requires 0"));
+        },
+        Ok(_) => testing::fail("expected external generic arity diagnostic"),
+    }
+    testing::assert(
+        resolve_external_type_environment(requests, external_type_test_metadata(Vec::new())).is_err(),
+    );
+    let empty = resolve_external_type_environment(
+        Vec::new(),
+        external_type_test_metadata(Vec::new()),
+    )?;
+    testing::assert(empty.types.is_empty());
+    Result::Ok(())
+}
+
+#[test]
+fn external_type_environment_preserves_source_identity_and_checks_arity() -> () {
+    if let Err(error) = exercise_external_type_environment() {
+        testing::fail(error)
+    }
+}
+
+fn test_external_type(name: string, args: Vec[Type]) -> Type {
+    Type::External { import_path: "example.com/host", name, args }
+}
+
+#[test]
+fn external_types_preserve_nominality_and_inference_occurs_checks() -> () {
+    let duration = Type::External { import_path: "time", name: "Duration", args: Vec::new() };
+    assert_external_type(!types_equal(duration, Type::Int64), "Duration must differ from i64");
+    assert_external_type(!unify(duration, Type::Int64), "Duration must not unify with i64");
+    assert_external_type(
+        !types_equal(duration, Type::Con { name: "time::Duration" }),
+        "external and GoML nominal identities must differ",
+    );
+    assert_external_type(
+        !types_equal(duration, test_external_type("Duration", Vec::new())),
+        "Go import path must participate in identity",
+    );
+    let variable = fresh_type(Ref::new(100), VarKind::Any);
+    assert_external_type(
+        !unify(variable, test_external_type("Box", Vec::from_array([variable]))),
+        "external arguments must participate in occurs checking",
+    );
+    let parameter = Type::Param { name: "T" };
+    let template = test_external_type("Box", Vec::from_array([parameter]));
+    let concrete = test_external_type("Box", Vec::from_array([duration]));
+    assert_external_type(
+        types_equal(
+            substitute_params(template, Vec::from_array(["T"]), Vec::from_array([duration])),
+            concrete,
+        ),
+        "external generic substitution must preserve nominal identity",
+    );
+    let inferred = test_external_type("Box", Vec::from_array([variable]));
+    assert_external_type(
+        contains_unbound_type_variable(inferred),
+        "external arguments must expose unbound variables",
+    );
+    assert_external_type(
+        !type_is_concrete(inferred),
+        "external arguments must remain nonconcrete until inferred",
+    );
+    assert_external_type(
+        call_types_compatible(inferred, concrete),
+        "compatible external types must permit argument inference",
+    );
+    assert_external_type(unify(inferred, concrete), "external type arguments must unify");
+    assert_external_type(
+        types_equal(resolve_type(inferred), concrete),
+        "resolving external arguments must preserve the constructor",
+    );
+    assert_external_type(type_is_concrete(inferred), "inferred external types must be concrete");
+    assert_external_type(
+        !contains_unbound_type_variable(inferred),
+        "inferred arguments must no longer be unresolved",
+    );
+    assert_external_type(
+        type_contains_error(test_external_type("Box", Vec::from_array([Type::Error]))),
+        "external arguments must retain errors",
+    );
+    assert_external_type(
+        type_contains_parameter(template, "T"),
+        "external arguments must retain type parameters",
+    );
+    let numeric = fresh_type(Ref::new(200), VarKind::Integer);
+    assert_external_type(
+        !unify(numeric, duration),
+        "integer literals must not infer as defined Go types",
+    );
+    assert_external_type(
+        type_text(concrete).contains("time"),
+        "external type diagnostics must include the Go package",
+    );
+    assert_external_type(
+        type_text(concrete).contains("Duration"),
+        "external type diagnostics must include the Go object",
+    );
+}
+
+fn assert_external_type(condition: bool, message: string) -> () {
+    if !condition {
+        testing::fail(message)
+    }
+}
+
+fn external_source_files(sources: Vec[string]) -> Vec[hir::File] {
+    let parsed = Vec::new();
+    for source in sources {
+        parsed.push(parser::parse(source))
+    }
+    let inputs = Vec::new();
+    let files = ast::lower_package(parsed);
+    for index in range(0, files.len()) {
+        inputs.push((files[index], "source" + index.to_string() + ".gom"))
+    }
+    let result = Vec::new();
+    for lowered in hir::lower_package_files(inputs, "test::api") {
+        for diagnostic in lowered.diagnostics {
+            testing::fail(diagnostic.message)
+        }
+        if let Some(file) = lowered.hir {
+            result.push(file)
+        }
+    }
+    result
+}
+
+fn check_external_source(sources: Vec[string]) -> Result[CheckResult, string] {
+    let files = external_source_files(sources);
+    let requests = external_type_requests(files)?;
+    let external = resolve_external_type_environment(
+        requests,
+        external_type_test_metadata(requests),
+    )?;
+    let dependencies = Vec::new();
+    dependencies.push(implicit_builtin_dependency_environment()?);
+    for environment in dependency_environments(implicit_prelude_hir_files()?)? {
+        dependencies.push(environment)
+    }
+    check_package_files_for_link_with_external_types(files, dependencies, external)
+}
+
+fn exercise_external_source_checking() -> Result[(), string] {
+    let declarations = "package api; #[go_type(\"time\", \"Duration\")] pub extern type Delay; #[go_type(\"time\", \"Duration\")] extern type Duration;";
+    let checked = check_external_source(
+        Vec::from_array(
+            [
+                declarations,
+                "package api; pub fn convert(value: Delay) -> Duration { value } pub fn identity(value: Duration) -> Delay { convert(value) }",
+            ],
+        ),
+    )?;
+    for diagnostic in checked.diagnostics {
+        testing::fail(diagnostic.message)
+    }
+    testing::assert(checked.tast.is_some());
+    let signature_files = external_source_files(
+        Vec::from_array(
+            [
+                declarations
+                    + "#[go_ffi(\"example.com/host\", \"Echo\")] pub extern fn echo(value: Delay) -> Duration;",
+            ],
+        ),
+    );
+    let requests = external_type_requests(signature_files)?;
+    let external = resolve_external_type_environment(
+        requests,
+        external_type_test_metadata(requests),
+    )?;
+    let signatures = package_signatures_with_external_types(signature_files[0], external)?;
+    testing::assert_eq(signatures.type_aliases.len(), 2);
+    let expected = Type::External { import_path: "time", name: "Duration", args: Vec::new() };
+    for alias in signatures.type_aliases {
+        testing::assert(types_equal(alias.ty, expected))
+    }
+    testing::assert_eq(signatures.functions.len(), 1);
+    testing::assert(types_equal(signatures.functions[0].params[0], expected));
+    testing::assert(types_equal(signatures.functions[0].ret_ty, expected));
+    for body in Vec::from_array(
+        [
+            "pub fn wrong(value: Delay) -> i64 { value }",
+            "pub fn wrong() -> Delay { 0 }",
+            "pub fn wrong(value: Delay) -> i64 { value.hidden }",
+            "pub fn wrong() -> Delay { Delay {} }",
+        ],
+    ) {
+        let invalid = check_external_source(Vec::from_array([declarations + body]))?;
+        testing::assert(!invalid.diagnostics.is_empty());
+        testing::assert(
+            !has_diagnostic_containing(invalid.diagnostics, "metadata is not yet connected"),
+        );
+    }
+    Result::Ok(())
+}
+
+#[test]
+fn external_source_checking_preserves_identity_across_files_and_rejects_construction() -> () {
+    if let Err(error) = exercise_external_source_checking() {
+        testing::fail(error)
+    }
+}
+
+fn exercise_external_application_collection() -> Result[(), string] {
+    let applications = Vec::new();
+    let aliases = Vec::from_array(
+        [
+            TypeAliasInfo {
+                go_comparable: Option::None,
+                applications: Option::Some(applications),
+                name: "test::api::Constrained",
+                generics: Vec::from_array(["T"]),
+                ty: Type::Int64,
+            },
+        ],
+    );
+    let files = external_source_files(
+        Vec::from_array(
+            [
+                "package api; #[go_type(\"example.com/host\", \"Constrained\")] extern type Constrained[T]; type Local = Constrained[bool]; pub fn identity(value: Local) -> i64 { value }",
+            ],
+        ),
+    );
+    let dependencies = Vec::new();
+    dependencies.push(implicit_builtin_dependency_environment()?);
+    for environment in dependency_environments(implicit_prelude_hir_files()?)? {
+        dependencies.push(environment)
+    }
+    let checked = check_package_files_for_link_with_environments_options(
+        files,
+        dependencies,
+        false,
+        false,
+        aliases,
+    );
+    for diagnostic in checked.diagnostics {
+        testing::fail(diagnostic.message)
+    }
+    testing::assert(!applications.is_empty());
+    let query = ffi::TypeDeclarationQuery {
+        type_id: "test::api::Constrained",
+        import_path: "example.com/host",
+        name: "Constrained",
+    };
+    let queries = external_application_queries(query, applications)?;
+    testing::assert_eq(queries.len(), 1);
+    testing::assert_eq(queries[0].declaration.name, "Constrained");
+    testing::assert(
+        ffi::bridge_types_equal(queries[0].arguments[0], ffi::BridgeType::Scalar("bool")),
+    );
+    for application in applications {
+        testing::assert(application.source_path != "");
+        testing::assert(types_equal(application.arguments[0], Type::Bool))
+    }
+    let symbolic = Vec::from_array(
+        [
+            ExternalTypeApplication {
+                function_name: Option::None,
+                arguments: Vec::from_array([Type::Param { name: "T" }]),
+                source_path: "generic.gom",
+                span: Option::None,
+            },
+        ],
+    );
+    testing::assert(external_application_queries(query, symbolic).is_err());
+    Result::Ok(())
+}
+
+#[test]
+fn external_alias_applications_preserve_arguments_erased_by_normalization() -> () {
+    if let Err(error) = exercise_external_application_collection() {
+        testing::fail(error)
+    }
+}
+
+fn exercise_imported_external_collection() -> Result[(), string] {
+    let query = ffi::TypeDeclarationQuery {
+        type_id: "other::api::Box",
+        import_path: "example.com/host",
+        name: "Box",
+    };
+    let response = "{\"protocol_version\":1,\"go_world_identity\":\"world\",\"diagnostics\":[],\"bindings\":[],\"type_results\":[{\"type_id\":\"other::api::Box\",\"status\":\"verified\",\"declaration_kind\":\"defined\",\"declared_type\":\"box\"}],\"referenced_types\":[{\"id\":\"box\",\"tag\":\"named\",\"name\":\"Box\",\"import_path\":\"example.com/host\",\"underlying\":\"body\",\"type_parameters\":[\"p\"]},{\"id\":\"body\",\"tag\":\"struct\",\"fields\":[]},{\"id\":\"p\",\"tag\":\"type_parameter\",\"name\":\"T\",\"constraint\":\"any\"},{\"id\":\"any\",\"tag\":\"interface\",\"methods\":[]}]}";
+    let metadata = ffi::ForeignTypeMetadata {
+        queries: Vec::from_array([query]),
+        declarations: ffi::decode_type_declarations(response, Vec::from_array([query]))?,
+        instances: Vec::new(),
+    };
+    let aliases = Vec::from_array(
+        [
+            TypeAliasInfo {
+                go_comparable: Option::None,
+                applications: Option::None,
+                name: query.type_id,
+                generics: Vec::from_array(["T"]),
+                ty: test_external_type("Box", Vec::from_array([Type::Param { name: "T" }])),
+            },
+        ],
+    );
+    let collectors = attach_external_alias_collectors(aliases, metadata)?;
+    testing::assert_eq(collectors.len(), 1);
+    let dependencies = Vec::new();
+    dependencies.push(implicit_builtin_dependency_environment()?);
+    dependencies.push(
+        dependency_environment(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            aliases,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ),
+    );
+    let files = external_source_files(
+        Vec::from_array(
+            [
+                "package api; use other::api as remote; pub fn identity(value: remote::Box[i64]) -> remote::Box[i64] { value }",
+            ],
+        ),
+    );
+    let checked = check_package_files_for_link_with_environments(files, dependencies);
+    for diagnostic in checked.diagnostics {
+        testing::fail(diagnostic.message)
+    }
+    let instances = external_collector_queries(collectors)?;
+    testing::assert_eq(instances.len(), 1);
+    testing::assert_eq(instances[0].declaration.import_path, "example.com/host");
+    testing::assert(
+        ffi::bridge_types_equal(instances[0].arguments[0], ffi::BridgeType::Scalar("int64")),
+    );
+    aliases.set(
+        0,
+        TypeAliasInfo {
+            go_comparable: Option::None,
+            applications: Option::None,
+            name: query.type_id,
+            generics: Vec::from_array(["T"]),
+            ty: Type::Int64,
+        },
+    );
+    testing::assert(attach_external_alias_collectors(aliases, metadata).is_err());
+    Result::Ok(())
+}
+
+#[test]
+fn imported_external_aliases_collect_concrete_arguments_and_validate_metadata() -> () {
+    if let Err(error) = exercise_imported_external_collection() {
+        testing::fail(error)
+    }
+}
+
+fn exercise_external_application_owners() -> Result[(), string] {
+    let applications = Vec::new();
+    let aliases = Vec::from_array(
+        [
+            TypeAliasInfo {
+                go_comparable: Option::None,
+                applications: Option::Some(applications),
+                name: "test::api::Constrained",
+                generics: Vec::from_array(["T"]),
+                ty: Type::Int64,
+            },
+        ],
+    );
+    let files = external_source_files(
+        Vec::from_array(
+            [
+                "package api; #[go_type(\"example.com/host\", \"Constrained\")] extern type Constrained[T]; type Concrete = Constrained[i64]; pub fn outer[T](value: T) -> T { let closure = |item: Constrained[T]| item; let _ = closure; value } pub fn signature[T](value: Constrained[T]) -> i64 { value }",
+            ],
+        ),
+    );
+    let dependencies = Vec::from_array([implicit_builtin_dependency_environment()?]);
+    let checked = check_package_files_for_link_with_environments_options(
+        files,
+        dependencies,
+        false,
+        false,
+        aliases,
+    );
+    for diagnostic in checked.diagnostics {
+        testing::fail(diagnostic.message)
+    }
+    let mut outer = false;
+    let mut signature = false;
+    let mut unowned = false;
+    for application in applications {
+        match application.function_name {
+            Some(name) if name == "test::api::outer" => {
+                testing::assert(types_equal(application.arguments[0], Type::Param { name: "T" }));
+                outer = true;
+            },
+            Some(name) if name == "test::api::signature" => {
+                testing::assert(types_equal(application.arguments[0], Type::Param { name: "T" }));
+                signature = true;
+            },
+            None => {
+                testing::assert(types_equal(application.arguments[0], Type::Int64));
+                unowned = true;
+            },
+            _ => testing::fail("unexpected external application owner"),
+        }
+    }
+    testing::assert(outer);
+    testing::assert(signature);
+    testing::assert(unowned);
+    let plan = partition_external_applications(
+        ffi::TypeDeclarationQuery {
+            type_id: "test::api::Constrained",
+            import_path: "example.com/host",
+            name: "Constrained",
+        },
+        applications,
+    )?;
+    testing::assert_eq(plan.concrete.len(), 1);
+    testing::assert_eq(plan.symbolic.len(), 2);
+    for application in plan.symbolic {
+        testing::assert(application.source_path != "");
+        testing::assert_eq(application.declaration.name, "Constrained");
+        testing::assert(types_equal(application.arguments[0], Type::Param { name: "T" }))
+    }
+    Result::Ok(())
+}
+
+#[test]
+fn external_applications_track_signature_and_closure_owners_without_leaking_scope() -> () {
+    if let Err(error) = exercise_external_application_owners() {
+        testing::fail(error)
+    }
+}
+
+#[test]
+fn external_pointer_types_substitute_without_becoming_references() -> () {
+    let pointer = Type::GoPointer { elem: Type::Param { name: "T" } };
+    let actual = substitute_params(pointer, Vec::from_array(["T"]), Vec::from_array([Type::Int64]));
+    testing::assert(types_equal(actual, Type::GoPointer { elem: Type::Int64 }));
+    testing::assert(!types_equal(actual, Type::RefType { elem: Type::Int64 }));
+    testing::assert(!unify(actual, Type::Int64));
+    testing::assert(!unify(actual, Type::RefType { elem: Type::Int64 }));
+    testing::assert(type_is_concrete(actual));
+    testing::assert(!type_is_concrete(pointer));
+    let variable = fresh_type(Ref::new(300), VarKind::Any);
+    testing::assert(!unify(variable, Type::GoPointer { elem: variable }));
+}

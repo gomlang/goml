@@ -1,0 +1,646 @@
+package main;
+
+use module::test_support;
+use std::fs;
+use std::path;
+use std::process;
+use std::testing;
+
+fn export_cli_fixture(name: string) -> string {
+    let root = test_support::workspace(name);
+    test_support::write_file(path::join(root, "goml.toml"), "[module]\npath = \"demo::calc\"\n");
+    test_support::write_file(path::join(root, "go.mod"), "module example.com/host\n\ngo 1.25\n");
+    test_support::write_file(
+        path::join(root, "calc.gom"),
+        "package calc; #[go_ffi(\"math\", \"Abs\")] extern fn abs(value: f64) -> f64; #[go_export(\"Add\")] pub fn add(a: i64, b: i64) -> i64 { a + b } #[go_export(\"Pair\")] pub fn pair(value: i64) -> (i64, bool) { (value + 1, value > 0) } #[go_export(\"AbsPlusOne\")] pub fn absolute(value: f64) -> f64 { abs(value) + 1.0 }",
+    );
+    root
+}
+
+fn run_export_fixture(root: string, extra: Vec[string]) -> process::Output {
+    let args = Vec::from_array(
+        [
+            "export-go",
+            "--compiler",
+            test_support::gomlc_binary(),
+            "--import-path",
+            "example.com/host/gen/calclib",
+            "--out",
+            "gen/calclib",
+        ],
+    );
+    for value in extra {
+        args.push(value)
+    }
+    test_support::run(args, root)
+}
+
+#[test]
+fn export_go_cli_generates_a_reusable_go_package_and_preserves_owned_outputs() -> () {
+    let root = export_cli_fixture("export_cli_end_to_end");
+    let output = path::join(root, "gen/calclib");
+    let source = path::join(output, "goml_generated.go");
+    let manifest = path::join(output, "goml_exports.json");
+    test_support::write_file(
+        path::join(output, "handwritten.go"),
+        "package calclib\nfunc DoubleAdd() int64 { return Add(20, 22)*2 }\n",
+    );
+    test_support::assert_success(run_export_fixture(root, Vec::new()));
+    let before = test_support::read_file(source);
+    let metadata = test_support::read_file(manifest);
+    testing::assert(metadata.contains("AbsPlusOne"));
+    testing::assert(metadata.contains("required"));
+    test_support::assert_success(run_export_fixture(root, Vec::new()));
+    testing::assert_eq(test_support::read_file(source), before);
+    testing::assert_eq(test_support::read_file(manifest), metadata);
+    test_support::write_file(
+        path::join(root, "host_test.go"),
+        "package host_test\nimport (\"testing\"; \"example.com/host/gen/calclib\")\nfunc TestLibrary(t *testing.T) { if calclib.Add(20,22)!=42 || calclib.AbsPlusOne(-3)!=4 || calclib.DoubleAdd()!=84 { t.Fatal(\"library\") }; a,b:=calclib.Pair(7); if a!=8 || !b { t.Fatal(\"pair\") } }\n",
+    );
+    match process::Command::new("go").args(Vec::from_array(["test", "./..."])).current_dir(root).env(
+        "GOWORK",
+        "off",
+    ).env("GOTOOLCHAIN", "local").env("GOPROXY", "off").output_structured() {
+        Ok(output) => test_support::assert_success(output),
+        Err(error) => testing::fail(error.to_string()),
+    }
+    test_support::write_file(
+        path::join(root, "calc.gom"),
+        "package calc; #[go_export(\"Add\")] pub fn add() -> i64 { unknown() }",
+    );
+    testing::assert(!run_export_fixture(root, Vec::new()).status().success());
+    testing::assert_eq(test_support::read_file(source), before);
+    testing::assert_eq(test_support::read_file(manifest), metadata);
+    test_support::write_file(source, before + "\n");
+    let rejected = run_export_fixture(root, Vec::new());
+    testing::assert(!rejected.status().success());
+    testing::assert(test_support::stderr(rejected).contains("modified"));
+    testing::assert_eq(test_support::read_file(source), before + "\n");
+    testing::assert(fs::is_file(path::join(output, "handwritten.go")));
+    testing::assert_eq(
+        test_support::read_file(path::join(root, "go.mod")),
+        "module example.com/host\n\ngo 1.25\n",
+    );
+    testing::assert(!fs::exists(path::join(root, "go.sum")));
+}
+
+#[test]
+fn export_go_cli_dry_run_and_argument_errors_do_not_publish() -> () {
+    let root = export_cli_fixture("export_cli_dry_run");
+    let output = run_export_fixture(root, Vec::from_array(["--dry-run"]));
+    test_support::assert_success(output);
+    testing::assert(test_support::stdout(output).contains("__link-go-library"));
+    testing::assert(test_support::stdout(output).contains("__check-go-library"));
+    testing::assert(!fs::exists(path::join(root, "gen")));
+    testing::assert(
+        !run_export_fixture(root, Vec::from_array(["--out", "other"])).status().success(),
+    );
+    testing::assert(
+        !run_export_fixture(root, Vec::from_array(["--ffi-check", "invalid"])).status().success(),
+    );
+    testing::assert(!run_export_fixture(root, Vec::from_array(["--jobs", "0"])).status().success());
+}
+
+#[test]
+fn export_go_cli_off_is_explicit_and_unused_bindings_are_checked() -> () {
+    let root = export_cli_fixture("export_cli_off");
+    test_support::write_file(
+        path::join(root, "calc.gom"),
+        "package calc; #[go_ffi(\"math\", \"MissingFunction\")] extern fn unused(value: f64) -> f64; #[go_export(\"Add\")] pub fn add(a: i64, b: i64) -> i64 { a + b }",
+    );
+    let required = run_export_fixture(root, Vec::new());
+    testing::assert(!required.status().success());
+    testing::assert(test_support::stderr(required).contains("MissingFunction"));
+    let generated = path::join(root, "gen/calclib/goml_generated.go");
+    testing::assert(!fs::exists(generated));
+    let unchecked = run_export_fixture(root, Vec::from_array(["--ffi-check", "off"]));
+    test_support::assert_success(unchecked);
+    testing::assert(test_support::stderr(unchecked).contains("ffi-unverified"));
+    testing::assert(
+        test_support::read_file(path::join(root, "gen/calclib/goml_exports.json")).contains(
+            "\"ffi_check\":\"off\"",
+        ),
+    );
+    testing::assert(!test_support::read_file(generated).contains("MissingFunction"));
+}
+
+#[test]
+fn export_go_cli_selects_one_nested_library_without_exporting_main() -> () {
+    let root = export_cli_fixture("export_cli_nested");
+    test_support::write_file(
+        path::join(root, "calc.gom"),
+        "package main; fn main() -> () { unknown(); }",
+    );
+    test_support::write_file(
+        path::join(root, "library/library.gom"),
+        "package library; #[go_export(\"Selected\")] pub fn selected() -> i64 { 42 }",
+    );
+    test_support::assert_success(run_export_fixture(root, Vec::from_array(["library"])));
+    let generated = test_support::read_file(path::join(root, "gen/calclib/goml_generated.go"));
+    testing::assert(generated.contains("func Selected("));
+    testing::assert(!generated.contains("func main("));
+    testing::assert(!generated.contains("AbsPlusOne"));
+}
+
+#[test]
+fn export_go_complete_fixture_runs_without_goml_sources() -> () {
+    let root = test_support::workspace("export_complete_fixture");
+    let fixture = path::join(test_support::module_root(), "../tools/release/testdata/go-export");
+    for file in Vec::from_array(["goml.toml", "go.mod", "calc.gom", "main.go", "main_test.go"]) {
+        test_support::write_file(
+            path::join(root, file),
+            test_support::read_file(path::join(fixture, file)),
+        );
+    }
+    test_support::assert_success(
+        test_support::project_command(
+            "check",
+            "",
+            Vec::from_array(["--ffi-check", "required"]),
+            root,
+        ),
+    );
+    test_support::assert_success(run_export_fixture(root, Vec::from_array(["."])));
+    let generated = test_support::read_file(path::join(root, "gen/calclib/goml_generated.go"));
+    testing::assert(!generated.contains(root));
+    testing::assert(fs::remove_file(path::join(root, "calc.gom")).is_ok());
+    testing::assert(fs::remove_file(path::join(root, "goml.toml")).is_ok());
+    for args in Vec::from_array([Vec::from_array(["test", "./..."]), Vec::from_array(["run", "."])]) {
+        match process::Command::new("go").args(args).current_dir(root).env("GOWORK", "off").env(
+            "GOTOOLCHAIN",
+            "local",
+        ).env("GOPROXY", "off").output_structured() {
+            Ok(output) => {
+                test_support::assert_success(output);
+                if args[0] == "run" {
+                    testing::assert_eq(test_support::stdout(output), "42 4 7 8\n")
+                }
+            },
+            Err(error) => testing::fail(error.to_string()),
+        }
+    }
+}
+
+#[test]
+fn export_go_all_scalar_widths_preserve_go_signatures_and_boundary_values() -> () {
+    let root = export_cli_fixture("export_scalar_widths");
+    let types = Vec::from_array(
+        [
+            ("bool", "bool", "Bool", "false, true"),
+            ("isize", "int", "Int", "-int(^uint(0)>>1)-1, -1, 0, int(^uint(0)>>1)"),
+            ("i8", "int8", "I8", "-128, -1, 0, 127"),
+            ("i16", "int16", "I16", "-32768, -1, 0, 32767"),
+            ("i32", "int32", "I32", "-2147483648, -1, 0, 2147483647"),
+            ("i64", "int64", "I64", "-9223372036854775808, -1, 0, 9223372036854775807"),
+            ("usize", "uint", "Uint", "0, 1, ^uint(0)"),
+            ("u8", "uint8", "U8", "0, 1, 255"),
+            ("u16", "uint16", "U16", "0, 1, 65535"),
+            ("u32", "uint32", "U32", "0, 1, 4294967295"),
+            ("u64", "uint64", "U64", "0, 1, 18446744073709551615"),
+        ],
+    );
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\nfunc Identity[T any](value T) T { return value }\n",
+    );
+    let mut source = "package calc;\n";
+    let mut host = "package host_test\nimport (\"testing\"; \"math\"; \"example.com/host/gen/calclib\")\n";
+    for (gom_type, go_type, suffix, values) in types {
+        source = source + "#[go_ffi(\"example.com/host/shim\", \"Identity\")] extern fn foreign_"
+            + gom_type
+            + "(value: "
+            + gom_type
+            + ") -> "
+            + gom_type
+            + ";\n"
+            + "#[go_export(\"Echo"
+            + suffix
+            + "\")] pub fn echo_"
+            + gom_type
+            + "(value: "
+            + gom_type
+            + ") -> "
+            + gom_type
+            + " { foreign_"
+            + gom_type
+            + "(value) }\n";
+        host = host + "func Test" + suffix + "(t *testing.T) { var echo func(" + go_type + ") "
+            + go_type
+            + " = calclib.Echo"
+            + suffix
+            + "; for _, value := range []"
+            + go_type
+            + "{"
+            + values
+            + "} { if echo(value) != value { t.Fatalf(\"value changed: %v\", value) } } }\n";
+    }
+    source = source
+        + "#[go_ffi(\"example.com/host/shim\", \"Identity\")] extern fn foreign_f32(value: f32) -> f32; #[go_ffi(\"example.com/host/shim\", \"Identity\")] extern fn foreign_f64(value: f64) -> f64;\n"
+        + "#[go_export(\"EchoF32\")] pub fn echo_f32(value: f32) -> f32 { foreign_f32(value) }\n#[go_export(\"EchoF64\")] pub fn echo_f64(value: f64) -> f64 { foreign_f64(value) }\n#[go_export(\"Matrix\")] pub fn matrix(value: [[i16; 2]; 2]) -> [[i16; 2]; 2] { value }\n#[go_export(\"NoResult\")] pub fn no_result() -> () {}\n#[go_export(\"Mixed\")] pub fn mixed(value: i8) -> (i8, u64, f32, bool) { (value, 42, 0.5, value < 0) }\n";
+    host = host +
+        \\func TestFloats(t *testing.T) {
+        \\    var f32 func(float32) float32 = calclib.EchoF32
+        \\    var f64 func(float64) float64 = calclib.EchoF64
+        \\    for _, bits := range []uint32{0, 0x80000000, 1, 0x7f7fffff, 0xff7fffff, 0x7f800000, 0xff800000, 0x7fc01234} {
+        \\        if math.Float32bits(f32(math.Float32frombits(bits))) != bits { t.Fatalf("f32 changed: %x", bits) }
+        \\    }
+        \\    for _, bits := range []uint64{0, 0x8000000000000000, 1, 0x7fefffffffffffff, 0xffefffffffffffff, 0x7ff0000000000000, 0xfff0000000000000, 0x7ff8000000001234} {
+        \\        if math.Float64bits(f64(math.Float64frombits(bits))) != bits { t.Fatalf("f64 changed: %x", bits) }
+        \\    }
+        \\}
+        \\func TestCompositeResults(t *testing.T) {
+        \\    var matrix func([2][2]int16) [2][2]int16 = calclib.Matrix
+        \\    input := [2][2]int16{{-32768, 32767}, {0, -1}}
+        \\    output := matrix(input)
+        \\    if output != input { t.Fatal("array changed") }
+        \\    output[0][0] = 7
+        \\    if input[0][0] != -32768 { t.Fatal("array was not passed by value") }
+        \\    var unit func() = calclib.NoResult
+        \\    unit()
+        \\    var mixed func(int8) (int8, uint64, float32, bool) = calclib.Mixed
+        \\    a,b,c,d := mixed(-128)
+        \\    if a != -128 || b != 42 || c != 0.5 || !d { t.Fatal("mixed result changed") }
+        \\}
+    ;
+    test_support::write_file(path::join(root, "calc.gom"), source);
+    test_support::write_file(path::join(root, "scalar_test.go"), host);
+    test_support::assert_success(run_export_fixture(root, Vec::new()));
+    match process::Command::new("go").args(Vec::from_array(["test", "./..."])).current_dir(root).env(
+        "GOWORK",
+        "off",
+    ).env("GOTOOLCHAIN", "local").env("GOPROXY", "off").output_structured() {
+        Ok(output) => test_support::assert_success(output),
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn export_go_cli_import_cycles_do_not_replace_previous_output() -> () {
+    let root = export_cli_fixture("export_cli_cycles");
+    test_support::write_file(
+        path::join(root, "calc.gom"),
+        "package calc; #[go_export(\"Value\")] pub fn value() -> i64 { 42 }",
+    );
+    test_support::assert_success(run_export_fixture(root, Vec::new()));
+    let source_path = path::join(root, "gen/calclib/goml_generated.go");
+    let manifest_path = path::join(root, "gen/calclib/goml_exports.json");
+    let previous_source = test_support::read_file(source_path);
+    let previous_manifest = test_support::read_file(manifest_path);
+    test_support::write_file(
+        path::join(root, "shim/shim.go"),
+        "package shim\nimport \"example.com/host/gen/calclib\"\nfunc Value() int64 { return calclib.Value() }\n",
+    );
+    for imported in Vec::from_array(["example.com/host/shim", "example.com/host/gen/calclib"]) {
+        test_support::write_file(
+            path::join(root, "calc.gom"),
+            "package calc; #[go_ffi(\"" + imported
+                + "\", \"Value\")] extern fn foreign_value() -> i64; #[go_export(\"Value\")] pub fn value() -> i64 { foreign_value() }",
+        );
+        let output = run_export_fixture(root, Vec::new());
+        testing::assert(!output.status().success());
+        testing::assert(test_support::stderr(output).contains("import cycle"));
+        testing::assert_eq(test_support::read_file(source_path), previous_source);
+        testing::assert_eq(test_support::read_file(manifest_path), previous_manifest);
+        testing::assert(!fs::exists(path::join(root, "gen/calclib/.goml-export-lock")));
+    }
+}
+
+#[test]
+fn export_go_revalidates_build_tags_targets_and_selected_file_changes() -> () {
+    let root = export_cli_fixture("export_selected_context");
+    test_support::write_file(
+        path::join(root, "calc.gom"),
+        "package calc; #[go_ffi(\"example.com/host/shim\", \"Value\")] extern fn foreign_value() -> i64; #[go_export(\"Value\")] pub fn value() -> i64 { foreign_value() }",
+    );
+    test_support::write_file(
+        path::join(root, "shim/ordinary.go"),
+        "//go:build !alternate\n\npackage shim\nfunc Value() int64 { return 11 }\n",
+    );
+    let alternate = path::join(root, "shim/alternate.go");
+    let windows = path::join(root, "shim/target_windows.go");
+    let source = path::join(root, "gen/calclib/goml_generated.go");
+    let manifest = path::join(root, "gen/calclib/goml_exports.json");
+    test_support::write_file(
+        alternate,
+        "//go:build alternate\n\npackage shim\nfunc Value() string { return \"wrong\" }\n",
+    );
+    test_support::write_file(windows, "package shim\nvar invalid int = \"wrong target\"\n");
+    let previous_source = Ref::new("");
+    let previous_manifest = Ref::new("");
+    for phase in 0..8 {
+        if phase == 2 || phase == 4 {
+            test_support::write_file(
+                alternate,
+                "//go:build alternate\n\npackage shim\nfunc Value() int64 { return 22 }\n",
+            )
+        }
+        if phase == 3 {
+            testing::assert(fs::remove_file(alternate).is_ok())
+        }
+        if phase == 6 {
+            test_support::write_file(windows, "package shim\nvar valid int = 1\n")
+        }
+        let target = if phase == 5 || phase == 6 {
+            "windows"
+        } else {
+            "linux"
+        };
+        let flags = if phase >= 1 && phase <= 4 {
+            "-tags=alternate"
+        } else {
+            ""
+        };
+        let command = process::Command::new(test_support::goml_binary()).args(
+            Vec::from_array(
+                [
+                    "export-go",
+                    "--compiler",
+                    test_support::gomlc_binary(),
+                    "--import-path",
+                    "example.com/host/gen/calclib",
+                    "--out",
+                    "gen/calclib",
+                ],
+            ),
+        ).current_dir(root).env("GOENV", "off").env("GOOS", target).env("GOARCH", "amd64").env(
+            "CGO_ENABLED",
+            "0",
+        ).env("GOFLAGS", flags).env("GOWORK", "off").env("GOTOOLCHAIN", "local").env(
+            "GOPROXY",
+            "off",
+        );
+        let result = match command.output_structured() {
+            Ok(value) => value,
+            Err(error) => return testing::fail(error.to_string()),
+        };
+        if phase == 1 || phase == 3 || phase == 5 {
+            testing::assert(!result.status().success());
+            testing::assert_eq(test_support::read_file(source), previous_source.get());
+            testing::assert_eq(test_support::read_file(manifest), previous_manifest.get())
+        } else {
+            test_support::assert_success(result);
+            let metadata = test_support::read_file(manifest);
+            testing::assert(metadata.contains(target));
+            if flags != "" {
+                testing::assert(metadata.contains(flags))
+            }
+            previous_source.set(test_support::read_file(source));
+            previous_manifest.set(metadata)
+        }
+        testing::assert(!fs::exists(path::join(root, "gen/calclib/.goml-export-lock")))
+    }
+    testing::assert(!fs::exists(path::join(root, "go.sum")));
+}
+
+#[test]
+fn export_go_cli_rejects_invalid_destinations_without_changing_user_files() -> () {
+    let root = export_cli_fixture("export_invalid_destinations");
+    test_support::write_file(
+        path::join(root, "nested/go.mod"),
+        "module example.com/nested\n\ngo 1.25\n",
+    );
+    test_support::write_file(
+        path::join(root, "unowned/goml_generated.go"),
+        "package unowned\nvar UserValue = 9\n",
+    );
+    test_support::write_file(
+        path::join(root, "collision/handwritten.go"),
+        "package collision\nfunc Add() {}\n",
+    );
+    let module_before = test_support::read_file(path::join(root, "go.mod"));
+    let cases = Vec::from_array(
+        [
+            ("../escape", "example.com/host/escape", "parent traversal"),
+            ("mismatch", "example.com/other/mismatch", "--import-path must be"),
+            ("main", "example.com/host/main", "invalid Go package name"),
+            ("nested/lib", "example.com/host/nested/lib", "nested Go module"),
+            ("unowned", "example.com/host/unowned", "ownership manifest"),
+            ("collision", "example.com/host/collision", "redeclared"),
+        ],
+    );
+    for (destination, import_path, diagnostic) in cases {
+        let sentinel = path::join(root, destination + "/user.txt");
+        if destination != "../escape" {
+            test_support::write_file(sentinel, "preserve user contents\n")
+        }
+        let result = test_support::run(
+            Vec::from_array(
+                [
+                    "export-go",
+                    "--compiler",
+                    test_support::gomlc_binary(),
+                    "--out",
+                    destination,
+                    "--import-path",
+                    import_path,
+                ],
+            ),
+            root,
+        );
+        testing::assert(!result.status().success());
+        test_support::assert_contains(test_support::stderr(result), diagnostic);
+        if destination != "../escape" {
+            testing::assert_eq(test_support::read_file(sentinel), "preserve user contents\n");
+            testing::assert(!fs::exists(path::join(root, destination + "/goml_exports.json")));
+            testing::assert(!fs::exists(path::join(root, destination + "/.goml-export-lock")));
+            if destination != "unowned" {
+                testing::assert(!fs::exists(path::join(root, destination + "/goml_generated.go")))
+            }
+        }
+        testing::assert_eq(test_support::read_file(path::join(root, "go.mod")), module_before);
+        testing::assert(!fs::exists(path::join(root, "go.sum")))
+    }
+    testing::assert_eq(
+        test_support::read_file(path::join(root, "unowned/goml_generated.go")),
+        "package unowned\nvar UserValue = 9\n",
+    );
+    testing::assert_eq(
+        test_support::read_file(path::join(root, "collision/handwritten.go")),
+        "package collision\nfunc Add() {}\n",
+    );
+    testing::assert_eq(
+        test_support::read_file(path::join(root, "nested/go.mod")),
+        "module example.com/nested\n\ngo 1.25\n",
+    );
+}
+
+#[test]
+fn export_go_initializes_dependency_statics_once_without_running_main() -> () {
+    let root = export_cli_fixture("export_dependency_statics");
+    test_support::write_file(
+        path::join(root, "calc.gom"),
+        "package main; fn main() -> () { panic(\"GoML main invoked\") }",
+    );
+    test_support::write_file(
+        path::join(root, "state/state.gom"),
+        "package state; static TRACE: OnceCell[Ref[i64]] = OnceCell::new(); pub fn record(digit: i64) -> () { let value = TRACE.get_or_init(|| Ref::new(0)); value.set(value.get() * 10 + digit) } pub fn trace() -> i64 { TRACE.get_or_init(|| Ref::new(0)).get() }",
+    );
+    test_support::write_file(
+        path::join(root, "leaf/leaf.gom"),
+        "package leaf; use demo::calc::state; static VALUE: OnceCell[i64] = OnceCell::new(); fn identity[T](value: T) -> T { value } pub fn value() -> i64 { VALUE.get_or_init(|| { state::record(1); identity(10) }) }",
+    );
+    test_support::write_file(
+        path::join(root, "middle/middle.gom"),
+        "package middle; use demo::calc::state; use demo::calc::leaf; static VALUE: OnceCell[i64] = OnceCell::new(); pub fn value() -> i64 { VALUE.get_or_init(|| { let value = leaf::value(); state::record(2); value + 10 }) }",
+    );
+    test_support::write_file(
+        path::join(root, "library/library.gom"),
+        "package library; use demo::calc::state; use demo::calc::middle; use demo::calc::leaf; static VALUE: OnceCell[i64] = OnceCell::new(); #[go_export(\"Value\")] pub fn value() -> i64 { VALUE.get_or_init(|| { let value = middle::value(); state::record(3); value + 10 }) } #[go_export(\"Leaf\")] pub fn leaf_value() -> i64 { leaf::value() } #[go_export(\"Trace\")] pub fn trace() -> i64 { state::trace() }",
+    );
+    test_support::assert_success(run_export_fixture(root, Vec::from_array(["library"])));
+    let generated = test_support::read_file(path::join(root, "gen/calclib/goml_generated.go"));
+    testing::assert(!generated.contains("GoML main invoked"));
+    testing::assert(!generated.contains("func main("));
+    let host =
+        \\package host_test
+        \\import (
+        \\    "testing"
+        \\    calc "example.com/host/gen/calclib"
+        \\)
+        \\func TestRootFirst(t *testing.T) {
+        \\    if calc.Trace() != 0 { t.Fatal("eager cell contents") }
+        \\    if calc.Value() != 30 || calc.Trace() != 123 { t.Fatal("dependency initialization order") }
+        \\    for i := 0; i < 3; i++ {
+        \\        if calc.Leaf() != 10 || calc.Value() != 30 || calc.Trace() != 123 { t.Fatal("repeated initialization") }
+        \\    }
+        \\}
+        \\func TestLeafFirst(t *testing.T) {
+        \\    if calc.Trace() != 0 { t.Fatal("initial state") }
+        \\    if calc.Leaf() != 10 || calc.Trace() != 1 { t.Fatal("leaf initialization") }
+        \\    if calc.Value() != 30 || calc.Trace() != 123 { t.Fatal("shared dependency state") }
+        \\    if calc.Value() != 30 || calc.Leaf() != 10 || calc.Trace() != 123 { t.Fatal("repeated initialization") }
+        \\}
+    ;
+    test_support::write_file(path::join(root, "host_test.go"), host);
+    for name in Vec::from_array(["TestRootFirst", "TestLeafFirst"]) {
+        match process::Command::new("go").args(
+            Vec::from_array(["test", "-count=1", "-run", "^" + name + "$", "."]),
+        ).current_dir(root).env("GOWORK", "off").env("GOTOOLCHAIN", "local").env("GOPROXY", "off").output_structured() {
+            Ok(output) => test_support::assert_success(output),
+            Err(error) => testing::fail(error.to_string()),
+        }
+    }
+}
+
+#[test]
+fn export_go_preserves_legacy_text_marker_slice_and_channel_imports() -> () {
+    let root = export_cli_fixture("export_legacy_imports");
+    let declarations = Vec::from_array(
+        [
+            ("text", "Identity", "value: string", "string"),
+            ("rune", "Identity", "value: char", "char"),
+            ("make_any", "MakeAny", "", "dyn Native"),
+            ("any_echo", "Identity", "value: dyn Native", "dyn Native"),
+            ("same_any", "SameAny", "a: dyn Native, b: dyn Native", "bool"),
+            ("make_slice", "MakeSlice", "", "Slice[i64]"),
+            ("slice_echo", "Identity", "value: Slice[i64]", "Slice[i64]"),
+            ("read_slice", "ReadSlice", "value: Slice[i64]", "i64"),
+            ("make_mut", "MakeSlice", "", "MutSlice[i64]"),
+            ("mut_echo", "Identity", "value: MutSlice[i64]", "MutSlice[i64]"),
+            ("write_mut", "WriteSlice", "value: MutSlice[i64]", "()"),
+            ("read_mut", "ReadSlice", "value: MutSlice[i64]", "i64"),
+            ("make_channel", "MakeChannel", "", "Channel[string]"),
+            ("channel_echo", "Identity", "value: Channel[string]", "Channel[string]"),
+            ("sender_echo", "Identity", "value: Sender[string]", "Sender[string]"),
+            ("receiver_echo", "Identity", "value: Receiver[string]", "Receiver[string]"),
+            ("send", "Send", "value: Sender[string]", "()"),
+            ("receive", "Receive", "value: Receiver[string]", "string"),
+        ],
+    );
+    let mut source = "package calc; trait Native {}\n";
+    for (name, target, parameters, result) in declarations {
+        source = source + "#[go_ffi(\"example.com/host/shim\", \"" + target + "\")] extern fn "
+            + name
+            + "("
+            + parameters
+            + ") -> "
+            + result
+            + ";\n";
+    }
+    source = source +
+        \\#[go_export("Check")] pub fn check() -> bool {
+        \\    let opaque = make_any();
+        \\    let immutable = make_slice();
+        \\    let mutable = make_mut();
+        \\    write_mut(mut_echo(mutable));
+        \\    let channel = channel_echo(make_channel());
+        \\    send(sender_echo(channel.sender()));
+        \\    text("hello") == "hello" && rune('界') == '界'
+        \\        && same_any(opaque, any_echo(opaque))
+        \\        && read_slice(slice_echo(immutable)) == 7
+        \\        && read_mut(mutable) == 42
+        \\        && receive(receiver_echo(channel.receiver())) == "message"
+        \\}
+    ;
+    test_support::write_file(path::join(root, "calc.gom"), source);
+    let shim =
+        \\package shim
+        \\func Identity[T any](value T) T { return value }
+        \\func MakeAny() any { value := 9; return &value }
+        \\func SameAny(a, b any) bool { return a == b }
+        \\func MakeSlice() []int64 { return []int64{7} }
+        \\func ReadSlice(value []int64) int64 { return value[0] }
+        \\func WriteSlice(value []int64) { value[0] = 42 }
+        \\func MakeChannel() chan string { return make(chan string, 1) }
+        \\func Send(value chan<- string) { value <- "message" }
+        \\func Receive(value <-chan string) string { return <-value }
+    ;
+    test_support::write_file(path::join(root, "shim/shim.go"), shim);
+    test_support::assert_success(run_export_fixture(root, Vec::new()));
+    test_support::write_file(
+        path::join(root, "host_test.go"),
+        "package host_test\nimport (\"testing\"; \"example.com/host/gen/calclib\")\nfunc TestLegacy(t *testing.T) { if !calclib.Check() { t.Fatal(\"legacy import changed\") } }\n",
+    );
+    match process::Command::new("go").args(Vec::from_array(["test", "./..."])).current_dir(root).env(
+        "GOWORK",
+        "off",
+    ).env("GOTOOLCHAIN", "local").env("GOPROXY", "off").output_structured() {
+        Ok(output) => test_support::assert_success(output),
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn export_go_raw_text_requires_explicit_checked_conversion_policy() -> () {
+    let root = export_cli_fixture("export_raw_text");
+    test_support::write_file(
+        path::join(root, "calc.gom"),
+        "package calc; use std::ffi;\n#[go_export(\"RawEcho\")] pub fn raw_echo(value: ffi::String) -> ffi::String { value }\n#[go_export(\"CheckedText\")] pub fn checked_text(value: ffi::String) -> (ffi::String, bool) {\n match ffi::string_text(value) {\n  Ok(text) => (ffi::string_from_text(text + \"!\"), true),\n  Err(_) => (value, false),\n }\n}\n#[go_export(\"CheckedRune\")] pub fn checked_rune(value: ffi::Rune) -> (ffi::Rune, bool) {\n match ffi::rune_char(value) {\n  Ok(character) => (ffi::rune_from_char(character), true),\n  Err(_) => (value, false),\n }\n}\n#[go_export(\"RawArray\")] pub fn raw_array(value: [ffi::String; 2]) -> [ffi::String; 2] { value }\n",
+    );
+    test_support::write_file(
+        path::join(root, "host_test.go"),
+        "package host_test\nimport (\"testing\"; \"example.com/host/gen/calclib\")\nvar _ func(string) string = calclib.RawEcho\nvar _ func(string) (string, bool) = calclib.CheckedText\nvar _ func(int32) (int32, bool) = calclib.CheckedRune\nvar _ func([2]string) [2]string = calclib.RawArray\nfunc TestTextPolicy(t *testing.T) {\n invalid := string([]byte{255, 0, 97})\n for _, value := range []string{\"\", \"héllo\", \"a\\x00b\", invalid} {\n  if calclib.RawEcho(value) != value { t.Fatal(\"raw bytes changed\") }\n }\n if value, ok := calclib.CheckedText(invalid); ok || value != invalid { t.Fatal(\"invalid UTF-8 policy\") }\n if value, ok := calclib.CheckedText(\"héllo\"); !ok || value != \"héllo!\" { t.Fatal(\"checked text\") }\n if value, ok := calclib.CheckedText(\"a\\x00b\"); !ok || value != \"a\\x00b!\" { t.Fatal(\"NUL\") }\n if value := calclib.RawArray([2]string{invalid, \"text\"}); value != [2]string{invalid, \"text\"} { t.Fatal(\"array bytes\") }\n for _, value := range []int32{-1, 0xd800, 0xdfff, 0x110000, 2147483647} {\n  if got, ok := calclib.CheckedRune(value); ok || got != value { t.Fatal(\"invalid rune policy\") }\n }\n for _, value := range []int32{0, 0xd7ff, 0xe000, 0x10ffff} {\n  if got, ok := calclib.CheckedRune(value); !ok || got != value { t.Fatal(\"valid rune\") }\n }\n}\n",
+    );
+    test_support::assert_success(run_export_fixture(root, Vec::new()));
+    let generated = test_support::read_file(path::join(root, "gen/calclib/goml_generated.go"));
+    test_support::assert_success(run_export_fixture(root, Vec::new()));
+    testing::assert_eq(
+        test_support::read_file(path::join(root, "gen/calclib/goml_generated.go")),
+        generated,
+    );
+    match process::Command::new("go").args(Vec::from_array(["test", "./..."])).current_dir(root).env(
+        "GOWORK",
+        "off",
+    ).env("GOTOOLCHAIN", "local").env("GOPROXY", "off").output_structured() {
+        Ok(output) => test_support::assert_success(output),
+        Err(error) => testing::fail(error.to_string()),
+    }
+    for signature in Vec::from_array(
+        ["value: string) -> string { value }", "value: char) -> char { value }"],
+    ) {
+        test_support::write_file(
+            path::join(root, "calc.gom"),
+            "package calc; #[go_export(\"Implicit\")] pub fn implicit(" + signature,
+        );
+        let rejected = run_export_fixture(root, Vec::new());
+        test_support::assert_failure(rejected);
+        test_support::assert_contains(
+            test_support::stderr(rejected),
+            "unsupported go_export parameter type",
+        );
+        testing::assert_eq(
+            test_support::read_file(path::join(root, "gen/calclib/goml_generated.go")),
+            generated,
+        );
+    }
+}

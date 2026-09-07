@@ -1,0 +1,177 @@
+package go_backend;
+
+use std::testing;
+use module::repr;
+
+#[test]
+fn go_library_roots_follow_global_initializers_back_to_functions() -> () {
+    let entry = Function {
+        name: "Export",
+        params: Vec::new(),
+        ret_ty: Option::Some(Type::Int),
+        body: Block {
+            stmts: Vec::from_array(
+                [Stmt::Return { expr: Option::Some(Expr::Var { name: "cell" }) }],
+            ),
+        },
+    };
+    let helper = Function {
+        name: "initialize",
+        params: Vec::new(),
+        ret_ty: Option::Some(Type::Int),
+        body: Block {
+            stmts: Vec::from_array([Stmt::Return { expr: Option::Some(Expr::Int { value: "42" }) }]),
+        },
+    };
+    let global = Global {
+        name: "cell",
+        ty: Option::Some(Type::Int),
+        value: Expr::Call { func: Expr::Var { name: "initialize" }, args: Vec::new() },
+    };
+    let file = File {
+        items: Vec::from_array(
+            [Item::Function(helper), Item::Function(entry), Item::Global(global)],
+        ),
+    };
+    let output = encode_package(
+        prune_functions_with_roots(file, Vec::from_array(["Export"])),
+        "library",
+    );
+    testing::assert(output.contains("func initialize("));
+    testing::assert(output.contains("func Export("));
+    testing::assert(output.starts_with("package library"));
+}
+
+#[test]
+fn go_library_exports_detect_generated_and_import_name_conflicts() -> () {
+    let declarations = Vec::from_array([("source", "Collision")]);
+    let items = Vec::from_array(
+        [Item::ImportGroup(Vec::from_array([("Collision", "example.com/package")]))],
+    );
+    let result = emit_library_exports(items, Vec::new(), new_function_names(), declarations);
+    match result {
+        Err(message) => testing::assert(message.contains("conflicts")),
+        Ok(()) => testing::fail("expected export collision"),
+    }
+    let items = Vec::from_array([Item::Struct(StructDef { name: "Collision", fields: Vec::new() })]);
+    let result = emit_library_exports(items, Vec::new(), new_function_names(), declarations);
+    match result {
+        Err(message) => testing::assert(message.contains("conflicts")),
+        Ok(()) => testing::fail("expected export collision"),
+    }
+}
+
+#[test]
+fn go_library_private_names_preserve_shadowing_and_foreign_selectors() -> () {
+    let candidate = go_hashed_ident("private", "Helper");
+    let helper = Function {
+        name: "Helper",
+        params: Vec::new(),
+        ret_ty: Option::Some(Type::Int),
+        body: Block {
+            stmts: Vec::from_array([Stmt::Return { expr: Option::Some(Expr::Int { value: "1" }) }]),
+        },
+    };
+    let exported = Function {
+        name: "Export",
+        params: Vec::from_array([("Helper", Type::Int), (candidate, Type::Int)]),
+        ret_ty: Option::Some(Type::Float64),
+        body: Block {
+            stmts: Vec::from_array(
+                [
+                    Stmt::Assign { name: "Helper", value: Expr::Var { name: candidate } },
+                    Stmt::Return {
+                        expr: Option::Some(
+                            Expr::Call {
+                                func: Expr::Field {
+                                    expr: Expr::Var { name: "Math" },
+                                    field_name: "Abs",
+                                },
+                                args: Vec::from_array(
+                                    [
+                                        Expr::Convert {
+                                            ty: Type::Float64,
+                                            expr: Expr::Var { name: "Helper" },
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                    },
+                ],
+            ),
+        },
+    };
+    let source = File {
+        items: Vec::from_array(
+            [
+                Item::ImportGroup(Vec::from_array([("Math", "math")])),
+                Item::Function(helper),
+                Item::Function(exported),
+            ],
+        ),
+    };
+    let renamed: Vec[(string, string)] = Vec::new();
+    let output = encode_package(
+        privatize_library_with_names(source, Vec::from_array(["Export"]), renamed),
+        "library",
+    );
+    testing::assert_eq(renamed.len(), 1);
+    testing::assert_eq(renamed[0].0, "Helper");
+    testing::assert_eq(renamed[0].1, candidate + "_1");
+    testing::assert(output.contains("func " + candidate + "_1()"));
+    testing::assert(output.contains("func Export("));
+    testing::assert(output.contains(candidate + "_1 int"));
+    testing::assert(output.contains(candidate + " int"));
+    testing::assert(output.contains(candidate + "_1 = " + candidate));
+    testing::assert(output.contains("Math.Abs(float64(" + candidate + "_1))"));
+    testing::assert(output.contains("Math \"math\""));
+}
+
+#[test]
+fn external_type_only_imports_survive_generic_types_and_library_pruning() -> () {
+    let time_type = repr::Type::External { import_path: "time", name: "Time", args: Vec::new() };
+    let handle = repr::Type::External {
+        import_path: "unique",
+        name: "Handle",
+        args: Vec::from_array([time_type]),
+    };
+    let collected = new_collected_types();
+    collect_type(collected, handle);
+    let items: Vec[Item] = Vec::new();
+    emit_go_foreign_import_items(items, Vec::new(), collected.values);
+    let ty = lower_type(handle);
+    items.push(
+        Item::Function(
+            Function {
+                name: "Identity",
+                params: Vec::from_array([("value", ty)]),
+                ret_ty: Option::Some(ty),
+                body: Block {
+                    stmts: Vec::from_array(
+                        [Stmt::Return { expr: Option::Some(Expr::Var { name: "value" }) }],
+                    ),
+                },
+            },
+        ),
+    );
+    let result = privatize_library(
+        prune_functions_with_roots(File { items }, Vec::from_array(["Identity"])),
+        Vec::from_array(["Identity"]),
+    );
+    let source = encode_package(result, "library");
+    testing::assert(source.contains("\"unique\""));
+    testing::assert(source.contains("\"time\""));
+    testing::assert(source.contains("Handle[" + go_foreign_import_alias("time") + ".Time]"));
+    testing::assert(!source.contains("type "));
+    testing::assert(
+        encode_type(handle)
+            != encode_type(
+                repr::Type::External {
+                    import_path: "other",
+                    name: "Handle",
+                    args: Vec::from_array([time_type]),
+                },
+            ),
+    );
+}
