@@ -1,7 +1,5 @@
 # Allowlisted binding generation
 
-Status: D2 commands and protected publication are implemented. The internal-import and same-package generation audit defects have been fixed, including stale-output regeneration and candidate Go package validation. Focused helper/CLI tests and the complete CI pass; see [acceptance-d2.md](acceptance-d2.md) for the full-suite, fixed-point and extracted-release evidence.
-
 The configuration uses versioned JSON and explicitly selects each native function and type. The command is `goml bind-go <CONFIG>`, with optional `--compiler <COMPILER>` and `--dry-run`; `gomlc bind-go <CONFIG>` also works directly. Relative output paths resolve from the configuration file, within the existing GoML and Go module roots. Generation must not create or modify dependency manifests or execute Go package initializers.
 
 ```json
@@ -27,7 +25,7 @@ Each entry may have `type_arguments`, a finite array using the existing bridge-t
 
 The Go output is intended for native forwarding functions that retain explicit generic arguments and variadic slice expansion. It is constructed through Go AST nodes. The GoML output exposes the selected bindings with explicit raw boundaries and no implicit error, nullable or record conversion. Such higher-level adapters require explicit mapping configuration before they can be generated.
 
-Publication must validate module-relative output paths and Go import identity, retain deterministic output, and refuse to overwrite files whose contents no longer match the generator's recorded output. A second identical generation must leave files unchanged. The source generator has an end-to-end `goml check` regression. The [standard-library example](../../examples/ffi-bind-go/README.md) has passed generation, formatting, `goml check` and execution. The complete CI also checks this example using the extracted release toolchain.
+Publication must validate module-relative output paths and Go import identity, retain deterministic output, and refuse to overwrite files whose contents no longer match the generator's recorded output. A second identical generation must leave files unchanged. See the [standard-library example](../../examples/ffi-bind-go/README.md) for generation, checking and execution commands.
 
 The publisher records both source hashes and module-relative output names in `<CONFIG>.goml-bind.json`. It accepts existing outputs only when both files and that exact canonical manifest agree. Repeating identical generation preserves file timestamps. Output paths reject parent traversal, symbolic links, nested module boundaries and the reserved `.goml-bind-go-lock` recovery and `.goml-bind-go-query` query directories. A module-level lock serializes generators. Publication stages both sources and the manifest, rechecks the previous contents, and rolls back committed sources if a later rename fails. If rollback itself fails, the lock and backup files remain for recovery; subsequent generation refuses to proceed until the failure is resolved. These checks protect generated files; handwritten files outside the configured output names are not publication targets.
 
