@@ -1,0 +1,202 @@
+package ffi;
+
+use std::json;
+
+pub struct FunctionQuery {
+    pub id: string,
+    pub import_path: string,
+    pub name: string,
+    pub arguments: Vec[BridgeType],
+}
+
+pub struct QueriedFunction {
+    pub query: FunctionQuery,
+    pub signature: GoTypeIdentity,
+    pub variadic: bool,
+}
+
+pub struct FunctionQueries {
+    pub metadata: TypeDeclarations,
+    pub functions: Vec[QueriedFunction],
+}
+
+pub fn encode_function_queries(
+    context: GoBuildContext,
+    caller: CallerContext,
+    queries: Vec[FunctionQuery],
+) -> Result[string, string] {
+    if queries.len() > 4096 {
+        return Result::Err("ffi-protocol: too many function queries")
+    }
+    let seen: HashMap[string, bool] = HashMap::new();
+    let values = Vec::new();
+    let remaining = Ref::new(65536);
+    for query in queries {
+        if query.id == "" || seen[query.id].is_some()
+            || !named_bridge_identity_valid(query.import_path, query.name)
+            || query.import_path == "" {
+            return Result::Err("ffi-protocol: invalid or duplicate function query")
+        }
+        seen[query.id] = true;
+        for argument in query.arguments {
+            let _ = instance_argument_identity(argument, 0, remaining)?;
+        }
+        values.push(
+            json::object(
+                Vec::from_array(
+                    [
+                        ("type_id", json::Value::String(query.id)),
+                        ("import_path", json::Value::String(query.import_path)),
+                        ("name", json::Value::String(query.name)),
+                        ("query_mode", json::Value::String("function")),
+                        ("type_arguments", bridge_types_json(query.arguments)),
+                    ],
+                ),
+            ),
+        );
+    }
+    let Object(fields) = json::parse(encode_request(context, caller, Vec::new()))? else {
+        return Result::Err("ffi-protocol: invalid function request object")
+    };
+    fields.push(("type_queries", json::Value::Array(values)));
+    let result = json::encode(json::Value::Object(fields));
+    if result.byte_len() > 8388608 {
+        Result::Err("ffi-protocol: function query request exceeds limit")
+    } else {
+        Result::Ok(result)
+    }
+}
+
+fn queried_signature(metadata: TypeDeclarations, id: string, parameters: HashMap[string, isize]) -> Result[
+    (GoTypeIdentity, bool),
+    string,
+] {
+    let node = metadata.nodes[id].ok_or("ffi-protocol: missing function signature")?;
+    if response_string(node, "tag")? != "signature" || json::field(node, "receiver").is_some() {
+        return Result::Err("ffi-protocol: expected a package-level function signature")
+    }
+    let variadic = match json::field(node, "variadic") {
+        Some(value) => json::as_bool(value).ok_or("ffi-protocol: invalid variadic flag")?,
+        None => false,
+    };
+    let remaining = Ref::new(16384);
+    let resolve = |id| normalize_go_type_node(
+        metadata,
+        id,
+        "",
+        parameters,
+        HashMap::new(),
+        remaining,
+        0,
+    );
+    let params = Vec::new();
+    let results = Vec::new();
+    for id in identity_references(node, "parameters")? {
+        params.push(resolve(id)?);
+    }
+    for id in identity_references(node, "results")? {
+        results.push(resolve(id)?);
+    }
+    if variadic {
+        if params.is_empty() {
+            return Result::Err("ffi-protocol: variadic function has no final parameter")
+        }
+        if let GoTypeIdentity::Slice(_) = params[params.len() - 1] {} else {
+            return Result::Err("ffi-protocol: variadic function must end with a slice")
+        }
+    }
+    Result::Ok((GoTypeIdentity::Function { parameters: params, results }, variadic))
+}
+
+pub fn decode_function_queries(input: string, expected: Vec[FunctionQuery]) -> Result[
+    FunctionQueries,
+    string,
+] {
+    if input.byte_len() > 8388608 || !response_nesting_is_bounded(input) {
+        return Result::Err("ffi-protocol: invalid function response JSON")
+    }
+    let value = json::parse(input).map_err(|error| "ffi-protocol: " + error)?;
+    if json::as_int(response_field(value, "protocol_version")?) != Option::Some(1) {
+        return Result::Err("ffi-protocol: unsupported response version")
+    }
+    let diagnostics = response_array(value, "diagnostics")?;
+    if !diagnostics.is_empty() {
+        return Result::Err(diagnostic_text(diagnostics[0])?)
+    }
+    if !response_array(value, "bindings")?.is_empty() {
+        return Result::Err("ffi-protocol: unexpected function binding results")
+    }
+    let ids = response_type_ids(value)?;
+    let nodes: HashMap[string, json::Value] = HashMap::new();
+    for node in response_array(value, "referenced_types")? {
+        validate_type_node_links(ids, node)?;
+        nodes[response_string(node, "id")?] = node;
+    }
+    let world = response_string(value, "go_world_identity")?;
+    if world == "" && !expected.is_empty() {
+        return Result::Err("ffi-protocol: missing Go world identity")
+    }
+    let metadata = TypeDeclarations { go_world_identity: world, declarations: Vec::new(), nodes };
+    let results = response_array(value, "type_results")?;
+    if expected.len() > 4096 || results.len() != expected.len() {
+        return Result::Err("ffi-protocol: unexpected function result count")
+    }
+    let queries: HashMap[string, FunctionQuery] = HashMap::new();
+    let seen: HashMap[string, bool] = HashMap::new();
+    for query in expected {
+        if query.id == "" || queries[query.id].is_some() {
+            return Result::Err("ffi-protocol: invalid expected function identity")
+        }
+        queries[query.id] = query;
+    }
+    let functions = Vec::new();
+    let remaining = Ref::new(65536);
+    for result in results {
+        let id = response_string(result, "type_id")?;
+        let query = queries[id].ok_or("ffi-protocol: unexpected function result " + id)?;
+        if seen[id].is_some() {
+            return Result::Err("ffi-protocol: duplicate function result " + id)
+        }
+        seen[id] = true;
+        let diagnostics = match json::field(result, "diagnostics") {
+            Some(_) => response_array(result, "diagnostics")?,
+            None => Vec::new(),
+        };
+        let status = response_string(result, "status")?;
+        if status == "failed" && !diagnostics.is_empty() {
+            return Result::Err(id + ": " + diagnostic_text(diagnostics[0])?)
+        }
+        if status != "verified" || !diagnostics.is_empty()
+            || response_string(result, "declaration_kind")? != "function" {
+            return Result::Err("ffi-protocol: inconsistent function status " + id)
+        }
+        let declared = response_string(result, "declared_type")?;
+        let concrete = response_string(result, "type")?;
+        let declared_node = nodes[declared].ok_or("ffi-protocol: missing function declaration")?;
+        let concrete_node = nodes[concrete].ok_or("ffi-protocol: missing function instance")?;
+        let parameters = identity_references(declared_node, "type_parameters")?;
+        if parameters.len() != query.arguments.len()
+            || !identity_references(concrete_node, "type_parameters")?.is_empty() {
+            return Result::Err("ffi-protocol: function instance argument count mismatch")
+        }
+        let parameter_map: HashMap[string, isize] = HashMap::new();
+        let arguments = Vec::new();
+        for index in 0..parameters.len() {
+            if ids[parameters[index]] != Option::Some("type_parameter")
+                || parameter_map[parameters[index]].is_some() {
+                return Result::Err("ffi-protocol: invalid function type parameter")
+            }
+            parameter_map[parameters[index]] = index;
+            arguments.push(instance_argument_identity(query.arguments[index], 0, remaining)?);
+        }
+        let original = queried_signature(metadata, declared, parameter_map)?;
+        let actual = queried_signature(metadata, concrete, HashMap::new())?;
+        let predicted = substitute_go_identity(original.0, arguments)?;
+        if original.1 != actual.1
+            || go_type_identity_key(predicted) != go_type_identity_key(actual.0) {
+            return Result::Err("ffi-protocol: function instance identity mismatch")
+        }
+        functions.push(QueriedFunction { query, signature: actual.0, variadic: actual.1 });
+    }
+    Result::Ok(FunctionQueries { metadata, functions })
+}

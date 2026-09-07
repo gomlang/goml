@@ -47,7 +47,18 @@ struct CompiledValue {
     expr: Expr,
 }
 
+struct RuntimeRequirements {
+    runtime_hooks: Vec[string],
+    missing_types: CollectedTypes,
+    intrinsics: Vec[string],
+    go_foreign: Vec[GoForeignSpec],
+    callbacks: Vec[repr::CallbackAdapter],
+    interface_bridges: Vec[repr::GoInterfaceBridge],
+}
+
 struct GoForeignSpec {
+    bindings: Vec[string],
+    is_method: bool,
     import_path: string,
     symbol: string,
     ty: repr::Type,
@@ -378,7 +389,32 @@ fn go_foreign_wrapper_name(import_path: string, symbol: string, ty: repr::Type) 
     go_hashed_ident("ffi", import_path + "\u0000" + symbol + "\u0000" + compact_type(ty))
 }
 
+fn go_method_wrapper_name(symbol: string, ty: repr::Type) -> string {
+    go_hashed_ident("ffi_method", symbol + "\u0000" + compact_type(ty))
+}
+
+fn go_foreign_spec_name(spec: GoForeignSpec) -> string {
+    if spec.is_method {
+        go_method_wrapper_name(spec.symbol, spec.ty)
+    } else {
+        go_foreign_wrapper_name(spec.import_path, spec.symbol, spec.ty)
+    }
+}
+
 fn go_foreign_call(spec: GoForeignSpec, args: Vec[Expr]) -> Expr {
+    if spec.is_method {
+        if let Func { params, ret_ty: _ } = repr::resolve_type(spec.ty) {
+            if !params.is_empty() {
+                return Expr::Call {
+                    func: Expr::MethodExpression {
+                        receiver: lower_type(params[0]),
+                        name: spec.symbol,
+                    },
+                    args,
+                }
+            }
+        }
+    }
     Expr::Call {
         func: Expr::Field {
             expr: Expr::Var { name: go_foreign_import_alias(spec.import_path) },
@@ -456,14 +492,14 @@ fn go_foreign_wrapper(spec: GoForeignSpec) -> Function {
                 ),
             }
             Function {
-                name: go_foreign_wrapper_name(spec.import_path, spec.symbol, spec.ty),
+                name: go_foreign_spec_name(spec),
                 params,
                 ret_ty: Option::Some(lower_type(ret_ty)),
                 body: Block { stmts },
             }
         },
         _ => Function {
-            name: go_foreign_wrapper_name(spec.import_path, spec.symbol, spec.ty),
+            name: go_foreign_spec_name(spec),
             params: Vec::new(),
             ret_ty: Option::Some(Type::Unit),
             body: Block {
@@ -473,9 +509,16 @@ fn go_foreign_wrapper(spec: GoForeignSpec) -> Function {
     }
 }
 
-fn emit_go_foreign_import_items(items: Vec[Item], values: Vec[GoForeignSpec]) -> () {
+fn emit_go_foreign_import_items(
+    items: Vec[Item],
+    values: Vec[GoForeignSpec],
+    types: Vec[repr::Type],
+) -> () {
     let imports: Vec[(string, string)] = Vec::new();
     for value in values {
+        if value.is_method {
+            continue
+        }
         let mut found = false;
         for present in imports {
             if present.1 == value.import_path {
@@ -485,6 +528,21 @@ fn emit_go_foreign_import_items(items: Vec[Item], values: Vec[GoForeignSpec]) ->
         }
         if !found {
             imports.push((go_foreign_import_alias(value.import_path), value.import_path))
+        }
+    }
+    for ty in types {
+        if let repr::Type::External { import_path, .. } = ty {
+            if import_path != "" {
+                let mut found = false;
+                for present in imports {
+                    if present.1 == import_path {
+                        found = true;
+                    }
+                }
+                if !found {
+                    imports.push((go_foreign_import_alias(import_path), import_path))
+                }
+            }
         }
     }
     if !imports.is_empty() {
@@ -503,8 +561,15 @@ fn callable_name(env: LowerEnv, value: repr::Callable, ty: repr::Type) -> string
         Function(name) => env_function_name(env, name),
         LangItem { item: _, function_name } => env_function_name(env, function_name),
         Runtime(name) => runtime_hook_name(name),
+        CallbackAdapter(value) => callback_factory_name(value),
+        InterfaceBridge(value) => interface_bridge_factory(value),
         Intrinsic(name) => go_ident(name),
-        GoForeign { import_path, symbol } => go_foreign_wrapper_name(import_path, symbol, ty),
+        GoMethod { symbol, binding } => go_method_wrapper_name(symbol, ty),
+        GoForeign { import_path, symbol, binding } => go_foreign_wrapper_name(
+            import_path,
+            symbol,
+            ty,
+        ),
         TraitMethod { trait_ref: reference, method_name: name, .. } => {
             go_ident(reference.name + "#" + name)
         },
@@ -2171,8 +2236,98 @@ fn compile_collection_from_array_callable(key: string, function_ty: repr::Type) 
     }
 }
 
+fn compile_go_nil_callable(key: string, function_ty: repr::Type) -> Expr {
+    match repr::resolve_type(function_ty) {
+        Func { params: param_types, ret_ty } => {
+            let params: Vec[(string, Type)] = Vec::new();
+            for index in 0..param_types.len() {
+                params.push((f"p{index}", lower_type(param_types[index])))
+            }
+            let value = if key == "go_ptr.null" || key == "go_error.nil" || key == "go_slice.nil"
+                || key == "go_map.nil"
+                || key == "go_func.nil" {
+                Expr::Nil
+            } else {
+                Expr::Binary { op: BinaryOp::Eq, lhs: Expr::Var { name: "p0" }, rhs: Expr::Nil }
+            };
+            Expr::FuncLit {
+                params,
+                ret_ty: lower_type(ret_ty),
+                body: Block { stmts: Vec::from_array([Stmt::Return { expr: Option::Some(value) }]) },
+            }
+        },
+        _ => Expr::Var { name: go_ident(key) },
+    }
+}
+
+fn compile_go_bytes_callable(key: string, function_ty: repr::Type) -> Expr {
+    match repr::resolve_type(function_ty) {
+        Func { params, ret_ty } if params.len() == 1 => {
+            let storage_type = match lower_type(ret_ty) {
+                Pointer { elem } => elem,
+                value => value,
+            };
+            let message = if key == "go_string.bytes" {
+                Expr::Var { name: "p0" }
+            } else {
+                Expr::Call {
+                    func: Expr::MethodExpression {
+                        receiver: Type::Named { name: "error" },
+                        name: "Error",
+                    },
+                    args: Vec::from_array([Expr::Var { name: "p0" }]),
+                }
+            };
+            let value = Expr::Unary {
+                op: UnaryOp::Address,
+                expr: Expr::StructLiteral {
+                    ty: storage_type,
+                    fields: Vec::from_array(
+                        [
+                            (
+                                "items",
+                                Expr::Convert {
+                                    ty: Type::Slice { elem: Type::Uint8 },
+                                    expr: message,
+                                },
+                            ),
+                        ],
+                    ),
+                },
+            };
+            Expr::FuncLit {
+                params: Vec::from_array([("p0", lower_type(params[0]))]),
+                ret_ty: lower_type(ret_ty),
+                body: Block { stmts: Vec::from_array([Stmt::Return { expr: Option::Some(value) }]) },
+            }
+        },
+        _ => Expr::Var { name: "invalid_go_bytes_callable" },
+    }
+}
+
 fn compile_intrinsic_callable(key: string, function_ty: repr::Type) -> Expr {
-    if key == "vec.from_array" || key == "hashmap.from_array" {
+    if key == "go_map.new" || key == "go_map.len" || key == "go_map.lookup" || key == "go_map.set"
+        || key == "go_map.delete"
+        || key == "go_map.copy" {
+        compile_go_map_callable(key, function_ty)
+    } else if key == "go_slice.capacity" || key == "go_slice.append" {
+        compile_go_slice_callable(key, function_ty)
+    } else if key == "go_error.is" {
+        Expr::Var { name: go_foreign_wrapper_name("errors", "Is", function_ty) }
+    } else if key == "go_error.message_bytes" || key == "go_string.bytes" {
+        compile_go_bytes_callable(key, function_ty)
+    } else if key == "go_string.from_text" || key == "go_string.from_bytes" {
+        compile_go_string_callable(key, function_ty)
+    } else if key == "go_ptr.null" || key == "go_ptr.is_nil" || key == "go_error.nil"
+        || key == "go_error.is_nil"
+        || key == "go_slice.nil"
+        || key == "go_slice.is_nil"
+        || key == "go_map.nil"
+        || key == "go_map.is_nil"
+        || key == "go_func.nil"
+        || key == "go_func.is_nil" {
+        compile_go_nil_callable(key, function_ty)
+    } else if key == "vec.from_array" || key == "hashmap.from_array" {
         compile_collection_from_array_callable(key, function_ty)
     } else if key == "slice.new" || key == "slice.get" || key == "slice.len" || key == "slice.sub"
         || key == "mut_slice.new"
@@ -2235,7 +2390,12 @@ fn compile_call(env: LowerEnv, func: anf::Imm, args: Vec[anf::Imm]) -> Expr {
     }
     match func {
         Callable { callable: Intrinsic(key), ty: _ } => {
-            if key == "slice.new" || key == "mut_slice.new" {
+            if key == "go_ptr.null" || key == "go_error.nil" || key == "go_slice.nil"
+                || key == "go_map.nil" {
+                Expr::Nil
+            } else if key == "go_ptr.is_nil" || key == "go_error.is_nil" {
+                Expr::Binary { op: BinaryOp::Eq, lhs: compiled[0], rhs: Expr::Nil }
+            } else if key == "slice.new" || key == "mut_slice.new" {
                 Expr::Slice {
                     base: Expr::Field { expr: compiled[0], field_name: "items" },
                     start: compiled[1],
@@ -4982,6 +5142,12 @@ fn add_collected_type(result: CollectedTypes, value: repr::Type) -> () {
 
 fn collect_type(result: CollectedTypes, value: repr::Type) -> () {
     match repr::resolve_type(value) {
+        External { args, .. } => {
+            add_collected_type(result, value);
+            for arg in args {
+                collect_type(result, arg)
+            }
+        },
         Tuple { items: values } => {
             add_collected_type(result, value);
             for inner in values {
@@ -4994,7 +5160,10 @@ fn collect_type(result: CollectedTypes, value: repr::Type) -> () {
             add_collected_type(result, value);
             collect_type(result, elem);
         },
-        Slice { elem } | MutSlice { elem } => collect_type(result, elem),
+        GoPointer { elem } | GoFunction { signature: elem } | Slice { elem } | MutSlice { elem } => collect_type(
+            result,
+            elem,
+        ),
         VecType { elem } => {
             add_collected_type(result, value);
             collect_type(result, elem);
@@ -5004,6 +5173,10 @@ fn collect_type(result: CollectedTypes, value: repr::Type) -> () {
             collect_type(result, elem);
         },
         Channel { elem, direction: _ } => collect_type(result, elem),
+        GoMap { key, value } => {
+            collect_type(result, key);
+            collect_type(result, value);
+        },
         HashMap { key, value } => {
             add_collected_type(result, repr::Type::HashMap { key, value });
             collect_type(result, key);
@@ -5023,63 +5196,82 @@ fn collect_imm_type(result: CollectedTypes, value: anf::Imm) -> () {
     collect_type(result, anf::imm_type(value))
 }
 
-fn collect_runtime_imm(
-    result: Vec[string],
-    missing_types: CollectedTypes,
-    intrinsics: Vec[string],
-    go_foreign: Vec[GoForeignSpec],
-    value: anf::Imm,
-) -> () {
+fn collect_runtime_imm(requirements: RuntimeRequirements, value: anf::Imm) -> () {
     match value {
+        Callable { callable: InterfaceBridge(value), ty: _ } => add_interface_bridge(
+            requirements.interface_bridges,
+            value,
+        ),
+        Callable { callable: CallbackAdapter(value), ty: _ } => add_callback_adapter(
+            requirements.callbacks,
+            value,
+        ),
         Callable { callable: Runtime(key), ty: _ } => {
-            if !result.contains(key) {
-                result.push(key)
+            if !requirements.runtime_hooks.contains(key) {
+                requirements.runtime_hooks.push(key)
             }
         },
         Callable { callable: Intrinsic(key), ty: function_ty } => {
-            if !intrinsics.contains(key) {
-                intrinsics.push(key)
+            if !requirements.intrinsics.contains(key) {
+                requirements.intrinsics.push(key)
+            }
+            if key == "go_error.is" {
+                add_go_foreign_spec(
+                    requirements.go_foreign,
+                    GoForeignSpec {
+                        bindings: Vec::new(),
+                        is_method: false,
+                        import_path: "errors",
+                        symbol: "Is",
+                        ty: function_ty,
+                    },
+                )
             }
             if key == "compiler.missing" {
                 if let Func { params: _, ret_ty } = repr::resolve_type(function_ty) {
-                    add_collected_type(missing_types, ret_ty)
+                    add_collected_type(requirements.missing_types, ret_ty)
                 }
             }
         },
-        Callable { callable: GoForeign { import_path, symbol }, ty } => {
-            let name = go_foreign_wrapper_name(import_path, symbol, ty);
-            let mut found = false;
-            for value in go_foreign {
-                if go_foreign_wrapper_name(value.import_path, value.symbol, value.ty) == name {
-                    found = true;
-                    break
-                }
-            }
-            if !found {
-                go_foreign.push(GoForeignSpec { import_path, symbol, ty })
-            }
+        Callable { callable: GoForeign { import_path, symbol, binding }, ty } => {
+            add_go_foreign_spec(
+                requirements.go_foreign,
+                GoForeignSpec {
+                    bindings: Vec::from_array([binding]),
+                    is_method: false,
+                    import_path,
+                    symbol,
+                    ty,
+                },
+            )
+        },
+        Callable { callable: GoMethod { symbol, binding }, ty } => {
+            add_go_foreign_spec(
+                requirements.go_foreign,
+                GoForeignSpec {
+                    bindings: Vec::from_array([binding]),
+                    is_method: true,
+                    import_path: "",
+                    symbol,
+                    ty,
+                },
+            )
         },
         _ => (),
     }
 }
 
-fn collect_runtime_value(
-    result: Vec[string],
-    missing_types: CollectedTypes,
-    intrinsics: Vec[string],
-    go_foreign: Vec[GoForeignSpec],
-    value: anf::Value,
-) -> () {
+fn collect_runtime_value(requirements: RuntimeRequirements, value: anf::Value) -> () {
     match value {
         Imm(value) => {
-            collect_runtime_imm(result, missing_types, intrinsics, go_foreign, value)
+            collect_runtime_imm(requirements, value)
         },
         Constr { constructor: _, args, ty: _ } | Tuple { items: args, ty: _ } | Array {
             items: args,
             ty: _,
         } => {
             for arg in args {
-                collect_runtime_imm(result, missing_types, intrinsics, go_foreign, arg)
+                collect_runtime_imm(requirements, arg)
             }
         },
         ConstrGet { expr, constructor: _, field_index: _, ty: _ } | Unary { op: _, expr, ty: _ } | Cast {
@@ -5090,113 +5282,95 @@ fn collect_runtime_value(
             index: _,
             ty: _,
         } => {
-            collect_runtime_imm(result, missing_types, intrinsics, go_foreign, expr)
+            collect_runtime_imm(requirements, expr)
         },
         Binary { op: _, lhs, rhs, ty: _ } => {
-            collect_runtime_imm(result, missing_types, intrinsics, go_foreign, lhs);
-            collect_runtime_imm(result, missing_types, intrinsics, go_foreign, rhs)
+            collect_runtime_imm(requirements, lhs);
+            collect_runtime_imm(requirements, rhs)
         },
         Assign { name: _, value: expr, target_ty: _, ty: _ } => {
-            collect_runtime_imm(result, missing_types, intrinsics, go_foreign, expr)
+            collect_runtime_imm(requirements, expr)
         },
         Call { func, args, ty: _ } => {
-            collect_runtime_imm(result, missing_types, intrinsics, go_foreign, func);
+            collect_runtime_imm(requirements, func);
             for arg in args {
-                collect_runtime_imm(result, missing_types, intrinsics, go_foreign, arg)
+                collect_runtime_imm(requirements, arg)
             }
         },
         ToDyn { trait_name: _, for_ty: _, expr, ty: _ } => {
-            collect_runtime_imm(result, missing_types, intrinsics, go_foreign, expr)
+            collect_runtime_imm(requirements, expr)
         },
         DynCall { trait_name: _, method_name: _, receiver, args, ty: _ } => {
-            collect_runtime_imm(result, missing_types, intrinsics, go_foreign, receiver);
+            collect_runtime_imm(requirements, receiver);
             for arg in args {
-                collect_runtime_imm(result, missing_types, intrinsics, go_foreign, arg)
+                collect_runtime_imm(requirements, arg)
             }
         },
     }
 }
 
-fn collect_runtime_block(
-    result: Vec[string],
-    missing_types: CollectedTypes,
-    intrinsics: Vec[string],
-    go_foreign: Vec[GoForeignSpec],
-    value: anf::Block,
-) -> () {
+fn collect_runtime_block(requirements: RuntimeRequirements, value: anf::Block) -> () {
     for bind in value.binds {
         match bind {
             Let(value) => {
-                collect_runtime_value(result, missing_types, intrinsics, go_foreign, value.value)
+                collect_runtime_value(requirements, value.value)
             },
             Join(value) => {
-                collect_runtime_block(result, missing_types, intrinsics, go_foreign, value.body)
+                collect_runtime_block(requirements, value.body)
             },
             JoinRec(values) => {
                 for value in values {
-                    collect_runtime_block(result, missing_types, intrinsics, go_foreign, value.body)
+                    collect_runtime_block(requirements, value.body)
                 }
             },
         }
     }
     match value.term {
         Return(value) => {
-            collect_runtime_imm(result, missing_types, intrinsics, go_foreign, value)
+            collect_runtime_imm(requirements, value)
         },
         Jump { target: _, args, ret_ty: _ } => {
             for arg in args {
-                collect_runtime_imm(result, missing_types, intrinsics, go_foreign, arg)
+                collect_runtime_imm(requirements, arg)
             }
         },
         If { cond, then_, else_, ret_ty: _ } => {
-            collect_runtime_imm(result, missing_types, intrinsics, go_foreign, cond);
-            collect_runtime_block(result, missing_types, intrinsics, go_foreign, then_);
-            collect_runtime_block(result, missing_types, intrinsics, go_foreign, else_)
+            collect_runtime_imm(requirements, cond);
+            collect_runtime_block(requirements, then_);
+            collect_runtime_block(requirements, else_)
         },
         Match { scrutinee: scrut, arms, default, ret_ty: _ } => {
-            collect_runtime_imm(result, missing_types, intrinsics, go_foreign, scrut);
+            collect_runtime_imm(requirements, scrut);
             for arm in arms {
-                collect_runtime_imm(result, missing_types, intrinsics, go_foreign, arm.lhs);
-                collect_runtime_block(result, missing_types, intrinsics, go_foreign, arm.body)
+                collect_runtime_imm(requirements, arm.lhs);
+                collect_runtime_block(requirements, arm.body)
             }
             if let Some(body) = default {
-                collect_runtime_block(result, missing_types, intrinsics, go_foreign, body)
+                collect_runtime_block(requirements, body)
             }
         },
         Select { arms, default, .. } => {
             for arm in arms {
                 match arm {
                     Receive { channel, guard, binding: _, binding_ty: _, body } => {
-                        collect_runtime_imm(result, missing_types, intrinsics, go_foreign, channel);
+                        collect_runtime_imm(requirements, channel);
                         if let Some(value) = guard {
-                            collect_runtime_imm(
-                                result,
-                                missing_types,
-                                intrinsics,
-                                go_foreign,
-                                value,
-                            )
+                            collect_runtime_imm(requirements, value)
                         }
-                        collect_runtime_block(result, missing_types, intrinsics, go_foreign, body)
+                        collect_runtime_block(requirements, body)
                     },
                     Send { channel, value, guard, body } => {
-                        collect_runtime_imm(result, missing_types, intrinsics, go_foreign, channel);
-                        collect_runtime_imm(result, missing_types, intrinsics, go_foreign, value);
+                        collect_runtime_imm(requirements, channel);
+                        collect_runtime_imm(requirements, value);
                         if let Some(value) = guard {
-                            collect_runtime_imm(
-                                result,
-                                missing_types,
-                                intrinsics,
-                                go_foreign,
-                                value,
-                            )
+                            collect_runtime_imm(requirements, value)
                         }
-                        collect_runtime_block(result, missing_types, intrinsics, go_foreign, body)
+                        collect_runtime_block(requirements, body)
                     },
                 }
             }
             if let Some(body) = default {
-                collect_runtime_block(result, missing_types, intrinsics, go_foreign, body)
+                collect_runtime_block(requirements, body)
             }
         },
         Unreachable { ty: _ } => (),
@@ -5504,6 +5678,7 @@ fn go_type_size(value: repr::Type, structs: Vec[repr::StructDef], depth: isize) 
             Int16 | Uint16 => known_go_size(2, 2),
             Int32 | Uint32 | Float32 | Char => known_go_size(4, 4),
             Int | Int64 | Uint | Uint64 | Float64 => known_go_size(8, 8),
+            External { .. } => unknown_go_size(),
             String => known_go_size(16, 8),
             Tuple { items } => go_type_list_size(items, structs, depth),
             Named { name } | ClosureEnvironment { name } => match find_struct(structs, name) {
@@ -5526,10 +5701,12 @@ fn go_type_size(value: repr::Type, structs: Vec[repr::StructDef], depth: isize) 
                 }
             },
             Slice { elem: _ } | MutSlice { elem: _ } => known_go_size(24, 8),
-            VecType { elem: _ } | RefType { elem: _ } | HashMap { .. } | Channel {
+            VecType { elem: _ } | GoPointer { elem: _ } | GoFunction { signature: _ } | RefType {
                 elem: _,
-                direction: _,
-            } | Func { .. } => known_go_size(8, 8),
+            } | HashMap { .. } | GoMap { .. } | Channel { elem: _, direction: _ } | Func { .. } => known_go_size(
+                8,
+                8,
+            ),
         }
     }
 }
@@ -5987,10 +6164,21 @@ fn test_main_function(
     Function { name: "main", params: Vec::new(), ret_ty: Option::None, body: Block { stmts } }
 }
 
-fn lower_with_test_cases(
+fn lower_with_target(
     value: anf::File,
     testing: bool,
+    exports: Option[Vec[(string, string)]],
     test_cases: Vec[(string, string, Vec[(string, string)])],
+) -> Result[File, string] {
+    lower_with_target_and_names(value, testing, exports, test_cases, Vec::new())
+}
+
+fn lower_with_target_and_names(
+    value: anf::File,
+    testing: bool,
+    exports: Option[Vec[(string, string)]],
+    test_cases: Vec[(string, string, Vec[(string, string)])],
+    renamed: Vec[(string, string)],
 ) -> Result[File, string] {
     let builtin = tast::builtin_contract()?;
     let enums = value.enums;
@@ -6018,6 +6206,15 @@ fn lower_with_test_cases(
     let intrinsics: Vec[string] = Vec::new();
     let go_foreign: Vec[GoForeignSpec] = Vec::new();
     let missing_types = new_collected_types();
+    let callbacks: Vec[repr::CallbackAdapter] = Vec::new();
+    let requirements = RuntimeRequirements {
+        runtime_hooks: runtime_hook_keys,
+        missing_types,
+        intrinsics,
+        go_foreign,
+        callbacks,
+        interface_bridges: Vec::new(),
+    };
     let coercions: Vec[DynCoercion] = Vec::new();
     for function in value.functions {
         for param in function.params {
@@ -6025,13 +6222,7 @@ fn lower_with_test_cases(
         }
         collect_type(types, function.ret_ty);
         collect_block_types(types, function.body);
-        collect_runtime_block(
-            runtime_hook_keys,
-            missing_types,
-            intrinsics,
-            go_foreign,
-            function.body,
-        );
+        collect_runtime_block(requirements, function.body);
         collect_dyn_block(coercions, function.body)
     }
     for value in statics {
@@ -6056,9 +6247,15 @@ fn lower_with_test_cases(
     }
     let dyn_helper_names = build_dyn_helper_names(builtin, coercions, value.functions);
     collect_type_definition_fields(types, enums, structs, type_instances);
-    emit_go_foreign_import_items(items, go_foreign);
+    emit_go_foreign_import_items(items, go_foreign, types.values);
     emit_runtime_hook_items(items, runtime_hooks, intrinsics);
     emit_go_foreign_wrapper_items(items, go_foreign);
+    emit_callback_adapter_items(items, callbacks);
+    for bridge in requirements.interface_bridges {
+        for item in emit_interface_bridge(bridge)? {
+            items.push(item);
+        }
+    }
     emit_missing_base_item(items, missing_types.values);
     emit_builtin_runtime_items(
         builtin,
@@ -6099,7 +6296,9 @@ fn lower_with_test_cases(
     ) {
         items.push(Item::Function(function))
     }
-    if testing {
+    if let Some(declarations) = exports {
+        emit_library_exports(items, value.functions, function_names, declarations)?;
+    } else if testing {
         let test_fail = resources::runtime_abi_by_hook(
             resources::RuntimeHook::Standard(resources::StandardRuntimeHook::TestingFail),
         );
@@ -6128,7 +6327,22 @@ fn lower_with_test_cases(
             ),
         )
     }
-    Result::Ok(prune_functions(File { items }))
+    match exports {
+        Some(declarations) => {
+            let roots: Vec[string] = Vec::new();
+            for declaration in declarations {
+                roots.push(declaration.1)
+            }
+            Result::Ok(
+                privatize_library_with_names(
+                    prune_functions_with_roots(File { items }, roots),
+                    roots,
+                    renamed,
+                ),
+            )
+        },
+        None => Result::Ok(prune_functions(File { items })),
+    }
 }
 
 fn validate_anf_term(value: anf::Term) -> Result[(), string] {
@@ -6203,11 +6417,25 @@ fn validate_anf_with_external_functions(value: anf::File, external_functions: Ve
     let intrinsics: Vec[string] = Vec::new();
     let go_foreign: Vec[GoForeignSpec] = Vec::new();
     let missing_types = new_collected_types();
+    let requirements = RuntimeRequirements {
+        runtime_hooks,
+        missing_types,
+        intrinsics,
+        go_foreign,
+        callbacks: Vec::new(),
+        interface_bridges: Vec::new(),
+    };
     for function in value.functions {
         if let Err(error) = validate_anf_block(function.body) {
             return Result::Err("in function " + function.name + ": " + error)
         }
-        collect_runtime_block(runtime_hooks, missing_types, intrinsics, go_foreign, function.body)
+        collect_runtime_block(requirements, function.body)
+    }
+    for bridge in requirements.interface_bridges {
+        repr::validate_go_interface_bridge(bridge, repr::go_interface_bridge_type(bridge))?;
+    }
+    for value in requirements.callbacks {
+        repr::validate_callback_signature(value.signature)?;
     }
     resolve_runtime_hooks(runtime_hooks)?;
     for key in intrinsics {
@@ -6224,7 +6452,7 @@ fn validate_anf(value: anf::File) -> Result[(), string] {
 
 pub fn lower(value: anf::File) -> Result[File, string] {
     validate_anf(value)?;
-    lower_with_test_cases(anf::canonicalize_names(value), false, Vec::new())
+    lower_with_target(anf::canonicalize_names(value), false, Option::None, Vec::new())
 }
 
 pub fn lower_tests(value: anf::File, test_cases: Vec[(string, string, Vec[(string, string)])]) -> Result[
@@ -6232,5 +6460,159 @@ pub fn lower_tests(value: anf::File, test_cases: Vec[(string, string, Vec[(strin
     string,
 ] {
     validate_anf(value)?;
-    lower_with_test_cases(anf::canonicalize_names(value), true, test_cases)
+    lower_with_target(anf::canonicalize_names(value), true, Option::None, test_cases)
+}
+
+fn add_go_foreign_spec(values: Vec[GoForeignSpec], spec: GoForeignSpec) -> () {
+    let name = go_foreign_spec_name(spec);
+    for value in values {
+        if go_foreign_spec_name(value) == name {
+            for binding in spec.bindings {
+                if binding != "" && !value.bindings.contains(binding) {
+                    value.bindings.push(binding)
+                }
+            }
+            return
+        }
+    }
+    values.push(spec)
+}
+
+fn compile_go_string_callable(key: string, function_ty: repr::Type) -> Expr {
+    match repr::resolve_type(function_ty) {
+        Func { params, ret_ty } if params.len() == 1 => {
+            let value = if key == "go_string.from_text" {
+                Expr::Var { name: "p0" }
+            } else {
+                Expr::Convert {
+                    ty: Type::String,
+                    expr: Expr::Field { expr: Expr::Var { name: "p0" }, field_name: "items" },
+                }
+            };
+            Expr::FuncLit {
+                params: Vec::from_array([("p0", lower_type(params[0]))]),
+                ret_ty: lower_type(ret_ty),
+                body: Block { stmts: Vec::from_array([Stmt::Return { expr: Option::Some(value) }]) },
+            }
+        },
+        _ => Expr::Var { name: "invalid_go_string_callable" },
+    }
+}
+
+fn compile_go_slice_callable(key: string, function_ty: repr::Type) -> Expr {
+    match repr::resolve_type(function_ty) {
+        Func { params: param_types, ret_ty } => {
+            let params: Vec[(string, Type)] = Vec::new();
+            let args: Vec[Expr] = Vec::new();
+            for index in 0..param_types.len() {
+                let name = f"p{index}";
+                params.push((name, lower_type(param_types[index])));
+                args.push(Expr::Var { name });
+            }
+            let name = if key == "go_slice.capacity" {
+                "cap"
+            } else {
+                "append"
+            };
+            let value = Expr::Call { func: Expr::Var { name }, args };
+            Expr::FuncLit {
+                params,
+                ret_ty: lower_type(ret_ty),
+                body: Block { stmts: Vec::from_array([Stmt::Return { expr: Option::Some(value) }]) },
+            }
+        },
+        _ => Expr::Var { name: go_ident(key) },
+    }
+}
+
+fn compile_go_map_callable(key: string, function_ty: repr::Type) -> Expr {
+    match repr::resolve_type(function_ty) {
+        Func { params: param_types, ret_ty } => {
+            let params: Vec[(string, Type)] = Vec::new();
+            let args: Vec[Expr] = Vec::new();
+            for index in 0..param_types.len() {
+                let name = f"p{index}";
+                params.push((name, lower_type(param_types[index])));
+                args.push(Expr::Var { name });
+            }
+            let stmts: Vec[Stmt] = Vec::new();
+            let value = if key == "go_map.new" {
+                Expr::Make { ty: lower_type(ret_ty), args: Vec::new() }
+            } else if key == "go_map.len" {
+                Expr::Call { func: Expr::Var { name: "len" }, args }
+            } else if key == "go_map.lookup" {
+                let element = match repr::resolve_type(param_types[0]) {
+                    GoMap { key: _, value } => value,
+                    _ => repr::Type::Unit,
+                };
+                stmts.push(Stmt::Var { name: "item", ty: lower_type(element), value: Option::None });
+                stmts.push(Stmt::Var { name: "present", ty: Type::Bool, value: Option::None });
+                stmts.push(
+                    Stmt::MultiAssign {
+                        names: Vec::from_array(["item", "present"]),
+                        value: Expr::Index { base: args[0], index: args[1] },
+                    },
+                );
+                Expr::StructLiteral {
+                    ty: lower_type(ret_ty),
+                    fields: Vec::from_array(
+                        [("_0", Expr::Var { name: "item" }), ("_1", Expr::Var { name: "present" })],
+                    ),
+                }
+            } else if key == "go_map.set" {
+                stmts.push(Stmt::IndexAssign { base: args[0], index: args[1], value: args[2] });
+                Expr::Unit
+            } else if key == "go_map.delete" {
+                stmts.push(
+                    Stmt::Expr { expr: Expr::Call { func: Expr::Var { name: "delete" }, args } },
+                );
+                Expr::Unit
+            } else {
+                stmts.push(
+                    Stmt::If {
+                        cond: Expr::Binary { op: BinaryOp::Eq, lhs: args[0], rhs: Expr::Nil },
+                        then_: Block {
+                            stmts: Vec::from_array([Stmt::Return { expr: Option::Some(Expr::Nil) }]),
+                        },
+                        else_: Option::None,
+                    },
+                );
+                stmts.push(
+                    Stmt::Var {
+                        name: "result",
+                        ty: lower_type(ret_ty),
+                        value: Option::Some(
+                            Expr::Make {
+                                ty: lower_type(ret_ty),
+                                args: Vec::from_array(
+                                    [Expr::Call { func: Expr::Var { name: "len" }, args }],
+                                ),
+                            },
+                        ),
+                    },
+                );
+                stmts.push(
+                    Stmt::Range {
+                        names: Vec::from_array(["entry_key", "entry_value"]),
+                        expr: args[0],
+                        body: Block {
+                            stmts: Vec::from_array(
+                                [
+                                    Stmt::IndexAssign {
+                                        base: Expr::Var { name: "result" },
+                                        index: Expr::Var { name: "entry_key" },
+                                        value: Expr::Var { name: "entry_value" },
+                                    },
+                                ],
+                            ),
+                        },
+                    },
+                );
+                Expr::Var { name: "result" }
+            };
+            stmts.push(Stmt::Return { expr: Option::Some(value) });
+            Expr::FuncLit { params, ret_ty: lower_type(ret_ty), body: Block { stmts } }
+        },
+        _ => Expr::Var { name: go_ident(key) },
+    }
 }

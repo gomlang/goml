@@ -1,0 +1,451 @@
+package tast;
+
+use module::ast;
+use module::ffi;
+use module::hir;
+use std::json;
+
+pub struct ExternalTypeRequest {
+    pub declaration: hir::ExternType,
+    pub source_path: string,
+    pub query: ffi::TypeDeclarationQuery,
+}
+
+pub struct ExternalTypeApplication {
+    pub function_name: Option[string],
+    pub arguments: Vec[Type],
+    pub source_path: string,
+    pub span: Option[ast::Span],
+}
+
+pub struct ExternalTypeInfo {
+    pub applications: Vec[ExternalTypeApplication],
+    pub declaration: hir::ExternType,
+    pub source_path: string,
+    pub template: ffi::GoTypeTemplate,
+}
+
+pub struct ExternalTypeEnvironment {
+    pub metadata: ffi::TypeDeclarations,
+    pub types: Vec[ExternalTypeInfo],
+}
+
+pub fn external_type_requests(files: Vec[hir::File]) -> Result[Vec[ExternalTypeRequest], string] {
+    let result: Vec[ExternalTypeRequest] = Vec::new();
+    let names: HashMap[string, bool] = HashMap::new();
+    for file in files {
+        for item in file.items {
+            if let ExternType(declaration) = item {
+                if names[declaration.name].is_some() {
+                    return Result::Err(
+                        file.source_path + ": duplicate external type " + declaration.name,
+                    )
+                }
+                names[declaration.name] = true;
+                let mut target: Option[(string, string)] = Option::None;
+                for attribute in declaration.attrs {
+                    if attribute.name == "go_type" {
+                        if target.is_some() || attribute.args.len() != 2 {
+                            return Result::Err(
+                                file.source_path + ": invalid go_type attribute for "
+                                    + declaration.name,
+                            )
+                        }
+                        match (attribute.args[0], attribute.args[1]) {
+                            (
+                                ast::AttributeArg::String(import_path),
+                                ast::AttributeArg::String(name),
+                            ) => {
+                                if import_path == "" || name == "" {
+                                    return Result::Err(
+                                        file.source_path + ": empty go_type target for "
+                                            + declaration.name,
+                                    )
+                                }
+                                target = Option::Some((import_path, name));
+                            },
+                            _ => return Result::Err(
+                                file.source_path + ": go_type expects two strings for "
+                                    + declaration.name,
+                            ),
+                        }
+                    }
+                }
+                let (import_path, name) = target.ok_or(
+                    file.source_path + ": missing go_type attribute for " + declaration.name,
+                )?;
+                result.push(
+                    ExternalTypeRequest {
+                        declaration,
+                        source_path: file.source_path,
+                        query: ffi::TypeDeclarationQuery {
+                            type_id: declaration.name,
+                            import_path,
+                            name,
+                        },
+                    },
+                );
+            }
+        }
+    }
+    Result::Ok(result)
+}
+
+pub fn resolve_external_type_environment(
+    requests: Vec[ExternalTypeRequest],
+    metadata: ffi::TypeDeclarations,
+) -> Result[ExternalTypeEnvironment, string] {
+    if requests.len() != metadata.declarations.len() {
+        return Result::Err("ffi-type: external declaration metadata count mismatch")
+    }
+    let types: Vec[ExternalTypeInfo] = Vec::new();
+    for request in requests {
+        let template = ffi::resolve_go_type_template(metadata, request.query.type_id).map_err(
+            |error| request.source_path + ": " + request.declaration.name + ": " + error,
+        )?;
+        if template.parameter_constraints.len() != request.declaration.generics.len() {
+            return Result::Err(
+                request.source_path + ": external type " + request.declaration.name + " declares "
+                    + request.declaration.generics.len().to_string()
+                    + " type parameters but Go type "
+                    + request.query.import_path
+                    + "."
+                    + request.query.name
+                    + " requires "
+                    + template.parameter_constraints.len().to_string(),
+            )
+        }
+        types.push(
+            ExternalTypeInfo {
+                applications: Vec::new(),
+                declaration: request.declaration,
+                source_path: request.source_path,
+                template,
+            },
+        );
+    }
+    Result::Ok(ExternalTypeEnvironment { metadata, types })
+}
+
+pub fn external_identity_type(identity: ffi::GoTypeIdentity, parameters: Vec[string]) -> Result[
+    Type,
+    string,
+] {
+    match identity {
+        Basic(name) => match name {
+            "string" => Result::Ok(
+                Type::External { import_path: "", name: "string", args: Vec::new() },
+            ),
+            "bool" => Result::Ok(Type::Bool),
+            "int" => Result::Ok(Type::Int),
+            "int8" => Result::Ok(Type::Int8),
+            "int16" => Result::Ok(Type::Int16),
+            "int32" => Result::Ok(Type::Int32),
+            "int64" => Result::Ok(Type::Int64),
+            "uint" => Result::Ok(Type::Uint),
+            "uint8" => Result::Ok(Type::Uint8),
+            "uint16" => Result::Ok(Type::Uint16),
+            "uint32" => Result::Ok(Type::Uint32),
+            "uint64" => Result::Ok(Type::Uint64),
+            "float32" => Result::Ok(Type::Float32),
+            "float64" => Result::Ok(Type::Float64),
+            _ => Result::Err("unsupported external Go basic type " + name),
+        },
+        Pointer(element) => Result::Ok(
+            Type::GoPointer { elem: external_identity_type(element, parameters)? },
+        ),
+        Named { import_path, name, arguments } => {
+            if !ffi::named_bridge_identity_valid(import_path, name)
+                || (import_path == "" && !arguments.is_empty()) {
+                return Result::Err(
+                    "external Go type is not publicly nameable: " + import_path + "." + name,
+                )
+            }
+            let args: Vec[Type] = Vec::new();
+            for argument in arguments {
+                args.push(external_identity_type(argument, parameters)?)
+            }
+            Result::Ok(Type::External { import_path, name, args })
+        },
+        Parameter(index) => {
+            if index < 0 || index >= parameters.len() {
+                return Result::Err("external type parameter index is out of range")
+            }
+            Result::Ok(Type::Param { name: parameters[index] })
+        },
+        Array { element, length } => Result::Ok(
+            Type::Array { len: length, elem: external_identity_type(element, parameters)? },
+        ),
+        Slice(element) => Result::Ok(
+            Type::MutSlice { elem: external_identity_type(element, parameters)? },
+        ),
+        Map { key, element } => Result::Ok(
+            Type::GoMap {
+                key: external_identity_type(key, parameters)?,
+                value: external_identity_type(element, parameters)?,
+            },
+        ),
+        Function { parameters: values, results } => {
+            let params = Vec::new();
+            let returns = Vec::new();
+            for value in values {
+                params.push(external_identity_type(value, parameters)?)
+            }
+            for value in results {
+                returns.push(external_identity_type(value, parameters)?)
+            }
+            let ret_ty = if returns.is_empty() {
+                Type::Unit
+            } else if returns.len() == 1 {
+                returns[0]
+            } else {
+                Type::Tuple { items: returns }
+            };
+            Result::Ok(Type::GoFunction { signature: Type::Func { params, ret_ty } })
+        },
+        Channel { .. } => Result::Err("external Go type requires an unsupported raw representation"),
+    }
+}
+
+fn external_environment_aliases(environment: ExternalTypeEnvironment) -> Result[
+    Vec[TypeAliasInfo],
+    string,
+] {
+    let result: Vec[TypeAliasInfo] = Vec::new();
+    for value in environment.types {
+        let ty = external_identity_type(value.template.identity, value.declaration.generics).map_err(
+            |error| value.source_path + ": " + value.declaration.name + ": " + error,
+        )?;
+        result.push(
+            TypeAliasInfo {
+                go_comparable: Option::Some(
+                    ffi::go_type_comparability_rule(environment.metadata, value.declaration.name)?,
+                ),
+                applications: Option::Some(value.applications),
+                name: value.declaration.name,
+                generics: value.declaration.generics,
+                ty,
+            },
+        );
+    }
+    Result::Ok(result)
+}
+
+pub fn check_package_files_for_link_with_external_types(
+    values: Vec[hir::File],
+    dependencies: Vec[DependencyEnvironment],
+    external: ExternalTypeEnvironment,
+) -> Result[CheckResult, string] {
+    Result::Ok(
+        check_package_files_for_link_with_environments_options(
+            values,
+            dependencies,
+            false,
+            false,
+            external_environment_aliases(external)?,
+        ),
+    )
+}
+
+pub fn package_signatures_with_external_types(file: hir::File, external: ExternalTypeEnvironment) -> Result[
+    PackageSignatures,
+    string,
+] {
+    package_signatures_with_aliases(file, external_environment_aliases(external)?)
+}
+
+fn record_external_type_application(ctx: Checker, alias: TypeAliasInfo, arguments: Vec[Type]) -> () {
+    if let Some(applications) = alias.applications {
+        applications.push(
+            ExternalTypeApplication {
+                function_name: ctx.current_function.get(),
+                arguments,
+                source_path: ctx.source_path,
+                span: ctx.current_span.get(),
+            },
+        )
+    }
+}
+
+pub fn external_application_queries(
+    declaration: ffi::TypeDeclarationQuery,
+    applications: Vec[ExternalTypeApplication],
+) -> Result[Vec[ffi::TypeInstanceQuery], string] {
+    let result = Vec::new();
+    let seen: HashMap[string, bool] = HashMap::new();
+    for application in applications {
+        let arguments = Vec::new();
+        let keys = Vec::new();
+        for argument in application.arguments {
+            if !type_is_concrete(argument) {
+                return Result::Err(
+                    application.source_path
+                        + ": external type application requires specialization: "
+                        + declaration.type_id,
+                )
+            }
+            let bridge = foreign_bridge_type(argument, Vec::new(), false).map_err(
+                |error| application.source_path + ": " + declaration.type_id + ": " + error,
+            )?;
+            arguments.push(bridge);
+            keys.push(ffi::bridge_type_json(bridge))
+        }
+        let id = declaration.type_id + "::instance:" + json::encode(json::Value::Array(keys));
+        if seen[id].is_none() {
+            seen[id] = true;
+            result.push(
+                ffi::TypeInstanceQuery {
+                    declaration: ffi::TypeDeclarationQuery {
+                        type_id: id,
+                        import_path: declaration.import_path,
+                        name: declaration.name,
+                    },
+                    arguments,
+                },
+            )
+        }
+    }
+    Result::Ok(result)
+}
+
+pub struct ExternalTypeCollector {
+    pub query: ffi::TypeDeclarationQuery,
+    pub applications: Vec[ExternalTypeApplication],
+}
+
+pub fn attach_external_alias_collectors(
+    aliases: Vec[TypeAliasInfo],
+    metadata: ffi::ForeignTypeMetadata,
+) -> Result[Vec[ExternalTypeCollector], string] {
+    let result = Vec::new();
+    for index in range(0, aliases.len()) {
+        let alias = aliases[index];
+        for query in metadata.queries {
+            if query.type_id == alias.name {
+                let template = ffi::resolve_go_type_template(metadata.declarations, query.type_id)?;
+                if template.parameter_constraints.len() != alias.generics.len() {
+                    return Result::Err(
+                        "external alias parameter count differs from metadata: " + alias.name,
+                    )
+                }
+                let target = external_identity_type(template.identity, alias.generics)?;
+                if !types_equal(alias.ty, target) {
+                    return Result::Err("external alias target differs from metadata: " + alias.name)
+                }
+                let applications = Vec::new();
+                aliases.set(
+                    index,
+                    TypeAliasInfo {
+                        go_comparable: Option::Some(
+                            ffi::go_type_comparability_rule(metadata.declarations, query.type_id)?,
+                        ),
+                        applications: Option::Some(applications),
+                        name: alias.name,
+                        generics: alias.generics,
+                        ty: alias.ty,
+                    },
+                );
+                result.push(ExternalTypeCollector { query, applications })
+            }
+        }
+    }
+    Result::Ok(result)
+}
+
+pub fn external_collector_queries(collectors: Vec[ExternalTypeCollector]) -> Result[
+    Vec[ffi::TypeInstanceQuery],
+    string,
+] {
+    let result = Vec::new();
+    for collector in collectors {
+        for query in external_application_queries(collector.query, collector.applications)? {
+            result.push(query)
+        }
+    }
+    Result::Ok(result)
+}
+
+pub fn package_signatures_with_external_types_and_dependencies(
+    file: hir::File,
+    external: ExternalTypeEnvironment,
+    dependencies: Vec[DependencyEnvironment],
+) -> Result[PackageSignatures, string] {
+    package_signatures_with_aliases_and_dependencies(
+        file,
+        external_environment_aliases(external)?,
+        dependencies,
+    )
+}
+
+pub struct SymbolicExternalApplication {
+    pub function_name: string,
+    pub declaration: ffi::TypeDeclarationQuery,
+    pub arguments: Vec[Type],
+    pub source_path: string,
+    pub span: Option[ast::Span],
+}
+
+pub struct ExternalApplicationPlan {
+    pub concrete: Vec[ffi::TypeInstanceQuery],
+    pub symbolic: Vec[SymbolicExternalApplication],
+}
+
+pub fn partition_external_applications(
+    declaration: ffi::TypeDeclarationQuery,
+    applications: Vec[ExternalTypeApplication],
+) -> Result[ExternalApplicationPlan, string] {
+    let concrete = Vec::new();
+    let symbolic: Vec[SymbolicExternalApplication] = Vec::new();
+    for application in applications {
+        let mut requires_specialization = false;
+        for argument in application.arguments {
+            if contains_unbound_type_variable(argument) || type_contains_error(argument) {
+                return Result::Err(
+                    application.source_path + ": unresolved external application argument",
+                )
+            }
+            if !type_is_concrete(argument) {
+                requires_specialization = true;
+            }
+        }
+        if requires_specialization {
+            let owner = application.function_name.ok_or(
+                application.source_path + ": symbolic external application has no function owner",
+            )?;
+            let mut duplicate = false;
+            for previous in symbolic {
+                if previous.function_name == owner
+                    && previous.arguments.len() == application.arguments.len() {
+                    let mut equal = true;
+                    for index in range(0, previous.arguments.len()) {
+                        if !types_equal(previous.arguments[index], application.arguments[index]) {
+                            equal = false;
+                        }
+                    }
+                    if equal {
+                        duplicate = true;
+                    }
+                }
+            }
+            if !duplicate {
+                symbolic.push(
+                    SymbolicExternalApplication {
+                        function_name: owner,
+                        declaration,
+                        arguments: application.arguments,
+                        source_path: application.source_path,
+                        span: application.span,
+                    },
+                )
+            }
+        } else {
+            concrete.push(application)
+        }
+    }
+    Result::Ok(
+        ExternalApplicationPlan {
+            concrete: external_application_queries(declaration, concrete)?,
+            symbolic,
+        },
+    )
+}

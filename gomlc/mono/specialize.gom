@@ -27,6 +27,8 @@ struct TraitSelection {
 }
 
 struct SpecializeCtx {
+    external_applications: Vec[core::ExternalTypeApplication],
+    resolved_external_applications: Vec[core::ExternalTypeApplication],
     builtin: tast::BuiltinContract,
     functions: Vec[core::Function],
     function_index: HashMap[string, core::Function],
@@ -134,6 +136,10 @@ fn unify_type(template: core::Type, actual: core::Type, bindings: Vec[TypeBindin
         (Tuple { items: templates }, Tuple { items: actuals }) => {
             unify_types(templates, actuals, bindings)
         },
+        (
+            External { import_path: a, name: n, args: x },
+            External { import_path: b, name: m, args: y },
+        ) => a == b && n == m && unify_types(x, y, bindings),
         (Con { name: template }, Con { name: actual }) => template == actual,
         (Dyn { trait_name: template, .. }, Dyn { trait_name: actual, .. }) => {
             template == actual
@@ -170,6 +176,9 @@ fn unify_type(template: core::Type, actual: core::Type, bindings: Vec[TypeBindin
         ) | (VecType { elem: template }, VecType { elem: actual }) | (
             RefType { elem: template },
             RefType { elem: actual },
+        ) | (GoPointer { elem: template }, GoPointer { elem: actual }) | (
+            GoFunction { signature: template },
+            GoFunction { signature: actual },
         ) => {
             unify_type(template, actual, bindings)
         },
@@ -183,6 +192,13 @@ fn unify_type(template: core::Type, actual: core::Type, bindings: Vec[TypeBindin
         (
             HashMap { key: template_key, value: template_value },
             HashMap { key: actual_key, value: actual_value },
+        ) => {
+            unify_type(template_key, actual_key, bindings)
+                && unify_type(template_value, actual_value, bindings)
+        },
+        (
+            GoMap { key: template_key, value: template_value },
+            GoMap { key: actual_key, value: actual_value },
         ) => {
             unify_type(template_key, actual_key, bindings)
                 && unify_type(template_value, actual_value, bindings)
@@ -248,6 +264,11 @@ fn substitute_type(value: core::Type, bindings: Vec[TypeBinding]) -> core::Type 
         Tuple { items } => {
             core::Type::Tuple { items: substitute_types(items, bindings) }
         },
+        External { import_path, name, args } => core::Type::External {
+            import_path,
+            name,
+            args: substitute_types(args, bindings),
+        },
         Con { name } => core::Type::Con { name },
         Dyn { trait_name, args, associated_types, additional_bounds } => {
             let substituted_associated: Vec[(string, core::Type)] = Vec::new();
@@ -302,6 +323,12 @@ fn substitute_type(value: core::Type, bindings: Vec[TypeBinding]) -> core::Type 
         VecType { elem } => {
             core::Type::VecType { elem: substitute_type(elem, bindings) }
         },
+        GoPointer { elem } => {
+            core::Type::GoPointer { elem: substitute_type(elem, bindings) }
+        },
+        GoFunction { signature } => {
+            core::Type::GoFunction { signature: substitute_type(signature, bindings) }
+        },
         RefType { elem } => {
             core::Type::RefType { elem: substitute_type(elem, bindings) }
         },
@@ -309,6 +336,10 @@ fn substitute_type(value: core::Type, bindings: Vec[TypeBinding]) -> core::Type 
             core::Type::Channel { elem: substitute_type(elem, bindings), direction }
         },
         HashMap { key, value } => core::Type::HashMap {
+            key: substitute_type(key, bindings),
+            value: substitute_type(value, bindings),
+        },
+        GoMap { key, value } => core::Type::GoMap {
             key: substitute_type(key, bindings),
             value: substitute_type(value, bindings),
         },
@@ -382,6 +413,9 @@ fn canonical_inherent_owner_type(builtin: tast::BuiltinContract, value: core::Ty
                 },
                 Con { name } if mono_names_match(name, builtin.ref_type.name) && values.len() == 1 => {
                     core::Type::RefType { elem: values[0] }
+                },
+                Con { name } if mono_names_match(name, builtin.go_map.name) && values.len() == 2 => {
+                    core::Type::GoMap { key: values[0], value: values[1] }
                 },
                 Con { name } if mono_names_match(name, builtin.hashmap.name) && values.len() == 2 => {
                     core::Type::HashMap { key: values[0], value: values[1] }
@@ -1147,6 +1181,15 @@ fn mono_types_equal(left: core::Type, right: core::Type) -> bool {
 
 fn mono_type_contains_proper_subterm(value: core::Type, expected: core::Type) -> bool {
     match core::resolve_type(value) {
+        External { import_path: _, name: _, args: values } => {
+            for value in values {
+                if mono_types_equal(value, expected)
+                    || mono_type_contains_proper_subterm(value, expected) {
+                    return true
+                }
+            }
+            false
+        },
         Tuple { items: values } => {
             for value in values {
                 if mono_types_equal(value, expected)
@@ -1168,12 +1211,17 @@ fn mono_type_contains_proper_subterm(value: core::Type, expected: core::Type) ->
             }
             false
         },
-        Array { len: _, elem } | Slice { elem } | MutSlice { elem } | VecType { elem } | RefType {
+        Array { len: _, elem } | Slice { elem } | MutSlice { elem } | VecType { elem } | GoPointer {
             elem,
-        } | Channel { elem, direction: _ } => {
+        } | GoFunction { signature: elem } | RefType { elem } | Channel { elem, direction: _ } => {
             mono_types_equal(elem, expected) || mono_type_contains_proper_subterm(elem, expected)
         },
         HashMap { key, value } => {
+            mono_types_equal(key, expected) || mono_type_contains_proper_subterm(key, expected)
+                || mono_types_equal(value, expected)
+                || mono_type_contains_proper_subterm(value, expected)
+        },
+        GoMap { key, value } => {
             mono_types_equal(key, expected) || mono_type_contains_proper_subterm(key, expected)
                 || mono_types_equal(value, expected)
                 || mono_type_contains_proper_subterm(value, expected)
@@ -1197,6 +1245,10 @@ fn mono_type_contains_proper_subterm(value: core::Type, expected: core::Type) ->
 
 fn mono_type_outer_constructor_matches(left: core::Type, right: core::Type) -> bool {
     match (core::resolve_type(left), core::resolve_type(right)) {
+        (
+            External { import_path: a, name: n, args: _ },
+            External { import_path: b, name: m, args: _ },
+        ) => a == b && n == m,
         (Tuple { items: _ }, Tuple { items: _ }) | (
             Array { len: _, elem: _ },
             Array { len: _, elem: _ },
@@ -1204,9 +1256,28 @@ fn mono_type_outer_constructor_matches(left: core::Type, right: core::Type) -> b
             VecType { elem: _ },
             VecType { elem: _ },
         ) | (RefType { elem: _ }, RefType { elem: _ }) | (
+            GoPointer { elem: _ },
+            GoPointer { elem: _ },
+        ) | (GoFunction { signature: _ }, GoFunction { signature: _ }) | (
             Channel { elem: _, direction: _ },
             Channel { elem: _, direction: _ },
         ) | (HashMap { key: _, value: _ }, HashMap { key: _, value: _ }) | (
+            Func { params: _, ret_ty: _ },
+            Func { params: _, ret_ty: _ },
+        ) => true,
+        (Tuple { items: _ }, Tuple { items: _ }) | (
+            Array { len: _, elem: _ },
+            Array { len: _, elem: _ },
+        ) | (Slice { elem: _ }, Slice { elem: _ }) | (MutSlice { elem: _ }, MutSlice { elem: _ }) | (
+            VecType { elem: _ },
+            VecType { elem: _ },
+        ) | (RefType { elem: _ }, RefType { elem: _ }) | (
+            GoPointer { elem: _ },
+            GoPointer { elem: _ },
+        ) | (GoFunction { signature: _ }, GoFunction { signature: _ }) | (
+            Channel { elem: _, direction: _ },
+            Channel { elem: _, direction: _ },
+        ) | (GoMap { key: _, value: _ }, GoMap { key: _, value: _ }) | (
             Func { params: _, ret_ty: _ },
             Func { params: _, ret_ty: _ },
         ) => true,
@@ -1528,6 +1599,11 @@ fn normalize_type(ctx: SpecializeCtx, value: core::Type, active: Vec[string]) ->
         Tuple { items } => {
             core::Type::Tuple { items: normalize_types(ctx, items, active) }
         },
+        External { import_path, name, args } => core::Type::External {
+            import_path,
+            name,
+            args: normalize_types(ctx, args, active),
+        },
         Con { name } => core::Type::Con { name },
         Dyn { trait_name, args, associated_types, additional_bounds } => {
             let normalized_associated: Vec[(string, core::Type)] = Vec::new();
@@ -1576,6 +1652,12 @@ fn normalize_type(ctx: SpecializeCtx, value: core::Type, active: Vec[string]) ->
         VecType { elem } => {
             core::Type::VecType { elem: normalize_type(ctx, elem, active) }
         },
+        GoPointer { elem } => {
+            core::Type::GoPointer { elem: normalize_type(ctx, elem, active) }
+        },
+        GoFunction { signature } => {
+            core::Type::GoFunction { signature: normalize_type(ctx, signature, active) }
+        },
         RefType { elem } => {
             core::Type::RefType { elem: normalize_type(ctx, elem, active) }
         },
@@ -1583,6 +1665,10 @@ fn normalize_type(ctx: SpecializeCtx, value: core::Type, active: Vec[string]) ->
             core::Type::Channel { elem: normalize_type(ctx, elem, active), direction }
         },
         HashMap { key, value } => core::Type::HashMap {
+            key: normalize_type(ctx, key, active),
+            value: normalize_type(ctx, value, active),
+        },
+        GoMap { key, value } => core::Type::GoMap {
             key: normalize_type(ctx, key, active),
             value: normalize_type(ctx, value, active),
         },
@@ -1607,14 +1693,20 @@ fn types_contain_associated_projection(values: Vec[core::Type]) -> bool {
 fn type_contains_associated_projection(value: core::Type) -> bool {
     match value {
         Projection { for_ty: _, name: _, trait_ref: _ } => true,
+        External { import_path: _, name: _, args } => types_contain_associated_projection(args),
         Tuple { items } => types_contain_associated_projection(items),
         App { ty: base, args } => {
             type_contains_associated_projection(base) || types_contain_associated_projection(args)
         },
-        Array { len: _, elem } | Slice { elem } | MutSlice { elem } | VecType { elem } | RefType {
+        Array { len: _, elem } | Slice { elem } | MutSlice { elem } | VecType { elem } | GoPointer {
             elem,
-        } | Channel { elem, direction: _ } => type_contains_associated_projection(elem),
+        } | GoFunction { signature: elem } | RefType { elem } | Channel { elem, direction: _ } => type_contains_associated_projection(
+            elem,
+        ),
         HashMap { key, value } => {
+            type_contains_associated_projection(key) || type_contains_associated_projection(value)
+        },
+        GoMap { key, value } => {
             type_contains_associated_projection(key) || type_contains_associated_projection(value)
         },
         Func { params, ret_ty } => {
@@ -1691,6 +1783,7 @@ fn complete_function_bindings_up_to(
                         }
                     }
                 },
+                GoComparable(_) => (),
                 Equality { lhs, rhs } => {
                     let lhs = substitute_type(lhs, bindings);
                     let rhs = substitute_type(rhs, bindings);
@@ -1715,6 +1808,13 @@ fn predicates_are_satisfied_up_to(
     for index in 0..predicate_count {
         let predicate = value.predicates[index];
         match predicate {
+            GoComparable(ty) => {
+                let ty = substitute_type(ty, bindings);
+                if !type_is_concrete(ty)
+                    || tast::go_map_key_definitely_uncomparable(core::type_to_tast(ty)) {
+                    return false
+                }
+            },
             Trait { for_ty, trait_ref: reference } => {
                 let for_ty = substitute_type(for_ty, bindings);
                 let reference = substitute_trait_ref(reference, bindings);
@@ -1756,6 +1856,8 @@ fn builtin_structural_trait_satisfied(
     reference: core::TraitRef,
 ) -> bool {
     match core::resolve_type(for_ty) {
+        GoPointer { elem: _ } => false,
+        GoFunction { signature: _ } => false,
         RefType { elem: _ } => true,
         Tuple { items } => {
             for item in items {
@@ -1834,6 +1936,14 @@ fn incomplete_function_message(
 ) -> string {
     for predicate in value.predicates {
         match predicate {
+            GoComparable(ty) => {
+                let ty = substitute_type(ty, bindings);
+                if !type_is_concrete(ty)
+                    || tast::go_map_key_definitely_uncomparable(core::type_to_tast(ty)) {
+                    return "cannot specialize " + value.name + ": Go map key is not comparable: "
+                        + compact_type(ty)
+                }
+            },
             Trait { for_ty, trait_ref: reference } => {
                 let for_ty = substitute_type(for_ty, bindings);
                 let reference = substitute_trait_ref(reference, bindings);
@@ -1865,8 +1975,13 @@ fn specialize_callable(ctx: SpecializeCtx, value: core::Callable, bindings: Vec[
         LangItem { item, function_name } => core::Callable::LangItem { item, function_name },
         Runtime(name) => core::Callable::Runtime(name),
         Intrinsic(name) => core::Callable::Intrinsic(name),
-        GoForeign { import_path, symbol } => {
-            core::Callable::GoForeign { import_path, symbol }
+        GoInterfaceBridge { binding, methods } => core::Callable::GoInterfaceBridge {
+            binding,
+            methods,
+        },
+        GoMethod { symbol, binding } => core::Callable::GoMethod { symbol, binding },
+        GoForeign { import_path, symbol, binding } => {
+            core::Callable::GoForeign { import_path, symbol, binding }
         },
         TraitMethod { trait_ref: reference, method_name: name, for_ty, has_receiver } => {
             core::Callable::TraitMethod {
@@ -2432,6 +2547,10 @@ fn ensure_runtime_trait_impls_for_types(ctx: SpecializeCtx, values: Vec[core::Ty
 
 fn ensure_runtime_trait_impls_for_type(ctx: SpecializeCtx, value: core::Type) -> () {
     match core::resolve_type(value) {
+        External { import_path: _, name: _, args: items } => ensure_runtime_trait_impls_for_types(
+            ctx,
+            items,
+        ),
         Tuple { items } => ensure_runtime_trait_impls_for_types(ctx, items),
         Projection { for_ty: base, name: _, trait_ref: reference } => {
             ensure_runtime_trait_impls_for_type(ctx, base);
@@ -2447,11 +2566,18 @@ fn ensure_runtime_trait_impls_for_type(ctx: SpecializeCtx, value: core::Type) ->
             elem,
             direction: _,
         } => ensure_runtime_trait_impls_for_type(ctx, elem),
+        GoPointer { elem } => ensure_runtime_trait_impls_for_type(ctx, elem),
+        GoFunction { signature } => ensure_runtime_trait_impls_for_type(ctx, signature),
         RefType { elem } => {
             ensure_eq_hash_impls(ctx, elem);
             ensure_runtime_trait_impls_for_type(ctx, elem)
         },
         HashMap { key, value } => {
+            ensure_eq_hash_impls(ctx, key);
+            ensure_runtime_trait_impls_for_type(ctx, key);
+            ensure_runtime_trait_impls_for_type(ctx, value)
+        },
+        GoMap { key, value } => {
             ensure_eq_hash_impls(ctx, key);
             ensure_runtime_trait_impls_for_type(ctx, key);
             ensure_runtime_trait_impls_for_type(ctx, value)
@@ -2591,6 +2717,7 @@ fn ensure_runtime_trait_impls(ctx: SpecializeCtx, functions: Vec[core::Function]
 }
 
 fn specialize_function(ctx: SpecializeCtx, instance: Instance, value: core::Function) -> core::Function {
+    specialize_external_applications_for_function(ctx, instance);
     let params: Vec[(string, core::Type)] = Vec::new();
     for param in value.params {
         params.push((param.0, specialize_type(ctx, param.1, instance.bindings)))
@@ -2632,6 +2759,16 @@ fn specialize_function(ctx: SpecializeCtx, instance: Instance, value: core::Func
 }
 
 fn specialize(value: core::File, error: Ref[Option[string]]) -> core::File {
+    specialize_with_application_records(value, error, Vec::new(), Vec::new(), Vec::new())
+}
+
+fn specialize_with_application_records(
+    value: core::File,
+    error: Ref[Option[string]],
+    external_applications: Vec[core::ExternalTypeApplication],
+    resolved_external_applications: Vec[core::ExternalTypeApplication],
+    source_names: Vec[(string, string)],
+) -> core::File {
     let builtin = match tast::builtin_contract() {
         Ok(value) => value,
         Err(message) => {
@@ -2669,6 +2806,8 @@ fn specialize(value: core::File, error: Ref[Option[string]]) -> core::File {
         }
     }
     let ctx = SpecializeCtx {
+        external_applications,
+        resolved_external_applications,
         builtin,
         functions: value.functions,
         function_index,
@@ -2703,6 +2842,7 @@ fn specialize(value: core::File, error: Ref[Option[string]]) -> core::File {
             match find_function(ctx, instance.original_name) {
                 Some(function) => {
                     ctx.active.set(Option::Some(instance));
+                    source_names.push((instance.name, instance.original_name));
                     output.push(specialize_function(ctx, instance, function));
                     ctx.active.set(Option::None)
                 },

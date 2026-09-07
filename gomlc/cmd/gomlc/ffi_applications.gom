@@ -1,0 +1,150 @@
+package main;
+
+use module::artifact;
+use module::ffi;
+use module::hir;
+use module::tast;
+use std::env;
+use std::fs;
+use std::path;
+
+struct ImportedExternalCollectors {
+    metadata: ffi::ForeignTypeMetadata,
+    collectors: Vec[tast::ExternalTypeCollector],
+}
+
+fn attach_imported_external_collectors(units: Vec[artifact::ArtifactInterfaceUnit]) -> Result[
+    Vec[ImportedExternalCollectors],
+    string,
+] {
+    let result = Vec::new();
+    for unit in units {
+        if let Some(metadata) = unit.foreign_types {
+            result.push(
+                ImportedExternalCollectors {
+                    metadata,
+                    collectors: tast::attach_external_alias_collectors(
+                        unit.exports.type_aliases,
+                        metadata,
+                    )?,
+                },
+            )
+        }
+    }
+    Result::Ok(result)
+}
+
+fn append_external_query(queries: Vec[ffi::TypeDeclarationQuery], value: ffi::TypeDeclarationQuery) -> Result[
+    (),
+    string,
+] {
+    for query in queries {
+        if query.type_id == value.type_id {
+            if query.import_path != value.import_path || query.name != value.name {
+                return Result::Err("ffi-type: conflicting declaration identity " + value.type_id)
+            }
+            return Result::Ok(())
+        }
+    }
+    queries.push(value);
+    Result::Ok(())
+}
+
+fn append_external_instance(instances: Vec[ffi::TypeInstanceQuery], value: ffi::TypeInstanceQuery) -> Result[
+    (),
+    string,
+] {
+    for instance in instances {
+        if instance.declaration.type_id == value.declaration.type_id {
+            if instance.declaration.import_path != value.declaration.import_path
+                || instance.declaration.name != value.declaration.name
+                || instance.arguments.len() != value.arguments.len() {
+                return Result::Err(
+                    "ffi-type: conflicting instance identity " + value.declaration.type_id,
+                )
+            }
+            for index in range(0, instance.arguments.len()) {
+                if !ffi::bridge_types_equal(instance.arguments[index], value.arguments[index]) {
+                    return Result::Err(
+                        "ffi-type: conflicting instance arguments " + value.declaration.type_id,
+                    )
+                }
+            }
+            return Result::Ok(())
+        }
+    }
+    instances.push(value);
+    Result::Ok(())
+}
+
+fn resolve_external_application_metadata(
+    validation: Option[ForeignValidationCommand],
+    files: Vec[hir::File],
+    external: tast::ExternalTypeEnvironment,
+    imported: Vec[ImportedExternalCollectors],
+) -> Result[Option[ffi::ForeignTypeMetadata], string] {
+    let queries = Vec::new();
+    let instances = Vec::new();
+    let previous = Vec::new();
+    let own_queries = Vec::new();
+    for request in tast::external_type_requests(files)? {
+        own_queries.push(request.query);
+        append_external_query(queries, request.query)?;
+        for value in external.types {
+            if value.declaration.name == request.query.type_id {
+                for instance in tast::external_application_queries(
+                    request.query,
+                    value.applications,
+                )? {
+                    append_external_instance(instances, instance)?;
+                }
+            }
+        }
+    }
+    if !own_queries.is_empty() {
+        previous.push(
+            ffi::ForeignTypeMetadata {
+                queries: own_queries,
+                declarations: external.metadata,
+                instances: Vec::new(),
+            },
+        )
+    }
+    for group in imported {
+        previous.push(group.metadata);
+        for query in group.metadata.queries {
+            append_external_query(queries, query)?;
+        }
+        for instance in group.metadata.instances {
+            append_external_instance(instances, instance)?;
+        }
+        for instance in tast::external_collector_queries(group.collectors)? {
+            append_external_instance(instances, instance)?;
+        }
+    }
+    if queries.is_empty() {
+        return Result::Ok(Option::None)
+    }
+    let command = validation.ok_or("ffi-type: external applications require a Go caller context")?;
+    let context = match command.mode {
+        Required => ffi::decode_build_context(
+            fs::read_file_structured(command.context_path).map_err(|error| error.to_string())?,
+        )?,
+        Off => resolve_foreign_build_context(
+            "go",
+            foreign_type_context_directory(command.caller.directory),
+        )?,
+    };
+    let executable = env::current_exe_structured().map_err(|error| error.to_string())?;
+    let helper = path::join(
+        path::parent(executable).ok_or("ffi-tool-unavailable: compiler has no executable directory")?,
+        "goml-go-meta",
+    );
+    let declarations = run_foreign_type_declarations(helper, context, command.caller, queries)?;
+    for metadata in previous {
+        ffi::validate_foreign_type_metadata(metadata, declarations)?;
+    }
+    let metadata = ffi::ForeignTypeMetadata { queries, declarations, instances };
+    check_artifact_foreign_types(command, "external applications", metadata)?;
+    Result::Ok(Option::Some(metadata))
+}

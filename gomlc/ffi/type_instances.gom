@@ -1,0 +1,216 @@
+package ffi;
+
+use std::json;
+
+pub struct TypeInstanceQuery {
+    pub declaration: TypeDeclarationQuery,
+    pub arguments: Vec[BridgeType],
+}
+
+pub struct TypeInstance {
+    pub type_id: string,
+    pub identity: GoTypeIdentity,
+}
+
+pub struct TypeInstances {
+    pub declarations: TypeDeclarations,
+    pub instances: Vec[TypeInstance],
+}
+
+fn instance_argument_identity(value: BridgeType, depth: isize, remaining: Ref[isize]) -> Result[
+    GoTypeIdentity,
+    string,
+] {
+    if depth > 64 || remaining.get() <= 0 {
+        return Result::Err("ffi-type: instance argument complexity limit exceeded")
+    }
+    remaining.set(remaining.get() - 1);
+    match value {
+        Function { parameters, results } => {
+            let params = Vec::new();
+            let returns = Vec::new();
+            for value in parameters {
+                params.push(instance_argument_identity(value, depth + 1, remaining)?)
+            }
+            for value in results {
+                returns.push(instance_argument_identity(value, depth + 1, remaining)?)
+            }
+            Result::Ok(GoTypeIdentity::Function { parameters: params, results: returns })
+        },
+        Scalar(name) => normalized_go_basic(name),
+        Named { import_path, name, arguments } => {
+            if !named_bridge_identity_valid(import_path, name)
+                || (import_path == "" && !arguments.is_empty()) {
+                return Result::Err("ffi-type: invalid instance argument identity")
+            }
+            let args = Vec::new();
+            for argument in arguments {
+                args.push(instance_argument_identity(argument, depth + 1, remaining)?)
+            }
+            Result::Ok(GoTypeIdentity::Named { import_path, name, arguments: args })
+        },
+        Array { element, length } => if length < 0 {
+            Result::Err("ffi-type: negative instance array length")
+        } else {
+            Result::Ok(
+                GoTypeIdentity::Array {
+                    element: instance_argument_identity(element, depth + 1, remaining)?,
+                    length,
+                },
+            )
+        },
+        Pointer { element } => Result::Ok(
+            GoTypeIdentity::Pointer(instance_argument_identity(element, depth + 1, remaining)?),
+        ),
+        Slice { element } => Result::Ok(
+            GoTypeIdentity::Slice(instance_argument_identity(element, depth + 1, remaining)?),
+        ),
+        Map { key, element } => Result::Ok(
+            GoTypeIdentity::Map {
+                key: instance_argument_identity(key, depth + 1, remaining)?,
+                element: instance_argument_identity(element, depth + 1, remaining)?,
+            },
+        ),
+        Channel { element, direction } => if direction == "both" || direction == "send"
+            || direction == "receive" {
+            Result::Ok(
+                GoTypeIdentity::Channel {
+                    element: instance_argument_identity(element, depth + 1, remaining)?,
+                    direction,
+                },
+            )
+        } else {
+            Result::Err("ffi-type: invalid instance channel direction")
+        },
+    }
+}
+
+pub fn encode_type_instances(
+    context: GoBuildContext,
+    caller: CallerContext,
+    queries: Vec[TypeInstanceQuery],
+) -> Result[string, string] {
+    if queries.len() > 4096 {
+        return Result::Err("ffi-protocol: too many type instances")
+    }
+    let seen: HashMap[string, bool] = HashMap::new();
+    let values = Vec::new();
+    let remaining = Ref::new(65536);
+    for query in queries {
+        let declaration = query.declaration;
+        if declaration.type_id == "" || seen[declaration.type_id].is_some()
+            || !named_bridge_identity_valid(declaration.import_path, declaration.name) {
+            return Result::Err("ffi-protocol: invalid or duplicate instance query")
+        }
+        seen[declaration.type_id] = true;
+        for argument in query.arguments {
+            let _ = instance_argument_identity(argument, 0, remaining)?;
+        }
+        values.push(
+            json::object(
+                Vec::from_array(
+                    [
+                        ("type_id", json::Value::String(declaration.type_id)),
+                        ("import_path", json::Value::String(declaration.import_path)),
+                        ("name", json::Value::String(declaration.name)),
+                        ("query_mode", json::Value::String("instance")),
+                        ("type_arguments", bridge_types_json(query.arguments)),
+                    ],
+                ),
+            ),
+        )
+    }
+    let Object(fields) = json::parse(encode_request(context, caller, Vec::new()))? else {
+        return Result::Err("ffi-protocol: invalid request object")
+    };
+    fields.push(("type_queries", json::Value::Array(values)));
+    let result = json::encode(json::Value::Object(fields));
+    if result.byte_len() > 8388608 {
+        Result::Err("ffi-protocol: instance request exceeds limit")
+    } else {
+        Result::Ok(result)
+    }
+}
+
+pub fn decode_type_instances(input: string, expected: Vec[TypeInstanceQuery]) -> Result[
+    TypeInstances,
+    string,
+] {
+    if input.byte_len() > 8388608 || !response_nesting_is_bounded(input) {
+        return Result::Err("ffi-protocol: invalid instance response JSON")
+    }
+    let response = json::parse(input)?;
+    let values = response_array(response, "type_results")?;
+    let results = Vec::new();
+    let instance_ids: HashMap[string, string] = HashMap::new();
+    for value in values {
+        let id = response_string(value, "type_id")?;
+        if response_string(value, "status")? == "verified" {
+            instance_ids[id] = response_string(value, "type")?;
+        }
+        let Object(fields) = value else {
+            return Result::Err("ffi-protocol: invalid instance result")
+        };
+        let stripped = Vec::new();
+        for (name, value) in fields {
+            if name != "type" {
+                stripped.push((name, value))
+            }
+        }
+        results.push(json::Value::Object(stripped))
+    }
+    let Object(fields) = response else {
+        return Result::Err("ffi-protocol: invalid instance response")
+    };
+    let stripped = Vec::new();
+    for (name, value) in fields {
+        stripped.push(
+            (
+                name,
+                if name == "type_results" {
+                    json::Value::Array(results)
+                } else {
+                    value
+                },
+            ),
+        )
+    }
+    let declarations = Vec::new();
+    for query in expected {
+        declarations.push(query.declaration)
+    }
+    let metadata = decode_type_declarations(
+        json::encode(json::Value::Object(stripped)),
+        declarations,
+    )?;
+    let instances = Vec::new();
+    let remaining = Ref::new(65536);
+    for query in expected {
+        let id = query.declaration.type_id;
+        let root = instance_ids[id].ok_or("ffi-protocol: missing instance type")?;
+        let identity = normalize_go_type_node(
+            metadata,
+            root,
+            "",
+            HashMap::new(),
+            HashMap::new(),
+            Ref::new(16384),
+            0,
+        )?;
+        let arguments = Vec::new();
+        for argument in query.arguments {
+            arguments.push(instance_argument_identity(argument, 0, remaining)?)
+        }
+        let predicted = substitute_go_type_template(
+            resolve_go_type_template(metadata, id)?,
+            arguments,
+        )?;
+        if go_type_identity_key(identity) != go_type_identity_key(predicted) {
+            return Result::Err(
+                "ffi-protocol: instance identity differs from requested arguments: " + id,
+            )
+        }
+        instances.push(TypeInstance { type_id: id, identity })
+    }
+    Result::Ok(TypeInstances { declarations: metadata, instances })
+}

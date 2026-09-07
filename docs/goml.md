@@ -423,7 +423,7 @@ This form is the newtype pattern. Construct it with `UserId(value)`, access its 
 
 ### Type syntax not currently available
 
-GoML has no Rust references and lifetimes, raw pointers, nullable types, slice literals, or union types.Use `Ref[T]` to express shared variable units, use `Option[T]` to express optional values, and use `Slice[T]` or `MutSlice[T]` to express read-only or mutable contiguous views.
+GoML has no Rust reference or lifetime syntax, pointer arithmetic, slice literals, or union types. Use `Ref[T]` for shared mutable storage, `Option[T]` for optional values, and `Slice[T]` or `MutSlice[T]` for read-only or mutable contiguous views. `std::ffi::Ptr[T]` and external Go type aliases can carry nullable Go pointers; they remain distinct from `Ref[T]` and numeric types.
 
 `A + B` is only usable as a trait bound or supertrait list. The parser reserves `dyn A + B`, but the type checker deliberately rejects multiple dyn bounds in the current object model.
 
@@ -1778,7 +1778,7 @@ enum Entry[T, Marker] {
 }
 ```
 
-All fields or variant payloads used by a derive must support that trait. For a generic definition, the generated impl constrains each distinct participating field or payload type that mentions a type parameter. An unused phantom parameter receives no constraint. Compiler-owned runtime, intrinsic, and lang-item attributes remain unavailable to ordinary projects. User projects may use the `go_ffi` attribute described in the next section.
+All fields or variant payloads used by a derive must support that trait. For a generic definition, the generated impl constrains each distinct participating field or payload type that mentions a type parameter. An unused phantom parameter receives no constraint. Compiler-owned runtime, intrinsic, and lang-item attributes remain unavailable to ordinary projects. User projects may use the `go_ffi`, `go_type`, `go_method` and `go_interface` attributes described in the next section.
 
 The eight prelude derives are supplied by verified handlers in the toolchain's builtin sources. They are not hard-coded code generators in the compiler. Standard-library and third-party derives use the same handler and artifact mechanism, but they are not added to the prelude: import the trait or its package before using the derive name.
 
@@ -2018,6 +2018,8 @@ Handlers are deterministic and have no host access. Imported derive CTIR is veri
 
 ## Go FFI
 
+The runnable [file reading example](../examples/ffi-file-read/README.md) combines raw pointers, methods, shared byte buffers, partial reads, error identity, explicit Close and Go↔GoML result transport.
+
 The typed Go FFI binds a top-level GoML declaration to an exported package-level Go function:
 
 ```goml
@@ -2035,16 +2037,74 @@ fn example() -> string {
 
 The first attribute argument is the Go import path and the second is an exported ASCII Go identifier. The GoML function name is local and may differ from the Go symbol. Add `pub` before `extern fn` to expose the binding through another GoML package; interface and Core artifacts preserve the Go import path and symbol.
 
+Bind a Go type with `#[go_type("time", "Duration")] pub extern type Duration;`. The GoML name may differ from the Go object name. Declarations cannot have a body or an `= Type` target. Go defined types retain their identity: `Duration` differs from `i64`, while two GoML packages binding `time.Duration` share the same type. Go aliases normalize to their target type. Values can pass through ordinary GoML functions and typed Go foreign calls; generated Go uses the original type and preserves its method set. GoML field access, struct construction and pointer dereferencing are not yet supported for these values.
+
+```goml
+#[go_type("time", "Duration")]
+extern type Duration;
+
+#[go_ffi("time", "Sleep")]
+extern fn sleep(duration: Duration) -> ();
+
+fn wait(duration: Duration) -> () {
+    sleep(duration)
+}
+```
+
+A Go alias such as `type Handle = *Cell` can be bound with `#[go_type("example.com/shim", "Handle")] extern type Handle;`. The generated type is `*Cell`, including its nil value and pointer identity. Passing it through functions, closures or containers does not copy the pointed-to object. `Option::Some` containing a nil pointer remains distinct from `Option::None`. GoML cannot construct such a value from an integer or a `Ref`, or use struct layout syntax to create it. `use std::ffi;` exposes `ffi::Ptr[T]`, a transparent spelling for a raw Go pointer to T. `ffi::null()` constructs a nil pointer with its type inferred from context, and `ffi::is_nil(value)` tests it. Non-null pointers enter through explicit Go function bindings. For example, `let empty: ffi::Ptr[Cell] = ffi::null();` and `ffi::is_nil(empty)` use the same representation as a Go alias of `*Cell`. These functions are also ordinary function values. This uses the existing external type declaration grammar, with no `*T` source type syntax.
+
+Bind a Go method with `#[go_method("Method")] extern fn`; its first parameter is the receiver. Declarations must be monomorphic and have exactly one ABI attribute. The method name must be an exported ASCII Go identifier. Go checks the receiver's actual method set: pointer-only methods require an appropriate pointer receiver, while value methods can also be called through pointers. There is no implicit address-taking of a copied value. Interface and promoted methods follow the same Go rules. Bindings can be public, imported across packages, or passed as ordinary function values, and are runtime-only, including when loaded from artifacts.
+
+```goml
+use std::ffi;
+
+#[go_type("example.com/shim", "Cell")]
+extern type Cell;
+
+#[go_method("Read")]
+extern fn read(cell: ffi::Ptr[Cell]) -> i64;
+
+#[go_method("Write")]
+extern fn write(cell: ffi::Ptr[Cell], value: i64) -> ();
+```
+
+These bindings emit Go method expressions such as `(*shim.Cell).Read(cell)`. A nil receiver reaches the Go method unchanged, including any panic or special nil behavior the method defines. Methods do not automatically allocate objects, close resources, or convert errors into `Result`. Obtaining non-null values still requires an explicit Go binding.
+
+`ffi::Error` is the original nullable Go `error` interface. `ffi::nil_error()` constructs a nil interface; `ffi::error_is_nil(value)` tests interface nilness. An interface holding a typed nil pointer is not nil. Errors retain their original object and chain through functions, closures and artifacts, and Go aliases of `error` have the same type. Raw `(T, error)` returns remain tuples; `Option::Some` containing a nil error remains distinct from `None`.
+
+`ffi::NonNilError::from_error(error)` returns `None` for a nil interface and `Some` for a non-nil interface, including typed-nil errors. Its private storage cannot be constructed directly; `as_error()` returns the original error. Consequently `Result[T, ffi::NonNilError]` cannot accept `Err(ffi::nil_error())`. This wrapper does not call `Error()` or inspect concrete error payloads.
+
+`ffi::Outcome::new(value, error)` preserves both results in public `value` and `error` fields, including a partial value returned alongside a failure. The explicitly named `into_result_discarding_value_on_error()` adapter returns `Result[T, ffi::NonNilError]`: it keeps the value only on success and discards it on failure. No such conversion happens automatically. For example:
+
+```goml
+let (count, error) = read(buffer);
+let outcome = ffi::Outcome::new(count, error);
+let partial_count = outcome.value;
+let result = outcome.into_result_discarding_value_on_error();
+```
+
+Reverse conversion is also explicit. `ffi::Outcome::from_raw_result(result, failure_value)` accepts `Result[T, ffi::Error]` and returns `Result[ffi::Outcome[T], ffi::BoundaryError]`. An `Ok(value)` produces that value with a nil Go error. An `Err(error)` uses the caller-supplied failure value and preserves the error. If that error is a true nil interface, conversion fails with `BoundaryError::NilError`, whose message is `Go FFI boundary rejected Err(nil)`. Typed-nil errors remain failures. The failure-value argument is evaluated normally even when the input is `Ok`.
+
+`ffi::Outcome::from_result(result, failure_value)` accepts `Result[T, ffi::NonNilError]` and applies the same boundary check. `outcome.into_tuple()` returns the exact `(value, error)` pair for an explicit Go call; it does not normalize partial results or nil values. None of these adapters invent a default failure value or implicitly turn a contract error into Go success.
+
+`ffi::error_matches(value, target)` uses Go `errors.Is`, including wrapped chains, custom `Is` methods and Go nil matching semantics. `NonNilError::matches(target)` provides the same operation for a checked wrapper. Matching compares the original error objects and chains, never message strings.
+
+`NonNilError::message_bytes()` invokes the original Go `Error()` method and returns a fresh `std::bytes::Bytes` copy of its bytes. `message()` returns `Result[string, std::utf8::Utf8Error]`, accepting valid UTF-8 and rejecting invalid bytes without replacement. Message access does not replace the stored error. Typed-nil interfaces can enter the checked wrapper, so the underlying Go method's nil handling, side effects and panics remain its own. These APIs do not catch Go panics or implicitly convert errors to strings.
+
+Package compilation queries Go metadata for every declaration, including private and unused declarations. Interface and Core artifacts preserve this metadata, and cached inputs are rechecked against the current Go declarations. Changed declarations require rebuilding the GoML package from source. `--ffi-check off` cannot skip external type resolution or artifact type revalidation. Generic declarations such as `#[go_type("example.com/shim", "Box")] extern type Box[T];` accept concrete applications such as `Box[i64]`. The Go type checker validates the original Go constraints, including constraints on alias parameters that disappear when the alias is expanded. Imported applications are checked too, and concrete instance requests are saved for artifact revalidation. Concrete instance validation requires that a variable of the resolved Go type is legal. Constraint-only interfaces can be described in declaration metadata but cannot be used as runtime instances. Applications involving unresolved GoML generic parameters currently report that specialization is required; using `Box[T]` inside a generic GoML function or alias is not yet supported. Aliases to Go pointers are supported when their pointee has a supported representation. Aliases requiring other unsupported raw representations, such as raw Go channels, produce diagnostics. This support currently applies to module compilation; the query/LSP checking path is not yet connected to Go type metadata.
+
 The initial ABI supports values whose generated Go representations are already directly assignable:
 
 | GoML type | Go representation |
 | --- | --- |
 | `bool`, numeric primitives, `string` | Corresponding Go primitive |
+| External named type with concrete arguments | Original Go package type, without a new defined type |
 | `char` | `rune` / `int32` |
 | `byte` | `byte` / `uint8` |
 | `[T; N]` | `[N]T` |
 | `Slice[T]` | `[]T` |
 | `MutSlice[T]` | `[]T` |
+| `ffi::Func[F]` | Nullable Go function with signature F; unit/flat tuple results use zero/multiple Go results |
 | `Channel[T]` | `chan T` |
 | `Sender[T]` | `chan<- T` |
 | `Receiver[T]` | `<-chan T` |
@@ -2054,11 +2114,15 @@ The initial ABI supports values whose generated Go representations are already d
 
 Tuple types are supported only as the complete return type. Tuple elements and array, slice, or channel elements must themselves be FFI-safe. Parameters cannot be `()`.
 
-`dyn Marker` is supported only as a direct parameter or as the complete single return type. `Marker` must be strictly empty: it cannot declare generic parameters, predicates, supertraits, associated types, or methods, and the `dyn` type cannot have arguments, associated-type bindings, or additional bounds. The wrapper passes the object's `data` field to Go as `any` and wraps a returned Go value back into the empty marker object. Empty marker objects are not yet supported inside tuples, arrays, slices, or channels.
+`dyn Marker` is supported only as a direct parameter or as the complete single return type. `Marker` must be strictly empty: it cannot declare generic parameters, predicates, supertraits, associated types, or methods, and the `dyn` type cannot have arguments, associated-type bindings, or additional bounds. Artifact validation resolves a local unqualified marker name in the declaring function’s package, including private markers. The wrapper passes the object's `data` field to Go as `any` and wraps a returned Go value back into the empty marker object. Empty marker objects are not yet supported inside tuples, arrays, slices, or channels.
 
-The declaration must be monomorphic and must describe the Go function exactly. GoML does not inspect Go package type information during type checking; the Go compiler is the final authority for symbol existence and assignability. In particular, a Go named type such as `time.Duration` is not interchangeable with a GoML `i64` parameter even when its underlying representation is the same.
+The declaration must be monomorphic. Project `goml check`, `build`, `run`, and `test` default to `--ffi-check required`: the adjacent `goml-go-meta` helper uses Go package loading and type checking to validate the actual generated call, including unused private declarations. Missing tools, unavailable packages, and incompatible signatures produce errors before successful package artifact publication. Cached GoML artifacts are checked again against current Go sources; verification success is not reused across commands. Binding diagnostics include the GoML declaration location when its source is readable, along with the Go target and parameter-name mapping. When source is unavailable, the package/binding identity and Go diagnostic remain available. Go remains the authority for symbol existence and assignability. In particular, a Go named type such as `time.Duration` is not interchangeable with a GoML `i64` parameter even when its underlying representation is the same.
 
-`Vec`, `Ref`, `HashMap`, `Option`, `Result`, user structs and enums, nonempty trait objects, function values, nested tuples, generic declarations, methods, callbacks, automatic Go object lifetime management, and automatic `error` conversion are not supported by this ABI. Write a small Go shim with an exported function and FFI-safe parameters when adapting such an API:
+Use `goml check --ffi-check off` (also accepted by `build`, `run`, and `test`) to explicitly skip Go signature validation. Commands with foreign declarations emit an `ffi-unverified` warning in this mode. This does not guarantee that the final Go build succeeds. Checks with no foreign declarations do not require Go or the helper. Standalone compiler commands and LSP queries do not yet perform this project validation.
+
+Required validation and the final executable build share the selected Go executable, target, flags, module policy, and generated caller directories. Validation honors `internal` import restrictions, uses readonly module resolution, disables workspace mode and automatic toolchain downloads, and does not fetch packages or modify `go.mod`/`go.sum`. Prepare required Go dependencies separately. A valid signature does not prove Unicode, mutability, lifetime, or concurrency contracts. A unit-returning legacy binding may still discard Go results; ordinary calls also retain Go's generic inference and variadic-call rules.
+
+`Vec`, `Ref`, `HashMap`, `Option`, `Result`, user structs and enums, nonempty trait objects, ordinary GoML function values, nested tuples, generic function declarations, implicit callback conversion, automatic Go object lifetime management, and automatic `error` conversion are not supported by this ABI. Write a small Go shim with an exported function and FFI-safe parameters when adapting such an API:
 
 ```go
 package goshim
@@ -2078,7 +2142,212 @@ extern fn read_text(name: string) -> (string, bool);
 
 When the GoML module root contains `go.mod`, `goml build`, `goml run`, and test linking invoke Go in module mode, so local shim packages and declared Go module dependencies can be imported. Go workspace mode remains disabled. Without `go.mod`, builds retain the existing module-off behavior. Module-mode Go builds always execute and delegate dependency and source freshness to Go's own build cache, so changes to `go.mod`, `go.sum`, and local `.go` shims are observed.
 
-This interface only calls Go from GoML. Exporting GoML functions to Go, calling methods, dynamic symbol lookup, and C ABI interoperation require separate mechanisms.
+The package-function form calls Go from GoML; method calls use the explicit `go_method` form described above. Dynamic symbol lookup and C ABI interoperation require separate mechanisms.
+
+### Go interface wrappers
+
+In module compilation, `go_interface` on a top-level trait generates a wrapper holding an explicitly bound native Go interface and forwarding methods:
+
+```goml
+use std::ffi;
+
+#[go_type("io", "Reader")]
+pub extern type GoReader;
+
+#[go_interface(GoReader, ReaderAdapter, read = "Read")]
+pub trait Reader {
+    fn read(self: Self, buffer: ffi::RawSlice[u8]) -> (isize, ffi::Error);
+}
+
+fn wrap(raw: GoReader) -> ReaderAdapter {
+    ReaderAdapter::from_go(raw)
+}
+```
+
+The first argument is the raw type path, which may name an imported external type. The second is an unqualified wrapper name; its visibility follows the trait. Named string arguments map every trait method to exactly one exported Go method. The completed Go interface method set must be covered exactly, including embedded methods. Missing, duplicate, unexported or mismatched methods produce diagnostics at the adapter declaration. Generated type/helper names and reserved wrapper members cannot collide with user declarations.
+
+`ReaderAdapter::from_go(raw)` stores the original interface value in a private field; `wrapper.into_go()` returns it. These preserve nil interfaces, typed-nil receivers and the identity of referenced Go objects. Forwarded calls retain Go receiver behavior, including nil-receiver handling and panics. No receiver is replaced and no automatic close is added. The raw Go interface remains distinct from `dyn Reader`; use `wrapper as dyn Reader` for an explicit GoML trait conversion.
+
+Method signatures use explicit raw boundaries: `ffi::String`/`ffi::Rune` for text and `ffi::RawSlice` for slices. Apply copy/share adapters explicitly at the caller. Every Go result is preserved: `()` means no results, and `(isize, ffi::Error)` retains both a partial count and its original error. Ordinary GoML text, read-only slices, implicit closures and runtime containers are not automatic interface method conversions.
+
+`ReaderAdapter::from_trait(value: dyn Reader)` creates a wrapper backed by a generated Go bridge. Use `ReaderAdapter::from_trait(implementation as dyn Reader).into_go()` to pass a GoML implementation to Go. Typed forwarding closures retain the supplied trait object after the creating function returns. Go calls preserve shared captured state and every return component; panics propagate in the same goroutine. The generated bridge includes a compile-time Go interface-satisfaction assertion. The resulting interface is non-nil, including when the supplied trait object wraps a nil raw interface. `from_go`, `into_go` and `from_trait` are reserved wrapper method names. Subscription removal and resource closing remain explicit caller responsibilities.
+
+The current adapter requires a concrete Go interface and a non-generic GoML trait with instance methods, without supertraits, associated types or additional method predicates. Constraint-only interfaces are rejected as runtime values. Both `--ffi-check required` and `--ffi-check off` require current interface metadata and complete typed method validation before publishing a generated implementation. Cached interfaces retain the external metadata for revalidation. This feature currently follows the module-only external-type path; standalone and source-only LSP analysis do not yet resolve Go metadata. For explicit allowlisted raw bindings and finite generic instances, use `goml bind-go` as described below; it does not infer interface adapter mappings.
+
+### Raw Go function values
+
+`ffi::Func[F]` is a nullable raw Go function value, distinct from a GoML closure with signature F. For example, `ffi::Func[(i64) -> (i64, ffi::Error)]` represents Go `func(int64) (int64, error)`, and `ffi::Func[() -> ()]` represents `func()`. F must resolve to a function signature with FFI-safe parameters and results; functions cannot be raw map keys. A Go alias of a supported non-variadic function type normalizes to this representation.
+
+`ffi::func_nil()` constructs nil with its signature inferred from context, and `ffi::func_is_nil(value)` checks it. Values returned by Go can pass through packages, generic functions, containers and captured GoML closures without losing their Go closure environment. `Option::Some` containing a nil function remains distinct from `Option::None`. Go bindings can receive these raw values and invoke them in Go. Raw functions are not directly callable with GoML call syntax, and neither implicit closure conversion nor struct construction is supported.
+
+```goml
+use std::ffi;
+
+fn empty_callback() -> ffi::Func[(i64) -> i64] {
+    ffi::func_nil()
+}
+```
+
+`ffi::func_from_closure(value)` explicitly converts a GoML function or closure into a non-nil raw Go function. `ffi::func_to_closure(value)` returns `None` for nil, or `Some(closure)` for a callable GoML closure. Both directions preserve captured state; converting two closures with the same signature keeps their environments distinct. Captured `Ref` cells retain their ordinary sharing behavior.
+
+```goml
+use std::ffi;
+
+fn round_trip() -> bool {
+    let callback: ffi::Func[(i64) -> i64] = ffi::func_from_closure(|x| x + 1);
+    let Some(call) = ffi::func_to_closure(callback) else { return false };
+    call(41) == 42
+}
+```
+
+Conversions generate typed Go method values that retain the original function and its environment. GoML closures still undergo lambda lifting. Unit and flat tuple results are converted explicitly between GoML storage and Go's zero/multiple results. Raw errors and other supported raw values are preserved. Callback text values must use `ffi::String` or `ffi::Rune`; ordinary GoML `string`/`char`, including in arrays, slices, channels or raw maps, are rejected during adapter validation. Perform checked Unicode conversions inside the callback and choose an explicit failure result shape.
+
+The adapters add no synchronization, global registry, reflection or panic recovery. A panic propagates with its original value along the same goroutine, including through both conversion directions, and Go defers run during stack unwinding. It does not become an error result. Recovery requires an explicit caller-owned Go adapter using defer/recover in that goroutine; it cannot recover a panic in another goroutine or intercept process exit. Go may retain a converted callback after its registering GoML call returns, invoke it on another goroutine, or reenter GoML recursively. Captured state remains reachable through the Go function value. Concurrent mutation needs ordinary synchronization; conversion does not make a `Ref` thread-safe.
+
+The runnable [callback subscription example](../examples/ffi-callbacks/README.md) provides explicit unregister, gated asynchronous dispatch, concurrent atomic updates, recursive reentry and registration stress coverage. Its callback reference is removed by unregister; already selected invocations may still run, so callers wait for their batches before disposing of captured resources. GC reachability and registration lifetime are separate. The example and its generated Go program are tested with the race detector. GoLibrary function-value exports remain unsupported; the [callback benchmark](../examples/ffi-callback-bench/README.md) measures invocation and escaping construction separately. Executable, test and library module links embed a versioned JSON index in the generated Go string constant `_goml_source_origins`, relating surviving functions and callback adapters to enclosing GoML declarations. Shared adapters may have several source entries. External-call wrappers also identify the actual extern declarations used, including `go_method`; unused aliases of the same native target are excluded. The index records canonical symbols, the source package, package-relative source files and declaration-name positions, including explicitly defined impl methods; it is not an expression-level stack-trace line table. The [C2 acceptance audit](ffi/acceptance-c2.md) records provenance, panic, pruning, packaging and measurement coverage.
+
+### Raw Go strings
+
+`std::ffi::String` represents arbitrary Go string bytes and is distinct from the GoML Unicode `string` type. Go aliases of `string` normalize to this raw type. It can cross foreign calls, package interfaces, generic functions and captured closures without changing its bytes. Neither implicit conversion nor direct construction is supported.
+
+| Explicit adapter | Result and policy |
+| --- | --- |
+| `ffi::string_from_bytes(bytes::Bytes)` | `ffi::String`; copies bytes, including invalid UTF-8 and NUL |
+| `ffi::string_from_text(string)` | `ffi::String`; preserves validated text |
+| `ffi::string_bytes(ffi::String)` | `bytes::Bytes`; returns an independent mutable byte copy |
+| `ffi::string_text(ffi::String)` | `Result[string, utf8::Utf8Error]`; validates UTF-8 without replacing invalid bytes |
+
+```goml
+use std::ffi;
+use std::bytes;
+
+fn checked_text() -> bool {
+    let raw = ffi::string_from_bytes(bytes::Bytes::from_vec(Vec::from_array([255, 0])));
+    match ffi::string_text(raw) {
+        Ok(_) => false,
+        Err(error) => error.valid_up_to() == 0,
+    }
+}
+```
+
+Legacy foreign bindings declared with GoML `string` retain their existing trusted text contract. Use `ffi::String` when a Go producer can return arbitrary bytes. GoLibrary exports may use `ffi::String` to select the raw-byte policy. Ordinary GoML `string` and `char` exports remain unsupported; use explicit checked adapters at the boundary. Raw Go strings use ordinary qualified type and function syntax; no new grammar is introduced.
+
+### Raw Go runes
+
+`ffi::Rune` is a transparent alias of `i32`, matching Go's `rune`. Raw values may be negative, surrogate code points or larger than the Unicode scalar range. `ffi::rune_from_char(char) -> ffi::Rune` preserves a valid character. `ffi::rune_char(ffi::Rune) -> Result[char, ffi::BoundaryError]` checks the scalar range and returns `InvalidRune(original_value)` for invalid input. It never substitutes a replacement character. These adapters use ordinary type alias and function syntax.
+
+### Raw Go slices
+
+`ffi::RawSlice[T]` is an alias of `MutSlice[T]` and directly represents a Go `[]T` header. Go slice aliases normalize to this type. Header assignment copies length, capacity and the backing-storage reference; it does not copy elements. Existing checked indexing and subslicing methods remain available.
+
+| Adapter or operation | Policy |
+| --- | --- |
+| `ffi::slice_nil[T]()` / `ffi::slice_is_nil(value)` | Preserve and inspect nil separately from a non-nil empty slice |
+| `ffi::slice_capacity(value)` | Return the original header capacity |
+| `ffi::slice_append(value, item)` | Return Go append's new header; retain it to observe the new length |
+| `ffi::slice_shared(vector)` | Share mutable element storage with a snapshot of the Vec header |
+| `ffi::slice_from_vec_copy(vector)` / `ffi::slice_copy(value)` | Copy elements into independent storage |
+| `ffi::slice_to_vec_copy(value)` | Copy elements into a new Vec |
+| `ffi::slice_trusted_readonly(value)` | Share storage through a read-only `Slice[T]` view under the binding author's promise |
+
+Copies are shallow: copying a slice of pointers isolates the element slots, while the pointed-to objects remain shared. Copy adapters produce a non-nil empty allocation for empty input and do not preserve nil identity or spare capacity. Appending may reuse backing storage or allocate another backing array; neither Go append nor Vec append updates previously copied headers. Go writes are visible through aliases sharing the same backing storage. No adapter adds synchronization.
+
+`trusted_readonly` is an explicit author promise that the storage is suitable for read-only use, including coordinating any other writers; Go signatures cannot prove this promise. The conversion does not freeze the original slice or recursively freeze referenced objects. Copy first when independent element storage is needed. Vec and HashMap still have no implicit foreign conversion.
+
+```goml
+use std::ffi;
+
+fn append_header() -> bool {
+    let original: ffi::RawSlice[i64] = ffi::slice_nil();
+    let updated = ffi::slice_append(original, 7);
+    ffi::slice_is_nil(original) && updated.len() == 1
+}
+```
+
+These APIs reuse ordinary aliases, generic functions and existing slice operations; no new grammar is introduced. GoLibrary slice exports remain unavailable.
+
+### Raw Go maps
+
+`ffi::RawMap[K, V]` represents Go `map[K]V` directly and is distinct from GoML `HashMap[K, V]`. Go aliases of map types normalize to this representation. It preserves nil and shared storage through assignments, foreign calls, package interfaces, generics and captured closures. Go operations on an alias observe the same entries.
+
+`ffi::map_nil[K, V]() -> ffi::RawMap[K, V]` produces nil. `ffi::map_is_nil(value) -> bool` distinguishes nil from an allocated empty map. An `Option::Some` containing nil remains distinct from `None`. The raw type has no public struct constructor and no implicit conversion to or from `HashMap`; their storage, hashing and equality contracts differ. Raw map syntax uses ordinary qualified generic aliases and functions.
+
+| Operation | Semantics |
+| --- | --- |
+| `ffi::map_new[K, V]()` | Allocate a non-nil empty raw map |
+| `ffi::map_len(value)` | Entry count; nil has length zero |
+| `ffi::map_get(value, key)` | `Option[V]`; distinguish absence from a present zero or nil value |
+| `ffi::map_set(value, key, item)` | Insert or replace using Go equality; writing nil retains Go's panic |
+| `ffi::map_delete(value, key)` | Delete if present; missing keys and nil maps are no-ops |
+| `ffi::map_copy(value)` | Independent entry storage with shallow values; preserve nil |
+
+Assignment and argument passing share entry storage. Use `map_copy` for independent entries. Pointer values in a copy still refer to the original objects. Copy traverses key/value pairs directly, so NaN-keyed entries retain their values even though NaN cannot be looked up by equality. None of these operations freezes storage, introduces synchronization or converts HashMap hashing semantics.
+
+
+```goml
+use std::ffi;
+
+#[go_ffi("example.com/myapp/goshim", "Entries")]
+extern fn entries() -> ffi::RawMap[i64, i64];
+
+fn available() -> bool {
+    !ffi::map_is_nil(entries())
+}
+```
+
+Foreign signature validation uses Go's key comparability rules. GoML checking rejects known non-comparable keys, including slices, raw maps, arrays or tuples containing them, and local structs with such fields; inferred generic applications are checked after inference. Repeated local generic wrappers are checked at each concrete instantiation: `Key[Key[RawSlice[i64]]]` is rejected when `Key[T]` stores `T` directly, while wrappers that only store a pointer to `T` remain comparable. Recursive struct layouts and structural checks exceeding 64 nested struct instantiations produce recoverable diagnostics. A pointer to an otherwise non-comparable type remains a valid key. Public GoML struct interfaces retain a comparability summary for private fields, so downstream key checking observes their restrictions without exposing field names or types. Summaries may depend on generic arguments; unknown hidden structure does not establish comparability. The artifact decoder also rejects directly non-comparable key shapes. External named keys are checked from Go metadata, including private fields, aliases and imported declarations. Generic external keys retain comparability requirements on their type parameters; concrete arguments are substituted when the type is used as a key, including nested types and aliases that reorder or erase arguments. A parameter used only behind a Go pointer imposes no comparability requirement. Disabling foreign call validation does not disable these checks. Build/link validation also checks keys through materialized local struct fields and external named types after generic specialization. External checks use persisted Go metadata and substitute concrete arguments into comparability rules, including nested types and reordered aliases. Missing or unresolved external key metadata produces a recoverable diagnostic, even with foreign call validation disabled. Module checking infers internal comparability requirements from generic function bodies, including requirements reached through function values and nested closures. Package checks propagate them across files until signatures stabilize, with a recoverable limit of 256 passes. Exported function interfaces retain the inferred requirements, so downstream module checks can reject invalid keys before building Go. Private structural key wrappers are reduced to their required type parameters or associated-type projections. These predicates have no user-written bound syntax and do not introduce let-generalization. Source-only dependency analysis checks dependency bodies and retains their inferred requirements before checking callers, including unsaved source overrides. Struct and enum interfaces also retain the key requirements of maps stored in fields or variant payloads, including private storage and aliases. These requirements propagate between nominal declarations with a recoverable 256-pass limit and are substituted at concrete type applications. Recursive type applications are checked through their declaration requirements without repeatedly expanding their layouts. Default trait methods retain their inferred map-key requirements separately from the method declaration bounds. An implementation that uses a default body must satisfy those requirements after substituting its receiver and associated types. An explicit method override does not inherit requirements from the unused default body. GoLibrary map exports remain unsupported. Raw maps add no synchronization or automatic deep copy.
+
+### Exporting a Go library
+
+The frontend recognizes `#[go_export("Add")] pub fn add(x: i64, y: i64) -> i64 { x + y }`. It checks that the declaration is an ordinary top-level public function without generics, comptime/derive capability, or test attributes. The Go name starts with an ASCII uppercase letter and contains only ASCII letters, digits, or underscores; names must be unique across the selected GoML package. Duplicate attributes and attributes on methods, externs, types, fields, and other non-function items are rejected.
+
+Export parameters currently allow bool, integer and floating-point primitives, `ffi::String`, and fixed arrays of those values. Returns additionally allow unit or a flat tuple of non-unit permitted values. Transparent aliases normalize to their underlying type. Ordinary GoML strings and chars, slices, channels, user-defined types, function values, tuple parameters, and nested tuple returns are outside this export boundary.
+
+The text boundary policy is explicit in the GoML types and adapter body:
+
+| Exported GoML type | Go signature | Boundary policy |
+| --- | --- | --- |
+| `ffi::String` | `string` | Preserve arbitrary bytes, including invalid UTF-8 and NUL; no implicit Unicode conversion |
+| `ffi::Rune` (alias of `i32`) | `int32` / `rune` | Preserve the raw integer; no implicit scalar validation |
+| ordinary `string` / `char` | Rejected | Choose raw types and write an explicit checked adapter |
+
+Use `ffi::string_text` or `ffi::rune_char` inside the exported function to validate values before treating them as Unicode. Failure must be expressed by the adapter's supported return signature or a deliberate boundary failure strategy. The following adapter returns the original bytes with `false` for invalid UTF-8, and validated text with `true` otherwise. It never silently substitutes replacement characters:
+
+```goml
+use std::ffi;
+
+#[go_export("CheckedText")]
+pub fn checked_text(value: ffi::String) -> (ffi::String, bool) {
+    match ffi::string_text(value) {
+        Ok(text) => (ffi::string_from_text(text), true),
+        Err(_) => (value, false),
+    }
+}
+```
+
+A raw echo returning `ffi::String` can preserve bytes without decoding. A rune adapter can return `(ffi::Rune, bool)` in the same way. Fixed arrays and flat tuple returns preserve these element policies. `Result` itself is not a Go export ABI type; selecting and documenting the failure shape belongs to the adapter author. These exports reuse existing type aliases, function syntax and `go_export` grammar.
+
+Interface and Core artifacts preserve the selected Go export name, stable package/function identity, resolved signature, and relative source origin. Export names and signatures participate in the interface semantic hash; source positions do not. The internal library linker selects only the chosen package’s declared exports as function roots before dead-code elimination and monomorphization; reachable private and cross-package helpers are retained without requiring a `main`. The internal Go library backend emits callable wrappers for scalar and fixed-array parameters and results, maps unit to no Go result, and maps a flat tuple to multiple Go results. Library wrappers use package-level OnceCell initialization and preserve panics. Generated internal package declarations are private Go identifiers; only explicitly selected export names become public API. `pub` alone does not request a Go export.
+
+Use `goml bind-go <CONFIG> [--compiler <COMPILER>] [--dry-run]` to generate explicitly allowlisted Go bindings from a versioned JSON configuration. `gomlc bind-go <CONFIG> [--dry-run]` is the compiler entry point. The configuration selects each native package/symbol and may list finite `type_arguments`; Go checks their constraints. It generates a GoML raw binding file and native Go forwarding functions without running package initializers or creating dependencies. An existing GoML module and an enclosing Go module are required. Output paths resolve relative to the configuration, remain within the GoML module, and must match the configured Go import path. Parent traversal, symbolic links and nested module boundaries are rejected.
+
+Native APIs may reside in the output Go package; same-package references do not introduce self imports. Metadata queries omit the previously owned output in memory, then Go checks the complete candidate package, including handwritten files, before publication. No source overlay is written to disk.
+
+The ownership manifest `<CONFIG>.goml-bind.json` records both generated files. Identical regeneration preserves timestamps; modifications to either source or the manifest prevent overwriting. Put handwritten conversions and wrappers in separate files. Raw strings and errors retain their explicit `std::ffi` boundaries; the generator does not infer error, nullable or record adapters. Dry runs validate configuration, module and output paths and print destinations without writing files; they do not query the selected symbols. See [the configuration contract](ffi/bind-go.md) and [the complete standard-library example](../examples/ffi-bind-go/README.md). This command uses existing extern/type-alias syntax and introduces no grammar changes.
+
+Use `goml export-go` to generate a library from one package in the current GoML module:
+
+```text
+goml export-go [PACKAGE_DIR] --import-path example.com/host/gen/calclib --out ./gen/calclib
+```
+
+The default source is the GoML module root. Explicit source and output paths are relative to the current working directory. The source must be a package in the current module and must not declare `package main`. Only its `go_export` declarations become Go API; dependency exports are retained only when reachable. The output directory's basename is the Go package name and must be a non-main ASCII Go identifier.
+
+The GoML module root must already contain `go.mod`. The output must remain inside that Go module, outside nested Go modules, and the supplied import path must equal the Go module path plus the canonical relative output path. Parent traversal is rejected and symlinks are resolved before checking boundaries. The command never creates or repairs go.mod/go.sum or downloads missing dependencies.
+
+The output contains `goml_generated.go` and `goml_exports.json`. The manifest records public signatures, generation version, build prerequisites, FFI check mode and ownership digests. Handwritten Go files are preserved and checked together with the candidate generated source. New output is checked using a Go overlay before publication; malformed Go, duplicate symbols and import cycles fail without publishing the candidate. Modified or unowned generated files are not overwritten. Concurrent generation for the same output is rejected. Publication rolls back reported file replacement errors; two-file publication is not crash-atomic across power loss or forced process termination.
+
+`--ffi-check required` is the default. All declared foreign bindings, including unused private ones, are checked before publication in the final generated-package context. `--ffi-check off` emits an unverified warning when foreign bindings exist and records `off` in the manifest; Go still compiles the candidate package. `--compiler`, `--target-dir`, `--jobs` and `--dry-run` are supported. The generated pure-Go library builds without the GoML compiler or metadata helper installed. A complete bidirectional example, including a Go executable and Go tests, is available in [the interoperability fixture](../tools/release/testdata/go-export).
 
 ## test
 
@@ -2825,7 +3094,7 @@ Sorting mutates a `Vec[T]` in place. `sort` and `stable_sort` use `cmp::Ord`; `s
 | A loop with a condition | `while condition { ... }` |
 | `for i := 0; ...` | `while`, or `for i in start..end` |
 | `switch` | `match` |
-| `null`、`nil` | `Option::None` |
+| `null`、`nil` | `Option::None` for optional values; `ffi::null()` for raw Go pointers; `ffi::nil_error()` for Go errors |
 | `throw`, exception | `Result` and `?` |
 | `float_value.to_i32()` | Floating point to integer conversion is not supported; use dedicated parsing or conversion APIs |
 | `dyn A + B` | Use one dyn-safe trait; multiple bounds are reserved syntax but not yet supported |
@@ -2834,7 +3103,11 @@ Sorting mutates a `Vec[T]` in place. `sort` and `stable_sort` use `cmp::Ord`; `s
 | `use pkg::*` | List the required public items explicitly with `use pkg::{A, B};` |
 | `mod`、`crate::`、`super::` | Directory packages, `module::path` for the current module, and canonical paths for dependencies |
 | `fn helper` inside function | Top-level function or local closure |
-| Unannotated user `extern fn` | Use a normal GoML function or `#[go_ffi("import/path", "ExportedSymbol")] extern fn` |
+| Go external type | `#[go_type("pkg", "Name")] extern type Name[T];` retains Go identity and validates concrete instances across packages and artifacts; `std::ffi::Ptr[T]` and Go pointer aliases preserve nullable pointer values, with explicit `ffi::null()` and `ffi::is_nil`; method bindings use `#[go_method("Method")]`; symbolic instances remain unsupported |
+| Go interface adapter | `#[go_interface(RawType, Wrapper, method = "GoMethod")]` generates a checked native-interface wrapper and trait implementation; `from_trait` explicitly creates a typed Go bridge retaining the supplied dyn object; nil/typed-nil and multiple results are preserved |
+| Go binding generator | `goml bind-go <CONFIG>` selects explicit package/symbol allowlists and finite Go-checked generic arguments; emits raw bindings with protected deterministic output |
+| Go-callable export | Annotate a supported public function with `#[go_export("Name")]` and generate a Go package with `goml export-go` |
+| Unannotated user `extern fn` | Use a normal GoML function or `#[go_ffi("import/path", "ExportedSymbol")] extern fn`; project commands validate Go calls by default (`--ffi-check required`) |
 | Call an ordinary function from `comptime` | Mark a supported free function with `#[comptime]` |
 | Capture a runtime local in `comptime` | Pass a literal or compile-time value to a `#[comptime]` function |
 
@@ -2860,13 +3133,18 @@ item          = attribute* visibility? function
               | attribute* visibility? trait_def
               | attribute* impl_def
               | go_ffi_extern
+              | attribute* visibility? extern_type
 visibility    = "pub"
 attribute     = "#[" attribute_body "]"
+go_export_attribute = "#[" "go_export" "(" string_literal ")" "]"
 comptime_attribute = "#[" "comptime" "]"
 comptime_derive_attribute = "#[" "comptime_derive" ("(" ident ")")? "]"
 derive_attribute = "#[" "derive" "(" path ("," path)* ")" "]"
+extern_type = "extern" "type" upper_ident generic_params? ";"
 go_ffi_attribute = "#[" "go_ffi" "(" string_literal "," string_literal ")" "]"
-go_ffi_extern = go_ffi_attribute visibility? "extern" "fn" lower_ident
+go_method_attribute = "#[" "go_method" "(" string_literal ")" "]"
+go_interface_attribute = "#[" "go_interface" "(" path "," ident ("," ident "=" string_literal)* ","? ")" "]"
+go_ffi_extern = (go_ffi_attribute | go_method_attribute) visibility? "extern" "fn" lower_ident
                 param_list return_type? ";"
 
 function      = "fn" lower_ident generic_params? param_list return_type? where_clause? block

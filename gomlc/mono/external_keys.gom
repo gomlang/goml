@@ -1,0 +1,152 @@
+package mono;
+
+use module::core;
+use module::ffi;
+use module::tast;
+
+pub struct ExternalKeyRule {
+    pub template: ffi::GoTypeIdentity,
+    pub rule: ffi::GoComparability,
+}
+
+fn match_external_key(template: ffi::GoTypeIdentity, value: Type, parameters: HashMap[isize, Type]) -> bool {
+    match (template, value) {
+        (Parameter(index), value) => {
+            if let Some(previous) = parameters[index] {
+                types_equal(previous, value)
+            } else {
+                parameters[index] = value;
+                true
+            }
+        },
+        (Named { import_path, name, arguments }, External { import_path: path, name: actual, args }) => {
+            if import_path != path || name != actual || arguments.len() != args.len() {
+                return false
+            }
+            for index in 0..args.len() {
+                if !match_external_key(arguments[index], args[index], parameters) {
+                    return false
+                }
+            }
+            true
+        },
+        (Pointer(element), GoPointer { elem }) | (Slice(element), MutSlice { elem }) | (
+            Slice(element),
+            Slice { elem },
+        ) => match_external_key(element, elem, parameters),
+        (Array { element, length }, Array { elem, len }) => length == len
+            && match_external_key(element, elem, parameters),
+        (Map { key, element }, GoMap { key: actual_key, value }) => match_external_key(
+            key,
+            actual_key,
+            parameters,
+        )
+            && match_external_key(element, value, parameters),
+        (Basic(name), value) => match tast::foreign_bridge_type(
+            core::type_to_tast(mono_type_to_core(value)),
+            Vec::new(),
+            false,
+        ) {
+            Ok(ffi::BridgeType::Scalar(actual)) => name == actual,
+            _ => false,
+        },
+        (
+            Function { parameters: args, results },
+            GoFunction { signature: Type::Func { params, ret_ty } },
+        ) => {
+            if args.len() != params.len() {
+                return false
+            }
+            for index in 0..args.len() {
+                if !match_external_key(args[index], params[index], parameters) {
+                    return false
+                }
+            }
+            let returns = match ret_ty {
+                Unit => Vec::new(),
+                Tuple { items } => items,
+                value => Vec::from_array([value]),
+            };
+            if results.len() != returns.len() {
+                return false
+            }
+            for index in 0..results.len() {
+                if !match_external_key(results[index], returns[index], parameters) {
+                    return false
+                }
+            }
+            true
+        },
+        _ => false,
+    }
+}
+
+fn external_key_rule_uncomparable(
+    ctx: ValidateContext,
+    rule: ffi::GoComparability,
+    parameters: HashMap[isize, Type],
+    active: Vec[string],
+) -> Result[bool, string] {
+    match rule {
+        Always => Result::Ok(false),
+        Never => Result::Ok(true),
+        Unknown => Result::Err("Go map key comparability is unresolved after specialization"),
+        Parameter(index) => go_map_key_uncomparable(
+            ctx,
+            parameters[index].ok_or("Go map key comparability parameter is missing")?,
+            active,
+        ),
+        All(rules) => {
+            for rule in rules {
+                if external_key_rule_uncomparable(ctx, rule, parameters, active)? {
+                    return Result::Ok(true)
+                }
+            }
+            Result::Ok(false)
+        },
+    }
+}
+
+fn external_key_uncomparable(ctx: ValidateContext, value: Type, active: Vec[string]) -> Result[
+    bool,
+    string,
+] {
+    let Some(rules) = ctx.external_keys else {
+        return Result::Ok(false)
+    };
+    if let External { import_path: "", name, args } = value {
+        if args.is_empty() && (name == "error" || name == "string") {
+            return Result::Ok(false)
+        }
+    }
+    if active.len() >= 64 {
+        return Result::Err("Go map key comparability exceeds the structural depth limit")
+    }
+    let identity = compact_mono_type(value);
+    if active.contains(identity) {
+        return Result::Err("Go map key has recursive external comparability metadata")
+    }
+    active.push(identity);
+    let mut matched = false;
+    let mut invalid = false;
+    for rule in rules {
+        if !match rule.template {
+            Named { .. } => true,
+            _ => false,
+        } {
+            continue
+        }
+        let parameters: HashMap[isize, Type] = HashMap::new();
+        if match_external_key(rule.template, value, parameters) {
+            matched = true;
+            if external_key_rule_uncomparable(ctx, rule.rule, parameters, active)? {
+                invalid = true;
+            }
+        }
+    }
+    active.truncate(active.len() - 1);
+    if !matched {
+        return Result::Err("Go map key is missing external comparability metadata: " + identity)
+    }
+    Result::Ok(invalid)
+}

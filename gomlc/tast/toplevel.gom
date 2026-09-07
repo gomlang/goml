@@ -20,6 +20,7 @@ fn function_context(
     let param_aliases = predicate_type_aliases(predicates);
     let projection_aliases = predicate_projection_aliases(predicates);
     Checker {
+        current_function: base.current_function,
         builtin: base.builtin,
         counter: base.counter,
         diagnostics: base.diagnostics,
@@ -86,6 +87,7 @@ fn function_context(
 
 fn closure_context(base: Checker, ret_ty: Type) -> Checker {
     Checker {
+        current_function: base.current_function,
         builtin: base.builtin,
         counter: base.counter,
         diagnostics: base.diagnostics,
@@ -437,6 +439,32 @@ fn check_function(
     inherited_predicates: Vec[TypePredicate],
     self_ty: Option[Type],
 ) -> Function {
+    let previous = base.current_function.get();
+    base.current_function.set(
+        if self_ty.is_none() {
+            Option::Some(value.name)
+        } else {
+            Option::None
+        },
+    );
+    let result = check_function_inner(
+        base,
+        value,
+        inherited_generics,
+        inherited_predicates,
+        self_ty,
+    );
+    base.current_function.set(previous);
+    result
+}
+
+fn check_function_inner(
+    base: Checker,
+    value: hir::Function,
+    inherited_generics: Vec[string],
+    inherited_predicates: Vec[TypePredicate],
+    self_ty: Option[Type],
+) -> Function {
     let derive_export_name = comptime_derive_export_name(value.attrs);
     let comptime = match self_ty {
         None => function_comptime_capability(
@@ -546,9 +574,25 @@ fn check_function(
     resolve_field_constraints(ctx);
     resolve_coercion_constraints(ctx);
     resolve_numeric_literal_constraints(ctx);
+    infer_function_map_predicates(ctx, params, ret_ty, comptime_origin_start, predicates);
     let report_all_unresolved = resolve_required_predicates(ctx);
     report_unresolved_block(ctx, value.body, report_all_unresolved);
     let body = resolve_deferred_block(ctx, checked_body.0);
+    for index in comptime_origin_start..base.typeck_results.exprs.len() {
+        let fact = base.typeck_results.exprs[index];
+        if let Some(error) = invalid_go_function_signature(ctx, fact.ty) {
+            push_diagnostic_at(ctx, error, Option::Some(fact.span));
+            break
+        }
+        if let Some(key) = invalid_go_map_key(ctx, fact.ty) {
+            push_diagnostic_at(
+                ctx,
+                "Go map key is not comparable: " + type_text(key),
+                Option::Some(fact.span),
+            );
+            break
+        }
+    }
     if let ComptimeCapability::Derive = comptime {
         if match value.visibility {
             ast::Visibility::Public => true,
@@ -577,6 +621,7 @@ fn check_function(
         comptime_origins.push(base.typeck_results.exprs[index].span)
     }
     Function {
+        name_span: value.name_span,
         visibility: value.visibility,
         name: value.name,
         comptime,
@@ -903,6 +948,9 @@ fn collect_injective_type_params(value: Type, result: collections::IndexSet[stri
         Param { name } => {
             let _ = result.insert(name);
         },
+        External { import_path: _, name: _, args: items } => for item in items {
+            collect_injective_type_params(item, result)
+        },
         Tuple { items } => for item in items {
             collect_injective_type_params(item, result)
         },
@@ -913,10 +961,17 @@ fn collect_injective_type_params(value: Type, result: collections::IndexSet[stri
                 collect_injective_type_params(arg, result)
             }
         },
-        Array { len: _, elem } | Slice { elem } | MutSlice { elem } | VecType { elem } | RefType {
+        Array { len: _, elem } | Slice { elem } | MutSlice { elem } | VecType { elem } | GoPointer {
             elem,
-        } | Channel { elem, direction: _ } => collect_injective_type_params(elem, result),
+        } | GoFunction { signature: elem } | RefType { elem } | Channel { elem, direction: _ } => collect_injective_type_params(
+            elem,
+            result,
+        ),
         HashMap { key, value } => {
+            collect_injective_type_params(key, result);
+            collect_injective_type_params(value, result)
+        },
+        GoMap { key, value } => {
             collect_injective_type_params(key, result);
             collect_injective_type_params(value, result)
         },
@@ -933,6 +988,14 @@ fn collect_injective_type_params(value: Type, result: collections::IndexSet[stri
 fn type_contains_projection(value: Type) -> bool {
     match prune(value) {
         Projection { for_ty: _, name: _, trait_ref: _ } => true,
+        External { import_path: _, name: _, args: items } => {
+            for item in items {
+                if type_contains_projection(item) {
+                    return true
+                }
+            }
+            false
+        },
         Tuple { items } => {
             for item in items {
                 if type_contains_projection(item) {
@@ -952,10 +1015,15 @@ fn type_contains_projection(value: Type) -> bool {
             }
             false
         },
-        Array { len: _, elem } | Slice { elem } | MutSlice { elem } | VecType { elem } | RefType {
+        Array { len: _, elem } | Slice { elem } | MutSlice { elem } | VecType { elem } | GoPointer {
             elem,
-        } | Channel { elem, direction: _ } => type_contains_projection(elem),
+        } | GoFunction { signature: elem } | RefType { elem } | Channel { elem, direction: _ } => type_contains_projection(
+            elem,
+        ),
         HashMap { key, value } => {
+            type_contains_projection(key) || type_contains_projection(value)
+        },
+        GoMap { key, value } => {
             type_contains_projection(key) || type_contains_projection(value)
         },
         Func { params, ret_ty } => {
@@ -1108,7 +1176,7 @@ fn check_impl(base: Checker, value: hir::ImplBlock) -> ImplBlock {
                         + type_text(for_type),
                 ),
             }
-            Option::Some(normalize_trait_ref(base, reference))
+            Option::Some(canonical_resolved_trait_ref(base, normalize_trait_ref(base, reference)))
         },
         None => Option::None,
     };
@@ -1427,6 +1495,14 @@ fn associated_type_reaches(
             }
             false
         },
+        External { import_path: _, name: _, args: items } => {
+            for item in items {
+                if associated_type_reaches(values, item, target_trait, target, active) {
+                    return true
+                }
+            }
+            false
+        },
         Tuple { items } => {
             for item in items {
                 if associated_type_reaches(values, item, target_trait, target, active) {
@@ -1446,12 +1522,16 @@ fn associated_type_reaches(
             }
             false
         },
-        Array { len: _, elem } | Slice { elem } | MutSlice { elem } | VecType { elem } | RefType {
+        Array { len: _, elem } | Slice { elem } | MutSlice { elem } | VecType { elem } | GoPointer {
             elem,
-        } | Channel { elem, direction: _ } => {
+        } | GoFunction { signature: elem } | RefType { elem } | Channel { elem, direction: _ } => {
             associated_type_reaches(values, elem, target_trait, target, active)
         },
         HashMap { key, value } => {
+            associated_type_reaches(values, key, target_trait, target, active)
+                || associated_type_reaches(values, value, target_trait, target, active)
+        },
+        GoMap { key, value } => {
             associated_type_reaches(values, key, target_trait, target, active)
                 || associated_type_reaches(values, value, target_trait, target, active)
         },
@@ -1495,6 +1575,7 @@ fn validate_associated_type_cycles(
 
 fn predicate_text(value: TypePredicate) -> string {
     match value {
+        GoComparable(ty) => "go_comparable(" + type_text(ty) + ")",
         Trait { for_ty, trait_ref } => {
             type_text(for_ty) + ": " + trait_ref_text(trait_ref)
         },
@@ -1528,6 +1609,11 @@ fn resolve_impl_alias_type(ctx: Checker, value: Type) -> Type {
                 },
             }
         },
+        External { import_path, name, args: items } => Type::External {
+            import_path,
+            name,
+            args: resolve_impl_alias_types(ctx, items),
+        },
         Tuple { items } => Type::Tuple { items: resolve_impl_alias_types(ctx, items) },
         App { ty, args } => Type::App {
             ty: resolve_impl_alias_type(ctx, ty),
@@ -1537,8 +1623,16 @@ fn resolve_impl_alias_type(ctx: Checker, value: Type) -> Type {
         Slice { elem } => Type::Slice { elem: resolve_impl_alias_type(ctx, elem) },
         MutSlice { elem } => Type::MutSlice { elem: resolve_impl_alias_type(ctx, elem) },
         VecType { elem } => Type::VecType { elem: resolve_impl_alias_type(ctx, elem) },
+        GoPointer { elem } => Type::GoPointer { elem: resolve_impl_alias_type(ctx, elem) },
+        GoFunction { signature } => Type::GoFunction {
+            signature: resolve_impl_alias_type(ctx, signature),
+        },
         RefType { elem } => Type::RefType { elem: resolve_impl_alias_type(ctx, elem) },
         HashMap { key, value } => Type::HashMap {
+            key: resolve_impl_alias_type(ctx, key),
+            value: resolve_impl_alias_type(ctx, value),
+        },
+        GoMap { key, value } => Type::GoMap {
             key: resolve_impl_alias_type(ctx, key),
             value: resolve_impl_alias_type(ctx, value),
         },
@@ -1556,6 +1650,7 @@ fn resolve_impl_alias_type(ctx: Checker, value: Type) -> Type {
 
 fn resolve_impl_alias_predicate(ctx: Checker, value: TypePredicate) -> TypePredicate {
     match value {
+        GoComparable(ty) => TypePredicate::GoComparable(resolve_impl_alias_type(ctx, ty)),
         Trait { for_ty, trait_ref } => TypePredicate::Trait {
             for_ty: resolve_impl_alias_type(ctx, for_ty),
             trait_ref: resolve_impl_alias_trait_ref(ctx, trait_ref),
@@ -1645,6 +1740,7 @@ fn trait_ref_contains_any_parameter(reference: TraitRef, parameters: Vec[string]
 
 fn predicate_contains_any_parameter(value: TypePredicate, parameters: Vec[string]) -> bool {
     match value {
+        GoComparable(ty) => type_contains_any_parameter(ty, parameters),
         Trait { for_ty, trait_ref } => {
             type_contains_any_parameter(for_ty, parameters)
                 || trait_ref_contains_any_parameter(trait_ref, parameters)
@@ -1832,7 +1928,7 @@ fn contains_function_named(values: Vec[Function], name: string) -> bool {
     false
 }
 
-fn canonical_default_trait_ref(ctx: Checker, value: TraitRef) -> TraitRef {
+fn canonical_resolved_trait_ref(ctx: Checker, value: TraitRef) -> TraitRef {
     TraitRef {
         name: match find_trait(ctx, value.name) {
             Some(info) => info.name,
@@ -1847,9 +1943,10 @@ fn canonical_default_predicates(ctx: Checker, values: Vec[TypePredicate]) -> Vec
     for value in values {
         result.push(
             match value {
+                GoComparable(ty) => TypePredicate::GoComparable(ty),
                 Trait { for_ty, trait_ref } => TypePredicate::Trait {
                     for_ty,
-                    trait_ref: canonical_default_trait_ref(ctx, trait_ref),
+                    trait_ref: canonical_resolved_trait_ref(ctx, trait_ref),
                 },
                 Equality { lhs, rhs } => TypePredicate::Equality { lhs, rhs },
             },
@@ -1888,8 +1985,10 @@ fn default_trait_method(
         owner_predicates,
         canonical_default_predicates(ctx, substitute_predicates(expected.predicates, substitutions)),
     );
+    validate_default_map_requirements(ctx, expected, substitutions, generics, predicates);
     let function_ty = Type::Func { params: param_types, ret_ty };
     Function {
+        name_span: ast::Span { start: 0, end: 0 },
         visibility: ast::Visibility::Private,
         name: expected.name,
         comptime: ComptimeCapability::RuntimeOnly,
@@ -2076,6 +2175,7 @@ fn validate_local_definitions(
         let info = ctx.traits[index];
         for predicate in info.predicates {
             match predicate {
+                GoComparable(ty) => validate_signature_type(ctx, ty),
                 Trait { for_ty, trait_ref: reference } => {
                     validate_signature_type(ctx, for_ty);
                     validate_trait_reference(ctx, reference)
@@ -2097,6 +2197,7 @@ fn validate_local_definitions(
         for method in info.methods {
             for predicate in method.predicates {
                 match predicate {
+                    GoComparable(ty) => validate_signature_type(ctx, ty),
                     Trait { for_ty, trait_ref: reference } => {
                         validate_signature_type(ctx, for_ty);
                         validate_trait_reference(ctx, reference)
@@ -2124,7 +2225,13 @@ fn builtin_enum_definitions(builtin: BuiltinContract) -> Vec[EnumDef] {
         }
         let option_variants = enum_option_variants(builtin, value.name, variants);
         result.push(
-            EnumDef { name: value.name, generics: value.generics, variants, option_variants },
+            EnumDef {
+                map_requirements: value.map_requirements,
+                name: value.name,
+                generics: value.generics,
+                variants,
+                option_variants,
+            },
         )
     }
     result
@@ -2297,6 +2404,7 @@ fn validate_file_declaration_names(ctx: Checker, value: hir::File) -> () {
             EnumDef(definition) => Option::Some((definition.name, 1)),
             StructDef(definition) => Option::Some((definition.name, 2)),
             TypeAlias(definition) => Option::Some((definition.name, 3)),
+            ExternType(definition) => Option::Some((definition.name, 3)),
             _ => Option::None,
         };
         if let Some(value) = nominal {
@@ -2385,6 +2493,16 @@ fn validate_file_declaration_names(ctx: Checker, value: hir::File) -> () {
             ExternFunction(function) => {
                 validate_type_parameter_names(ctx, function.generics)
             },
+            ExternType(definition) => {
+                validate_type_parameter_names(ctx, definition.generics);
+                if find_type_alias(ctx, definition.name).is_none() {
+                    push_diagnostic_at(
+                        ctx,
+                        "external type metadata is not yet connected: " + definition.name,
+                        Option::Some(definition.name_span),
+                    )
+                }
+            },
             TypeAlias(alias) => {
                 validate_type_parameter_names(ctx, alias.generics)
             },
@@ -2414,6 +2532,7 @@ fn validate_cross_file_declaration_names(
                 EnumDef(definition) => Option::Some((definition.name, 1)),
                 StructDef(definition) => Option::Some((definition.name, 2)),
                 TypeAlias(definition) => Option::Some((definition.name, 3)),
+                ExternType(definition) => Option::Some((definition.name, 3)),
                 _ => Option::None,
             };
             if let Some(value) = nominal {
@@ -2528,6 +2647,7 @@ fn validate_lang_item_declarations(ctx: Checker, value: hir::File, allow_lang_it
             ExternFunction(value) => {
                 validate_lang_item_attributes(ctx, value.attrs, allow_lang_items)
             },
+            ExternType(value) => validate_lang_item_attributes(ctx, value.attrs, allow_lang_items),
             TypeAlias(value) => {
                 validate_lang_item_attributes(ctx, value.attrs, allow_lang_items)
             },
@@ -2652,6 +2772,7 @@ fn validate_comptime_declarations(ctx: Checker, value: hir::File) -> () {
             StructDef(value) => validate_comptime_attributes(ctx, value.attrs, false, false),
             TraitDef(value) => validate_comptime_attributes(ctx, value.attrs, false, false),
             ExternFunction(value) => validate_comptime_attributes(ctx, value.attrs, false, false),
+            ExternType(value) => validate_comptime_attributes(ctx, value.attrs, false, false),
             TypeAlias(value) => validate_comptime_attributes(ctx, value.attrs, false, false),
             Constant(value) => validate_comptime_attributes(ctx, value.attrs, false, false),
             Static(value) => validate_comptime_attributes(ctx, value.attrs, false, false),
@@ -3007,7 +3128,7 @@ fn attach_file_diagnostic_spans(ctx: Checker, value: hir::File) -> () {
     }
 }
 
-fn check_file_with_package(
+fn check_file_with_package_inferred(
     value: hir::File,
     package_files: Vec[hir::File],
     package_environments: Vec[PackageEnvironment],
@@ -3016,6 +3137,8 @@ fn check_file_with_package(
     include_builtin_types: bool,
     validate_function_names: bool,
     allow_externs: bool,
+    external_aliases: Vec[TypeAliasInfo],
+    inferred: Vec[InferredMapPredicates],
 ) -> CheckResult {
     let builtin = match builtin_contract() {
         Ok(value) => value,
@@ -3030,7 +3153,12 @@ fn check_file_with_package(
             }
         },
     };
-    let ctx = collect_environment(value, allow_externs, builtin);
+    let ctx = collect_environment_with_external_aliases(
+        value,
+        allow_externs,
+        builtin,
+        external_aliases,
+    );
     for diagnostic in diagnostics {
         ctx.diagnostics.push(diagnostic)
     }
@@ -3054,8 +3182,10 @@ fn check_file_with_package(
     for dependency in dependencies {
         append_dependency_environment(ctx, dependency)
     }
+    attach_inferred_map_predicates(ctx, inferred);
     append_builtin_source_impls(ctx);
     validate_go_ffi_signatures(ctx, value);
+    validate_go_exports(ctx, value, package_files);
     let canonical_traits = collections::IndexSet::new();
     for name in ctx.in_scope_traits {
         let _ = canonical_traits.insert(canonical_imported_name(ctx, name));
@@ -3096,6 +3226,7 @@ fn check_file_with_package(
     for index in 0..ctx.structs.len() {
         ctx.structs.set(index, resolve_struct_info_signature(ctx, ctx.structs[index]))
     }
+    infer_nominal_map_requirements(ctx);
     for index in 0..ctx.traits.len() {
         ctx.traits.set(index, resolve_trait_info_signature(ctx, ctx.traits[index]))
     }
@@ -3219,7 +3350,13 @@ fn check_file_with_package(
         }
         let option_variants = enum_option_variants(ctx.builtin, value.name, variants);
         enums.push(
-            EnumDef { name: value.name, generics: value.generics, variants, option_variants },
+            EnumDef {
+                map_requirements: value.map_requirements,
+                name: value.name,
+                generics: value.generics,
+                variants,
+                option_variants,
+            },
         )
     }
     let structs: Vec[StructDef] = Vec::new();
@@ -3227,11 +3364,13 @@ fn check_file_with_package(
         let value = ctx.structs[index];
         structs.push(
             StructDef {
+                map_requirements: value.map_requirements,
                 name: value.name,
                 generics: value.generics,
                 fields: value.fields,
                 public_fields: value.public_fields,
                 has_hidden_fields: false,
+                go_comparable: Option::Some(struct_key_comparability(ctx, value)),
             },
         )
     }
@@ -3381,6 +3520,7 @@ fn check_file_with_dependency_environments(
         include_builtin_types,
         true,
         allow_externs,
+        Vec::new(),
     );
     finalize_check_comptime(checked, package_name, Vec::new(), environments)
 }
@@ -3395,6 +3535,7 @@ fn dependency_comptime_enums(values: Vec[DependencyEnvironment]) -> Vec[EnumDef]
             }
             result.push(
                 EnumDef {
+                    map_requirements: value.map_requirements,
                     name: value.name,
                     generics: value.generics,
                     variants,
@@ -3412,11 +3553,13 @@ fn dependency_comptime_structs(values: Vec[DependencyEnvironment]) -> Vec[Struct
         for value in dependency.structs {
             result.push(
                 StructDef {
+                    map_requirements: value.map_requirements,
                     name: value.name,
                     generics: value.generics,
                     fields: value.fields,
                     public_fields: value.public_fields,
                     has_hidden_fields: value.has_hidden_fields,
+                    go_comparable: value.go_comparable,
                 },
             )
         }
@@ -3611,11 +3754,23 @@ pub fn check_package_files_for_link_with_dependencies(
     dependencies: Vec[hir::File],
 ) -> CheckResult {
     let dependencies = dependency_environments(dependencies).unwrap_or_else(|_| Vec::new());
-    check_package_files_for_link_with_environments_options(values, dependencies, false, false)
+    check_package_files_for_link_with_environments_options(
+        values,
+        dependencies,
+        false,
+        false,
+        Vec::new(),
+    )
 }
 
 pub fn check_builtin_package_files(values: Vec[hir::File]) -> CheckResult {
-    check_package_files_for_link_with_environments_options(values, Vec::new(), true, false)
+    check_package_files_for_link_with_environments_options(
+        values,
+        Vec::new(),
+        true,
+        false,
+        Vec::new(),
+    )
 }
 
 pub fn check_package_files_for_link_with_dependencies_allowing_externs(
@@ -3623,21 +3778,35 @@ pub fn check_package_files_for_link_with_dependencies_allowing_externs(
     dependencies: Vec[hir::File],
 ) -> CheckResult {
     let dependencies = dependency_environments(dependencies).unwrap_or_else(|_| Vec::new());
-    check_package_files_for_link_with_environments_options(values, dependencies, true, false)
+    check_package_files_for_link_with_environments_options(
+        values,
+        dependencies,
+        true,
+        false,
+        Vec::new(),
+    )
 }
 
 pub fn check_package_files_for_link_with_environments(
     values: Vec[hir::File],
     dependencies: Vec[DependencyEnvironment],
 ) -> CheckResult {
-    check_package_files_for_link_with_environments_options(values, dependencies, false, false)
+    check_package_files_for_link_with_environments_options(
+        values,
+        dependencies,
+        false,
+        false,
+        Vec::new(),
+    )
 }
 
-fn check_package_files_for_link_with_environments_options(
+fn check_package_files_for_link_with_environments_pass(
     values: Vec[hir::File],
     dependencies: Vec[DependencyEnvironment],
     allow_externs: bool,
     include_builtin_types: bool,
+    external_aliases: Vec[TypeAliasInfo],
+    inferred: Vec[InferredMapPredicates],
 ) -> CheckResult {
     let items: Vec[Item] = Vec::new();
     let enums: Vec[EnumDef] = Vec::new();
@@ -3656,7 +3825,14 @@ fn check_package_files_for_link_with_environments_options(
     let package_environments: Vec[PackageEnvironment] = Vec::new();
     if let Ok(builtin) = builtin_contract() {
         for value in values {
-            package_environments.push(package_environment(value, allow_externs, builtin))
+            package_environments.push(
+                package_environment_with_external_aliases(
+                    value,
+                    allow_externs,
+                    builtin,
+                    external_aliases,
+                ),
+            )
         }
     }
     let mut valid = true;
@@ -3671,7 +3847,7 @@ fn check_package_files_for_link_with_environments_options(
                 }
             }
         }
-        let checked = check_file_with_package(
+        let checked = check_file_with_package_inferred(
             values[index],
             package_files,
             other_environments,
@@ -3680,6 +3856,8 @@ fn check_package_files_for_link_with_environments_options(
             include_builtin_types && index == 0,
             index == 0,
             allow_externs,
+            external_aliases,
+            inferred,
         );
         for diagnostic in checked.diagnostics {
             diagnostics.push(diagnostic)

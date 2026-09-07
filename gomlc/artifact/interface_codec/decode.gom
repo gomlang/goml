@@ -59,6 +59,22 @@ fn artifact_decode_fn_scheme(
         Some(value) => tast_codec::artifact_decode_callable_body(name, value)?,
         None => tast::Callable::Function(name),
     };
+    match body {
+        GoForeign { .. } | GoMethod { .. } | GoInterfaceBridge { .. } => match comptime {
+            RuntimeOnly => (),
+            _ => return Result::Err("foreign function artifacts must be runtime-only"),
+        },
+        _ => (),
+    }
+    if let GoInterfaceBridge { methods, .. } = body {
+        tast::validate_go_interface_bridge_callable(methods, ty)?;
+    }
+    if let GoMethod { .. } = body {
+        match tast::resolve_type(ty) {
+            Func { params, ret_ty: _ } if !params.is_empty() => (),
+            _ => return Result::Err("foreign method artifacts require a receiver parameter"),
+        }
+    }
     Result::Ok(artifact::ArtifactFnScheme { name, comptime, type_params, constraints, ty, body })
 }
 
@@ -133,6 +149,11 @@ fn artifact_decode_enum_def(context: tast_codec::ArtifactDecodeContext, value: w
     string,
 ] {
     let object = wire::artifact_json_object(value, "enum definition")?;
+    let map_requirements = tast_codec::artifact_decode_type_array(
+        context,
+        wire::artifact_json_required_field(object, "map_requirements")?,
+        "map requirements",
+    )?;
     let name = wire::artifact_json_field_string(object, "name")?;
     tast_codec::artifact_add_type_name(context.enum_names, name);
     let generics = wire::artifact_decode_string_array(
@@ -162,7 +183,7 @@ fn artifact_decode_enum_def(context: tast_codec::ArtifactDecodeContext, value: w
         let fields = artifact_decode_enum_variant_fields(context, fields_value)?;
         variants.push(tast::EnumVariantDef { name: variant_name, fields })
     }
-    Result::Ok(tast::EnumDef { name, generics, variants, option_variants })
+    Result::Ok(tast::EnumDef { name, generics, variants, option_variants, map_requirements })
 }
 
 fn artifact_decode_struct_def(
@@ -170,6 +191,11 @@ fn artifact_decode_struct_def(
     value: wire::ArtifactValue,
 ) -> Result[tast::StructDef, string] {
     let object = wire::artifact_json_object(value, "struct definition")?;
+    let map_requirements = tast_codec::artifact_decode_type_array(
+        context,
+        wire::artifact_json_required_field(object, "map_requirements")?,
+        "map requirements",
+    )?;
     let name = wire::artifact_json_field_string(object, "name")?;
     tast_codec::artifact_add_type_name(context.struct_names, name);
     let generics = wire::artifact_decode_string_array(
@@ -189,7 +215,21 @@ fn artifact_decode_struct_def(
         wire::artifact_json_required_field(object, "has_hidden_fields")?,
         "struct hidden fields flag",
     )?;
-    Result::Ok(tast::StructDef { name, generics, fields, public_fields, has_hidden_fields })
+    let go_comparable = artifact_decode_struct_comparability(
+        wire::artifact_json_required_field(object, "go_comparable")?,
+        generics.len(),
+    )?;
+    Result::Ok(
+        tast::StructDef {
+            map_requirements,
+            name,
+            generics,
+            fields,
+            public_fields,
+            has_hidden_fields,
+            go_comparable,
+        },
+    )
 }
 
 fn artifact_decode_type_alias(
@@ -206,7 +246,15 @@ fn artifact_decode_type_alias(
         context,
         wire::artifact_json_required_field(object, "ty")?,
     )?;
-    Result::Ok(tast::TypeAliasInfo { name, generics, ty })
+    Result::Ok(
+        tast::TypeAliasInfo {
+            go_comparable: Option::None,
+            applications: Option::None,
+            name,
+            generics,
+            ty,
+        },
+    )
 }
 
 fn artifact_decode_associated_type_defs(
@@ -252,8 +300,14 @@ fn artifact_decode_trait_def(
         context,
         wire::artifact_json_required_field(object, "methods")?,
     )?;
+    let default_map_requirements = artifact_decode_default_map_requirements(
+        context,
+        object,
+        methods,
+    )?;
     Result::Ok(
         artifact::ArtifactTraitDef {
+            default_map_requirements,
             name,
             params,
             predicates,
@@ -444,6 +498,11 @@ pub fn decode_exports(value: wire::ArtifactValue) -> Result[
     }
     Result::Ok(
         artifact::ArtifactPackageExports {
+            go_exports: decode_go_exports(
+                context,
+                wire::artifact_json_required_field(object, "go_exports")?,
+                functions,
+            )?,
             reexports,
             enum_type_names: context.enum_names,
             struct_type_names: context.struct_names,
@@ -513,7 +572,7 @@ pub fn artifact_decode_interface_value(value: wire::ArtifactValue) -> Result[
             "compiler ABI",
         )?,
     )?;
-    if format_version != 23 {
+    if format_version != 30 {
         return Result::Err("unsupported interface artifact format version")
     } else if compiler_abi != 5 {
         return Result::Err("unsupported interface compiler ABI")
@@ -523,6 +582,18 @@ pub fn artifact_decode_interface_value(value: wire::ArtifactValue) -> Result[
     let package_interface = artifact_decode_package_interface(
         wire::artifact_json_required_field(object, "interface")?,
     )?;
+    validate_go_export_package(package_name, exports)?;
+    for value in exports.go_exports {
+        let mut public = false;
+        for (name, _) in package_interface.value_exports {
+            if name == value.symbol {
+                public = true;
+            }
+        }
+        if !public {
+            return Result::Err("Go export is absent from public package interface")
+        }
+    }
     let comptime = match wire::artifact_json_required_field(object, "comptime")? {
         wire::ArtifactValue::Null => Option::None,
         value => Option::Some(artifact_decode_comptime_unit(value)?),
@@ -532,7 +603,14 @@ pub fn artifact_decode_interface_value(value: wire::ArtifactValue) -> Result[
         "dependency hashes",
     )?;
     let interface_hash = wire::artifact_json_field_string(object, "interface_hash")?;
+    let foreign_bindings = decode_foreign_bindings(
+        wire::artifact_json_required_field(object, "foreign_bindings")?,
+    )?;
     let result = artifact::ArtifactInterfaceUnit {
+        foreign_types: decode_foreign_type_metadata(
+            wire::artifact_json_required_field(object, "foreign_types")?,
+        )?,
+        foreign_bindings,
         package_name,
         exports,
         package_interface,

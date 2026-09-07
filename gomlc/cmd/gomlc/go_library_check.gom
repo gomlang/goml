@@ -1,0 +1,142 @@
+package main;
+
+use module::ffi;
+use std::fs;
+use std::json;
+use std::path;
+use std::time;
+use std::utf8;
+use utf8::BytesUtf8;
+
+fn check_go_library_command(args: Vec[string]) -> Result[(), string] {
+    let cores: Vec[string] = Vec::new();
+    let values: HashMap[string, string] = HashMap::new();
+    let mut index = 2;
+    while index < args.len() {
+        let option = args[index];
+        if option != "--context" && option != "--input" && option != "--directory"
+            && option != "--import-path"
+            && option != "--overlay"
+            && option != "--core-path"
+            && option != "--ffi-check" {
+            return Result::Err("Go library check: unknown option " + option)
+        }
+        if option != "--core-path" && values[option].is_some() {
+            return Result::Err("Go library check: repeated option " + option)
+        }
+        if index + 1 >= args.len() || args[index + 1] == "" || args[index + 1].starts_with("--") {
+            return Result::Err("Go library check: missing value for " + option)
+        }
+        if option == "--core-path" {
+            cores.push(args[index + 1])
+        } else {
+            values[option] = args[index + 1];
+        }
+        index += 2;
+    }
+    let context_path = values["--context"].ok_or("Go library check: --context is required")?;
+    let context = ffi::decode_build_context(
+        fs::read_file_structured(context_path).map_err(|error| error.to_string())?,
+    )?;
+    if context.go111module != "on" || context.gowork != "off" {
+        return Result::Err("Go library check requires module mode without a workspace")
+    }
+    let directory = fs::canonicalize(
+        values["--directory"].ok_or("Go library check: --directory is required")?,
+    ).map_err(|error| error.to_string())?;
+    let relative = path::relative(context.module_dir, directory).map_err(|error| error.to_string())?;
+    if path::is_absolute(relative) || relative == ".." || relative.starts_with("../") {
+        return Result::Err("Go library check: output is outside the Go module")
+    }
+    let import_path = values["--import-path"].ok_or("Go library check: --import-path is required")?;
+    let module_path = foreign_module_import_path(context)?;
+    let expected = if relative == "." {
+        module_path
+    } else {
+        module_path + "/" + relative
+    };
+    if import_path != expected {
+        return Result::Err("Go library check: expected import path " + expected)
+    }
+    let input = fs::canonicalize(values["--input"].ok_or("Go library check: --input is required")?).map_err(
+        |error| error.to_string(),
+    )?;
+    let overlay = path::absolute_structured(
+        values["--overlay"].ok_or("Go library check: --overlay is required")?,
+    ).map_err(|error| error.to_string())?;
+    let target = path::join(directory, "goml_generated.go");
+    if overlay == input || overlay == target {
+        return Result::Err("Go library check: overlay path conflicts with source")
+    }
+    let mapping = json::object(
+        Vec::from_array(
+            [("Replace", json::object(Vec::from_array([(target, json::Value::String(input))])))],
+        ),
+    );
+    fs::write_file_structured(overlay, json::encode(mapping)).map_err(|error| error.to_string())?;
+    let arguments = Vec::from_array(["build", "-mod=readonly", "-overlay", overlay]);
+    if !context.build_tags.is_empty() {
+        let mut tags = "";
+        for tag in context.build_tags {
+            if tags != "" {
+                tags = tags + ",";
+            }
+            tags = tags + tag;
+        }
+        arguments.push("-tags=" + tags)
+    }
+    arguments.push(import_path);
+    let output = foreign_go_process(context, arguments).output_timeout_structured(
+        time::Duration::from_milliseconds(120000),
+    ).map_err(|error| error.to_string())?;
+    if !output.status().success() {
+        return Result::Err(
+            "Go library check failed:\n"
+                + output.stderr().to_string_utf8().unwrap_or("invalid Go diagnostic"),
+        )
+    }
+    if !cores.is_empty() {
+        let mode = ffi::parse_check_mode(
+            values["--ffi-check"].ok_or(
+                "Go library check: --ffi-check is required with Core inputs",
+            )?,
+        )?;
+        let units = artifact_read_core_units(cores)?;
+        let bindings = foreign_unit_bindings(Vec::new(), units)?;
+        let locations: HashMap[string, string] = HashMap::new();
+        for unit in units {
+            for (id, location) in foreign_source_locations(
+                unit.package_name,
+                unit.sources,
+                bindings,
+            ).entries() {
+                locations[id] = location;
+            }
+        }
+        let source = fs::read_file_structured(input).map_err(|error| error.to_string())?;
+        let package_name = path::file_name(directory).ok_or(
+            "Go library check: missing package name",
+        )?;
+        let validation = ForeignValidationCommand {
+            context_path,
+            mode,
+            additional_directories: Vec::new(),
+            caller: ffi::CallerContext {
+                generated_source: Option::Some(source),
+                load_mode: "package",
+                import_path,
+                directory,
+                package_name,
+            },
+        };
+        check_foreign_type_units(Option::Some(validation), Vec::new(), units)?;
+        check_foreign_bindings_at(validation, bindings, locations)?;
+    }
+    Result::Ok(())
+}
+
+fn run_go_library_check(args: Vec[string]) -> () {
+    if let Err(message) = check_go_library_command(args) {
+        fail(COMPILE_ERROR_PREFIX + message)
+    }
+}

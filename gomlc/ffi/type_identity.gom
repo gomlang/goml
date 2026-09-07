@@ -1,0 +1,354 @@
+package ffi;
+
+use std::json;
+
+pub enum GoTypeIdentity {
+    Basic(string),
+    Function {
+        parameters: Vec[GoTypeIdentity],
+        results: Vec[GoTypeIdentity],
+    },
+    Named {
+        import_path: string,
+        name: string,
+        arguments: Vec[GoTypeIdentity],
+    },
+    Parameter(isize),
+    Pointer(GoTypeIdentity),
+    Array {
+        element: GoTypeIdentity,
+        length: isize,
+    },
+    Slice(GoTypeIdentity),
+    Map {
+        key: GoTypeIdentity,
+        element: GoTypeIdentity,
+    },
+    Channel {
+        element: GoTypeIdentity,
+        direction: string,
+    },
+}
+
+pub struct GoTypeTemplate {
+    pub identity: GoTypeIdentity,
+    pub parameter_constraints: Vec[string],
+    pub declaration_kind: string,
+    pub underlying_kind: string,
+}
+
+fn identity_references(node: json::Value, field: string) -> Result[Vec[string], string] {
+    let values = match json::field(node, field) {
+        None => return Result::Ok(Vec::new()),
+        Some(_) => response_array(node, field)?,
+    };
+    let result: Vec[string] = Vec::new();
+    for value in values {
+        result.push(json::as_string(value).ok_or("ffi-protocol: invalid identity reference")?)
+    }
+    Result::Ok(result)
+}
+
+fn normalized_go_basic(name: string) -> Result[GoTypeIdentity, string] {
+    match name {
+        "byte" => Result::Ok(GoTypeIdentity::Basic("uint8")),
+        "rune" => Result::Ok(GoTypeIdentity::Basic("int32")),
+        "bool" | "int" | "int8" | "int16" | "int32" | "int64" | "uint" | "uint8" | "uint16" | "uint32" | "uint64" | "uintptr" | "float32" | "float64" | "complex64" | "complex128" | "string" => Result::Ok(
+            GoTypeIdentity::Basic(name),
+        ),
+        _ => Result::Err("ffi-type: unsupported Go basic type " + name),
+    }
+}
+
+fn normalize_go_type_node(
+    metadata: TypeDeclarations,
+    id: string,
+    root: string,
+    parameters: HashMap[string, isize],
+    active: HashMap[string, bool],
+    remaining: Ref[isize],
+    depth: isize,
+) -> Result[GoTypeIdentity, string] {
+    if depth > 128 || remaining.get() <= 0 {
+        return Result::Err("ffi-type: type identity exceeds limit")
+    }
+    remaining.set(remaining.get() - 1);
+    if active[id] == Option::Some(true) {
+        return Result::Err("ffi-type: cyclic alias or structural type")
+    }
+    let node = metadata.nodes[id].ok_or("ffi-protocol: missing identity node " + id)?;
+    active[id] = true;
+    let resolve = |next| normalize_go_type_node(
+        metadata,
+        next,
+        root,
+        parameters,
+        active,
+        remaining,
+        depth + 1,
+    );
+    let result = match response_string(node, "tag")? {
+        "basic" => normalized_go_basic(response_string(node, "name")?)?,
+        "type_parameter" => GoTypeIdentity::Parameter(
+            parameters[id].ok_or("ffi-type: unbound Go type parameter")?,
+        ),
+        "alias" => resolve(response_string(node, "underlying")?)?,
+        "named" => {
+            let name = response_string(node, "name")?;
+            let import_path = match json::field(node, "import_path") {
+                None => "",
+                Some(_) => response_string(node, "import_path")?,
+            };
+            if name == "" || (import_path == "" && name != "error") {
+                return Result::Err("ffi-type: missing named Go type identity")
+            }
+            let arguments: Vec[GoTypeIdentity] = Vec::new();
+            let refs = identity_references(node, "type_arguments")?;
+            let declared = identity_references(node, "type_parameters")?;
+            if !refs.is_empty() && refs.len() != declared.len() {
+                return Result::Err("ffi-protocol: inconsistent Go type argument count")
+            }
+            if refs.is_empty() && !declared.is_empty() {
+                if id != root {
+                    return Result::Err("ffi-type: uninstantiated generic Go type " + name)
+                }
+                for parameter in declared {
+                    arguments.push(resolve(parameter)?)
+                }
+            } else {
+                for argument in refs {
+                    arguments.push(resolve(argument)?)
+                }
+            }
+            GoTypeIdentity::Named { import_path, name, arguments }
+        },
+        "signature" => {
+            if let Some(value) = json::field(node, "variadic") {
+                match json::as_bool(value) {
+                    Some(false) => (),
+                    _ => return Result::Err("ffi-type: unsupported variadic Go function signature"),
+                }
+            }
+            if !identity_references(node, "type_parameters")?.is_empty() {
+                return Result::Err("ffi-type: uninstantiated generic Go function signature")
+            }
+            let params = Vec::new();
+            let results = Vec::new();
+            for value in identity_references(node, "parameters")? {
+                params.push(resolve(value)?)
+            }
+            for value in identity_references(node, "results")? {
+                results.push(resolve(value)?)
+            }
+            GoTypeIdentity::Function { parameters: params, results }
+        },
+        "pointer" => GoTypeIdentity::Pointer(resolve(response_string(node, "element")?)?),
+        "slice" => GoTypeIdentity::Slice(resolve(response_string(node, "element")?)?),
+        "array" => {
+            let length = json::as_int(response_field(node, "length")?).ok_or(
+                "ffi-protocol: invalid Go array length",
+            )?;
+            if length < 0 {
+                return Result::Err("ffi-protocol: negative Go array length")
+            }
+            GoTypeIdentity::Array { element: resolve(response_string(node, "element")?)?, length }
+        },
+        "map" => GoTypeIdentity::Map {
+            key: resolve(response_string(node, "key")?)?,
+            element: resolve(response_string(node, "element")?)?,
+        },
+        "channel" => {
+            let direction = response_string(node, "direction")?;
+            if direction != "both" && direction != "send" && direction != "receive" {
+                return Result::Err("ffi-protocol: invalid Go channel direction")
+            }
+            GoTypeIdentity::Channel {
+                element: resolve(response_string(node, "element")?)?,
+                direction,
+            }
+        },
+        tag => return Result::Err("ffi-type: unsupported structural Go type " + tag),
+    };
+    active[id] = false;
+    Result::Ok(result)
+}
+
+fn go_underlying_kind(metadata: TypeDeclarations, root: string) -> Result[string, string] {
+    let mut id = root;
+    for _ in 0..129 {
+        let node = metadata.nodes[id].ok_or("ffi-protocol: missing underlying type")?;
+        let tag = response_string(node, "tag")?;
+        if tag != "alias" && tag != "named" {
+            return Result::Ok(tag)
+        }
+        id = response_string(node, "underlying")?;
+    }
+    Result::Err("ffi-type: cyclic or excessive underlying type chain")
+}
+
+pub fn resolve_go_type_template(metadata: TypeDeclarations, type_id: string) -> Result[
+    GoTypeTemplate,
+    string,
+] {
+    for declaration in metadata.declarations {
+        if declaration.type_id == type_id {
+            let root = metadata.nodes[declaration.declared_type].ok_or(
+                "ffi-protocol: missing declaration type",
+            )?;
+            let parameters: HashMap[string, isize] = HashMap::new();
+            let constraints: Vec[string] = Vec::new();
+            for id in identity_references(root, "type_parameters")? {
+                if parameters[id].is_some() {
+                    return Result::Err("ffi-protocol: duplicate Go type parameter")
+                }
+                let parameter = metadata.nodes[id].ok_or("ffi-protocol: missing Go type parameter")?;
+                if response_string(parameter, "tag")? != "type_parameter" {
+                    return Result::Err("ffi-protocol: invalid Go type parameter")
+                }
+                parameters[id] = constraints.len();
+                constraints.push(response_string(parameter, "constraint")?);
+            }
+            let identity = normalize_go_type_node(
+                metadata,
+                declaration.declared_type,
+                declaration.declared_type,
+                parameters,
+                HashMap::new(),
+                Ref::new(16384),
+                0,
+            )?;
+            return Result::Ok(
+                GoTypeTemplate {
+                    identity,
+                    parameter_constraints: constraints,
+                    declaration_kind: declaration.kind,
+                    underlying_kind: go_underlying_kind(metadata, declaration.declared_type)?,
+                },
+            )
+        }
+    }
+    Result::Err("ffi-type: missing Go type declaration " + type_id)
+}
+
+fn go_identity_value(identity: GoTypeIdentity) -> json::Value {
+    let values: Vec[json::Value] = Vec::new();
+    match identity {
+        Function { parameters, results } => {
+            values.push(json::Value::String("function"));
+            let params = Vec::new();
+            let returns = Vec::new();
+            for value in parameters {
+                params.push(go_identity_value(value))
+            }
+            for value in results {
+                returns.push(go_identity_value(value))
+            }
+            values.push(json::Value::Array(params));
+            values.push(json::Value::Array(returns));
+        },
+        Basic(name) => {
+            values.push(json::Value::String("basic"));
+            values.push(json::Value::String(name));
+        },
+        Named { import_path, name, arguments } => {
+            values.push(json::Value::String("named"));
+            values.push(json::Value::String(import_path));
+            values.push(json::Value::String(name));
+            for argument in arguments {
+                values.push(go_identity_value(argument))
+            }
+        },
+        Parameter(index) => {
+            values.push(json::Value::String("parameter"));
+            values.push(json::Value::Number(index.to_string()));
+        },
+        Pointer(element) => {
+            values.push(json::Value::String("pointer"));
+            values.push(go_identity_value(element));
+        },
+        Slice(element) => {
+            values.push(json::Value::String("slice"));
+            values.push(go_identity_value(element));
+        },
+        Array { element, length } => {
+            values.push(json::Value::String("array"));
+            values.push(json::Value::Number(length.to_string()));
+            values.push(go_identity_value(element));
+        },
+        Map { key, element } => {
+            values.push(json::Value::String("map"));
+            values.push(go_identity_value(key));
+            values.push(go_identity_value(element));
+        },
+        Channel { element, direction } => {
+            values.push(json::Value::String("channel"));
+            values.push(json::Value::String(direction));
+            values.push(go_identity_value(element));
+        },
+    }
+    json::Value::Array(values)
+}
+
+pub fn go_type_identity_key(identity: GoTypeIdentity) -> string {
+    json::encode(go_identity_value(identity))
+}
+
+fn substitute_go_identity(identity: GoTypeIdentity, arguments: Vec[GoTypeIdentity]) -> Result[
+    GoTypeIdentity,
+    string,
+] {
+    let substitute = |value| substitute_go_identity(value, arguments);
+    Result::Ok(
+        match identity {
+            Function { parameters, results } => {
+                let params = Vec::new();
+                let returns = Vec::new();
+                for value in parameters {
+                    params.push(substitute(value)?)
+                }
+                for value in results {
+                    returns.push(substitute(value)?)
+                }
+                GoTypeIdentity::Function { parameters: params, results: returns }
+            },
+            Basic(_) => identity,
+            Parameter(index) => {
+                if index < 0 || index >= arguments.len() {
+                    return Result::Err("ffi-type: missing Go type argument")
+                }
+                arguments[index]
+            },
+            Named { import_path, name, arguments: values } => {
+                let result: Vec[GoTypeIdentity] = Vec::new();
+                for value in values {
+                    result.push(substitute(value)?)
+                }
+                GoTypeIdentity::Named { import_path, name, arguments: result }
+            },
+            Pointer(element) => GoTypeIdentity::Pointer(substitute(element)?),
+            Slice(element) => GoTypeIdentity::Slice(substitute(element)?),
+            Array { element, length } => GoTypeIdentity::Array {
+                element: substitute(element)?,
+                length,
+            },
+            Map { key, element } => GoTypeIdentity::Map {
+                key: substitute(key)?,
+                element: substitute(element)?,
+            },
+            Channel { element, direction } => GoTypeIdentity::Channel {
+                element: substitute(element)?,
+                direction,
+            },
+        },
+    )
+}
+
+pub fn substitute_go_type_template(template: GoTypeTemplate, arguments: Vec[GoTypeIdentity]) -> Result[
+    GoTypeIdentity,
+    string,
+] {
+    if arguments.len() != template.parameter_constraints.len() {
+        return Result::Err("ffi-type: incorrect Go type argument count")
+    }
+    substitute_go_identity(template.identity, arguments)
+}

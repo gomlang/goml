@@ -1,0 +1,306 @@
+package tast;
+
+use module::hir;
+
+struct InferredMapPredicates {
+    def_id: hir::DefId,
+    predicates: Vec[TypePredicate],
+}
+
+fn inferred_map_predicates(values: Vec[InferredMapPredicates], id: hir::DefId) -> Vec[TypePredicate] {
+    for value in values {
+        if value.def_id.pkg == id.pkg && value.def_id.index == id.index {
+            return value.predicates
+        }
+    }
+    Vec::new()
+}
+
+fn attach_inferred_map_predicates(ctx: Checker, values: Vec[InferredMapPredicates]) -> () {
+    for function in ctx.functions {
+        if let Some(id) = function.def_id {
+            for predicate in inferred_map_predicates(values, id) {
+                push_predicate(function.predicates, predicate)
+            }
+        }
+    }
+    for method in ctx.methods {
+        if let Some(id) = method.function.def_id {
+            for predicate in inferred_map_predicates(values, id) {
+                push_predicate(method.function.predicates, predicate)
+            }
+        }
+    }
+    attach_default_map_requirements(ctx.traits, ctx.functions)
+}
+
+fn collect_function_map_types(ctx: Checker, value: Type) -> () {
+    let required = Vec::new();
+    collect_type_map_requirements(ctx, value, required);
+    for key in required {
+        require_predicate(ctx, TypePredicate::GoComparable(key), "type predicate not satisfied")
+    }
+}
+
+fn infer_function_map_predicates(
+    ctx: Checker,
+    params: Vec[(string, Type)],
+    ret_ty: Type,
+    start: isize,
+    predicates: Vec[TypePredicate],
+) -> () {
+    for param in params {
+        collect_function_map_types(ctx, param.1)
+    }
+    collect_function_map_types(ctx, ret_ty);
+    for index in start..ctx.typeck_results.exprs.len() {
+        let fact = ctx.typeck_results.exprs[index];
+        let previous = ctx.current_span.get();
+        ctx.current_span.set(Option::Some(fact.span));
+        collect_function_map_types(ctx, fact.ty);
+        ctx.current_span.set(previous);
+    }
+    for requirement in ctx.required_predicates {
+        if let GoComparable(ty) = requirement.predicate {
+            let keys = Vec::new();
+            if collect_go_comparable_requirements(ctx, ty, keys, Vec::new()) {
+                for key in keys {
+                    if type_contains_any_parameter(key, ctx.type_params)
+                        && !contains_unbound_type_variable(key) {
+                        let predicate = TypePredicate::GoComparable(key);
+                        push_predicate(ctx.predicates, predicate);
+                        push_predicate(predicates, predicate);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn record_function_map_predicates(
+    result: Vec[InferredMapPredicates],
+    source: hir::Function,
+    function: Function,
+) -> bool {
+    let existing = inferred_map_predicates(result, source.def_id);
+    let mut changed = false;
+    for predicate in function.predicates {
+        if let GoComparable(_) = predicate {
+            let before = existing.len();
+            push_predicate(existing, predicate);
+            if before != existing.len() {
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        let mut found = false;
+        for item in result {
+            if item.def_id.pkg == source.def_id.pkg && item.def_id.index == source.def_id.index {
+                found = true;
+            }
+        }
+        if !found {
+            result.push(InferredMapPredicates { def_id: source.def_id, predicates: existing });
+        }
+    }
+    changed
+}
+
+fn map_predicate_functions(file: File) -> Vec[Function] {
+    let result = Vec::new();
+    for item in file.items {
+        let functions = Vec::new();
+        match item {
+            Function(value) => functions.push(value),
+            ImplBlock(value) => for method in value.methods {
+                functions.push(method)
+            },
+        }
+        for function in functions {
+            let mut found = false;
+            for predicate in function.predicates {
+                if let GoComparable(_) = predicate {
+                    found = true;
+                }
+            }
+            if found {
+                result.push(function);
+            }
+        }
+    }
+    result
+}
+
+fn record_file_map_predicates(
+    result: Vec[InferredMapPredicates],
+    sources: Vec[hir::File],
+    file: File,
+) -> bool {
+    let mut changed = false;
+    for function in map_predicate_functions(file) {
+        for source in sources {
+            if function.source_path != source.source_path {
+                continue
+            }
+            for item in source.items {
+                let declarations = Vec::new();
+                match item {
+                    hir::Item::Function(value) => declarations.push(value),
+                    hir::Item::ImplBlock(value) => for method in value.methods {
+                        declarations.push(method)
+                    },
+                    _ => (),
+                }
+                for declaration in declarations {
+                    if function.name_span.start == declaration.name_span.start
+                        && function.name == declaration.name {
+                        if record_function_map_predicates(result, declaration, function) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    changed
+}
+
+fn check_file_with_package(
+    value: hir::File,
+    package_files: Vec[hir::File],
+    package_environments: Vec[PackageEnvironment],
+    dependencies: Vec[DependencyEnvironment],
+    diagnostics: Vec[Diagnostic],
+    include_builtin_types: bool,
+    validate_function_names: bool,
+    allow_externs: bool,
+    external_aliases: Vec[TypeAliasInfo],
+) -> CheckResult {
+    let inferred = Vec::new();
+    for attempt in 0..256 {
+        let checked = check_file_with_package_inferred(
+            value,
+            package_files,
+            package_environments,
+            dependencies,
+            diagnostics,
+            include_builtin_types,
+            validate_function_names,
+            allow_externs,
+            external_aliases,
+            inferred,
+        );
+        let changed = match checked.tast {
+            Some(file) => record_file_map_predicates(inferred, Vec::from_array([value]), file),
+            None => false,
+        };
+        if !changed {
+            return checked
+        }
+        if attempt == 255 {
+            checked.diagnostics.push(
+                new_diagnostic(
+                    TYPER_STAGE,
+                    "Go map key requirement inference exceeds the package iteration limit",
+                    value.source_path,
+                    Option::None,
+                ),
+            );
+            return checked
+        }
+    }
+    check_file_with_package_inferred(
+        value,
+        package_files,
+        package_environments,
+        dependencies,
+        diagnostics,
+        include_builtin_types,
+        validate_function_names,
+        allow_externs,
+        external_aliases,
+        inferred,
+    )
+}
+
+fn check_package_files_for_link_with_environments_options(
+    values: Vec[hir::File],
+    dependencies: Vec[DependencyEnvironment],
+    allow_externs: bool,
+    include_builtin_types: bool,
+    external_aliases: Vec[TypeAliasInfo],
+) -> CheckResult {
+    let inferred = Vec::new();
+    for attempt in 0..256 {
+        let checked = check_package_files_for_link_with_environments_pass(
+            values,
+            dependencies,
+            allow_externs,
+            include_builtin_types,
+            external_aliases,
+            inferred,
+        );
+        let changed = match checked.tast {
+            Some(file) => record_file_map_predicates(inferred, values, file),
+            None => false,
+        };
+        if !changed {
+            return checked
+        }
+        if attempt == 255 {
+            checked.diagnostics.push(
+                new_diagnostic(
+                    TYPER_STAGE,
+                    "Go map key requirement inference exceeds the package iteration limit",
+                    if values.is_empty() {
+                        "<unknown>"
+                    } else {
+                        values[0].source_path
+                    },
+                    Option::None,
+                ),
+            );
+            return checked
+        }
+    }
+    check_package_files_for_link_with_environments_pass(
+        values,
+        dependencies,
+        allow_externs,
+        include_builtin_types,
+        external_aliases,
+        inferred,
+    )
+}
+
+pub fn attach_inferred_function_predicates(signatures: PackageSignatures, file: File) -> () {
+    for function in map_predicate_functions(file) {
+        for scheme in signatures.functions {
+            if function.name == scheme.name {
+                for predicate in function.predicates {
+                    if let GoComparable(_) = predicate {
+                        push_predicate(scheme.predicates, predicate)
+                    }
+                }
+            }
+        }
+    }
+    attach_default_map_requirements(signatures.traits, signatures.functions)
+}
+
+pub fn dependency_environments_with_checked_files(sources: Vec[hir::File], checked_files: Vec[File]) -> Result[
+    Vec[DependencyEnvironment],
+    string,
+] {
+    let inferred = Vec::new();
+    for file in checked_files {
+        let _ = record_file_map_predicates(inferred, sources, file);
+    }
+    let builtin = builtin_contract()?;
+    let result = Vec::new();
+    for source in sources {
+        result.push(dependency_environment_from_hir_with_inferred(source, builtin, inferred))
+    }
+    Result::Ok(result)
+}

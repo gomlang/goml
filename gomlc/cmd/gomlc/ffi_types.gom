@@ -1,0 +1,267 @@
+package main;
+
+use module::ffi;
+use module::artifact;
+use module::hir;
+use module::tast;
+use std::env;
+use std::fs;
+use std::path;
+use std::text;
+use std::bytes;
+use std::process;
+use std::time;
+use std::utf8;
+use utf8::BytesUtf8;
+
+fn run_foreign_type_declarations(
+    helper: string,
+    context: ffi::GoBuildContext,
+    caller: ffi::CallerContext,
+    queries: Vec[ffi::TypeDeclarationQuery],
+) -> Result[ffi::TypeDeclarations, string] {
+    if queries.is_empty() {
+        return Result::Ok(
+            ffi::TypeDeclarations {
+                go_world_identity: "",
+                declarations: Vec::new(),
+                nodes: HashMap::new(),
+            },
+        )
+    }
+    let input = ffi::encode_type_declarations(context, caller, queries)?;
+    let output = process::Command::new(helper).arg("--timeout=2m").current_dir(context.module_dir).input(
+        bytes::Bytes::from_string(input),
+    ).output_timeout_structured(time::Duration::from_milliseconds(125000)).map_err(
+        |error| "ffi-tool-unavailable: " + error.to_string(),
+    )?;
+    if output.stdout().len() > 8388608 || output.stderr().len() > 8388608 {
+        return Result::Err("ffi-protocol: helper type output exceeds limit")
+    }
+    let response = output.stdout().to_string_utf8().map_err(
+        |_| "ffi-protocol: invalid UTF-8 type response",
+    )?;
+    if response == "" {
+        return Result::Err("ffi-tool-unavailable: helper returned no type response")
+    }
+    let result = ffi::decode_type_declarations(response, queries)?;
+    if !output.status().success() {
+        return Result::Err("ffi-protocol: type success with failing helper status")
+    }
+    Result::Ok(result)
+}
+
+fn resolve_package_foreign_types(
+    files: Vec[hir::File],
+    validation: Option[ForeignValidationCommand],
+) -> Result[tast::ExternalTypeEnvironment, string] {
+    let requests = tast::external_type_requests(files)?;
+    let queries: Vec[ffi::TypeDeclarationQuery] = Vec::new();
+    for request in requests {
+        queries.push(request.query)
+    }
+    if queries.is_empty() {
+        return tast::resolve_external_type_environment(
+            requests,
+            ffi::TypeDeclarations {
+                go_world_identity: "",
+                declarations: Vec::new(),
+                nodes: HashMap::new(),
+            },
+        )
+    }
+    let command = validation.ok_or(
+        "ffi-type: external type declarations require a Go build context",
+    )?;
+    let context = match command.mode {
+        Required => ffi::decode_build_context(
+            fs::read_file_structured(command.context_path).map_err(
+                |error| "ffi-protocol: " + error.to_string(),
+            )?,
+        )?,
+        Off => resolve_foreign_build_context(
+            "go",
+            foreign_type_context_directory(command.caller.directory),
+        )?,
+    };
+    let executable = env::current_exe_structured().map_err(
+        |error| "ffi-tool-unavailable: " + error.to_string(),
+    )?;
+    let helper = path::join(
+        path::parent(executable).ok_or("ffi-tool-unavailable: compiler has no executable directory")?,
+        "goml-go-meta",
+    );
+    let metadata = run_foreign_type_declarations(helper, context, command.caller, queries).map_err(
+        |error| external_type_query_diagnostic(error, requests),
+    )?;
+    let resolved = tast::resolve_external_type_environment(requests, metadata)?;
+    for directory in command.additional_directories {
+        let caller = ffi::CallerContext {
+            generated_source: Option::None,
+            load_mode: command.caller.load_mode,
+            import_path: command.caller.import_path,
+            directory,
+            package_name: command.caller.package_name,
+        };
+        let additional = run_foreign_type_declarations(helper, context, caller, queries).map_err(
+            |error| external_type_query_diagnostic(error, requests),
+        )?;
+        let _ = tast::resolve_external_type_environment(requests, additional)?;
+    }
+    Result::Ok(resolved)
+}
+
+fn external_type_query_diagnostic(error: string, requests: Vec[tast::ExternalTypeRequest]) -> string {
+    let result = text::StringBuilder::new();
+    result.write_string(error + "\n");
+    for request in requests {
+        if error.starts_with(request.query.type_id + ":") || requests.len() == 1 {
+            render_diagnostic_label(
+                result,
+                "primary",
+                request.source_path,
+                request.declaration.name_span,
+                Option::Some("Go type: " + request.query.import_path + "." + request.query.name),
+                request.source_path,
+                fs::read_file_structured(request.source_path).unwrap_or(""),
+            );
+        }
+    }
+    result.finish()
+}
+
+fn foreign_type_context_directory(directory: string) -> string {
+    let mut current = directory;
+    while true {
+        if fs::is_file(path::join(current, "go.mod")) {
+            return current
+        }
+        match path::parent(current) {
+            Some(parent) => {
+                if parent == current || parent == "" {
+                    return directory
+                }
+                current = parent;
+            },
+            None => return directory,
+        }
+    }
+    directory
+}
+
+fn check_artifact_foreign_types(
+    command: ForeignValidationCommand,
+    package_name: string,
+    metadata: ffi::ForeignTypeMetadata,
+) -> Result[(), string] {
+    if metadata.queries.is_empty() {
+        return Result::Ok(())
+    }
+    let context = match command.mode {
+        Required => ffi::decode_build_context(
+            fs::read_file_structured(command.context_path).map_err(|error| error.to_string())?,
+        )?,
+        Off => resolve_foreign_build_context(
+            "go",
+            foreign_type_context_directory(command.caller.directory),
+        )?,
+    };
+    let executable = env::current_exe_structured().map_err(|error| error.to_string())?;
+    let helper = path::join(
+        path::parent(executable).ok_or("ffi-tool-unavailable: compiler has no executable directory")?,
+        "goml-go-meta",
+    );
+    let callers = Vec::from_array([command.caller]);
+    for directory in command.additional_directories {
+        callers.push(
+            ffi::CallerContext {
+                generated_source: Option::None,
+                load_mode: command.caller.load_mode,
+                import_path: command.caller.import_path,
+                directory,
+                package_name: command.caller.package_name,
+            },
+        )
+    }
+    for caller in callers {
+        let current = run_foreign_type_declarations(helper, context, caller, metadata.queries).map_err(
+            |error| package_name + ": " + error,
+        )?;
+        ffi::validate_foreign_type_metadata(metadata, current).map_err(
+            |error| package_name + ": " + error,
+        )?;
+        if !metadata.instances.is_empty() {
+            let _ = run_foreign_type_instances(helper, context, caller, metadata.instances).map_err(
+                |error| package_name + ": " + error,
+            )?;
+        }
+    }
+    Result::Ok(())
+}
+
+fn check_foreign_type_units(
+    validation: Option[ForeignValidationCommand],
+    interfaces: Vec[artifact::ArtifactInterfaceUnit],
+    cores: Vec[artifact::ArtifactCoreUnit],
+) -> Result[(), string] {
+    let values = Vec::new();
+    for unit in interfaces {
+        if let Some(metadata) = unit.foreign_types {
+            values.push((unit.package_name, metadata))
+        }
+    }
+    for unit in cores {
+        if let Some(metadata) = unit.foreign_types {
+            values.push((unit.package_name, metadata))
+        }
+    }
+    let verified: Vec[ffi::TypeDeclarations] = Vec::new();
+    for (package_name, metadata) in values {
+        if !metadata.queries.is_empty() {
+            let command = validation.ok_or(
+                "ffi-type: " + package_name + " requires a Go caller context for external types",
+            )?;
+            check_artifact_foreign_types(command, package_name, metadata)?;
+            verified.push(metadata.declarations);
+        }
+    }
+    validate_interface_bridge_units(interfaces, cores, verified)
+}
+
+fn run_foreign_type_instances_with_overlay(
+    helper: string,
+    context: ffi::GoBuildContext,
+    caller: ffi::CallerContext,
+    queries: Vec[ffi::TypeInstanceQuery],
+    overlay: Option[ffi::SourceOverlay],
+) -> Result[ffi::TypeInstances, string] {
+    let input = ffi::with_source_overlay(
+        ffi::encode_type_instances(context, caller, queries)?,
+        overlay,
+    )?;
+    let output = process::Command::new(helper).arg("--timeout=2m").current_dir(context.module_dir).input(
+        bytes::Bytes::from_string(input),
+    ).output_timeout_structured(time::Duration::from_milliseconds(125000)).map_err(
+        |error| "ffi-tool-unavailable: " + error.to_string(),
+    )?;
+    if output.stdout().len() > 8388608 || output.stderr().len() > 8388608 {
+        return Result::Err("ffi-protocol: helper instance output exceeds limit")
+    }
+    let response = output.stdout().to_string_utf8().map_err(
+        |_| "ffi-protocol: invalid UTF-8 instance response",
+    )?;
+    let result = ffi::decode_type_instances(response, queries)?;
+    if !output.status().success() {
+        return Result::Err("ffi-protocol: instance success with failing helper status")
+    }
+    Result::Ok(result)
+}
+
+fn run_foreign_type_instances(
+    helper: string,
+    context: ffi::GoBuildContext,
+    caller: ffi::CallerContext,
+    queries: Vec[ffi::TypeInstanceQuery],
+) -> Result[ffi::TypeInstances, string] {
+    run_foreign_type_instances_with_overlay(helper, context, caller, queries, Option::None)
+}

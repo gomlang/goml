@@ -1,8 +1,12 @@
 package mono;
 
 use std::collections;
+use module::core;
+use module::tast;
 
 struct ValidateContext {
+    external_keys: Option[Vec[ExternalKeyRule]],
+    structs: Vec[StructDef],
     types: collections::HashSet[string],
 }
 
@@ -12,6 +16,13 @@ fn validate_type(ctx: ValidateContext, value: Type, context: string) -> Result[(
             (),
         ),
         Tuple { items } => validate_types(ctx, items, context + " tuple item"),
+        External { import_path, name, args } => {
+            if name == ""
+                || (import_path == "" && ((name != "error" && name != "string") || !args.is_empty())) {
+                return Result::Err(context + " has an invalid external Go type identity")
+            }
+            validate_types(ctx, args, context + " external argument")
+        },
         Named { name } => if name.byte_len() == 0 {
             Result::Err(context + " has an empty nominal type name")
         } else if !ctx.types.contains(name) {
@@ -48,8 +59,27 @@ fn validate_type(ctx: ValidateContext, value: Type, context: string) -> Result[(
         Slice { elem } => validate_type(ctx, elem, context + " slice element"),
         MutSlice { elem } => validate_type(ctx, elem, context + " mutable slice element"),
         VecType { elem } => validate_type(ctx, elem, context + " vector element"),
+        GoPointer { elem } => validate_type(ctx, elem, context + " pointer element"),
+        GoFunction { signature } => match signature {
+            Func { .. } => {
+                let _ = tast::foreign_bridge_type(
+                    core::type_to_tast(mono_type_to_core(Type::GoFunction { signature })),
+                    Vec::new(),
+                    false,
+                )?;
+                validate_type(ctx, signature, context + " Go function signature")
+            },
+            _ => Result::Err(context + ": Go function requires a concrete function signature"),
+        },
         RefType { elem } => validate_type(ctx, elem, context + " reference element"),
         HashMap { key, value } => {
+            validate_type(ctx, key, context + " map key")?;
+            validate_type(ctx, value, context + " map value")
+        },
+        GoMap { key, value } => {
+            if go_map_key_uncomparable(ctx, key, Vec::new())? {
+                return Result::Err(context + " Go map key is not comparable")
+            }
             validate_type(ctx, key, context + " map key")?;
             validate_type(ctx, value, context + " map value")
         },
@@ -118,9 +148,9 @@ fn validate_callable(ctx: ValidateContext, value: Callable, context: string) -> 
         InherentMethod { receiver_ty, method_name: _ } => {
             validate_type(ctx, receiver_ty, context + " inherent receiver")
         },
-        Function(_) | LangItem { .. } | Runtime(_) | Intrinsic(_) | GoForeign { .. } | DynTraitMethod {
+        Function(_) | LangItem { .. } | Runtime(_) | Intrinsic(_) | GoInterfaceBridge { .. } | GoForeign {
             ..,
-        } => Result::Ok(()),
+        } | GoMethod { .. } | DynTraitMethod { .. } => Result::Ok(()),
     }
 }
 
@@ -130,7 +160,17 @@ fn validate_expr(ctx: ValidateContext, value: Expr, context: string) -> Result[(
         Var { name: _, ty: _ } | Prim { value: _, ty: _ } | Continue { target: _, ty: _ } => Result::Ok(
             (),
         ),
-        Callable { callable, ty: _ } => validate_callable(ctx, callable, context),
+        Callable { callable, ty } => {
+            if let GoMethod { .. } = callable {
+                match ty {
+                    Func { params, ret_ty: _ } if !params.is_empty() => (),
+                    _ => return Result::Err(
+                        context + " foreign method requires a receiver parameter",
+                    ),
+                }
+            }
+            validate_callable(ctx, callable, context)
+        },
         Constr { constructor: _, args, ty: _ } => validate_exprs(ctx, args, context),
         Tuple { items, ty: _ } | Array { items, ty: _ } => validate_exprs(ctx, items, context),
         Closure { params, body, ty: _ } => {
@@ -240,6 +280,13 @@ fn validate_function(ctx: ValidateContext, value: Function) -> Result[(), string
 }
 
 pub fn validate(value: File) -> Result[(), string] {
+    validate_with_external_keys(value, Option::None)
+}
+
+pub fn validate_with_external_keys(value: File, external_keys: Option[Vec[ExternalKeyRule]]) -> Result[
+    (),
+    string,
+] {
     let type_names: collections::HashSet[string] = collections::HashSet::new();
     for definition in value.enums {
         if !type_names.insert(definition.name) {
@@ -259,7 +306,7 @@ pub fn validate(value: File) -> Result[(), string] {
             let _ = type_names.insert(instance.name);
         }
     }
-    let ctx = ValidateContext { types: type_names };
+    let ctx = ValidateContext { external_keys, types: type_names, structs: value.structs };
     for definition in value.enums {
         for variant in definition.variants {
             match variant.fields {
@@ -289,4 +336,60 @@ pub fn validate(value: File) -> Result[(), string] {
         validate_function(ctx, function)?
     }
     Result::Ok(())
+}
+
+fn go_map_key_definitely_uncomparable(value: Type) -> bool {
+    match value {
+        Slice { .. } | MutSlice { .. } | GoMap { .. } | GoFunction { .. } => true,
+        Array { elem, .. } => go_map_key_definitely_uncomparable(elem),
+        Tuple { items } => {
+            for item in items {
+                if go_map_key_definitely_uncomparable(item) {
+                    return true
+                }
+            }
+            false
+        },
+        _ => false,
+    }
+}
+
+fn go_map_key_uncomparable(ctx: ValidateContext, value: Type, active: Vec[string]) -> Result[
+    bool,
+    string,
+] {
+    if go_map_key_definitely_uncomparable(value) {
+        return Result::Ok(true)
+    }
+    match value {
+        Named { name } => {
+            if active.contains(name) {
+                return Result::Ok(false)
+            }
+            active.push(name);
+            let mut invalid = false;
+            for definition in ctx.structs {
+                if definition.name == name {
+                    for field in definition.fields {
+                        if go_map_key_uncomparable(ctx, field.1, active)? {
+                            invalid = true;
+                        }
+                    }
+                }
+            }
+            active.truncate(active.len() - 1);
+            Result::Ok(invalid)
+        },
+        Array { elem, .. } => go_map_key_uncomparable(ctx, elem, active),
+        Tuple { items } => {
+            for item in items {
+                if go_map_key_uncomparable(ctx, item, active)? {
+                    return Result::Ok(true)
+                }
+            }
+            Result::Ok(false)
+        },
+        External { .. } => external_key_uncomparable(ctx, value, active),
+        _ => Result::Ok(false),
+    }
 }

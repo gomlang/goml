@@ -325,7 +325,7 @@ fn artifact_dependency_environments(
     for package_value in selected_standard_packages_for_needs(standard, needs) {
         result.push(
             tast::dependency_environment_with_comptime(
-                artifact_dependency_environment_from_exports(package_value.environment_exports)?,
+                artifact_dependency_environment_from_exports(package_value.interface_unit.exports)?,
                 package_value.interface_unit.comptime.map(|value| value.module),
             ),
         )
@@ -616,10 +616,13 @@ fn compile_artifact_package(
     if disallowed_toolchain_import(command.package_name) {
         return Result::Err("package " + command.package_name + " is internal to the toolchain")
     }
+    let source_texts: Vec[string] = Vec::new();
     let parsed: Vec[cst::ParseResult] = Vec::new();
     let parser_diagnostics: Vec[tast::Diagnostic] = Vec::new();
     for source_path in command.inputs {
-        let value = parser::parse(read_source(source_path));
+        let source = read_source(source_path);
+        source_texts.push(source);
+        let value = parser::parse(source);
         for diagnostic in ast_diagnostics(value.diagnostics, "parser", source_path) {
             parser_diagnostics.push(diagnostic)
         }
@@ -627,8 +630,15 @@ fn compile_artifact_package(
     }
     fail_on_typer_diagnostics(parser_diagnostics, "", "");
     let ast_values = ast::lower_package(parsed);
+    validate_package_interface_names(ast_values, command.inputs)?;
     for index in 0..ast_values.len() {
-        ast_values.set(index, ast::resolve_module_paths(ast_values[index], command.module_name))
+        ast_values.set(
+            index,
+            ast::resolve_module_paths(
+                hir::expand_go_interfaces(ast_values[index]),
+                command.module_name,
+            ),
+        )
     }
     let lower_diagnostics: Vec[tast::Diagnostic] = Vec::new();
     for index in 0..ast_values.len() {
@@ -718,6 +728,7 @@ fn compile_artifact_package(
         source_needs,
         artifact_standard_needs_from_units(dependency_names, dependency_units),
     );
+    let imported_external = attach_imported_external_collectors(dependency_units)?;
     let environments = artifact_dependency_environments(
         world.builtin_interface.exports,
         world.prelude.interface_unit.exports,
@@ -725,12 +736,22 @@ fn compile_artifact_package(
         needs,
         dependency_units,
     )?;
-    let checked = tast::check_package_files_for_link_with_environments(hir_files, environments);
+    check_foreign_type_units(command.foreign_validation, dependency_units, Vec::new())?;
+    let external = resolve_package_foreign_types(hir_files, command.foreign_validation)?;
+    let checked = tast::check_package_files_for_link_with_external_types(
+        hir_files,
+        environments,
+        external,
+    )?;
     for diagnostic in internal_import_diagnostics {
         checked.diagnostics.push(diagnostic)
     }
     let hir_file = merge_hir_files(hir_files, command.package_name);
-    let signatures = tast::package_signatures(hir_file)?;
+    let signatures = tast::package_signatures_with_external_types_and_dependencies(
+        hir_file,
+        external,
+        environments,
+    )?;
     let comptime_module = checked.comptime;
     let Some(tast_file) = checked.tast else {
         return Result::Err("failed to typecheck package " + command.package_name)
@@ -760,6 +781,9 @@ fn compile_artifact_package(
         enum_names,
         struct_names,
     )?;
+    let go_exports = artifact_go_exports(hir_file, tast_file, command.package_name)?;
+    artifact_attach_go_exports(public_exports, go_exports)?;
+    artifact_attach_go_exports(exports, go_exports)?;
     let test_validation = validate_package_tests(
         command.package_name,
         test_candidates.candidates,
@@ -785,6 +809,20 @@ fn compile_artifact_package(
         }
     }
     fail_on_typer_diagnostics(checked.diagnostics, "", "");
+    validate_package_interface_adapters(
+        hir_files,
+        signatures,
+        tast_file,
+        external,
+        dependency_units,
+    )?;
+    let bridge_metadata = Vec::from_array([external.metadata]);
+    for dependency in dependency_units {
+        if let Some(metadata) = dependency.foreign_types {
+            bridge_metadata.push(metadata.declarations);
+        }
+    }
+    validate_interface_bridge_exports(exports, bridge_metadata)?;
     if let Err(error) = validate_public_trait_impls(hir_file, command.package_name, public_names) {
         return Result::Err("error[typer]: " + error)
     }
@@ -796,13 +834,29 @@ fn compile_artifact_package(
         return Result::Err("error[typer]: " + error)
     }
     let deps = artifact_direct_dependency_hashes(world, dependency_names, dependency_units)?;
-    let generated_interface = interface_codec::new_unit_with_comptime(
+    let foreign_traits: Vec[tast::TraitInfo] = Vec::new();
+    for environment in environments {
+        for trait_info in environment.traits {
+            foreign_traits.push(trait_info)
+        }
+    }
+    let generated_interface = interface_codec::new_unit_with_foreign_bindings(
         command.package_name,
         public_exports,
         artifact_package_interface(command.package_name, declared_name, public_exports),
         artifact_comptime_unit(comptime_module, public_exports),
         deps,
+        foreign_artifact_bindings_with_traits(command.package_name, exports, foreign_traits)?,
     );
+    let generated_interface = match resolve_external_application_metadata(
+        command.foreign_validation,
+        hir_files,
+        external,
+        imported_external,
+    )? {
+        Some(metadata) => interface_codec::with_foreign_types(generated_interface, metadata)?,
+        None => generated_interface,
+    };
     let interface_unit = production_interface.unwrap_or(generated_interface);
     let core_ir = if build {
         core::eliminate_dead_locals(
@@ -821,6 +875,16 @@ fn compile_artifact_package(
         ArtifactCompiledPackage {
             interface_unit,
             core_unit: artifact::ArtifactCoreUnit {
+                source_origins: artifact_package_source_origins(
+                    command.package_name,
+                    command.inputs,
+                    ast_values,
+                    source_texts,
+                    tast_file,
+                    core_ir,
+                )?,
+                external_applications: Vec::new(),
+                foreign_types: generated_interface.foreign_types,
                 package_name: command.package_name,
                 declared_name,
                 interface_hash: interface_unit.interface_hash,

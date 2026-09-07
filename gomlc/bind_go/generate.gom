@@ -1,0 +1,306 @@
+package bind_go;
+
+use module::ffi;
+use module::formatter;
+use module::go_backend;
+use module::tast;
+use std::collections;
+use std::json;
+use std::text;
+
+pub struct Generated {
+    pub goml_source: string,
+    pub go_source: string,
+}
+
+fn sorted_bindings(values: Vec[Binding]) -> Vec[Binding] {
+    let result = Vec::new();
+    for value in values {
+        result.push(value);
+    }
+    collections::sort_by(
+        result,
+        |left, right| if left.name < right.name {
+            -1
+        } else if left.name == right.name {
+            0
+        } else {
+            1
+        },
+    );
+    result
+}
+
+fn same_arguments(left: Vec[ffi::BridgeType], right: Vec[ffi::BridgeType]) -> bool {
+    if left.len() != right.len() {
+        return false
+    }
+    for index in 0..left.len() {
+        if !ffi::bridge_types_equal(left[index], right[index]) {
+            return false
+        }
+    }
+    true
+}
+
+fn matching_function(value: Binding, functions: Vec[ffi::QueriedFunction]) -> Result[
+    ffi::QueriedFunction,
+    string,
+] {
+    let mut result: Option[ffi::QueriedFunction] = Option::None;
+    for function in functions {
+        if function.query.id == value.name {
+            if result.is_some() || function.query.import_path != value.import_path
+                || function.query.name != value.symbol
+                || !same_arguments(function.query.arguments, value.arguments) {
+                return Result::Err("bind-go: function query identity mismatch for " + value.name)
+            }
+            result = Option::Some(function);
+        }
+    }
+    result.ok_or("bind-go: missing function metadata for " + value.name)
+}
+
+fn add_import(paths: Vec[string], value: string) -> () {
+    if value != "" && !paths.contains(value) {
+        paths.push(value);
+    }
+}
+
+fn identity_imports(paths: Vec[string], value: ffi::GoTypeIdentity, depth: isize) -> Result[
+    (),
+    string,
+] {
+    if depth > 128 {
+        return Result::Err("bind-go: import type depth exceeded")
+    }
+    match value {
+        Named { import_path, arguments, .. } => {
+            add_import(paths, import_path);
+            for value in arguments {
+                identity_imports(paths, value, depth + 1)?;
+            }
+        },
+        Function { parameters, results } => {
+            for value in parameters {
+                identity_imports(paths, value, depth + 1)?;
+            }
+            for value in results {
+                identity_imports(paths, value, depth + 1)?;
+            }
+        },
+        Pointer(value) | Slice(value) | Array { element: value, .. } | Channel {
+            element: value,
+            ..,
+        } => identity_imports(paths, value, depth + 1)?,
+        Map { key, element } => {
+            identity_imports(paths, key, depth + 1)?;
+            identity_imports(paths, element, depth + 1)?;
+        },
+        Basic(_) => (),
+        Parameter(_) => return Result::Err("bind-go: unresolved import type"),
+    }
+    Result::Ok(())
+}
+
+fn quoted(value: string) -> string {
+    json::encode(json::Value::String(value))
+}
+
+fn render_type(value: Binding, template: ffi::GoTypeTemplate, names: Vec[TypeBinding]) -> Result[
+    string,
+    string,
+] {
+    if template.parameter_constraints.len() != value.arguments.len() {
+        return Result::Err("bind-go: type argument count mismatch for " + value.name)
+    }
+    let attribute = "#[go_type(" + quoted(value.import_path) + ", " + quoted(value.symbol) + ")]\n";
+    if value.arguments.is_empty() {
+        return Result::Ok(attribute + "pub extern type " + value.name + ";\n")
+    }
+    let parameters = Vec::new();
+    let arguments = Vec::new();
+    for index in 0..value.arguments.len() {
+        parameters.push("T" + index.to_string());
+        arguments.push(goml_type(ffi::bridge_type_identity(value.arguments[index])?, names)?);
+    }
+    let helper = "GomlBindType_" + value.name;
+    Result::Ok(
+        attribute + "extern type " + helper + "[" + text::join(parameters, ", ") + "];\npub type "
+            + value.name
+            + " = "
+            + helper
+            + "["
+            + text::join(arguments, ", ")
+            + "];\n",
+    )
+}
+
+fn forward_function(value: ffi::QueriedFunction, name: string, imports: HashMap[string, string]) -> Result[
+    go_backend::Item,
+    string,
+] {
+    let ffi::GoTypeIdentity::Function { parameters, results } = value.signature else {
+        return Result::Err("bind-go: expected function signature")
+    };
+    let params = Vec::new();
+    let args = Vec::new();
+    for index in 0..parameters.len() {
+        let name = "p" + index.to_string();
+        params.push((name, native_type(parameters[index], imports)?));
+        args.push(go_backend::Expr::Var { name });
+    }
+    let qualifier = imports[value.query.import_path].ok_or("bind-go: missing function import")?;
+    let mut func = if qualifier == "" {
+        go_backend::Expr::Var { name: value.query.name }
+    } else {
+        go_backend::Expr::Field {
+            expr: go_backend::Expr::Var { name: qualifier },
+            field_name: value.query.name,
+        }
+    };
+    if !value.query.arguments.is_empty() {
+        let types = Vec::new();
+        for value in value.query.arguments {
+            types.push(native_type(ffi::bridge_type_identity(value)?, imports)?);
+        }
+        func = go_backend::Expr::Instantiate { expr: func, args: types };
+    }
+    let call = if value.variadic {
+        if args.is_empty() {
+            return Result::Err("bind-go: variadic function lacks slice parameter")
+        }
+        let prefix = Vec::new();
+        for index in 0..args.len() - 1 {
+            prefix.push(args[index]);
+        }
+        go_backend::Expr::CallSpread { func, args: prefix, spread: args[args.len() - 1] }
+    } else {
+        go_backend::Expr::Call { func, args }
+    };
+    let go_backend::Type::Func { ret_ty, .. } = native_type(value.signature, imports)? else {
+        return Result::Err("bind-go: missing native signature")
+    };
+    let stmts = Vec::new();
+    if results.is_empty() {
+        stmts.push(go_backend::Stmt::Expr { expr: call });
+    } else {
+        stmts.push(go_backend::Stmt::Return { expr: Option::Some(call) });
+    }
+    Result::Ok(
+        go_backend::Item::Function(
+            go_backend::Function {
+                name,
+                params,
+                ret_ty: if results.is_empty() {
+                    Option::None
+                } else {
+                    Option::Some(ret_ty)
+                },
+                body: go_backend::Block { stmts },
+            },
+        ),
+    )
+}
+
+pub fn generate(config: Config, functions: ffi::FunctionQueries, types: ffi::TypeInstances) -> Result[
+    Generated,
+    string,
+] {
+    if config.functions.len() != functions.functions.len()
+        || config.types.len() != types.instances.len() {
+        return Result::Err("bind-go: allowlist metadata count mismatch")
+    }
+    let names = Vec::new();
+    let selected_types = sorted_bindings(config.types);
+    for value in selected_types {
+        let mut found = false;
+        for instance in types.instances {
+            if instance.type_id == value.name {
+                if found {
+                    return Result::Err("bind-go: duplicate type metadata")
+                }
+                found = true;
+                let template = ffi::resolve_go_type_template(types.declarations, value.name)?;
+                let arguments = Vec::new();
+                for argument in value.arguments {
+                    arguments.push(ffi::bridge_type_identity(argument)?);
+                }
+                let predicted = ffi::substitute_go_type_template(template, arguments)?;
+                if ffi::go_type_identity_key(predicted)
+                    != ffi::go_type_identity_key(instance.identity) {
+                    return Result::Err("bind-go: type instance identity mismatch")
+                }
+                let _ = tast::external_identity_type(instance.identity, Vec::new())?;
+                names.push(TypeBinding { name: value.name, identity: instance.identity });
+            }
+        }
+        if !found {
+            return Result::Err("bind-go: missing type metadata for " + value.name)
+        }
+    }
+    let selected = Vec::new();
+    let paths = Vec::new();
+    for value in sorted_bindings(config.functions) {
+        let function = matching_function(value, functions.functions)?;
+        add_import(paths, value.import_path);
+        identity_imports(paths, function.signature, 0)?;
+        for argument in value.arguments {
+            identity_imports(paths, ffi::bridge_type_identity(argument)?, 0)?;
+        }
+        selected.push(function);
+    }
+    collections::sort(paths);
+    let imports: HashMap[string, string] = HashMap::new();
+    let imported = Vec::new();
+    for index in 0..paths.len() {
+        if paths[index] == config.go_import_path {
+            imports[paths[index]] = "";
+        } else {
+            let alias = "native_" + imported.len().to_string();
+            imports[paths[index]] = alias;
+            imported.push((alias, paths[index]));
+        }
+    }
+    let items = Vec::new();
+    if !imported.is_empty() {
+        items.push(go_backend::Item::ImportGroup(imported));
+    }
+    let mut source = "package " + config.package_name + ";\nuse std::ffi;\n";
+    for value in selected_types {
+        source = source
+            + render_type(
+                value,
+                ffi::resolve_go_type_template(types.declarations, value.name)?,
+                names,
+            )?;
+    }
+    for function in selected {
+        let ffi::GoTypeIdentity::Function { parameters, results } = function.signature else {
+            return Result::Err("bind-go: expected function metadata")
+        };
+        let params = Vec::new();
+        for index in 0..parameters.len() {
+            params.push("p" + index.to_string() + ": " + goml_type(parameters[index], names)?);
+        }
+        let native_name = "GomlBind_" + function.query.id;
+        source = source + "#[go_ffi(" + quoted(config.go_import_path) + ", " + quoted(native_name)
+            + ")]\npub extern fn "
+            + function.query.id
+            + "("
+            + text::join(params, ", ")
+            + ") -> "
+            + goml_results(results, names)?
+            + ";\n";
+        items.push(forward_function(function, native_name, imports)?);
+    }
+    let goml_source = formatter::format_source(source).map_err(
+        |_| "bind-go: generated GoML source failed formatting",
+    )?;
+    Result::Ok(
+        Generated {
+            goml_source,
+            go_source: go_backend::encode_package(go_backend::File { items }, config.go_package),
+        },
+    )
+}

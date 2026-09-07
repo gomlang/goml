@@ -1,0 +1,262 @@
+package main;
+
+use module::artifact;
+use module::ffi;
+use module::tast;
+use std::env;
+use std::fs;
+use std::io;
+use std::json;
+use std::path;
+
+struct ForeignArtifactCommand {
+    source_package: string,
+    source_paths: Vec[string],
+    interfaces: Vec[string],
+    cores: Vec[string],
+    validation: ForeignValidationCommand,
+}
+
+struct ForeignValidationCommand {
+    additional_directories: Vec[string],
+    context_path: string,
+    caller: ffi::CallerContext,
+    mode: ffi::CheckMode,
+}
+
+fn foreign_validation_option(option: string) -> bool {
+    match option {
+        "--additional-callers" | "--caller-mode" | "--context" | "--caller-directory" | "--caller-import-path" | "--caller-package" | "--ffi-check" => true,
+        _ => false,
+    }
+}
+
+fn foreign_validation_command(values: HashMap[string, string]) -> Result[
+    ForeignValidationCommand,
+    string,
+] {
+    let load_mode = values["--caller-mode"].ok_or("ffi-protocol: --caller-mode is required")?;
+    if load_mode != "package" && load_mode != "files" {
+        return Result::Err("ffi-protocol: --caller-mode must be package or files")
+    }
+    let import_path = values["--caller-import-path"].ok_or(
+        "ffi-protocol: --caller-import-path is required",
+    )?;
+    if load_mode == "files" && import_path != "command-line-arguments" {
+        return Result::Err("ffi-protocol: files mode requires command-line-arguments")
+    }
+    let additional_directories: Vec[string] = Vec::new();
+    if let Some(encoded) = values["--additional-callers"] {
+        let entries = json::as_array(json::parse(encoded)?).ok_or(
+            "ffi-protocol: additional callers must be an array",
+        )?;
+        for entry in entries {
+            let directory = json::as_string(entry).ok_or(
+                "ffi-protocol: caller directory must be a string",
+            )?;
+            if directory == "" || load_mode != "files" {
+                return Result::Err(
+                    "ffi-protocol: additional callers require files mode and nonempty directories",
+                )
+            }
+            additional_directories.push(directory)
+        }
+    }
+    Result::Ok(
+        ForeignValidationCommand {
+            additional_directories,
+            context_path: values["--context"].ok_or("ffi-protocol: --context is required")?,
+            caller: ffi::CallerContext {
+                generated_source: Option::None,
+                load_mode,
+                import_path,
+                directory: values["--caller-directory"].ok_or(
+                    "ffi-protocol: --caller-directory is required",
+                )?,
+                package_name: values["--caller-package"].ok_or(
+                    "ffi-protocol: --caller-package is required",
+                )?,
+            },
+            mode: ffi::parse_check_mode(
+                values["--ffi-check"].ok_or("ffi-protocol: --ffi-check is required")?,
+            )?,
+        },
+    )
+}
+
+fn parse_foreign_artifact_command(args: Vec[string]) -> Result[ForeignArtifactCommand, string] {
+    let interfaces: Vec[string] = Vec::new();
+    let cores: Vec[string] = Vec::new();
+    let source_paths: Vec[string] = Vec::new();
+    let values: HashMap[string, string] = HashMap::new();
+    let mut index = 2;
+    while index < args.len() {
+        let option = args[index];
+        if index + 1 >= args.len() {
+            return Result::Err("ffi-protocol: missing value for " + option)
+        }
+        let value = args[index + 1];
+        if value == "" || value.starts_with("--") {
+            return Result::Err("ffi-protocol: missing value for " + option)
+        }
+        match option {
+            "--interface-path" => interfaces.push(value),
+            "--core-path" => cores.push(value),
+            "--source-path" => source_paths.push(value),
+            "--source-package" => {
+                if values[option].is_some() {
+                    return Result::Err("ffi-protocol: repeated option " + option)
+                }
+                values[option] = value;
+            },
+            "--additional-callers" | "--caller-mode" | "--context" | "--caller-directory" | "--caller-import-path" | "--caller-package" | "--ffi-check" => {
+                if values[option].is_some() {
+                    return Result::Err("ffi-protocol: repeated option " + option)
+                }
+                values[option] = value;
+            },
+            _ => return Result::Err("ffi-protocol: unknown artifact-check option " + option),
+        }
+        index += 2;
+    }
+    if interfaces.is_empty() && cores.is_empty() {
+        return Result::Err("ffi-protocol: at least one artifact is required")
+    }
+    Result::Ok(
+        ForeignArtifactCommand {
+            source_package: values["--source-package"].unwrap_or(""),
+            source_paths,
+            interfaces,
+            cores,
+            validation: foreign_validation_command(values)?,
+        },
+    )
+}
+
+fn foreign_command_bindings(command: ForeignArtifactCommand) -> Result[
+    Vec[ffi::ForeignBinding],
+    string,
+] {
+    let interfaces = read_foreign_interfaces(command.interfaces)?;
+    let cores = artifact_read_core_units(command.cores)?;
+    foreign_unit_bindings(interfaces, cores)
+}
+
+fn foreign_unit_bindings(
+    interfaces: Vec[artifact::ArtifactInterfaceUnit],
+    cores: Vec[artifact::ArtifactCoreUnit],
+) -> Result[Vec[ffi::ForeignBinding], string] {
+    let traits: Vec[tast::TraitInfo] = Vec::new();
+    let exports: Vec[artifact::ArtifactPackageExports] = Vec::new();
+    for unit in interfaces {
+        exports.push(unit.exports)
+    }
+    for unit in cores {
+        exports.push(unit.exports)
+    }
+    for package_exports in exports {
+        for definition in package_exports.traits {
+            traits.push(artifact_dependency_trait(definition)?)
+        }
+    }
+    let mut bindings: Vec[ffi::ForeignBinding] = Vec::new();
+    for unit in interfaces {
+        bindings = ffi::merge_bindings(bindings, foreign_interface_bindings(unit, traits)?)?;
+    }
+    for unit in cores {
+        bindings = ffi::merge_bindings(
+            bindings,
+            foreign_artifact_bindings_with_traits(unit.package_name, unit.exports, traits)?,
+        )?;
+    }
+    Result::Ok(bindings)
+}
+
+fn check_foreign_artifacts(command: ForeignArtifactCommand) -> Result[(), string] {
+    let interfaces = read_foreign_interfaces(command.interfaces)?;
+    let cores = artifact_read_core_units(command.cores)?;
+    check_foreign_type_units(Option::Some(command.validation), interfaces, cores)?;
+    let bindings = foreign_unit_bindings(interfaces, cores)?;
+    let locations = foreign_source_locations(command.source_package, command.source_paths, bindings);
+    for unit in cores {
+        for (id, location) in foreign_source_locations(unit.package_name, unit.sources, bindings).entries() {
+            locations[id] = location;
+        }
+    }
+    check_foreign_bindings_at(command.validation, bindings, locations)
+}
+
+fn read_foreign_interfaces(paths: Vec[string]) -> Result[
+    Vec[artifact::ArtifactInterfaceUnit],
+    string,
+] {
+    let result = Vec::new();
+    for path_value in paths {
+        result.push(artifact_read_interface_unit(path_value)?)
+    }
+    Result::Ok(result)
+}
+
+fn check_foreign_bindings_at(
+    command: ForeignValidationCommand,
+    bindings: Vec[ffi::ForeignBinding],
+    locations: HashMap[string, string],
+) -> Result[(), string] {
+    if bindings.is_empty() {
+        return Result::Ok(())
+    }
+    match command.mode {
+        Off => {
+            io::eprintln(
+                "warning[ffi-unverified]: Go signature verification was not performed (--ffi-check off)",
+            );
+            return Result::Ok(())
+        },
+        Required => (),
+    }
+    let context = ffi::decode_build_context(
+        fs::read_file_structured(command.context_path).map_err(
+            |error| "ffi-protocol: " + error.to_string(),
+        )?,
+    )?;
+    let executable = env::current_exe_structured().map_err(
+        |error| "ffi-tool-unavailable: " + error.to_string(),
+    )?;
+    let parent = path::parent(executable).ok_or(
+        "ffi-tool-unavailable: compiler has no executable directory",
+    )?;
+    let helper = path::join(parent, "goml-go-meta");
+    let _ = run_foreign_validation_with_locations(
+        command.mode,
+        helper,
+        context,
+        command.caller,
+        bindings,
+        locations,
+    )?;
+    for directory in command.additional_directories {
+        let caller = ffi::CallerContext {
+            generated_source: Option::None,
+            load_mode: command.caller.load_mode,
+            import_path: command.caller.import_path,
+            package_name: command.caller.package_name,
+            directory,
+        };
+        let _ = run_foreign_validation_with_locations(
+            command.mode,
+            helper,
+            context,
+            caller,
+            bindings,
+            locations,
+        )?;
+    }
+    Result::Ok(())
+}
+
+fn run_foreign_artifact_command(args: Vec[string]) -> () {
+    match parse_foreign_artifact_command(args).and_then(|command| check_foreign_artifacts(command)) {
+        Ok(()) => (),
+        Err(message) => fail(message),
+    }
+}

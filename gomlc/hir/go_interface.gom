@@ -1,0 +1,272 @@
+package hir;
+
+use module::ast;
+use module::cst;
+use std::text;
+
+fn interface_path(name: string, span: ast::Span) -> ast::Path {
+    let segments: Vec[ast::PathSegment] = Vec::new();
+    for part in text::split(name, "::") {
+        segments.push(ast::PathSegment { ident: part, span });
+    }
+    ast::Path { segments }
+}
+
+fn interface_type(name: string, span: ast::Span) -> ast::TypeExpr {
+    ast::TypeExpr::Con { path: interface_path(name, span) }
+}
+
+fn interface_variable(name: string, span: ast::Span) -> ast::Expr {
+    ast::Expr::Path {
+        path: interface_path(name, span),
+        owner_type_args: Vec::new(),
+        member_type_args: Vec::new(),
+        span,
+    }
+}
+
+fn interface_raw_receiver(span: ast::Span) -> ast::Expr {
+    ast::Expr::Field {
+        expr: interface_variable("self", span),
+        field_name: "raw",
+        method_type_args: Vec::new(),
+        span,
+    }
+}
+
+fn interface_function(
+    name: string,
+    visibility: ast::Visibility,
+    params: Vec[(string, ast::TypeExpr)],
+    ret_ty: ast::TypeExpr,
+    body: ast::Expr,
+    span: ast::Span,
+) -> ast::Function {
+    let spans: Vec[ast::Span] = Vec::new();
+    for param in params {
+        spans.push(span);
+    }
+    ast::Function {
+        attrs: Vec::new(),
+        visibility,
+        name,
+        name_span: span,
+        generics: Vec::new(),
+        generic_bounds: Vec::new(),
+        predicates: Vec::new(),
+        params,
+        param_type_spans: spans,
+        ret_ty: Option::Some(ret_ty),
+        ret_ty_span: Option::Some(span),
+        body: ast::Block { stmts: Vec::new(), tail: Option::Some(body), span },
+    }
+}
+
+fn interface_impl(
+    owner: ast::TypeExpr,
+    trait_ref: Option[ast::TraitRef],
+    methods: Vec[ast::Function],
+    span: ast::Span,
+) -> ast::Item {
+    ast::Item::ImplBlock(
+        ast::ImplBlock {
+            attrs: Vec::new(),
+            generics: Vec::new(),
+            generic_bounds: Vec::new(),
+            predicates: Vec::new(),
+            associated_types: Vec::new(),
+            trait_ref,
+            for_type: owner,
+            for_type_span: span,
+            methods,
+        },
+    )
+}
+
+fn interface_adapter_items(definition: ast::TraitDef, spec: ast::GoInterfaceSpec) -> Result[
+    Vec[ast::Item],
+    string,
+] {
+    if !definition.generics.is_empty() || !definition.generic_bounds.is_empty()
+        || !definition.predicates.is_empty()
+        || !definition.supertraits.is_empty()
+        || !definition.associated_types.is_empty() {
+        return Result::Err(
+            "go_interface requires a non-generic trait without supertraits or associated types",
+        )
+    }
+    if spec.methods.len() != definition.method_sigs.len() {
+        return Result::Err("go_interface requires a mapping for every trait method")
+    }
+    let span = spec.span;
+    let raw_type = interface_type(spec.raw_type, span);
+    let wrapper_type = interface_type(spec.wrapper_name, span);
+    let items: Vec[ast::Item] = Vec::new();
+    items.push(
+        ast::Item::StructDef(
+            ast::StructDef {
+                attrs: Vec::new(),
+                visibility: definition.visibility,
+                name: spec.wrapper_name,
+                generics: Vec::new(),
+                newtype: false,
+                fields: Vec::from_array([("raw", raw_type)]),
+                field_type_spans: Vec::from_array([span]),
+                field_attrs: Vec::from_array([Vec::new()]),
+                public_fields: Vec::new(),
+            },
+        ),
+    );
+    items.push(
+        interface_impl(
+            wrapper_type,
+            Option::None,
+            Vec::from_array(
+                [
+                    interface_function(
+                        "from_go",
+                        definition.visibility,
+                        Vec::from_array([("raw", raw_type)]),
+                        wrapper_type,
+                        ast::Expr::StructLiteral {
+                            name: interface_path(spec.wrapper_name, span),
+                            fields: Vec::from_array([("raw", interface_variable("raw", span))]),
+                            base: Option::None,
+                            span,
+                        },
+                        span,
+                    ),
+                    interface_function(
+                        "into_go",
+                        definition.visibility,
+                        Vec::from_array([("self", wrapper_type)]),
+                        raw_type,
+                        interface_raw_receiver(span),
+                        span,
+                    ),
+                ],
+            ),
+            span,
+        ),
+    );
+    let methods: Vec[ast::Function] = Vec::new();
+    for method in definition.method_sigs {
+        if !method.has_receiver || method.params.is_empty() || !method.generics.is_empty()
+            || !method.generic_bounds.is_empty()
+            || !method.predicates.is_empty() {
+            return Result::Err(
+                "go_interface requires non-generic instance methods without additional predicates",
+            )
+        }
+        let mut target: Option[string] = Option::None;
+        for mapping in spec.methods {
+            if mapping.0 == method.name {
+                target = Option::Some(mapping.1);
+            }
+        }
+        let target = target.ok_or("go_interface omitted trait method " + method.name)?;
+        let helper = "__goml_interface_" + spec.wrapper_name + "_" + method.name;
+        let native_params: Vec[(string, ast::TypeExpr)] = Vec::from_array([("receiver", raw_type)]);
+        let wrapper_params: Vec[(string, ast::TypeExpr)] = Vec::from_array([("self", wrapper_type)]);
+        let args: Vec[ast::Expr] = Vec::from_array([interface_raw_receiver(span)]);
+        for index in 1..method.params.len() {
+            let name = f"arg{index}";
+            native_params.push((name, method.params[index].1));
+            wrapper_params.push((name, method.params[index].1));
+            args.push(interface_variable(name, span));
+        }
+        items.push(
+            ast::Item::ExternFunction(
+                ast::ExternFunction {
+                    name_span: span,
+                    attrs: Vec::from_array(
+                        [
+                            ast::Attribute {
+                                span,
+                                text: "#[go_method(\"" + target + "\")]",
+                                name: "go_method",
+                                has_argument_list: true,
+                                args: Vec::from_array([ast::AttributeArg::String(target)]),
+                            },
+                        ],
+                    ),
+                    visibility: ast::Visibility::Private,
+                    name: helper,
+                    generics: Vec::new(),
+                    generic_bounds: Vec::new(),
+                    predicates: Vec::new(),
+                    params: native_params,
+                    ret_ty: Option::Some(method.ret_ty),
+                },
+            ),
+        );
+        methods.push(
+            interface_function(
+                method.name,
+                ast::Visibility::Private,
+                wrapper_params,
+                method.ret_ty,
+                ast::Expr::Call { func: interface_variable(helper, span), args, span },
+                span,
+            ),
+        );
+    }
+    items.push(
+        interface_impl(
+            wrapper_type,
+            Option::Some(
+                ast::TraitRef { path: interface_path(definition.name, span), args: Vec::new() },
+            ),
+            methods,
+            span,
+        ),
+    );
+    for item in interface_bridge_items(definition, spec) {
+        items.push(item);
+    }
+    Result::Ok(items)
+}
+
+pub fn expand_go_interfaces(value: ast::LowerResult) -> ast::LowerResult {
+    let Some(file) = value.ast else {
+        return value
+    };
+    let items: Vec[ast::Item] = Vec::new();
+    let diagnostics = value.diagnostics;
+    for item in file.items {
+        items.push(item);
+        if let ast::Item::TraitDef(definition) = item {
+            let generated = ast::go_interface_spec(definition.attrs).and_then(
+                |spec| match spec {
+                    Some(spec) => interface_adapter_items(definition, spec),
+                    None => Result::Ok(Vec::new()),
+                },
+            );
+            match generated {
+                Ok(generated) => for item in generated {
+                    items.push(item);
+                },
+                Err(error) => for attribute in definition.attrs {
+                    if attribute.name == "go_interface" {
+                        diagnostics.push(
+                            cst::diagnostic(error, attribute.span.start, attribute.span.end),
+                        );
+                        break
+                    }
+                },
+            }
+        }
+    }
+    ast::LowerResult {
+        ast: Option::Some(
+            ast::File {
+                package_name: file.package_name,
+                package_explicit: file.package_explicit,
+                uses: file.uses,
+                items,
+                invalid_self_type_spans: file.invalid_self_type_spans,
+            },
+        ),
+        diagnostics,
+    }
+}

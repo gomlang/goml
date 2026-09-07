@@ -1,0 +1,347 @@
+package tast;
+
+use module::ffi;
+
+pub fn go_map_key_definitely_uncomparable(value: Type) -> bool {
+    match resolve_type(value) {
+        Slice { .. } | MutSlice { .. } | GoMap { .. } | GoFunction { .. } => true,
+        Array { elem, .. } => go_map_key_definitely_uncomparable(elem),
+        Tuple { items } => {
+            for item in items {
+                if go_map_key_definitely_uncomparable(item) {
+                    return true
+                }
+            }
+            false
+        },
+        _ => false,
+    }
+}
+
+fn go_map_key_uncomparable(ctx: Checker, value: Type, active: Vec[string]) -> bool {
+    let normalized = prune(normalize_type(ctx, value));
+    if go_map_key_definitely_uncomparable(normalized) {
+        return true
+    }
+    match normalized {
+        External { .. } => {
+            for alias in ctx.type_aliases {
+                if let Some(rule) = alias.go_comparable {
+                    let substitutions: Vec[TypeSubst] = Vec::new();
+                    if unify_parameter_aliases(alias.ty, normalized, substitutions)
+                        && external_map_rule_uncomparable(
+                            ctx,
+                            rule,
+                            alias.generics,
+                            substitutions,
+                            active,
+                        ) {
+                        return true
+                    }
+                }
+            }
+            false
+        },
+        Array { elem, .. } => go_map_key_uncomparable(ctx, elem, active),
+        Tuple { items } => {
+            for item in items {
+                if go_map_key_uncomparable(ctx, item, active) {
+                    return true
+                }
+            }
+            false
+        },
+        value => match struct_application_parts(value) {
+            Some(parts) if !active.contains(type_text(value)) => match find_struct_by_name(
+                ctx,
+                parts.0,
+            ) {
+                Some(info) => {
+                    if let Some(rule) = info.go_comparable {
+                        return external_map_rule_uncomparable(
+                            ctx,
+                            rule,
+                            info.generics,
+                            struct_comparability_substitutions(info, parts.1),
+                            active,
+                        )
+                    }
+                    for field in info.fields {
+                        if by_value_type_has_cycle(ctx, field.1, Vec::from_array([info.name])) {
+                            push_diagnostic(ctx, "Go map key has a recursive struct layout");
+                            return false
+                        }
+                    }
+                    if active.len() >= 64 {
+                        push_diagnostic(
+                            ctx,
+                            "Go map key comparability exceeds the structural depth limit",
+                        );
+                        return false
+                    }
+                    let next = copied_names(active);
+                    next.push(type_text(value));
+                    for field in info.fields {
+                        if go_map_key_uncomparable(
+                            ctx,
+                            substitute_params(field.1, info.generics, parts.1),
+                            next,
+                        ) {
+                            return true
+                        }
+                    }
+                    false
+                },
+                None => false,
+            },
+            _ => false,
+        },
+    }
+}
+
+fn invalid_go_map_key(ctx: Checker, value: Type) -> Option[Type] {
+    let children: Vec[Type] = Vec::new();
+    match prune(normalize_type(ctx, value)) {
+        GoMap { key, value } => {
+            if go_map_key_uncomparable(ctx, key, Vec::new()) {
+                return Option::Some(key)
+            }
+            children.push(key);
+            children.push(value);
+        },
+        HashMap { key, value } => {
+            children.push(key);
+            children.push(value);
+        },
+        Array { elem, .. } | Slice { elem } | MutSlice { elem } | VecType { elem } | GoPointer {
+            elem,
+        } | GoFunction { signature: elem } | RefType { elem } | Channel { elem, .. } => children.push(
+            elem,
+        ),
+        Tuple { items } => for item in items {
+            children.push(item)
+        },
+        External { args, .. } | App { args, .. } | Dyn { args, .. } => for item in args {
+            children.push(item)
+        },
+        Func { params, ret_ty } => {
+            for param in params {
+                children.push(param)
+            }
+            children.push(ret_ty);
+        },
+        _ => (),
+    }
+    for child in children {
+        if let Some(key) = invalid_go_map_key(ctx, child) {
+            return Option::Some(key)
+        }
+    }
+    Option::None
+}
+
+fn validate_go_map_key(ctx: Checker, key: Type) -> () {
+    if go_map_key_uncomparable(ctx, key, Vec::new()) {
+        push_diagnostic(ctx, "Go map key is not comparable: " + type_text(key))
+    }
+}
+
+fn external_map_rule_uncomparable(
+    ctx: Checker,
+    rule: ffi::GoComparability,
+    parameters: Vec[string],
+    substitutions: Vec[TypeSubst],
+    active: Vec[string],
+) -> bool {
+    match rule {
+        Never => true,
+        Always | Unknown => false,
+        Parameter(index) => {
+            if index >= 0 && index < parameters.len() {
+                if let Some(value) = find_substitution(substitutions, parameters[index]) {
+                    return go_map_key_uncomparable(ctx, value, active)
+                }
+            }
+            false
+        },
+        All(rules) => {
+            for rule in rules {
+                if external_map_rule_uncomparable(ctx, rule, parameters, substitutions, active) {
+                    return true
+                }
+            }
+            false
+        },
+    }
+}
+
+fn collect_go_comparable_requirements(
+    ctx: Checker,
+    value: Type,
+    result: Vec[Type],
+    active: Vec[string],
+) -> bool {
+    let value = prune(normalize_type(ctx, value));
+    if go_map_key_uncomparable(ctx, value, Vec::new()) {
+        return false
+    }
+    match value {
+        Param { .. } | Projection { .. } | Var(_) => {
+            for previous in result {
+                if types_equal(previous, value) {
+                    return true
+                }
+            }
+            result.push(value);
+            true
+        },
+        Array { elem, .. } => collect_go_comparable_requirements(ctx, elem, result, active),
+        Tuple { items } => {
+            for item in items {
+                if !collect_go_comparable_requirements(ctx, item, result, active) {
+                    return false
+                }
+            }
+            true
+        },
+        External { import_path, name, args } => {
+            if import_path == "" && args.is_empty() && (name == "error" || name == "string") {
+                return true
+            }
+            let identity = type_text(value);
+            if active.contains(identity) || active.len() >= 64 {
+                return false
+            }
+            let next = copied_names(active);
+            next.push(identity);
+            let mut matched = false;
+            for alias in ctx.type_aliases {
+                if let Some(rule) = alias.go_comparable {
+                    if !match alias.ty {
+                        External { .. } => true,
+                        _ => false,
+                    } {
+                        continue
+                    }
+                    let substitutions: Vec[TypeSubst] = Vec::new();
+                    if unify_parameter_aliases(alias.ty, value, substitutions) {
+                        matched = true;
+                        if !collect_go_comparability_rule(
+                            ctx,
+                            rule,
+                            alias.generics,
+                            substitutions,
+                            result,
+                            next,
+                        ) {
+                            return false
+                        }
+                    }
+                }
+            }
+            matched
+        },
+        value => match struct_application_parts(value) {
+            Some(parts) => match find_struct_by_name(ctx, parts.0) {
+                Some(info) => {
+                    if let Some(rule) = info.go_comparable {
+                        return collect_go_comparability_rule(
+                            ctx,
+                            rule,
+                            info.generics,
+                            struct_comparability_substitutions(info, parts.1),
+                            result,
+                            active,
+                        )
+                    }
+                    if info.has_hidden_fields {
+                        return false
+                    }
+                    for field in info.fields {
+                        if by_value_type_has_cycle(ctx, field.1, Vec::from_array([info.name])) {
+                            return false
+                        }
+                    }
+                    let identity = type_text(value);
+                    if active.contains(identity) || active.len() >= 64 {
+                        return false
+                    }
+                    let next = copied_names(active);
+                    next.push(identity);
+                    for field in info.fields {
+                        if !collect_go_comparable_requirements(
+                            ctx,
+                            substitute_params(field.1, info.generics, parts.1),
+                            result,
+                            next,
+                        ) {
+                            return false
+                        }
+                    }
+                    true
+                },
+                None => true,
+            },
+            None => true,
+        },
+    }
+}
+
+fn collect_go_comparability_rule(
+    ctx: Checker,
+    rule: ffi::GoComparability,
+    parameters: Vec[string],
+    substitutions: Vec[TypeSubst],
+    result: Vec[Type],
+    active: Vec[string],
+) -> bool {
+    match rule {
+        Always => true,
+        Never | Unknown => false,
+        Parameter(index) => {
+            if index < 0 || index >= parameters.len() {
+                return false
+            }
+            match find_substitution(substitutions, parameters[index]) {
+                Some(value) => collect_go_comparable_requirements(ctx, value, result, active),
+                None => false,
+            }
+        },
+        All(rules) => {
+            for rule in rules {
+                if !collect_go_comparability_rule(
+                    ctx,
+                    rule,
+                    parameters,
+                    substitutions,
+                    result,
+                    active,
+                ) {
+                    return false
+                }
+            }
+            true
+        },
+    }
+}
+
+fn go_comparable_satisfied(ctx: Checker, value: Type) -> bool {
+    let required = Vec::new();
+    if !collect_go_comparable_requirements(ctx, value, required, Vec::new()) {
+        return false
+    }
+    for ty in required {
+        let mut found = false;
+        for predicate in ctx.predicates {
+            if let GoComparable(bound) = predicate {
+                if types_equal(normalize_type(ctx, bound), ty) {
+                    found = true;
+                }
+            }
+        }
+        if !found {
+            return false
+        }
+    }
+    true
+}

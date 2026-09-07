@@ -1,0 +1,276 @@
+package project;
+
+use std::fs;
+use std::json;
+use std::io;
+use std::path;
+use std::process;
+use std::task;
+use std::time;
+
+fn foreign_plan_has_bindings(context: Context, plan: Plan) -> Result[bool, string] {
+    let files: Vec[string] = Vec::new();
+    let known: HashMap[string, bool] = HashMap::new();
+    for package_value in context.graph.packages {
+        for file in package_value.files {
+            known[absolute_from_module(context.graph.module_dir, file)] = package_value.go_foreign;
+        }
+    }
+    for command in plan.commands {
+        if let Compile { input_files, .. } = command {
+            for file in input_files {
+                let absolute = absolute_from_module(context.graph.module_dir, file);
+                match known[absolute] {
+                    Some(true) => return Result::Ok(true),
+                    Some(false) => (),
+                    None => files.push(absolute),
+                }
+            }
+        }
+    }
+    if !files.is_empty() {
+        for info in compiler_package_info(context.compiler, context.graph.module_dir, files)? {
+            if info.go_foreign {
+                return Result::Ok(true)
+            }
+        }
+    }
+    Result::Ok(false)
+}
+
+fn foreign_plan_callers(context: Context, plan: Plan) -> HashMap[string, Vec[string]] {
+    let callers: HashMap[string, Vec[string]] = HashMap::new();
+    for command in plan.commands {
+        let inputs = match command {
+            Link { input_cores, output, .. } | TestLink { input_cores, output, .. } => {
+                let directory = path::parent(absolute_from_module(context.graph.module_dir, output)).unwrap_or(
+                    context.graph.module_dir,
+                );
+                (input_cores, directory)
+            },
+            _ => (Vec::new(), ""),
+        };
+        for input in inputs.0 {
+            let key = path::with_extension(input, "interface");
+            let directories = callers[key].unwrap_or(Vec::new());
+            if !directories.contains(inputs.1) {
+                directories.push(inputs.1)
+            }
+            callers[key] = directories;
+        }
+    }
+    for command in plan.commands {
+        if let Compile { output, .. } = command {
+            let key = path::with_extension(output, "interface");
+            if callers[key].is_none() {
+                let directory = path::parent(absolute_from_module(context.graph.module_dir, output)).unwrap_or(
+                    context.graph.module_dir,
+                );
+                callers[key] = Vec::from_array([directory]);
+            }
+        }
+    }
+    callers
+}
+
+pub fn prepare_foreign_execution(context: Context, plan: Plan, mode: string, dry_run: bool) -> Result[
+    Context,
+    string,
+] {
+    if !foreign_plan_has_bindings(context, plan)? {
+        return Result::Ok(context)
+    }
+    let context_path = path::join(context.artifact_root, "ffi-build-context.json");
+    let callers = foreign_plan_callers(context, plan);
+    let context_arguments = Vec::from_array(
+        [
+            "__ffi-build-context",
+            "--go",
+            "go",
+            "--module-directory",
+            context.graph.module_dir,
+            "--output",
+            context_path,
+        ],
+    );
+    if dry_run {
+        if mode == "required" {
+            io::println(display_args(context.compiler, context_arguments))
+        }
+    } else {
+        for (_, directories) in callers.entries() {
+            for directory in directories {
+                fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+            }
+        }
+        if mode == "required" {
+            fs::create_dir_all(context.artifact_root).map_err(|error| error.to_string())?;
+            let output = process::Command::new(context.compiler).args(context_arguments).current_dir(
+                context.graph.module_dir,
+            ).output_timeout_structured(time::Duration::from_milliseconds(60000)).map_err(
+                |error| error.to_string(),
+            )?;
+            if !output.status().success() {
+                return Result::Err(output_text(output.stderr()))
+            }
+        }
+    }
+    Result::Ok(
+        Context {
+            graph: context.graph,
+            compiler: context.compiler,
+            compiler_world: context.compiler_world,
+            artifact_root: context.artifact_root,
+            foreign: Option::Some(ForeignExecution { mode, context_path, callers }),
+        },
+    )
+}
+
+fn foreign_validation_args(execution: ForeignExecution, directories: Vec[string]) -> Vec[string] {
+    let extra: Vec[json::Value] = Vec::new();
+    for index in 1..directories.len() {
+        extra.push(json::Value::String(directories[index]))
+    }
+    Vec::from_array(
+        [
+            "--ffi-check",
+            execution.mode,
+            "--context",
+            execution.context_path,
+            "--caller-mode",
+            "files",
+            "--caller-import-path",
+            "command-line-arguments",
+            "--caller-package",
+            "main",
+            "--caller-directory",
+            directories[0],
+            "--additional-callers",
+            json::encode(json::Value::Array(extra)),
+        ],
+    )
+}
+
+fn foreign_command_args(context: Context, command: Command) -> (string, Vec[string]) {
+    let normal = command_args(command);
+    let Some(execution) = context.foreign else {
+        return normal
+    };
+    match command {
+        Compile { output, .. } => {
+            let directories = execution.callers[path::with_extension(output, "interface")].unwrap_or(
+                Vec::new(),
+            );
+            if !directories.is_empty() {
+                for argument in foreign_validation_args(execution, directories) {
+                    normal.1.push(argument)
+                }
+            }
+            normal
+        },
+        Link { output, .. } | TestLink { output, .. } => {
+            let directory = path::parent(absolute_from_module(context.graph.module_dir, output)).unwrap_or(
+                context.graph.module_dir,
+            );
+            for argument in foreign_validation_args(execution, Vec::from_array([directory])) {
+                normal.1.push(argument)
+            }
+            normal
+        },
+        GoBuild { input, output } if execution.mode == "required" => (
+            GOMLC_PROGRAM,
+            Vec::from_array(
+                [
+                    "__ffi-go-build",
+                    "--context",
+                    execution.context_path,
+                    "--input",
+                    input,
+                    "--output",
+                    output,
+                ],
+            ),
+        ),
+        _ => normal,
+    }
+}
+
+fn verify_foreign_command_artifacts(cancel: task::CancelToken, context: Context, command: Command) -> Result[
+    (),
+    string,
+] {
+    let Some(execution) = context.foreign else {
+        return Result::Ok(())
+    };
+    let args = Vec::from_array(["__ffi-check-artifacts"]);
+    let directories = match command {
+        Compile { package_name, input_files, output, interface_files, .. } => {
+            args.push("--source-package");
+            args.push(package_name);
+            for input in input_files {
+                args.push("--source-path");
+                args.push(input)
+            }
+            let interface = path::with_extension(output, "interface");
+            args.push("--interface-path");
+            args.push(interface);
+            for dependency in interface_files {
+                args.push("--interface-path");
+                args.push(dependency)
+            }
+            execution.callers[interface].unwrap_or(Vec::new())
+        },
+        Link { input_cores, output, .. } | TestLink { input_cores, output, .. } => {
+            for core in input_cores {
+                args.push("--core-path");
+                args.push(core)
+            }
+            Vec::from_array(
+                [
+                    path::parent(absolute_from_module(context.graph.module_dir, output)).unwrap_or(
+                        context.graph.module_dir,
+                    ),
+                ],
+            )
+        },
+        _ => return Result::Ok(()),
+    };
+    if directories.is_empty() {
+        return Result::Err("ffi-protocol: missing caller directory")
+    }
+    for argument in foreign_validation_args(execution, directories) {
+        args.push(argument)
+    }
+    let status = process::Command::new(context.compiler).args(args).current_dir(
+        context.graph.module_dir,
+    ).status_cancel_structured(cancel).map_err(|error| error.to_string())?;
+    if status.success() {
+        Result::Ok(())
+    } else {
+        Result::Err("Go FFI validation failed")
+    }
+}
+
+fn verify_foreign_cached_command(cancel: task::CancelToken, context: Context, command: Command) -> Result[
+    (),
+    string,
+] {
+    verify_foreign_command_artifacts(cancel, context, command)?;
+    if context.foreign.is_none() {
+        return Result::Ok(())
+    }
+    let name = match command {
+        Link { .. } => "__ffi-check-link",
+        TestLink { .. } => "__ffi-check-test-link",
+        _ => return Result::Ok(()),
+    };
+    let invocation = foreign_command_args(context, command);
+    invocation.1.set(0, name);
+    let status = process::Command::new(context.compiler).args(invocation.1).current_dir(
+        context.graph.module_dir,
+    ).status_cancel_structured(cancel).map_err(|error| error.to_string())?;
+    if !status.success() {
+        return Result::Err("Go external specialization validation failed")
+    }
+    Result::Ok(())
+}

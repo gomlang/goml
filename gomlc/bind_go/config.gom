@@ -1,0 +1,237 @@
+package bind_go;
+
+use module::ffi;
+use module::lexer;
+use std::json;
+
+pub struct Binding {
+    pub name: string,
+    pub import_path: string,
+    pub symbol: string,
+    pub arguments: Vec[ffi::BridgeType],
+}
+
+pub struct Config {
+    pub package_name: string,
+    pub output: string,
+    pub go_package: string,
+    pub go_output: string,
+    pub go_import_path: string,
+    pub functions: Vec[Binding],
+    pub types: Vec[Binding],
+}
+
+fn fields(value: json::Value, allowed: Vec[string]) -> Result[HashMap[string, json::Value], string] {
+    let Object(values) = value else {
+        return Result::Err("bind-go: expected an object")
+    };
+    let result: HashMap[string, json::Value] = HashMap::new();
+    for (key, value) in values {
+        if !allowed.contains(key) || result[key].is_some() {
+            return Result::Err("bind-go: unknown or duplicate field " + key)
+        }
+        result[key] = value;
+    }
+    Result::Ok(result)
+}
+
+fn text(values: HashMap[string, json::Value], name: string) -> Result[string, string] {
+    let value = values[name].ok_or("bind-go: missing field " + name)?;
+    let value = json::as_string(value).ok_or("bind-go: expected string for " + name)?;
+    if value == "" || value.contains("\u0000") || value.contains("\n") || value.contains("\r") {
+        return Result::Err("bind-go: invalid " + name)
+    }
+    Result::Ok(value)
+}
+
+fn goml_identifier(value: string) -> bool {
+    let tokens = lexer::lex(value);
+    tokens.len() == 1 && lexer::token_kind_equal(tokens[0].kind, lexer::TokenKind::Ident)
+        && tokens[0].text == value
+}
+
+fn lower_name(value: string) -> bool {
+    if value.byte_len() == 0 {
+        return false
+    }
+    let first = value.byte_get(0);
+    (first >= b'a' && first <= b'z') || first == b'_'
+}
+
+fn go_identifier(value: string) -> bool {
+    if value == "" || value == "_" {
+        return false
+    }
+    for index in 0..value.byte_len() {
+        let byte = value.byte_get(index);
+        if !(byte >= b'a' && byte <= b'z') && !(byte >= b'A' && byte <= b'Z') && byte != b'_'
+            && !(index > 0 && byte >= b'0' && byte <= b'9') {
+            return false
+        }
+    }
+    !Vec::from_array(
+        [
+            "break",
+            "default",
+            "func",
+            "interface",
+            "select",
+            "case",
+            "defer",
+            "go",
+            "map",
+            "struct",
+            "chan",
+            "else",
+            "goto",
+            "package",
+            "switch",
+            "const",
+            "fallthrough",
+            "if",
+            "range",
+            "type",
+            "continue",
+            "for",
+            "import",
+            "return",
+            "var",
+        ],
+    ).contains(value)
+}
+
+fn bindings(value: Option[json::Value], seen: HashMap[string, bool], remaining: Ref[isize]) -> Result[
+    Vec[Binding],
+    string,
+] {
+    let Some(value) = value else {
+        return Result::Ok(Vec::new())
+    };
+    let values = json::as_array(value).ok_or("bind-go: expected a binding allowlist")?;
+    let result = Vec::new();
+    for value in values {
+        if remaining.get() == 0 {
+            return Result::Err("bind-go: too many bindings")
+        }
+        remaining.set(remaining.get() - 1);
+        let value = fields(
+            value,
+            Vec::from_array(["name", "import_path", "symbol", "type_arguments"]),
+        )?;
+        let name = text(value, "name")?;
+        if !goml_identifier(name) || name == "ffi" || name.starts_with("__goml_bind_")
+            || name.starts_with("GomlBindType_")
+            || seen[name].is_some() {
+            return Result::Err("bind-go: invalid, reserved or duplicate binding name " + name)
+        }
+        seen[name] = true;
+        let import_path = text(value, "import_path")?;
+        let symbol = text(value, "symbol")?;
+        if !ffi::named_bridge_identity_valid(import_path, symbol) {
+            return Result::Err("bind-go: expected an explicit package and exported Go symbol")
+        }
+        let arguments = match value["type_arguments"] {
+            None => Vec::new(),
+            Some(value) => ffi::decode_bridge_types(
+                json::as_array(value).ok_or("bind-go: expected a finite type argument list")?,
+            )?,
+        };
+        result.push(Binding { name, import_path, symbol, arguments });
+    }
+    Result::Ok(result)
+}
+
+pub fn parse_config(input: string) -> Result[Config, string] {
+    if input.byte_len() > 1048576 {
+        return Result::Err("bind-go: configuration exceeds 1 MiB")
+    }
+    let value = fields(
+        ffi::parse_bounded_json(input)?,
+        Vec::from_array(
+            [
+                "version",
+                "package",
+                "output",
+                "go_package",
+                "go_output",
+                "go_import_path",
+                "functions",
+                "types",
+            ],
+        ),
+    )?;
+    if value["version"].and_then(|value| json::as_int(value)) != Option::Some(1) {
+        return Result::Err("bind-go: unsupported or missing configuration version")
+    }
+    let package_name = text(value, "package")?;
+    let go_package = text(value, "go_package")?;
+    if !goml_identifier(package_name) || package_name == "main" || !lower_name(package_name) {
+        return Result::Err("bind-go: expected a non-main GoML package name")
+    }
+    if !go_identifier(go_package) || go_package == "main" {
+        return Result::Err("bind-go: expected a non-main Go package name")
+    }
+    let output = text(value, "output")?;
+    let go_output = text(value, "go_output")?;
+    if !output.ends_with(".gom") || !go_output.ends_with(".go") {
+        return Result::Err("bind-go: output paths must end in .gom and .go")
+    }
+    let go_import_path = text(value, "go_import_path")?;
+    if !ffi::named_bridge_identity_valid(go_import_path, "Binding") {
+        return Result::Err("bind-go: invalid generated Go import path")
+    }
+    let seen: HashMap[string, bool] = HashMap::new();
+    let remaining = Ref::new(4096);
+    let functions = bindings(value["functions"], seen, remaining)?;
+    let types = bindings(value["types"], seen, remaining)?;
+    for value in functions {
+        if !lower_name(value.name) {
+            return Result::Err(
+                "bind-go: function name must start with a lowercase letter or underscore",
+            )
+        }
+    }
+    for value in types {
+        if value.name.byte_get(0) < b'A' || value.name.byte_get(0) > b'Z' {
+            return Result::Err("bind-go: type name must start with an uppercase letter")
+        }
+    }
+    if functions.is_empty() && types.is_empty() {
+        return Result::Err("bind-go: allowlist is empty")
+    }
+    Result::Ok(
+        Config { package_name, output, go_package, go_output, go_import_path, functions, types },
+    )
+}
+
+pub fn function_queries(config: Config) -> Vec[ffi::FunctionQuery] {
+    let result = Vec::new();
+    for value in config.functions {
+        result.push(
+            ffi::FunctionQuery {
+                id: value.name,
+                import_path: value.import_path,
+                name: value.symbol,
+                arguments: value.arguments,
+            },
+        );
+    }
+    result
+}
+
+pub fn type_queries(config: Config) -> Vec[ffi::TypeInstanceQuery] {
+    let result = Vec::new();
+    for value in config.types {
+        result.push(
+            ffi::TypeInstanceQuery {
+                declaration: ffi::TypeDeclarationQuery {
+                    type_id: value.name,
+                    import_path: value.import_path,
+                    name: value.symbol,
+                },
+                arguments: value.arguments,
+            },
+        );
+    }
+    result
+}

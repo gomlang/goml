@@ -29,6 +29,7 @@ struct StandardNeeds {
     encoding_hex: bool,
     error: bool,
     env: bool,
+    ffi: bool,
     fs: bool,
     io: bool,
     internal_host: bool,
@@ -88,6 +89,7 @@ fn no_standard_needs() -> StandardNeeds {
         encoding_hex: false,
         error: false,
         env: false,
+        ffi: false,
         fs: false,
         io: false,
         internal_host: false,
@@ -129,6 +131,7 @@ fn standard_needs_from_package_names(package_names: Vec[string]) -> StandardNeed
         encoding_hex: closure.contains(resources::STD_ENCODING_HEX_PACKAGE),
         error: closure.contains(resources::STD_ERROR_PACKAGE),
         env: closure.contains(resources::STD_ENV_PACKAGE),
+        ffi: closure.contains(resources::STD_FFI_PACKAGE),
         fs: closure.contains(resources::STD_FS_PACKAGE),
         io: closure.contains(resources::STD_IO_PACKAGE),
         internal_host: closure.contains(resources::STD_INTERNAL_HOST_PACKAGE),
@@ -179,6 +182,7 @@ fn merge_standard_needs(left: StandardNeeds, right: StandardNeeds) -> StandardNe
         encoding_hex: left.encoding_hex || right.encoding_hex,
         error: left.error || right.error,
         env: left.env || right.env,
+        ffi: left.ffi || right.ffi,
         fs: left.fs || right.fs,
         io: left.io || right.io,
         internal_host: left.internal_host || right.internal_host,
@@ -314,6 +318,10 @@ fn public_ast_item_name(package_name: string, value: ast::Item) -> Option[string
             Private => Option::None,
         },
         ExternFunction(value) => match value.visibility {
+            Public => Option::Some(package_item_name(package_name, value.name)),
+            Private => Option::None,
+        },
+        ExternType(value) => match value.visibility {
             Public => Option::Some(package_item_name(package_name, value.name)),
             Private => Option::None,
         },
@@ -659,6 +667,9 @@ fn selected_standard_package_names(needs: StandardNeeds) -> Vec[string] {
     if needs.env {
         result.push(resources::STD_ENV_PACKAGE)
     }
+    if needs.ffi {
+        result.push(resources::STD_FFI_PACKAGE)
+    }
     if needs.fs {
         result.push(resources::STD_FS_PACKAGE)
     }
@@ -879,6 +890,7 @@ fn run_package_command(args: Vec[string], build: bool, emit_tests: bool) -> () {
         Err(error) => {
             handle_cli_parse_error(args[1], error);
             PackageCommandArgs {
+                foreign_validation: Option::None,
                 package_name: "main",
                 module_name: "main",
                 inputs: Vec::new(),
@@ -925,6 +937,9 @@ fn run_package_command(args: Vec[string], build: bool, emit_tests: bool) -> () {
             ArtifactCompiledPackage {
                 interface_unit,
                 core_unit: artifact::ArtifactCoreUnit {
+                    source_origins: Vec::new(),
+                    external_applications: Vec::new(),
+                    foreign_types: Option::None,
                     package_name: command.package_name,
                     declared_name: "main",
                     interface_hash: interface_unit.interface_hash,
@@ -942,6 +957,19 @@ fn run_package_command(args: Vec[string], build: bool, emit_tests: bool) -> () {
             }
         },
     };
+    if let Some(validation) = command.foreign_validation {
+        if let Err(error) = check_foreign_bindings_at(
+            validation,
+            artifact.interface_unit.foreign_bindings,
+            foreign_source_locations(
+                command.package_name,
+                command.inputs,
+                artifact.interface_unit.foreign_bindings,
+            ),
+        ) {
+            fail(error)
+        }
+    }
     if let Err(error) = output_transaction(
         command.output,
         || {
@@ -959,11 +987,16 @@ fn run_package_command(args: Vec[string], build: bool, emit_tests: bool) -> () {
 }
 
 fn run_link_command(args: Vec[string]) -> () {
+    run_link_command_with_validation(args, false)
+}
+
+fn run_link_command_with_validation(args: Vec[string], validate_only: bool) -> () {
     let command = match parse_link_command_args(args) {
         Ok(value) => value,
         Err(error) => {
             handle_cli_parse_error(LINK_COMMAND, error);
             LinkCommandArgs {
+                foreign_validation: Option::None,
                 inputs: Vec::new(),
                 entry: "main",
                 output: "main.go",
@@ -998,6 +1031,9 @@ fn run_link_command(args: Vec[string]) -> () {
     };
     if let Err(error) = artifact_validate_link_core_units(world, core_units) {
         fail(COMPILE_ERROR_PREFIX + error)
+    }
+    if validate_only && !core_units_have_external_applications(core_units) {
+        return
     }
     artifact_prepare_core_units(world, core_units);
     match artifact_find_core_unit(core_units, command.entry) {
@@ -1039,10 +1075,49 @@ fn run_link_command(args: Vec[string]) -> () {
         linked_dependencies,
         entry_core(entry.core_value, command.entry),
     );
-    let mono_value = lower_mono_or_fail(linked);
-    let lift_value = lower_lift_stage(mono_value, world.counter);
+    let source_names: Vec[(string, string)] = Vec::new();
+    let mono_value = match lower_linked_with_source_names(
+        linked,
+        core_units,
+        command.foreign_validation,
+        source_names,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            fail(COMPILE_ERROR_PREFIX + error);
+            return
+        },
+    };
+    if validate_only {
+        return
+    }
+    let lifted_sources: Vec[(string, string)] = Vec::new();
+    let lift_value = match lift::lower_checked_with_source_names(
+        mono_value,
+        world.counter,
+        lifted_sources,
+    ) {
+        Ok(value) => lift::dce(value),
+        Err(message) => {
+            fail(COMPILE_ERROR_PREFIX + message);
+            return
+        },
+    };
     let anf_value = lower_anf_stage(lift_value, world.counter);
-    let go_source = go_backend::encode(lower_go_or_fail(go_backend::lower(anf_value)));
+    let generated = match go_backend::lower_with_source_names(anf_value) {
+        Ok(value) => value,
+        Err(message) => {
+            fail(COMPILE_ERROR_PREFIX + message);
+            return
+        },
+    };
+    let metadata = linked_source_origins(
+        core_units,
+        source_names,
+        lifted_sources,
+        generated.source_names,
+    );
+    let go_source = go_backend::encode(go_backend::embed_source_origins(generated.file, metadata));
     match ensure_parent(command.output) {
         Ok(()) => match atomic_write_text(command.output, go_source) {
             Ok(()) => (),
@@ -1064,11 +1139,16 @@ fn empty_core_file() -> core::File {
 }
 
 fn run_test_link_command(args: Vec[string]) -> () {
+    run_test_link_command_with_validation(args, false)
+}
+
+fn run_test_link_command_with_validation(args: Vec[string], validate_only: bool) -> () {
     let command = match parse_test_link_command_args(args) {
         Ok(value) => value,
         Err(error) => {
             handle_cli_parse_error(TEST_LINK_COMMAND, error);
             TestLinkCommandArgs {
+                foreign_validation: Option::None,
                 inputs: Vec::new(),
                 packages: Vec::new(),
                 output: "main.go",
@@ -1104,6 +1184,9 @@ fn run_test_link_command(args: Vec[string]) -> () {
     if let Err(error) = artifact_validate_link_core_units(world, core_units) {
         fail(COMPILE_ERROR_PREFIX + error)
     }
+    if validate_only && !core_units_have_external_applications(core_units) {
+        return
+    }
     artifact_prepare_core_units(world, core_units);
     let package_cores: Vec[core::File] = Vec::new();
     let needs = artifact_core_standard_needs(core_units);
@@ -1134,12 +1217,52 @@ fn run_test_link_command(args: Vec[string]) -> () {
         linked_dependencies,
         empty_core_file(),
     );
-    let mono_value = lower_mono_or_fail(linked);
-    let lift_value = lower_lift_stage(mono_value, world.counter);
+    let source_names: Vec[(string, string)] = Vec::new();
+    let mono_value = match lower_linked_with_source_names(
+        linked,
+        core_units,
+        command.foreign_validation,
+        source_names,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            fail(COMPILE_ERROR_PREFIX + error);
+            return
+        },
+    };
+    if validate_only {
+        return
+    }
+    let lifted_sources: Vec[(string, string)] = Vec::new();
+    let lift_value = match lift::lower_checked_with_source_names(
+        mono_value,
+        world.counter,
+        lifted_sources,
+    ) {
+        Ok(value) => lift::dce(value),
+        Err(message) => {
+            fail(COMPILE_ERROR_PREFIX + message);
+            return
+        },
+    };
     let anf_value = lower_anf_stage(lift_value, world.counter);
-    let go_source = go_backend::encode(
-        lower_go_or_fail(go_backend::lower_tests(anf_value, test_link_cases(tests))),
+    let generated = match go_backend::lower_tests_with_source_names(
+        anf_value,
+        test_link_cases(tests),
+    ) {
+        Ok(value) => value,
+        Err(message) => {
+            fail(COMPILE_ERROR_PREFIX + message);
+            return
+        },
+    };
+    let metadata = linked_source_origins(
+        core_units,
+        source_names,
+        lifted_sources,
+        generated.source_names,
     );
+    let go_source = go_backend::encode(go_backend::embed_source_origins(generated.file, metadata));
     if let Err(error) = output_transaction(
         command.output,
         || {

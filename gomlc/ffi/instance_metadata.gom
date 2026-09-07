@@ -1,0 +1,190 @@
+package ffi;
+
+use std::json;
+
+fn instance_queries_json(values: Vec[TypeInstanceQuery]) -> json::Value {
+    let ids = Vec::new();
+    for value in values {
+        ids.push(value.declaration.type_id)
+    }
+    let result = Vec::new();
+    for id in metadata_sorted_keys(ids) {
+        for value in values {
+            if value.declaration.type_id == id {
+                result.push(
+                    json::object(
+                        Vec::from_array(
+                            [
+                                ("type_id", json::Value::String(id)),
+                                ("import_path", json::Value::String(value.declaration.import_path)),
+                                ("name", json::Value::String(value.declaration.name)),
+                                ("arguments", bridge_types_json(value.arguments)),
+                            ],
+                        ),
+                    ),
+                )
+            }
+        }
+    }
+    json::Value::Array(result)
+}
+
+fn decode_instance_argument(value: json::Value, depth: isize, remaining: Ref[isize]) -> Result[
+    BridgeType,
+    string,
+] {
+    if depth > 64 || remaining.get() <= 0 {
+        return Result::Err("ffi-protocol: persisted instance complexity limit exceeded")
+    }
+    remaining.set(remaining.get() - 1);
+    let tag = response_string(value, "tag")?;
+    match tag {
+        "function" => {
+            match value {
+                Object(fields) if fields.len() == 2 => for field in fields {
+                    if field.0 != "tag" && field.0 != "signature" {
+                        return Result::Err("ffi-protocol: unexpected function type field")
+                    }
+                },
+                _ => return Result::Err("ffi-protocol: invalid function type object"),
+            }
+            let signature = response_field(value, "signature")?;
+            match signature {
+                Object(fields) if fields.len() == 2 => for field in fields {
+                    if field.0 != "parameters" && field.0 != "results" {
+                        return Result::Err("ffi-protocol: unexpected function signature field")
+                    }
+                    match field.1 {
+                        Array(_) => (),
+                        _ => return Result::Err("ffi-protocol: expected function signature array"),
+                    }
+                },
+                _ => return Result::Err("ffi-protocol: invalid function signature object"),
+            }
+            let parameters = Vec::new();
+            let results = Vec::new();
+            for value in response_array(signature, "parameters")? {
+                parameters.push(decode_instance_argument(value, depth + 1, remaining)?)
+            }
+            for value in response_array(signature, "results")? {
+                results.push(decode_instance_argument(value, depth + 1, remaining)?)
+            }
+            Result::Ok(BridgeType::Function { parameters, results })
+        },
+        "named" => {
+            let args = Vec::new();
+            for argument in response_array(value, "type_arguments")? {
+                args.push(decode_instance_argument(argument, depth + 1, remaining)?)
+            }
+            Result::Ok(
+                BridgeType::Named {
+                    import_path: response_string(value, "import_path")?,
+                    name: response_string(value, "name")?,
+                    arguments: args,
+                },
+            )
+        },
+        "array" => Result::Ok(
+            BridgeType::Array {
+                element: decode_instance_argument(
+                    response_field(value, "element")?,
+                    depth + 1,
+                    remaining,
+                )?,
+                length: json::as_int(response_field(value, "length")?).ok_or(
+                    "ffi-protocol: invalid instance array length",
+                )?,
+            },
+        ),
+        "pointer" => Result::Ok(
+            BridgeType::Pointer {
+                element: decode_instance_argument(
+                    response_field(value, "element")?,
+                    depth + 1,
+                    remaining,
+                )?,
+            },
+        ),
+        "slice" => Result::Ok(
+            BridgeType::Slice {
+                element: decode_instance_argument(
+                    response_field(value, "element")?,
+                    depth + 1,
+                    remaining,
+                )?,
+            },
+        ),
+        "map" => Result::Ok(
+            BridgeType::Map {
+                key: decode_instance_argument(response_field(value, "key")?, depth + 1, remaining)?,
+                element: decode_instance_argument(
+                    response_field(value, "element")?,
+                    depth + 1,
+                    remaining,
+                )?,
+            },
+        ),
+        "channel" => Result::Ok(
+            BridgeType::Channel {
+                element: decode_instance_argument(
+                    response_field(value, "element")?,
+                    depth + 1,
+                    remaining,
+                )?,
+                direction: response_string(value, "direction")?,
+            },
+        ),
+        "bool" | "int" | "int8" | "int16" | "int32" | "int64" | "uint" | "uint8" | "uint16" | "uint32" | "uint64" | "float32" | "float64" | "string" => Result::Ok(
+            BridgeType::Scalar(tag),
+        ),
+        _ => Result::Err("ffi-protocol: unsupported persisted instance argument " + tag),
+    }
+}
+
+fn decode_instance_queries(
+    value: json::Value,
+    queries: Vec[TypeDeclarationQuery],
+    declarations: TypeDeclarations,
+) -> Result[Vec[TypeInstanceQuery], string] {
+    let values = json::as_array(value).ok_or("ffi-protocol: expected instance query array")?;
+    if values.len() > 4096 {
+        return Result::Err("ffi-protocol: too many persisted instances")
+    }
+    let result = Vec::new();
+    let seen: HashMap[string, bool] = HashMap::new();
+    let remaining = Ref::new(65536);
+    for value in values {
+        let id = response_string(value, "type_id")?;
+        if id == "" || seen[id].is_some() {
+            return Result::Err("ffi-protocol: invalid or duplicate persisted instance")
+        }
+        seen[id] = true;
+        let import_path = response_string(value, "import_path")?;
+        let name = response_string(value, "name")?;
+        let arguments = Vec::new();
+        let identities = Vec::new();
+        for argument in response_array(value, "arguments")? {
+            let bridge = decode_instance_argument(argument, 0, remaining)?;
+            identities.push(instance_argument_identity(bridge, 0, Ref::new(65536))?);
+            arguments.push(bridge)
+        }
+        let mut declared = false;
+        for query in queries {
+            if query.import_path == import_path && query.name == name {
+                let template = resolve_go_type_template(declarations, query.type_id)?;
+                let _ = substitute_go_type_template(template, identities)?;
+                declared = true;
+            }
+        }
+        if !declared {
+            return Result::Err("ffi-protocol: instance has no saved declaration: " + id)
+        }
+        result.push(
+            TypeInstanceQuery {
+                declaration: TypeDeclarationQuery { type_id: id, import_path, name },
+                arguments,
+            },
+        )
+    }
+    Result::Ok(result)
+}

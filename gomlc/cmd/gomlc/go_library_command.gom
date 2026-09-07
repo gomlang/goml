@@ -1,0 +1,153 @@
+package main;
+
+use module::go_backend;
+use module::lift;
+use std::fs;
+use std::path;
+use std::json;
+
+struct GoLibraryCommand {
+    inputs: Vec[string],
+    package_name: string,
+    go_package: string,
+    output: string,
+    api_output: Option[string],
+    world: Option[string],
+    validation: Option[ForeignValidationCommand],
+}
+
+fn parse_go_library_command(args: Vec[string]) -> Result[GoLibraryCommand, string] {
+    let extracted = extract_package_foreign_args(args)?;
+    let args = extracted.args;
+    let values: HashMap[string, string] = HashMap::new();
+    let inputs: Vec[string] = Vec::new();
+    let mut index = 2;
+    while index < args.len() {
+        let option = args[index];
+        if option != "--input" && option != "--package" && option != "--go-package"
+            && option != "--output"
+            && option != "--world"
+            && option != "--api-output" {
+            return Result::Err("Go library: unknown option " + option)
+        }
+        if index + 1 >= args.len() || args[index + 1] == "" || args[index + 1].starts_with("--") {
+            return Result::Err("Go library: missing value for " + option)
+        }
+        let value = args[index + 1];
+        if option == "--input" {
+            if inputs.contains(value) {
+                return Result::Err("Go library: duplicate input " + value)
+            }
+            inputs.push(value)
+        } else {
+            if values[option].is_some() {
+                return Result::Err("Go library: repeated option " + option)
+            }
+            values[option] = value;
+        }
+        index += 2;
+    }
+    if inputs.is_empty() {
+        return Result::Err("Go library: --input is required")
+    }
+    let go_package = values["--go-package"].ok_or("Go library: --go-package is required")?;
+    if !go_backend::library_package_name_is_valid(go_package) {
+        return Result::Err("Go library: invalid Go package name " + go_package)
+    }
+    if let Some(api_output) = values["--api-output"] {
+        if let Some(output) = values["--output"] {
+            if path::absolute_structured(api_output).map_err(|error| error.to_string())?
+                == path::absolute_structured(output).map_err(|error| error.to_string())? {
+                return Result::Err("Go library: API output must differ from Go output")
+            }
+        }
+    }
+    if let Some(validation) = extracted.validation {
+        if !validation.additional_directories.is_empty()
+            || (validation.caller.load_mode == "package"
+                && validation.caller.package_name != go_package) {
+            return Result::Err("Go library: invalid validation caller context")
+        }
+    }
+    Result::Ok(
+        GoLibraryCommand {
+            inputs,
+            package_name: values["--package"].ok_or("Go library: --package is required")?,
+            go_package,
+            output: values["--output"].ok_or("Go library: --output is required")?,
+            world: values["--world"],
+            api_output: values["--api-output"],
+            validation: extracted.validation,
+        },
+    )
+}
+
+fn emit_go_library_command(command: GoLibraryCommand) -> Result[(), string] {
+    let world = match command.world {
+        Some(path) => read_package_world(path)?,
+        None => package_world(),
+    };
+    let units = artifact_reachable_core_units(
+        Vec::from_array([command.package_name]),
+        artifact_read_core_units(command.inputs)?,
+    )?;
+    check_foreign_type_units(command.validation, Vec::new(), units)?;
+    let linked = link_go_library_core(world, units, command.package_name)?;
+    let bindings = foreign_unit_bindings(Vec::new(), units)?;
+    if !bindings.is_empty() {
+        let validation = command.validation.ok_or(
+            "Go library: foreign bindings require explicit --ffi-check and caller context",
+        )?;
+        let locations: HashMap[string, string] = HashMap::new();
+        for unit in units {
+            for (id, location) in foreign_source_locations(
+                unit.package_name,
+                unit.sources,
+                bindings,
+            ).entries() {
+                locations[id] = location;
+            }
+        }
+        check_foreign_bindings_at(validation, bindings, locations)?
+    }
+    let source_names = Vec::new();
+    let mono_value = lower_linked_with_source_names(
+        linked.core_value,
+        units,
+        command.validation,
+        source_names,
+    )?;
+    let lifted_sources = Vec::new();
+    let lifted = lift::lower_checked_with_source_names(mono_value, world.counter, lifted_sources)?;
+    let anf_value = lower_anf_stage(lift::dce(lifted), world.counter);
+    let declarations: Vec[(string, string)] = Vec::new();
+    for exported in linked.exports {
+        declarations.push((exported.symbol, exported.go_name))
+    }
+    let generated = go_backend::lower_library_with_source_names(anf_value, declarations)?;
+    let metadata = linked_source_origins(
+        units,
+        source_names,
+        lifted_sources,
+        generated.source_names,
+    );
+    let output = go_backend::encode_package(
+        go_backend::embed_source_origins(generated.file, metadata),
+        command.go_package,
+    );
+    let api = go_library_api(linked.exports)?;
+    fs::write_file_structured(command.output, output).map_err(|error| error.to_string())?;
+    if let Some(api_output) = command.api_output {
+        fs::write_file_structured(api_output, json::encode(api) + "\n").map_err(
+            |error| error.to_string(),
+        )?
+    }
+    Result::Ok(())
+}
+
+fn run_go_library_command(args: Vec[string]) -> () {
+    match parse_go_library_command(args).and_then(|command| emit_go_library_command(command)) {
+        Ok(()) => (),
+        Err(message) => fail(COMPILE_ERROR_PREFIX + message),
+    }
+}

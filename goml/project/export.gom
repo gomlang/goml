@@ -1,0 +1,247 @@
+package project;
+
+use std::env;
+use std::fs;
+use std::io;
+use std::json;
+use std::path;
+use std::process;
+
+pub struct ExportOptions {
+    pub source: Option[string],
+    pub output: string,
+    pub import_path: string,
+    pub ffi_check: string,
+    pub jobs: isize,
+    pub dry_run: bool,
+}
+
+fn export_compiler(context: Context, args: Vec[string]) -> Result[(), string] {
+    let status = process::Command::new(context.compiler).args(args).current_dir(
+        context.graph.module_dir,
+    ).status_structured().map_err(|error| error.to_string())?;
+    if status.success() {
+        Result::Ok(())
+    } else {
+        Result::Err("export-go: compiler command failed")
+    }
+}
+
+fn export_build_context(context: Context, output: string) -> Vec[string] {
+    Vec::from_array(
+        [
+            "__ffi-build-context",
+            "--go",
+            "go",
+            "--module-directory",
+            context.graph.module_dir,
+            "--output",
+            output,
+        ],
+    )
+}
+
+fn export_link_args(
+    context: Context,
+    destination: GoExportDestination,
+    cores: Vec[string],
+    staging: string,
+    validation: Vec[string],
+) -> Vec[string] {
+    let args = Vec::from_array(
+        [
+            "__link-go-library",
+            "--package",
+            destination.source_package,
+            "--go-package",
+            destination.go_package,
+            "--output",
+            path::join(staging, "candidate.go"),
+            "--api-output",
+            path::join(staging, "api.json"),
+        ],
+    );
+    for core in cores {
+        args.push("--input");
+        args.push(core)
+    }
+    if let Some(world) = compiler_world_path(context) {
+        args.push("--world");
+        args.push(world)
+    }
+    for argument in validation {
+        args.push(argument)
+    }
+    args
+}
+
+fn export_check_args(
+    destination: GoExportDestination,
+    staging: string,
+    context_path: string,
+    cores: Vec[string],
+    mode: string,
+) -> Vec[string] {
+    let args = Vec::from_array(
+        [
+            "__check-go-library",
+            "--context",
+            context_path,
+            "--input",
+            path::join(staging, "candidate.go"),
+            "--directory",
+            destination.output_directory,
+            "--import-path",
+            destination.import_path,
+            "--overlay",
+            path::join(staging, "overlay.json"),
+            "--ffi-check",
+            mode,
+        ],
+    );
+    for core in cores {
+        args.push("--core-path");
+        args.push(core)
+    }
+    args
+}
+
+fn export_product(
+    destination: GoExportDestination,
+    staging: string,
+    context_path: string,
+    mode: string,
+) -> Result[GoExportProduct, string] {
+    let source = fs::read_file_structured(path::join(staging, "candidate.go")).map_err(
+        |error| error.to_string(),
+    )?;
+    let api = json::parse(
+        fs::read_file_structured(path::join(staging, "api.json")).map_err(|error| error.to_string())?,
+    )?;
+    if json::as_int(export_json_field(api, "protocol")?) != Option::Some(1) {
+        return Result::Err("export-go: unsupported compiler API protocol")
+    }
+    let entries = json::as_array(export_json_field(api, "exports")?).ok_or(
+        "export-go: invalid compiler API",
+    )?;
+    if entries.is_empty() {
+        return Result::Err("export-go: compiler omitted exported API")
+    }
+    let build = json::parse(
+        fs::read_file_structured(context_path).map_err(|error| error.to_string())?,
+    )?;
+    let fields: Vec[(string, json::Value)] = Vec::new();
+    for name in Vec::from_array(
+        ["toolchain", "goos", "goarch", "cgo_enabled", "goflags", "build_tags"],
+    ) {
+        fields.push((name, export_json_field(build, name)?))
+    }
+    fields.push(("ffi_check", json::Value::String(mode)));
+    Result::Ok(
+        GoExportProduct {
+            source,
+            package_name: destination.go_package,
+            import_path: destination.import_path,
+            api: entries,
+            prerequisites: json::object(fields),
+        },
+    )
+}
+
+fn export_selected(context: Context, destination: GoExportDestination, options: ExportOptions) -> Result[
+    (),
+    string,
+] {
+    let output_root = path::join(context.artifact_root, "export-go");
+    let packages = reachable_packages(context.graph, Vec::from_array([destination.source_package]))?;
+    let commands = compile_commands(
+        context,
+        output_root,
+        BUILD_SUBCOMMAND,
+        BUILD_SUBCOMMAND,
+        packages,
+    )?;
+    let plan = Plan { commands, executable: Option::None, test_groups: Vec::new() };
+    let cores = core_outputs(context, output_root, packages);
+    let staging = path::join(destination.output_directory, ".goml-export-lock");
+    let context_path = path::join(staging, "context.json");
+    let callers: HashMap[string, Vec[string]] = HashMap::new();
+    for command in commands {
+        if let Command::Compile { output, .. } = command {
+            callers[path::with_extension(output, "interface")] = Vec::from_array(
+                [destination.output_directory],
+            );
+        }
+    }
+    let execution = ForeignExecution { mode: options.ffi_check, context_path, callers };
+    let prepared = Context {
+        graph: context.graph,
+        compiler: context.compiler,
+        compiler_world: context.compiler_world,
+        artifact_root: context.artifact_root,
+        foreign: Option::Some(execution),
+    };
+    let validation = foreign_validation_args(
+        execution,
+        Vec::from_array([destination.output_directory]),
+    );
+    if options.dry_run {
+        io::println(display_args(context.compiler, export_build_context(context, context_path)));
+        execute_plan(prepared, plan, true, options.jobs)?;
+        io::println(
+            display_args(
+                context.compiler,
+                export_link_args(context, destination, cores, staging, validation),
+            ),
+        );
+        io::println(
+            display_args(
+                context.compiler,
+                export_check_args(destination, staging, context_path, cores, options.ffi_check),
+            ),
+        );
+        return Result::Ok(())
+    }
+    with_export_output(
+        destination.output_directory,
+        |staging| with_build_lock(
+            context,
+            || {
+                export_compiler(context, export_build_context(context, context_path))?;
+                execute_plan(prepared, plan, false, options.jobs)?;
+                export_compiler(
+                    context,
+                    export_link_args(context, destination, cores, staging, validation),
+                )?;
+                export_compiler(
+                    context,
+                    export_check_args(destination, staging, context_path, cores, options.ffi_check),
+                )?;
+                export_product(destination, staging, context_path, options.ffi_check)
+            },
+        ),
+    )
+}
+
+pub fn export_go(context: Context, options: ExportOptions) -> Result[(), string] {
+    if options.ffi_check != "required" && options.ffi_check != "off" {
+        return Result::Err("export-go: invalid FFI check mode")
+    }
+    if options.jobs < 1 {
+        return Result::Err("export-go: jobs must be greater than zero")
+    }
+    let current = env::current_dir_structured().map_err(|error| error.to_string())?;
+    let source = match options.source {
+        Some(value) => export_input_path(current, value)?,
+        None => context.graph.module_dir,
+    };
+    let output = export_input_path(current, options.output)?;
+    let destination = resolve_export_destination(
+        context.graph,
+        source,
+        output,
+        options.import_path,
+        "go",
+    )?;
+    export_selected(context, destination, options)
+}

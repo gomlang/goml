@@ -590,13 +590,13 @@ fn resolve_pattern_named_field_constructor(ctx: Checker, head: hir::PatternHead,
 fn nominal_arguments(value: Type) -> Vec[Type] {
     match prune(value) {
         App { ty: _, args } => args,
-        VecType { elem } | Slice { elem } | MutSlice { elem } | RefType { elem } | Channel {
-            elem,
-            direction: _,
-        } => {
+        VecType { elem } | Slice { elem } | MutSlice { elem } | GoPointer { elem } | GoFunction {
+            signature: elem,
+        } | RefType { elem } | Channel { elem, direction: _ } => {
             one_type(elem)
         },
         HashMap { key, value: item } => two_types(key, item),
+        GoMap { key, value: item } => two_types(key, item),
         _ => Vec::new(),
     }
 }
@@ -711,6 +711,10 @@ fn call_types_compatible(left: Type, right: Type) -> bool {
         (Tuple { items: left }, Tuple { items: right }) => {
             call_type_lists_compatible(left, right)
         },
+        (
+            External { import_path: a, name: n, args: x },
+            External { import_path: b, name: m, args: y },
+        ) => a == b && n == m && call_type_lists_compatible(x, y),
         (Con { name: left }, Con { name: right }) | (
             Dyn { trait_name: left, .. },
             Dyn { trait_name: right, .. },
@@ -731,6 +735,9 @@ fn call_types_compatible(left: Type, right: Type) -> bool {
         ) | (VecType { elem: left }, VecType { elem: right }) | (
             RefType { elem: left },
             RefType { elem: right },
+        ) | (GoPointer { elem: left }, GoPointer { elem: right }) | (
+            GoFunction { signature: left },
+            GoFunction { signature: right },
         ) => {
             call_types_compatible(left, right)
         },
@@ -745,6 +752,10 @@ fn call_types_compatible(left: Type, right: Type) -> bool {
             HashMap { key: left_key, value: left_value },
             HashMap { key: right_key, value: right_value },
         ) => {
+            call_types_compatible(left_key, right_key)
+                && call_types_compatible(left_value, right_value)
+        },
+        (GoMap { key: left_key, value: left_value }, GoMap { key: right_key, value: right_value }) => {
             call_types_compatible(left_key, right_key)
                 && call_types_compatible(left_value, right_value)
         },
@@ -931,6 +942,7 @@ fn context_trait_bound_satisfied(ctx: Checker, bound_ty: Type, reference: TraitR
     let reference = normalize_trait_ref(ctx, reference);
     for predicate in ctx.predicates {
         match predicate {
+            GoComparable(_) => (),
             Trait { for_ty: candidate_ty, trait_ref: candidate_ref } => {
                 if types_equal(normalize_type(ctx, candidate_ty), bound_ty)
                     && trait_ref_equal(normalize_trait_ref(ctx, candidate_ref), reference) {
@@ -946,6 +958,9 @@ fn context_trait_bound_satisfied(ctx: Checker, bound_ty: Type, reference: TraitR
 fn predicates_satisfied_at(ctx: Checker, predicates: Vec[TypePredicate], goals: Vec[string]) -> bool {
     for predicate in predicates {
         match predicate {
+            GoComparable(ty) => if !go_comparable_satisfied(ctx, ty) {
+                return false
+            },
             Trait { for_ty: bound_ty, trait_ref: reference } => {
                 if !trait_bound_satisfied_at(ctx, bound_ty, reference, goals) {
                     return false
@@ -986,6 +1001,14 @@ fn contains_unbound_any_variable(value: Type) -> bool {
             Unbound { id: _, kind: _ } => false,
             Link(inner) => contains_unbound_any_variable(inner),
         },
+        External { import_path: _, name: _, args: values } => {
+            for value in values {
+                if contains_unbound_any_variable(value) {
+                    return true
+                }
+            }
+            false
+        },
         Tuple { items: values } => {
             for value in values {
                 if contains_unbound_any_variable(value) {
@@ -1020,10 +1043,15 @@ fn contains_unbound_any_variable(value: Type) -> bool {
                 false
             }
         },
-        Array { len: _, elem } | Slice { elem } | MutSlice { elem } | VecType { elem } | RefType {
+        Array { len: _, elem } | Slice { elem } | MutSlice { elem } | VecType { elem } | GoPointer {
             elem,
-        } | Channel { elem, direction: _ } => contains_unbound_any_variable(elem),
+        } | GoFunction { signature: elem } | RefType { elem } | Channel { elem, direction: _ } => contains_unbound_any_variable(
+            elem,
+        ),
         HashMap { key, value } => {
+            contains_unbound_any_variable(key) || contains_unbound_any_variable(value)
+        },
+        GoMap { key, value } => {
             contains_unbound_any_variable(key) || contains_unbound_any_variable(value)
         },
         Func { params, ret_ty } => {
@@ -1045,6 +1073,8 @@ fn contains_unbound_any_variable(value: Type) -> bool {
 fn predicate_requirement_message(ctx: Checker, value: TypePredicate, fallback: string) -> string {
     if fallback == "type predicate not satisfied" {
         match value {
+            GoComparable(ty) => "Go map key is not comparable: "
+                + type_text(normalize_type(ctx, ty)),
             Trait { for_ty, trait_ref: reference } => {
                 let mut unresolved = contains_unbound_type_variable(for_ty);
                 let mut ambiguous = contains_unbound_any_variable(for_ty);
@@ -1072,6 +1102,14 @@ fn predicate_requirement_message(ctx: Checker, value: TypePredicate, fallback: s
 fn type_contains_error(value: Type) -> bool {
     match prune(value) {
         Error => true,
+        External { import_path: _, name: _, args: values } => {
+            for value in values {
+                if type_contains_error(value) {
+                    return true
+                }
+            }
+            false
+        },
         Tuple { items: values } => {
             for value in values {
                 if type_contains_error(value) {
@@ -1093,10 +1131,15 @@ fn type_contains_error(value: Type) -> bool {
                 false
             }
         },
-        Array { len: _, elem } | Slice { elem } | MutSlice { elem } | VecType { elem } | RefType {
+        Array { len: _, elem } | Slice { elem } | MutSlice { elem } | VecType { elem } | GoPointer {
             elem,
-        } | Channel { elem, direction: _ } => type_contains_error(elem),
+        } | GoFunction { signature: elem } | RefType { elem } | Channel { elem, direction: _ } => type_contains_error(
+            elem,
+        ),
         HashMap { key, value } => {
+            type_contains_error(key) || type_contains_error(value)
+        },
+        GoMap { key, value } => {
             type_contains_error(key) || type_contains_error(value)
         },
         Func { params, ret_ty } => {
@@ -1117,6 +1160,7 @@ fn type_contains_error(value: Type) -> bool {
 
 fn predicate_contains_error(value: TypePredicate) -> bool {
     match value {
+        GoComparable(ty) => type_contains_error(ty),
         Trait { for_ty, trait_ref: reference } => {
             if type_contains_error(for_ty) {
                 true
@@ -1146,6 +1190,9 @@ fn mark_unresolved_inference_type(ctx: Checker, value: Type) -> () {
             Link(inner) => mark_unresolved_inference_type(ctx, inner),
             _ => (),
         },
+        External { import_path: _, name: _, args: items } => for item in items {
+            mark_unresolved_inference_type(ctx, item)
+        },
         Tuple { items } => for item in items {
             mark_unresolved_inference_type(ctx, item)
         },
@@ -1163,12 +1210,16 @@ fn mark_unresolved_inference_type(ctx: Checker, value: Type) -> () {
                 mark_unresolved_inference_type(ctx, arg)
             }
         },
-        Array { len: _, elem } | Slice { elem } | MutSlice { elem } | VecType { elem } | RefType {
+        Array { len: _, elem } | Slice { elem } | MutSlice { elem } | VecType { elem } | GoPointer {
             elem,
-        } | Channel { elem, direction: _ } => {
+        } | GoFunction { signature: elem } | RefType { elem } | Channel { elem, direction: _ } => {
             mark_unresolved_inference_type(ctx, elem)
         },
         HashMap { key, value } => {
+            mark_unresolved_inference_type(ctx, key);
+            mark_unresolved_inference_type(ctx, value)
+        },
+        GoMap { key, value } => {
             mark_unresolved_inference_type(ctx, key);
             mark_unresolved_inference_type(ctx, value)
         },
@@ -1184,6 +1235,7 @@ fn mark_unresolved_inference_type(ctx: Checker, value: Type) -> () {
 
 fn mark_unresolved_inference_predicate(ctx: Checker, value: TypePredicate) -> () {
     match value {
+        GoComparable(ty) => mark_unresolved_inference_type(ctx, ty),
         Trait { for_ty, trait_ref } => {
             mark_unresolved_inference_type(ctx, for_ty);
             for arg in trait_ref.args {
@@ -1214,6 +1266,9 @@ fn predicate_message_present(
 fn resolve_required_predicates(ctx: Checker) -> bool {
     for requirement in ctx.required_predicates {
         match requirement.predicate {
+            GoComparable(ty) => {
+                let _ = default_numeric_type(ty);
+            },
             Trait { for_ty, trait_ref } => {
                 let _ = default_numeric_type(for_ty);
                 for arg in trait_ref.args {
@@ -1239,6 +1294,7 @@ fn resolve_required_predicates(ctx: Checker) -> bool {
     let spans: Vec[Option[ast::Span]] = Vec::new();
     for requirement in ctx.required_predicates {
         match requirement.predicate {
+            GoComparable(_) => (),
             Trait { for_ty, trait_ref: _ } => {
                 if contains_unbound_type_variable(for_ty) && is_numeric_type(for_ty) {
                     let _ = resolve_type(for_ty);
@@ -1963,6 +2019,7 @@ fn contains_trait_ref(values: Vec[TraitRef], expected: TraitRef) -> bool {
 
 fn predicate_equal(left: TypePredicate, right: TypePredicate) -> bool {
     match (left, right) {
+        (GoComparable(left), GoComparable(right)) => types_equal(left, right),
         (
             Trait { for_ty: left_ty, trait_ref: left_ref },
             Trait { for_ty: right_ty, trait_ref: right_ref },
@@ -2041,6 +2098,7 @@ fn projection_candidates_from_predicates(ctx: Checker, predicates: Vec[TypePredi
     let result: Vec[ProjectionCandidate] = Vec::new();
     for predicate in predicates {
         match predicate {
+            GoComparable(_) => (),
             Trait { for_ty, trait_ref } => match find_trait(ctx, trait_ref.name) {
                 Some(info) => {
                     let associated_names: Vec[string] = Vec::new();
@@ -2131,6 +2189,11 @@ fn resolve_projection_type(
             };
             Type::Projection { for_ty, name, trait_ref }
         },
+        External { import_path, name, args: values } => Type::External {
+            import_path,
+            name,
+            args: resolve_projection_types(ctx, values, candidates, report),
+        },
         Tuple { items: values } => Type::Tuple {
             items: resolve_projection_types(ctx, values, candidates, report),
         },
@@ -2151,6 +2214,12 @@ fn resolve_projection_type(
         VecType { elem } => Type::VecType {
             elem: resolve_projection_type(ctx, elem, candidates, report),
         },
+        GoPointer { elem } => Type::GoPointer {
+            elem: resolve_projection_type(ctx, elem, candidates, report),
+        },
+        GoFunction { signature } => Type::GoFunction {
+            signature: resolve_projection_type(ctx, signature, candidates, report),
+        },
         RefType { elem } => Type::RefType {
             elem: resolve_projection_type(ctx, elem, candidates, report),
         },
@@ -2159,6 +2228,10 @@ fn resolve_projection_type(
             direction,
         },
         HashMap { key, value } => Type::HashMap {
+            key: resolve_projection_type(ctx, key, candidates, report),
+            value: resolve_projection_type(ctx, value, candidates, report),
+        },
+        GoMap { key, value } => Type::GoMap {
             key: resolve_projection_type(ctx, key, candidates, report),
             value: resolve_projection_type(ctx, value, candidates, report),
         },
@@ -2180,6 +2253,9 @@ fn resolve_projection_predicates(
     for predicate in predicates {
         result.push(
             match predicate {
+                GoComparable(ty) => TypePredicate::GoComparable(
+                    resolve_projection_type(ctx, ty, candidates, report),
+                ),
                 Trait { for_ty, trait_ref } => TypePredicate::Trait {
                     for_ty: resolve_projection_type(ctx, for_ty, candidates, report),
                     trait_ref: resolve_projection_trait_ref(ctx, trait_ref, candidates, report),
@@ -2201,6 +2277,7 @@ fn resolve_signature_predicates(ctx: Checker, predicates: Vec[TypePredicate], re
     if report {
         for predicate in predicates {
             match predicate {
+                GoComparable(ty) => validate_signature_type(ctx, ty),
                 Trait { for_ty, trait_ref: reference } => {
                     validate_signature_type(ctx, for_ty);
                     validate_trait_reference(ctx, reference)
@@ -2307,6 +2384,7 @@ fn validate_nominal_application(ctx: Checker, name: string, args: Vec[Type]) -> 
             None => push_diagnostic(ctx, f"Unknown type constructor {name}"),
         },
     }
+    validate_nominal_map_arguments(ctx, name, args);
     for arg in args {
         validate_signature_type(ctx, arg)
     }
@@ -2330,6 +2408,14 @@ fn validate_trait_reference(ctx: Checker, reference: TraitRef) -> () {
 fn type_contains_parameter(value: Type, expected: string) -> bool {
     match prune(value) {
         Param { name } => name == expected,
+        External { import_path: _, name: _, args: values } => {
+            for value in values {
+                if type_contains_parameter(value, expected) {
+                    return true
+                }
+            }
+            false
+        },
         Tuple { items: values } => {
             for value in values {
                 if type_contains_parameter(value, expected) {
@@ -2364,10 +2450,16 @@ fn type_contains_parameter(value: Type, expected: string) -> bool {
                 false
             }
         },
-        Array { len: _, elem } | Slice { elem } | MutSlice { elem } | VecType { elem } | RefType {
+        Array { len: _, elem } | Slice { elem } | MutSlice { elem } | VecType { elem } | GoPointer {
             elem,
-        } | Channel { elem, direction: _ } => type_contains_parameter(elem, expected),
+        } | GoFunction { signature: elem } | RefType { elem } | Channel { elem, direction: _ } => type_contains_parameter(
+            elem,
+            expected,
+        ),
         HashMap { key, value } => {
+            type_contains_parameter(key, expected) || type_contains_parameter(value, expected)
+        },
+        GoMap { key, value } => {
             type_contains_parameter(key, expected) || type_contains_parameter(value, expected)
         },
         Func { params, ret_ty } => {
@@ -2389,6 +2481,14 @@ fn type_contains_parameter(value: Type, expected: string) -> bool {
 fn type_contains_unbound_dyn_self(value: Type, associated_types: Vec[(string, Type)]) -> bool {
     match prune(value) {
         Param { name } => name == "Self",
+        External { import_path: _, name: _, args: values } => {
+            for value in values {
+                if type_contains_unbound_dyn_self(value, associated_types) {
+                    return true
+                }
+            }
+            false
+        },
         Tuple { items: values } => {
             for value in values {
                 if type_contains_unbound_dyn_self(value, associated_types) {
@@ -2427,10 +2527,17 @@ fn type_contains_unbound_dyn_self(value: Type, associated_types: Vec[(string, Ty
                 false
             }
         },
-        Array { len: _, elem } | Slice { elem } | MutSlice { elem } | VecType { elem } | RefType {
+        Array { len: _, elem } | Slice { elem } | MutSlice { elem } | VecType { elem } | GoPointer {
             elem,
-        } | Channel { elem, direction: _ } => type_contains_unbound_dyn_self(elem, associated_types),
+        } | GoFunction { signature: elem } | RefType { elem } | Channel { elem, direction: _ } => type_contains_unbound_dyn_self(
+            elem,
+            associated_types,
+        ),
         HashMap { key, value } => {
+            type_contains_unbound_dyn_self(key, associated_types)
+                || type_contains_unbound_dyn_self(value, associated_types)
+        },
+        GoMap { key, value } => {
             type_contains_unbound_dyn_self(key, associated_types)
                 || type_contains_unbound_dyn_self(value, associated_types)
         },
@@ -2586,16 +2693,30 @@ fn validate_signature_type(ctx: Checker, value: Type) -> () {
                 validate_trait_reference(ctx, reference)
             }
         },
+        External { import_path: _, name: _, args: values } => for value in values {
+            validate_signature_type(ctx, value)
+        },
         Tuple { items: values } => for value in values {
             validate_signature_type(ctx, value)
         },
         Array { len: _, elem: element } | Slice { elem: element } | MutSlice { elem: element } | VecType {
             elem: element,
-        } | RefType { elem: element } | Channel { elem: element, direction: _ } => validate_signature_type(
-            ctx,
-            element,
-        ),
+        } | GoPointer { elem: element } | RefType { elem: element } | Channel {
+            elem: element,
+            direction: _,
+        } => validate_signature_type(ctx, element),
         HashMap { key, value } => {
+            validate_signature_type(ctx, key);
+            validate_signature_type(ctx, value)
+        },
+        GoFunction { signature } => {
+            if let Some(error) = invalid_go_function_signature(ctx, Type::GoFunction { signature }) {
+                push_diagnostic(ctx, error)
+            }
+            validate_signature_type(ctx, signature)
+        },
+        GoMap { key, value } => {
+            validate_go_map_key(ctx, key);
             validate_signature_type(ctx, key);
             validate_signature_type(ctx, value)
         },
@@ -2647,6 +2768,7 @@ fn expand_type_alias_inner(ctx: Checker, value: Type, stack: Vec[string], report
                 }
                 Type::Error
             } else {
+                record_external_type_application(ctx, alias, Vec::new());
                 let next: Vec[string] = Vec::new();
                 for item in stack {
                     next.push(item)
@@ -2677,6 +2799,7 @@ fn expand_type_alias_inner(ctx: Checker, value: Type, stack: Vec[string], report
                         }
                         Type::Error
                     } else {
+                        record_external_type_application(ctx, alias, expanded_args);
                         let substitutions: Vec[TypeSubst] = Vec::new();
                         for index in 0..alias.generics.len() {
                             substitutions.push(
@@ -2706,6 +2829,31 @@ fn expand_type_alias_inner(ctx: Checker, value: Type, stack: Vec[string], report
                 },
             }
         },
+        Dyn { trait_name, args, associated_types, additional_bounds } => {
+            let primary = expand_type_alias_dyn_bound(
+                ctx,
+                DynTraitBound { trait_name, args, associated_types },
+                stack,
+                report,
+            );
+            let additional: Vec[DynTraitBound] = Vec::new();
+            for bound in additional_bounds {
+                additional.push(expand_type_alias_dyn_bound(ctx, bound, stack, report))
+            }
+            Type::Dyn {
+                trait_name: primary.trait_name,
+                args: primary.args,
+                associated_types: primary.associated_types,
+                additional_bounds: additional,
+            }
+        },
+        External { import_path, name, args: values } => {
+            let result: Vec[Type] = Vec::new();
+            for item in values {
+                result.push(expand_type_alias_inner(ctx, item, stack, report))
+            }
+            Type::External { import_path, name, args: result }
+        },
         Tuple { items: values } => {
             let result: Vec[Type] = Vec::new();
             for item in values {
@@ -2734,6 +2882,12 @@ fn expand_type_alias_inner(ctx: Checker, value: Type, stack: Vec[string], report
         VecType { elem } => Type::VecType {
             elem: expand_type_alias_inner(ctx, elem, stack, report),
         },
+        GoPointer { elem } => Type::GoPointer {
+            elem: expand_type_alias_inner(ctx, elem, stack, report),
+        },
+        GoFunction { signature } => Type::GoFunction {
+            signature: expand_type_alias_inner(ctx, signature, stack, report),
+        },
         RefType { elem } => Type::RefType {
             elem: expand_type_alias_inner(ctx, elem, stack, report),
         },
@@ -2742,6 +2896,10 @@ fn expand_type_alias_inner(ctx: Checker, value: Type, stack: Vec[string], report
             direction,
         },
         HashMap { key, value } => Type::HashMap {
+            key: expand_type_alias_inner(ctx, key, stack, report),
+            value: expand_type_alias_inner(ctx, value, stack, report),
+        },
+        GoMap { key, value } => Type::GoMap {
             key: expand_type_alias_inner(ctx, key, stack, report),
             value: expand_type_alias_inner(ctx, value, stack, report),
         },
@@ -2756,6 +2914,22 @@ fn expand_type_alias_inner(ctx: Checker, value: Type, stack: Vec[string], report
             }
         },
         other => other,
+    }
+}
+
+fn expand_type_alias_dyn_bound(ctx: Checker, value: DynTraitBound, stack: Vec[string], report: bool) -> DynTraitBound {
+    let reference = canonical_resolved_trait_ref(
+        ctx,
+        TraitRef { name: value.trait_name, args: value.args },
+    );
+    let associated: Vec[(string, Type)] = Vec::new();
+    for binding in value.associated_types {
+        associated.push((binding.0, expand_type_alias_inner(ctx, binding.1, stack, report)))
+    }
+    DynTraitBound {
+        trait_name: reference.name,
+        args: expand_type_alias_types(ctx, value.args, stack, report),
+        associated_types: associated,
     }
 }
 
@@ -2787,6 +2961,9 @@ fn expand_type_alias_predicates(ctx: Checker, values: Vec[TypePredicate], report
     for value in values {
         result.push(
             match value {
+                GoComparable(ty) => TypePredicate::GoComparable(
+                    expand_type_aliases(ctx, ty, report),
+                ),
                 Trait { for_ty, trait_ref } => TypePredicate::Trait {
                     for_ty: expand_type_aliases(ctx, for_ty, report),
                     trait_ref: expand_type_alias_trait_ref(ctx, trait_ref, report),
@@ -2890,6 +3067,7 @@ fn expand_implied_predicates(ctx: Checker, predicates: Vec[TypePredicate]) -> Ve
         let predicate = result[index];
         index += 1;
         match predicate {
+            GoComparable(_) => (),
             Trait { for_ty, trait_ref: reference } => {
                 for application in trait_ref_closure(ctx, reference) {
                     push_predicate(result, TypePredicate::Trait { for_ty, trait_ref: application });
@@ -2940,6 +3118,7 @@ fn resolve_predicate_method(ctx: Checker, receiver: Type, name: string, method_e
     let candidates = text::StringBuilder::new();
     for predicate in ctx.predicates {
         match predicate {
+            GoComparable(_) => (),
             Trait { for_ty: bound_ty, trait_ref: reference } => {
                 if types_equal(normalize_type(ctx, bound_ty), receiver) {
                     if let Some(value) = resolve_trait_reference_method(

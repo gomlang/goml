@@ -1,0 +1,237 @@
+package main;
+
+use module::artifact;
+use module::ast;
+use module::ffi;
+use module::hir;
+use module::tast;
+use std::fs;
+use std::text;
+
+fn validate_interface_adapter_metadata(
+    specification: ast::GoInterfaceSpec,
+    trait_info: tast::TraitInfo,
+    raw_type: tast::Type,
+    metadata: ffi::TypeDeclarations,
+) -> Result[bool, string] {
+    let expected = tast::foreign_bridge_type(raw_type, Vec::new(), false)?;
+    let mut found = false;
+    for declaration in metadata.declarations {
+        let template = ffi::resolve_go_type_template(metadata, declaration.type_id)?;
+        let Ok(actual) = ffi::go_identity_bridge_type(template.identity) else {
+            continue
+        };
+        if ffi::bridge_types_equal(actual, expected) {
+            let shape = ffi::resolve_go_interface_shape(metadata, declaration.type_id)?;
+            let plan = tast::plan_go_interface_adapter(specification, trait_info, shape)?;
+            if !tast::types_equal(plan.raw_type, raw_type) {
+                return Result::Err("go_interface raw receiver identity mismatch")
+            }
+            found = true;
+        }
+    }
+    Result::Ok(found)
+}
+
+fn validate_interface_adapter_members(
+    file: hir::File,
+    specification: ast::GoInterfaceSpec,
+    wrapper: string,
+    typed: tast::File,
+) -> Result[(), string] {
+    for item in typed.items {
+        if let tast::Item::ImplBlock(block) = item {
+            if !tast::types_equal(block.for_type, tast::Type::Con { name: wrapper }) {
+                continue
+            }
+            for method in block.methods {
+                let mut reserved = method.name == "from_go" || method.name == "into_go"
+                    || method.name == "from_trait";
+                for mapping in specification.methods {
+                    if mapping.0 == method.name {
+                        reserved = true;
+                    }
+                }
+                if reserved
+                    && (method.source_path != file.source_path
+                        || method.name_span.start != specification.span.start
+                        || method.name_span.end != specification.span.end) {
+                    return Result::Err(
+                        "go_interface generated member collides with " + wrapper + "::"
+                            + method.name,
+                    )
+                }
+            }
+        }
+    }
+    Result::Ok(())
+}
+
+fn interface_adapter_diagnostic(message: string, source_path: string, span: ast::Span) -> string {
+    let output = text::StringBuilder::new();
+    output.write_string("ffi-interface: " + message + "\n");
+    render_diagnostic_label(
+        output,
+        "primary",
+        source_path,
+        span,
+        Option::Some("Go interface adapter declaration"),
+        source_path,
+        fs::read_file_structured(source_path).unwrap_or(""),
+    );
+    output.finish()
+}
+
+fn validate_interface_adapter_definition(
+    file: hir::File,
+    definition: hir::TraitDef,
+    specification: ast::GoInterfaceSpec,
+    signatures: tast::PackageSignatures,
+    typed: tast::File,
+    external: tast::ExternalTypeEnvironment,
+    dependencies: Vec[artifact::ArtifactInterfaceUnit],
+) -> Result[(), string] {
+    let wrapper = file.package_name + "::" + specification.wrapper_name;
+    let mut raw_type: Option[tast::Type] = Option::None;
+    for structure in typed.structs {
+        if structure.name == wrapper {
+            for field in structure.fields {
+                if field.0 == "raw" {
+                    raw_type = Option::Some(field.1);
+                }
+            }
+        }
+    }
+    let raw_type = raw_type.ok_or("go_interface generated wrapper is missing: " + wrapper)?;
+    validate_interface_adapter_members(file, specification, wrapper, typed)?;
+    let mut info: Option[tast::TraitInfo] = Option::None;
+    for candidate in signatures.traits {
+        if candidate.name == definition.name {
+            info = Option::Some(candidate);
+        }
+    }
+    let info = info.ok_or("go_interface trait signature is missing: " + definition.name)?;
+    let mut found = validate_interface_adapter_metadata(
+        specification,
+        info,
+        raw_type,
+        external.metadata,
+    )?;
+    for dependency in dependencies {
+        if let Some(metadata) = dependency.foreign_types {
+            if validate_interface_adapter_metadata(
+                specification,
+                info,
+                raw_type,
+                metadata.declarations,
+            )? {
+                found = true;
+            }
+        }
+    }
+    if !found {
+        return Result::Err(
+            "go_interface requires verified external interface metadata for "
+                + specification.raw_type,
+        )
+    }
+    Result::Ok(())
+}
+
+fn validate_package_interface_adapters(
+    files: Vec[hir::File],
+    signatures: tast::PackageSignatures,
+    typed: tast::File,
+    external: tast::ExternalTypeEnvironment,
+    dependencies: Vec[artifact::ArtifactInterfaceUnit],
+) -> Result[(), string] {
+    for file in files {
+        for item in file.items {
+            let hir::Item::TraitDef(definition) = item else {
+                continue
+            };
+            let Some(specification) = ast::go_interface_spec(definition.attrs)? else {
+                continue
+            };
+            validate_interface_adapter_definition(
+                file,
+                definition,
+                specification,
+                signatures,
+                typed,
+                external,
+                dependencies,
+            ).map_err(
+                |message| interface_adapter_diagnostic(
+                    message,
+                    file.source_path,
+                    specification.span,
+                ),
+            )?;
+        }
+    }
+    Result::Ok(())
+}
+
+fn interface_item_name(item: ast::Item) -> Option[string] {
+    match item {
+        Function(value) => Option::Some(value.name),
+        ExternFunction(value) => Option::Some(value.name),
+        ExternType(value) => Option::Some(value.name),
+        StructDef(value) => Option::Some(value.name),
+        EnumDef(value) => Option::Some(value.name),
+        TraitDef(value) => Option::Some(value.name),
+        TypeAlias(value) => Option::Some(value.name),
+        Constant(value) => Option::Some(value.name),
+        Static(value) => Option::Some(value.name),
+        ImplBlock(_) => Option::None,
+    }
+}
+
+fn validate_package_interface_names(files: Vec[ast::LowerResult], paths: Vec[string]) -> Result[
+    (),
+    string,
+] {
+    let names: Vec[string] = Vec::new();
+    for value in files {
+        if let Some(file) = value.ast {
+            for item in file.items {
+                if let Some(name) = interface_item_name(item) {
+                    names.push(name);
+                }
+            }
+        }
+    }
+    for index in 0..files.len() {
+        if let Some(file) = files[index].ast {
+            for item in file.items {
+                if let ast::Item::TraitDef(definition) = item {
+                    if let Ok(Some(specification)) = ast::go_interface_spec(definition.attrs) {
+                        let generated = Vec::from_array([specification.wrapper_name]);
+                        generated.push(
+                            "__goml_interface_" + specification.wrapper_name + "_from_trait",
+                        );
+                        for mapping in specification.methods {
+                            generated.push(
+                                "__goml_interface_" + specification.wrapper_name + "_" + mapping.0,
+                            );
+                        }
+                        for name in generated {
+                            if names.contains(name) {
+                                return Result::Err(
+                                    interface_adapter_diagnostic(
+                                        "go_interface generated declaration collides with " + name,
+                                        paths[index],
+                                        specification.span,
+                                    ),
+                                )
+                            }
+                            names.push(name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Result::Ok(())
+}

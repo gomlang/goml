@@ -1,0 +1,231 @@
+package project;
+
+use module::version;
+use std::fs;
+use std::io;
+use std::json;
+use std::path;
+
+struct GoExportProduct {
+    source: string,
+    package_name: string,
+    import_path: string,
+    api: Vec[json::Value],
+    prerequisites: json::Value,
+}
+
+struct GoExportPrevious {
+    source: Option[string],
+    manifest: Option[string],
+}
+
+fn export_optional_file(file: string) -> Result[Option[string], string] {
+    match fs::symlink_metadata(file) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Result::Err("export-go: output must be a regular file: " + file)
+            }
+            Result::Ok(
+                Option::Some(fs::read_file_structured(file).map_err(|error| error.to_string())?),
+            )
+        },
+        Err(error) => if error.kind() == io::ErrorKind::NotFound {
+            Result::Ok(Option::None)
+        } else {
+            Result::Err(error.to_string())
+        },
+    }
+}
+
+fn export_read_previous(directory: string) -> Result[GoExportPrevious, string] {
+    Result::Ok(
+        GoExportPrevious {
+            source: export_optional_file(path::join(directory, "goml_generated.go"))?,
+            manifest: export_optional_file(path::join(directory, "goml_exports.json"))?,
+        },
+    )
+}
+
+fn export_json_field(value: json::Value, name: string) -> Result[json::Value, string] {
+    json::field(value, name).ok_or("export-go: invalid ownership manifest: missing " + name)
+}
+
+fn export_json_string(value: json::Value, name: string) -> Result[string, string] {
+    json::as_string(export_json_field(value, name)?).ok_or(
+        "export-go: invalid ownership manifest field " + name,
+    )
+}
+
+fn export_check_previous(previous: GoExportPrevious) -> Result[(), string] {
+    match (previous.source, previous.manifest) {
+        (None, None) => Result::Ok(()),
+        (Some(source), Some(encoded)) => {
+            let envelope = json::parse(encoded).map_err(
+                |error| "export-go: invalid ownership manifest: " + error,
+            )?;
+            if json::encode(envelope) + "\n" != encoded {
+                return Result::Err("export-go: ownership manifest was modified")
+            }
+            let payload = export_json_field(envelope, "payload")?;
+            if export_json_string(envelope, "sha256")? != sha256_text(json::encode(payload)) {
+                return Result::Err("export-go: ownership manifest was modified")
+            }
+            if export_json_string(payload, "generator")? != "goml"
+                || json::as_int(export_json_field(payload, "protocol")?) != Option::Some(1) {
+                return Result::Err("export-go: unsupported ownership manifest")
+            }
+            if export_json_string(payload, "manifest_name")? != "goml_exports.json" {
+                return Result::Err("export-go: unsupported ownership manifest name")
+            }
+            let files = json::as_array(export_json_field(payload, "files")?).ok_or(
+                "export-go: invalid owned files",
+            )?;
+            if files.len() != 1 || export_json_string(files[0], "name")? != "goml_generated.go" {
+                return Result::Err("export-go: unsupported owned files")
+            }
+            if export_json_string(files[0], "sha256")? != sha256_text(source) {
+                return Result::Err(
+                    "export-go: goml_generated.go was modified; refusing to overwrite it",
+                )
+            }
+            Result::Ok(())
+        },
+        _ => Result::Err(
+            "export-go: generated output has no complete ownership manifest; refusing to overwrite it",
+        ),
+    }
+}
+
+fn export_manifest(product: GoExportProduct) -> string {
+    let payload = json::object(
+        Vec::from_array(
+            [
+                ("generator", json::Value::String("goml")),
+                ("version", json::Value::String(version::current())),
+                ("protocol", json::Value::Number("1")),
+                ("manifest_name", json::Value::String("goml_exports.json")),
+                ("package", json::Value::String(product.package_name)),
+                ("import_path", json::Value::String(product.import_path)),
+                ("api", json::Value::Array(product.api)),
+                ("prerequisites", product.prerequisites),
+                (
+                    "files",
+                    json::Value::Array(
+                        Vec::from_array(
+                            [
+                                json::object(
+                                    Vec::from_array(
+                                        [
+                                            ("name", json::Value::String("goml_generated.go")),
+                                            (
+                                                "sha256",
+                                                json::Value::String(sha256_text(product.source)),
+                                            ),
+                                        ],
+                                    ),
+                                ),
+                            ],
+                        ),
+                    ),
+                ),
+            ],
+        ),
+    );
+    json::encode(
+        json::object(
+            Vec::from_array(
+                [
+                    ("payload", payload),
+                    ("sha256", json::Value::String(sha256_text(json::encode(payload)))),
+                ],
+            ),
+        ),
+    )
+        + "\n"
+}
+
+fn export_restore_source(directory: string, staging: string, previous: Option[string]) -> Result[
+    (),
+    string,
+] {
+    let output = path::join(directory, "goml_generated.go");
+    match previous {
+        Some(source) => {
+            let restore = path::join(staging, "restore.go");
+            fs::write_file_structured(restore, source).map_err(|error| error.to_string())?;
+            fs::rename(restore, output).map_err(|error| error.to_string())
+        },
+        None => fs::remove_file(output).map_err(|error| error.to_string()),
+    }
+}
+
+fn export_publish_locked(
+    directory: string,
+    staging: string,
+    produce: (string) -> Result[GoExportProduct, string],
+) -> Result[(), string] {
+    let previous = export_read_previous(directory)?;
+    export_check_previous(previous)?;
+    let product = produce(staging)?;
+    let source_path = path::join(staging, "new.go");
+    let manifest_path = path::join(staging, "new.json");
+    fs::write_file_structured(source_path, product.source).map_err(|error| error.to_string())?;
+    fs::write_file_structured(manifest_path, export_manifest(product)).map_err(
+        |error| error.to_string(),
+    )?;
+    let current = export_read_previous(directory)?;
+    if current.source != previous.source || current.manifest != previous.manifest {
+        return Result::Err("export-go: output changed during generation")
+    }
+    export_commit_files(directory, staging, source_path, manifest_path, previous.source)
+}
+
+fn export_commit_files(
+    directory: string,
+    staging: string,
+    source_path: string,
+    manifest_path: string,
+    previous_source: Option[string],
+) -> Result[(), string] {
+    fs::rename(source_path, path::join(directory, "goml_generated.go")).map_err(
+        |error| error.to_string(),
+    )?;
+    if let Err(error) = fs::rename(manifest_path, path::join(directory, "goml_exports.json")) {
+        if let Err(restore) = export_restore_source(directory, staging, previous_source) {
+            return Result::Err(
+                "export-go: publication failed: " + error.to_string() + "; rollback failed: "
+                    + restore,
+            )
+        }
+        return Result::Err("export-go: publication failed: " + error.to_string())
+    }
+    Result::Ok(())
+}
+
+fn with_export_output(directory: string, produce: (string) -> Result[GoExportProduct, string]) -> Result[
+    (),
+    string,
+] {
+    fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    let staging = path::join(directory, ".goml-export-lock");
+    fs::create_dir(staging).map_err(
+        |error| if error.kind() == io::ErrorKind::AlreadyExists {
+            "export-go: output is locked by another generation: " + directory
+        } else {
+            error.to_string()
+        },
+    )?;
+    let result = export_publish_locked(directory, staging, produce);
+    let cleanup = fs::remove_dir_all(staging).map_err(|error| error.to_string());
+    match result {
+        Ok(()) => {
+            if let Err(error) = cleanup {
+                io::eprintln(
+                    "warning[export-go]: output published, but lock cleanup failed: " + error,
+                )
+            }
+            Result::Ok(())
+        },
+        Err(error) => Result::Err(error),
+    }
+}

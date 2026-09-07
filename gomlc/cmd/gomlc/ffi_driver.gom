@@ -1,0 +1,228 @@
+package main;
+
+use module::ffi;
+use module::artifact;
+use module::tast;
+use std::json;
+use std::fs;
+use std::path;
+use std::bytes;
+use std::process;
+use std::time;
+use std::utf8;
+use utf8::BytesUtf8;
+
+fn foreign_output_verification(output: process::Output, bindings: Vec[ffi::ForeignBinding]) -> Result[
+    ffi::Verification,
+    string,
+] {
+    foreign_output_verification_with_locations(output, bindings, HashMap::new())
+}
+
+fn foreign_output_verification_with_locations(
+    output: process::Output,
+    bindings: Vec[ffi::ForeignBinding],
+    locations: HashMap[string, string],
+) -> Result[ffi::Verification, string] {
+    if output.stdout().len() > 8388608 || output.stderr().len() > 8388608 {
+        return Result::Err("ffi-protocol: helper output exceeds limit")
+    }
+    let stdout = output.stdout().to_string_utf8().map_err(
+        |_| "ffi-protocol: helper response is not UTF-8",
+    )?;
+    if stdout == "" {
+        let stderr = output.stderr().to_string_utf8().unwrap_or("invalid UTF-8 on stderr");
+        return Result::Err("ffi-tool-unavailable: helper returned no protocol response: " + stderr)
+    }
+    let verification = ffi::decode_verification_with_locations(stdout, bindings, locations)?;
+    if output.status().success() {
+        Result::Ok(verification)
+    } else {
+        Result::Err("ffi-protocol: helper reported success with a failing exit status")
+    }
+}
+
+fn run_foreign_validation(
+    mode: ffi::CheckMode,
+    helper: string,
+    context: ffi::GoBuildContext,
+    caller: ffi::CallerContext,
+    bindings: Vec[ffi::ForeignBinding],
+) -> Result[ffi::Verification, string] {
+    run_foreign_validation_with_locations(mode, helper, context, caller, bindings, HashMap::new())
+}
+
+fn run_foreign_validation_with_locations(
+    mode: ffi::CheckMode,
+    helper: string,
+    context: ffi::GoBuildContext,
+    caller: ffi::CallerContext,
+    bindings: Vec[ffi::ForeignBinding],
+    locations: HashMap[string, string],
+) -> Result[ffi::Verification, string] {
+    if bindings.is_empty() {
+        return Result::Ok(ffi::Verification::Unverified)
+    }
+    match mode {
+        Off => return Result::Ok(ffi::Verification::Unverified),
+        Required => (),
+    }
+    let input = ffi::encode_request(context, caller, bindings);
+    if input.byte_len() > 8388608 {
+        return Result::Err("ffi-protocol: helper request exceeds limit")
+    }
+    let output = process::Command::new(helper).arg("--timeout=2m").current_dir(context.module_dir).input(
+        bytes::Bytes::from_string(input),
+    ).output_timeout_structured(time::Duration::from_milliseconds(125000)).map_err(
+        |error| "ffi-tool-unavailable: " + error.to_string(),
+    )?;
+    foreign_output_verification_with_locations(output, bindings, locations)
+}
+
+fn foreign_artifact_bindings(package_name: string, exports: artifact::ArtifactPackageExports) -> Result[
+    Vec[ffi::ForeignBinding],
+    string,
+] {
+    foreign_artifact_bindings_with_traits(package_name, exports, Vec::new())
+}
+
+fn foreign_artifact_bindings_with_traits(
+    package_name: string,
+    exports: artifact::ArtifactPackageExports,
+    inherited_traits: Vec[tast::TraitInfo],
+) -> Result[Vec[ffi::ForeignBinding], string] {
+    let traits: Vec[tast::TraitInfo] = Vec::new();
+    for trait_info in inherited_traits {
+        traits.push(trait_info)
+    }
+    for definition in exports.traits {
+        traits.push(artifact_dependency_trait(definition)?)
+    }
+    let result: Vec[ffi::ForeignBinding] = Vec::new();
+    for scheme in exports.functions {
+        match scheme.body {
+            GoForeign { .. } | GoMethod { .. } => (),
+            _ => continue,
+        }
+        let function = artifact_dependency_function_scheme(
+            scheme,
+            Vec::new(),
+            Vec::new(),
+            scheme.body,
+        )?;
+        let id = package_name + ":" + function.name;
+        match tast::foreign_binding(id, function, traits) {
+            Ok(Some(binding)) => result.push(binding),
+            Ok(None) => (),
+            Err(message) => return Result::Err(id + ": " + message),
+        }
+    }
+    Result::Ok(result)
+}
+
+fn foreign_go_env_string(value: json::Value, name: string) -> Result[string, string] {
+    match json::field(value, name) {
+        Some(value) => json::as_string(value).ok_or(
+            "ffi-protocol: invalid Go environment field " + name,
+        ),
+        None => Result::Err("ffi-protocol: missing Go environment field " + name),
+    }
+}
+
+fn resolve_foreign_build_context(go_program: string, module_dir: string) -> Result[
+    ffi::GoBuildContext,
+    string,
+] {
+    let go_executable = process::look_path_structured(go_program).map_err(
+        |error| "ffi-tool-unavailable: " + error.to_string(),
+    )?;
+    let go_executable = path::absolute_structured(go_executable).map_err(|error| error.to_string())?;
+    let module_dir = fs::canonicalize(module_dir).map_err(|error| error.to_string())?;
+    let module_mode = if fs::is_file(path::join(module_dir, "go.mod")) {
+        "on"
+    } else {
+        "off"
+    };
+    let output = process::Command::new(go_executable).args(
+        Vec::from_array(["env", "-json", "GOVERSION", "GOOS", "GOARCH", "CGO_ENABLED", "GOFLAGS"]),
+    ).current_dir(module_dir).env("GOWORK", "off").env("GO111MODULE", module_mode).env(
+        "GOTOOLCHAIN",
+        "local",
+    ).output_timeout_structured(time::Duration::from_milliseconds(30000)).map_err(
+        |error| "ffi-tool-unavailable: " + error.to_string(),
+    )?;
+    if !output.status().success() {
+        return Result::Err("ffi-tool-unavailable: could not resolve Go build context")
+    }
+    let stdout = output.stdout().to_string_utf8().map_err(
+        |_| "ffi-protocol: invalid Go environment encoding",
+    )?;
+    let value = json::parse(stdout).map_err(|message| "ffi-protocol: " + message)?;
+    Result::Ok(
+        ffi::GoBuildContext {
+            go_executable,
+            toolchain: foreign_go_env_string(value, "GOVERSION")?,
+            module_dir,
+            goos: foreign_go_env_string(value, "GOOS")?,
+            goarch: foreign_go_env_string(value, "GOARCH")?,
+            cgo_enabled: foreign_go_env_string(value, "CGO_ENABLED")?,
+            goflags: foreign_go_env_string(value, "GOFLAGS")?,
+            build_tags: Vec::new(),
+            go111module: module_mode,
+            gowork: "off",
+            dependencies: "readonly",
+            network: "off",
+        },
+    )
+}
+
+fn foreign_interface_bindings(
+    unit: artifact::ArtifactInterfaceUnit,
+    inherited_traits: Vec[tast::TraitInfo],
+) -> Result[Vec[ffi::ForeignBinding], string] {
+    let public_bindings = foreign_artifact_bindings_with_traits(
+        unit.package_name,
+        unit.exports,
+        inherited_traits,
+    )?;
+    ffi::merge_bindings(unit.foreign_bindings, public_bindings)
+}
+
+fn foreign_go_process(context: ffi::GoBuildContext, arguments: Vec[string]) -> process::Command {
+    process::Command::new(context.go_executable).args(arguments).current_dir(context.module_dir).env(
+        "GOOS",
+        context.goos,
+    ).env("GOARCH", context.goarch).env("CGO_ENABLED", context.cgo_enabled).env(
+        "GOFLAGS",
+        context.goflags,
+    ).env("GO111MODULE", context.go111module).env("GOWORK", context.gowork).env(
+        "GOTOOLCHAIN",
+        "local",
+    ).env("GOPROXY", "off").env("GOSUMDB", "off").env("GOVCS", "*:off").env("GONOPROXY", "none").env(
+        "GONOSUMDB",
+        "*",
+    )
+}
+
+fn foreign_module_import_path(context: ffi::GoBuildContext) -> Result[string, string] {
+    if context.go111module == "off" {
+        return Result::Ok("")
+    }
+    let output = foreign_go_process(
+        context,
+        Vec::from_array(["list", "-mod=readonly", "-m", "-json"]),
+    ).output_timeout_structured(time::Duration::from_milliseconds(30000)).map_err(
+        |error| "ffi-package-load: " + error.to_string(),
+    )?;
+    if !output.status().success() {
+        return Result::Err(
+            "ffi-package-load: "
+                + output.stderr().to_string_utf8().unwrap_or("could not read Go module identity"),
+        )
+    }
+    let source = output.stdout().to_string_utf8().map_err(
+        |_| "ffi-protocol: invalid Go module metadata encoding",
+    )?;
+    let value = json::parse(source).map_err(|error| "ffi-protocol: " + error)?;
+    foreign_go_env_string(value, "Path")
+}

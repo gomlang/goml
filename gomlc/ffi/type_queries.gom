@@ -1,0 +1,216 @@
+package ffi;
+
+use std::json;
+
+pub struct TypeDeclarationQuery {
+    pub type_id: string,
+    pub import_path: string,
+    pub name: string,
+}
+
+pub struct TypeDeclaration {
+    pub type_id: string,
+    pub kind: string,
+    pub declared_type: string,
+}
+
+pub struct TypeDeclarations {
+    pub go_world_identity: string,
+    pub declarations: Vec[TypeDeclaration],
+    pub nodes: HashMap[string, json::Value],
+}
+
+pub fn encode_type_declarations(
+    context: GoBuildContext,
+    caller: CallerContext,
+    queries: Vec[TypeDeclarationQuery],
+) -> Result[string, string] {
+    if queries.len() > 4096 {
+        return Result::Err("ffi-protocol: too many type queries")
+    }
+    let seen: HashMap[string, bool] = HashMap::new();
+    let values: Vec[json::Value] = Vec::new();
+    for query in queries {
+        if query.type_id == "" || seen[query.type_id].is_some() || query.import_path == ""
+            || query.name == "" {
+            return Result::Err("ffi-protocol: invalid or duplicate type query")
+        }
+        seen[query.type_id] = true;
+        values.push(
+            json::object(
+                Vec::from_array(
+                    [
+                        ("type_id", json::Value::String(query.type_id)),
+                        ("import_path", json::Value::String(query.import_path)),
+                        ("name", json::Value::String(query.name)),
+                        ("query_mode", json::Value::String("declaration")),
+                    ],
+                ),
+            ),
+        )
+    }
+    let base = json::parse(encode_request(context, caller, Vec::new()))?;
+    let Object(fields) = base else {
+        return Result::Err("ffi-protocol: invalid encoded request")
+    };
+    fields.push(("type_queries", json::Value::Array(values)));
+    let encoded = json::encode(json::Value::Object(fields));
+    if encoded.byte_len() > 8388608 {
+        Result::Err("ffi-protocol: type request exceeds limit")
+    } else {
+        Result::Ok(encoded)
+    }
+}
+
+fn type_node_reference(nodes: HashMap[string, string], value: json::Value) -> Result[(), string] {
+    let id = json::as_string(value).ok_or("ffi-protocol: type reference is not a string")?;
+    if nodes[id].is_none() {
+        Result::Err("ffi-protocol: unknown type reference " + id)
+    } else {
+        Result::Ok(())
+    }
+}
+
+fn validate_type_node_links(ids: HashMap[string, string], node: json::Value) -> Result[(), string] {
+    let Object(fields) = node else {
+        return Result::Err("ffi-protocol: invalid type node")
+    };
+    let seen: HashMap[string, bool] = HashMap::new();
+    for (name, value) in fields {
+        if seen[name].is_some() {
+            return Result::Err("ffi-protocol: duplicate type node field " + name)
+        }
+        seen[name] = true;
+        match name {
+            "element" | "key" | "underlying" | "origin" | "receiver" | "constraint" => type_node_reference(
+                ids,
+                value,
+            )?,
+            "parameters" | "results" | "type_arguments" | "type_parameters" | "embedded" => {
+                let values = json::as_array(value).ok_or(
+                    "ffi-protocol: invalid type reference list",
+                )?;
+                for value in values {
+                    type_node_reference(ids, value)?
+                }
+            },
+            "fields" | "methods" | "interface_methods" | "terms" => {
+                let values = json::as_array(value).ok_or("ffi-protocol: invalid type member list")?;
+                for value in values {
+                    type_node_reference(ids, response_field(value, "type")?)?
+                }
+            },
+            "runtime_interface" => if json::as_bool(value).is_none() {
+                return Result::Err("ffi-protocol: invalid runtime interface flag")
+            },
+            _ => (),
+        }
+    }
+    let tag = response_string(node, "tag")?;
+    if tag != "interface"
+        && (seen["runtime_interface"].is_some() || seen["interface_methods"].is_some()) {
+        return Result::Err("ffi-protocol: interface metadata on a non-interface type")
+    }
+    let required = match tag {
+        "pointer" | "array" | "slice" | "channel" => Vec::from_array(["element"]),
+        "map" => Vec::from_array(["element", "key"]),
+        "named" | "alias" => Vec::from_array(["underlying"]),
+        "type_parameter" => Vec::from_array(["constraint"]),
+        _ => Vec::new(),
+    };
+    for field in required {
+        type_node_reference(ids, response_field(node, field)?)?
+    }
+    if tag == "named" || tag == "alias" || tag == "basic" {
+        if response_string(node, "name")? == "" {
+            return Result::Err("ffi-protocol: empty type name")
+        }
+    }
+    Result::Ok(())
+}
+
+pub fn decode_type_declarations(input: string, expected: Vec[TypeDeclarationQuery]) -> Result[
+    TypeDeclarations,
+    string,
+] {
+    if input.byte_len() > 8388608 || !response_nesting_is_bounded(input) {
+        return Result::Err("ffi-protocol: invalid type response JSON")
+    }
+    let value = json::parse(input).map_err(|error| "ffi-protocol: " + error)?;
+    if json::as_int(response_field(value, "protocol_version")?) != Option::Some(1) {
+        return Result::Err("ffi-protocol: unsupported response version")
+    }
+    let diagnostics = response_array(value, "diagnostics")?;
+    if !diagnostics.is_empty() {
+        return Result::Err(diagnostic_text(diagnostics[0])?)
+    }
+    if !response_array(value, "bindings")?.is_empty() {
+        return Result::Err("ffi-protocol: unexpected function binding results")
+    }
+    let ids = response_type_ids(value)?;
+    let nodes: HashMap[string, json::Value] = HashMap::new();
+    for node in response_array(value, "referenced_types")? {
+        validate_type_node_links(ids, node)?;
+        nodes[response_string(node, "id")?] = node;
+    }
+    let results = response_array(value, "type_results")?;
+    if expected.len() > 4096 || results.len() != expected.len() {
+        return Result::Err("ffi-protocol: unexpected type result count")
+    }
+    let remaining: HashMap[string, bool] = HashMap::new();
+    for query in expected {
+        if query.type_id == "" || remaining[query.type_id].is_some() {
+            return Result::Err("ffi-protocol: invalid expected type identity")
+        }
+        remaining[query.type_id] = true;
+    }
+    let declarations: Vec[TypeDeclaration] = Vec::new();
+    for result in results {
+        let id = response_string(result, "type_id")?;
+        if remaining[id] != Option::Some(true) {
+            return Result::Err("ffi-protocol: unexpected or duplicate type result " + id)
+        }
+        remaining[id] = false;
+        let diagnostics = match json::field(result, "diagnostics") {
+            Some(_) => response_array(result, "diagnostics")?,
+            None => Vec::new(),
+        };
+        let status = response_string(result, "status")?;
+        if status == "failed" && !diagnostics.is_empty() {
+            return Result::Err(id + ": " + diagnostic_text(diagnostics[0])?)
+        }
+        if status != "verified" || !diagnostics.is_empty() {
+            return Result::Err("ffi-protocol: inconsistent type status " + id)
+        }
+        let kind = response_string(result, "declaration_kind")?;
+        let declared_type = response_string(result, "declared_type")?;
+        let expected_tag = if kind == "alias" {
+            "alias"
+        } else if kind == "defined" {
+            "named"
+        } else {
+            return Result::Err("ffi-protocol: unknown declaration kind")
+        };
+        if ids[declared_type] != Option::Some(expected_tag) {
+            return Result::Err("ffi-protocol: declaration type kind mismatch")
+        }
+        if json::field(result, "type").is_some() {
+            return Result::Err("ffi-protocol: declaration result contains instance type")
+        }
+        let node = nodes[declared_type].ok_or("ffi-protocol: missing declaration node")?;
+        for query in expected {
+            if query.type_id == id {
+                if response_string(node, "name")? != query.name
+                    || response_string(node, "import_path")? != query.import_path {
+                    return Result::Err("ffi-protocol: declaration identity mismatch " + id)
+                }
+            }
+        }
+        declarations.push(TypeDeclaration { type_id: id, kind, declared_type });
+    }
+    let world = response_string(value, "go_world_identity")?;
+    if world == "" && !expected.is_empty() {
+        return Result::Err("ffi-protocol: missing Go world identity")
+    }
+    Result::Ok(TypeDeclarations { go_world_identity: world, declarations, nodes })
+}

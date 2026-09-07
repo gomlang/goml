@@ -20,6 +20,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o "dist/$package/bin/g
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o "dist/$package/bin/gomlfmt" gomlc/_bootstrap/stage2/build/pkg/gomlc/cmd/gomlfmt/goml_generated.go
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o "dist/$package/bin/gomllsp" gomlc/_bootstrap/stage2/build/pkg/gomlc/cmd/gomllsp/goml_generated.go
 
+bash tools/goml-go-meta/build.sh "dist/$package"
 bash tools/lib/install.sh "dist/$package"
 test -f "dist/$package/lib/builtin/contract.gom"
 test -f "dist/$package/lib/builtin/goml.toml"

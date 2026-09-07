@@ -1,0 +1,288 @@
+package project;
+
+use std::ascii;
+use std::fs;
+use std::io;
+use std::json;
+use std::path;
+use std::process;
+use std::time;
+use std::text;
+use std::utf8;
+use utf8::BytesUtf8;
+
+struct GoExportDestination {
+    module_directory: string,
+    source_package: string,
+    output_directory: string,
+    go_package: string,
+    import_path: string,
+}
+
+fn export_input_path(base: string, value: string) -> Result[string, string] {
+    if value == "" {
+        return Result::Err("export-go: empty directory path")
+    }
+    for component in path::components(value) {
+        if component == ".." {
+            return Result::Err("export-go: parent traversal is not allowed")
+        }
+    }
+    path::absolute_structured(absolute_from_module(base, value)).map_err(|error| error.to_string())
+}
+
+fn export_canonical_destination(value: string) -> Result[string, string] {
+    let pending: Vec[string] = Vec::new();
+    let mut current = value;
+    loop {
+        match fs::symlink_metadata(current) {
+            Ok(_) => {
+                let mut result = fs::canonicalize(current).map_err(|error| error.to_string())?;
+                if !fs::is_dir(result) {
+                    return Result::Err("export-go: output ancestor is not a directory")
+                }
+                let mut index = pending.len();
+                while index > 0 {
+                    index -= 1;
+                    result = path::join(result, pending[index]);
+                }
+                return Result::Ok(result)
+            },
+            Err(error) => if error.kind() != io::ErrorKind::NotFound {
+                return Result::Err(error.to_string())
+            },
+        }
+        pending.push(path::file_name(current).ok_or("export-go: invalid output directory")?);
+        current = path::parent(current).ok_or("export-go: no existing output ancestor")?;
+    }
+}
+
+fn export_go_identifier(name: string) -> bool {
+    if name == "" || name == "_" || name == "main" {
+        return false
+    }
+    for keyword in Vec::from_array(
+        [
+            "break",
+            "default",
+            "func",
+            "interface",
+            "select",
+            "case",
+            "defer",
+            "go",
+            "map",
+            "struct",
+            "chan",
+            "else",
+            "goto",
+            "package",
+            "switch",
+            "const",
+            "fallthrough",
+            "if",
+            "range",
+            "type",
+            "continue",
+            "for",
+            "import",
+            "return",
+            "var",
+        ],
+    ) {
+        if name == keyword {
+            return false
+        }
+    }
+    for index in 0..name.byte_len() {
+        let value = name.byte_get(index);
+        if !ascii::is_alphabetic(value) && value != b'_' && !(index > 0 && ascii::is_digit(value)) {
+            return false
+        }
+    }
+    true
+}
+
+fn export_case_equal(left: string, right: string) -> bool {
+    if left.byte_len() != right.byte_len() {
+        return false
+    }
+    for index in 0..left.byte_len() {
+        if !ascii::eq_ignore_case(left.byte_get(index), right.byte_get(index)) {
+            return false
+        }
+    }
+    true
+}
+
+fn export_import_component(component: string) -> bool {
+    if component == "" || component.ends_with(".") {
+        return false
+    }
+    for index in 0..component.byte_len() {
+        let value = component.byte_get(index);
+        if !ascii::is_alphabetic(value) && !ascii::is_digit(value) && value != b'-' && value != b'.'
+            && value != b'_'
+            && value != b'~'
+            && value != b'+' {
+            return false
+        }
+    }
+    let short = text::split(component, ".")[0];
+    for reserved in Vec::from_array(
+        [
+            "CON",
+            "PRN",
+            "AUX",
+            "NUL",
+            "COM1",
+            "COM2",
+            "COM3",
+            "COM4",
+            "COM5",
+            "COM6",
+            "COM7",
+            "COM8",
+            "COM9",
+            "LPT1",
+            "LPT2",
+            "LPT3",
+            "LPT4",
+            "LPT5",
+            "LPT6",
+            "LPT7",
+            "LPT8",
+            "LPT9",
+        ],
+    ) {
+        if export_case_equal(short, reserved) {
+            return false
+        }
+    }
+    let parts = text::split(short, "~");
+    if parts.len() > 1 && parts[parts.len() - 1] != "" {
+        let suffix = parts[parts.len() - 1];
+        let mut digits = true;
+        for index in 0..suffix.byte_len() {
+            digits = digits && ascii::is_digit(suffix.byte_get(index));
+        }
+        if digits {
+            return false
+        }
+    }
+    true
+}
+
+fn export_check_nested_modules(root: string, output: string) -> Result[(), string] {
+    let mut current = output;
+    while current != root {
+        match fs::symlink_metadata(path::join(current, "go.mod")) {
+            Ok(_) => return Result::Err(
+                "export-go: output is inside a nested Go module: " + current,
+            ),
+            Err(error) => if error.kind() != io::ErrorKind::NotFound {
+                return Result::Err(error.to_string())
+            },
+        }
+        current = path::parent(current).ok_or("export-go: output is outside the Go module")?;
+    }
+    Result::Ok(())
+}
+
+fn export_go_module_path(go_program: string, root: string) -> Result[string, string] {
+    let manifest = path::join(root, "go.mod");
+    let metadata = fs::symlink_metadata(manifest).map_err(
+        |_| "export-go: GoML module root must contain an existing go.mod",
+    )?;
+    if !metadata.file_type().is_file() {
+        return Result::Err("export-go: module-root go.mod must be a regular file")
+    }
+    let output = process::Command::new(go_program).args(Vec::from_array(["mod", "edit", "-json"])).current_dir(
+        root,
+    ).env("GOWORK", "off").env("GOFLAGS", "").env("GOENV", "off").env("GO111MODULE", "on").env(
+        "GOTOOLCHAIN",
+        "local",
+    ).env("GOPROXY", "off").env("GOSUMDB", "off").output_timeout_structured(
+        time::Duration::from_milliseconds(30000),
+    ).map_err(|error| error.to_string())?;
+    if !output.status().success() {
+        return Result::Err(
+            "export-go: cannot read Go module: "
+                + output.stderr().to_string_utf8().unwrap_or("invalid Go diagnostic"),
+        )
+    }
+    let value = json::parse(output.stdout().to_string_utf8().map_err(|error| error.to_string())?)?;
+    let module = json::field(value, "Module").ok_or("export-go: go.mod has no module declaration")?;
+    let module_path = json::field(module, "Path").and_then(|value| json::as_string(value)).ok_or(
+        "export-go: go.mod has no module path",
+    )?;
+    if module_path == "" {
+        return Result::Err("export-go: go.mod has an empty module path")
+    }
+    Result::Ok(module_path)
+}
+
+fn resolve_export_destination(
+    graph: Graph,
+    source: string,
+    output: string,
+    import_path: string,
+    go_program: string,
+) -> Result[GoExportDestination, string] {
+    let root = fs::canonicalize(graph.module_dir).map_err(|error| error.to_string())?;
+    let source = fs::canonicalize(export_input_path(root, source)?).map_err(
+        |error| error.to_string(),
+    )?;
+    if !path_inside(root, source) || !fs::is_dir(source) {
+        return Result::Err(
+            "export-go: source must be a package directory inside the current module",
+        )
+    }
+    let mut selected: Option[Package] = Option::None;
+    for package_value in graph.packages {
+        if package_value.module_name == graph.module_path
+            && fs::canonicalize(package_value.directory).map_err(|error| error.to_string())?
+                == source {
+            selected = Option::Some(package_value);
+        }
+    }
+    let selected = selected.ok_or("export-go: source is not a package in the current module")?;
+    if selected.declared_name == "main" {
+        return Result::Err("export-go: source package must not be main")
+    }
+    let output = export_canonical_destination(export_input_path(root, output)?)?;
+    if !path_inside(root, output) {
+        return Result::Err("export-go: output is outside the Go module")
+    }
+    export_check_nested_modules(root, output)?;
+    let go_package = path::file_name(output).ok_or("export-go: output has no package name")?;
+    if !export_go_identifier(go_package) {
+        return Result::Err(
+            "export-go: output directory has an invalid Go package name: " + go_package,
+        )
+    }
+    let module_path = export_go_module_path(go_program, root)?;
+    let relative = relative_path(root, output);
+    let expected = if relative == "." {
+        module_path
+    } else {
+        module_path + "/" + relative
+    };
+    for component in text::split(expected, "/") {
+        if !export_import_component(component) {
+            return Result::Err("export-go: invalid Go import path component: " + component)
+        }
+    }
+    if import_path != expected {
+        return Result::Err("export-go: --import-path must be " + expected)
+    }
+    Result::Ok(
+        GoExportDestination {
+            module_directory: root,
+            source_package: selected.name,
+            output_directory: output,
+            go_package,
+            import_path,
+        },
+    )
+}

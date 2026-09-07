@@ -1,0 +1,151 @@
+package go_backend;
+
+use module::anf;
+use module::repr;
+use module::tast;
+
+fn library_value_type(value: repr::Type) -> bool {
+    match value {
+        Bool | Int | Int8 | Int16 | Int32 | Int64 | Uint | Uint8 | Uint16 | Uint32 | Uint64 | Float32 | Float64 => true,
+        External { import_path, name, args } => import_path == "" && name == "string"
+            && args.is_empty(),
+        Array { len, elem } => len >= 0 && library_value_type(elem),
+        _ => false,
+    }
+}
+
+fn library_item_names(items: Vec[Item]) -> NameSet {
+    let names = new_name_set();
+    for item in items {
+        match item {
+            Function(value) => add_reachable(names, value.name),
+            Global(value) => add_reachable(names, value.name),
+            TypeDef(value) => add_reachable(names, value.name),
+            Interface(value) => add_reachable(names, value.name),
+            Struct(value) => add_reachable(names, value.name),
+            ConstGroup(value) => {
+                for spec in value.specs {
+                    add_reachable(names, spec.name)
+                }
+            },
+            ImportGroup(values) => {
+                for value in values {
+                    add_reachable(names, value.0)
+                }
+            },
+            Method(_) => (),
+        }
+    }
+    names
+}
+
+fn library_wrapper(source: anf::Function, internal_name: string, public_name: string) -> Result[
+    Function,
+    string,
+] {
+    let params: Vec[(string, Type)] = Vec::new();
+    let args: Vec[Expr] = Vec::new();
+    for index in 0..source.params.len() {
+        let ty = source.params[index].1;
+        if !library_value_type(ty) {
+            return Result::Err("unsupported Go export parameter: " + public_name)
+        }
+        let name = f"arg{index}";
+        params.push((name, lower_type(ty)));
+        args.push(Expr::Var { name })
+    }
+    let call = Expr::Call { func: Expr::Var { name: internal_name }, args };
+    let stmts: Vec[Stmt] = Vec::new();
+    let ret_ty = match source.ret_ty {
+        repr::Type::Unit => {
+            stmts.push(Stmt::Expr { expr: call });
+            Option::None
+        },
+        repr::Type::Tuple { items } => {
+            let results: Vec[Type] = Vec::new();
+            let expressions: Vec[Expr] = Vec::new();
+            for index in 0..items.len() {
+                if !library_value_type(items[index]) {
+                    return Result::Err("unsupported Go export result: " + public_name)
+                }
+                results.push(lower_type(items[index]));
+                expressions.push(
+                    Expr::Field { expr: Expr::Var { name: "result" }, field_name: f"_{index}" },
+                )
+            }
+            if items.is_empty() {
+                stmts.push(Stmt::Expr { expr: call });
+                Option::None
+            } else {
+                stmts.push(
+                    Stmt::Var {
+                        name: "result",
+                        ty: lower_type(source.ret_ty),
+                        value: Option::Some(call),
+                    },
+                );
+                stmts.push(Stmt::ReturnMulti { exprs: expressions });
+                Option::Some(Type::Multi { items: results })
+            }
+        },
+        _ => {
+            if !library_value_type(source.ret_ty) {
+                return Result::Err("unsupported Go export result: " + public_name)
+            }
+            stmts.push(Stmt::Return { expr: Option::Some(call) });
+            Option::Some(lower_type(source.ret_ty))
+        },
+    };
+    Result::Ok(Function { name: public_name, params, ret_ty, body: Block { stmts } })
+}
+
+fn emit_library_exports(
+    items: Vec[Item],
+    functions: Vec[anf::Function],
+    function_names: FunctionNames,
+    declarations: Vec[(string, string)],
+) -> Result[(), string] {
+    if declarations.is_empty() {
+        return Result::Err("Go library requires at least one export")
+    }
+    let names = library_item_names(items);
+    let symbols = new_name_set();
+    for declaration in declarations {
+        let symbol = declaration.0;
+        let name = declaration.1;
+        if !tast::go_export_symbol_is_valid(name) {
+            return Result::Err("invalid Go export name: " + name)
+        }
+        if name_present(names, name) {
+            return Result::Err(
+                "Go export name conflicts with generated declaration or import: " + name,
+            )
+        }
+        if name_present(symbols, symbol) {
+            return Result::Err("duplicate Go export function: " + symbol)
+        }
+        add_reachable(names, name);
+        add_reachable(symbols, symbol);
+        let mut selected: Option[anf::Function] = Option::None;
+        for function in functions {
+            if function.name == symbol {
+                selected = Option::Some(function);
+            }
+        }
+        let source = selected.ok_or("missing Go export function: " + symbol)?;
+        let internal_name = mapped_function_name(function_names, symbol).ok_or(
+            "missing Go export generated name: " + symbol,
+        )?;
+        items.push(Item::Function(library_wrapper(source, internal_name, name)?))
+    }
+    Result::Ok(())
+}
+
+pub fn lower_library(value: anf::File, declarations: Vec[(string, string)]) -> Result[File, string] {
+    validate_anf(value)?;
+    lower_with_target(anf::canonicalize_names(value), false, Option::Some(declarations), Vec::new())
+}
+
+pub fn library_package_name_is_valid(name: string) -> bool {
+    is_valid_ident(name) && !is_keyword(name) && name != "_" && name != "main"
+}

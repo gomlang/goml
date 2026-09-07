@@ -1,0 +1,227 @@
+package tast;
+
+use module::ast;
+use module::ffi;
+
+pub struct GoInterfaceMethodPlan {
+    pub goml_name: string,
+    pub go_name: string,
+    pub parameters: Vec[Type],
+    pub ret_ty: Type,
+}
+
+pub struct GoInterfaceAdapterPlan {
+    pub declaration: ast::GoInterfaceSpec,
+    pub trait_name: string,
+    pub raw_type: Type,
+    pub methods: Vec[GoInterfaceMethodPlan],
+}
+
+pub fn validate_go_interface_bridge_callable(methods: Vec[string], ty: Type) -> Result[(), string] {
+    let Func { params, ret_ty } = resolve_type(ty) else {
+        return Result::Err("Go interface bridge requires a constructor function type")
+    };
+    let External { import_path, name, .. } = resolve_type(ret_ty) else {
+        return Result::Err("Go interface bridge requires a native interface target")
+    };
+    if import_path == "" && name != "error" {
+        return Result::Err("Go interface bridge requires a native interface target")
+    }
+    if !type_is_concrete(ty) || params.len() != methods.len() {
+        return Result::Err("Go interface bridge constructor does not match its method plan")
+    }
+    let seen: Vec[string] = Vec::new();
+    for index in 0..methods.len() {
+        let name = methods[index];
+        if !go_ffi_symbol_is_valid(name) || seen.contains(name) {
+            return Result::Err("Go interface bridge requires distinct exported method names")
+        }
+        seen.push(name);
+        interface_boundary_type(params[index])?;
+        let _ = foreign_function_bridge(params[index], Vec::new())?;
+    }
+    Result::Ok(())
+}
+
+pub fn validate_go_interface_bridge_shape(
+    methods: Vec[string],
+    ty: Type,
+    shape: ffi::GoInterfaceShape,
+) -> Result[(), string] {
+    validate_go_interface_bridge_callable(methods, ty)?;
+    let Func { params, ret_ty } = resolve_type(ty) else {
+        return Result::Err("Go interface bridge requires a constructor function type")
+    };
+    if shape.template.underlying_kind != "interface"
+        || !shape.template.parameter_constraints.is_empty() {
+        return Result::Err("Go interface bridge requires a concrete runtime interface")
+    }
+    let actual_target = foreign_bridge_type(ret_ty, Vec::new(), false)?;
+    let expected_target = ffi::go_identity_bridge_type(shape.template.identity)?;
+    if !ffi::bridge_types_equal(actual_target, expected_target) {
+        return Result::Err("Go interface bridge target identity mismatch")
+    }
+    if methods.len() != shape.methods.len() {
+        return Result::Err("Go interface bridge requires the complete Go method set")
+    }
+    for index in 0..methods.len() {
+        let mut found = false;
+        for method in shape.methods {
+            if !go_ffi_symbol_is_valid(method.name) {
+                return Result::Err(
+                    "Go interface bridge cannot implement an unexported method " + method.name,
+                )
+            }
+            if method.name == methods[index] {
+                if found {
+                    return Result::Err("Go interface bridge has an ambiguous target method")
+                }
+                found = true;
+                let actual = foreign_function_bridge(params[index], Vec::new())?;
+                let expected = ffi::go_identity_bridge_type(method.signature)?;
+                if !ffi::bridge_types_equal(actual, expected) {
+                    return Result::Err("Go interface bridge signature mismatch for " + method.name)
+                }
+            }
+        }
+        if !found {
+            return Result::Err(
+                "Go interface bridge target method does not exist: " + methods[index],
+            )
+        }
+    }
+    Result::Ok(())
+}
+
+fn interface_boundary_type(value: Type) -> Result[(), string] {
+    match resolve_type(value) {
+        String | Char => Result::Err(
+            "go_interface text boundaries require ffi::String and ffi::Rune",
+        ),
+        Slice { .. } => Result::Err(
+            "go_interface slice boundaries require ffi::RawSlice and an explicit copy/share policy",
+        ),
+        GoPointer { elem } | MutSlice { elem } | Array { elem, .. } | Channel { elem, .. } => interface_boundary_type(
+            elem,
+        ),
+        GoMap { key, value } => {
+            interface_boundary_type(key)?;
+            interface_boundary_type(value)
+        },
+        GoFunction { signature } => interface_boundary_type(signature),
+        Func { params, ret_ty } => {
+            for param in params {
+                interface_boundary_type(param)?;
+            }
+            interface_boundary_type(ret_ty)
+        },
+        Tuple { items } => {
+            for item in items {
+                interface_boundary_type(item)?;
+            }
+            Result::Ok(())
+        },
+        External { args, .. } => {
+            for arg in args {
+                interface_boundary_type(arg)?;
+            }
+            Result::Ok(())
+        },
+        _ => Result::Ok(()),
+    }
+}
+
+pub fn plan_go_interface_adapter(
+    declaration: ast::GoInterfaceSpec,
+    trait_info: TraitInfo,
+    shape: ffi::GoInterfaceShape,
+) -> Result[GoInterfaceAdapterPlan, string] {
+    if !trait_info.generics.is_empty() || !trait_info.predicates.is_empty()
+        || !trait_info.supertraits.is_empty()
+        || !trait_info.associated_types.is_empty() {
+        return Result::Err(
+            "go_interface requires a non-generic trait without supertraits or associated types",
+        )
+    }
+    if shape.template.underlying_kind != "interface" {
+        return Result::Err("go_interface target is not a Go interface")
+    }
+    if !shape.template.parameter_constraints.is_empty() {
+        return Result::Err("go_interface requires a concrete Go interface type")
+    }
+    if declaration.methods.len() != trait_info.methods.len()
+        || declaration.methods.len() != shape.methods.len() {
+        return Result::Err("go_interface requires a complete one-to-one method mapping")
+    }
+    for method in shape.methods {
+        if !go_ffi_symbol_is_valid(method.name) {
+            return Result::Err("go_interface cannot forward an unexported Go method " + method.name)
+        }
+    }
+    let methods: Vec[GoInterfaceMethodPlan] = Vec::new();
+    let used_targets: Vec[string] = Vec::new();
+    for method in trait_info.methods {
+        if !method.has_receiver || method.params.is_empty() || !method.generics.is_empty()
+            || !method.predicates.is_empty() {
+            return Result::Err(
+                "go_interface requires non-generic instance methods without additional predicates",
+            )
+        }
+        if !types_equal(method.params[0], Type::Param { name: "Self" }) {
+            return Result::Err("go_interface methods require a Self receiver")
+        }
+        let mut target: Option[string] = Option::None;
+        for mapping in declaration.methods {
+            if mapping.0 == method.name {
+                if target.is_some() {
+                    return Result::Err("duplicate go_interface trait method mapping")
+                }
+                target = Option::Some(mapping.1);
+            }
+        }
+        let target = target.ok_or("go_interface omitted trait method " + method.name)?;
+        if used_targets.contains(target) {
+            return Result::Err("duplicate go_interface Go method mapping")
+        }
+        used_targets.push(target);
+        let mut signature: Option[ffi::GoTypeIdentity] = Option::None;
+        for foreign in shape.methods {
+            if foreign.name == target {
+                if signature.is_some() {
+                    return Result::Err("ambiguous Go interface method " + target)
+                }
+                signature = Option::Some(foreign.signature);
+            }
+        }
+        let signature = signature.ok_or("go_interface target method does not exist: " + target)?;
+        let params: Vec[Type] = Vec::new();
+        for index in 1..method.params.len() {
+            params.push(method.params[index]);
+        }
+        let function = Type::Func { params, ret_ty: method.ret_ty };
+        interface_boundary_type(function)?;
+        let actual = foreign_function_bridge(function, Vec::new())?;
+        let expected = ffi::go_identity_bridge_type(signature)?;
+        if !ffi::bridge_types_equal(actual, expected) {
+            return Result::Err(
+                "go_interface signature mismatch for " + method.name + " -> " + target,
+            )
+        }
+        methods.push(
+            GoInterfaceMethodPlan {
+                goml_name: method.name,
+                go_name: target,
+                parameters: params,
+                ret_ty: method.ret_ty,
+            },
+        );
+    }
+    Result::Ok(
+        GoInterfaceAdapterPlan {
+            declaration,
+            trait_name: trait_info.name,
+            raw_type: external_identity_type(shape.template.identity, Vec::new())?,
+            methods,
+        },
+    )
+}

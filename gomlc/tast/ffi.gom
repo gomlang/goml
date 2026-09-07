@@ -1,0 +1,204 @@
+package tast;
+
+use module::ast;
+use module::ffi;
+
+fn foreign_marker_is_empty(traits: Vec[TraitInfo], name: string) -> bool {
+    for value in traits {
+        if value.name == name {
+            return value.generics.is_empty() && value.predicates.is_empty()
+                && value.supertraits.is_empty()
+                && value.associated_types.is_empty()
+                && value.methods.is_empty()
+        }
+    }
+    false
+}
+
+pub fn foreign_bridge_type(value: Type, traits: Vec[TraitInfo], direct: bool) -> Result[
+    ffi::BridgeType,
+    string,
+] {
+    match resolve_type(value) {
+        GoMap { key, value } => Result::Ok(
+            ffi::BridgeType::Map {
+                key: foreign_bridge_type(key, traits, false)?,
+                element: foreign_bridge_type(value, traits, false)?,
+            },
+        ),
+        GoPointer { elem } => Result::Ok(
+            ffi::BridgeType::Pointer { element: foreign_bridge_type(elem, traits, false)? },
+        ),
+        GoFunction { signature } => foreign_function_bridge(signature, traits),
+        External { import_path, name, args } if import_path == "" && name == "string"
+            && args.is_empty() => Result::Ok(ffi::BridgeType::Scalar("string")),
+        External { import_path, name, args } => {
+            if !ffi::named_bridge_identity_valid(import_path, name)
+                || (import_path == "" && !args.is_empty()) {
+                return Result::Err(
+                    "ffi-signature-mismatch: external Go type is not publicly nameable: "
+                        + import_path
+                        + "."
+                        + name,
+                )
+            }
+            let arguments: Vec[ffi::BridgeType] = Vec::new();
+            for arg in args {
+                arguments.push(foreign_bridge_type(arg, traits, false)?)
+            }
+            Result::Ok(ffi::BridgeType::Named { import_path, name, arguments })
+        },
+        Bool => Result::Ok(ffi::BridgeType::Scalar("bool")),
+        Int => Result::Ok(ffi::BridgeType::Scalar("int")),
+        Int8 => Result::Ok(ffi::BridgeType::Scalar("int8")),
+        Int16 => Result::Ok(ffi::BridgeType::Scalar("int16")),
+        Int32 | Char => Result::Ok(ffi::BridgeType::Scalar("int32")),
+        Int64 => Result::Ok(ffi::BridgeType::Scalar("int64")),
+        Uint => Result::Ok(ffi::BridgeType::Scalar("uint")),
+        Uint8 => Result::Ok(ffi::BridgeType::Scalar("uint8")),
+        Uint16 => Result::Ok(ffi::BridgeType::Scalar("uint16")),
+        Uint32 => Result::Ok(ffi::BridgeType::Scalar("uint32")),
+        Uint64 => Result::Ok(ffi::BridgeType::Scalar("uint64")),
+        Float32 => Result::Ok(ffi::BridgeType::Scalar("float32")),
+        Float64 => Result::Ok(ffi::BridgeType::Scalar("float64")),
+        String => Result::Ok(ffi::BridgeType::Scalar("string")),
+        Array { len, elem } => if len < 0 {
+            Result::Err("ffi-signature-mismatch: negative array length")
+        } else {
+            Result::Ok(
+                ffi::BridgeType::Array {
+                    element: foreign_bridge_type(elem, traits, false)?,
+                    length: len,
+                },
+            )
+        },
+        Slice { elem } | MutSlice { elem } => Result::Ok(
+            ffi::BridgeType::Slice { element: foreign_bridge_type(elem, traits, false)? },
+        ),
+        Channel { elem, direction } => Result::Ok(
+            ffi::BridgeType::Channel {
+                element: foreign_bridge_type(elem, traits, false)?,
+                direction: match direction {
+                    ast::ChannelDirection::Both => "both",
+                    ast::ChannelDirection::Send => "send",
+                    ast::ChannelDirection::Receive => "receive",
+                },
+            },
+        ),
+        Dyn { trait_name, args, associated_types, additional_bounds } => if direct
+            && args.is_empty()
+            && associated_types.is_empty()
+            && additional_bounds.is_empty()
+            && foreign_marker_is_empty(traits, trait_name) {
+            Result::Ok(ffi::BridgeType::Scalar("any"))
+        } else {
+            Result::Err(
+                "ffi-signature-mismatch: only direct empty marker data may cross the Go boundary",
+            )
+        },
+        _ => Result::Err("ffi-signature-mismatch: unsupported bridge type"),
+    }
+}
+
+fn foreign_function_bridge_type(value: Type, traits: Vec[TraitInfo], owner: string) -> Result[
+    ffi::BridgeType,
+    string,
+] {
+    let value = match resolve_type(value) {
+        Dyn { trait_name, args, associated_types, additional_bounds } => {
+            let mut name = trait_name;
+            if !name.contains("::") {
+                let prefix = owner.byte_slice(0, owner.byte_len() - short_name(owner).byte_len());
+                let candidate = prefix + name;
+                for definition in traits {
+                    if definition.name == candidate {
+                        name = candidate;
+                    }
+                }
+            }
+            Type::Dyn { trait_name: name, args, associated_types, additional_bounds }
+        },
+        other => other,
+    };
+    foreign_bridge_type(value, traits, true)
+}
+
+pub fn foreign_binding(binding_id: string, value: FunctionScheme, traits: Vec[TraitInfo]) -> Result[
+    Option[ffi::ForeignBinding],
+    string,
+] {
+    let (call_mode, import_path, symbol) = match value.callable {
+        GoForeign { import_path, symbol, binding } => (
+            ffi::ForeignCallMode::Ordinary,
+            import_path,
+            symbol,
+        ),
+        GoMethod { symbol, binding } => (ffi::ForeignCallMode::Method, "", symbol),
+        _ => return Result::Ok(Option::None),
+    };
+    {
+        if call_mode == ffi::ForeignCallMode::Method && value.params.is_empty() {
+            return Result::Err("ffi-signature-mismatch: foreign method requires a receiver")
+        }
+        match value.comptime {
+            RuntimeOnly => (),
+            _ => return Result::Err("ffi-signature-mismatch: foreign functions are runtime-only"),
+        }
+        if !value.generics.is_empty() || !value.predicates.is_empty() {
+            return Result::Err("ffi-signature-mismatch: foreign functions must be monomorphic")
+        }
+        let parameters: Vec[ffi::BridgeType] = Vec::new();
+        for parameter in value.params {
+            parameters.push(foreign_function_bridge_type(parameter, traits, value.name)?)
+        }
+        let results: Vec[ffi::BridgeType] = Vec::new();
+        match resolve_type(value.ret_ty) {
+            Unit => (),
+            Tuple { items } => {
+                if items.is_empty() {
+                    return Result::Err("ffi-signature-mismatch: empty tuple return")
+                }
+                for item in items {
+                    results.push(foreign_bridge_type(item, traits, false)?)
+                }
+            },
+            ty => results.push(foreign_function_bridge_type(ty, traits, value.name)?),
+        }
+        Result::Ok(
+            Option::Some(
+                ffi::ForeignBinding {
+                    call_mode,
+                    binding_id,
+                    import_path,
+                    symbol,
+                    parameters,
+                    results,
+                },
+            ),
+        )
+    }
+}
+
+fn foreign_function_bridge(signature: Type, traits: Vec[TraitInfo]) -> Result[
+    ffi::BridgeType,
+    string,
+] {
+    match resolve_type(signature) {
+        Func { params, ret_ty } => {
+            let parameters = Vec::new();
+            let results = Vec::new();
+            for value in params {
+                parameters.push(foreign_bridge_type(value, traits, false)?)
+            }
+            match resolve_type(ret_ty) {
+                Unit => (),
+                Tuple { items } => for value in items {
+                    results.push(foreign_bridge_type(value, traits, false)?)
+                },
+                value => results.push(foreign_bridge_type(value, traits, false)?),
+            }
+            Result::Ok(ffi::BridgeType::Function { parameters, results })
+        },
+        _ => Result::Err("Go function requires a concrete function signature"),
+    }
+}
