@@ -10,6 +10,8 @@ The type checker lowers the parser AST into a strongly typed syntax arena with s
 
 Syntax paths are opaque, immutable handles. Use `node.path.to_string()` to render them and `syntax::empty_path()` or `syntax::text_path(value)` when constructing syntax nodes.
 
+`SyntaxArena.nodes` is a contiguous `Vec[SyntaxNode]`, with each node ID equal to its array index. Use `syntax::get_kind` for kind-only queries, `syntax::get_node` for a complete optional node value, and `syntax::has_node` to check an ID; invalid IDs remain recoverable.
+
 Type facts retain independent constant snapshots. `FactConstant::SmallInt(i64)` stores signed 64-bit integers directly; larger values retain copied arbitrary-precision storage. Use `type_fact_constant` and `type_fact_constant_kind` to read the exact value and kind across storage variants.
 
 The source importer evaluates `//go:build` and `// +build` constraints, GOOS/GOARCH and release tags, custom tags, cgo selection, platform filename suffixes, import cycles, and source dependencies. It selects ordinary, internal-test, and external-test package sources separately. Its default target is `linux/amd64`, cgo disabled, with `/usr/lib/go-1.26/src` as the source root.
