@@ -1,6 +1,6 @@
 # gomlgo
 
-`gomlgo` is an independent GoML module implementing a Go 1.26 scanner, recursive-descent parser, package type checker, and source importer. The compatibility target is Go 1.26.5 at `/usr/lib/go-1.26`. Production code does not call `go/scanner`, `go/parser`, `go/types`, `go/constant`, or `go/importer`.
+`gomlgo` is an independent GoML module implementing a Go 1.26 scanner, recursive-descent parser, package type checker, and source importer. The compatibility target is Go 1.26.5; the default toolchain path is `/usr/lib/go-1.26`. Production code does not call `go/scanner`, `go/parser`, `go/types`, `go/constant`, or `go/importer`.
 
 The frontend accepts source as `std::bytes::Bytes`, preserving invalid UTF-8 and physical byte offsets. The scanner implements the complete Go token set, literal validation, comments, BOM and NUL handling, Unicode identifiers, and automatic semicolon insertion. Tokens retain kind, literal, start/end offsets, and whether a semicolon is synthetic.
 
@@ -22,7 +22,7 @@ The source importer evaluates `//go:build` and `// +build` constraints, GOOS/GOA
 
 ## Commands
 
-From the repository root:
+Run these recipes from the repository root. `just test` and `just ci` do not include this independent suite. The oracle build uses `${GOMLGO_GO:-/usr/lib/go-1.26/bin/go}`; `GOMLGO_GO` overrides the oracle compiler, while the GOROOT recipes below explicitly use `/usr/lib/go-1.26/src`.
 
 ```bash
 just gomlgo-test
@@ -48,22 +48,22 @@ just gomlgo-ast-comments-goroot
 just gomlgo-mutate-diff 25
 ```
 
-The built CLI supports:
+`just gomlgo-build` writes the CLI and differential runners under `_artifact/gomlgo-build/bin/cmd`. From the repository root:
 
 ```bash
-_artifact/bin/cmd/gomlgo/gomlgo scan FILE
-_artifact/bin/cmd/gomlgo/gomlgo parse FILE
-_artifact/bin/cmd/gomlgo/gomlgo parse-expr 'a + b*c'
-_artifact/bin/cmd/gomlgo/gomlgo check FILE...
-_artifact/bin/cmd/gomlgo/gomlgo check-package DIRECTORY
-_artifact/bin/cmd/gomlgo/gomlgo run FILE [-- PROGRAM_ARGS...]
+_artifact/gomlgo-build/bin/cmd/gomlgo/gomlgo scan FILE
+_artifact/gomlgo-build/bin/cmd/gomlgo/gomlgo parse FILE
+_artifact/gomlgo-build/bin/cmd/gomlgo/gomlgo parse-expr 'a + b*c'
+_artifact/gomlgo-build/bin/cmd/gomlgo/gomlgo check FILE...
+_artifact/gomlgo-build/bin/cmd/gomlgo/gomlgo check-package DIRECTORY
+_artifact/gomlgo-build/bin/cmd/gomlgo/gomlgo run FILE [-- PROGRAM_ARGS...]
 ```
 
 ## Single-file interpreter
 
 `gomlgo run` accepts exactly one explicit `.go` file. The file must declare `package main` and define `main.main`. Only that file is interpreted: other files in the directory, local packages, third-party modules, cgo, and assembly are outside the current execution scope. Imports are limited to Go 1.26 standard-library packages.
 
-The execution loader uses the selected Go 1.26 toolchain for environment and standard-library dependency metadata. User functions are lowered to typed bytecode and executed by the GoML VM; `gomlgo run` is not a wrapper around `go run`. The VM supports package initialization, functions and closures, control flow, arrays, structs, pointers, slices, maps, methods, interfaces, type assertions and switches, method values and expressions, variadic calls, generic function and method instantiation, string, byte-slice, rune-slice, and rune conversions, and `defer`, `panic`, and `recover`. Runtime faults use the same panic unwinding path and therefore execute deferred calls and can be recovered. A cooperative scheduler implements goroutines, buffered and unbuffered channels, close, channel range, seeded select, and deadlock detection. `--seed` selects deterministic select choices and `--max-goroutines` limits scheduler growth.
+The execution loader uses the selected Go 1.26 toolchain for environment and standard-library dependency metadata. User functions are lowered to typed bytecode and executed by the GoML VM; `gomlgo run` is not a wrapper around `go run`. The VM supports package initialization, functions and closures, control flow, arrays, structs, pointers, slices, maps, methods, interfaces, type assertions and switches, method values and expressions, variadic calls, generic function and method instantiation, string, byte-slice, rune-slice, and rune conversions, and `defer`, `panic`, and `recover`. Runtime faults use the same panic unwinding path and therefore execute deferred calls and can be recovered. A cooperative scheduler implements goroutines, buffered and unbuffered channels, close, channel range, seeded select, and deadlock detection. `--seed` selects deterministic select choices, `--max-goroutines` limits scheduler growth, and `--max-steps` sets a positive instruction limit or `-1` for no limit.
 
 Generated files named `.gom.go` or `goml_generated.go` use the same standard-library source declarations as ordinary `.go` files. Their filenames do not select alternate type definitions. Native image builds sharing a cache key are serialized with a process lock; failed builds release the lock and remove their staging files.
 
@@ -74,6 +74,8 @@ Exported standard-library named structs are registered with their real Go types,
 Native calls run on host goroutines and wake the VM through a completion queue. User closures cross the boundary as direct callback tokens and execute on the VM scheduler, preserving captures, panic, and exit behavior. The image generator emits concrete proxies for exported standard-library interfaces and type shells for exported, non-generic user structs with supported fields, including struct tags. Native channels such as values returned by `time.After` participate in blocking receive and receive-only select. `os.Args` contains the image path followed only by arguments after `--`.
 
 The native value boundary currently supports scalar values, recursively supported slices, concrete function callbacks, selected exported interfaces, non-generic user structs whose fields use supported value types, and receive-capable native channels. Unsupported package variables other than `os.Args`, interface methods with generic or variadic signatures, native channel send/mixed native-and-interpreted select, user aggregate pointers requiring persistent writeback identity, `unsafe`, cgo, and third-party packages are diagnosed rather than approximated. Native code has the same operating-system authority as an ordinary Go program, so the interpreter is not a security sandbox.
+
+## Differential checks
 
 The parser differential binary accepts `parse-acceptance`, `ast-shape`, `ast-position`, `ast-comments`, or `diagnostic-strict`. A mismatch reports the file, normalized AST path, surrounding node offset, expected value, and actual value.
 
@@ -87,26 +89,19 @@ The official type corpus recipes also run in a resource-limited user systemd sco
 
 `testdata/invalid/` contains recovery smoke cases. `testdata/regressions/` contains minimized differential failures and is checked by `just gomlgo-diff`.
 
-## Current parity
+## Compatibility coverage
 
-Against all 7,710 `.go` files under `/usr/lib/go-1.26/src`:
+Differential results depend on the checked-out sources, exact Go toolchain, target, and selected corpus. Use the commands above to obtain current results; historical file counts and zero-difference totals are not a compatibility guarantee.
 
-- Scanner: 17,255,942 tokens, zero kind/literal/start/end/synthetic mismatches.
-- Parse acceptance: zero mismatches, with 7,666 accepted and 44 rejected files.
-- Valid AST shape and important data: zero mismatches.
-- Valid AST byte positions: zero mismatches.
-- Comments, doc/trailing attachment, `File.Comments`, and `GoVersion`: zero mismatches.
-- Mutation sample: 25 valid seeds and 272 generated cases had zero acceptance mismatches; 8 cases differed only in the first diagnostic byte offset.
-- Local type-check fixtures: 3 files, with 2 accepted and 1 rejected, have zero acceptance differences; accepted files have complete normalized TypeInfo parity and the rejected fixture has exact diagnostic parity.
-- Official Go type-check corpus: 363 files have zero acceptance and exact-diagnostic differences. The result is 83 accepted and 280 rejected files; all 83 accepted files have complete normalized package, type, Defs, Uses, Implicits, Selections, Scopes, Instances, InitOrder, FileVersions, Universe, and unsafe parity, and all 280 rejected files have partial normalized TypeInfo parity.
-  - `internal/types/testdata/check`: 79 files, 13 accepted and 66 rejected.
-  - `internal/types/testdata/spec`: 12 files, 1 accepted and 11 rejected.
-  - `internal/types/testdata/examples`: 8 files, all rejected.
-  - `internal/types/testdata/fixedbugs`: 262 files, 68 accepted and 194 rejected.
-  - `go/types/testdata/local`: 2 files, 1 accepted and 1 rejected.
-- Type-check mutation smoke corpus: 2 accepted seeds and 9 semantic mutations have zero acceptance differences.
-- GOROOT `std` on linux/amd64 with cgo disabled: 339 selected packages, 336 accepted and 3 rejected, with zero acceptance differences. Complete normalized TypeInfo matches for 335 accepted source packages; the remaining accepted package is the built-in `unsafe` package.
-- GOROOT `cmd/...` on linux/amd64 with cgo disabled: 210 selected packages, 188 accepted and 22 rejected, with zero acceptance differences.
-- Targeted extension smoke checks have zero acceptance differences for `internal/goarch` on linux/arm64, `internal/goos` on windows/amd64, `runtime/cgo` with cgo enabled, the internal tests of `bytes`, and the external test package `cmp_test`.
+| Area | Comparison | Reproduce |
+| --- | --- | --- |
+| Scanner and parser fixtures | Tokens, acceptance, AST shape, positions, and comments | `just gomlgo-diff` |
+| GOROOT scanner and parser | Tokens and normalized AST including comments | `just gomlgo-diff-goroot` |
+| Local type checking | Acceptance, diagnostics, and normalized type information | `just gomlgo-type-diff` |
+| Official Go type corpus | Normalized type information and exact diagnostics | `just gomlgo-type-diff-official` and `just gomlgo-type-diagnostics-official` |
+| Standard-library packages | Acceptance or normalized type information | `just gomlgo-type-diff-goroot -1 std acceptance` or `just gomlgo-type-diff-goroot -1 std info` |
+| Go command packages | Acceptance | `just gomlgo-type-diff-goroot -1 cmd acceptance` |
+| Target and test-package samples | Selected platforms and internal/external tests | `just gomlgo-type-diff-goroot-matrix` and `just gomlgo-type-diff-goroot-tests` |
+| Mutation samples | Parser and type-checker regressions | `just gomlgo-mutate-diff` and `just gomlgo-type-mutate-diff` |
 
-Strict parser diagnostic count and message parity for invalid files is still best-effort. Complete `cmd/...` Info, the full cgo-enabled corpus, broad internal/external test-package corpora, and full GOOS/GOARCH matrices have not been established as zero-diff.
+Strict parser diagnostic count and message parity for invalid files is best-effort. Complete `cmd/...` type information, the full cgo-enabled corpus, broad internal/external test-package corpora, and full GOOS/GOARCH matrices are not established compatibility guarantees. Interpreter execution has the separate limits described above.
