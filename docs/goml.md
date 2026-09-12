@@ -1745,6 +1745,8 @@ fn read(source: dyn Source[Item = isize]) -> isize {
 }
 ```
 
+Type inference rejects recursive types, including cycles through a trait object’s associated type bindings. A rejected cycle produces a type diagnostic instead of creating a self-referential inference variable.
+
 Every associated type declared by the trait must be bound exactly once. The bracket grammar reserves positional trait arguments followed by associated bindings, such as `dyn Consumer[string, Error = IoError]`; positional arguments after the first `Name = Type` binding are rejected. Generic trait objects are still rejected, so the positional form is reserved for forward compatibility rather than enabled today.
 
 Current dyn-safe conditions:
