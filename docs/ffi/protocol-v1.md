@@ -1,6 +1,6 @@
 # Go metadata protocol v1
 
-Transport is one JSON request on stdin and one JSON response on stdout. stderr is reserved for operational diagnostics. The helper transport, GoML response consumption and project-command orchestration are implemented. `tools/goml-go-meta/internal/protocol` defines the current wire schema.
+Transport is one JSON request on stdin and one JSON response on stdout. stderr is reserved for operational diagnostics. [The protocol package](../../tools/goml-go-meta/internal/protocol/protocol.go) defines the current wire schema. See the [language guide](../goml.md#go-ffi) for source-level bindings and [bind-go](bind-go.md) for allowlisted generation.
 
 Every request contains `protocol_version: 1`, `build_context`, `caller_context`, and `bindings`. Unknown fields, unknown type tags, duplicate or empty binding IDs, malformed/trailing JSON, and invalid contexts are recoverable `ffi-protocol` errors.
 
@@ -15,10 +15,13 @@ Bridge types use these structured nodes:
 | Tag | Additional fields |
 | --- | --- |
 | `bool`, `int`, `int8`, `int16`, `int32`, `int64`, `uint`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `string`, `any` | None |
+| `pointer` | `element` |
 | `array` | `element`, nonnegative `length` |
 | `slice` | `element` |
+| `map` | `key`, `element` (the value type); Go validates key comparability |
 | `channel` | `element`, `direction` (`both`, `send`, `receive`) |
 | `function` | `signature` with required `parameters` and `results` arrays |
+| `named` | `import_path`, `name`, optional recursive `type_arguments`; builtin `error` uses an empty import path |
 
 GoML isize/usize map to int/uint; char maps to int32 and byte to uint8. Slice and MutSlice share the same Go bridge shape. Direct empty marker data maps to any; any is forbidden inside containers and multiple results. This protocol does not infer Unicode validity, readonly guarantees, or thread safety.
 
@@ -40,7 +43,6 @@ Project drivers may add `--additional-callers <JSON-array-of-directories>` in fi
 
 The artifact-check command accepts optional `--source-package <canonical-GoML-package>` and repeated `--source-path <file>` for local diagnostic provenance. Source compilation supplies its own inputs directly; Core checks also consult recorded source files when readable. Locations are associated by binding ID and attached while decoding per-binding diagnostics. These paths are not sent to the Go helper or added to interface semantic hashes.
 
-
 ## Internal Go library emission
 
 `gomlc __link-go-library` accepts repeated `--input <Core artifact>`, required `--package <canonical GoML package>`, `--go-package <Go identifier>`, and `--output <Go source path>`, plus optional `--world <compiler world>`. It selects the package dependency closure, validates export metadata, installs library roots, and emits a private implementation plus public Go wrappers. Go package names must be ASCII identifiers other than keywords, `_`, or `main`.
@@ -49,20 +51,17 @@ Foreign bindings require the explicit validation option group used by package co
 
 This is an internal emission step, not the public `export-go` publication command. Its caller owns output staging, Go module/import-path validation, full generated-package checks, manifest creation, concurrent-output locking, and publication. Existing executable compiler/driver protocols remain unchanged.
 
-
 ### Export API metadata and staged package checking
 
 `__link-go-library` optionally accepts `--api-output <path>` for a separate protocol-1 JSON document. Its `exports` array is sorted by public Go name. Each entry records `name`, stable GoML `symbol`, and `parameters`/`results` arrays using the bridge type encoding. Unit has no results and a flat tuple has multiple results. Metadata contains no absolute source origin. Both emission outputs are scratch artifacts; the caller publishes them only after complete validation.
 
 `gomlc __check-go-library --context <path> --input <staged Go source> --directory <final package directory> --import-path <identity> --overlay <scratch JSON path>` validates a whole generated Go package. It checks module/caller identity and builds the import path with a Go overlay replacing or adding `goml_generated.go`. Existing handwritten files participate in the build. Build tags, target and Go flags come from the selected context; module writes and network lookup remain disabled. This catches stale-output masking, symbol conflicts and direct/indirect import cycles without publishing the candidate. The caller owns cleanup of the overlay and staged source.
 
-
 `caller_context.generated_source` is an optional string containing candidate generated Go source. It is allowed only in package mode and overlays `goml_generated.go` in the caller directory while signature witnesses are loaded. The existing request size limit applies. Source hashing uses its contents instead of any old generated file. Export compilation/linking first use file witnesses; final `__check-go-library` accepts repeated `--core-path` and explicit `--ffi-check` to revalidate all selected Core bindings in package mode with this source overlay after the candidate Go build passes.
-
 
 ## Type queries
 
-The optional `type_queries` request array and `type_results` response array extend v1 without changing requests that omit them or their responses. Each query has a unique nonempty `type_id`, `import_path`, `name` and optional `type_arguments` and `query_mode`. IDs are unique within the type-query namespace. The combined binding/query count is limited to 4096; arguments share the existing bridge-type depth/node budget. Type arguments support the bridge nodes above plus `named` nodes containing `import_path`, `name` and recursive `type_arguments`. Named nodes also work in helper function witnesses, preserving Go nominal types. The GoML bridge encoder emits them for resolved external identities and concrete type arguments.
+The optional `type_queries` request array and `type_results` response array extend v1 without changing requests that omit them or their responses. Each query has a unique nonempty `type_id`, `import_path`, `name` and optional `type_arguments` and `query_mode`. IDs are unique within the type-query namespace. The combined binding/query count is limited to 4096; arguments share the existing bridge-type depth/node budget. Type arguments use the bridge nodes above. Named nodes also work in helper function witnesses, preserving Go nominal types. The GoML bridge encoder emits them for resolved external identities and concrete type arguments.
 
 `query_mode` is `instance` by default. Explicit `declaration` mode accepts no type arguments and returns declaration metadata, including generic parameters and constraints, without treating an uninstantiated generic declaration as a value type. It uses a blank-import witness and validates the requested object separately.
 
@@ -73,7 +72,6 @@ Explicit `function` mode queries one exported package-level function named by `i
 A type result contains `type_id`, `status`, `diagnostics`, and, when available, `declaration_kind` (`alias`, `defined`, or `function`), `declared_type` and `type`. Both type fields reference nodes in `referenced_types`. `declared_type` describes the original declaration, including its generic parameters. `type` describes the requested concrete type after alias normalization and is absent for declaration queries. For function queries, `declared_type` describes the original function signature and `type` the concrete instantiated signature, including parameter/result lists and the variadic flag. Function results are consumed separately from persisted external-type declaration metadata. A named interface is distinguishable through its structured underlying interface node. Method sets and instantiated arguments remain in the graph. These session-local node IDs are references, not portable nominal identities.
 
 The helper exits unsuccessfully if any type result fails. Existing old helpers reject the new request field recoverably; the compiler must use its paired installed helper. Module compilation consumes this extension before typechecking `extern type` declarations and revalidates persisted instances against the current Go world.
-
 
 ### GoML declaration codec
 

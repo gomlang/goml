@@ -1,10 +1,14 @@
-# GoML Syntax Description
+# GoML language guide
 
 This article describes the GoML syntax and key type rules implemented in the current repository, mainly for use by code agents when generating, modifying, and reviewing `.gom` source code. It is not a future design proposal; if something resembles Rust, Go, or OCaml syntax but is not listed here, assume that GoML does not support it.
 
-GoML is a statically typed language with garbage collection. Its syntax is close to Rust, while its semantics are closer to ML. Source code is compiled into Go without Go generics or Go closures after monomorphization and lambda lifting. GoML has no ownership, borrowing, lifetimes, or manual memory management.
+GoML is a statically typed language with garbage collection. Its syntax is close to Rust, while its semantics are closer to ML. The compiler monomorphizes generics and lambda-lifts GoML closures before emitting Go. Explicit Go FFI can preserve native generic types and function values. GoML has no ownership, borrowing, lifetimes, or manual memory management.
 
-## Code agent must first remember the rules
+Quick navigation: [packages](#modules-packages-and-imports), [types](#type), [control flow](#control-flow), [patterns](#patterns), [traits](#trait-and-impl), [compile-time evaluation](#compile-time-evaluation), [Go FFI](#go-ffi), [tests](#tests), [prelude](#built-in-prelude), [standard library](#standard-library-package), and [verification](#verify-generated-code).
+
+Build and installation instructions are in the [repository README](../README.md) and [release guide](releasing.md). See [formatting](formatting.md) for canonical source layout and [compile-time evaluation architecture](comptime.md) for CTIR internals.
+
+## Essential rules
 
 1. The project source code uses `.gom`; the project root directory uses `goml.toml` to declare the canonical module path.
 2. Each source file in the project first writes `package name;`, then writes the file's own `use`, and finally writes the top-level definition.
@@ -14,13 +18,13 @@ GoML is a statically typed language with garbage collection. Its syntax is close
 6. `if`, `match`, and `select` are expressions. `if` without `else` must return `()`; `match` must be exhaustive.
 7. The last semicolon-free expression of a block is the block value; adding a semicolon discards the value.
 8. `let` and assignment statements must end with a semicolon. Mutable bindings may be introduced with `let mut pattern` or precisely inside a pattern with `mut name`; the semicolon can be omitted for `if`, `match`, `select`, `while`, `loop` and `for` as statements.
-9. Enumeration construction uses full names such as `Option::Some(value)`.In patterns, the enum qualifier may be omitted when the matched type determines it, such as `Some(value)` and `None`.
-10. For cross-package calls, write `alias::item`.Top-level items, structure fields, and native methods must all be marked with `pub` as required.
+9. Enumeration construction uses full names such as `Option::Some(value)`. In patterns, the enum qualifier may be omitted when the matched type determines it, such as `Some(value)` and `None`.
+10. For cross-package calls, write `alias::item`. Top-level items, struct fields, and inherent methods must all be marked with `pub` as required.
 11. Before using trait method syntax across packages, import the package and trait with `use alias::Trait;` or a braced import; when in doubt, use UFCS: `Trait::method(value)`.
 12. Use `module::path` for a package below the current module root. Do not generate `mod`, `crate::`, `self::`, `super::`, root paths `::x`, Rust references, or Go `var` / `:=`. A user `extern fn` is valid only with the typed Go FFI attribute described below.
 13. The test function uses `#[test]`, which must have no parameters, no type parameters and return `()`; the white-box test is placed in `*_test.gom` of the same package, and the black-box test is placed in the `tests/` directory of the package under test.
 
-## minimal program
+## Minimal program
 
 Single-file compilation allows omission of `package main;`:
 
@@ -176,7 +180,7 @@ Dependency versions must use the strict `X.Y.Z` form. A dependency version is a 
 
 Each module path segment must be non-empty and may contain ASCII letters, digits, `_`, and `-`. Paths rooted at `builtin` or `prelude` are reserved for the toolchain and cannot be used as a module path or dependency. The `[module]` section currently has no `name`, `kind`, `root`, or similar fields.
 
-### Build product catalog
+### Build output layout
 
 The default product layout is as follows; the standard package paths in the path are expanded by directory level, for example, `alice::myapp::utils` corresponds to `alice/myapp/utils`:
 
@@ -223,7 +227,7 @@ The executable file of the module root entry package is `bin/<module name>`; the
 
 The configured production directory will not participate in package discovery and cannot be a target to be inspected, built, or tested.The `.gitignore` generated by `goml new` contains `/_artifact/` by default; after modifying `build.target-dir`, the project's own `.gitignore` should be modified simultaneously.
 
-### Catalog package
+### Directory packages
 
 Each directory containing a `.gom` file is a package.All source files in the same directory must declare the same package name:
 
@@ -456,22 +460,6 @@ const NEWLINE: byte = b'\n';
 
 Constant names may start with an uppercase letter, a lowercase letter, or `_`; `UPPER_SNAKE_CASE` is the preferred convention. Constant expressions support literals, constructors, references to other constants, unary and binary operators, integer conversion methods, and comptime-capable calls. They may use forward references, but cycles are rejected. Allowed constant types are recursively immutable values: `bool`, numeric types, `string`, `char`, `byte`, tuples, fixed arrays, and structs or enums whose fields satisfy the same rule. `Vec`, `HashMap`, `Ref`, `Channel`, closures, and dynamic values are rejected. Composite constants cannot be used as patterns. Public constants are available through package-qualified paths.
 
-### Statics and one-time initialization
-
-A top-level `static` has one program-wide storage location. Its binding cannot be reassigned. In the first supported form, its explicit type must be `OnceCell[T]` and its initializer must be exactly `OnceCell::new()`:
-
-```goml
-static EMOJI: OnceCell[FrozenVec[FrozenVec[u16]]] = OnceCell::new();
-
-fn emoji() -> FrozenVec[FrozenVec[u16]] {
-    EMOJI.get_or_init(|| build_emoji().freeze())
-}
-```
-
-`OnceCell.get_or_init(init)` runs one initializer and caches its result. Concurrent first callers wait for that initializer and receive the same value. Recursive initialization of the same cell terminates with an error that names the static. A cached `Result` is an ordinary cached value. Statics do not run user-observable destruction at process exit.
-
-Unlike a `const`, a `static` has observable identity. `OnceCell[T]` controls initialization but does not make `T` immutable. Shared caches should therefore expose `FrozenVec` or another immutable value instead of a mutable `Vec`.
-
 Visible top-level constants can be used as value patterns in `match`, `if let`, `while let`, and `let else`. Both local names and package-qualified names are supported, and constant patterns can be nested or combined with or-patterns:
 
 ```goml
@@ -484,6 +472,22 @@ match value {
 ```
 
 In these refutable pattern contexts, a visible constant takes precedence over introducing a binding with the same name. Use an explicit alias such as `answer @ _` to bind that name instead. Ordinary `let` bindings and `for` patterns continue to introduce bindings, even when a top-level constant has the same name. Range-pattern endpoints remain integer or character literals.
+
+### Statics and one-time initialization
+
+A top-level `static` has one program-wide storage location. Its binding cannot be reassigned. Its explicit type must be `OnceCell[T]` and its initializer must be exactly `OnceCell::new()`:
+
+```goml
+static EMOJI: OnceCell[FrozenVec[FrozenVec[u16]]] = OnceCell::new();
+
+fn emoji() -> FrozenVec[FrozenVec[u16]] {
+    EMOJI.get_or_init(|| build_emoji().freeze())
+}
+```
+
+`OnceCell.get_or_init(init)` runs one initializer and caches its result. Concurrent first callers wait for that initializer and receive the same value. Recursive initialization of the same cell terminates with an error that names the static. A cached `Result` is an ordinary cached value. Statics do not run user-observable destruction at process exit.
+
+Unlike a `const`, a `static` has observable identity. `OnceCell[T]` controls initialization but does not make `T` immutable. Shared caches should therefore expose `FrozenVec` or another immutable value instead of a mutable `Vec`.
 
 ### Compile-time evaluation
 
@@ -901,11 +905,11 @@ From low to high:
 
 | Hierarchy | operator | illustrate |
 | --- | --- | --- |
-| 1 | `..` | Half-open range; cannot be used in chains |
-| 2 | ` |  | ` | short circuit logic or |
+| 1 | `..`, `..=` | Half-open or inclusive range; cannot be chained |
+| 2 | `\|\|` | Short-circuit logical OR |
 | 3 | `&&` | short circuit logical AND |
 | 4 | `==`、`!=`、`<`、`>`、`<=`、`>=` | Compare; not chainable |
-| 5 | `\ | ` | Bitwise OR |
+| 5 | `\|` | Bitwise OR |
 | 6 | `^` | Bitwise XOR |
 | 7 | `&` | Bitwise AND |
 | 8 | `<<`、`>>` | shift |
@@ -913,7 +917,7 @@ From low to high:
 | 10 | `*`、`/`、`%` | Multiplication, division, remainder |
 | 11 | `as` | explicit `dyn Trait` conversion |
 | 12 | Call `()`, index `[]`, `?`, member `.` | suffix |
-| 13 | One dollar `-`, `!`, `~` | prefix |
+| 13 | Unary `-`, `!`, `~` | prefix |
 
 The binary operator is left associative, and the function type `->` is right associative.Don’t write comparisons in chains; use combinations of logical operations:
 
@@ -1260,11 +1264,11 @@ Don't write `go work();`; that evaluates `work()` first, while `go` requires a v
 
 The `unstructured_go` lint warns on each `go` expression. A function or method that intentionally owns detached background work can use `#[allow(unstructured_go)]`.
 
-## model
+## Patterns
 
 Patterns can be used with `let`, `for`, `match`, `if let` and `while let`.
 
-| model | Example |
+| Pattern | Example |
 | --- | --- |
 | variable binding | `value` |
 | Wildcard | `_` |
@@ -1287,9 +1291,9 @@ Patterns can be used with `let`, `for`, `match`, `if let` and `while let`.
 | scope | `0..10`、`'a'..='z'` |
 | Nested mode | `Result::Ok((key, value))` |
 
-### Rebuttability and binding
+### Refutability and binding
 
-`let` and `for` require that the pattern be irrefutable, that is, the type at that position must succeed.`match`, `if let` and `while let` can use rebuttable patterns:
+`let` and `for` require that the pattern be irrefutable, that is, the type at that position must succeed.`match`, `if let` and `while let` can use refutable patterns:
 
 ```goml
 let (left, right) = pair;
@@ -1382,7 +1386,7 @@ whole @ (Either::Left(value) | Either::Right(value))
 
 or-pattern is tried from left to right and can be nested in tuple, struct, enumeration and sequence patterns.
 
-### range mode
+### Range patterns
 
 `start..end` does not contain an upper bound, `start..=end` contains an upper bound:
 
@@ -1638,9 +1642,9 @@ impl Iterator for Counter {
 }
 ```
 
-When implementing a trait with supertraits, you also need to provide the impl of the target type for each supertrait.The compiler rejects overlapping impls and enforces the orphan rule: at least one of the trait or the nominal type being implemented must belong to the current package.The target nominal type of intrinsic impl must belong to the current package.
+When implementing a trait with supertraits, you also need to provide the impl of the target type for each supertrait.The compiler rejects overlapping impls and enforces the orphan rule: at least one of the trait or the nominal type being implemented must belong to the current package.The target nominal type of inherent impl must belong to the current package.
 
-### intrinsic impl
+### Inherent impl
 
 ```goml
 impl Point {
@@ -1656,7 +1660,7 @@ impl Point {
 
 The associated function without a receiver is called with `Point::new(1, 2)`; the method whose first parameter is the receiver can be called with `point.sum()` or `Point::sum(point)`.
 
-Intrinsic impl of generic types:
+Inherent impl of generic types:
 
 ```goml
 impl[T] Box[T] {
@@ -1792,7 +1796,7 @@ Derived `Debug` provides `Debug::debug(value)` and the `.debug()` method. It for
 
 `Hash` combines fields in declaration order and includes the enum variant discriminant. It can be derived independently, although hash-map keys still require both `Eq` and `Hash`.
 
-`Default` initializes every struct field with `Default::default()`. For an enum it always selects the first declared variant and recursively defaults that variant's tuple or named payload. An empty enum cannot derive `Default`. Reordering enum variants therefore changes both the derived default value and the derived ordering; the first version does not support `#[default]`.
+`Default` initializes every struct field with `Default::default()`. For an enum it always selects the first declared variant and recursively defaults that variant's tuple or named payload. An empty enum cannot derive `Default`. Reordering enum variants therefore changes both the derived default value and the derived ordering; `#[default]` is not supported.
 
 ### Programmable derive
 
@@ -1864,7 +1868,6 @@ struct User {
 
 ```goml
 use std::json;
-use std::math;
 use json::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -1886,7 +1889,7 @@ A qualified custom derive must have the form `package_alias::export_name`, where
 
 `#[comptime_derive]` and `#[comptime_derive(Name)]` are valid only on non-generic free functions. A public handler must have the exact signature `(DeriveInput) -> DeriveOutput`. Private functions with the unnamed attribute are compile-time-only helpers and are included in the interface when reachable from a public handler. A derive handler may call those helpers and ordinary `#[comptime]` functions, but it cannot be called from runtime code or ordinary value `comptime`. Derive handlers are not exported as runtime functions.
 
-The first version resolves handlers from already compiled dependency interfaces. A handler cannot be defined and applied within the same package compilation. Put reusable handlers and their generated traits in a separate package. The target may be a generic struct or enum; the generated impl inherits its type parameters. `derive_output_add_predicate` and `derive_output_add_call_site_predicate` add the bounds required by generated methods.
+The compiler resolves handlers from already compiled dependency interfaces. A handler cannot be defined and applied within the same package compilation. Put reusable handlers and their generated traits in a separate package. The target may be a generic struct or enum; the generated impl inherits its type parameters. `derive_output_add_predicate` and `derive_output_add_call_site_predicate` add the bounds required by generated methods.
 
 The input reflection operations are:
 
@@ -2095,12 +2098,18 @@ Reverse conversion is also explicit. `ffi::Outcome::from_raw_result(result, fail
 
 Package compilation queries Go metadata for every declaration, including private and unused declarations. Interface and Core artifacts preserve this metadata, and cached inputs are rechecked against the current Go declarations. Changed declarations require rebuilding the GoML package from source. `--ffi-check off` cannot skip external type resolution or artifact type revalidation. Generic declarations such as `#[go_type("example.com/shim", "Box")] extern type Box[T];` accept concrete applications such as `Box[i64]`. The Go type checker validates the original Go constraints, including constraints on alias parameters that disappear when the alias is expanded. Imported applications are checked too, and concrete instance requests are saved for artifact revalidation. Concrete instance validation requires that a variable of the resolved Go type is legal. Constraint-only interfaces can be described in declaration metadata but cannot be used as runtime instances. Applications involving unresolved GoML generic parameters currently report that specialization is required; using `Box[T]` inside a generic GoML function or alias is not yet supported. Aliases to Go pointers are supported when their pointee has a supported representation. Aliases requiring other unsupported raw representations, such as raw Go channels, produce diagnostics. This support currently applies to module compilation; the query/LSP checking path is not yet connected to Go type metadata.
 
-The initial ABI supports values whose generated Go representations are already directly assignable:
+The foreign-call ABI supports values whose generated Go representations are directly assignable. Raw boundary types and adapters are detailed in the following sections:
 
 | GoML type | Go representation |
 | --- | --- |
 | `bool`, numeric primitives, `string` | Corresponding Go primitive |
 | External named type with concrete arguments | Original Go package type, without a new defined type |
+| `ffi::Ptr[T]` | Nullable Go pointer `*T` |
+| `ffi::Error` | Nullable Go `error` interface |
+| `ffi::String` | Go `string` preserving arbitrary bytes |
+| `ffi::Rune` | Go `rune` / `int32` without scalar validation |
+| `ffi::RawSlice[T]` | Nullable Go slice `[]T` |
+| `ffi::RawMap[K, V]` | Nullable Go map `map[K]V` with comparable keys |
 | `char` | `rune` / `int32` |
 | `byte` | `byte` / `uint8` |
 | `[T; N]` | `[N]T` |
@@ -2303,6 +2312,14 @@ fn available() -> bool {
 
 Foreign signature validation uses Go's key comparability rules. GoML checking rejects known non-comparable keys, including slices, raw maps, arrays or tuples containing them, and local structs with such fields; inferred generic applications are checked after inference. Repeated local generic wrappers are checked at each concrete instantiation: `Key[Key[RawSlice[i64]]]` is rejected when `Key[T]` stores `T` directly, while wrappers that only store a pointer to `T` remain comparable. Recursive struct layouts and structural checks exceeding 64 nested struct instantiations produce recoverable diagnostics. A pointer to an otherwise non-comparable type remains a valid key. Public GoML struct interfaces retain a comparability summary for private fields, so downstream key checking observes their restrictions without exposing field names or types. Summaries may depend on generic arguments; unknown hidden structure does not establish comparability. The artifact decoder also rejects directly non-comparable key shapes. External named keys are checked from Go metadata, including private fields, aliases and imported declarations. Generic external keys retain comparability requirements on their type parameters; concrete arguments are substituted when the type is used as a key, including nested types and aliases that reorder or erase arguments. A parameter used only behind a Go pointer imposes no comparability requirement. Disabling foreign call validation does not disable these checks. Build/link validation also checks keys through materialized local struct fields and external named types after generic specialization. External checks use persisted Go metadata and substitute concrete arguments into comparability rules, including nested types and reordered aliases. Missing or unresolved external key metadata produces a recoverable diagnostic, even with foreign call validation disabled. Module checking infers internal comparability requirements from generic function bodies, including requirements reached through function values and nested closures. Package checks propagate them across files until signatures stabilize, with a recoverable limit of 256 passes. Exported function interfaces retain the inferred requirements, so downstream module checks can reject invalid keys before building Go. Private structural key wrappers are reduced to their required type parameters or associated-type projections. These predicates have no user-written bound syntax and do not introduce let-generalization. Source-only dependency analysis checks dependency bodies and retains their inferred requirements before checking callers, including unsaved source overrides. Struct and enum interfaces also retain the key requirements of maps stored in fields or variant payloads, including private storage and aliases. These requirements propagate between nominal declarations with a recoverable 256-pass limit and are substituted at concrete type applications. Recursive type applications are checked through their declaration requirements without repeatedly expanding their layouts. Default trait methods retain their inferred map-key requirements separately from the method declaration bounds. An implementation that uses a default body must satisfy those requirements after substituting its receiver and associated types. An explicit method override does not inherit requirements from the unused default body. GoLibrary map exports remain unsupported. Raw maps add no synchronization or automatic deep copy.
 
+### Generating Go bindings
+
+Use `goml bind-go <CONFIG> [--compiler <COMPILER>] [--dry-run]` to generate explicitly allowlisted Go bindings from a versioned JSON configuration. `gomlc bind-go <CONFIG> [--dry-run]` is the compiler entry point. The configuration selects each native package/symbol and may list finite `type_arguments`; Go checks their constraints. It generates a GoML raw binding file and native Go forwarding functions without running package initializers or creating dependencies. An existing GoML module and an enclosing Go module are required. Output paths resolve relative to the configuration, remain within the GoML module, and must match the configured Go import path. Parent traversal, symbolic links and nested module boundaries are rejected.
+
+Native APIs may reside in the output Go package; same-package references do not introduce self imports. Metadata queries omit the previously owned output in memory, then Go checks the complete candidate package, including handwritten files, before publication. No source overlay is written to disk.
+
+The ownership manifest `<CONFIG>.goml-bind.json` records both generated files. Identical regeneration preserves timestamps; modifications to either source or the manifest prevent overwriting. Put handwritten conversions and wrappers in separate files. Raw strings and errors retain their explicit `std::ffi` boundaries; the generator does not infer error, nullable or record adapters. Dry runs validate configuration, module and output paths and print destinations without writing files; they do not query the selected symbols. See [the configuration contract](ffi/bind-go.md) and [the complete standard-library example](../examples/ffi-bind-go/README.md). This command uses existing extern/type-alias syntax and introduces no grammar changes.
+
 ### Exporting a Go library
 
 The frontend recognizes `#[go_export("Add")] pub fn add(x: i64, y: i64) -> i64 { x + y }`. It checks that the declaration is an ordinary top-level public function without generics, comptime/derive capability, or test attributes. The Go name starts with an ASCII uppercase letter and contains only ASCII letters, digits, or underscores; names must be unique across the selected GoML package. Duplicate attributes and attributes on methods, externs, types, fields, and other non-function items are rejected.
@@ -2335,12 +2352,6 @@ A raw echo returning `ffi::String` can preserve bytes without decoding. A rune a
 
 Interface and Core artifacts preserve the selected Go export name, stable package/function identity, resolved signature, and relative source origin. Export names and signatures participate in the interface semantic hash; source positions do not. The internal library linker selects only the chosen package’s declared exports as function roots before dead-code elimination and monomorphization; reachable private and cross-package helpers are retained without requiring a `main`. The internal Go library backend emits callable wrappers for scalar and fixed-array parameters and results, maps unit to no Go result, and maps a flat tuple to multiple Go results. Library wrappers use package-level OnceCell initialization and preserve panics. Generated internal package declarations are private Go identifiers; only explicitly selected export names become public API. `pub` alone does not request a Go export.
 
-Use `goml bind-go <CONFIG> [--compiler <COMPILER>] [--dry-run]` to generate explicitly allowlisted Go bindings from a versioned JSON configuration. `gomlc bind-go <CONFIG> [--dry-run]` is the compiler entry point. The configuration selects each native package/symbol and may list finite `type_arguments`; Go checks their constraints. It generates a GoML raw binding file and native Go forwarding functions without running package initializers or creating dependencies. An existing GoML module and an enclosing Go module are required. Output paths resolve relative to the configuration, remain within the GoML module, and must match the configured Go import path. Parent traversal, symbolic links and nested module boundaries are rejected.
-
-Native APIs may reside in the output Go package; same-package references do not introduce self imports. Metadata queries omit the previously owned output in memory, then Go checks the complete candidate package, including handwritten files, before publication. No source overlay is written to disk.
-
-The ownership manifest `<CONFIG>.goml-bind.json` records both generated files. Identical regeneration preserves timestamps; modifications to either source or the manifest prevent overwriting. Put handwritten conversions and wrappers in separate files. Raw strings and errors retain their explicit `std::ffi` boundaries; the generator does not infer error, nullable or record adapters. Dry runs validate configuration, module and output paths and print destinations without writing files; they do not query the selected symbols. See [the configuration contract](ffi/bind-go.md) and [the complete standard-library example](../examples/ffi-bind-go/README.md). This command uses existing extern/type-alias syntax and introduces no grammar changes.
-
 Use `goml export-go` to generate a library from one package in the current GoML module:
 
 ```text
@@ -2355,9 +2366,9 @@ The output contains `goml_generated.go` and `goml_exports.json`. The manifest re
 
 `--ffi-check required` is the default. All declared foreign bindings, including unused private ones, are checked before publication in the final generated-package context. `--ffi-check off` emits an unverified warning when foreign bindings exist and records `off` in the manifest; Go still compiles the candidate package. `--compiler`, `--target-dir`, `--jobs` and `--dry-run` are supported. The generated pure-Go library builds without the GoML compiler or metadata helper installed. A complete bidirectional example, including a Go executable and Go tests, is available in [the interoperability fixture](../tools/release/testdata/go-export).
 
-## test
+## Tests
 
-### Test functions and properties
+### Test functions and attributes
 
 Top-level functions are marked as tests using `#[test]`:
 
@@ -2396,12 +2407,24 @@ fn integration_case() -> () {
 }
 ```
 
+Parameterized tests use one or more `#[test_case(...)]` attributes on a top-level function. Test cases accept string and boolean arguments, which are checked against the function parameters. Each case receives a content-derived stable ID, while list, filter, text/JSON reporting, artifact manifests, and CodeLens continue to use its readable display name. Ordinary zero-argument `#[test]` functions remain unchanged.
+
+```goml
+#[test_case("left", true)]
+#[test_case("right", false)]
+fn is_left(value: string, expected: bool) -> () {
+    testing::assert_eq(value == "left", expected)
+}
+```
+
 `std::testing` provides the following assertions:
 
 - `testing::fail(message)`: Fail the current test immediately;
 - `testing::assert(condition)`: requires the condition to be `true`;
 - `testing::assert_eq(actual, expected)`: requires two values of the same type that implement `PartialEq + Debug` to be equal;
-- `testing::assert_ne(actual, expected)`: requires two values of the same type that implement `PartialEq + Debug` to be unequal.
+- `testing::assert_ne(actual, expected)`: requires two values of the same type that implement `PartialEq + Debug` to be unequal;
+- `testing::assert_some`, `assert_none`, `assert_ok`, and `assert_err`: check the variant of an `Option` or `Result`;
+- `testing::expect_some`, `expect_ok`, and `expect_err`: return the selected payload or fail with the supplied message.
 
 ### White box testing and black box testing
 
@@ -2483,6 +2506,7 @@ goml test [FILTER]
 - `--ignored`: only run ignored tests;
 - `--include-ignored`: Run normal tests and ignored tests at the same time;
 - `--jobs N`: Number of parallel workers, default is `1`;
+- `--seed N`: Supply a reproducible positive seed to every test;
 - `--timeout 500ms|30s|2m`: timeout for a single test, the default is `30s`;
 - `--nocapture`: Let the standard output and standard error of the test directly inherit the terminal;
 - `--format text|json`: Select text or line-by-line JSON results; JSON format cannot be used with `--nocapture` at the same time;
@@ -2490,13 +2514,15 @@ goml test [FILTER]
 
 Each test is executed in a separate runner process, and failure to exit and timeout do not affect other tests; `--jobs` controls the number of test processes running at the same time.Executing `goml test` requires an available Go toolchain to build the test runner.
 
+`goml test --seed N` supplies one reproducible positive seed to every test process through `testing::seed()`. Failure summaries print the replay seed, and every JSON result event includes it. Captured stdout and stderr remain isolated per test process and are emitted only for failures unless `--nocapture` is selected.
+
 ### LSP and editor
 
 LSP will construct the analysis package according to the production file, white box test file and black box test file respectively according to the path, so diagnosis, completion, hover and jump follow the corresponding visibility.`Run Test` CodeLens will appear on the `#[test]` function; the VS Code extension will save the dirty file first, and then call the module-level `goml test` with the complete test name and test type.
 
 The custom `goml/expandedDerive` request returns the formatted AST after built-in and programmable derives have run for the requested document. It uses the same package aliases, explicit derive imports, ambiguity checks, dependency interfaces, CTIR verifier, and resource limits as `goml check`. The VS Code command `GoML: Show Expanded Derive` opens that result beside the source file.
 
-`gomllsp` supports full-document formatting through `textDocument/formatting`. Formatting uses the latest unsaved document text and the fixed rules described in `docs/formatting.md`. Invalid documents are left unchanged.
+`gomllsp` supports full-document formatting through `textDocument/formatting`. Formatting uses the latest unsaved document text and the fixed rules described in [formatting.md](formatting.md). Invalid documents are left unchanged.
 
 ## Built-in prelude
 
@@ -2535,6 +2561,10 @@ Construction uses `Option::Some`, `Option::None`, `Result::Ok` and `Result::Err`
 - `value.map(map_fn) -> Result[U, E]`
 - `value.map_err(map_fn) -> Result[T, F]`
 - `value.and_then(next) -> Result[U, E]`
+
+### `Default`
+
+The prelude `Default` implementations use `()` for the empty tuple, `false` for `bool`, zero for numeric types, and the empty string for `string`. `Vec` and `HashMap` default to empty containers, and the standard collection types `HashSet`, `IndexMap`, `Stack`, `Deque`, `BitSet`, `Arena`, `IndexVec`, and `Interner` likewise default through their empty constructors. `Option[T]` defaults to `None` without requiring `T: Default`, while tuples and fixed arrays default each element. `Result[T, E]` and `Ref[T]` intentionally have no global default implementation.
 
 ### Output and string conversion
 
@@ -2784,6 +2814,7 @@ use std::ascii;
 use std::bincode;
 use std::bytes;
 use std::bytes::endian;
+use std::channel;
 use std::cmp;
 use std::collections;
 use std::crypto;
@@ -2791,10 +2822,12 @@ use std::encoding::base64;
 use std::encoding::hex;
 use std::error;
 use std::env;
+use std::ffi;
 use std::fs;
 use std::io;
 use std::iter;
 use std::json;
+use std::math;
 use std::num;
 use std::path;
 use std::process;
@@ -2810,11 +2843,12 @@ use std::utf16;
 use std::unicode;
 ```
 
-Current public entrances include:
+Public APIs include:
 
 - `ascii::is_ascii`, character-class predicates, ASCII case conversion and comparison, and `escape_default`
 - `bincode::standard`, `legacy`, configuration builders, serde `Serialize` and `Deserialize` re-exports, `encode_to_vec`, and `decode_from_slice`
 - `bytes::Bytes`, `bytes::Builder`, checked and zero-copy byte views, plus `bytes::endian::{Builder, Reader, Writer, Endian}` and checked integer and floating-point reads and writes
+- `channel::Operation`, `Selection`, `select`, `try_select`, and `try_select_priority` for runtime-sized channel selection
 - `cmp::Ordering`, `Ord`, `Reverse`, comparison helpers, and two-value minimum, maximum, and clamping operations. `Ordering` is a builtin type re-exported by `cmp`.
 - `collections::Arena`, `BinaryHeap`, `BitSet`, `BTreeMap`, `BTreeSet`, `Deque`, `HashSet`, `IndexMap`, `IndexSet`, `IndexVec`, `Interner`, and `Stack`; hash-backed collections require `Hash + Eq`, while tree collections and heaps use `cmp::Ord`
 - `collections::sort`, `stable_sort`, `binary_search`, `min`, `max`, and their comparator variants. The sorting, search, selection, and deduplication methods on `Vec[T]` are the canonical forms.
@@ -2823,6 +2857,7 @@ Current public entrances include:
 - `encoding::base64` RFC 4648 standard and URL-safe encoding with padded and unpadded variants
 - `error::Error`, `ErrorKind`, `Details`, and stable error-kind code conversion
 - `env::args`, current-directory and executable queries, and environment-variable reads
+- `ffi::String`, `Rune`, `Ptr`, `Error`, `Func`, `RawSlice`, `RawMap`, and explicit Go boundary adapters
 - `fs::read_file_structured`, `write_file_structured`, structured byte I/O, directory operations, path inspection, and `sha256_file`
 - `io::print`, `println`, `eprint`, `eprintln`, and byte-oriented standard stream I/O
 - `iter::empty`, `once`, `from_fn`, iterator adapters, and single-pass consumers
@@ -2889,27 +2924,43 @@ Importing `utf8::BytesUtf8` adds `Bytes::to_string_utf8`, which returns `Utf8Err
 
 `std::utf16` converts between strings and `Slice[u16]`, or between strings and endian-tagged byte slices. Decoding rejects lone surrogates and odd byte lengths with an indexed `Utf16Error`; encoding emits surrogate pairs for non-BMP scalar values.
 
+### Text and source positions
+
+Text search indices are UTF-8 byte offsets, matching the indices accepted by the built-in string APIs. `starts_with_at` returns false for out-of-range and non-character-boundary offsets. `rfind` returns the last matching byte offset. Trimming recognizes ASCII whitespace. Splitting on an empty separator returns the original string as one item, while `split_once` with an empty separator returns `Option::None`.
+
+`text::LineIndex` precomputes line starts and non-ASCII scalar positions for repeated source-position conversion. `offset_to_line_column` and `line_column_to_offset` support UTF-8, UTF-16, and UTF-32 columns, treat CRLF as one line ending, and clamp unchecked out-of-range positions. `line_column_to_offset_checked` rejects positions inside an encoded scalar or outside the source.
+
 `text::find`, `text::rfind`, and `text::find_bytes` return byte offsets; the string methods `find`, `rfind`, and `find_bytes` are the canonical forms. `text::char_indices` yields byte offsets paired with Unicode scalar values, `text::char_count` counts scalar values, and `text::slice_chars` uses scalar-value indexes and returns `None` for an invalid range.
+
+### ASCII and Unicode
+
+`std::ascii` operates on `byte`. Classification and case conversion use only the 7-bit ASCII range, and bytes above `0x7f` remain unchanged. `escape_default` emits short escapes for tabs, carriage returns, newlines, quotes, and backslashes, preserves printable ASCII, and uses lowercase `\\xNN` escapes for other bytes.
 
 `std::unicode` fixes its public data version to Unicode 15.0.0. Character predicates operate on one Unicode scalar value. `lowercase` and `uppercase` apply Unicode case mapping to a complete string. `case_fold` uses the checked-in table generated by `tools/generate_unicode_casefold.py`, supports multi-scalar folds, and is locale independent.
 
+### Mathematics
+
 `std::math` delegates elementary operations to Go's `math` package and follows its IEEE 754 special-value behavior. The f32 forms calculate through f64 and round the result back to f32. Results therefore use the target Go toolchain's correctly rounded conversions but do not promise bit-for-bit equality across different operating systems or processor implementations for every transcendental function.
+
+### Randomness and cryptographic helpers
+
+`std::crypto::hash::sha256` returns the lowercase hexadecimal SHA-256 digest of a byte buffer, and `sha256_file` hashes a complete file before returning. `std::crypto::rand::bytes` reads the requested number of bytes from the operating-system cryptographic random source. These APIs do not expose hasher or random-source handles.
 
 `std::rand` uses the versioned `splitmix64-v1` algorithm. Every operation requires an explicit seed, and identical inputs produce identical outputs. It is intended for tests, simulations, sampling, and shuffling and is not cryptographically secure.
 
-`goml test --seed N` supplies one reproducible positive seed to every test process through `testing::seed()`. Failure summaries print the replay seed, and every JSON result event includes it. Captured stdout and stderr remain isolated per test process and are emitted only for failures unless `--nocapture` is selected.
-
-Parameterized tests use one or more `#[test_case(...)]` attributes on a top-level function. This release accepts string and boolean arguments and validates them against the function parameters. Each case receives a content-derived stable ID, while list, filter, text/JSON reporting, artifact manifests, and CodeLens continue to use its readable display name. Ordinary zero-argument `#[test]` functions remain unchanged.
-
-`std::crypto::hash::sha256` returns the lowercase hexadecimal SHA-256 digest of a byte buffer, and `sha256_file` hashes a complete file before returning. `std::crypto::rand::bytes` reads the requested number of bytes from the operating-system cryptographic random source. These APIs do not expose hasher or random-source handles.
+### Hexadecimal and base64
 
 `std::encoding::hex` encodes `bytes::Bytes` to lowercase hexadecimal by default, while `encode_upper` emits uppercase digits. Decoding accepts either case and returns `DecodeError` with the byte offset of an odd length or invalid digit.
 
 `std::encoding::base64` uses the padded RFC 4648 standard alphabet by default. `Variant` selects standard or URL-safe alphabets with required or omitted padding. Decoding is strict: it rejects invalid lengths, alphabet mixing, misplaced padding, and nonzero unused trailing bits.
 
-`text::LineIndex` precomputes line starts and non-ASCII scalar positions for repeated source-position conversion. `offset_to_line_column` and `line_column_to_offset` support UTF-8, UTF-16, and UTF-32 columns, treat CRLF as one line ending, and clamp unchecked out-of-range positions. `line_column_to_offset_checked` rejects positions inside an encoded scalar or outside the source.
+### Time
+
+`Duration` stores a non-negative number of nanoseconds and offers constructors and whole-unit accessors for nanoseconds, microseconds, milliseconds, and seconds. Subtraction saturates at zero. `Instant` is monotonic and is suitable for elapsed-time measurement. `SystemTime` exposes Unix nanosecond, millisecond, and second timestamps. `time::sleep` blocks the current goroutine for a `Duration`.
 
 `Duration` provides checked and saturating scaled constructors, addition, subtraction, and multiplication. Checked operations return `None` on overflow, underflow, or a negative input. Saturating operations clamp to zero or the largest signed 64-bit nanosecond value. `Duration`, `Instant`, and `SystemTime` expose `compare`; `Instant::checked_duration_since` returns `None` when the receiver precedes the supplied instant.
+
+### Files and standard streams
 
 `fs::read_file_structured`, `read_bytes_structured`, `write_file_structured`, and `write_bytes_structured` perform whole-file I/O. They return `fs::Error` with a stable `io::ErrorKind`, operation, path, optional raw operating-system code, and display message. Directory creation and removal, canonicalization, directory listing, and file hashing use the same error type.
 
@@ -2919,7 +2970,13 @@ Parameterized tests use one or more `#[test_case(...)]` attributes on a top-leve
 
 `io::read_stdin_structured`, `read_stdin_exact_structured`, `write_stdout_structured`, and `write_stderr_structured` provide structured errors for standard streams. `read_stdin_to_string` validates the complete input as UTF-8 and reports `InvalidData` on failure. A negative exact-read length reports `InvalidInput` before accessing stdin.
 
+### Numeric parsing and checked arithmetic
+
+Numeric parsing returns `Result[_, num::ParseIntError]` or `Result[_, num::ParseFloatError]`. Integer radix parsing accepts radix `0` or `2..36`; radix `0` recognizes `0b`, `0o`, and `0x` prefixes and permits Go-style digit separators. Invalid radices, malformed input, and overflow return `Result::Err`. Floating-point parsing supports decimal and hexadecimal IEEE 754 input, signed exponents, digit separators, `inf`, `infinity`, and `NaN`, and rounds directly to the requested `f32` or `f64` width.
+
 `num::parse_int_structured`, radix and unsigned variants, and the structured float parsers return domain parse errors. The `checked_*_int64` operations return `None` on overflow; the corresponding `saturating_*_int64` operations clamp to the signed 64-bit bounds.
+
+### Environment, paths, and processes
 
 `env::current_dir_structured`, `current_exe_structured`, and `var_structured`, `path::absolute_structured`, and the `process` structured execution methods expose whole-operation errors. Process timeout methods take `time::Duration`, terminate and wait through the command runtime, and return `TimedOut` through `process::Error`.
 
@@ -2953,13 +3010,13 @@ fn round_trip(value: Message) -> Result[Message, string] {
 }
 ```
 
-The first version supports the shared serde primitives, byte slices through custom direct implementations, `Vec`, `Option`, two- and three-element tuples, and derived structs and enums. Fixed arrays are not yet supported because GoML does not yet have const-generic serde implementations. Dynamic `serde::Value`, `json::Value`, and `toml::Value` do not describe the concrete binary layout needed by typed bincode decode.
+Typed bincode supports the shared serde primitives, byte slices through custom direct implementations, `Vec`, `Option`, two- and three-element tuples, and derived structs and enums. Fixed arrays are not yet supported because GoML does not yet have const-generic serde implementations. Dynamic `serde::Value`, `json::Value`, and `toml::Value` do not describe the concrete binary layout needed by typed bincode decode.
 
 ### TOML values and typed documents
 
 `std::toml` follows the same public split as JSON. `toml::Value` has string, signed 64-bit integer, 64-bit float, boolean, datetime text, array, and table variants. `parse` and `encode` operate on that schema-free representation. `to_value`, `from_value`, `to_string`, and `from_string` use the shared serde traits and enforce the destination type. TOML still plans a complete table tree before emission because headers and dotted paths require document-wide organization; it is compatible with the streaming traits but is not currently a fully direct format. Unsigned values above the TOML signed-integer range are rejected, and `()` or `None` cannot be encoded because TOML has no null value.
 
-The first parser accepts basic and literal strings, Unicode escapes, booleans, decimal and base-prefixed integers, floats, datetime text, arrays, inline tables, dotted keys, and ordinary table headers. It preserves table and field order for deterministic output. Multiline strings, array-of-table headers, and dotted keys inside inline tables are not yet supported.
+The TOML parser accepts basic and literal strings, Unicode escapes, booleans, decimal and base-prefixed integers, floats, datetime text, arrays, inline tables, dotted keys, and ordinary table headers. It preserves table and field order for deterministic output. Multiline strings, array-of-table headers, and dotted keys inside inline tables are not yet supported.
 
 ```goml
 use std::toml;
@@ -2976,11 +3033,11 @@ fn load(input: string) -> Result[Server, string] {
 }
 ```
 
-`std::ascii` operates on `byte`. Classification and case conversion use only the 7-bit ASCII range, and bytes above `0x7f` remain unchanged. `escape_default` emits short escapes for tabs, carriage returns, newlines, quotes, and backslashes, preserves printable ASCII, and uses lowercase `\\xNN` escapes for other bytes.
+### Comparison and sorting
+
+Sorting mutates a `Vec[T]` in place. `sort` and `stable_sort` use `cmp::Ord`; `sort_by_ordering` and `stable_sort_by_ordering` use `cmp::Ordering`; `sort_by` and `stable_sort_by` accept negative/zero/positive integer comparators. All sorting variants are stable. `binary_search` and its comparator-based variants expect the vector to already be ordered and return the first matching index.
 
 `std::cmp` provides `PartialOrd` and `Ord`. `()`, `bool`, `string`, `char`, and all signed and unsigned integer types implement both. Floating-point values implement only `PartialOrd`, because NaN does not form a total order; comparison with NaN yields `Option::None`. Tuples, fixed arrays, `Vec`, `Slice`, `Option`, and `Result` implement the comparison traits conditionally and use lexicographic order. `cmp::compare` returns `Ordering::Less`, `Equal`, or `Greater`; `Ordering` supports predicates, reversal, lexicographic chaining, and conversion to the negative/zero/positive integer convention. `cmp::Reverse[T]` reverses an existing ordering. `cmp::clamp` returns an error when the minimum exceeds the maximum.
-
-The prelude `Default` implementations use `()` for the empty tuple, `false` for `bool`, zero for numeric types, and the empty string for `string`. `Vec` and `HashMap` default to empty containers, and the standard collection types `HashSet`, `IndexMap`, `Stack`, `Deque`, `BitSet`, `Arena`, `IndexVec`, and `Interner` likewise default through their empty constructors. `Option[T]` defaults to `None` without requiring `T: Default`, while tuples and fixed arrays default each element. `Result[T, E]` and `Ref[T]` intentionally have no global default implementation.
 
 ### Structured concurrency
 
@@ -3067,16 +3124,6 @@ Common methods are `new`, `with_capacity`, `len`, `is_empty`, `contains`, `get`,
 The implementation uses a sparse open-addressed index table and an insertion-ordered entry array. Deleted entries become tombstones and are compacted during later growth or when deletion density becomes high. Lookup, insertion, and removal are expected O(1); iteration and compaction are O(n). Structural mutation while an iterator is active is unsupported.
 
 `IndexMap` does not currently have literal or indexing syntax. Use `insert` and `get`.
-
-File system operations use `Result[..., string]` to report errors, and can be combined with `?`.
-
-Text search indices are UTF-8 byte offsets, matching the indices accepted by the built-in string APIs. `starts_with_at` returns false for out-of-range and non-character-boundary offsets. `rfind` returns the last matching byte offset. Trimming recognizes ASCII whitespace. Splitting on an empty separator returns the original string as one item, while `split_once` with an empty separator returns `Option::None`.
-
-Numeric parsing returns `Result[_, string]` and is implemented by the GoML standard library. Integer radix parsing accepts radix `0` or `2..36`; radix `0` recognizes `0b`, `0o`, and `0x` prefixes and permits Go-style digit separators. Invalid radices, malformed input, and overflow return `Result::Err`. Floating-point parsing supports decimal and hexadecimal IEEE 754 input, signed exponents, digit separators, `inf`, `infinity`, and `NaN`, and rounds directly to the requested `f32` or `f64` width.
-
-Sorting mutates a `Vec[T]` in place. `sort` and `stable_sort` use `cmp::Ord`; `sort_by_ordering` and `stable_sort_by_ordering` use `cmp::Ordering`; `sort_by` and `stable_sort_by` accept negative/zero/positive integer comparators. All sorting variants are stable. `binary_search` and its comparator-based variants expect the vector to already be ordered and return the first matching index.
-
-`Duration` stores a non-negative number of nanoseconds and offers constructors and whole-unit accessors for nanoseconds, microseconds, milliseconds, and seconds. Subtraction saturates at zero. `Instant` is monotonic and is suitable for elapsed-time measurement. `SystemTime` exposes Unix nanosecond, millisecond, and second timestamps. `time::sleep` blocks the current goroutine for a `Duration`.
 
 ## Comparison of common writing errors
 
@@ -3297,10 +3344,10 @@ The parser will do some error recovery for commas and semicolons, but the code a
 
 ## Verify generated code
 
-After building stage 1, verify a standalone source file from the repository root:
+After running `just make`, verify a standalone source file from the repository root:
 
 ```sh
-stage1/bin/gomlc run-single path/to/main.gom
+stage2/bin/gomlc run-single path/to/main.gom
 ```
 
 For a project, run the installed driver from anywhere inside its module:
@@ -3318,4 +3365,4 @@ goml fmt
 
 When you need to inspect a compilation phase, add `--dump-ast`, `--dump-expanded-ast`, `--dump-hir`, `--dump-tast`, `--dump-ctir`, `--dump-core`, `--dump-mono`, `--dump-lift`, `--dump-anf`, or `--dump-go` to `gomlc run-single`. `--dump-ast` shows source lowering before derive expansion, while `--dump-expanded-ast` includes every generated implementation.
 
-The code agent should at least run the corresponding `goml check` or `gomlc run-single` before submitting the source code; when modifying the test, it should also run `goml check --tests` and the related `goml test`.When type inference fails, give priority to adding local result types, empty container types, closure parameter types, or using UFCS instead of rewriting to unsupported Rust/Go syntax.
+The code agent should at least run the corresponding `goml check` or `gomlc run-single` before submitting the source code; when modifying the test, it should also run `goml check --tests` and the related `goml test`. When type inference fails, give priority to adding local result types, empty container types, closure parameter types, or using UFCS instead of rewriting to unsupported Rust/Go syntax.
