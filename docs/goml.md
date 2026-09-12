@@ -1,6 +1,6 @@
 # GoML language guide
 
-This article describes the GoML syntax and key type rules implemented in the current repository, mainly for use by code agents when generating, modifying, and reviewing `.gom` source code. It is not a future design proposal; if something resembles Rust, Go, or OCaml syntax but is not listed here, assume that GoML does not support it.
+This guide describes the GoML syntax, type rules, tools, and public library APIs implemented in this repository. Use it when writing, modifying, and reviewing `.gom` source. Similarities to Rust, Go, or OCaml do not imply that their syntax or APIs are supported.
 
 GoML is a statically typed language with garbage collection. Its syntax is close to Rust, while its semantics are closer to ML. The compiler monomorphizes generics and lambda-lifts GoML closures before emitting Go. Explicit Go FFI can preserve native generic types and function values. GoML has no ownership, borrowing, lifetimes, or manual memory management.
 
@@ -17,7 +17,7 @@ Build and installation instructions are in the [repository README](../README.md)
 5. Generic calls usually rely on type inference; when explicit type arguments are required, write `id::[i32](1)`, not `id[i32](1)` or Rust's `id::<i32>(1)`.
 6. `if`, `match`, and `select` are expressions. `if` without `else` must return `()`; `match` must be exhaustive.
 7. The last semicolon-free expression of a block is the block value; adding a semicolon discards the value.
-8. `let` and assignment statements must end with a semicolon. Mutable bindings may be introduced with `let mut pattern` or precisely inside a pattern with `mut name`; the semicolon can be omitted for `if`, `match`, `select`, `while`, `loop` and `for` as statements.
+8. `let` and assignment statements must end with a semicolon. Mutable bindings may be introduced with `let mut pattern` or precisely inside a pattern with `mut name`; the semicolon can be omitted for `if`, `match`, `select`, and unlabeled `while`, `loop` and `for` statements. Labeled loop statements require a semicolon before a following statement.
 9. Enumeration construction uses full names such as `Option::Some(value)`. In patterns, the enum qualifier may be omitted when the matched type determines it, such as `Some(value)` and `None`.
 10. For cross-package calls, write `alias::item`. Top-level items, struct fields, and inherent methods must all be marked with `pub` as required.
 11. Before using trait method syntax across packages, import the package and trait with `use alias::Trait;` or a braced import; when in doubt, use UFCS: `Trait::method(value)`.
@@ -44,11 +44,11 @@ fn main() -> () {
 }
 ```
 
-`main` cannot have parameters or type parameters.When generating an executable file, the package selected as the entry must be declared as `package main;` and define `fn main()`.It is recommended to let `main` return `()`.
+`main` cannot have parameters or type parameters. When generating an executable file, the package selected as the entry must be declared as `package main;` and define `fn main()`. It is recommended to let `main` return `()`.
 
 ## Lexical rules
 
-### identifiers and keywords
+### Identifiers and keywords
 
 Ordinary identifiers only use ASCII and are of the form:
 
@@ -56,13 +56,13 @@ Ordinary identifiers only use ASCII and are of the form:
 [A-Za-z][A-Za-z_0-9]* | _[A-Za-z_0-9]+
 ```
 
-The single `_` is a wildcard character, not an ordinary variable name.The current syntax enforces the first letter case of name categories:
+The single `_` is a wildcard character, not an ordinary variable name. The current syntax enforces the first letter case of name categories:
 
 - Package names, package aliases in `use package as alias`, functions, methods, parameters, local bindings and fields must start with a lowercase letter or `_`; imported item aliases may follow the naming convention of the imported item;
 - Structures, enumerations, traits, enumeration variants, generic parameters, and associated types must start with a capital letter;
 - Paths retain the appropriate case for the referenced name.
 
-Enumeration construction should use `Enum::Variant`.Patterns may omit `Enum::` because their expected type determines the variant owner.
+Enumeration construction should use `Enum::Variant`. Patterns may omit `Enum::` because their expected type determines the variant owner.
 
 Common keywords include:
 
@@ -77,25 +77,25 @@ f32 f64 string char extern
 
 `self` is a special abbreviation for the receiver parameter, and can also be used as a common receiver variable name; `Self` has special meaning in the type position of trait and impl.
 
-The white space is not noticeable.Only line comments from `//` to the end of the line are supported, block comments are not supported.
+Whitespace separates tokens but does not determine block structure. Only line comments from `//` to the end of the line are supported; block comments are not supported.
 
-### literal
+### Literals
 
 | category | Syntax example | Default or description |
 | --- | --- | --- |
 | empty tuple | `()` | Type is `()` |
-| bool | `true`、`false` | Type is `bool` |
-| integer | `0`、`42`、`1_000`、`0b1010`、`0o755`、`0xff` | Determined by context; defaults to `isize` when unconstrained |
-| floating point number | `1.25`、`1e3`、`2.5e-2` | Determined by context; defaults to `f64` when unconstrained |
+| bool | `true`, `false` | Type is `bool` |
+| integer | `0`, `42`, `1_000`, `0b1010`, `0o755`, `0xff` | Determined by context; defaults to `isize` when unconstrained |
+| floating point number | `1.25`, `1e3`, `2.5e-2` | Determined by context; defaults to `f64` when unconstrained |
 | string | `"text"` | Type is `string` |
-| raw string | `r"text"`、`r#"text with \"quotes\""#` | Type is `string`; escapes are not processed |
+| raw string | `r"text"`, `r#"text with \"quotes\""#` | Type is `string`; escapes are not processed |
 | byte string | `b"text\\n"` | Type is `Vec[byte]`; ASCII contents and byte escapes are supported |
-| raw byte string | `br"text"`、`br#"text with "quotes""#` | Type is `Vec[byte]`; escapes are not processed |
+| raw byte string | `br"text"`, `br#"text with "quotes""#` | Type is `Vec[byte]`; escapes are not processed |
 | interpolated string | `f"value={value}"` | Type is `string`; embedded values use `ToString` |
-| character | `'a'`、`'\n'`、`'\u0041'` | Type is `char`, representing a Unicode scalar value |
-| byte | `b'A'`、`b'\n'`、`b'\xFF'` | Type is `byte`, a transparent alias of `u8` |
+| character | `'a'`, `'\n'`, `'\u0041'` | Type is `char`, representing a Unicode scalar value |
+| byte | `b'A'`, `b'\n'`, `b'\xFF'` | Type is `byte`, a transparent alias of `u8` |
 
-Numbers have no type suffix.Integer literals support binary `0b`/`0B`, octal `0o`/`0O`, decimal, and hexadecimal `0x`/`0X` forms.The `_` delimiter can be used between two digits; floating point numbers support `e`/`E` exponent and optional exponent sign.When using a decimal point, there must be digits on both sides of the decimal point.Negative numbers are composed of unary `-` and positive numeric literals.
+Numbers have no type suffix. Integer literals support binary `0b`/`0B`, octal `0o`/`0O`, decimal, and hexadecimal `0x`/`0X` forms. The `_` delimiter can be used between two digits; floating point numbers support `e`/`E` exponent and optional exponent sign. When using a decimal point, there must be digits on both sides of the decimal point. Negative numbers are composed of unary `-` and positive numeric literals.
 
 Floating-point literals are rounded directly from their source text to the context-selected `f32` or `f64` width using round-to-nearest, ties-to-even. Overflowing literals are rejected; underflow may round to zero.
 
@@ -225,17 +225,17 @@ value tree.
 
 The executable file of the module root entry package is `bin/<module name>`; the nested entry package retains the directory within the module and appends the entry name. For example, the output of `alice::app::cmd::server` is `bin/cmd/server/server`. Production test dependencies are built once under `test/base`; internal and external tests each share one Go entry, manifest, and runner at the corresponding test-kind root. The runner file has the `.exe` suffix on Windows. External dependencies use the same `deps/<owner>/<module>/<version>/pkg/...` structure in the root directory of each stage.
 
-The configured production directory will not participate in package discovery and cannot be a target to be inspected, built, or tested.The `.gitignore` generated by `goml new` contains `/_artifact/` by default; after modifying `build.target-dir`, the project's own `.gitignore` should be modified simultaneously.
+The configured production directory will not participate in package discovery and cannot be a target to be inspected, built, or tested. The `.gitignore` generated by `goml new` contains `/_artifact/` by default; after modifying `build.target-dir`, the project's own `.gitignore` should be modified simultaneously.
 
 ### Directory packages
 
-Each directory containing a `.gom` file is a package.All source files in the same directory must declare the same package name:
+Each directory containing a `.gom` file is a package. All source files in the same directory must declare the same package name:
 
 ```goml
 package utils;
 ```
 
-The canonical identity of a package is the module path plus the relative directory path.The package declaration name determines the local name when imported without aliases, but not the global identity of the package.The canonical identity of the root package is the module path.
+The canonical identity of a package is the module path plus the relative directory path. The package declaration name determines the local name when imported without aliases, but not the global identity of the package. The canonical identity of the root package is the module path.
 
 A typical project could be:
 
@@ -245,7 +245,7 @@ main.gom
 utils/utils.gom
 ```
 
-`utils/utils.gom`：
+`utils/utils.gom`:
 
 ```goml
 package utils;
@@ -255,7 +255,7 @@ pub fn message() -> string {
 }
 ```
 
-`main.gom`：
+`main.gom`:
 
 ```goml
 package main;
@@ -269,9 +269,9 @@ fn main() -> () {
 
 ### `use`
 
-`use` is a file-level declaration and must be placed after `package` and before any top-level items.Imports are not shared between different files.
+`use` is a file-level declaration and must be placed after `package` and before any top-level items. Imports are not shared between different files.
 
-Imports are not transitive: package A imports package B, which does not allow files using A to automatically see B.Each file must directly import each package it references.
+Imports are not transitive: package A imports package B, which does not allow files using A to automatically see B. Each file must directly import each package it references.
 
 ```goml
 use alice::http::client;
@@ -313,7 +313,7 @@ use alice::rendering::api;
 use api::Render;
 ```
 
-Importing `Render` in a braced list also adds it to the method scope. Afterwards, the specific value can be written as `value.render()`.Even if the trait is not added to the method scope, you can still write a qualified call to `api::Render::render(value)`.
+Importing `Render` in a braced list also adds it to the method scope. Afterwards, the specific value can be written as `value.render()`. Even if the trait is not added to the method scope, you can still write a qualified call to `api::Render::render(value)`.
 
 `pub use` re-exports a named package or public item from the current package without changing its identity:
 
@@ -335,9 +335,9 @@ super::x
 ::rooted::x
 ```
 
-### visibility
+### Visibility
 
-Top-level items are only visible within the package by default.Top-level functions, structures, enumerations and traits are exported using `pub`; structure fields and inherent impl methods are also private by default and need to be marked `pub` separately for cross-package access:
+Top-level items are only visible within the package by default. Top-level functions, structures, enumerations and traits are exported using `pub`; structure fields and inherent impl methods are also private by default and need to be marked `pub` separately for cross-package access:
 
 ```goml
 pub struct Point {
@@ -356,30 +356,30 @@ impl Point {
 }
 ```
 
-All files in the same package can use private top-level items.The trait impl method inherits the visibility of the trait method and cannot write `pub`.
+All files in the same package can use private top-level items. The trait impl method inherits the visibility of the trait method and cannot write `pub`.
 
-## type
+## Type
 
 ### Basic types and composite types
 
-| type | Example | illustrate |
+| Type | Example | Description |
 | --- | --- | --- |
 | empty tuple | `()` | The only value is `()` |
-| Boolean | `bool` | `true`、`false` |
-| raw integer | `isize` | Corresponds to the `int` of the target Go platform and is also the default type of integers. |
-| signed integer | `i8`、`i16`、`i32`、`i64` | fixed width |
-| unsigned integer | `usize`、`u8`、`u16`、`u32`、`u64` | `usize` corresponds to the target Go platform's `uint`; the others have fixed widths |
+| Boolean | `bool` | `true`, `false` |
+| platform-sized integer | `isize` | Corresponds to the `int` of the target Go platform and is also the default type of integers. |
+| signed integer | `i8`, `i16`, `i32`, `i64` | fixed width |
+| unsigned integer | `usize`, `u8`, `u16`, `u32`, `u64` | `usize` corresponds to the target Go platform's `uint`; the others have fixed widths |
 | byte | `byte` | Transparent builtin alias of `u8` |
-| floating point | `f32`、`f64` | IEEE floating point |
+| floating point | `f32`, `f64` | IEEE floating point |
 | string | `string` | Go string backend |
 | character | `char` | Compile to Go `rune` |
 | tuple | `(i32, string)` | Nonempty tuples in type syntax have at least two elements |
 | fixed array | `[i32; 4]` | The length is part of the type |
 | function | `(i32, string) -> bool` | parameter type list to return type |
-| Generic application | `Option[i32]`、`pkg::Box[string]` | Use square brackets |
+| Generic application | `Option[i32]`, `pkg::Box[string]` | Use square brackets |
 | channel | `Channel[isize]`, `Sender[isize]`, `Receiver[isize]` | Bidirectional and directional Go channel backends |
-| trait object | `dyn Render`、`dyn Iterator[Item = isize]` | A single, non-generic dyn-safe trait; associated types must be bound |
-| Associative type projection | `I::Item`、`Self::Output`、`I::IntoIter::Item` | There must be corresponding trait constraints; projections may be chained |
+| trait object | `dyn Render`, `dyn Iterator[Item = isize]` | A single, non-generic dyn-safe trait; associated types must be bound |
+| Associated type projection | `I::Item`, `Self::Output`, `I::IntoIter::Item` | There must be corresponding trait constraints; projections may be chained |
 
 Example of function type:
 
@@ -392,9 +392,9 @@ let accepts_empty: (()) -> () = |value: ()| value;
 
 `()` is the empty-tuple type. At the left of `->`, `() -> T` is a zero-parameter function type, while `(()) -> T` is a function taking one `()` parameter.
 
-`(value)` in value and pattern is a group, `(value,)` is a single-element tuple.The current type syntax cannot directly annotate single-element tuples: `(T,)` still normalizes to `T`, so the type of such values ​​must be inferred from the local context.
+`(value)` in value and pattern is a group, `(value,)` is a single-element tuple. The current type syntax cannot directly annotate single-element tuples: `(T,)` still normalizes to `T`, so the type of such values must be inferred from the local context.
 
-`A -> B -> C` is parsed by right associative analysis.It is recommended to always write function argument lists in parentheses, especially for higher-order functions: `(A) -> (B) -> C` .
+`A -> B -> C` is parsed by right associative analysis. It is recommended to always write function argument lists in parentheses, especially for higher-order functions: `(A) -> (B) -> C`.
 
 The array length must be a non-negative decimal integer in the source code, not a constant expression:
 
@@ -402,7 +402,7 @@ The array length must be a non-negative decimal integer in the source code, not 
 let pair: [string; 2] = ["left", "right"];
 ```
 
-The number of array literal elements must match the array type.Empty arrays and empty generic containers usually require type annotations.
+The number of array literal elements must match the array type. Empty arrays and empty generic containers usually require type annotations.
 
 ### Type aliases
 
@@ -410,16 +410,19 @@ Top-level aliases are transparent and may have type parameters:
 
 ```goml
 type UserId = u64;
+
 type Pair[T] = (T, T);
+
 pub type Names = Vec[string];
 ```
 
-Aliases do not create nominally distinct types and recursive alias cycles are rejected.Public aliases can be referenced across packages.
+Aliases do not create nominally distinct types and recursive alias cycles are rejected. Public aliases can be referenced across packages.
 
 Use a single-field tuple struct when a value needs a distinct nominal type instead of an alias:
 
 ```goml
 struct UserId(u64);
+
 struct Box[T](T);
 ```
 
@@ -433,7 +436,7 @@ GoML has no Rust reference or lifetime syntax, pointer arithmetic, slice literal
 
 `Self` is only used in the trait signature and the type position of impl; ordinary top-level functions cannot use `Self` as an implicit type parameter.
 
-## top level definition
+## Top-level definitions
 
 The top level of an ordinary source code file should only contain:
 
@@ -446,7 +449,7 @@ The top level of an ordinary source code file should only contain:
 - `const`
 - `static`
 
-`package` and `use` can only appear at the beginning of a file.The top level cannot write local variables or arbitrary execution statements.
+`package` and `use` can only appear at the beginning of a file. The top level cannot write local variables or arbitrary execution statements.
 
 ### Constants
 
@@ -454,7 +457,9 @@ Top-level constants require an explicit type and a compile-time expression:
 
 ```goml
 const BASE: i32 = 0x20;
+
 pub const ANSWER: i32 = BASE + 10;
+
 const NEWLINE: byte = b'\n';
 ```
 
@@ -541,7 +546,7 @@ Compile-time integer evaluation uses the same fixed-width, wrapping representati
 
 At runtime, integer addition, subtraction, and multiplication use the same fixed-width wrapping representation. Integer division or remainder by zero terminates the current process with the generated Go runtime failure. Integer conversion methods use the same narrowing, sign-extension, and signedness rules as compile-time evaluation.
 
-### Structure
+### Structs
 
 ```goml
 struct Point {
@@ -566,7 +571,7 @@ fn increment(value: UserId) -> UserId {
 
 Unlike `type UserId = u64;`, the newtype is not interchangeable with `u64`. It must be explicitly constructed or destructured. Newtypes may be generic, their field is private by default, and a trailing comma inside the parentheses is accepted. This syntax requires exactly one field; tuple structs with zero or multiple fields are not supported.
 
-The type parameter list of structure and enumeration itself does not write bound.Put constraints on functions, traits, or impl that use the type.
+Struct and enum type parameter lists do not accept bounds. Put constraints on the functions, traits, or impls that use the type.
 
 Write out the fields during construction, allowing field abbreviations:
 
@@ -585,10 +590,7 @@ let x = point.x;
 Structure update copies omitted fields from a base value of the same structure type. The `..base` item must be last. Explicit field expressions are evaluated from left to right, followed by the base expression, and every expression is evaluated once:
 
 ```goml
-let moved = Point {
-    x: point.x + 1,
-    ..point,
-};
+let moved = Point { x: point.x + 1, ..point };
 ```
 
 Structure update is rejected when inaccessible fields prevent construction across a package boundary.
@@ -602,20 +604,18 @@ struct Node {
 }
 ```
 
-### enumerate
+### Enums
 
 ```goml
 enum Message[T] {
     Quit,
     Value(T),
     Pair(T, T),
-    Named {
-        value: T,
-    },
+    Named { value: T },
 }
 ```
 
-Unloaded variants are used directly as values, loaded variants are called like functions:
+Unit variants are values, tuple variants use function-call syntax, and struct-like variants use named fields:
 
 ```goml
 let quit: Message[i32] = Message::Quit;
@@ -624,13 +624,13 @@ let pair = Message::Pair("left", "right");
 let named = Message::Named { value: 42 };
 ```
 
-Unloaded generic variants provide no inference clues, usually the expected type is given:
+A unit variant provides no payload from which to infer generic arguments, so it usually needs an expected type:
 
 ```goml
 let none: Option[i32] = Option::None;
 ```
 
-Loaded constructors are also available as first-class function values:
+Tuple variant constructors are also available as first-class function values:
 
 ```goml
 let some: (i32) -> Option[i32] = Option::Some;
@@ -645,11 +645,11 @@ match named {
 }
 ```
 
-Patterns may omit the enum qualifier.When the expected pattern type is `Option[T]`, `Some(value)` and `None` resolve to `Option::Some(value)` and `Option::None`.The same rule applies to unit, tuple-like, and struct-like variants of user enums, including enums imported from another package and enums reached through a type alias.Duplicate variant names in unrelated enums are not ambiguous because the expected enum type selects the owner.Nested patterns are resolved recursively, so `Some(Ok(value))` uses the payload type of `Some` to resolve `Ok`.
+Patterns may omit the enum qualifier. When the expected pattern type is `Option[T]`, `Some(value)` and `None` resolve to `Option::Some(value)` and `Option::None`. The same rule applies to unit, tuple-like, and struct-like variants of user enums, including enums imported from another package and enums reached through a type alias. Duplicate variant names in unrelated enums are not ambiguous because the expected enum type selects the owner. Nested patterns are resolved recursively, so `Some(Ok(value))` uses the payload type of `Some` to resolve `Ok`.
 
 ## Functions and generics
 
-### top-level function
+### Top-level functions
 
 ```goml
 fn add(left: i32, right: i32) -> i32 {
@@ -661,9 +661,9 @@ fn log(message: string) {
 }
 ```
 
-The parameter type cannot be omitted.Omitting `-> ...` is equivalent to `-> ()`.The top-level function name must be unique in the same package, and overloading by parameter type is not supported.
+The parameter type cannot be omitted. Omitting `-> ...` is equivalent to `-> ()`. The top-level function name must be unique in the same package, and overloading by parameter type is not supported.
 
-### Generic function
+### Generic functions
 
 ```goml
 fn identity[T](value: T) -> T {
@@ -680,10 +680,7 @@ Constraints can also be placed in a `where` clause:
 ```goml
 use std::iter;
 
-fn collect_items[T, I: Iterator](iterator: I) -> Vec[T]
-where
-    I::Item = T,
-{
+fn collect_items[T, I: Iterator](iterator: I) -> Vec[T] where I::Item = T {
     iter::collect(iterator)
 }
 ```
@@ -720,11 +717,11 @@ let trait_call = Convert::[i32]::convert::[string](value, fallback);
 
 Top-level functions and methods may introduce their own type parameters. A method's parameters are distinct from the parameters of its enclosing trait or impl and may have their own bounds and `where` predicates. Local named functions do not exist; use closures. Closures do not have generics. Structures, enumerations, traits, and impl blocks can also have type parameters.
 
-GoML monomorphizes generic calls.Recursive generic code must produce a limited number of concrete instances and cannot continually change to a new nested type with each recursive call.
+GoML monomorphizes generic calls. Recursive generic code must produce a limited number of concrete instances and cannot continually change to a new nested type with each recursive call.
 
 ## Blocks, bindings and assignments
 
-### Block values ​​and semicolons
+### Block values and semicolons
 
 The last semicolon-less expression of the block is the return value:
 
@@ -735,7 +732,7 @@ fn square(value: i32) -> i32 {
 }
 ```
 
-A block without a tail expression returns `()`.Adding `;` after an expression turns it into an expression statement and discards the result:
+A block without a tail expression returns `()`. Adding `;` after an expression turns it into an expression statement and discards the result:
 
 ```goml
 fn run() -> () {
@@ -744,7 +741,7 @@ fn run() -> () {
 }
 ```
 
-`let`, ordinary assignments, and general non-tail expression statements require semicolons.When used as statements and followed by code, `if`, `match`, `select`, `while`, `loop` and `for` can omit the semicolon; other expression statements still require semicolons.Functions, brace-delimited structures, enumerations, traits, impl and blocks themselves are not declared with a semicolon after them. Newtype declarations such as `struct UserId(u64);` do require the trailing semicolon.
+`let`, ordinary assignments, and general non-tail expression statements require semicolons. When used as statements and followed by code, `if`, `match`, `select`, and unlabeled `while`, `loop` and `for` can omit the semicolon; other expression statements still require semicolons. Functions, brace-delimited structures, enumerations, traits, impl and blocks themselves are not declared with a semicolon after them. Newtype declarations such as `struct UserId(u64);` do require the trailing semicolon.
 
 `defer expression;` registers a `()` expression to run when the current lexical block is left. Deferred expressions run in last-in-first-out order on normal completion and when `return`, `?`, `break`, or `continue` crosses their block. A return or break value is evaluated before cleanup begins. Each loop-body block has its own cleanup stack, so a deferred expression registered during one iteration runs before that iteration exits.
 
@@ -771,7 +768,7 @@ let name = "first";
 let name = "second";
 ```
 
-Local variables allow shadowing with the same name.`let _ = expr;` executes explicitly and discards the result.
+Local variables allow shadowing with the same name. `let _ = expr;` executes explicitly and discards the result.
 
 The left side of `let` can be an irrefutable pattern:
 
@@ -804,14 +801,12 @@ Destructuring patterns can mark only selected bindings mutable:
 
 ```goml
 let (mut index, value) = pair;
-
 match state {
     Some(mut count) => {
         count += 1;
     },
     None => (),
-};
-
+}
 for mut item in values {
     item += 1;
 }
@@ -819,7 +814,7 @@ for mut item in values {
 
 `mut` inside a pattern is allowed only on a binding and does not introduce borrowing or reference semantics. The existing `let mut pattern = value;` form remains supported and recursively makes every binding in that pattern mutable. Per-binding `mut` composes with tuple, struct, enum, array, `match`, and `for` patterns.
 
-Ordinary local bindings without `mut` cannot be reassigned.Assignment targets include mutable locals, tuple projections, structure fields, and supported index locations. Compound assignment supports `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, and `>>=`:
+Ordinary local bindings without `mut` cannot be reassigned. Assignment targets include mutable locals, tuple projections, structure fields, and supported index locations. Compound assignment supports `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, and `>>=`:
 
 ```goml
 count += 1;
@@ -834,7 +829,6 @@ Array index assignment requires that the root value is a `let mut` local array, 
 ```goml
 let mut values = [1, 2, 3];
 values[1] = 20;
-
 let shared = Ref::new([4, 5]);
 shared.get()[0] = 40;
 ```
@@ -845,7 +839,6 @@ shared.get()[0] = 40;
 let values: Vec[i32] = Vec::new();
 values.push(10);
 values[0] = 20;
-
 let counts: HashMap[string, i32] = HashMap::new();
 counts["answer"] = 42;
 ```
@@ -854,7 +847,7 @@ counts["answer"] = 42;
 
 ## Expressions and operators
 
-### basic expression
+### Basic expressions
 
 GoML supports:
 
@@ -870,7 +863,7 @@ GoML supports:
 - Integer conversion method `value.to_u32()`
 - Explicit trait-object conversion `value as dyn Trait`
 - Half-open range expression `start..end`
-- `if`、`if let`、`match`、`select`、`while`、`while let`、`loop`、`for`
+- `if`, `if let`, `match`, `select`, `while`, `while let`, `loop`, `for`
 - closure
 - `return`, `break`, `continue`, `go` and `?`
 
@@ -881,7 +874,6 @@ let answer = {
     let base = 40;
     base + 2
 };
-
 return {
     cleanup();
     answer
@@ -899,27 +891,27 @@ if ({
 }
 ```
 
-### operator precedence
+### Operator precedence
 
 From low to high:
 
-| Hierarchy | operator | illustrate |
+| Precedence | Operator | Description |
 | --- | --- | --- |
 | 1 | `..`, `..=` | Half-open or inclusive range; cannot be chained |
 | 2 | `\|\|` | Short-circuit logical OR |
 | 3 | `&&` | short circuit logical AND |
-| 4 | `==`、`!=`、`<`、`>`、`<=`、`>=` | Compare; not chainable |
+| 4 | `==`, `!=`, `<`, `>`, `<=`, `>=` | Compare; not chainable |
 | 5 | `\|` | Bitwise OR |
 | 6 | `^` | Bitwise XOR |
 | 7 | `&` | Bitwise AND |
-| 8 | `<<`、`>>` | shift |
-| 9 | `+`、`-` | Addition, subtraction, string concatenation |
-| 10 | `*`、`/`、`%` | Multiplication, division, remainder |
+| 8 | `<<`, `>>` | shift |
+| 9 | `+`, `-` | Addition, subtraction, string concatenation |
+| 10 | `*`, `/`, `%` | Multiplication, division, remainder |
 | 11 | `as` | explicit `dyn Trait` conversion |
 | 12 | Call `()`, index `[]`, `?`, member `.` | suffix |
 | 13 | Unary `-`, `!`, `~` | prefix |
 
-The binary operator is left associative, and the function type `->` is right associative.Don’t write comparisons in chains; use combinations of logical operations:
+The binary operator is left associative, and the function type `->` is right associative. Don’t write comparisons in chains; use combinations of logical operations:
 
 ```goml
 let inside = lower <= value && value < upper;
@@ -936,7 +928,7 @@ let valid = !(predicate());
 
 - The two numeric operands of `+ - * /` must be of the same concrete numeric type; there is no implicit numeric promotion.
 - `%` only accepts integers of the same type.
-- `& | ^ ~` only accepts integers, and both sides of binary bitwise operations must be of the same type.Both sides of `<< >>` must be integers and the result type is the same as the left operand.
+- `& | ^ ~` only accepts integers, and both sides of binary bitwise operations must be of the same type. Both sides of `<< >>` must be integers and the result type is the same as the left operand.
 - `+` also supports `string + string`.
 - `&& || !` only accepts `bool`.
 - The unary `-` only accepts signed integers or floating point numbers.
@@ -950,7 +942,7 @@ let valid = !(predicate());
 
 There are no exponentiation, null coalescing or user-defined operators.
 
-### range expression
+### Range expressions
 
 `start..end` constructs an incrementing half-open `FnIterator[isize]`, and `start..=end` constructs an inclusive iterator. Both can be used directly in `for`:
 
@@ -966,11 +958,11 @@ for value in 0..=10 {
 
 Both ends are `isize`. A half-open range is empty when `start >= end`; an inclusive range is empty when `start > end` and contains one value when both ends are equal. Each endpoint is evaluated once from left to right. Inclusive iteration does not compute `end + 1`, so the maximum `isize` endpoint does not overflow. Range expressions cannot be chained. Open ranges, character ranges, and custom step syntax are not supported. The `..` and `..=` in patterns are a separate range-pattern syntax.
 
-## control flow
+## Control flow
 
 ### `if`
 
-`if` is always an expression.`else` is required when generating values other than `()`:
+`if` is always an expression. `else` is required when generating values other than `()`:
 
 ```goml
 fn absolute(value: i32) -> i32 {
@@ -982,7 +974,7 @@ fn absolute(value: i32) -> i32 {
 }
 ```
 
-Both branches must produce compatible types.Conditions with only side effects can omit `else`; in this case the then branch must produce `()`:
+Both branches must produce compatible types. Conditions with only side effects can omit `else`; in this case the then branch must produce `()`:
 
 ```goml
 if enabled {
@@ -1002,7 +994,7 @@ let label = if score > 90 {
 };
 ```
 
-`if let` executes the then branch when the pattern match is successful and restricts the pattern binding to that branch.The matched expression is evaluated only once:
+`if let` executes the then branch when the pattern match is successful and restricts the pattern binding to that branch. The matched expression is evaluated only once:
 
 ```goml
 let number = if let Option::Some(value) = candidate {
@@ -1020,7 +1012,7 @@ if let Option::Some(value) = candidate {
 }
 ```
 
-When you need to get values ​​from two branches, you must write `else` explicitly.
+When you need to get values from two branches, you must write `else` explicitly.
 
 ### `match`
 
@@ -1033,9 +1025,9 @@ fn unwrap_or(value: Option[i32], fallback: i32) -> i32 {
 }
 ```
 
-The matched expression is evaluated only once, and the pattern is tried from top to bottom.All branches must produce compatible types, and the compiler is required to cover all possible values.
+The matched expression is evaluated only once, and the pattern is tried from top to bottom. All branches must produce compatible types, and the compiler is required to cover all possible values.
 
-An unqualified variant in a pattern is resolved only against the matched value's type.The compiler does not search unrelated enums for a fallback.If that type is not an enum, does not contain the variant, or cannot be inferred, the pattern is rejected.Fully qualified patterns remain available:
+An unqualified variant in a pattern is resolved only against the matched value's type. The compiler does not search unrelated enums for a fallback. If that type is not an enum, does not contain the variant, or cannot be inferred, the pattern is rejected. Fully qualified patterns remain available:
 
 ```goml
 match value {
@@ -1044,9 +1036,9 @@ match value {
 }
 ```
 
-The rule is shared by `match`, `if let`, `while let`, `let`, `for`, nested patterns, and or-patterns.Existing refutability requirements still apply to `let` and `for`.
+The rule is shared by `match`, `if let`, `while let`, `let`, `for`, nested patterns, and or-patterns. Existing refutability requirements still apply to `let` and `for`.
 
-Branches can be guarded.guard must be a `bool`, and bindings introduced by this branching pattern can be used:
+A match arm may have a guard of type `bool`. The guard can use bindings introduced by that arm’s pattern:
 
 ```goml
 match value {
@@ -1056,9 +1048,9 @@ match value {
 }
 ```
 
-guard only evaluates after a successful pattern match.Branches with ordinary guards are not counted in exhaustive coverage; only branches without guards and branches with guard literal `true` provide coverage.Branches with guard literal `false` are unreachable.The compiler also warns about branches that are completely covered by earlier patterns.
+A guard is evaluated only after a successful pattern match. Branches with ordinary guards are not counted in exhaustive coverage; only branches without guards and branches with guard literal `true` provide coverage. Branches with guard literal `false` are unreachable. The compiler also warns about branches that are completely covered by earlier patterns.
 
-A branch body can be a single expression or a block.Different branches must be separated by commas, and the comma in the last branch can be omitted:
+A branch body can be a single expression or a block. Different branches must be separated by commas, and the comma in the last branch can be omitted:
 
 ```goml
 match value {
@@ -1116,7 +1108,7 @@ Channel operands, send values, and guards are evaluated exactly once from top to
 let mut index = 0;
 while index < limit {
     index = index + 1;
-};
+}
 ```
 
 The condition must be `bool` and the loop result is `()`. A `while` loop accepts only `break` without a value.
@@ -1126,10 +1118,10 @@ The condition must be `bool` and the loop result is `()`. A `while` loop accepts
 ```goml
 while let Option::Some(value) = iterator.next() {
     println(value);
-};
+}
 ```
 
-The loop body must return `()`.Pattern binding is only visible within the loop body.
+The loop body must return `()`. Pattern binding is only visible within the loop body.
 
 ### `loop`
 
@@ -1140,7 +1132,7 @@ let result = loop {
     let candidate = next();
     if candidate >= 0 {
         break candidate;
-    };
+    }
 };
 ```
 
@@ -1152,20 +1144,19 @@ All `break` values targeting the same `loop` must have compatible types. `break;
 let values: Vec[i32] = Vec::new();
 values.push(10);
 values.push(20);
-
 for value in values {
     println(value);
-};
+}
 ```
 
-`for pattern in source { ... }` accepts fixed arrays and values ​​that implement `IntoIterator`.Both the source expression and the `into_iter` transformation are executed only once.The pattern must be irrefutable and the loop body must return `()` .`start..end` can be used directly as a native `isize` range.
+`for pattern in source { ... }` accepts fixed arrays and values that implement `IntoIterator`. Both the source expression and the `into_iter` transformation are executed only once. The pattern must be irrefutable and the loop body must return `()`. `start..end` can be used directly as a native `isize` range.
 
 Tuple destructuring can be used directly in loops:
 
 ```goml
 for (key, value) in pairs {
     println(key + value.to_string());
-};
+}
 ```
 
 Fixed arrays use a native indexed loop. `Vec[T]`, `Slice[T]`, `MutSlice[T]` and all `Iterator` values have corresponding `IntoIterator` implementations.
@@ -1179,7 +1170,7 @@ while true {
     } else {
         continue
     };
-};
+}
 ```
 
 `break` and `continue` can only appear in loops. `continue` never has a value. `break value` is allowed only for `loop`; `while` and `for` accept `break;` only. Both are divergent control expressions and can appear in `if`, `match`, or other value positions.
@@ -1195,14 +1186,15 @@ Rust-style labels select an enclosing `while`, `loop`, or `for` without conflict
             continue;
         }
     }
-}
-
+};
 let answer = 'result: loop {
     break 'result 42;
 };
 ```
 
 `continue 'label;` resumes the selected enclosing loop. `break 'label value;` may carry a value only when the selected target is a `loop`. Labels must refer to an active enclosing loop and cannot be duplicated while an outer label of the same name is active. Crossing one or more blocks still runs their `defer` cleanups from inner to outer before control reaches the target.
+
+A labeled loop used as a statement requires a trailing semicolon before the next statement. The formatter preserves this semicolon. A labeled loop used as a block's tail expression does not need one.
 
 `return` can be taken with or without a value and checks the return type of the current function or closure:
 
@@ -1211,9 +1203,7 @@ fn first_positive(values: Vec[i32]) -> i32 {
     for value in values {
         if value > 0 {
             return value
-        } else {
-            ()
-        };
+        }
     };
     -1
 }
@@ -1246,7 +1236,7 @@ fn read_number(flag: bool) -> Result[i32, string] {
 }
 ```
 
-When using `?` with `Option[T]`, the nearest function or closure must return `Option[_]`.Use of `Result[T, E]` must return `Result[_, E]` with the same error type; there is currently no Rust `From`-style error conversion.`?` will evaluate the operand once.
+When using `?` with `Option[T]`, the nearest function or closure must return `Option[_]`. Use of `Result[T, E]` must return `Result[_, E]` with the same error type; there is currently no Rust `From`-style error conversion. `?` will evaluate the operand once.
 
 ### `go`
 
@@ -1258,7 +1248,7 @@ go || {
 };
 ```
 
-Don't write `go work();`; that evaluates `work()` first, while `go` requires a value of type `() -> ()`.Write `go || work();` instead.
+Don't write `go work();`; that evaluates `work()` first, while `go` requires a value of type `() -> ()`. Write `go || work();` instead.
 
 `go` is a detached, unstructured escape hatch. Its lifetime is not tied to the caller, it does not return a task handle, and its failures are not propagated. Use `std::task` when the caller must wait for child work or coordinate cancellation.
 
@@ -1273,7 +1263,7 @@ Patterns can be used with `let`, `for`, `match`, `if let` and `while let`.
 | variable binding | `value` |
 | Wildcard | `_` |
 | empty tuple | `()` |
-| bool/number/string/character | `true`、`42`、`"ok"`、`'x'` |
+| bool/number/string/character | `true`, `42`, `"ok"`, `'x'` |
 | top-level constant | `ANSWER` or `config::ANSWER` |
 | Group | `(pattern)` |
 | tuple | `(left, right)` |
@@ -1284,28 +1274,27 @@ Patterns can be used with `let`, `for`, `match`, `if let` and `while let`.
 | Enum unit variant | `Color::Red` or contextual `Red` |
 | Enum tuple variant | `Option::Some(value)` or contextual `Some(value)` |
 | Enum struct-like variant | `Message::Named { value }` or contextual `Named { value }` |
-| Array, Vec, Slice or MutSlice | `[first, second]`、`[first, .., last]` |
+| Array, Vec, Slice or MutSlice | `[first, second]`, `[first, .., last]` |
 | rest binding | `[first, middle @ .., last]` |
 | Alias | `whole @ Option::Some(value)` |
 | or-pattern | `Color::Red \| Color::Blue` |
-| scope | `0..10`、`'a'..='z'` |
-| Nested mode | `Result::Ok((key, value))` |
+| Range | `0..10`, `'a'..='z'` |
+| Nested pattern | `Result::Ok((key, value))` |
 
 ### Refutability and binding
 
-`let` and `for` require that the pattern be irrefutable, that is, the type at that position must succeed.`match`, `if let` and `while let` can use refutable patterns:
+`let` and `for` require that the pattern be irrefutable, that is, the type at that position must succeed. `match`, `if let` and `while let` can use refutable patterns:
 
 ```goml
 let (left, right) = pair;
-
 if let Option::Some(value) = candidate {
     println(value);
-};
+}
 ```
 
-Irrefutability is judged jointly by type and sub-pattern rather than by surface syntax alone.For example, the destructuring of a single-variant enum is irrefutable, as is the complete destructuring of a fixed-length array of known length; [first, ..] of a Vec[T] may fail with an empty Vec.
+Irrefutability is judged jointly by type and sub-pattern rather than by surface syntax alone. For example, the destructuring of a single-variant enum is irrefutable, as is the complete destructuring of a fixed-length array of known length; [first, ..] of a Vec[T] may fail with an empty Vec.
 
-Variables with the same name cannot be bound repeatedly in the same pattern branch.Each alternative of the or-pattern must be bound to exactly the same set of variables, and the corresponding variables must be of the same type:
+Variables with the same name cannot be bound repeatedly in the same pattern branch. Each alternative of the or-pattern must be bound to exactly the same set of variables, and the corresponding variables must be of the same type:
 
 ```goml
 match value {
@@ -1317,15 +1306,10 @@ Pattern binding is only visible in the corresponding `let` subsequent scope, `fo
 
 ### Groups, tuples, structures and enumerations
 
-`(pattern)` only changes the pattern combination method, `(pattern,)` is the single-element tuple pattern:
+`(pattern)` groups a pattern; `(pattern,)` matches a single-element tuple:
 
 ```goml
 let (only,) = one_tuple;
-
-match candidate {
-    (Option::Some(value)) => value,
-    Option::None => 0,
-}
 ```
 
 Structure field patterns support abbreviations with the same name:
@@ -1334,19 +1318,19 @@ Structure field patterns support abbreviations with the same name:
 let Point { x, y } = point;
 ```
 
-Struct mode is exact by default and all fields must be listed.Unlisted fields can be ignored using the trailing `..`:
+Struct patterns are exact by default and must list all fields. Unlisted fields can be ignored using the trailing `..`:
 
 ```goml
 let Point { x, .. } = point;
 ```
 
-`..` appears at most once in the structure pattern and must be the last item.Duplicate fields, unknown fields, and missing fields without writing `..` will all generate diagnoses.
+`..` appears at most once in the structure pattern and must be the last item. Duplicate fields, unknown fields, and missing fields without writing `..` will all generate diagnoses.
 
-The number of constructor parameters of the enumeration pattern must be consistent with the definition.An unqualified variant is resolved from the expected enum type rather than from global uniqueness.For example, `Shared` in a pattern for `First` means `First::Shared` even when `Second::Shared` also exists.If `First` has no `Shared` variant, the compiler reports that error instead of selecting `Second::Shared`.Type aliases and imported enum types participate after normalization.Nested variant payloads supply the expected type for nested patterns.
+The number of constructor parameters of the enumeration pattern must be consistent with the definition. An unqualified variant is resolved from the expected enum type rather than from global uniqueness. For example, `Shared` in a pattern for `First` means `First::Shared` even when `Second::Shared` also exists. If `First` has no `Shared` variant, the compiler reports that error instead of selecting `Second::Shared`. Type aliases and imported enum types participate after normalization. Nested variant payloads supply the expected type for nested patterns.
 
 ### Fixed arrays, Vec, Slice and MutSlice
 
-Fixed arrays `[T; N]`, `Vec[T]`, `Slice[T]` and `MutSlice[T]` share square bracket mode.Without `..`, the pattern requires the exact length; with `..`, the prefix and suffix only specify the minimum length:
+Fixed arrays `[T; N]`, `Vec[T]`, `Slice[T]` and `MutSlice[T]` share square-bracket pattern syntax. Without `..`, the pattern requires the exact length; with `..`, the prefix and suffix only specify the minimum length:
 
 ```goml
 match values {
@@ -1356,18 +1340,18 @@ match values {
 }
 ```
 
-There is at most one rest in a sequence pattern.rest can be located anywhere, or it can be written as `name @ ..` to bind the middle part:
+A sequence pattern allows at most one rest. It can appear at any position; `name @ ..` binds the elements between the explicit prefix and suffix:
 
 ```goml
 let values: [i32; 4] = [1, 2, 3, 4];
 let [first, middle @ .., last] = values;
 ```
 
-For fixed arrays, the number of elements must be exactly equal to `N` when rest is omitted; when rest is included, the total number of elements of explicit prefixes and suffixes cannot exceed `N`.In the above example, the type of `middle` is `[i32; 2]`.
+For fixed arrays, the number of elements must be exactly equal to `N` when rest is omitted; when rest is included, the total number of elements of explicit prefixes and suffixes cannot exceed `N`. In the above example, the type of `middle` is `[i32; 2]`.
 
-For `Vec[T]`, `Slice[T]` and `MutSlice[T]`, the binding type of `name @ ..` is read-only `Slice[T]`.For example `[head, tail @ ..]` requires at least one element, `tail` will not be copied into a new Vec.Since dynamic sequences may not be long enough, such patterns are usually placed inside a `match`, `if let` or `while let`.
+For `Vec[T]`, `Slice[T]` and `MutSlice[T]`, the binding type of `name @ ..` is read-only `Slice[T]`. For example `[head, tail @ ..]` requires at least one element, `tail` will not be copied into a new Vec. Since dynamic sequences may not be long enough, such patterns are usually placed inside a `match`, `if let` or `while let`.
 
-### Alias ​​and or-pattern
+### Alias and or-pattern
 
 `name @ pattern` binds the entire matched value to `name` while continuing to match the inner pattern:
 
@@ -1378,13 +1362,13 @@ match value {
 }
 ```
 
-`@` is more tightly bound than `|`.Therefore `whole @ A | B` resolves to `(whole @ A) | B`, and usually an error will be reported because the variables bound to the two alternatives are different.To make the alias cover the entire or-pattern, you must write parentheses:
+`@` is more tightly bound than `|`. Therefore `whole @ A | B` resolves to `(whole @ A) | B`, and usually an error will be reported because the variables bound to the two alternatives are different. To make the alias cover the entire or-pattern, you must write parentheses:
 
 ```goml
 whole @ (Either::Left(value) | Either::Right(value))
 ```
 
-or-pattern is tried from left to right and can be nested in tuple, struct, enumeration and sequence patterns.
+Or-pattern alternatives are tried from left to right and can be nested in tuple, struct, enum, and sequence patterns.
 
 ### Range patterns
 
@@ -1398,11 +1382,11 @@ match character {
 }
 ```
 
-Both endpoints must be integer or character literals of the same concrete type.Signed integer endpoints can be negative.The exclusive range requires the lower bound to be strictly less than the upper bound, and the inclusive range requires the lower bound to be less than or equal to the upper bound.Open ranges, floating point ranges, or string ranges are not currently supported; separate `..` in sequences and structures is a rest, not a range.
+Both endpoints must be integer or character literals of the same concrete type. Signed integer endpoints can be negative. The exclusive range requires the lower bound to be strictly less than the upper bound, and the inclusive range requires the lower bound to be less than or equal to the upper bound. Open ranges, floating point ranges, or string ranges are not currently supported; separate `..` in sequences and structures is a rest, not a range.
 
 ### Exhaustiveness and unreachable branches
 
-The compiler checks whether `match` is exhausted by the actual type of the pattern, and gives examples of missing patterns if it is not.The analysis covers bool, enumerations, tuples, structures, fixed arrays, Vec/Slice/MutSlice, integer and character ranges, aliases and or-patterns, and will also warn about branches that are never matched.
+The compiler checks whether `match` is exhaustive for the matched type and gives examples of missing patterns when it is not. The analysis covers bool, enumerations, tuples, structures, fixed arrays, Vec/Slice/MutSlice, integer and character ranges, aliases and or-patterns, and will also warn about branches that are never matched.
 
 An empty `match` is only valid for types that have no constructible value:
 
@@ -1414,15 +1398,15 @@ fn absurd(value: Never) -> i32 {
 }
 ```
 
-Exhaustive analysis ignores enumeration variants with no value for the payload type and also identifies purely recursive enumerations with no base variant.For example, `enum MaybeNever { Empty, Filled(Never) }` just overrides `Empty`; `enum Loop { Next(Loop) }` has no constructible value.
+Exhaustive analysis ignores enumeration variants with no value for the payload type and also identifies purely recursive enumerations with no base variant. For example, `enum MaybeNever { Empty, Filled(Never) }` requires only an `Empty` arm; `enum Loop { Next(Loop) }` has no constructible value.
 
-Branches with normal guards do not provide exhaustive coverage because guard may be false; subsequent unguarded branches are usually required.String and floating-point literals cannot enumerate the entire type, and `_` is also usually required when matching these types.In floating point mode, `-0.0` and `0.0` are regarded as the same value.
+Branches with normal guards do not provide exhaustive coverage because guard may be false; subsequent unguarded branches are usually required. String and floating-point literals cannot enumerate the entire type, and `_` is also usually required when matching these types. In floating-point patterns, `-0.0` and `0.0` are regarded as the same value.
 
 There are no `ref` or `ref mut` patterns. `mut name` is supported for individual bindings, while pattern matching on `dyn Trait` is not supported.
 
 ## Closures and function values
 
-### closure syntax
+### Closure syntax
 
 ```goml
 let add = |left: i32, right: i32| left + right;
@@ -1448,7 +1432,7 @@ let next = || {
 };
 ```
 
-`return` in a closure returns the closure, not the outer function.
+`return` in a closure exits that closure and supplies its result.
 
 ### No let-polymorphism
 
@@ -1459,7 +1443,7 @@ let identity = |value| value;
 let number = identity(1);
 ```
 
-The `string` cannot be processed with the same `identity` thereafter.Define top-level generic functions when polymorphism is required:
+The `string` cannot be processed with the same `identity` thereafter. Define top-level generic functions when polymorphism is required:
 
 ```goml
 fn identity[T](value: T) -> T {
@@ -1467,14 +1451,14 @@ fn identity[T](value: T) -> T {
 }
 ```
 
-Top-level functions, closures, and loaded enumeration constructors can all be passed or returned as function values.
+Top-level functions, closures, and tuple variant constructors can all be passed or returned as function values.
 Closures can be nested and return another closure that captures the environment, but each resulting closure expression still has only one concrete function type.
 
-## trait and impl
+## Trait and impl
 
 ### Define traits
 
-Trait method signatures must include parameter names.The first receiver can be written as `self`, which is short for `self: Self`:
+Trait method signatures must include parameter names. The first receiver can be written as `self`, which is short for `self: Self`:
 
 ```goml
 trait Render {
@@ -1513,7 +1497,6 @@ Traits can have supertraits, generic constraints, and associated types:
 ```goml
 trait Provider: Render {
     type Item: ToString;
-
     fn get(self) -> Self::Item;
 }
 ```
@@ -1521,10 +1504,7 @@ trait Provider: Render {
 Associated type projections may be chained when every step is constrained by its declaring trait. For example, `I::IntoIter::Item` projects `IntoIter` from `I`, then projects `Item` from that iterator type. Chained projections can appear in signatures and `where` equalities:
 
 ```goml
-trait IntoIterator
-where
-    Self::Item = Self::IntoIter::Item,
-{
+trait IntoIterator where Self::Item = Self::IntoIter::Item {
     type Item;
     type IntoIter: Iterator;
 }
@@ -1533,10 +1513,7 @@ where
 Generic trait example:
 
 ```goml
-trait Child[T: ToString]: Parent[T] + Render
-where
-    T: Eq,
-{
+trait Child[T: ToString]: Parent[T] + Render where T: Eq {
     fn child(self) -> string;
 }
 ```
@@ -1566,7 +1543,6 @@ Trait methods may provide a default body. An impl may omit such a method and wil
 ```goml
 trait Named {
     fn name(self) -> string;
-
     fn describe(self) -> string {
         "named:" + self.name()
     }
@@ -1589,7 +1565,7 @@ trait Convert {
 
 The corresponding impl method must have the same method-generic arity, signature, and constraints. Generic trait methods use static dispatch and make the trait unavailable as `dyn`.
 
-### trait impl
+### Trait impl
 
 ```goml
 struct Point {
@@ -1642,7 +1618,7 @@ impl Iterator for Counter {
 }
 ```
 
-When implementing a trait with supertraits, you also need to provide the impl of the target type for each supertrait.The compiler rejects overlapping impls and enforces the orphan rule: at least one of the trait or the nominal type being implemented must belong to the current package.The target nominal type of inherent impl must belong to the current package.
+When implementing a trait with supertraits, you also need to provide the impl of the target type for each supertrait. The compiler rejects overlapping impls and enforces the orphan rule: at least one of the trait or the nominal type being implemented must belong to the current package. The target nominal type of inherent impl must belong to the current package.
 
 ### Inherent impl
 
@@ -1681,7 +1657,7 @@ Method type arguments are normally inferred. Write `box_value.map::[string](conv
 For specific values, use:
 
 ```goml
-value.render()
+value.render();
 Render::render(value)
 ```
 
@@ -1692,7 +1668,7 @@ use acme::render;
 use render::Render;
 ```
 
-If multiple visible traits define methods with the same name, `value.render()` will be ambiguous.Use UFCS to explicitly select:
+If multiple visible traits define methods with the same name, `value.render()` will be ambiguous. Use UFCS to explicitly select:
 
 ```goml
 let a = A::render(value);
@@ -1706,7 +1682,7 @@ let number = Convert::[i32]::convert(token, 0);
 let text = Convert::[string]::convert(token, "");
 ```
 
-Trait bounds for type parameters make the corresponding methods available for generic values.supertrait and associated type bound will also participate in parsing as implicit constraints.
+Trait bounds make the corresponding methods available on generic values. Supertraits and associated type bounds also participate in method resolution as implied constraints.
 
 ## `dyn Trait`
 
@@ -1731,7 +1707,7 @@ Concrete values are never boxed implicitly when a `dyn Trait` value is expected.
 The `dyn` value supports method syntax, and UFCS can also be used; it can be seen that supertrait methods are also available:
 
 ```goml
-value.show()
+value.show();
 Display::show(value)
 ```
 
@@ -1740,7 +1716,6 @@ Associated types are fixed in square brackets and are available to dyn-dispatche
 ```goml
 trait Source {
     type Item;
-
     fn get(self: Self) -> Self::Item;
 }
 
@@ -1766,7 +1741,7 @@ Current limitations:
 - Multiple bounds such as `dyn Read + Close` are parsed for forward compatibility but rejected by the type checker;
 - Pattern matching on `dyn Trait` is not supported.
 
-## Properties and Derivations
+## Attributes and derive
 
 User source code supports deriving `ToString`, `Debug`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`, and `Default` for structures and enumerations, including generic types. `Serialize` and `Deserialize` are also available after importing them from `std::serde` or a re-exporting format package:
 
@@ -2036,7 +2011,11 @@ extern fn cut(value: string, separator: string) -> (string, string, bool);
 
 fn example() -> string {
     let (before, after, found) = cut("left:right", ":");
-    if found { to_upper(before + after) } else { "" }
+    if found {
+        to_upper(before + after)
+    } else {
+        ""
+    }
 }
 ```
 
@@ -2206,7 +2185,9 @@ use std::ffi;
 
 fn round_trip() -> bool {
     let callback: ffi::Func[(i64) -> i64] = ffi::func_from_closure(|x| x + 1);
-    let Some(call) = ffi::func_to_closure(callback) else { return false };
+    let Some(call) = ffi::func_to_closure(callback) else {
+        return false
+    };
     call(41) == 42
 }
 ```
@@ -2257,7 +2238,7 @@ Legacy foreign bindings declared with GoML `string` retain their existing truste
 
 | Adapter or operation | Policy |
 | --- | --- |
-| `ffi::slice_nil[T]()` / `ffi::slice_is_nil(value)` | Preserve and inspect nil separately from a non-nil empty slice |
+| `ffi::slice_nil::[T]()` / `ffi::slice_is_nil(value)` | Preserve and inspect nil separately from a non-nil empty slice |
 | `ffi::slice_capacity(value)` | Return the original header capacity |
 | `ffi::slice_append(value, item)` | Return Go append's new header; retain it to observe the new length |
 | `ffi::slice_shared(vector)` | Share mutable element storage with a snapshot of the Vec header |
@@ -2285,11 +2266,11 @@ These APIs reuse ordinary aliases, generic functions and existing slice operatio
 
 `ffi::RawMap[K, V]` represents Go `map[K]V` directly and is distinct from GoML `HashMap[K, V]`. Go aliases of map types normalize to this representation. It preserves nil and shared storage through assignments, foreign calls, package interfaces, generics and captured closures. Go operations on an alias observe the same entries.
 
-`ffi::map_nil[K, V]() -> ffi::RawMap[K, V]` produces nil. `ffi::map_is_nil(value) -> bool` distinguishes nil from an allocated empty map. An `Option::Some` containing nil remains distinct from `None`. The raw type has no public struct constructor and no implicit conversion to or from `HashMap`; their storage, hashing and equality contracts differ. Raw map syntax uses ordinary qualified generic aliases and functions.
+`ffi::map_nil::[K, V]()` produces a nil `ffi::RawMap[K, V]`. `ffi::map_is_nil(value) -> bool` distinguishes nil from an allocated empty map. An `Option::Some` containing nil remains distinct from `None`. The raw type has no public struct constructor and no implicit conversion to or from `HashMap`; their storage, hashing and equality contracts differ. Raw map syntax uses ordinary qualified generic aliases and functions.
 
 | Operation | Semantics |
 | --- | --- |
-| `ffi::map_new[K, V]()` | Allocate a non-nil empty raw map |
+| `ffi::map_new::[K, V]()` | Allocate a non-nil empty raw map |
 | `ffi::map_len(value)` | Entry count; nil has length zero |
 | `ffi::map_get(value, key)` | `Option[V]`; distinguish absence from a present zero or nil value |
 | `ffi::map_set(value, key, item)` | Insert or replace using Go equality; writing nil retains Go's panic |
@@ -2297,7 +2278,6 @@ These APIs reuse ordinary aliases, generic functions and existing slice operatio
 | `ffi::map_copy(value)` | Independent entry storage with shallow values; preserve nil |
 
 Assignment and argument passing share entry storage. Use `map_copy` for independent entries. Pointer values in a copy still refer to the original objects. Copy traverses key/value pairs directly, so NaN-keyed entries retain their values even though NaN cannot be looked up by equality. None of these operations freezes storage, introduces synchronization or converts HashMap hashing semantics.
-
 
 ```goml
 use std::ffi;
@@ -2360,7 +2340,7 @@ goml export-go [PACKAGE_DIR] --import-path example.com/host/gen/calclib --out ./
 
 The default source is the GoML module root. Explicit source and output paths are relative to the current working directory. The source must be a package in the current module and must not declare `package main`. Only its `go_export` declarations become Go API; dependency exports are retained only when reachable. The output directory's basename is the Go package name and must be a non-main ASCII Go identifier.
 
-The GoML module root must already contain `go.mod`. The output must remain inside that Go module, outside nested Go modules, and the supplied import path must equal the Go module path plus the canonical relative output path. Parent traversal is rejected and symlinks are resolved before checking boundaries. The command never creates or repairs go.mod/go.sum or downloads missing dependencies.
+The GoML module root must already contain `go.mod`. The output must remain inside that Go module, outside nested Go modules, and the supplied import path must equal the Go module path plus the canonical relative output path. Parent traversal is rejected and symlinks are resolved before checking boundaries. The command never creates or repairs `go.mod` or `go.sum` or downloads missing dependencies.
 
 The output contains `goml_generated.go` and `goml_exports.json`. The manifest records public signatures, generation version, build prerequisites, FFI check mode and ownership digests. Handwritten Go files are preserved and checked together with the candidate generated source. New output is checked using a Go overlay before publication; malformed Go, duplicate symbols and import cycles fail without publishing the candidate. Modified or unowned generated files are not overwritten. Concurrent generation for the same output is rejected. Publication rolls back reported file replacement errors; two-file publication is not crash-atomic across power loss or forced process termination.
 
@@ -2391,20 +2371,16 @@ Test functions must meet the following rules:
 - The return type must be `()`;
 - Canonical test IDs generated within the same test package must be unique.
 
-Test functions do not require `pub`.`#[test]` does not accept parameters.When you need to skip a test by default, you can use `#[ignore]` without parameters or `#[ignore("reason")]` with a string reason; `#[ignore]` cannot be used alone without `#[test]`:
+Test functions do not require `pub`. `#[test]` does not accept parameters. When you need to skip a test by default, you can use `#[ignore]` without parameters or `#[ignore("reason")]` with a string reason; `#[ignore]` cannot be used alone without `#[test]`:
 
 ```goml
 #[test]
 #[ignore]
-fn unfinished_case() -> () {
-    ()
-}
+fn unfinished_case() -> () {}
 
 #[test]
 #[ignore("requires an external service")]
-fn integration_case() -> () {
-    ()
-}
+fn integration_case() -> () {}
 ```
 
 Parameterized tests use one or more `#[test_case(...)]` attributes on a top-level function. Test cases accept string and boolean arguments, which are checked against the function parameters. Each case receives a content-derived stable ID, while list, filter, text/JSON reporting, artifact manifests, and CodeLens continue to use its readable display name. Ordinary zero-argument `#[test]` functions remain unchanged.
@@ -2426,7 +2402,7 @@ fn is_left(value: string, expected: bool) -> () {
 - `testing::assert_some`, `assert_none`, `assert_ok`, and `assert_err`: check the variant of an `Option` or `Result`;
 - `testing::expect_some`, `expect_ok`, and `expect_err`: return the selected payload or fail with the supplied message.
 
-### White box testing and black box testing
+### White-box and black-box tests
 
 The white-box test file and the source code under test are located in the same package directory. The file name must end with `_test.gom` and declare the same package name:
 
@@ -2436,7 +2412,7 @@ math/
 └── math_test.gom
 ```
 
-`math_test.gom`：
+`math_test.gom`:
 
 ```goml
 package math;
@@ -2449,9 +2425,9 @@ fn private_helper_works() -> () {
 }
 ```
 
-The test build will merge the production source code and all `*_test.gom` in the same directory into a single package, so white-box testing can access the private top-level items of the package.These files will not participate in compilation when executing normal `goml check`, `goml build` or `goml run` for production targets.
+The test build will merge the production source code and all `*_test.gom` in the same directory into a single package, so white-box testing can access the private top-level items of the package. These files will not participate in compilation when executing normal `goml check`, `goml build` or `goml run` for production targets.
 
-Black-box tests are located in the `tests/` directory of the package under test.This directory as a whole constitutes a package named `tests`. The package under test should be imported explicitly and only its public API can be accessed; nested test suites cannot be created under `tests/`:
+Black-box tests are located in the `tests/` directory of the package under test. This directory as a whole constitutes a package named `tests`. The package under test should be imported explicitly and only its public API can be accessed; nested test suites cannot be created under `tests/`:
 
 ```text
 math/
@@ -2461,7 +2437,7 @@ math/
     └── smoke_test.gom
 ```
 
-`math/tests/api_test.gom`：
+`math/tests/api_test.gom`:
 
 ```goml
 package tests;
@@ -2475,11 +2451,11 @@ fn public_add_works() -> () {
 }
 ```
 
-If the identity of the package under test is `alice::myapp::math`, the canonical identity of the test package in the above example is `alice::myapp::math::tests`.Ordinary package discovery will exclude the `tests` directory, and production packages cannot import black-box test packages.
+If the identity of the package under test is `alice::myapp::math`, the canonical identity of the test package in the above example is `alice::myapp::math::tests`. Ordinary package discovery will exclude the `tests` directory, and production packages cannot import black-box test packages.
 
 ### Check and run tests
 
-`goml check`, `goml build` and `goml test` always process complete modules discovered from the current directory upwards, and do not accept package or file targets.`goml check` only checks the production source code by default; using `--tests` will also check all white-box and black-box tests after the production package check is successful:
+`goml check`, `goml build` and `goml test` always process complete modules discovered from the current directory upwards, and do not accept package or file targets. `goml check` only checks the production source code by default; using `--tests` will also check all white-box and black-box tests after the production package check is successful:
 
 ```sh
 goml check
@@ -2499,7 +2475,7 @@ Run the test using:
 goml test [FILTER]
 ```
 
-`FILTER` performs substring matching on the complete test display name, such as `goml test addition`.Common options include:
+`FILTER` performs substring matching on the complete test display name, such as `goml test addition`. Common options include:
 
 - `--kind internal|external|all`: run only white box, only black box or all tests, the default is `all`;
 - `--list`: List matching tests without running them;
@@ -2512,13 +2488,13 @@ goml test [FILTER]
 - `--format text|json`: Select text or line-by-line JSON results; JSON format cannot be used with `--nocapture` at the same time;
 - `--target-dir`, `--dry-run` and `--compiler`: have the same meaning as project build commands.
 
-Each test is executed in a separate runner process, and failure to exit and timeout do not affect other tests; `--jobs` controls the number of test processes running at the same time.Executing `goml test` requires an available Go toolchain to build the test runner.
+Each test is executed in a separate runner process, and failure to exit and timeout do not affect other tests; `--jobs` controls the number of test processes running at the same time. Executing `goml test` requires an available Go toolchain to build the test runner.
 
 `goml test --seed N` supplies one reproducible positive seed to every test process through `testing::seed()`. Failure summaries print the replay seed, and every JSON result event includes it. Captured stdout and stderr remain isolated per test process and are emitted only for failures unless `--nocapture` is selected.
 
 ### LSP and editor
 
-LSP will construct the analysis package according to the production file, white box test file and black box test file respectively according to the path, so diagnosis, completion, hover and jump follow the corresponding visibility.`Run Test` CodeLens will appear on the `#[test]` function; the VS Code extension will save the dirty file first, and then call the module-level `goml test` with the complete test name and test type.
+The LSP analyzes production files, internal tests, and black-box tests in their corresponding package contexts, so diagnostics, completion, hover, and go-to-definition follow the same visibility rules as compilation. Test code lenses appear on ordinary tests and parameterized test cases. The VS Code extension saves the file and invokes module-level `goml test` with the selected test display name and kind.
 
 The custom `goml/expandedDerive` request returns the formatted AST after built-in and programmable derives have run for the requested document. It uses the same package aliases, explicit derive imports, ambiguity checks, dependency interfaces, CTIR verifier, and resource limits as `goml check`. The VS Code command `GoML: Show Expanded Derive` opens that result beside the source file.
 
@@ -2548,7 +2524,7 @@ enum Result[T, E] {
 }
 ```
 
-Construction uses `Option::Some`, `Option::None`, `Result::Ok` and `Result::Err`.Patterns may use either those full names or contextual `Some`, `None`, `Ok` and `Err`.
+Construction uses `Option::Some`, `Option::None`, `Result::Ok` and `Result::Err`. Patterns may use either those full names or contextual `Some`, `None`, `Ok` and `Err`.
 
 `Option[T]` provides `is_some`, `is_none`, `unwrap_or`, and `unwrap_or_else`, plus type-changing generic methods:
 
@@ -2570,7 +2546,7 @@ The prelude `Default` implementations use `()` for the empty tuple, `false` for 
 
 - `print[T: ToString](value: T) -> ()`
 - `println[T: ToString](value: T) -> ()`
-- `value.to_string() -> string`, suitable for values ​​that implement `ToString`
+- `value.to_string() -> string`, suitable for values that implement `ToString`
 - `value.debug() -> string`, suitable for values that implement `Debug`
 - `string.len() -> isize` and `string.byte_len() -> isize`, both returning the UTF-8 byte length
 - `string.get(index: isize) -> char`, decoding a character at a UTF-8 byte boundary
@@ -2608,7 +2584,7 @@ let before = cell.get();
 cell.set(before + 1);
 ```
 
-API：
+API:
 
 - `Ref::new(value) -> Ref[T]`
 - `reference.get() -> T`
@@ -2617,7 +2593,7 @@ API：
 
 The built-in `PartialEq`, `Eq`, and `Hash` implementations for `Ref[T]` use reference identity and do not require `T` to implement those traits. Mutating the referenced value therefore does not change equality or hashing. `Ref[T]` does not implement `Default`, because implicit allocation and recursive default construction would be surprising.
 
-### fixed array
+### Fixed arrays
 
 ```goml
 let mut values: [i32; 3] = [1, 2, 3];
@@ -2625,7 +2601,7 @@ let first = values[0];
 values[1] = 20;
 ```
 
-The index type is `isize`.The underlying `array_get` and `array_set` can also be called; index syntax is preferred for daily code.
+The index type is `isize`. The underlying `array_get` and `array_set` can also be called; index syntax is preferred for daily code.
 
 ### `Vec[T]`
 
@@ -2700,7 +2676,7 @@ let view: Slice[i32] = values.slice(1, 3);
 let item = view.get(0);
 ```
 
-Commonly used read-only methods are `get`, `get_checked`, `len`, `contains`, `sub`, `sub_checked`, `to_vec`, and `iter`.`contains(value)` requires the element type to implement `PartialEq`. `to_vec()` creates a shallow copy in a new `Vec[T]`; `view[index]` can be read, but `view[index] = value;` is rejected.
+Commonly used read-only methods are `get`, `get_checked`, `len`, `contains`, `sub`, `sub_checked`, `to_vec`, and `iter`. `contains(value)` requires the element type to implement `PartialEq`. `to_vec()` creates a shallow copy in a new `Vec[T]`; `view[index]` can be read, but `view[index] = value;` is rejected.
 
 `MutSlice[T]` is a bounded mutable zero-copy view. `Vec::slice_mut(start, end)` and `Vec::as_mut_slice()` create it; `as_slice()` converts it to a read-only view without copying:
 
@@ -2765,7 +2741,7 @@ Commonly used methods:
 
 `Sender[T]` provides `send` and `close`; `Receiver[T]` provides `recv`. Direction is enforced statically and emitted as Go's `chan<- T` and `<-chan T`. Converting a bidirectional channel requires an explicit endpoint method. `Channel[T]` keeps its original send, receive, and close API.
 
-Capacity `0` creates an unbuffered channel.Sending to an unbuffered channel should generally be concurrently received by another `go` closure, and vice versa.
+Capacity `0` creates an unbuffered channel. Sending to an unbuffered channel should generally be concurrently received by another `go` closure, and vice versa.
 
 Use `select` when a goroutine must wait on several channels, choose between sending and receiving, observe closure through `Option[T]`, or perform a non-blocking operation with `default`. The channel operands and send values are prepared once before selection.
 
@@ -2865,7 +2841,7 @@ Public APIs include:
 - `math` f32/f64 elementary functions, IEEE 754 classification, and the `E`, `PI`, `TAU`, `SQRT_2`, `LN_2`, and `LN_10` constants
 - `num` structured parsing plus checked and saturating `i64` arithmetic
 - `path::join`, `clean`, `is_absolute`, component inspection, and `absolute_structured`
-- `process::Command`, structured whole-process execution, `ExitStatus`, `Output`, `exit`, and `look_path`
+- `process::Command`, structured whole-process execution, `ExitStatus`, `Output`, `exit`, and `look_path_structured`
 - `rand::ALGORITHM`, `next_u64`, deterministic byte generation, integer ranges, and shuffle with an explicit seed
 - `serde::Value`, `Serializer`, `Deserializer`, `Serialize`, `Deserialize`, `value_serializer`, `value_deserializer`, `to_value`, and `from_value`
 - `task::Scope`, `Task[T]`, `CancelToken`, `WaitResult[T]`, `scope`, and `try_scope`
@@ -2910,7 +2886,7 @@ fn example() -> string {
 
 `std::utf8` validates byte slices and converts complete byte vectors to strings without admitting invalid UTF-8. `Utf8Error::valid_up_to` is the length of the valid prefix. `error_length` is the length of the invalid sequence when known and is `None` for an incomplete sequence at the end of the input. `encode` returns the UTF-8 bytes of a string, and `encoded_len` returns the byte length of one Unicode scalar value.
 
-Importing `utf8::BytesUtf8` adds `Bytes::to_string_utf8`, which returns `Utf8Error`.
+Importing `utf8::BytesUtf8` adds `Bytes::to_string_utf8`, which returns `Result[string, Utf8Error]`.
 
 `decode_slice` accepts a read-only byte view. `encode_into` writes into a `MutSlice[byte]` at a checked offset and reports `bytes::BoundsError` without a partial write; `encode_to` appends to the lightweight `bytes::Builder`.
 
@@ -3082,14 +3058,14 @@ Cancellation is cooperative. `Scope::cancel` changes the state observed by `Canc
 - `task::recv_with(token, channel) -> WaitResult[Option[T]]`
 - `task::send_with(token, channel, value) -> WaitResult[()]`
 - `time::sleep_with(token, duration) -> WaitResult[()]`
-- `Command::output_with(token) -> Result[WaitResult[Output], string]`
-- `Command::status_with(token) -> Result[WaitResult[ExitStatus], string]`
+- `command.output_cancel_structured(token) -> Result[process::Output, process::Error]`
+- `command.status_cancel_structured(token) -> Result[process::ExitStatus, process::Error]`
 
 `CancelToken::done() -> Receiver[()]` exposes the scope context's shared completion channel, and `Task::done() -> Receiver[()]` exposes the task's shared ready channel. Neither method starts a bridge goroutine. A task stores its result before closing the ready channel, so `join()` is immediately observable after its completion event.
 
 `std::time::Timer::new(duration)` creates a stoppable one-shot timer. `done()` returns its `Receiver[()]`, `stop()` reports whether it prevented a pending firing, and `time::after(duration)` is the one-shot convenience form. A successful stop leaves the completion channel unready. Timer firing and stopping are synchronized so the channel closes at most once.
 
-`WaitResult::Cancelled` means cancellation woke the operation. Process cancellation uses the host command context, so the scope waits for the process operation to return before it exits. Task scopes never close user channels automatically. `active_scope_count()` exposes the number of live runtime scopes for tests and leak diagnostics.
+Channel and sleep operations return `WaitResult::Cancelled` when cancellation wakes them. Process operations instead return `process::Error` with kind `io::ErrorKind::Interrupted`. Process cancellation uses the host command context, so the scope waits for the process operation to return before it exits. Task scopes never close user channels automatically. `active_scope_count()` exposes the number of live runtime scopes for tests and leak diagnostics.
 
 GoML has no lifetime or linear type system, so a `Scope` value can currently escape its body. Calling `spawn` after the scope begins closing is a runtime error. Panic remains a fatal runtime exception and is not converted into `Result`. A panic in the scope body or a child task cancels sibling tasks, waits for them, removes the runtime scope, and is then re-raised in the scope owner.
 
@@ -3106,12 +3082,10 @@ GoML has no lifetime or linear type system, so a `Scope` value can currently esc
 ```goml
 use std::collections;
 
-let headers: collections::IndexMap[string, string] =
-    collections::IndexMap::new();
+let headers: collections::IndexMap[string, string] = collections::IndexMap::new();
 headers.insert("content-type", "text/plain");
 headers.insert("content-length", "12");
 headers.insert("content-type", "application/json");
-
 for (name, value) in headers {
     println(name + ": " + value)
 }
@@ -3127,34 +3101,34 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 
 ## Comparison of common writing errors
 
-| Don't generate | GoML writing method |
+| Avoid | GoML form |
 | --- | --- |
 | `Vec<isize>` | `Vec[isize]` |
 | `fn id<T>(x: T) -> T` | `fn id[T](x: T) -> T` |
 | `id::<i32>(1)` | `id::[i32](1)` |
 | Ordinary function `id[i32](1)` | `id::[i32](1)`, or rely on parameter/result type inference |
-| `1i32`、`1u64`、`1.0f32` | Use the expected type, such as `let value: u64 = 1;` |
+| `1i32`, `1u64`, `1.0f32` | Use the expected type, such as `let value: u64 = 1;` |
 | Non-ASCII source text in `b"é"` | Use a `string`, or write its encoded bytes explicitly such as `b"\xC3\xA9"` |
 | A bare block as a control-flow header value | Parenthesize it, for example `if ({ prepare(); ready() }) { ... }` |
 | `let mut x: &T` | Use value `T` or `Ref[T]` as required |
 | Write `if cond { value }` in the value position | `if cond { value } else { other }` |
-| `let Option::Some(x) = value;` | `if let Option::Some(x) = value { ... };` or `match` |
+| `let Option::Some(x) = value;` | `let Some(x) = value else { return };`, `if let`, or `match` |
 | `let Point { x } = point;` | `let Point { x, .. } = point;` |
-| Endless `match` | Complete variant or `_` branch |
-| `x++`、`x--` | `x += 1;`、`x -= 1;` |
+| Non-exhaustive `match` | Cover every possible variant or add a `_` branch |
+| `x++`, `x--` | `x += 1;`, `x -= 1;` |
 | Assign through an immutable structure binding | Declare the binding with `let mut`, or create a new value with `Point { field: value, ..point }` |
-| `var x = 1`、`x := 1` | `let x = 1;` |
+| `var x = 1`, `x := 1` | `let x = 1;` |
 | A loop with a condition | `while condition { ... }` |
 | `for i := 0; ...` | `while`, or `for i in start..end` |
 | `switch` | `match` |
-| `null`、`nil` | `Option::None` for optional values; `ffi::null()` for raw Go pointers; `ffi::nil_error()` for Go errors |
+| `null`, `nil` | `Option::None` for optional values; `ffi::null()` for raw Go pointers; `ffi::nil_error()` for Go errors |
 | `throw`, exception | `Result` and `?` |
 | `float_value.to_i32()` | Floating point to integer conversion is not supported; use dedicated parsing or conversion APIs |
 | `dyn A + B` | Use one dyn-safe trait; multiple bounds are reserved syntax but not yet supported |
 | `dyn TraitWithAssociatedType` | Bind every associated type, for example `dyn Iterator[Item = isize]` |
 | Use `type UserId = u64;` when `UserId` must be distinct | Use `struct UserId(u64);` and construct it explicitly |
 | `use pkg::*` | List the required public items explicitly with `use pkg::{A, B};` |
-| `mod`、`crate::`、`super::` | Directory packages, `module::path` for the current module, and canonical paths for dependencies |
+| `mod`, `crate::`, `super::` | Directory packages, `module::path` for the current module, and canonical paths for dependencies |
 | `fn helper` inside function | Top-level function or local closure |
 | Go external type | `#[go_type("pkg", "Name")] extern type Name[T];` retains Go identity and validates concrete instances across packages and artifacts; `std::ffi::Ptr[T]` and Go pointer aliases preserve nullable pointer values, with explicit `ffi::null()` and `ffi::is_nil`; method bindings use `#[go_method("Method")]`; symbolic instances remain unsupported |
 | Go interface adapter | `#[go_interface(RawType, Wrapper, method = "GoMethod")]` generates a checked native-interface wrapper and trait implementation; `from_trait` explicitly creates a typed Go bridge retaining the supplied dyn object; nil/typed-nil and multiple results are preserved |
@@ -3263,7 +3237,7 @@ statement     = "let" "mut"? pattern (":" type)? "=" expression ("else" block)? 
               | "defer" expression ";"
               | assign_target assignment_operator expression ";"
               | expression ";"
-              | control_expression
+              | unlabeled_control_expression
 
 assignment_operator = "=" | "+=" | "-=" | "*=" | "/=" | "%="
                     | "&=" | "|=" | "^=" | "<<=" | ">>="
@@ -3289,8 +3263,9 @@ struct_literal = path "{" (struct_literal_field ("," struct_literal_field)*
                  ("," ".." expression)? ","? | ".." expression ","?)? "}"
 struct_literal_field = lower_ident (":" expression)?
 
-control_expression = if_expression | match_expression | select_expression
-                   | while_expression | loop_expression | for_expression
+unlabeled_control_expression = if_expression | match_expression | select_expression
+                   | "while" expression block | "while" "let" pattern "=" expression block
+                   | "loop" block | "for" pattern "in" expression block
 if_expression = "if" expression block ("else" (block | if_expression))?
               | "if" "let" pattern "=" expression block
                 ("else" (block | if_expression))?
@@ -3340,7 +3315,7 @@ array_pattern = "[" (array_pattern_item ("," array_pattern_item)* ","?)? "]"
 array_pattern_item = pattern | ".." | ident "@" ".."
 ```
 
-The parser will do some error recovery for commas and semicolons, but the code agent should always generate the above canonical form: list items separated by commas, `let`, assignments and ordinary non-tail expressions with semicolons, control flow statements without semicolons, trait method signatures with semicolons.The sequence pattern contains at most one rest; the `..` in the structure pattern appears at most once and must be at the end.
+The parser will do some error recovery for commas and semicolons, but the code agent should always generate the above canonical form: list items separated by commas, `let`, assignments and ordinary non-tail expressions with semicolons, unlabeled control-flow statements without unnecessary semicolons, labeled loop statements with semicolons before following statements, and trait method signatures with semicolons. The sequence pattern contains at most one rest; the `..` in the structure pattern appears at most once and must be at the end.
 
 ## Verify generated code
 
@@ -3353,12 +3328,12 @@ stage2/bin/gomlc run-single path/to/main.gom
 For a project, run the installed driver from anywhere inside its module:
 
 ```sh
+goml fmt
 goml check
 goml build
 goml check --tests
 goml test
 goml run
-goml fmt
 ```
 
 `goml check`, `goml build`, `goml test`, and `goml fmt` always operate on the complete module and do not accept package or file targets. `goml run [TARGET]` accepts an optional entry package file or directory when a module has multiple executable packages.

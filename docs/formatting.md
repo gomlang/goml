@@ -37,7 +37,7 @@ Empty blocks are written as `{}`. `else` remains on the line of the preceding cl
 
 An exact `()` at the end of a block and a standalone `();` are omitted when they contain no comments. Empty statements written as extra semicolons are also removed. These normalizations preserve the block's `()` result and do not remove comments.
 
-Semicolons after `while` and `for` expressions are removed. Semicolons after `if`, `match`, `select`, and `loop` are removed when another statement follows. A final `if` with an implicit `()` fallback also omits its semicolon. A final control-flow semicolon is retained when it may discard a value, and any control-flow semicolon is retained when the next token could continue the preceding expression, such as `(`, `[`, `.`, `?`, `as`, a range operator, or a binary operator.
+Semicolons after unlabeled `while` and `for` expressions are removed. Semicolons after `if`, `match`, `select`, and unlabeled `loop` are removed when another statement follows. A final `if` with an implicit `()` fallback also omits its semicolon. Labeled loop statements retain their semicolons because the parser requires them before a following statement. A final control-flow semicolon is retained when it may discard a value, and any control-flow semicolon is retained when the next token could continue the preceding expression, such as `(`, `[`, `.`, `?`, `as`, a range operator, or a binary operator.
 
 Struct-like enum variants with one field stay on one line when every such variant fits. If any struct-like variant has multiple fields, contains a comment, or exceeds the line width, all non-empty struct-like variants in that enum use the same expanded layout:
 
