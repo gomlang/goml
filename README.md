@@ -6,22 +6,37 @@ The "ml" in goml nods to the [ML (programming language)](https://en.wikipedia.or
 
 goml aims to empower gophers with a more powerful type system but without leaving the Go ecosystem.
 
-The compiler, project driver, tests, and language server are implemented in GoML. The main development commands are:
+GoML is statically typed and garbage-collected, with Rust-like syntax, monomorphized generics, and no ownership or lifetime system. The compiler, project driver, tests, formatter, and language server are implemented in GoML and compile to Go.
+
+## Documentation
+
+- [Language guide](docs/goml.md): syntax, semantics, packages, tests, and standard-library APIs
+- [Formatting](docs/formatting.md): formatter rules and CLI
+- [Compiler](gomlc/README.md) and [project driver](goml/README.md): local tools and development commands
+- [Compile-time evaluation](docs/comptime.md): CTIR and programmable derive architecture
+- [Go bindings](docs/ffi/bind-go.md) and [metadata protocol](docs/ffi/protocol-v1.md): Go interoperability
+- [gomlgo](gomlgo/README.md): independent Go frontend, interpreter, and differential tests
+- [VS Code extension](editors/vscode/README.md): editor setup and commands
+- [Releasing](docs/releasing.md): release archives, installation, and stage0 advancement
+
+## Development
+
+Run recipes from the repository root. The toolchain build requires Linux amd64, Go 1.25+, `just`, Bash, curl, tar, and sha256sum. Full CI also uses Node 20+, npm, and jq. See [.justfile](.justfile) for all commands and [gomlgo's README](gomlgo/README.md) for its separate Go 1.26 requirements.
 
 ```sh
 just make
 just test
-just all
+just ci
 just clean
 ```
 
-`just make` builds the stage2 toolchain, `just test` runs the self-hosted compiler and driver tests, `just all` builds and tests, and `just clean` removes local build caches and generated toolchains.
+`just make` incrementally builds stage2 directly from the pinned stage0. `just test` builds the tools and runs compiler, driver, and Go metadata tests; `just all` is an alias for it. `just ci` performs a clean stage2 build, fixed-point verification, tests, extension compilation, and release archive smoke checks. The independent gomlgo suite runs separately with `just gomlgo-test`.
 
-On Linux amd64, the bootstrap uses Bash, curl, tar, and sha256sum to download the checksum-pinned stage0 compiler recorded in `bootstrap/stage0.env`. `just bootstrap` performs a clean fixed-point build: it uses stage0 to build stage1, builds stage2 from stage1, builds stage3 from stage2, then compares the stage2 and stage3 compiler and driver artifacts. Set `GOML_STAGE0_ARCHIVE` to a previously downloaded stage0 archive for an offline bootstrap.
+The bootstrap downloads the checksum-pinned stage0 release recorded in [bootstrap/stage0.env](bootstrap/stage0.env). `just bootstrap` rebuilds stage2 from stage0, builds stage3 with stage2, then uses stage3 to rebuild the compiler and driver artifacts and compares them with the first stage3 build. Set `GOML_STAGE0_ARCHIVE` to a previously downloaded pinned archive to avoid downloading stage0.
 
-Generated toolchains are published under `stage1`, `stage2`, and `stage3`, with executables in each stage's `bin` directory, GoML toolchain projects in `lib`, and the installed compiler world in `lib/compiler`. Stage2 is the stable self-compiled toolchain, while stage3 verifies its fixed point. The downloaded stage0 toolchain uses the same layout under `stage0`; downloaded archives and build artifacts are stored under `_bootstrap/`. These generated directories are ignored by Git.
+Use `stage2/bin` for local development. Toolchain prefixes under `stage0`, `stage2`, and `stage3` contain `bin`, library projects under `lib`, and the finalized compiler world under `lib/compiler`. Downloaded archives are cached in `_bootstrap/cache`; compiler and driver bootstrap products live in their module-local `_bootstrap` directories. Generated outputs are ignored by Git.
 
-Release versions and the binary bootstrap chain are documented in [docs/releasing.md](docs/releasing.md).
+`just install` installs and finalizes the tools under `${GOML_HOME:-$HOME/.goml}`; add its `bin` directory to `PATH`. `just clean` removes the root and compiler/driver build caches and generated development stages, while retaining the downloaded `stage0` toolchain.
 
 Explore [gomlc/testdata/pipeline](gomlc/testdata/pipeline) for source programs and every compiler-stage golden file. Use `just verify-golden` to check the corpus or `just update-golden` to regenerate it through the self-hosted compiler.
 

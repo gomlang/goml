@@ -2,27 +2,31 @@
 
 `goml` is the self-hosted project driver. It provides project creation, package discovery, check/build/run/test plans, dependency resolution, registry cache management, incremental artifact fingerprints, native linking, and parallel test execution.
 
-Build and verify the complete toolchain:
+From the repository root, build the toolchain and run compiler, driver, and Go metadata tests:
 
 ```sh
 just all
 ```
 
-`just test` includes the project-driver tests.
+`just test` includes the same tests. `just ci` additionally checks the bootstrap fixed point, scripts, extension, and release packaging.
 
-Use the stage1 driver directly:
+Use the stage2 driver directly from the repository root:
 
 ```sh
 cd goml
-../stage1/bin/goml check \
-  --compiler ../stage1/bin/gomlc
-../stage1/bin/goml test \
-  --compiler ../stage1/bin/gomlc \
+../stage2/bin/goml check \
+  --compiler ../stage2/bin/gomlc
+../stage2/bin/goml test \
+  --compiler ../stage2/bin/gomlc \
   --jobs 4 \
   --timeout 30s
 ```
 
 `goml test --nocapture` inherits test output, while `--timeout` accepts positive `ms`, `s`, or `m` durations. Compiler, linker, and Go build steps are skipped only when their compiler identity, arguments, inputs, and recorded output digests all match.
+
+`check`, `build`, and `test` discover the enclosing `goml.toml` and operate on the complete module. The optional argument to `test` is a test-name substring filter. `run [TARGET]` selects an executable package and passes arguments after `--` to the program. `--dry-run` prints the command plan. `goml fmt` and `goml fmt --check` format or verify the module's production and test sources.
+
+Go FFI is validated by default with `--ffi-check required`. Go module builds always invoke Go so its cache observes native source and dependency changes. See the [language guide](../docs/goml.md#go-ffi) for the boundary rules, [bind-go](../docs/ffi/bind-go.md) for allowlisted binding generation, and [export-go](../docs/goml.md#exporting-a-go-library) for publishing a generated Go package.
 
 `goml clean` removes the current module's configured build target directory. Use `goml clean --target-dir <path>` to clean another target directory inside the module.
 

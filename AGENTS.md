@@ -26,11 +26,11 @@ Read the documentation relevant to the change:
 | `editors/vscode/` | VS Code extension |
 | `gomlc/testdata/` | Compiler regression fixtures and generated golden files |
 
-Generated toolchains live under `stage0` through `stage3`; use `stage2/bin` for local development. Each loads resources from its executable-relative `lib/`, including its finalized compiler world under `lib/compiler/`. Build outputs belong under `_bootstrap/`, `_artifact/`, or module-configured target directories.
+The current bootstrap uses toolchain prefixes under `stage0`, `stage2`, and `stage3`; use `stage2/bin` for local development. Each loads resources from its executable-relative `lib/`, including its finalized compiler world under `lib/compiler/`. Build outputs belong under `_bootstrap/`, `_artifact/`, or module-configured target directories.
 
 ## Development Workflow
 
-Requirements: Linux amd64, Go 1.25+, Node 20+, npm, `just`, Bash, curl, tar, and sha256sum. See the gomlgo README for its additional Go-version requirements.
+Requirements: Linux amd64, Go 1.25+, Node 20+, npm, `just`, Bash, curl, tar, sha256sum, and jq. See the gomlgo README for its additional Go-version requirements.
 
 Run recipes from the repository root; [.justfile](.justfile) is the command reference.
 
@@ -43,7 +43,7 @@ Run recipes from the repository root; [.justfile](.justfile) is the command refe
 | `just verify-golden` / `just update-golden` | Verify / regenerate snapshots through self-hosted tests |
 | `just vscode-ext` | Build the LSP and compile the extension |
 | `just gomlgo-test` | Run the independent gomlgo test suite |
-| `just clean` | Remove local build caches and generated toolchains |
+| `just clean` | Remove root and compiler/driver build caches and generated development stages; retain stage0 |
 
 - After editing `.gom` files, run `goml fmt` from every affected module before tests or commits. Modules include `gomlc/`, `goml/`, `gomlgo/`, and the separate library projects under `lib/`.
 - Use the repository formatter, for example `cd gomlc && ../stage2/bin/goml fmt`; `fmt --check` verifies formatting.

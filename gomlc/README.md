@@ -6,21 +6,23 @@
 lexer → parser → CST → AST → HIR → TAST → Core → Mono → Lift → ANF → Go
 ```
 
-On Linux amd64, a fresh checkout downloads the checksum-pinned binary stage0 and builds the stable stage2 toolchain:
+Run repository recipes from the repository root. On Linux amd64, a fresh checkout downloads the checksum-pinned binary stage0 and uses it to build the stage2 toolchain directly:
 
 ```sh
 just make
 ```
 
-Use `just bootstrap` when a clean stage2/stage3 fixed-point verification is required. The stable tools are:
+Use `just bootstrap` for a clean bootstrap and stage3 artifact fixed-point verification. The development tools include:
 
 ```text
 stage2/bin/gomlc
+stage2/bin/gomlfmt
 stage2/bin/gomllsp
 stage2/bin/goml
+stage2/bin/goml-go-meta
 ```
 
-Each stage is a complete toolchain prefix. The compiler loads builtin and standard-library sources from `stage2/lib`, derived only from the executable's location.
+Each installed stage is a complete toolchain prefix. The compiler resolves `lib` from its executable's location. Module commands read the finalized compiler world at `lib/compiler/compiler-world-v2.gaf`; the prefix also carries the builtin, prelude, and standard-library projects.
 
 Run a single source or inspect an IR stage:
 
@@ -38,4 +40,6 @@ just update-golden
 ```
 
 Run all self-hosted compiler, pipeline, query, and language-server tests with
-`just test`.
+`just test`. Run `just ci` for the complete repository checks, including fixed-point and packaging verification.
+
+See the [language guide](../docs/goml.md), [formatter rules](../docs/formatting.md), and [compile-time evaluation architecture](../docs/comptime.md) for the corresponding compiler contracts.

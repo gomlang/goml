@@ -2,7 +2,7 @@
 
 Releases use strict `vX.Y.Z` tags and currently publish Linux amd64 binaries.
 
-The root `VERSION` file is authoritative. `goml`, `gomlc`, `gomllsp`, and the VS Code extension must use the same version.
+The root [VERSION](../VERSION) file is authoritative. `goml`, `gomlc`, `gomlfmt`, `gomllsp`, and the VS Code extension must use the same version. The metadata helper `goml-go-meta` is packaged alongside them.
 
 ## Version policy
 
@@ -18,25 +18,26 @@ During the early bootstrap period, releases are limited to continuous `0.1.x` pa
 
 ## Publish
 
-Set the next version:
+Run from the repository root with the development prerequisites in the [README](../README.md#development), plus an authenticated GitHub CLI (`gh`) for release operations. Replace `X.Y.Z` with the next continuous version after the latest published release:
 
 ```sh
-just set-version 0.1.1
+release_version=X.Y.Z
+just set-version "$release_version"
 just ci
 ```
 
-Commit and push the version change, then wait for the main branch CI to succeed before creating the tag:
+`just set-version` synchronizes `VERSION`, both GoML version modules, and the VS Code package and lockfile versions. Commit and push the change, then wait for main CI on that exact commit before creating the tag. Keep `release_version` set in the same shell:
 
 ```sh
 release_sha="$(git rev-parse HEAD)"
 git push origin main
 ci_run_id="$(gh run list --repo lijunchen/goml --workflow CI --branch main --commit "$release_sha" --event push --limit 1 --json databaseId --jq '.[0].databaseId')"
 gh run watch "$ci_run_id" --repo lijunchen/goml --exit-status
-git tag -a v0.1.1 -m "goml v0.1.1"
-git push origin v0.1.1
+git tag -a "v$release_version" -m "goml v$release_version"
+git push origin "v$release_version"
 ```
 
-The main branch CI builds stage2 directly from the pinned stage0, then verifies the stage3 self-hosted compiler with a reproducible stage3 rebuild and runs the complete test suite. The Release workflow requires a successful main branch CI for the tagged commit, verifies the version, previous release, and stage0, rebuilds stage2, and tests the extracted release archive before publishing.
+Main CI builds stage2 directly from the pinned stage0. Its checks cover compiler and driver tests, Go metadata and scripts, extension compilation, archive smoke tests, and the stage3 fixed point. Fixed-point verification compares the compiler and driver artifacts built by stage2 with a rebuild using stage3. The independent gomlgo suite runs separately. The Release workflow requires successful main CI for the tagged commit, verifies the version, previous release, and stage0, rebuilds stage2, and runs archive and LSP smoke tests before publishing.
 
 Release archives use a complete toolchain prefix:
 
@@ -46,6 +47,7 @@ goml-X.Y.Z-linux-amd64/
 │   ├── goml
 │   ├── gomlc
 │   ├── gomlfmt
+│   ├── goml-go-meta
 │   └── gomllsp
 └── lib/
     ├── builtin/
@@ -77,10 +79,11 @@ Finalization builds and validates the compiler world in a temporary path, then a
 
 ## Advance stage0
 
-The release is built by the previous release as stage0. After publishing, read the new archive checksum from its `SHA256SUMS`, then advance stage0:
+The release is built by the previous release as stage0. After publishing, keep `release_version` set to the published version and replace `SHA256_FROM_SHA256SUMS` with its archive checksum, then advance stage0:
 
 ```sh
-just set-bootstrap-stage0 0.1.1 <sha256>
+archive_sha256=SHA256_FROM_SHA256SUMS
+just set-bootstrap-stage0 "$release_version" "$archive_sha256"
 just bootstrap
 ```
 
