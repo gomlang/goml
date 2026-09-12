@@ -862,7 +862,7 @@ GoML supports:
 - Unary and binary operations
 - Integer conversion method `value.to_u32()`
 - Explicit trait-object conversion `value as dyn Trait`
-- Half-open range expression `start..end`
+- Half-open and inclusive range expressions `start..end` and `start..=end`
 - `if`, `if let`, `match`, `select`, `while`, `while let`, `loop`, `for`
 - closure
 - `return`, `break`, `continue`, `go` and `?`
@@ -908,8 +908,10 @@ From low to high:
 | 9 | `+`, `-` | Addition, subtraction, string concatenation |
 | 10 | `*`, `/`, `%` | Multiplication, division, remainder |
 | 11 | `as` | explicit `dyn Trait` conversion |
-| 12 | Call `()`, index `[]`, `?`, member `.` | suffix |
-| 13 | Unary `-`, `!`, `~` | prefix |
+| 12 | Unary `-`, `!`, `~` | prefix |
+| 13 | Call `()`, index `[]` | suffix |
+| 14 | `?` | error or absence propagation |
+| 15 | Member `.` | field access, tuple projection, or method selection |
 
 The binary operator is left associative, and the function type `->` is right associative. Don’t write comparisons in chains; use combinations of logical operations:
 
@@ -917,11 +919,11 @@ The binary operator is left associative, and the function type `->` is right ass
 let inside = lower <= value && value < upper;
 ```
 
-Since the current combination of calls, `?` , unary operations, and dot notation are not exactly equivalent to Rust, it is safest to explicitly add parentheses when mixing them:
+Calls, indexing, `?`, and member access bind more tightly than unary operators. For example, `-compute()` negates the call result and `!values[0]` negates the indexed value:
 
 ```goml
-let negative = -(compute());
-let valid = !(predicate());
+let negative = -compute();
+let valid = !values[0];
 ```
 
 ### Operator type rules
@@ -1746,6 +1748,9 @@ Current limitations:
 User source code supports deriving `ToString`, `Debug`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`, and `Default` for structures and enumerations, including generic types. `Serialize` and `Deserialize` are also available after importing them from `std::serde` or a re-exporting format package:
 
 ```goml
+use std::cmp;
+use cmp::{Ord, PartialOrd};
+
 #[derive(ToString, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 struct Key {
     name: string,
@@ -1761,7 +1766,7 @@ enum Entry[T, Marker] {
 
 All fields or variant payloads used by a derive must support that trait. For a generic definition, the generated impl constrains each distinct participating field or payload type that mentions a type parameter. An unused phantom parameter receives no constraint. Compiler-owned runtime, intrinsic, and lang-item attributes remain unavailable to ordinary projects. User projects may use the `go_ffi`, `go_type`, `go_method` and `go_interface` attributes described in the next section.
 
-The eight prelude derives are supplied by verified handlers in the toolchain's builtin sources. They are not hard-coded code generators in the compiler. Standard-library and third-party derives use the same handler and artifact mechanism, but they are not added to the prelude: import the trait or its package before using the derive name.
+The eight prelude derives are supplied by verified handlers in the toolchain's builtin sources. They are not hard-coded code generators in the compiler. The `PartialOrd` and `Ord` traits themselves live in `std::cmp`; import that package when using their derives, and import the traits for unqualified bounds and method calls. Standard-library and third-party derives use the same handler and artifact mechanism, but they are not added to the prelude: import the trait or its package before using the derive name.
 
 Derived `Debug` provides `Debug::debug(value)` and the `.debug()` method. It formats structs with their type and field names and enums with their type and variant names. Primitive field values use their ordinary textual representation, while nested values recursively use `Debug`.
 
@@ -2880,7 +2885,7 @@ fn example() -> string {
 }
 ```
 
-`io`, `fs`, `path`, `env`, `process`, and `num` expose domain-specific error types. Callers can branch on stable error kinds and use `to_string()` only when a display message is needed.
+`io`, `fs`, `path`, `env`, `process`, `num`, and `time` expose domain-specific error types. Callers can branch on stable error kinds and use `to_string()` only when a display message is needed.
 
 ### UTF-8 validation and conversion
 
@@ -2895,6 +2900,8 @@ Importing `utf8::BytesUtf8` adds `Bytes::to_string_utf8`, which returns `Result[
 `std::bytes` uses `Slice[byte]` and `MutSlice[byte]` for borrowed views. `Bytes::as_slice` and `as_mut_slice` are zero-copy, while `slice_checked` and `slice_mut_checked` validate a subrange. `bytes::Builder` is a lightweight byte accumulator and returns `Bytes`.
 
 `std::bytes::endian` is an opt-in package for binary formats. Its `Builder` grows while writing typed values; `Reader` advances over a read-only view; `Writer` advances over a fixed mutable view and returns `endian::BoundsError` rather than partially writing past the end. The top-level `read_u16/u32/u64`, `read_i16/i32/i64`, `read_f32/f64` and matching `write_*` functions take an explicit `Endian::Little` or `Endian::Big`. One-byte operations omit endianness. Every operation validates the complete range before reading or writing.
+
+The stateful `Reader`, `Writer`, and `Builder` currently provide typed methods for `u8`, `u16`, `u32`, and `u64`. Signed and floating-point access uses the top-level functions with an explicit offset; those functions do not advance a reader or writer.
 
 ### UTF-16 conversion
 

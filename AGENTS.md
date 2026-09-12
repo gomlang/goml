@@ -30,7 +30,7 @@ The current bootstrap uses toolchain prefixes under `stage0`, `stage2`, and `sta
 
 ## Development Workflow
 
-Requirements: Linux amd64, Go 1.25+, Node 20+, npm, `just`, Bash, curl, tar, sha256sum, and jq. See the gomlgo README for its additional Go-version requirements.
+Requirements: Linux amd64, Go 1.25+, a C compiler for race-detector tests, Node 20+, npm, `just`, Bash, curl, tar, sha256sum, and jq. See the gomlgo README for its additional Go-version requirements.
 
 Run recipes from the repository root; [.justfile](.justfile) is the command reference.
 
@@ -47,7 +47,7 @@ Run recipes from the repository root; [.justfile](.justfile) is the command refe
 
 - After editing `.gom` files, run `goml fmt` from every affected module before tests or commits. Modules include `gomlc/`, `goml/`, `gomlgo/`, and the separate library projects under `lib/`.
 - Use the repository formatter, for example `cd gomlc && ../stage2/bin/goml fmt`; `fmt --check` verifies formatting.
-- Run a focused fixture with `stage2/bin/gomlc run-single <file.gom>`. Add `--dump-ast`, `--dump-hir`, `--dump-tast`, `--dump-core`, `--dump-mono`, `--dump-lift`, `--dump-anf`, or `--dump-go` to inspect lowering.
+- Run a focused fixture with `stage2/bin/gomlc run-single <file.gom>`. Add `--dump-ast`, `--dump-expanded-ast`, `--dump-hir`, `--dump-tast`, `--dump-ctir`, `--dump-core`, `--dump-mono`, `--dump-lift`, `--dump-anf`, or `--dump-go` to inspect lowering.
 - `goml check`, `goml build`, and `goml test` discover the enclosing `goml.toml` and operate on the complete module, without package targets. `--dry-run` prints planned commands.
 - The driver finds `gomlc` through `--compiler`, `GOMLC`, a sibling binary, `GOML_HOME/bin`, then `PATH`, and verifies the driver protocol.
 - Run relevant tests and `just ci` before reporting completion. Changes to `gomlgo/` also need its separate tests; consult its README for focused differential checks.

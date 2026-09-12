@@ -22,7 +22,7 @@ The source importer evaluates `//go:build` and `// +build` constraints, GOOS/GOA
 
 ## Commands
 
-Run these recipes from the repository root. `just test` and `just ci` do not include this independent suite. The oracle build uses `${GOMLGO_GO:-/usr/lib/go-1.26/bin/go}`; `GOMLGO_GO` overrides the oracle compiler, while the GOROOT recipes below explicitly use `/usr/lib/go-1.26/src`.
+Run these recipes from the repository root. `just test` and `just ci` do not include this independent suite. The oracle build uses `${GOMLGO_GO:-/usr/lib/go-1.26/bin/go}`. `GOMLGO_GO` also selects the interpreter's Go executable, while the GOROOT recipes below explicitly use `/usr/lib/go-1.26/src`.
 
 ```bash
 just gomlgo-test
@@ -63,7 +63,9 @@ _artifact/gomlgo-build/bin/cmd/gomlgo/gomlgo run FILE [-- PROGRAM_ARGS...]
 
 `gomlgo run` accepts exactly one explicit `.go` file. The file must declare `package main` and define `main.main`. Only that file is interpreted: other files in the directory, local packages, third-party modules, cgo, and assembly are outside the current execution scope. Imports are limited to Go 1.26 standard-library packages.
 
-The execution loader uses the selected Go 1.26 toolchain for environment and standard-library dependency metadata. User functions are lowered to typed bytecode and executed by the GoML VM; `gomlgo run` is not a wrapper around `go run`. The VM supports package initialization, functions and closures, control flow, arrays, structs, pointers, slices, maps, methods, interfaces, type assertions and switches, method values and expressions, variadic calls, generic function and method instantiation, string, byte-slice, rune-slice, and rune conversions, and `defer`, `panic`, and `recover`. Runtime faults use the same panic unwinding path and therefore execute deferred calls and can be recovered. A cooperative scheduler implements goroutines, buffered and unbuffered channels, close, channel range, seeded select, and deadlock detection. `--seed` selects deterministic select choices, `--max-goroutines` limits scheduler growth, and `--max-steps` sets a positive instruction limit or `-1` for no limit.
+The execution loader uses the selected Go 1.26 toolchain for environment and standard-library dependency metadata and native image builds. Set `GOMLGO_GO` to its executable path; when unset, the loader uses `/usr/lib/go-1.26/bin/go` if present, then `go` on `PATH`. Execution rejects versions outside Go 1.26.x.
+
+User functions are lowered to typed bytecode and executed by the GoML VM; `gomlgo run` is not a wrapper around `go run`. The VM supports package initialization, functions and closures, control flow, arrays, structs, pointers, slices, maps, methods, interfaces, type assertions and switches, method values and expressions, variadic calls, generic function and method instantiation, string, byte-slice, rune-slice, and rune conversions, and `defer`, `panic`, and `recover`. Runtime faults use the same panic unwinding path and therefore execute deferred calls and can be recovered. A cooperative scheduler implements goroutines, buffered and unbuffered channels, close, channel range, seeded select, and deadlock detection. `--seed` selects deterministic select choices, `--max-goroutines` limits scheduler growth, and `--max-steps` sets a positive instruction limit or `-1` for no limit.
 
 Generated files named `.gom.go` or `goml_generated.go` use the same standard-library source declarations as ordinary `.go` files. Their filenames do not select alternate type definitions. Native image builds sharing a cache key are serialized with a process lock; failed builds release the lock and remove their staging files.
 

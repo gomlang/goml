@@ -10,7 +10,7 @@ just all
 
 `just test` includes the same tests. `just ci` additionally checks the bootstrap fixed point, scripts, extension, and release packaging.
 
-Use the stage2 driver directly from the repository root:
+Starting at the repository root, enter the driver module to use stage2 directly:
 
 ```sh
 cd goml
@@ -19,7 +19,7 @@ cd goml
 ../stage2/bin/goml test \
   --compiler ../stage2/bin/gomlc \
   --jobs 4 \
-  --timeout 30s
+  --timeout 10m
 ```
 
 `goml test --nocapture` inherits test output, while `--timeout` accepts positive `ms`, `s`, or `m` durations. Compiler, linker, and Go build steps are skipped only when their compiler identity, arguments, inputs, and recorded output digests all match.
@@ -43,4 +43,4 @@ goml remove owner::module
 
 `update`, `add`, and `remove` accept `--local-registry <path>`. Registry state is stored under `$GOML_HOME/cache/registry`, defaulting to `~/.goml/cache/registry`.
 
-Driver tests live beside the CLI in `cmd/goml/cli_test.gom`. Their isolated workspaces are written below `_artifact/test-work`.
+CLI integration tests live in `cmd/goml/*_test.gom`, with shared helpers in `test_support/`; other packages also contain their own unit tests. Their isolated integration workspaces are written below `goml/_artifact/test-work` relative to the repository root.

@@ -29,13 +29,19 @@ just ci
 `just set-version` synchronizes `VERSION`, both GoML version modules, and the VS Code package and lockfile versions. Commit and push the change, then wait for main CI on that exact commit before creating the tag. Keep `release_version` set in the same shell:
 
 ```sh
-release_sha="$(git rev-parse HEAD)"
-git push origin main
-ci_run_id="$(gh run list --repo lijunchen/goml --workflow CI --branch main --commit "$release_sha" --event push --limit 1 --json databaseId --jq '.[0].databaseId')"
-gh run watch "$ci_run_id" --repo lijunchen/goml --exit-status
-git tag -a "v$release_version" -m "goml v$release_version"
-git push origin "v$release_version"
+(
+    set -eu
+    release_sha="$(git rev-parse HEAD)"
+    git push origin main
+    ci_run_id="$(gh run list --repo lijunchen/goml --workflow CI --branch main --commit "$release_sha" --event push --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+    test -n "$ci_run_id"
+    gh run watch "$ci_run_id" --repo lijunchen/goml --exit-status
+    git tag -a "v$release_version" -m "goml v$release_version"
+    git push origin "v$release_version"
+)
 ```
+
+The block stops before tagging if the push fails, the CI run is not registered yet, or CI fails. If the run is not yet visible, wait for it to appear and rerun the block.
 
 Main CI builds stage2 directly from the pinned stage0. Its checks cover compiler and driver tests, Go metadata and scripts, extension compilation, archive smoke tests, and the stage3 fixed point. Fixed-point verification compares the compiler and driver artifacts built by stage2 with a rebuild using stage3. The independent gomlgo suite runs separately. The Release workflow requires successful main CI for the tagged commit, verifies the version, previous release, and stage0, rebuilds stage2, and runs archive and LSP smoke tests before publishing.
 
@@ -55,8 +61,10 @@ goml-X.Y.Z-linux-amd64/
     │   ├── contract.gom
     │   ├── runtime.gom
     │   ├── impls.gom
+    │   ├── intrinsics.gom
     │   ├── language.gom
     │   ├── derive.gom
+    │   ├── ordering.gom
     │   └── numeric.gom
     ├── prelude/
     │   ├── goml.toml

@@ -21,7 +21,7 @@ GoML is statically typed and garbage-collected, with Rust-like syntax, monomorph
 
 ## Development
 
-Run recipes from the repository root. The toolchain build requires Linux amd64, Go 1.25+, `just`, Bash, curl, tar, and sha256sum. Full CI also uses Node 20+, npm, and jq. See [.justfile](.justfile) for all commands and [gomlgo's README](gomlgo/README.md) for its separate Go 1.26 requirements.
+Run recipes from the repository root. The toolchain build requires Linux amd64, Go 1.25+, `just`, Bash, curl, tar, and sha256sum. Tests require a C compiler for Go's race detector; full CI also uses Node 20+, npm, and jq. See [.justfile](.justfile) for all commands and [gomlgo's README](gomlgo/README.md) for its separate Go 1.26 requirements.
 
 ```sh
 just make
@@ -31,6 +31,8 @@ just clean
 ```
 
 `just make` incrementally builds stage2 directly from the pinned stage0. `just test` builds the tools and runs compiler, driver, and Go metadata tests; `just all` is an alias for it. `just ci` performs a clean stage2 build, fixed-point verification, tests, extension compilation, and release archive smoke checks. The independent gomlgo suite runs separately with `just gomlgo-test`.
+
+Local CI runs its check groups concurrently. Set `GOML_CI_SEQUENTIAL=1` to run them sequentially, `GOML_BUILD_JOBS` to limit bootstrap package workers, and `GOML_TEST_JOBS` to override compiler and driver test concurrency. Compiler fixtures may use Yaegi when it is available on `PATH`; they fall back to native Go compilation when it is unavailable or cannot run a fixture.
 
 The bootstrap downloads the checksum-pinned stage0 release recorded in [bootstrap/stage0.env](bootstrap/stage0.env). `just bootstrap` rebuilds stage2 from stage0, builds stage3 with stage2, then uses stage3 to rebuild the compiler and driver artifacts and compares them with the first stage3 build. Set `GOML_STAGE0_ARCHIVE` to a previously downloaded pinned archive to avoid downloading stage0.
 
