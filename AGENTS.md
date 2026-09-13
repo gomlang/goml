@@ -38,7 +38,7 @@ Run recipes from the repository root; [.justfile](.justfile) is the command refe
 | --- | --- |
 | `just make` | Incrementally build stage2 from pinned stage0 |
 | `just test` / `just all` | Build and run compiler, driver, and Go metadata tests |
-| `just ci` | Required full CI, including bootstrap fixed point and packaging |
+| `just ci` | Full CI, including bootstrap fixed point and packaging |
 | `just bootstrap` | Clean bootstrap and fixed-point verification |
 | `just verify-golden` / `just update-golden` | Verify / regenerate snapshots through self-hosted tests |
 | `just vscode-ext` | Build the LSP and compile the extension |
@@ -50,7 +50,8 @@ Run recipes from the repository root; [.justfile](.justfile) is the command refe
 - Run a focused fixture with `stage2/bin/gomlc run-single <file.gom>`. Add `--dump-ast`, `--dump-expanded-ast`, `--dump-hir`, `--dump-tast`, `--dump-ctir`, `--dump-core`, `--dump-mono`, `--dump-lift`, `--dump-anf`, or `--dump-go` to inspect lowering.
 - `goml check`, `goml build`, and `goml test` discover the enclosing `goml.toml` and operate on the complete module, without package targets. `--dry-run` prints planned commands.
 - The driver finds `gomlc` through `--compiler`, `GOMLC`, a sibling binary, `GOML_HOME/bin`, then `PATH`, and verifies the driver protocol.
-- Run relevant tests and `just ci` before reporting completion. Changes to `gomlgo/` also need its separate tests; consult its README for focused differential checks.
+- Run checks relevant to the change. Run `just ci` locally for changes affecting bootstrap compatibility, toolchain construction, or packaging, for release preparation, or when explicitly requested. Read-only reviews and documentation-only changes require only applicable checks.
+- Changes to `gomlgo/` behavior also need its separate tests; consult its README for focused differential checks. After checks pass, rerun or broaden them only when new changes, failures, or unresolved concerns warrant it.
 
 ## Coding and Architecture Rules
 
@@ -90,7 +91,7 @@ Run recipes from the repository root; [.justfile](.justfile) is the command refe
 ## Bootstrap and Language Evolution
 
 - `bootstrap/stage0.env` is the trust root: only published Linux amd64 Release archives with pinned SHA-256 checksums may become stage0. Never use unreleased workflow artifacts.
-- Current stage0 must compile the current compiler and driver sources. Every change must preserve this invariant and pass `just ci`.
+- Current stage0 must compile the current compiler and driver sources. Every change must preserve this invariant; use the Development Workflow above to select local checks.
 - Implement new syntax, builtins, standard-library APIs, traits, or type-system capabilities before using them in compiler or driver sources. Tests and fixtures may use them immediately; self-hosted consumers must wait until release and stage0 advancement.
 - Introduce standard-library capabilities in two phases: first ship public source, resource packaging, dependency selection, navigation, docs, and external tests while retaining compiler-owned fallbacks; after release and stage0 advancement, migrate consumers and remove fallbacks.
 - Incompatible syntax changes need a transition release accepting both forms. Advance stage0, migrate self-hosted sources, then remove the old form in a later release.
@@ -106,5 +107,5 @@ Run recipes from the repository root; [.justfile](.justfile) is the command refe
 - During early bootstrap, publish only continuous `0.1.x` patch releases until explicitly lifted. Otherwise use patch for compatible fixes, minor for features and pre-1.0 breaks, and major for post-1.0 breaks. Tags are strict `vX.Y.Z`, advancing one continuous SemVer step.
 - Follow [docs/releasing.md](docs/releasing.md): run `just set-version X.Y.Z` and `just ci`, push the release commit, wait for successful main CI on that exact commit, then tag and push it.
 - `just set-version` must synchronize `VERSION`, both GoML version modules, and the VS Code package and lockfile versions.
-- Main CI owns fixed-point verification and the complete test suite. Release CI requires successful main CI for the exact tagged commit, rebuilds stage2, and runs archive/LSP smoke tests without repeating the full suite.
+- Main CI must pass before merge or release and owns fixed-point verification and the complete test suite. Release CI requires successful main CI for the exact tagged commit, rebuilds stage2, and runs archive/LSP smoke tests without repeating the full suite.
 - After publication, take the archive checksum from `SHA256SUMS`, run `just set-bootstrap-stage0 X.Y.Z <sha256>` and `just bootstrap`, then commit `bootstrap/stage0.env` before relying on newly released capabilities.
