@@ -7,6 +7,8 @@ use module::hir;
 use module::parser;
 use module::tast;
 use std::collections;
+use std::env;
+use std::path;
 
 pub struct Analysis {
     pub source_path: string,
@@ -27,6 +29,10 @@ pub struct Analysis {
 }
 
 pub struct AnalysisContext {
+    discoveries: collections::IndexMap[string, CachedDiscovery],
+    packages: collections::IndexMap[string, CachedPackage],
+    stats: Ref[AnalysisStats],
+    foreign_helper: Result[string, string],
     builtin_files: Result[Vec[hir::File], string],
     prelude_files: Result[Vec[hir::File], string],
     builtin_derive: Result[Option[ctir::CtModule], string],
@@ -50,7 +56,18 @@ struct ProjectCheck {
 }
 
 pub fn analysis_context() -> AnalysisContext {
+    let helper = env::current_exe_structured().map_err(|error| error.to_string()).and_then(
+        |executable| path::parent(executable).ok_or("compiler has no executable directory"),
+    ).map(|directory| path::join(directory, "goml-go-meta"));
+    analysis_context_with_foreign_helper(helper)
+}
+
+pub fn analysis_context_with_foreign_helper(helper: Result[string, string]) -> AnalysisContext {
     AnalysisContext {
+        discoveries: collections::IndexMap::new(),
+        packages: collections::IndexMap::new(),
+        stats: Ref::new(AnalysisStats { checked_packages: Vec::new(), reused_packages: Vec::new() }),
+        foreign_helper: helper,
         builtin_files: builtin_hir_files(),
         prelude_files: prelude_hir_files(),
         builtin_derive: builtin_comptime_module(),
@@ -94,7 +111,10 @@ fn lower_package(
     let expanded_sources: Vec[(string, string)] = Vec::new();
     for file in value.files {
         let expanded = hir::expand_derives_with_environment(
-            ast::resolve_module_paths(ast::lower(parser::parse(file.source)), value.module_path),
+            ast::resolve_module_paths(
+                hir::expand_go_interfaces(ast::lower(parser::parse(file.source))),
+                value.module_path,
+            ),
             hir::DeriveEnvironment {
                 builtin: builtin_derive,
                 dependencies: derive_modules,
@@ -151,8 +171,13 @@ fn environments_with_comptime(
     files: Vec[hir::File],
     modules: Vec[ctir::CtModule],
     checked_dependencies: Vec[tast::File],
+    external: Vec[tast::ExternalTypeEnvironment],
 ) -> Result[Vec[tast::DependencyEnvironment], string] {
-    let environments = tast::dependency_environments_with_checked_files(files, checked_dependencies)?;
+    let environments = tast::dependency_environments_with_checked_external_files(
+        files,
+        checked_dependencies,
+        external,
+    )?;
     let attached_modules: collections::HashSet[string] = collections::HashSet::new();
     for index in 0..environments.len() {
         let module = Ref::new(Option::None);
@@ -178,12 +203,13 @@ fn environments_with_builtin_and_comptime(
     files: Vec[hir::File],
     modules: Vec[ctir::CtModule],
     checked_dependencies: Vec[tast::File],
+    external: Vec[tast::ExternalTypeEnvironment],
 ) -> Result[Vec[tast::DependencyEnvironment], string] {
     let result: Vec[tast::DependencyEnvironment] = Vec::new();
     if let Some(environment) = builtin {
         result.push(environment)
     }
-    for environment in environments_with_comptime(files, modules, checked_dependencies)? {
+    for environment in environments_with_comptime(files, modules, checked_dependencies, external)? {
         result.push(environment)
     }
     Result::Ok(result)
@@ -260,6 +286,10 @@ fn collect_dependency(
     builtin_derive: Option[ctir::CtModule],
     derive_modules: Vec[ctir::CtModule],
     derive_reexports: Vec[(string, string)],
+    external: Vec[tast::ExternalTypeEnvironment],
+    foreign: QueryForeignContext,
+    context: AnalysisContext,
+    revisions: collections::IndexMap[string, PackageRevision],
 ) -> () {
     if !visited.insert(package_name) {} else {
         match dependency_sources(module_root, module_path, package_name, overrides) {
@@ -274,12 +304,7 @@ fn collect_dependency(
                     package_name,
                     files: sources,
                 };
-                let discovery = lower_package(
-                    project,
-                    builtin_derive,
-                    derive_modules,
-                    derive_reexports,
-                );
+                let discovery = discover_cached_package(context, project, builtin_derive);
                 for file in discovery.files {
                     for import in file.import_aliases {
                         collect_dependency(
@@ -297,23 +322,21 @@ fn collect_dependency(
                             builtin_derive,
                             derive_modules,
                             derive_reexports,
+                            external,
+                            foreign,
+                            context,
+                            revisions,
                         )
                     }
                 }
-                let lowered = lower_package(
-                    project,
-                    builtin_derive,
-                    derive_modules,
-                    derive_reexports,
-                );
-                for diagnostic in lowered.diagnostics {
-                    diagnostics.push(diagnostic)
-                }
+                let revision = package_revision(project, discovery, revisions);
+                let selected = selected_dependency_files(dependencies, revision);
                 let environments = match environments_with_builtin_and_comptime(
                     builtin_environment,
-                    dependencies,
+                    selected,
                     derive_modules,
                     checked_dependencies,
+                    external,
                 ) {
                     Ok(value) => value,
                     Err(error) => {
@@ -323,10 +346,29 @@ fn collect_dependency(
                         Vec::new()
                     },
                 };
-                let checked = tast::check_package_files_for_link_with_environments(
-                    lowered.files,
+                let (lowered, checked) = check_cached_package(
+                    context,
+                    project,
+                    revision,
+                    builtin_derive,
+                    derive_modules,
+                    derive_reexports,
                     environments,
+                    external,
+                    foreign,
                 );
+                let _ = revisions.insert(
+                    package_name,
+                    PackageRevision {
+                        cacheable: revision.cacheable
+                            && !tast::diagnostics_have_errors(lowered.diagnostics)
+                            && !tast::diagnostics_have_errors(checked.diagnostics),
+                        ..revision,
+                    },
+                );
+                for diagnostic in lowered.diagnostics {
+                    diagnostics.push(diagnostic)
+                }
                 if package_has_comptime(lowered.files)
                     && !tast::diagnostics_have_errors(checked.diagnostics) {
                     derive_modules.push(checked.comptime)
@@ -365,6 +407,10 @@ fn append_navigation_sources(
 }
 
 fn check_project(value: Project, overrides: Vec[SourceOverride], context: AnalysisContext) -> ProjectCheck {
+    context.stats.set(AnalysisStats { checked_packages: Vec::new(), reused_packages: Vec::new() });
+    let revisions: collections::IndexMap[string, PackageRevision] = collections::IndexMap::new();
+    let external: Vec[tast::ExternalTypeEnvironment] = Vec::new();
+    let foreign = query_foreign_context(context.foreign_helper, value.module_root);
     let all_sources: Vec[SourceFile] = Vec::new();
     for file in value.files {
         all_sources.push(file)
@@ -403,7 +449,7 @@ fn check_project(value: Project, overrides: Vec[SourceOverride], context: Analys
         },
     };
     let derive_reexports: Vec[(string, string)] = Vec::new();
-    let discovery = lower_package(value, builtin_derive, Vec::new(), derive_reexports);
+    let discovery = discover_cached_package(context, value, builtin_derive);
     let visited: collections::HashSet[string] = collections::HashSet::new();
     let derive_modules: Vec[ctir::CtModule] = Vec::new();
     let _ = visited.insert(discovery.name);
@@ -426,10 +472,37 @@ fn check_project(value: Project, overrides: Vec[SourceOverride], context: Analys
                 builtin_derive,
                 derive_modules,
                 derive_reexports,
+                external,
+                foreign,
+                context,
+                revisions,
             )
         }
     }
-    let entry = lower_package(value, builtin_derive, derive_modules, derive_reexports);
+    let revision = package_revision(value, discovery, revisions);
+    let dependency_environments = environments_with_builtin_and_comptime(
+        builtin_environment,
+        dependencies,
+        derive_modules,
+        checked_dependencies,
+        external,
+    ).unwrap_or_else(
+        |error| {
+            diagnostics.push(query_diagnostic(value.files[0].path, "builtin", error, Option::None));
+            Vec::new()
+        },
+    );
+    let (entry, entry_checked) = check_cached_package(
+        context,
+        value,
+        revision,
+        builtin_derive,
+        derive_modules,
+        derive_reexports,
+        dependency_environments,
+        external,
+        foreign,
+    );
     for diagnostic in entry.diagnostics {
         diagnostics.push(diagnostic)
     }
@@ -445,6 +518,7 @@ fn check_project(value: Project, overrides: Vec[SourceOverride], context: Analys
         environment_files,
         derive_modules,
         checked_dependencies,
+        external,
     ) {
         Ok(values) => values,
         Err(error) => {
@@ -452,29 +526,7 @@ fn check_project(value: Project, overrides: Vec[SourceOverride], context: Analys
             Vec::new()
         },
     };
-    let dependency_environments = match environments_with_builtin_and_comptime(
-        builtin_environment,
-        dependencies,
-        derive_modules,
-        checked_dependencies,
-    ) {
-        Ok(values) => values,
-        Err(error) => {
-            diagnostics.push(query_diagnostic(value.files[0].path, "builtin", error, Option::None));
-            Vec::new()
-        },
-    };
-    let checked = if !entry.files.is_empty() {
-        tast::check_package_files_for_link_with_environments(entry.files, dependency_environments)
-    } else {
-        tast::CheckResult {
-            tast: Option::None,
-            comptime: ctir::empty_module(entry.name),
-            pending_constants: Vec::new(),
-            diagnostics: Vec::new(),
-            typeck_results: tast::empty_typeck_results(),
-        }
-    };
+    let checked = entry_checked;
     for diagnostic in diagnostics {
         checked.diagnostics.push(diagnostic)
     }

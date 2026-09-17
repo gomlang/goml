@@ -4,7 +4,7 @@ The extension provides syntax highlighting, diagnostics, hover, completion, go-t
 
 The status bar shows whether the language server is starting, ready, stopped, or busy. While it is busy, it shows the current server operation and elapsed time. Hover over the status item to see queued client requests, or click it to open the language server output. Operations taking at least two seconds are recorded there as warnings.
 
-Diagnostics run after editing pauses, while completion reuses the latest checked types immediately. Saving requests diagnostics without waiting for the edit delay.
+Diagnostics run after editing pauses, while completion reuses the latest checked types immediately. Saving requests diagnostics without waiting for the edit delay. Package checks reuse unchanged dependencies across edits. External Go types and concrete generic instances use the bundled `goml-go-meta` helper; an installed Go toolchain is required for these checks. Changes to Go sources and module files invalidate analysis alongside GoML changes.
 
 From the repository root, build the self-hosted language server and extension:
 
@@ -18,7 +18,7 @@ Use **GoML: Show Expanded Derive** to inspect the current document's AST after d
 
 Use **Format Document** to format the current GoML buffer. The language server uses GoML's fixed formatting rules and leaves syntactically invalid documents unchanged.
 
-The bundled server is built for the host platform. A custom server needs its complete executable-relative toolchain resources. See the [language guide](../../docs/goml.md#lsp-and-editor) and [formatting rules](../../docs/formatting.md) for details.
+The bundled server is built for the host platform. A custom server needs its complete executable-relative toolchain resources and an adjacent `goml-go-meta` helper for external Go type checks. See the [language guide](../../docs/goml.md#lsp-and-editor) and [formatting rules](../../docs/formatting.md) for details.
 
 Configuration:
 

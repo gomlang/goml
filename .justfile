@@ -137,6 +137,7 @@ _ci-vscode:
     find editors/vscode/bin -mindepth 1 -type f -delete
     find editors/vscode/bin -mindepth 1 -depth -type d -empty -delete
     cp stage2/bin/gomllsp editors/vscode/bin/gomllsp
+    cp stage2/bin/goml-go-meta editors/vscode/bin/goml-go-meta
     bash tools/lib/install.sh editors/vscode
     cd editors/vscode && npm install
     cd editors/vscode && npm run compile
@@ -166,6 +167,7 @@ vscode-ext: make-tools
     find editors/vscode/bin -mindepth 1 -type f -delete
     find editors/vscode/bin -mindepth 1 -depth -type d -empty -delete
     cp stage2/bin/gomllsp editors/vscode/bin/gomllsp
+    cp stage2/bin/goml-go-meta editors/vscode/bin/goml-go-meta
     bash tools/lib/install.sh editors/vscode
     cd editors/vscode && npm install
     cd editors/vscode && npm run compile

@@ -153,7 +153,7 @@ export function activate(context: ExtensionContext) {
     const clientOptions: LanguageClientOptions = {
         documentSelector: [{ scheme: 'file', language: 'goml' }],
         synchronize: {
-            fileEvents: workspace.createFileSystemWatcher('**/*.{gom,toml}'),
+            fileEvents: workspace.createFileSystemWatcher('**/*.{gom,toml,go,mod,sum}'),
         },
         outputChannelName: 'GoML Language Server',
         middleware: status.middleware,

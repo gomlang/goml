@@ -1,0 +1,168 @@
+package query;
+
+use module::ctir;
+use module::ffi;
+use module::hir;
+use module::tast;
+use std::path;
+
+struct QueryForeignContext {
+    helper: Result[string, string],
+    directory: string,
+    build: Ref[Option[Result[ffi::GoBuildContext, string]]],
+}
+
+fn query_foreign_context(helper: Result[string, string], directory: string) -> QueryForeignContext {
+    QueryForeignContext { helper, directory, build: Ref::new(Option::None) }
+}
+
+fn query_go_context(value: QueryForeignContext) -> Result[ffi::GoBuildContext, string] {
+    if let Some(cached) = value.build.get() {
+        return cached
+    }
+    let result = path::absolute_structured(value.directory).map_err(|error| error.to_string()).and_then(
+        |directory| ffi::resolve_foreign_build_context("go", directory),
+    );
+    value.build.set(Option::Some(result));
+    result
+}
+
+fn query_go_caller(context: ffi::GoBuildContext) -> ffi::CallerContext {
+    ffi::CallerContext {
+        generated_source: Option::None,
+        load_mode: "files",
+        import_path: "command-line-arguments",
+        directory: context.module_dir,
+        package_name: "main",
+    }
+}
+
+fn query_external_types(files: Vec[hir::File], foreign: QueryForeignContext) -> Result[
+    tast::ExternalTypeEnvironment,
+    string,
+] {
+    let requests = tast::external_type_requests(files)?;
+    let queries = Vec::new();
+    for request in requests {
+        queries.push(request.query)
+    }
+    let metadata = if queries.is_empty() {
+        ffi::TypeDeclarations {
+            go_world_identity: "",
+            declarations: Vec::new(),
+            nodes: HashMap::new(),
+        }
+    } else {
+        let context = query_go_context(foreign)?;
+        ffi::run_foreign_type_declarations(
+            foreign.helper?,
+            context,
+            query_go_caller(context),
+            queries,
+        )?
+    };
+    tast::resolve_external_type_environment(requests, metadata)
+}
+
+fn validate_query_external_applications(
+    external: Vec[tast::ExternalTypeEnvironment],
+    foreign: QueryForeignContext,
+    checked: tast::CheckResult,
+) -> () {
+    for environment in external {
+        for value in environment.types {
+            let result = tast::external_application_queries(value.query, value.applications).and_then(
+                |queries| {
+                    if queries.is_empty() {
+                        return Result::Ok(())
+                    }
+                    let context = query_go_context(foreign)?;
+                    let _ = ffi::run_foreign_type_instances(
+                        foreign.helper?,
+                        context,
+                        query_go_caller(context),
+                        queries,
+                        Option::None,
+                    )?;
+                    Result::Ok(())
+                },
+            );
+            if let Err(error) = result {
+                let application = if value.applications.is_empty() {
+                    Option::None
+                } else {
+                    Option::Some(value.applications[value.applications.len() - 1])
+                };
+                checked.diagnostics.push(
+                    query_diagnostic(
+                        application.map(|value| value.source_path).unwrap_or(value.source_path),
+                        "ffi",
+                        error,
+                        Option::Some(
+                            application.and_then(|value| value.span).unwrap_or(
+                                value.declaration.name_span,
+                            ),
+                        ),
+                    ),
+                )
+            }
+        }
+    }
+}
+
+fn check_query_package(
+    files: Vec[hir::File],
+    environments: Vec[tast::DependencyEnvironment],
+    external: Vec[tast::ExternalTypeEnvironment],
+    foreign: QueryForeignContext,
+) -> tast::CheckResult {
+    if files.is_empty() {
+        return tast::CheckResult {
+            tast: Option::None,
+            comptime: ctir::empty_module(""),
+            pending_constants: Vec::new(),
+            diagnostics: Vec::new(),
+            typeck_results: tast::empty_typeck_results(),
+        }
+    }
+    let resolved = match query_external_types(files, foreign) {
+        Ok(value) => value,
+        Err(error) => {
+            let checked = failed_check(files[0].source_path, "ffi", error);
+            if let Ok(requests) = tast::external_type_requests(files) {
+                if !requests.is_empty() {
+                    let mut request = requests[0];
+                    for candidate in requests {
+                        if error.contains(candidate.query.type_id + ":") {
+                            request = candidate;
+                            break
+                        }
+                    }
+                    checked.diagnostics.set(
+                        0,
+                        query_diagnostic(
+                            request.source_path,
+                            "ffi",
+                            error,
+                            Option::Some(request.declaration.name_span),
+                        ),
+                    );
+                }
+            }
+            return checked
+        },
+    };
+    external.push(resolved);
+    let checked = match tast::check_package_files_for_link_with_external_types(
+        files,
+        environments,
+        resolved,
+    ) {
+        Ok(value) => value,
+        Err(error) => return failed_check(files[0].source_path, "ffi", error),
+    };
+    if !tast::diagnostics_have_errors(checked.diagnostics) {
+        validate_query_external_applications(external, foreign, checked)
+    }
+    checked
+}

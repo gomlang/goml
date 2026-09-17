@@ -1,0 +1,170 @@
+package query;
+
+use module::ctir;
+use module::hash;
+use module::hir;
+use module::tast;
+use std::collections;
+use std::text;
+
+struct CachedDiscovery {
+    fingerprint: string,
+    lowered: LoweredPackage,
+}
+
+struct CachedPackage {
+    fingerprint: string,
+    lowered: LoweredPackage,
+    checked: tast::CheckResult,
+}
+
+struct PackageRevision {
+    fingerprint: string,
+    dependencies: Vec[string],
+    cacheable: bool,
+}
+
+pub struct AnalysisStats {
+    pub checked_packages: Vec[string],
+    pub reused_packages: Vec[string],
+}
+
+pub fn analysis_stats(context: AnalysisContext) -> AnalysisStats {
+    context.stats.get()
+}
+
+pub fn clear_analysis_cache(context: AnalysisContext) -> () {
+    context.discoveries.clear();
+    context.packages.clear()
+}
+
+fn package_cache_key(project: Project) -> string {
+    project.module_root + "\n" + project.package_name
+}
+
+fn package_source_fingerprint(project: Project) -> string {
+    let value = text::StringBuilder::new();
+    value.write_string(project.module_path + "\n" + project.package_name + "\n");
+    for file in project.files {
+        value.write_string(file.path.byte_len().to_string() + ":" + file.path);
+        value.write_string(file.source.byte_len().to_string() + ":" + file.source)
+    }
+    hash::sha256_hex(value.finish())
+}
+
+fn discover_cached_package(
+    context: AnalysisContext,
+    project: Project,
+    builtin: Option[ctir::CtModule],
+) -> LoweredPackage {
+    let key = package_cache_key(project);
+    let fingerprint = package_source_fingerprint(project);
+    if let Some(cached) = context.discoveries.get(key) {
+        if cached.fingerprint == fingerprint {
+            return cached.lowered
+        }
+    }
+    let lowered = lower_package(project, builtin, Vec::new(), Vec::new());
+    if context.discoveries.len() >= 256 {
+        context.discoveries.clear()
+    }
+    let _ = context.discoveries.insert(key, CachedDiscovery { fingerprint, lowered });
+    lowered
+}
+
+fn package_revision(
+    project: Project,
+    discovery: LoweredPackage,
+    revisions: collections::IndexMap[string, PackageRevision],
+) -> PackageRevision {
+    let value = text::StringBuilder::new();
+    value.write_string(package_source_fingerprint(project));
+    let dependencies: collections::IndexSet[string] = collections::IndexSet::new();
+    let mut cacheable = true;
+    for file in discovery.files {
+        for item in file.items {
+            if let hir::Item::ExternType(_) = item {
+                cacheable = false;
+            }
+        }
+        for import in file.import_aliases {
+            if dependencies.insert(import.package_name) {
+                if let Some(revision) = revisions.get(import.package_name) {
+                    value.write_string(import.package_name + ":" + revision.fingerprint);
+                    cacheable = cacheable && revision.cacheable;
+                    for name in revision.dependencies {
+                        let _ = dependencies.insert(name);
+                    }
+                } else if import.package_name != "builtin" && import.package_name != "prelude" {
+                    cacheable = false;
+                }
+            }
+        }
+    }
+    PackageRevision {
+        fingerprint: hash::sha256_hex(value.finish()),
+        dependencies: dependencies.to_vec(),
+        cacheable,
+    }
+}
+
+fn selected_dependency_files(files: Vec[hir::File], revision: PackageRevision) -> Vec[hir::File] {
+    let result = Vec::new();
+    for file in files {
+        if file.package_name == "prelude" || revision.dependencies.contains(file.package_name) {
+            result.push(file)
+        }
+    }
+    result
+}
+
+fn copied_check_result(value: tast::CheckResult) -> tast::CheckResult {
+    let diagnostics = Vec::new();
+    for diagnostic in value.diagnostics {
+        diagnostics.push(diagnostic)
+    }
+    tast::CheckResult { diagnostics, ..value }
+}
+
+fn check_cached_package(
+    context: AnalysisContext,
+    project: Project,
+    revision: PackageRevision,
+    builtin: Option[ctir::CtModule],
+    modules: Vec[ctir::CtModule],
+    reexports: Vec[(string, string)],
+    environments: Vec[tast::DependencyEnvironment],
+    external: Vec[tast::ExternalTypeEnvironment],
+    foreign: QueryForeignContext,
+) -> (LoweredPackage, tast::CheckResult) {
+    let key = package_cache_key(project);
+    if revision.cacheable {
+        if let Some(cached) = context.packages.get(key) {
+            if cached.fingerprint == revision.fingerprint {
+                context.stats.get().reused_packages.push(project.package_name);
+                return (cached.lowered, copied_check_result(cached.checked))
+            }
+        }
+    }
+    context.stats.get().checked_packages.push(project.package_name);
+    let lowered = lower_package(project, builtin, modules, reexports);
+    let checked = check_query_package(lowered.files, environments, external, foreign);
+    if revision.cacheable && lowered.diagnostics.is_empty()
+        && !tast::diagnostics_have_errors(checked.diagnostics) {
+        if context.packages.len() >= 256 {
+            context.packages.clear()
+        }
+        let _ = context.packages.insert(
+            key,
+            CachedPackage {
+                fingerprint: revision.fingerprint,
+                lowered,
+                checked: copied_check_result(checked),
+            },
+        );
+    } else {
+        let _ = context.packages.remove(key);
+    }
+    let result = (lowered, checked);
+    result
+}
