@@ -1,0 +1,144 @@
+package query;
+
+use module::tast;
+use std::env;
+use std::fs;
+use std::path;
+use std::testing;
+
+fn foreign_test_context() -> AnalysisContext {
+    let compiler = env::var_structured("GOML_TEST_GOMLC").unwrap_or("../stage2/bin/gomlc");
+    let helper = path::absolute_structured(compiler).map_err(|error| error.to_string()).and_then(
+        |compiler| path::parent(compiler).ok_or("compiler has no directory"),
+    ).map(|directory| path::join(directory, "goml-go-meta"));
+    analysis_context_with_foreign_helper(helper)
+}
+
+fn foreign_query_fixture(root: string) -> () {
+    for directory in Vec::from_array([root, root + "/native", root + "/bindings", root + "/client"]) {
+        if let Err(error) = fs::create_dir_all(directory) {
+            testing::fail(error.to_string())
+        }
+    }
+    write_query_fixture(root + "/goml.toml", "[module]\npath = \"example::query\"\n");
+    write_query_fixture(root + "/go.mod", "module example.com/query\n\ngo 1.25\n");
+    write_query_fixture(
+        root + "/native/types.go",
+        "package native\ntype Named int64\ntype Alias = int64\ntype Box[T ~int64] struct { Value T }\ntype Erased[T ~int64] = int64\n",
+    );
+    write_query_fixture(
+        root + "/bindings/types.gom",
+        "package bindings; #[go_type(\"example.com/query/native\", \"Named\")] pub extern type Named; #[go_type(\"example.com/query/native\", \"Alias\")] pub extern type Alias; #[go_type(\"example.com/query/native\", \"Box\")] pub extern type Box[T]; #[go_type(\"example.com/query/native\", \"Erased\")] pub extern type Erased[T]; pub fn echo(value: Named) -> Named { value }",
+    );
+}
+
+fn assert_foreign_query_error(analysis: Analysis, expected: string) -> () {
+    for diagnostic in diagnostics(analysis) {
+        if diagnostic.message.contains(expected) {
+            testing::assert(diagnostic.source_path != "");
+            return
+        }
+    }
+    testing::fail("expected query diagnostic: " + expected)
+}
+
+#[test]
+fn query_checks_external_types_across_packages_and_unsaved_sources() -> () {
+    let root = "/tmp/goml-query-external-types";
+    foreign_query_fixture(root);
+    let context = foreign_test_context();
+    let file = root + "/client/main.gom";
+    let source = "package client; use module::bindings; pub fn echo(value: bindings::Named) -> bindings::Named { bindings::echo(value) } pub fn alias(value: bindings::Alias) -> i64 { value } pub fn box(value: bindings::Box[i64]) -> bindings::Box[i64] { value }";
+    write_query_fixture(file, source);
+    let analysis = analyze_with_context(context, file, source, Vec::new());
+    assert_no_diagnostics(analysis);
+    if let Some(offset) = last_substring(source, "Named") {
+        let definitions = goto_definitions(analysis, offset);
+        testing::assert_eq(definitions.len(), 1);
+        testing::assert_eq(definitions[0].source_path, root + "/bindings/types.gom");
+        testing::assert(hover(analysis, offset).is_some());
+        testing::assert(has_completion(completions(analysis, offset), "Named"));
+    } else {
+        testing::fail("missing external type reference")
+    }
+    let bad = "package client; use module::bindings; pub fn bad(value: bindings::Named) -> i64 { value }";
+    testing::assert(
+        tast::diagnostics_have_errors(
+            diagnostics(analyze_with_context(context, file, bad, Vec::new())),
+        ),
+    );
+    let changed = "package bindings; #[go_type(\"example.com/query/native\", \"Alias\")] pub extern type Named;";
+    assert_no_diagnostics(
+        analyze_with_context(
+            context,
+            file,
+            bad,
+            Vec::from_array(
+                [SourceOverride { path: root + "/bindings/types.gom", source: changed }],
+            ),
+        ),
+    );
+    assert_no_diagnostics(analyze_with_context(context, file, source, Vec::new()));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn query_validates_external_generic_constraints_including_erased_aliases() -> () {
+    let root = "/tmp/goml-query-external-constraints";
+    foreign_query_fixture(root);
+    let context = foreign_test_context();
+    let file = root + "/client/main.gom";
+    for name in Vec::from_array(["Box", "Erased"]) {
+        let valid = "package client; use module::bindings; pub fn accept(value: Option[bindings::"
+            + name
+            + "[i64]]) -> () {}";
+        assert_no_diagnostics(analyze_with_context(context, file, valid, Vec::new()));
+        let invalid = "package client; use module::bindings; pub fn accept(value: Option[bindings::"
+            + name
+            + "[bool]]) -> () {}";
+        let analysis = analyze_with_context(context, file, invalid, Vec::new());
+        testing::assert(tast::diagnostics_have_errors(diagnostics(analysis)));
+        let symbolic = "package client; use module::bindings; pub fn accept[T](value: bindings::"
+            + name
+            + "[T]) -> () {}";
+        assert_foreign_query_error(
+            analyze_with_context(context, file, symbolic, Vec::new()),
+            "requires specialization",
+        );
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn query_recovers_external_metadata_errors_and_rechecks_native_changes() -> () {
+    let root = "/tmp/goml-query-external-recovery";
+    foreign_query_fixture(root);
+    let file = root + "/client/main.gom";
+    let context = foreign_test_context();
+    let missing = "package client; #[go_type(\"example.com/query/native\", \"Missing\")] extern type Missing;";
+    assert_foreign_query_error(analyze_with_context(context, file, missing, Vec::new()), "Missing");
+    let source = "package client; #[go_type(\"example.com/query/native\", \"Alias\")] extern type Alias; pub fn accept(value: Alias) -> i64 { value }";
+    assert_no_diagnostics(analyze_with_context(context, file, source, Vec::new()));
+    write_query_fixture(root + "/native/types.go", "package native\ntype Alias = bool\n");
+    testing::assert(
+        tast::diagnostics_have_errors(
+            diagnostics(analyze_with_context(context, file, source, Vec::new())),
+        ),
+    );
+    let unavailable = analysis_context_with_foreign_helper(
+        Result::Err("ffi-tool-unavailable: test helper unavailable"),
+    );
+    assert_foreign_query_error(
+        analyze_with_context(unavailable, file, source, Vec::new()),
+        "ffi-tool-unavailable",
+    );
+    assert_no_diagnostics(
+        analyze_with_context(
+            unavailable,
+            file,
+            "package client; pub fn value() -> i64 { 1 }",
+            Vec::new(),
+        ),
+    );
+    let _ = fs::remove_dir_all(root);
+}

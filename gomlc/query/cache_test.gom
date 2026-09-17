@@ -1,0 +1,142 @@
+package query;
+
+use module::tast;
+use std::fs;
+use std::testing;
+use std::time;
+
+fn cache_query_fixture(root: string) -> string {
+    for name in Vec::from_array(["leaf", "left", "right", "client"]) {
+        if let Err(error) = fs::create_dir_all(root + "/" + name) {
+            testing::fail(error.to_string())
+        }
+    }
+    write_query_fixture(root + "/goml.toml", "[module]\npath = \"example::cache\"\n");
+    write_query_fixture(root + "/leaf/value.gom", "package leaf; pub fn value() -> i64 { 1 }");
+    write_query_fixture(
+        root + "/left/value.gom",
+        "package left; use module::leaf; pub fn value() -> i64 { leaf::value() }",
+    );
+    write_query_fixture(root + "/right/value.gom", "package right; pub fn value() -> i64 { 2 }");
+    let source = "package client; use module::left; use module::right; pub fn value() -> i64 { left::value() + right::value() }";
+    write_query_fixture(root + "/client/main.gom", source);
+    source
+}
+
+fn assert_query_counts(context: AnalysisContext, checked: isize, reused: isize) -> () {
+    let stats = analysis_stats(context);
+    testing::assert_eq(stats.checked_packages.len(), checked);
+    testing::assert_eq(stats.reused_packages.len(), reused)
+}
+
+#[test]
+fn query_cache_rechecks_only_changed_packages_and_their_dependents() -> () {
+    let root = "/tmp/goml-query-cache-dependencies";
+    let source = cache_query_fixture(root);
+    let file = root + "/client/main.gom";
+    let context = analysis_context();
+    assert_no_diagnostics(analyze_with_context(context, file, source, Vec::new()));
+    assert_query_counts(context, 4, 0);
+    assert_no_diagnostics(analyze_with_context(context, file, source, Vec::new()));
+    assert_query_counts(context, 0, 4);
+    let edited = source + " pub fn extra() -> bool { true }";
+    assert_no_diagnostics(analyze_with_context(context, file, edited, Vec::new()));
+    assert_query_counts(context, 1, 3);
+    let overrides = Vec::from_array(
+        [
+            SourceOverride {
+                path: root + "/leaf/value.gom",
+                source: "package leaf; pub fn value() -> i64 { 3 }",
+            },
+        ],
+    );
+    assert_no_diagnostics(analyze_with_context(context, file, edited, overrides));
+    assert_query_counts(context, 3, 1);
+    testing::assert(analysis_stats(context).reused_packages.contains("example::cache::right"));
+    let changed = Vec::from_array(
+        [
+            SourceOverride {
+                path: root + "/leaf/value.gom",
+                source: "package leaf; pub fn value() -> bool { true }",
+            },
+        ],
+    );
+    testing::assert(
+        tast::diagnostics_have_errors(
+            diagnostics(analyze_with_context(context, file, edited, changed)),
+        ),
+    );
+    testing::assert(analysis_stats(context).reused_packages.contains("example::cache::right"));
+    assert_no_diagnostics(analyze_with_context(context, file, edited, Vec::new()));
+    assert_no_diagnostics(analyze_with_context(context, file, edited, Vec::new()));
+    assert_query_counts(context, 0, 4);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn query_cache_tracks_source_membership_and_dependency_failures() -> () {
+    let root = "/tmp/goml-query-cache-membership";
+    let source = cache_query_fixture(root);
+    let file = root + "/client/main.gom";
+    let context = analysis_context();
+    assert_no_diagnostics(analyze_with_context(context, file, source, Vec::new()));
+    let extra = root + "/leaf/extra.gom";
+    let override_files = Vec::from_array(
+        [SourceOverride { path: extra, source: "package leaf; pub fn value() -> i64 { 4 }" }],
+    );
+    testing::assert(
+        tast::diagnostics_have_errors(
+            diagnostics(analyze_with_context(context, file, source, override_files)),
+        ),
+    );
+    assert_no_diagnostics(analyze_with_context(context, file, source, Vec::new()));
+    let _ = fs::remove_file(root + "/leaf/value.gom");
+    testing::assert(
+        tast::diagnostics_have_errors(
+            diagnostics(analyze_with_context(context, file, source, Vec::new())),
+        ),
+    );
+    write_query_fixture(root + "/leaf/value.gom", "package leaf; pub fn value() -> i64 { 1 }");
+    assert_no_diagnostics(analyze_with_context(context, file, source, Vec::new()));
+    clear_analysis_cache(context);
+    assert_no_diagnostics(analyze_with_context(context, file, source, Vec::new()));
+    assert_query_counts(context, 4, 0);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn query_cache_measures_cold_body_and_signature_edits() -> () {
+    let root = "/tmp/goml-query-cache-measurements";
+    let source = cache_query_fixture(root);
+    let file = root + "/client/main.gom";
+    let context = analysis_context();
+    let cold = time::Instant::now();
+    assert_no_diagnostics(analyze_with_context(context, file, source, Vec::new()));
+    let cold_time = cold.elapsed().as_milliseconds();
+    let body = "package client; use module::left; use module::right; pub fn value() -> i64 { left::value() + right::value() + 3 }";
+    let start = time::Instant::now();
+    assert_no_diagnostics(analyze_with_context(context, file, body, Vec::new()));
+    let body_time = start.elapsed().as_milliseconds();
+    assert_query_counts(context, 1, 3);
+    let signature = Vec::from_array(
+        [
+            SourceOverride {
+                path: root + "/left/value.gom",
+                source: "package left; use module::leaf; pub fn value() -> bool { leaf::value() == 1 }",
+            },
+        ],
+    );
+    let start = time::Instant::now();
+    let checked = analyze_with_context(context, file, body, signature);
+    let signature_time = start.elapsed().as_milliseconds();
+    testing::assert(tast::diagnostics_have_errors(diagnostics(checked)));
+    assert_query_counts(context, 2, 2);
+    println(
+        "query cache: cold=" + cold_time.to_string() + "ms (4 checked), body="
+            + body_time.to_string()
+            + "ms (1 checked), signature="
+            + signature_time.to_string()
+            + "ms (2 checked)",
+    );
+    let _ = fs::remove_dir_all(root);
+}

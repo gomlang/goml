@@ -1,0 +1,207 @@
+package query;
+
+use module::artifact::interface_codec;
+use module::tast;
+use std::env;
+use std::fs;
+use std::path;
+use std::process;
+use std::testing;
+use std::utf8;
+use utf8::BytesUtf8;
+
+fn parity_cli_check(
+    root: string,
+    package_name: string,
+    file: string,
+    output: string,
+    dependencies: Vec[string],
+) -> Result[process::Output, string] {
+    let compiler = path::absolute_structured(
+        env::var_structured("GOML_TEST_GOMLC").unwrap_or("../stage2/bin/gomlc"),
+    ).map_err(|error| error.to_string())?;
+    let args = Vec::from_array(
+        [
+            "check",
+            "--module",
+            "example::query",
+            "--package",
+            package_name,
+            "--input",
+            file,
+            "--output",
+            output,
+            "--ffi-check",
+            "off",
+            "--context",
+            root + "/unused-context.json",
+            "--caller-mode",
+            "files",
+            "--caller-import-path",
+            "command-line-arguments",
+            "--caller-package",
+            "main",
+            "--caller-directory",
+            root,
+        ],
+    );
+    for dependency in dependencies {
+        args.push("--interface-path");
+        args.push(dependency)
+    }
+    process::Command::new(compiler).args(args).current_dir(root).output_structured().map_err(
+        |error| error.to_string(),
+    )
+}
+
+fn assert_parity_success(output: process::Output) -> () {
+    if !output.status().success() {
+        testing::fail(output.stderr().to_string_utf8().unwrap_or("invalid compiler output"))
+    }
+}
+
+fn assert_query_artifact_signatures(analysis: Analysis, file: string) -> Result[(), string] {
+    let unit = interface_codec::decode_binary(
+        fs::read_bytes_structured(file).map_err(|error| error.to_string())?,
+    )?;
+    let typed = analysis.checked.tast.ok_or("query produced no typed file")?;
+    let mut compared = 0;
+    for item in typed.items {
+        if let tast::Item::Function(function) = item {
+            if function.name.contains("shape_") {
+                let params = Vec::new();
+                for parameter in function.params {
+                    params.push(parameter.1)
+                }
+                let expected = tast::Type::Func { params, ret_ty: function.ret_ty };
+                let mut found = false;
+                for exported in unit.exports.functions {
+                    if exported.name == function.name {
+                        testing::assert(tast::types_equal(expected, exported.ty));
+                        found = true;
+                    }
+                }
+                testing::assert(found);
+                compared += 1;
+            }
+        }
+    }
+    testing::assert_eq(compared, 6);
+    Result::Ok(())
+}
+
+fn parity_shapes(prefix: string) -> Vec[string] {
+    Vec::from_array(
+        [
+            prefix + "Named",
+            "Option[" + prefix + "Named]",
+            "(" + prefix + "Named, bool)",
+            "(" + prefix + "Named) -> " + prefix + "Named",
+            "Option[" + prefix + "Box[i64]]",
+            "dyn " + prefix + "Source[Item = " + prefix + "Named]",
+        ],
+    )
+}
+
+fn exercise_query_cli_type_combinations(root: string) -> Result[(), string] {
+    foreign_query_fixture(root);
+    fs::create_dir_all(root + "/single").map_err(|error| error.to_string())?;
+    let declarations = "#[go_type(\"example.com/query/native\", \"Named\")] pub extern type Named; #[go_type(\"example.com/query/native\", \"Box\")] pub extern type Box[T]; pub trait Source { type Item; fn value(self: Self) -> Self::Item; } pub fn identity[T](value: T) -> T { value }";
+    let bindings_file = root + "/bindings/types.gom";
+    write_query_fixture(bindings_file, "package bindings; " + declarations);
+    let bindings_output = root + "/bindings-api";
+    assert_parity_success(
+        parity_cli_check(
+            root,
+            "example::query::bindings",
+            bindings_file,
+            bindings_output,
+            Vec::new(),
+        )?,
+    );
+    let context = foreign_test_context();
+    for cross_package in Vec::from_array([false, true]) {
+        let directory = if cross_package {
+            "client"
+        } else {
+            "single"
+        };
+        let prefix = if cross_package {
+            "bindings::"
+        } else {
+            ""
+        };
+        let mut source = "package " + directory + "; "
+            + if cross_package {
+                "use module::bindings; "
+            } else {
+                declarations
+            };
+        let shapes = parity_shapes(prefix);
+        for index in 0..shapes.len() {
+            let ty = shapes[index];
+            source = source + " pub fn shape_" + index.to_string() + "(value: " + ty + ") -> " + ty
+                + " { let apply: ("
+                + ty
+                + ") -> "
+                + ty
+                + " = |item| "
+                + prefix
+                + "identity(item); apply(value) }";
+        }
+        let file = root + "/" + directory + "/main.gom";
+        let output = root + "/" + directory + "-api";
+        let dependencies = if cross_package {
+            Vec::from_array([bindings_output + ".interface"])
+        } else {
+            Vec::new()
+        };
+        write_query_fixture(file, source);
+        let analysis = analyze_with_context(context, file, source, Vec::new());
+        assert_no_diagnostics(analysis);
+        assert_parity_success(
+            parity_cli_check(root, "example::query::" + directory, file, output, dependencies)?,
+        );
+        assert_query_artifact_signatures(analysis, output + ".interface")?;
+        for invalid in Vec::from_array(
+            [
+                "pub fn bad(value: " + prefix + "Named) -> i64 { value }",
+                "pub fn bad(value: Option[" + prefix + "Box[bool]]) -> () {}",
+                "pub fn bad[T](value: " + prefix + "Box[T]) -> () {}",
+            ],
+        ) {
+            let source = "package " + directory + "; "
+                + if cross_package {
+                    "use module::bindings; "
+                } else {
+                    declarations
+                }
+                + invalid;
+            write_query_fixture(file, source);
+            testing::assert(
+                tast::diagnostics_have_errors(
+                    diagnostics(analyze_with_context(context, file, source, Vec::new())),
+                ),
+            );
+            let result = parity_cli_check(
+                root,
+                "example::query::" + directory,
+                file,
+                output,
+                dependencies,
+            )?;
+            testing::assert(!result.status().success());
+        }
+    }
+    Result::Ok(())
+}
+
+#[test]
+fn query_cli_and_artifacts_agree_on_bounded_type_combinations() -> () {
+    let root = "/tmp/goml-query-cli-type-combinations";
+    let result = exercise_query_cli_type_combinations(root);
+    let _ = fs::remove_dir_all(root);
+    if let Err(error) = result {
+        testing::fail(error)
+    }
+}
