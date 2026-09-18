@@ -1,0 +1,201 @@
+package main;
+
+use std::fs;
+use std::fs::notify;
+use std::io;
+use std::path;
+use std::os::linux::syscall;
+use std::os::linux::syscall::{Arg};
+use std::task;
+use std::testing;
+use std::time;
+use std::utf8;
+
+#[go_ffi("os", "Getpid")]
+extern fn getpid() -> isize;
+
+fn ok(value: Result[(), fs::Error]) -> () {
+    match value {
+        Ok(()) => (),
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+fn read(watcher: notify::Watcher) -> Vec[notify::Event] {
+    match watcher.read(time::Duration::from_seconds(2)) {
+        Ok(events) => events,
+        Err(error) => {
+            testing::fail(error.to_string());
+            Vec::new()
+        },
+    }
+}
+
+fn find(events: Vec[notify::Event], name: string, mask: u32) -> notify::Event {
+    for event in events {
+        if event.path == name && event.has(mask) {
+            return event;
+        }
+    }
+    testing::fail("missing event for " + name + " mask " + mask.to_string());
+    notify::Event { path: "", mask: 0, cookie: 0, rescan: false }
+}
+
+fn replace_directory(from: string, to: string) -> () {
+    let source = utf8::encode(from);
+    source.push(0);
+    let destination = utf8::encode(to);
+    destination.push(0);
+    let result = testing::expect_ok(
+        syscall::syscall6_with_buffers(
+            82,
+            [
+                Arg::Buffer(source.as_mut_slice()),
+                Arg::Buffer(destination.as_mut_slice()),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+            ],
+        ),
+        "rename syscall",
+    );
+    testing::assert_eq(result.errno, 0);
+}
+
+fn expect_change(watcher: notify::Watcher, file: string) -> () {
+    ok(fs::write_file_structured(file, "changed"));
+    let events = read(watcher);
+    let _ = find(events, file, notify::CREATE);
+    let _ = find(events, file, notify::MODIFY);
+}
+
+fn main() -> () {
+    let base = "/tmp/goml-notify-" + getpid().to_string() + "-"
+        + time::SystemTime::now().unix_nanoseconds().to_string();
+    ok(fs::create_dir(base));
+    defer ok(fs::remove_dir_all(base));
+    let root = path::join(base, "root");
+    let outside = path::join(base, "outside");
+    ok(fs::create_dir_all(path::join(root, "existing/nested")));
+    ok(fs::create_dir_all(path::join(outside, "nested")));
+    ok(fs::symbolic_link(outside, path::join(root, "link")));
+    let watcher = testing::expect_ok(notify::watch_recursive(root), "recursive watch");
+    defer ok(watcher.close());
+    testing::assert_eq(testing::expect_ok(watcher.try_read(), "empty read").len(), 0);
+    expect_change(watcher, path::join(root, "existing/nested/first"));
+    ok(fs::write_file_structured(path::join(outside, "nested/unwatched"), "outside"));
+    testing::assert_eq(testing::expect_ok(watcher.try_read(), "skip symlink").len(), 0);
+    ok(fs::create_dir_all(path::join(root, "new/deep")));
+    let created = find(read(watcher), path::join(root, "new"), notify::CREATE);
+    testing::assert(created.is_dir() && created.rescan);
+    expect_change(watcher, path::join(root, "new/deep/second"));
+    ok(fs::rename(path::join(root, "new"), path::join(root, "renamed")));
+    ok(fs::write_file_structured(path::join(root, "renamed/deep/queued"), "after rename"));
+    let renamed = read(watcher);
+    let from = find(renamed, path::join(root, "new"), notify::MOVED_FROM);
+    let to = find(renamed, path::join(root, "renamed"), notify::MOVED_TO);
+    testing::assert(from.cookie != 0 && from.cookie == to.cookie);
+    testing::assert(to.rescan);
+    let _ = find(renamed, path::join(root, "renamed/deep/queued"), notify::CREATE);
+    expect_change(watcher, path::join(root, "renamed/deep/third"));
+    ok(fs::rename(outside, path::join(root, "incoming")));
+    testing::assert(find(read(watcher), path::join(root, "incoming"), notify::MOVED_TO).rescan);
+    expect_change(watcher, path::join(root, "incoming/nested/fourth"));
+    let outgoing = path::join(base, "outgoing");
+    ok(fs::rename(path::join(root, "incoming"), outgoing));
+    let _ = find(read(watcher), path::join(root, "incoming"), notify::MOVED_FROM);
+    ok(fs::write_file_structured(path::join(outgoing, "nested/ignored"), "outside"));
+    testing::assert_eq(
+        testing::expect_ok(watcher.read(time::Duration::from_milliseconds(150)), "move out").len(),
+        0,
+    );
+    ok(fs::write_file_structured(path::join(outgoing, "nested/ignored-later"), "outside"));
+    testing::assert_eq(testing::expect_ok(watcher.try_read(), "removed subtree").len(), 0);
+    ok(fs::remove_dir_all(path::join(root, "existing")));
+    let _ = find(read(watcher), path::join(root, "existing"), notify::DELETE);
+    expect_change(watcher, path::join(root, "still-alive"));
+    testing::assert_eq(
+        testing::expect_ok(watcher.read(time::Duration::from_milliseconds(5)), "timeout").len(),
+        0,
+    );
+    ok(fs::rename(path::join(root, "renamed"), outgoing + "-quick"));
+    ok(fs::rename(outgoing + "-quick", path::join(root, "returned")));
+    testing::assert(find(read(watcher), path::join(root, "returned"), notify::MOVED_TO).rescan);
+    expect_change(watcher, path::join(root, "returned/deep/return-file"));
+    ok(fs::create_dir(path::join(root, "replacement")));
+    let _ = read(watcher);
+    replace_directory(path::join(root, "returned"), path::join(root, "replacement"));
+    let _ = find(read(watcher), path::join(root, "replacement"), notify::MOVED_TO);
+    expect_change(watcher, path::join(root, "replacement/deep/replaced-file"));
+    for index in 0..1200 {
+        ok(fs::write_file_structured(path::join(root, "burst-" + index.to_string()), "data"));
+    }
+    let seen: HashMap[string, bool] = HashMap::new();
+    while seen.len() < 1200 {
+        let events = read(watcher);
+        testing::assert(events.len() > 0);
+        for event in events {
+            testing::assert(!event.has(notify::Q_OVERFLOW));
+            if event.has(notify::CREATE) && event.path.starts_with(path::join(root, "burst-")) {
+                seen.set(event.path, true);
+            }
+        }
+    }
+    let _ = testing::expect_ok(watcher.try_read(), "finish batch");
+    let flat = testing::expect_ok(notify::watch(root), "flat watch");
+    expect_change(flat, path::join(root, "flat"));
+    ok(fs::write_file_structured(path::join(root, "replacement/deep/flat-ignored"), "nested"));
+    testing::assert_eq(testing::expect_ok(flat.try_read(), "flat ignores descendants").len(), 0);
+    ok(flat.close());
+    ok(flat.close());
+    testing::assert_eq(
+        testing::expect_err(flat.try_read(), "closed watcher").kind(),
+        io::ErrorKind::InvalidInput,
+    );
+    testing::assert_eq(
+        testing::expect_err(notify::watch(path::join(root, "missing")), "missing root").kind(),
+        io::ErrorKind::NotFound,
+    );
+    testing::assert_eq(
+        testing::expect_err(
+            notify::watch(root + testing::expect_ok(utf8::decode(b"\0"), "NUL string") + "ignored"),
+            "NUL path",
+        ).kind(),
+        io::ErrorKind::InvalidInput,
+    );
+    let file = testing::expect_ok(notify::watch(path::join(root, "flat")), "file watch");
+    ok(file.close());
+    testing::assert_err(notify::watch_recursive(path::join(root, "link")));
+    let concurrent = testing::expect_ok(notify::watch(root), "concurrent watch");
+    task::scope(
+        |scope: task::Scope| {
+            let ready: Channel[()] = Channel::new(1);
+            let waiting = scope.spawn(
+                |_: task::CancelToken| {
+                    ready.send(());
+                    concurrent.read(time::Duration::from_seconds(5))
+                },
+            );
+            let _ = ready.recv();
+            ok(concurrent.close());
+            testing::assert_err(waiting.join());
+            ok(concurrent.close());
+        },
+    );
+    let dying = path::join(base, "dying");
+    ok(fs::create_dir(dying));
+    let terminal = testing::expect_ok(notify::watch_recursive(dying), "terminal watch");
+    ok(fs::rename(dying, path::join(base, "moved-root")));
+    let _ = find(read(terminal), dying, notify::MOVE_SELF);
+    testing::assert_err(terminal.try_read());
+    ok(terminal.close());
+    ok(fs::create_dir(dying));
+    let deleted = testing::expect_ok(notify::watch(dying), "deleted root watch");
+    ok(fs::remove_dir_all(dying));
+    let _ = find(read(deleted), dying, notify::DELETE_SELF);
+    testing::assert_err(deleted.try_read());
+    ok(deleted.close());
+    advanced(path::join(base, "advanced"));
+    println("recursive filesystem notification: ok");
+}

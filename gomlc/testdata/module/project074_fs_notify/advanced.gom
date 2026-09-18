@@ -1,0 +1,117 @@
+package main;
+
+use std::fs;
+use std::fs::notify;
+use std::io;
+use std::task;
+use std::testing;
+use std::time;
+
+fn advanced(root: string) -> () {
+    ok(fs::create_dir_all(root + "/nested"));
+    let set = notify::WatchSet::new();
+    let recursive = testing::expect_ok(set.add_recursive(root), "add recursive");
+    let direct = testing::expect_ok(
+        set.add_with(root + "/nested", notify::Options::new().with_mask(notify::MODIFY)),
+        "add filtered",
+    );
+    testing::assert(recursive != direct && recursive.value() != 0);
+    let infos = testing::expect_ok(set.watches(), "watch list");
+    testing::assert_eq(infos.len(), 2);
+    testing::assert_err(set.add_with(root, notify::Options::new().with_mask(notify::Q_OVERFLOW)));
+    task::scope(
+        |scope: task::Scope| {
+            let subscription = testing::expect_ok(set.subscribe(scope, 1), "subscribe to set");
+            ok(fs::write_file_structured(root + "/nested/file", "data"));
+            let first = Ref::new(false);
+            let second = Ref::new(false);
+            while !first.get() || !second.get() {
+                let batch = select {
+                    recv(subscription.events()) as batch => testing::expect_some(
+                        batch,
+                        "subscription batch",
+                    ),
+                    recv(time::after(time::Duration::from_seconds(3))) as _ => Result::Err(
+                        fs::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "test subscription",
+                            Option::None,
+                            Option::None,
+                            "timed out",
+                        ),
+                    ),
+                };
+                for notice in testing::expect_ok(batch, "set notices") {
+                    match notice {
+                        notify::Notice::Event(id, event) => {
+                            if event.path == root + "/nested/file" && event.has(notify::MODIFY) {
+                                if id == recursive {
+                                    first.set(true);
+                                }
+                                if id == direct {
+                                    second.set(true);
+                                }
+                            }
+                        },
+                        notify::Notice::Error(_, error) => testing::fail(error.to_string()),
+                        notify::Notice::Removed(_) => testing::fail("unexpected removal"),
+                    }
+                }
+            }
+            testing::assert(testing::expect_ok(set.remove(direct), "remove overlapping watch"));
+            testing::assert_eq(testing::expect_ok(set.watches(), "remaining watches").len(), 1);
+            testing::expect_ok(subscription.close(), "close subscription");
+            testing::expect_ok(subscription.close(), "repeat close");
+        },
+    );
+    testing::assert(set.is_closed());
+    testing::assert_err(set.add(root));
+    ok(set.close());
+    let file = testing::expect_ok(notify::watch(root + "/nested/file"), "watch file");
+    defer ok(file.close());
+    task::scope(
+        |scope: task::Scope| {
+            scope.cancel();
+            match testing::expect_ok(
+                file.read_with(scope.token(), time::Duration::from_seconds(1)),
+                "cancelled read",
+            ) {
+                task::WaitResult::Cancelled => (),
+                task::WaitResult::Completed(_) => testing::fail("read did not cancel"),
+            }
+        },
+    );
+    testing::assert(!file.is_closed());
+    ok(fs::write_file_structured(root + "/nested/file", "changed"));
+    let _ = find(read(file), root + "/nested/file", notify::MODIFY);
+    single_subscription(root);
+}
+
+fn single_subscription(root: string) -> () {
+    let watcher = testing::expect_ok(notify::watch(root), "single stream watcher");
+    task::scope(
+        |scope: task::Scope| {
+            let stream = testing::expect_ok(watcher.subscribe(scope, 1), "single stream");
+            ok(fs::write_file_structured(root + "/streamed", "data"));
+            let batch = select {
+                recv(stream.events()) as value => testing::expect_some(value, "single stream batch"),
+                recv(time::after(time::Duration::from_seconds(3))) as _ => Result::Err(
+                    fs::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "test subscription",
+                        Option::None,
+                        Option::None,
+                        "timed out",
+                    ),
+                ),
+            };
+            let _ = find(
+                testing::expect_ok(batch, "single stream events"),
+                root + "/streamed",
+                notify::CREATE,
+            );
+            ok(stream.close());
+        },
+    );
+    testing::assert(watcher.is_closed());
+}
