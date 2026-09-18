@@ -1,0 +1,251 @@
+package notify;
+
+use module::bytes::endian;
+use module::fs;
+use module::io;
+use module::os::linux::syscall;
+use module::os::linux::syscall::{Arg};
+use module::utf8;
+
+struct RawEvent {
+    wd: i32,
+    mask: u32,
+    cookie: u32,
+    name: string,
+}
+
+fn zeroes(size: isize) -> Vec[byte] {
+    let result = Vec::new();
+    for _ in 0..size {
+        result.push(0);
+    }
+    result
+}
+
+fn os_error(operation: string, name: Option[string], errno: usize) -> fs::Error {
+    let kind = match errno {
+        2 => io::ErrorKind::NotFound,
+        1 | 13 => io::ErrorKind::PermissionDenied,
+        4 => io::ErrorKind::Interrupted,
+        11 => io::ErrorKind::WouldBlock,
+        17 => io::ErrorKind::AlreadyExists,
+        9 | 20 | 22 | 40 => io::ErrorKind::InvalidInput,
+        38 => io::ErrorKind::Unsupported,
+        _ => io::ErrorKind::Other,
+    };
+    fs::Error::new(
+        kind,
+        operation,
+        name,
+        Option::Some(errno.to_isize()),
+        "errno " + errno.to_string(),
+    )
+}
+
+fn supported(result: Result[syscall::SyscallResult, syscall::Error]) -> Result[
+    syscall::SyscallResult,
+    fs::Error,
+] {
+    result.map_err(|value| error(io::ErrorKind::Unsupported, value.to_string()))
+}
+
+fn checked(result: syscall::SyscallResult, operation: string, name: Option[string]) -> Result[
+    usize,
+    fs::Error,
+] {
+    if result.is_ok() {
+        Result::Ok(result.r1)
+    } else {
+        Result::Err(os_error(operation, name, result.errno))
+    }
+}
+
+fn init() -> Result[usize, fs::Error] {
+    checked(
+        supported(syscall::syscall6(syscall::SYS_INOTIFY_INIT1, [0x80800, 0, 0, 0, 0, 0]))?,
+        "inotify_init1",
+        Option::None,
+    )
+}
+
+fn close_fd(fd: usize) -> Result[(), fs::Error] {
+    checked(
+        supported(syscall::syscall6(syscall::SYS_CLOSE, [fd, 0, 0, 0, 0, 0]))?,
+        "close",
+        Option::None,
+    )?;
+    Result::Ok(())
+}
+
+fn validate_path(value: string) -> Result[(), fs::Error] {
+    let bytes = utf8::encode(value);
+    if value == "" || bytes.contains(0) {
+        return Result::Err(
+            error(io::ErrorKind::InvalidInput, "path must be nonempty and contain no NUL bytes"),
+        );
+    }
+    utf8::decode(bytes).map_err(|value| error(io::ErrorKind::InvalidData, value.to_string()))?;
+    Result::Ok(())
+}
+
+fn add_watch(fd: usize, directory: string, requested: u32, only_directory: bool) -> Result[
+    i32,
+    fs::Error,
+] {
+    validate_path(directory)?;
+    let name = utf8::encode(directory);
+    name.push(0);
+    if !only_directory && fs::symlink_metadata(directory)?.file_type().is_symlink() {
+        return Result::Err(
+            fs::Error::new(
+                io::ErrorKind::InvalidInput,
+                "inotify_add_watch",
+                Option::Some(directory),
+                Option::None,
+                "symbolic link roots are unsupported",
+            ),
+        );
+    }
+    let mask = requested | MOVED_FROM | MOVED_TO | CREATE | DELETE | DELETE_SELF | MOVE_SELF
+        | 0x02000000
+        | if only_directory {
+            0x01000000
+        } else {
+            0
+        };
+    let result = supported(
+        syscall::syscall6_with_buffers(
+            syscall::SYS_INOTIFY_ADD_WATCH,
+            [
+                Arg::Word(fd),
+                Arg::Buffer(name.as_mut_slice()),
+                Arg::Word(mask.to_usize()),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+            ],
+        ),
+    )?;
+    Result::Ok(checked(result, "inotify_add_watch", Option::Some(directory))?.to_i32())
+}
+
+fn remove_watch(fd: usize, wd: i32) -> Result[(), fs::Error] {
+    let result = supported(
+        syscall::syscall6(syscall::SYS_INOTIFY_RM_WATCH, [fd, wd.to_usize(), 0, 0, 0, 0]),
+    )?;
+    if result.errno != syscall::EINVAL {
+        checked(result, "inotify_rm_watch", Option::None)?;
+    }
+    Result::Ok(())
+}
+
+fn poll(state: State, milliseconds: usize) -> Result[(), fs::Error] {
+    let fd = state.fd.get().ok_or(closed())?;
+    poll_fds(Vec::from_array([fd]), milliseconds)
+}
+
+fn poll_fds(fds: Vec[usize], milliseconds: usize) -> Result[(), fs::Error] {
+    let data = zeroes(fds.len() * 8);
+    for index in 0..fds.len() {
+        endian::write_i32(
+            data.as_mut_slice(),
+            index * 8,
+            fds[index].to_i32(),
+            endian::Endian::Little,
+        ).map_err(|value| error(io::ErrorKind::InvalidData, value.to_string()))?;
+        data[index * 8 + 4] = 1;
+    }
+    let result = supported(
+        syscall::syscall6_with_buffers(
+            syscall::SYS_POLL,
+            [
+                Arg::Buffer(data.as_mut_slice()),
+                Arg::Word(fds.len().to_usize()),
+                Arg::Word(milliseconds),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+            ],
+        ),
+    )?;
+    if result.errno != syscall::EINTR {
+        checked(result, "poll", Option::None)?;
+    }
+    for index in 0..fds.len() {
+        if data[index * 8 + 6] & 0x38 != 0 {
+            return Result::Err(
+                error(io::ErrorKind::Other, "inotify descriptor failed while polling"),
+            );
+        }
+    }
+    Result::Ok(())
+}
+
+fn read_kernel(state: State) -> Result[Vec[RawEvent], fs::Error] {
+    let fd = state.fd.get().ok_or(closed())?;
+    loop {
+        let result = supported(
+            syscall::syscall6_with_buffers(
+                syscall::SYS_READ,
+                [
+                    Arg::Word(fd),
+                    Arg::Buffer(state.buffer.as_mut_slice()),
+                    Arg::Word(state.buffer.len().to_usize()),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                ],
+            ),
+        )?;
+        if result.errno == syscall::EINTR {
+            continue;
+        }
+        if result.errno == syscall::EAGAIN {
+            return Result::Ok(Vec::new());
+        }
+        let count = checked(result, "read inotify", Option::None)?.to_isize();
+        if count == 0 {
+            return Result::Err(
+                error(io::ErrorKind::UnexpectedEof, "inotify returned end of stream"),
+            );
+        }
+        return decode(state.buffer.slice(0, count));
+    }
+}
+
+fn read_word(data: Slice[byte], offset: isize) -> Result[u32, fs::Error] {
+    endian::read_u32(data, offset, endian::Endian::Little).map_err(
+        |value| error(io::ErrorKind::InvalidData, value.to_string()),
+    )
+}
+
+fn decode(data: Slice[byte]) -> Result[Vec[RawEvent], fs::Error] {
+    let result = Vec::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        let wd = read_word(data, offset)?.to_i32();
+        let mask = read_word(data, offset + 4)?;
+        let cookie = read_word(data, offset + 8)?;
+        let length = read_word(data, offset + 12)?.to_isize();
+        offset += 16;
+        if length > data.len() - offset {
+            return Result::Err(error(io::ErrorKind::InvalidData, "truncated inotify event name"));
+        }
+        let mut end = offset;
+        while end < offset + length && data[end] != 0 {
+            end += 1;
+        }
+        if length > 0 && end == offset + length {
+            return Result::Err(error(io::ErrorKind::InvalidData, "unterminated inotify event name"));
+        }
+        let name = utf8::decode_slice(data.sub(offset, end)).map_err(
+            |value| error(io::ErrorKind::InvalidData, value.to_string()),
+        )?;
+        if name.contains("/") || name == "." || name == ".." {
+            return Result::Err(error(io::ErrorKind::InvalidData, "invalid inotify event name"));
+        }
+        result.push(RawEvent { wd, mask, cookie, name });
+        offset += length;
+    }
+    Result::Ok(result)
+}

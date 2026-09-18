@@ -1,0 +1,195 @@
+package notify;
+
+use module::fs;
+use module::io;
+use module::path;
+use module::time;
+use module::task;
+
+pub struct Event {
+    pub path: string,
+    pub mask: u32,
+    pub cookie: u32,
+    pub rescan: bool,
+}
+
+impl Event {
+    pub fn has(self: Event, mask: u32) -> bool {
+        self.mask & mask != 0
+    }
+
+    pub fn is_dir(self: Event) -> bool {
+        self.has(IS_DIR)
+    }
+}
+
+pub struct Watcher {
+    state: Channel[State],
+    stop: Channel[()],
+}
+
+pub fn watch(path: string) -> Result[Watcher, fs::Error] {
+    watch_with(path, Options::new())
+}
+
+pub fn watch_recursive(path: string) -> Result[Watcher, fs::Error] {
+    watch_with(path, Options::new().with_recursive(true))
+}
+
+pub fn watch_with(root: string, options: Options) -> Result[Watcher, fs::Error] {
+    let state = open_state(root, options)?;
+    let lock = Channel::new(1);
+    lock.send(state);
+    Result::Ok(Watcher { state: lock, stop: Channel::new(0) })
+}
+
+fn open_state(root: string, options: Options) -> Result[State, fs::Error] {
+    validate_options(options)?;
+    validate_path(root)?;
+    let fd = init()?;
+    let absolute = match path::absolute_structured(root) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = close_fd(fd);
+            return Result::Err(
+                fs::Error::new(
+                    error.kind(),
+                    "watch",
+                    Option::Some(root),
+                    error.raw_os_code(),
+                    error.message(),
+                ),
+            );
+        },
+    };
+    let state = State {
+        fd: Ref::new(Option::Some(fd)),
+        root: absolute,
+        recursive: options.recursive,
+        options,
+        watches: HashMap::new(),
+        moves: HashMap::new(),
+        buffer: zeroes(65536),
+        rescan: Ref::new(false),
+        close_requested: Ref::new(false),
+    };
+    if let Err(error) = add_tree(state, absolute, true) {
+        let _ = close_state(state);
+        return Result::Err(error);
+    }
+    Result::Ok(state)
+}
+
+impl Watcher {
+    pub fn try_read(self: Watcher) -> Result[Vec[Event], fs::Error] {
+        let state = self.state.recv().ok_or(closed())?;
+        defer self.state.send(state);
+        match read_batch(state) {
+            Ok(events) => Result::Ok(events),
+            Err(error) => {
+                let _ = close_state(state);
+                Result::Err(error)
+            },
+        }
+    }
+
+    pub fn read(self: Watcher, timeout: time::Duration) -> Result[Vec[Event], fs::Error] {
+        let start = time::Instant::now();
+        loop {
+            let events = self.try_read()?;
+            if events.len() > 0 {
+                return Result::Ok(events);
+            }
+            let remaining = timeout.saturating_subtract(start.elapsed());
+            if remaining.is_zero() {
+                return Result::Ok(events);
+            }
+            let milliseconds = if remaining.as_nanoseconds() >= 50000000 {
+                50
+            } else {
+                (remaining.as_nanoseconds() + 999999) / 1000000
+            };
+            self.wait(milliseconds.to_usize())?;
+        }
+    }
+
+    fn wait(self: Watcher, milliseconds: usize) -> Result[(), fs::Error] {
+        let state = self.state.recv().ok_or(closed())?;
+        defer self.state.send(state);
+        match poll(state, milliseconds) {
+            Ok(()) => Result::Ok(()),
+            Err(error) => {
+                let _ = close_state(state);
+                Result::Err(error)
+            },
+        }
+    }
+
+    pub fn read_with(self: Watcher, cancel: task::CancelToken, timeout: time::Duration) -> Result[
+        task::WaitResult[Vec[Event]],
+        fs::Error,
+    ] {
+        let started = time::Instant::now();
+        loop {
+            if cancel.is_cancelled() {
+                return Result::Ok(task::WaitResult::Cancelled);
+            }
+            let remaining = timeout.saturating_subtract(started.elapsed());
+            let interval = if remaining.as_milliseconds() > 50 {
+                time::Duration::from_milliseconds(50)
+            } else {
+                remaining
+            };
+            let events = self.read(interval)?;
+            if events.len() > 0 || started.elapsed().compare(timeout) >= 0 {
+                return Result::Ok(task::WaitResult::Completed(events));
+            }
+        }
+    }
+
+    pub fn is_closed(self: Watcher) -> bool {
+        match self.state.recv() {
+            Some(state) => {
+                let result = state.fd.get().is_none();
+                self.state.send(state);
+                result
+            },
+            None => true,
+        }
+    }
+
+    pub fn subscribe(self: Watcher, scope: task::Scope, capacity: isize) -> Result[
+        Subscription[Event],
+        fs::Error,
+    ] {
+        if self.is_closed() {
+            return Result::Err(closed());
+        }
+        subscribe_source(
+            scope,
+            capacity,
+            || self.read(time::Duration::from_milliseconds(50)),
+            || self.close(),
+            || self.is_closed(),
+            self.stop.receiver(),
+        )
+    }
+
+    pub fn close(self: Watcher) -> Result[(), fs::Error] {
+        let state = self.state.recv().ok_or(closed())?;
+        defer self.state.send(state);
+        if !state.close_requested.get() {
+            state.close_requested.set(true);
+            self.stop.close();
+        }
+        close_state(state)
+    }
+}
+
+fn closed() -> fs::Error {
+    error(io::ErrorKind::InvalidInput, "watcher is closed")
+}
+
+fn error(kind: io::ErrorKind, message: string) -> fs::Error {
+    fs::Error::new(kind, "filesystem notification", Option::None, Option::None, message)
+}

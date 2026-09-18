@@ -1,0 +1,259 @@
+package notify;
+
+use module::fs;
+use module::io;
+use module::task;
+use module::time;
+
+pub struct WatchId {
+    value: u64,
+}
+
+impl PartialEq for WatchId {
+    fn eq(self: WatchId, other: WatchId) -> bool {
+        self.value == other.value
+    }
+}
+
+impl Eq for WatchId {}
+
+impl Hash for WatchId {
+    fn hash(self: WatchId) -> u64 {
+        self.value.hash()
+    }
+}
+
+impl Debug for WatchId {
+    fn debug(self: WatchId) -> string {
+        "WatchId(" + self.value.to_string() + ")"
+    }
+}
+
+impl WatchId {
+    pub fn value(self: WatchId) -> u64 {
+        self.value
+    }
+}
+
+pub struct WatchInfo {
+    pub id: WatchId,
+    pub path: string,
+    pub options: Options,
+}
+
+pub enum Notice {
+    Event(WatchId, Event),
+    Error(WatchId, fs::Error),
+    Removed(WatchId),
+}
+
+struct Registration {
+    info: WatchInfo,
+    state: State,
+}
+
+struct SetState {
+    closed: Ref[bool],
+    next: Ref[u64],
+    registrations: HashMap[WatchId, Registration],
+}
+
+pub struct WatchSet {
+    state: Channel[SetState],
+    stop: Channel[()],
+}
+
+impl WatchSet {
+    pub fn new() -> WatchSet {
+        let state = Channel::new(1);
+        state.send(
+            SetState { closed: Ref::new(false), next: Ref::new(1), registrations: HashMap::new() },
+        );
+        WatchSet { state, stop: Channel::new(0) }
+    }
+
+    pub fn add(self: WatchSet, path: string) -> Result[WatchId, fs::Error] {
+        self.add_with(path, Options::new())
+    }
+
+    pub fn add_recursive(self: WatchSet, path: string) -> Result[WatchId, fs::Error] {
+        self.add_with(path, Options::new().with_recursive(true))
+    }
+
+    pub fn add_with(self: WatchSet, path: string, options: Options) -> Result[WatchId, fs::Error] {
+        let state = self.state.recv().ok_or(closed())?;
+        defer self.state.send(state);
+        require_set_open(state)?;
+        if state.next.get() == 0 {
+            return Result::Err(error(io::ErrorKind::Other, "watch identifiers exhausted"));
+        }
+        let root = open_state(path, options)?;
+        let id = WatchId { value: state.next.get() };
+        state.next.set(id.value + 1);
+        let info = WatchInfo { id, path: root.root, options };
+        state.registrations.set(id, Registration { info, state: root });
+        Result::Ok(id)
+    }
+
+    pub fn remove(self: WatchSet, id: WatchId) -> Result[bool, fs::Error] {
+        let state = self.state.recv().ok_or(closed())?;
+        defer self.state.send(state);
+        require_set_open(state)?;
+        match state.registrations.remove_value(id) {
+            Some(value) => {
+                close_state(value.state)?;
+                Result::Ok(true)
+            },
+            None => Result::Ok(false),
+        }
+    }
+
+    pub fn watches(self: WatchSet) -> Result[Vec[WatchInfo], fs::Error] {
+        let state = self.state.recv().ok_or(closed())?;
+        defer self.state.send(state);
+        require_set_open(state)?;
+        let result = Vec::new();
+        for (_, registration) in state.registrations.entries() {
+            result.push(registration.info);
+        }
+        Result::Ok(result)
+    }
+
+    pub fn try_read(self: WatchSet) -> Result[Vec[Notice], fs::Error] {
+        let state = self.state.recv().ok_or(closed())?;
+        defer self.state.send(state);
+        require_set_open(state)?;
+        let result = Vec::new();
+        for (id, registration) in state.registrations.entries() {
+            match read_batch(registration.state) {
+                Ok(events) => {
+                    for event in events {
+                        result.push(Notice::Event(id, event));
+                    }
+                },
+                Err(error) => {
+                    result.push(Notice::Error(id, error));
+                    let _ = close_state(registration.state);
+                },
+            }
+            if registration.state.fd.get().is_none() {
+                state.registrations.remove(id);
+                result.push(Notice::Removed(id));
+            }
+        }
+        Result::Ok(result)
+    }
+
+    pub fn read(self: WatchSet, timeout: time::Duration) -> Result[Vec[Notice], fs::Error] {
+        let start = time::Instant::now();
+        loop {
+            let events = self.try_read()?;
+            if !events.is_empty() {
+                return Result::Ok(events);
+            }
+            let remaining = timeout.saturating_subtract(start.elapsed());
+            if remaining.is_zero() {
+                return Result::Ok(events);
+            }
+            let milliseconds = if remaining.as_nanoseconds() >= 50000000 {
+                50
+            } else {
+                (remaining.as_nanoseconds() + 999999) / 1000000
+            };
+            self.wait(milliseconds.to_usize())?;
+        }
+    }
+
+    pub fn read_with(self: WatchSet, cancel: task::CancelToken, timeout: time::Duration) -> Result[
+        task::WaitResult[Vec[Notice]],
+        fs::Error,
+    ] {
+        let started = time::Instant::now();
+        loop {
+            if cancel.is_cancelled() {
+                return Result::Ok(task::WaitResult::Cancelled);
+            }
+            let remaining = timeout.saturating_subtract(started.elapsed());
+            let interval = if remaining.as_milliseconds() > 50 {
+                time::Duration::from_milliseconds(50)
+            } else {
+                remaining
+            };
+            let events = self.read(interval)?;
+            if !events.is_empty() || started.elapsed().compare(timeout) >= 0 {
+                return Result::Ok(task::WaitResult::Completed(events));
+            }
+        }
+    }
+
+    fn wait(self: WatchSet, milliseconds: usize) -> Result[(), fs::Error] {
+        let state = self.state.recv().ok_or(closed())?;
+        defer self.state.send(state);
+        require_set_open(state)?;
+        let fds = Vec::new();
+        for (_, registration) in state.registrations.entries() {
+            if let Some(fd) = registration.state.fd.get() {
+                fds.push(fd);
+            }
+        }
+        poll_fds(fds, milliseconds)
+    }
+
+    pub fn is_closed(self: WatchSet) -> bool {
+        match self.state.recv() {
+            Some(state) => {
+                let result = state.closed.get();
+                self.state.send(state);
+                result
+            },
+            None => true,
+        }
+    }
+
+    pub fn subscribe(self: WatchSet, scope: task::Scope, capacity: isize) -> Result[
+        Subscription[Notice],
+        fs::Error,
+    ] {
+        if self.is_closed() {
+            return Result::Err(closed());
+        }
+        subscribe_source(
+            scope,
+            capacity,
+            || self.read(time::Duration::from_milliseconds(50)),
+            || self.close(),
+            || self.is_closed(),
+            self.stop.receiver(),
+        )
+    }
+
+    pub fn close(self: WatchSet) -> Result[(), fs::Error] {
+        let state = self.state.recv().ok_or(closed())?;
+        defer self.state.send(state);
+        if !state.closed.get() {
+            state.closed.set(true);
+            self.stop.close();
+        }
+        let mut first = Option::None;
+        for (id, registration) in state.registrations.entries() {
+            if let Err(error) = close_state(registration.state) {
+                if first.is_none() {
+                    first = Option::Some(error);
+                }
+            }
+            state.registrations.remove(id);
+        }
+        match first {
+            Some(error) => Result::Err(error),
+            None => Result::Ok(()),
+        }
+    }
+}
+
+fn require_set_open(state: SetState) -> Result[(), fs::Error] {
+    if state.closed.get() {
+        Result::Err(closed())
+    } else {
+        Result::Ok(())
+    }
+}
