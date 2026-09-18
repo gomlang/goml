@@ -30,3 +30,5 @@ Package a `.vsix` with:
 ```sh
 just package-vscode-ext
 ```
+
+The package is written to `editors/vscode/goml-<version>.vsix`. Packaging resolves README links relative to `editors/vscode` on the repository's `main` branch. CI also packages the extension to validate this step.

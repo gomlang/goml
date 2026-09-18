@@ -43,7 +43,7 @@ just ci
 
 The block stops before tagging if the push fails, the CI run is not registered yet, or CI fails. If the run is not yet visible, wait for it to appear and rerun the block.
 
-Main CI builds stage2 directly from the pinned stage0. Its checks cover compiler and driver tests, Go metadata and scripts, extension compilation, archive smoke tests, and the stage3 fixed point. Fixed-point verification compares the compiler and driver artifacts built by stage2 with a rebuild using stage3. The independent gomlgo suite runs separately. The Release workflow requires successful main CI for the tagged commit, verifies the version, previous release, and stage0, rebuilds stage2, and runs archive and LSP smoke tests before publishing.
+Main CI builds stage2 directly from the pinned stage0. Its checks cover compiler and driver tests, Go metadata and scripts, extension compilation and VSIX packaging, archive smoke tests, and the stage3 fixed point. Fixed-point verification compares the compiler and driver artifacts built by stage2 with a rebuild using stage3. The independent gomlgo suite runs separately. The Release workflow requires successful main CI for the tagged commit, verifies the version, previous release, and stage0, rebuilds stage2, and runs archive and LSP smoke tests before publishing.
 
 Release archives use a complete toolchain prefix:
 

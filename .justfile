@@ -140,7 +140,7 @@ _ci-vscode:
     cp stage2/bin/goml-go-meta editors/vscode/bin/goml-go-meta
     bash tools/lib/install.sh editors/vscode
     cd editors/vscode && npm install
-    cd editors/vscode && npm run compile
+    cd editors/vscode && npm run package
 
 _ci-release-smoke:
     bash tools/release/package.sh "$(cat VERSION)"
@@ -173,7 +173,7 @@ vscode-ext: make-tools
     cd editors/vscode && npm run compile
 
 package-vscode-ext: vscode-ext
-    cd editors/vscode && npx @vscode/vsce package --allow-missing-repository --skip-license
+    cd editors/vscode && npm run package
 
 install: make-tools
     mkdir -p "${GOML_HOME:-$HOME/.goml}/bin"
