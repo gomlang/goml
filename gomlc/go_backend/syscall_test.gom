@@ -1,0 +1,116 @@
+package go_backend;
+
+use module::repr;
+use module::resources;
+use std::fs;
+use std::path;
+use std::process;
+use std::testing;
+use std::time;
+use std::utf8;
+use utf8::BytesUtf8;
+
+#[test]
+fn linux_syscall_buffers_survive_gc_and_block_without_stalling_scheduler() -> () {
+    let tuple = repr::Type::Tuple {
+        items: Vec::from_array(
+            [repr::Type::Bool, repr::Type::Uint, repr::Type::Uint, repr::Type::Uint],
+        ),
+    };
+    let items: Vec[Item] = Vec::new();
+    emit_runtime_hook_items(
+        items,
+        Vec::from_array(
+            [resources::RuntimeHook::Standard(resources::StandardRuntimeHook::LinuxSyscall6)],
+        ),
+        Vec::new(),
+    );
+    items.push(
+        Item::Struct(
+            StructDef {
+                name: type_name(tuple),
+                fields: Vec::from_array(
+                    [("_0", Type::Bool), ("_1", Type::Uint), ("_2", Type::Uint), ("_3", Type::Uint)],
+                ),
+            },
+        ),
+    );
+    let source = encode_package(File { items }, "syscalltest");
+    let root = "_artifact/linux-syscall-runtime";
+    testing::assert(fs::create_dir_all(root).is_ok());
+    testing::assert(
+        fs::write_file_structured(path::join(root, "go.mod"), "module syscalltest\n\ngo 1.25\n").is_ok(),
+    );
+    testing::assert(fs::write_file_structured(path::join(root, "runtime.go"), source).is_ok());
+    let host =
+        \\package syscalltest
+        \\import (
+        \\    "bytes"
+        \\    "os"
+        \\    "runtime"
+        \\    "syscall"
+        \\    "testing"
+        \\    "time"
+        \\)
+        \\func TestUnsupportedTarget(t *testing.T) {
+        \\    if runtime.GOOS == "linux" && runtime.GOARCH == "amd64" { t.Skip("supported target") }
+        \\    got := _goml_runtime_std_os_linux_syscall6(39, [6]uint{}, [6][]byte{})
+        \\    if got._0 || got._1 != 0 || got._2 != 0 || got._3 != 0 { t.Fatal(got) }
+        \\}
+        \\func TestRawResults(t *testing.T) {
+        \\    got := _goml_runtime_std_os_linux_syscall6(syscall.SYS_GETPID, [6]uint{}, [6][]byte{})
+        \\    if !got._0 || got._3 != 0 || got._1 != uint(os.Getpid()) { t.Fatal(got) }
+        \\    got = _goml_runtime_std_os_linux_syscall6(0x7fffffff, [6]uint{}, [6][]byte{})
+        \\    if !got._0 || got._3 != uint(syscall.ENOSYS) || got._1 != ^uint(0) { t.Fatal(got) }
+        \\}
+        \\func TestMultipleBuffers(t *testing.T) {
+        \\    path := append([]byte("/proc/self/exe"), 0)
+        \\    output := make([]byte, 4096)
+        \\    got := _goml_runtime_std_os_linux_syscall6(syscall.SYS_READLINK, [6]uint{0, 0, uint(len(output))}, [6][]byte{path, output})
+        \\    if !got._0 || got._3 != 0 || got._1 == 0 { t.Fatal(got) }
+        \\    expected, err := os.Readlink("/proc/self/exe")
+        \\    if err != nil || string(output[:got._1]) != expected { t.Fatal(got, err) }
+        \\}
+        \\func TestBlockingReadAndGC(t *testing.T) {
+        \\    previous := runtime.GOMAXPROCS(1)
+        \\    defer runtime.GOMAXPROCS(previous)
+        \\    fds := make([]int, 2)
+        \\    if err := syscall.Pipe(fds); err != nil { t.Fatal(err) }
+        \\    defer syscall.Close(fds[0])
+        \\    defer syscall.Close(fds[1])
+        \\    for iteration := 0; iteration < 8; iteration++ {
+        \\        ready := make(chan struct{})
+        \\        done := make(chan []byte)
+        \\        go func() {
+        \\            buffer := make([]byte, 32)
+        \\            close(ready)
+        \\            got := _goml_runtime_std_os_linux_syscall6(syscall.SYS_READ, [6]uint{uint(fds[0]), 0, uint(len(buffer))}, [6][]byte{nil, buffer})
+        \\            if !got._0 || got._3 != 0 || got._1 != uint(len(buffer)) { done <- nil; return }
+        \\            done <- buffer
+        \\        }()
+        \\        <-ready
+        \\        time.Sleep(time.Millisecond)
+        \\        for i := 0; i < 4; i++ { runtime.GC() }
+        \\        expected := bytes.Repeat([]byte{byte(iteration + 1)}, 32)
+        \\        got := _goml_runtime_std_os_linux_syscall6(syscall.SYS_WRITE, [6]uint{uint(fds[1]), 0, uint(len(expected))}, [6][]byte{nil, expected})
+        \\        if !got._0 || got._3 != 0 || got._1 != uint(len(expected)) { t.Fatal(got) }
+        \\        if result := <-done; !bytes.Equal(result, expected) { t.Fatal(result) }
+        \\    }
+        \\}
+    ;
+    testing::assert(fs::write_file_structured(path::join(root, "runtime_test.go"), host).is_ok());
+    let output = process::Command::new("go").args(
+        Vec::from_array(["test", "-race", "-count=1", "-timeout=30s", "./..."]),
+    ).current_dir(root).env("GOWORK", "off").env("GOTOOLCHAIN", "local").env("GOPROXY", "off").output_timeout_structured(
+        time::Duration::from_seconds(120),
+    );
+    match output {
+        Ok(output) => if !output.status().success() {
+            testing::fail(
+                output.stdout().to_string_utf8().unwrap_or("")
+                    + output.stderr().to_string_utf8().unwrap_or("syscall runtime test failed"),
+            );
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
