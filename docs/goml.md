@@ -432,6 +432,8 @@ This form is the newtype pattern. Construct it with `UserId(value)`, access its 
 
 GoML has no Rust reference or lifetime syntax, pointer arithmetic, slice literals, or union types. Use `Ref[T]` for shared mutable storage, `Option[T]` for optional values, and `Slice[T]` or `MutSlice[T]` for read-only or mutable contiguous views. `std::ffi::Ptr[T]` and external Go type aliases can carry nullable Go pointers; they remain distinct from `Ref[T]` and numeric types.
 
+On Linux amd64, `std::os::linux::syscall` accepts numeric machine words and scoped byte-buffer arguments for low-level kernel calls. It does not add pointer casts, pointer arithmetic, or native struct layout to the language.
+
 `A + B` is only usable as a trait bound or supertrait list. The parser reserves `dyn A + B`, but the type checker deliberately rejects multiple dyn bounds in the current object model.
 
 `Self` is only used in the trait signature and the type position of impl; ordinary top-level functions cannot use `Self` as an implicit type parameter.
@@ -2812,6 +2814,7 @@ use std::iter;
 use std::json;
 use std::math;
 use std::num;
+use std::os::linux::syscall;
 use std::path;
 use std::process;
 use std::rand;
@@ -2847,6 +2850,7 @@ Public APIs include:
 - `json::Value`, `parse`, `encode`, serde `Serialize` and `Deserialize` re-exports, `to_value`, `from_value`, `try_to_string`, `from_string`, `field`, and typed `as_*` accessors
 - `math` f32/f64 elementary functions, IEEE 754 classification, and the `E`, `PI`, `TAU`, `SQRT_2`, `LN_2`, and `LN_10` constants
 - `num` structured parsing plus checked and saturating `i64` arithmetic
+- `os::linux::syscall` Linux amd64 calls by number, six machine-word arguments, scoped mutable byte buffers, raw return values, and numeric errno
 - `path::join`, `clean`, `is_absolute`, component inspection, and `absolute_structured`
 - `process::Command`, structured whole-process execution, `ExitStatus`, `Output`, `exit`, and `look_path_structured`
 - `rand::ALGORITHM`, `next_u64`, deterministic byte generation, integer ranges, and shuffle with an explicit seed
@@ -2966,6 +2970,51 @@ Numeric parsing returns `Result[_, num::ParseIntError]` or `Result[_, num::Parse
 `env::current_dir_structured`, `current_exe_structured`, and `var_structured`, `path::absolute_structured`, and the `process` structured execution methods expose whole-operation errors. Process timeout methods take `time::Duration`, terminate and wait through the command runtime, and return `TimedOut` through `process::Error`.
 
 Paths remain UTF-8 `string` values. `path::separator` reports the host separator, `components` recognizes both slash forms, `relative` uses host path rules, and `windows_prefix` recognizes drive and UNC prefixes independently of the host operating system. Non-UTF-8 operating-system names cannot be represented and therefore cannot appear in these APIs.
+
+### Linux amd64 system calls
+
+`std::os::linux::syscall` is an explicit low-level escape hatch supported only on Linux amd64. `syscall6(number: usize, args: [usize; 6]) -> Result[SyscallResult, Error]` accepts any syscall number and six machine words. Unused argument positions should contain zero. Signed arguments use their machine-word bit pattern, for example `(-100).to_usize()` for Linux `AT_FDCWD`.
+
+`SyscallResult` has public `r1`, `r2`, and `errno` fields, all `usize`, preserving the values reported by Go's `syscall.Syscall6`. `is_ok()` tests `errno == 0`. A kernel failure still returns `Ok(SyscallResult)` with a nonzero errno; callers must inspect it. The outer `Err(Error::UnsupportedTarget)` reports that the executing target is not Linux amd64, before any syscall is issued. Other Go targets are not guaranteed to compile. Syscall numbers, layouts, and constants are specific to the Linux amd64 ABI; this package does not select numbers for another architecture.
+
+```goml
+use std::os::linux::syscall;
+
+fn process_id() -> Result[usize, string] {
+    let result = syscall::syscall6(syscall::SYS_GETPID, [0, 0, 0, 0, 0, 0]).map_err(
+        |error| error.to_string(),
+    )?;
+    if result.is_ok() {
+        Result::Ok(result.r1)
+    } else {
+        Result::Err("getpid errno " + result.errno.to_string())
+    }
+}
+```
+
+`syscall6_with_buffers(number: usize, args: [Arg; 6])` returns the same result type. `Arg::Word(usize)` passes an integer unchanged. `Arg::Buffer(MutSlice[byte])` passes the address of the view's first byte, or a null pointer for an empty view. The runtime retains and pins each nonempty backing allocation until the call returns; writes made by the kernel are visible through that view. Multiple buffers, subviews, and aliases of the same allocation are supported. A buffer argument does not implicitly add a length argument or a trailing NUL byte.
+
+```goml
+use std::os::linux::syscall;
+use std::os::linux::syscall::{Arg};
+
+fn write_once(fd: usize, data: Vec[byte]) -> Result[syscall::SyscallResult, syscall::Error] {
+    syscall::syscall6_with_buffers(syscall::SYS_WRITE, [
+        Arg::Word(fd),
+        Arg::Buffer(data.as_mut_slice()),
+        Arg::Word(data.len().to_usize()),
+        Arg::Word(0),
+        Arg::Word(0),
+        Arg::Word(0),
+    ])
+}
+```
+
+The caller is responsible for the syscall ABI, valid addresses, buffer lengths, alignment, native structure encoding, resource cleanup, and synchronization. Byte buffers can carry explicitly encoded native records; ordinary GoML structs have no kernel-layout guarantee. `Word` does not retain or pin any Go allocation, so a Go-managed address must not be smuggled through an integer. Numeric addresses returned by operations such as `mmap` remain raw words and require appropriate explicit cleanup such as `munmap`.
+
+Buffer lifetimes cover synchronous calls only. Operations that retain a pointer after returning, nested pointer graphs, and arbitrary Go object memory are outside this buffer API. The runtime uses scheduling-aware `Syscall6`, not `RawSyscall6`. It performs one call without automatic `EINTR` retry or completion of partial reads/writes. Per-thread operations require thread-affinity handling that this API does not provide. Raw changes to threads, process creation, signal handlers, or the Go runtime's address space can violate runtime invariants; accepting a number does not make every kernel operation safe to use from GoML. Calls remain subject to kernel availability, process permissions, and sandbox policy.
+
+The initial constant set is `SYS_READ`, `SYS_WRITE`, `SYS_CLOSE`, `SYS_MMAP`, `SYS_MUNMAP`, `SYS_GETPID`, `SYS_GETUID`, `SYS_GETPPID`, `SYS_CLOCK_GETTIME`, `SYS_OPENAT`, and `SYS_PIPE2`, plus `EINTR`, `EBADF`, `EINVAL`, and `ENOSYS`. Other numbers can be passed directly. This package uses ordinary imports, functions, enums, arrays, and mutable slices; it introduces no new grammar or `unsafe` syntax and cannot be used in `comptime`.
 
 ### Bincode typed binary data
 
@@ -3143,6 +3192,7 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | Go interface adapter | `#[go_interface(RawType, Wrapper, method = "GoMethod")]` generates a checked native-interface wrapper and trait implementation; `from_trait` explicitly creates a typed Go bridge retaining the supplied dyn object; nil/typed-nil and multiple results are preserved |
 | Go binding generator | `goml bind-go <CONFIG>` selects explicit package/symbol allowlists and finite Go-checked generic arguments; emits raw bindings with protected deterministic output |
 | Go-callable export | Annotate a supported public function with `#[go_export("Name")]` and generate a Go package with `goml export-go` |
+| Treat a GoML integer or struct as a kernel pointer/layout | Use `syscall::Arg::Buffer` for synchronous byte storage on Linux amd64; encode the native ABI explicitly and inspect `SyscallResult.errno` |
 | Unannotated user `extern fn` | Use a normal GoML function or `#[go_ffi("import/path", "ExportedSymbol")] extern fn`; project commands validate Go calls by default (`--ffi-check required`) |
 | Call an ordinary function from `comptime` | Mark a supported free function with `#[comptime]` |
 | Capture a runtime local in `comptime` | Pass a literal or compile-time value to a `#[comptime]` function |
