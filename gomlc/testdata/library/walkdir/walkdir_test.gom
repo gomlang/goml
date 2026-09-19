@@ -1,0 +1,292 @@
+package walkdir;
+
+use std::bytes::endian;
+use std::fs;
+use std::io;
+use std::os::linux::syscall;
+use std::path;
+use std::testing;
+use std::time;
+use std::utf8;
+
+fn put16(data: Vec[byte], offset: isize, value: u16) -> () {
+    testing::expect_ok(
+        endian::write_u16(data.as_mut_slice(), offset, value, endian::Endian::Little),
+        "write u16",
+    );
+}
+
+fn put32(data: Vec[byte], offset: isize, value: u32) -> () {
+    testing::expect_ok(
+        endian::write_u32(data.as_mut_slice(), offset, value, endian::Endian::Little),
+        "write u32",
+    );
+}
+
+fn put64(data: Vec[byte], offset: isize, value: u64) -> () {
+    testing::expect_ok(
+        endian::write_u64(data.as_mut_slice(), offset, value, endian::Endian::Little),
+        "write u64",
+    );
+}
+
+fn record(name: string, inode: u64, kind: byte) -> Vec[byte] {
+    let text = utf8::encode(name);
+    let size = (20 + text.len() + 7) / 8 * 8;
+    let data = zeroes(size);
+    put64(data, 0, inode);
+    put16(data, 16, size.to_u16());
+    data[18] = kind;
+    for index in 0..text.len() {
+        data[19 + index] = text[index];
+    }
+    data
+}
+
+#[test]
+fn decodes_directory_records_and_unknown_types() -> () {
+    let data = record(".", 1, 4);
+    data.extend(record("..", 2, 4));
+    data.extend(record("deleted", 0, 8));
+    data.extend(record("file", 3, 8));
+    data.extend(record("目录", 4, 0));
+    let padded = record("x", 5, 10);
+    padded[23] = 255;
+    data.extend(padded);
+    let names = testing::expect_ok(decode_dirents(data.as_slice(), "root"), "decode directory");
+    testing::assert_eq(names.len(), 3);
+    testing::assert_eq(names[0], "file");
+    testing::assert_eq(names[1], "目录");
+    testing::assert_eq(names[2], "x");
+    testing::assert_eq(
+        testing::expect_ok(decode_dirents(zeroes(0).as_slice(), "root"), "empty").len(),
+        0,
+    );
+}
+
+#[test]
+fn rejects_malformed_directory_records() -> () {
+    let good = record("abc", 1, 0);
+    for length in 1..good.len() {
+        testing::assert_err(decode_dirents(good.slice(0, length), "root"));
+    }
+    for length in Vec::from_array([0, 1, 19, 20, 23, 25, 32, 65535]) {
+        let data = record("abc", 1, 0);
+        put16(data, 16, length.to_u16());
+        let error = testing::expect_err(
+            decode_dirents(data.as_slice(), "root"),
+            "invalid record length",
+        );
+        testing::assert_eq(error.kind(), io::ErrorKind::InvalidData);
+        testing::assert(error.path() == Option::Some("root"));
+    }
+    for name in Vec::from_array(["", "a/b"]) {
+        testing::assert_err(decode_dirents(record(name, 1, 0).as_slice(), "root"));
+    }
+    let invalid_utf8 = record("a", 1, 0);
+    invalid_utf8[19] = 255;
+    testing::assert_err(decode_dirents(invalid_utf8.as_slice(), "root"));
+    let unterminated = record("a", 1, 0);
+    for offset in 19..unterminated.len() {
+        unterminated[offset] = b'a';
+    }
+    testing::assert_err(decode_dirents(unterminated.as_slice(), "root"));
+    let trailing = record("a", 1, 0);
+    trailing.push(0);
+    testing::assert_err(decode_dirents(trailing.as_slice(), "root"));
+}
+
+#[test]
+fn decodes_amd64_stat_and_rejects_invalid_records() -> () {
+    let data = zeroes(144);
+    put64(data, 0, 0x100000002);
+    put64(data, 8, 0x200000003);
+    put32(data, 24, 0o104640);
+    put64(data, 48, 0x300000004);
+    put64(data, 88, (-2).to_u64());
+    put64(data, 96, 123456789);
+    let info = testing::expect_ok(decode_stat(data.as_slice(), "file"), "decode stat");
+    testing::assert_eq(info.identity, "4294967298:8589934595");
+    testing::assert(info.value.file_type().is_file());
+    testing::assert_eq(info.value.permissions().mode(), 0o640);
+    testing::assert_eq(info.value.len(), 12884901892);
+    testing::assert_eq(info.value.modified_unix_nanoseconds(), -1876543211);
+    for (mode, kind) in Vec::from_array(
+        [
+            (0o040755, fs::FileType::Directory),
+            (0o120777, fs::FileType::Symlink),
+            (0o010600, fs::FileType::Other),
+        ],
+    ) {
+        put32(data, 24, mode);
+        testing::assert(
+            testing::expect_ok(decode_stat(data.as_slice(), "file"), "stat type").value.file_type()
+                == kind,
+        );
+    }
+    for size in Vec::from_array([0, 88, 96, 104, 143, 145]) {
+        testing::assert_err(decode_stat(zeroes(size).as_slice(), "file"));
+    }
+    put64(data, 96, 1000000000);
+    testing::assert_err(decode_stat(data.as_slice(), "file"));
+}
+
+fn temporary(label: string) -> string {
+    let root = "/tmp/goml-walkdir-kernel-" + label + "-"
+        + time::SystemTime::now().unix_nanoseconds().to_string();
+    testing::expect_ok(fs::create_dir(root), "create directory");
+    root
+}
+
+fn location(name: string) -> Location {
+    Location { path: name, name, parent: AT_FDCWD.to_usize(), depth: 0 }
+}
+
+fn descriptors(root: string) -> isize {
+    let mut count = 0;
+    for name in testing::expect_ok(fs::read_dir("/proc/self/fd"), "list descriptors") {
+        if let Ok(target) = fs::canonicalize(path::join("/proc/self/fd", name)) {
+            if target == root || target.starts_with(root + "/") {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+#[test]
+fn syscall_metadata_matches_filesystem_metadata() -> () {
+    let root = temporary("metadata");
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    let file = path::join(root, "file");
+    testing::expect_ok(fs::write_file_structured(file, "content"), "write file");
+    let link = path::join(root, "link");
+    testing::expect_ok(fs::symbolic_link("file", link), "make link");
+    for name in Vec::from_array([root, file, link]) {
+        for follow in Vec::from_array([true, false]) {
+            let actual = testing::expect_ok(stat_at(location(name), follow), "stat syscall").value;
+            let expected = testing::expect_ok(
+                if follow {
+                    fs::metadata(name)
+                } else {
+                    fs::symlink_metadata(name)
+                },
+                "stat host",
+            );
+            testing::assert(actual.file_type() == expected.file_type());
+            testing::assert_eq(actual.len(), expected.len());
+            testing::assert_eq(actual.permissions().mode(), expected.permissions().mode());
+            testing::assert_eq(
+                actual.modified_unix_nanoseconds(),
+                expected.modified_unix_nanoseconds(),
+            );
+        }
+    }
+}
+
+#[test]
+fn reads_multiple_batches_and_closes_on_exec() -> () {
+    let root = temporary("batches");
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    for index in 0..1200 {
+        testing::expect_ok(
+            fs::write_file_structured(path::join(root, "directory-entry-" + index.to_string()), ""),
+            "create entry",
+        );
+    }
+    let fd = testing::expect_ok(open_directory(location(root), false), "open directory");
+    defer {
+        let _ = close_fd(fd, root);
+    };
+    let flags = testing::expect_ok(syscall::syscall6(72, [fd, 1, 0, 0, 0, 0]), "fcntl");
+    testing::assert_eq(flags.errno, 0);
+    testing::assert(flags.r1 & 1 != 0);
+    let actual = testing::expect_ok(directory_names(fd, root), "getdents64");
+    let expected = testing::expect_ok(fs::read_dir(root), "host read directory");
+    testing::assert_eq(actual.len(), 1200);
+    for index in 0..actual.len() {
+        testing::assert_eq(actual[index], expected[index]);
+    }
+}
+
+#[test]
+fn preserves_errno_and_rejects_embedded_nul() -> () {
+    let root = temporary("errors");
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    let missing = testing::expect_err(
+        stat_at(location(path::join(root, "missing")), false),
+        "missing metadata",
+    );
+    testing::assert_eq(missing.kind(), io::ErrorKind::NotFound);
+    testing::assert(missing.raw_os_code() == Option::Some(2));
+    let nul = testing::expect_ok(utf8::decode(b"\0"), "NUL");
+    let error = testing::expect_err(stat_at(location(root + nul + "suffix"), false), "NUL path");
+    testing::assert_eq(error.kind(), io::ErrorKind::InvalidInput);
+    let fd = testing::expect_ok(open_directory(location(root), false), "open directory");
+    testing::expect_ok(close_fd(fd, root), "close directory");
+    let error = testing::expect_err(directory_names(fd, root), "closed directory");
+    testing::assert(error.raw_os_code() == Option::Some(9));
+}
+
+#[test]
+fn releases_descriptors_on_exhaustion_close_and_errors() -> () {
+    let root = temporary("lifecycle");
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    testing::expect_ok(fs::create_dir_all(path::join(root, "a/b")), "nested directories");
+    testing::expect_ok(fs::symbolic_link("..", path::join(root, "a/back")), "loop link");
+    let before = descriptors(root);
+    for _ in 0..20 {
+        let iterator = WalkDir::new(root).follow_links(true).iter();
+        let _ = iterator.next();
+        let _ = iterator.next();
+        testing::assert_eq(iterator.descriptors.len(), 1);
+        let shared = iterator;
+        shared.close();
+        iterator.close();
+        testing::assert_eq(iterator.descriptors.len(), 0);
+        testing::assert_eq(iterator.ancestors.len(), 0);
+        testing::assert(iterator.next().is_none());
+        testing::assert_eq(descriptors(root), before);
+        let full = WalkDir::new(root).follow_links(true).iter();
+        let mut loops = 0;
+        for item in full {
+            if item.is_err() {
+                loops += 1;
+            }
+        }
+        testing::assert_eq(loops, 1);
+        testing::assert_eq(full.descriptors.len(), 0);
+        testing::assert_eq(descriptors(root), before);
+    }
+}
+
+#[test]
+fn filter_can_close_without_reopening_descriptors() -> () {
+    let root = temporary("filter-close");
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    for postorder in Vec::from_array([true, false]) {
+        let slot: Ref[Option[WalkIterator]] = Ref::new(Option::None);
+        let iterator = WalkDir::new(root).contents_first(postorder).filter_entry(
+            |_| {
+                testing::expect_some(slot.get(), "active iterator").close();
+                true
+            },
+        ).iter();
+        slot.set(Option::Some(iterator));
+        let before = descriptors(root);
+        testing::assert(iterator.next().is_none());
+        testing::assert_eq(iterator.descriptors.len(), 0);
+        testing::assert_eq(descriptors(root), before);
+        slot.set(Option::None);
+    }
+}
