@@ -1,0 +1,216 @@
+package net;
+
+use module::io::{Error, ErrorKind};
+use module::os::linux::syscall;
+use module::os::linux::syscall::{Arg};
+
+const SOCKET_FLAGS: usize = 0x80800;
+
+fn zeroes(size: isize) -> Vec[byte] {
+    let result = Vec::new();
+    for _ in 0..size {
+        result.push(0);
+    }
+    result
+}
+
+fn put_le(data: MutSlice[byte], offset: isize, value: u64, width: isize) -> () {
+    for index in 0..width {
+        data[offset + index] = (value >> (index * 8)).to_u8();
+    }
+}
+
+fn get_le(data: Slice[byte], offset: isize, width: isize) -> u64 {
+    let mut result: u64 = 0;
+    for index in 0..width {
+        result = result | (data[offset + index].to_u64() << (index * 8));
+    }
+    result
+}
+
+fn put_be16(data: MutSlice[byte], offset: isize, value: u16) -> () {
+    data[offset] = (value >> 8).to_u8();
+    data[offset + 1] = value.to_u8();
+}
+
+fn get_be16(data: Slice[byte], offset: isize) -> u16 {
+    (data[offset].to_u16() << 8) | data[offset + 1].to_u16()
+}
+
+fn encode_address(address: SocketAddr) -> Result[Vec[byte], Error] {
+    match address.ip {
+        V4(parts) => {
+            if address.scope_id != 0 {
+                return Result::Err(invalid_address());
+            }
+            let data = zeroes(16);
+            put_le(data.as_mut_slice(), 0, 2, 2);
+            put_be16(data.as_mut_slice(), 2, address.port);
+            for index in 0..4 {
+                data[4 + index] = parts[index];
+            }
+            Result::Ok(data)
+        },
+        V6(parts) => {
+            let data = zeroes(28);
+            put_le(data.as_mut_slice(), 0, 10, 2);
+            put_be16(data.as_mut_slice(), 2, address.port);
+            for index in 0..8 {
+                put_be16(data.as_mut_slice(), 8 + index * 2, parts[index]);
+            }
+            put_le(data.as_mut_slice(), 24, address.scope_id.to_u64(), 4);
+            Result::Ok(data)
+        },
+    }
+}
+
+fn decode_address(data: Slice[byte]) -> Result[SocketAddr, Error] {
+    if data.len() >= 16 && get_le(data, 0, 2) == 2 {
+        Result::Ok(
+            SocketAddr::new(IpAddr::V4([data[4], data[5], data[6], data[7]]), get_be16(data, 2)),
+        )
+    } else if data.len() >= 28 && get_le(data, 0, 2) == 10 {
+        let mut parts: [u16; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+        for index in 0..8 {
+            parts[index] = get_be16(data, 8 + index * 2);
+        }
+        Result::Ok(
+            SocketAddr {
+                ip: IpAddr::V6(parts),
+                port: get_be16(data, 2),
+                scope_id: get_le(data, 24, 4).to_u32(),
+            },
+        )
+    } else {
+        Result::Err(error(ErrorKind::InvalidData, "decode address", "invalid socket address"))
+    }
+}
+
+fn call(number: usize, args: [Arg; 6], operation: string) -> Result[usize, Error] {
+    let result = syscall::syscall6_with_buffers(number, args).map_err(
+        |value| error(ErrorKind::Unsupported, operation, value.to_string()),
+    )?;
+    if result.is_ok() {
+        Result::Ok(result.r1)
+    } else {
+        Result::Err(errno_error(operation, result.errno))
+    }
+}
+
+fn invoke(number: usize, args: [Arg; 6], operation: string) -> Result[usize, Error] {
+    loop {
+        let result = call(number, args, operation);
+        if let Err(value) = result {
+            if value.raw_os_code() == Option::Some(4) {
+                continue;
+            }
+        }
+        return result;
+    }
+}
+
+fn close_fd(fd: usize) -> Result[(), Error] {
+    call(
+        syscall::SYS_CLOSE,
+        [Arg::Word(fd), Arg::Word(0), Arg::Word(0), Arg::Word(0), Arg::Word(0), Arg::Word(0)],
+        "close socket",
+    ).map(|_| ())
+}
+
+fn socket_option(fd: usize, level: usize, option: usize, value: u32) -> Result[(), Error] {
+    let data = zeroes(4);
+    put_le(data.as_mut_slice(), 0, value.to_u64(), 4);
+    invoke(
+        syscall::SYS_SETSOCKOPT,
+        [
+            Arg::Word(fd),
+            Arg::Word(level),
+            Arg::Word(option),
+            Arg::Buffer(data.as_mut_slice()),
+            Arg::Word(4),
+            Arg::Word(0),
+        ],
+        "set socket option",
+    ).map(|_| ())
+}
+
+fn socket_address(fd: usize, peer: bool) -> Result[SocketAddr, Error] {
+    let data = zeroes(28);
+    let size = zeroes(4);
+    put_le(size.as_mut_slice(), 0, 28, 4);
+    invoke(
+        if peer {
+            syscall::SYS_GETPEERNAME
+        } else {
+            syscall::SYS_GETSOCKNAME
+        },
+        [
+            Arg::Word(fd),
+            Arg::Buffer(data.as_mut_slice()),
+            Arg::Buffer(size.as_mut_slice()),
+            Arg::Word(0),
+            Arg::Word(0),
+            Arg::Word(0),
+        ],
+        "socket address",
+    )?;
+    let length = get_le(size.as_slice(), 0, 4).to_isize();
+    if length > data.len() {
+        return Result::Err(
+            error(ErrorKind::InvalidData, "socket address", "invalid address length"),
+        );
+    }
+    decode_address(data.slice(0, length))
+}
+
+fn create_socket(address: SocketAddr, datagram: bool) -> Result[usize, Error] {
+    let _ = encode_address(address)?;
+    let fd = invoke(
+        syscall::SYS_SOCKET,
+        [
+            Arg::Word(
+                if address.ip.is_ipv4() {
+                    2
+                } else {
+                    10
+                },
+            ),
+            Arg::Word(
+                SOCKET_FLAGS
+                    | if datagram {
+                        2
+                    } else {
+                        1
+                    },
+            ),
+            Arg::Word(0),
+            Arg::Word(0),
+            Arg::Word(0),
+            Arg::Word(0),
+        ],
+        "create socket",
+    )?;
+    if address.ip.is_ipv6() {
+        if let Err(value) = socket_option(fd, 41, 26, 1) {
+            let _ = close_fd(fd);
+            return Result::Err(value);
+        }
+    }
+    Result::Ok(fd)
+}
+
+fn bind_socket(fd: usize, address: SocketAddr) -> Result[(), Error] {
+    let data = encode_address(address)?;
+    invoke(
+        syscall::SYS_BIND,
+        [
+            Arg::Word(fd),
+            Arg::Buffer(data.as_mut_slice()),
+            Arg::Word(data.len().to_usize()),
+            Arg::Word(0),
+            Arg::Word(0),
+            Arg::Word(0),
+        ],
+        "bind socket",
+    ).map(|_| ())
+}

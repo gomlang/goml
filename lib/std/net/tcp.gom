@@ -1,0 +1,387 @@
+package net;
+
+use module::io::{Error, ErrorKind};
+use module::os::linux::syscall;
+use module::os::linux::syscall::{Arg};
+
+pub struct TcpListener {
+    socket: Socket,
+}
+
+pub struct TcpStream {
+    socket: Socket,
+}
+
+pub enum Shutdown {
+    Read,
+    Write,
+    Both,
+}
+
+impl TcpListener {
+    pub fn bind(address: SocketAddr) -> Result[TcpListener, Error] {
+        TcpListener::bind_with_backlog(address, 128)
+    }
+
+    pub fn bind_with_backlog(address: SocketAddr, backlog: isize) -> Result[TcpListener, Error] {
+        if backlog < 1 || backlog > 2147483647 {
+            return Result::Err(
+                error(ErrorKind::InvalidInput, "listen", "backlog must be a positive int32"),
+            );
+        }
+        let socket = socket_from_fd(create_socket(address, false)?)?;
+        let result = socket.with_fd(
+            "listen",
+            |fd| {
+                socket_option(fd, 1, 2, 1)?;
+                bind_socket(fd, address)?;
+                invoke(
+                    syscall::SYS_LISTEN,
+                    [
+                        Arg::Word(fd),
+                        Arg::Word(backlog.to_usize()),
+                        Arg::Word(0),
+                        Arg::Word(0),
+                        Arg::Word(0),
+                        Arg::Word(0),
+                    ],
+                    "listen",
+                ).map(|_| ())
+            },
+        );
+        if let Err(value) = result {
+            let _ = socket.close();
+            return Result::Err(value);
+        }
+        Result::Ok(TcpListener { socket })
+    }
+
+    pub fn local_addr(self: TcpListener) -> Result[SocketAddr, Error] {
+        self.socket.with_fd("local address", |fd| socket_address(fd, false))
+    }
+
+    pub fn close(self: TcpListener) -> Result[(), Error] {
+        self.socket.close()
+    }
+
+    pub fn is_closed(self: TcpListener) -> bool {
+        self.socket.is_closed()
+    }
+
+    pub fn accept(self: TcpListener) -> Result[(TcpStream, SocketAddr), Error] {
+        self.accept_with(WaitOptions::new())
+    }
+
+    pub fn accept_with(self: TcpListener, options: WaitOptions) -> Result[
+        (TcpStream, SocketAddr),
+        Error,
+    ] {
+        let wait = Wait::new(options, "accept");
+        defer wait.stop();
+        wait.acquire(self.socket.reader, self.socket.ended)?;
+        defer self.socket.reader.send(());
+        loop {
+            let result = self.socket.perform(
+                false,
+                wait,
+                |fd| call(
+                    syscall::SYS_ACCEPT4,
+                    [
+                        Arg::Word(fd),
+                        Arg::Word(0),
+                        Arg::Word(0),
+                        Arg::Word(SOCKET_FLAGS),
+                        Arg::Word(0),
+                        Arg::Word(0),
+                    ],
+                    "accept",
+                ),
+            );
+            if let Err(value) = result {
+                let code = value.raw_os_code().unwrap_or(0);
+                if code == 103 || code == 100 || code == 71 || code == 92 || code == 112
+                    || code == 64
+                    || code == 113
+                    || code == 95
+                    || code == 101 {
+                    continue;
+                }
+            }
+            let socket = socket_from_fd(result?)?;
+            let peer = match socket.with_fd("peer address", |fd| socket_address(fd, true)) {
+                Ok(value) => value,
+                Err(value) => {
+                    let _ = socket.close();
+                    return Result::Err(value);
+                },
+            };
+            return Result::Ok((TcpStream { socket }, peer));
+        }
+    }
+}
+
+fn finish_connect(socket: Socket, address: SocketAddr, wait: Wait) -> Result[(), Error] {
+    wait.check()?;
+    let data = encode_address(address)?;
+    let result = socket.with_fd(
+        "connect",
+        |fd| call(
+            syscall::SYS_CONNECT,
+            [
+                Arg::Word(fd),
+                Arg::Buffer(data.as_mut_slice()),
+                Arg::Word(data.len().to_usize()),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+            ],
+            "connect",
+        ),
+    );
+    if let Err(value) = result {
+        let code = value.raw_os_code().unwrap_or(0);
+        if code != 115 && code != 114 && code != 4 {
+            return Result::Err(value);
+        }
+        loop {
+            socket.wait(true, wait)?;
+            let error_code = socket.with_fd(
+                "connect",
+                |fd| {
+                    let data = zeroes(4);
+                    let size = zeroes(4);
+                    put_le(size.as_mut_slice(), 0, 4, 4);
+                    invoke(
+                        syscall::SYS_GETSOCKOPT,
+                        [
+                            Arg::Word(fd),
+                            Arg::Word(1),
+                            Arg::Word(4),
+                            Arg::Buffer(data.as_mut_slice()),
+                            Arg::Buffer(size.as_mut_slice()),
+                            Arg::Word(0),
+                        ],
+                        "connect",
+                    )?;
+                    Result::Ok(get_le(data.as_slice(), 0, 4).to_usize())
+                },
+            )?;
+            if error_code != 0 {
+                return Result::Err(errno_error("connect", error_code));
+            }
+            let peer = socket.with_fd("connect", |fd| socket_address(fd, true));
+            if let Err(value) = peer {
+                if value.raw_os_code() == Option::Some(107) {
+                    continue;
+                }
+                return Result::Err(value);
+            }
+            break;
+        }
+    }
+    Result::Ok(())
+}
+
+fn stream_read(socket: Socket, buffer: MutSlice[byte], wait: Wait) -> Result[isize, Error] {
+    socket.perform(
+        false,
+        wait,
+        |fd| call(
+            syscall::SYS_RECVFROM,
+            [
+                Arg::Word(fd),
+                Arg::Buffer(buffer),
+                Arg::Word(buffer.len().to_usize()),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+            ],
+            "read TCP",
+        ).map(|size| size.to_isize()),
+    )
+}
+
+fn stream_write(socket: Socket, buffer: MutSlice[byte], wait: Wait) -> Result[isize, Error] {
+    socket.perform(
+        true,
+        wait,
+        |fd| call(
+            syscall::SYS_SENDTO,
+            [
+                Arg::Word(fd),
+                Arg::Buffer(buffer),
+                Arg::Word(buffer.len().to_usize()),
+                Arg::Word(0x4000),
+                Arg::Word(0),
+                Arg::Word(0),
+            ],
+            "write TCP",
+        ).map(|size| size.to_isize()),
+    )
+}
+
+impl TcpStream {
+    pub fn connect(address: SocketAddr) -> Result[TcpStream, Error] {
+        TcpStream::connect_with(address, WaitOptions::new())
+    }
+
+    pub fn connect_with(address: SocketAddr, options: WaitOptions) -> Result[TcpStream, Error] {
+        let wait = Wait::new(options, "connect");
+        defer wait.stop();
+        wait.check()?;
+        let socket = socket_from_fd(create_socket(address, false)?)?;
+        if let Err(value) = finish_connect(socket, address, wait) {
+            let _ = socket.close();
+            return Result::Err(value);
+        }
+        Result::Ok(TcpStream { socket })
+    }
+
+    pub fn local_addr(self: TcpStream) -> Result[SocketAddr, Error] {
+        self.socket.with_fd("local address", |fd| socket_address(fd, false))
+    }
+
+    pub fn peer_addr(self: TcpStream) -> Result[SocketAddr, Error] {
+        self.socket.with_fd("peer address", |fd| socket_address(fd, true))
+    }
+
+    pub fn close(self: TcpStream) -> Result[(), Error] {
+        self.socket.close()
+    }
+
+    pub fn is_closed(self: TcpStream) -> bool {
+        self.socket.is_closed()
+    }
+
+    pub fn set_nodelay(self: TcpStream, enabled: bool) -> Result[(), Error] {
+        self.socket.with_fd(
+            "set nodelay",
+            |fd| socket_option(
+                fd,
+                6,
+                1,
+                if enabled {
+                    1
+                } else {
+                    0
+                },
+            ),
+        )
+    }
+
+    pub fn shutdown(self: TcpStream, direction: Shutdown) -> Result[(), Error] {
+        let how = match direction {
+            Read => 0,
+            Write => 1,
+            Both => 2,
+        };
+        self.socket.with_fd(
+            "shutdown",
+            |fd| invoke(
+                syscall::SYS_SHUTDOWN,
+                [
+                    Arg::Word(fd),
+                    Arg::Word(how),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                ],
+                "shutdown",
+            ).map(|_| ()),
+        )
+    }
+
+    pub fn read(self: TcpStream, buffer: MutSlice[byte]) -> Result[isize, Error] {
+        self.read_with(buffer, WaitOptions::new())
+    }
+
+    pub fn read_with(self: TcpStream, buffer: MutSlice[byte], options: WaitOptions) -> Result[
+        isize,
+        Error,
+    ] {
+        let wait = Wait::new(options, "read TCP");
+        defer wait.stop();
+        wait.acquire(self.socket.reader, self.socket.ended)?;
+        defer self.socket.reader.send(());
+        if buffer.len() == 0 {
+            return self.socket.with_fd("read TCP", |_| Result::Ok(0));
+        }
+        stream_read(self.socket, buffer, wait)
+    }
+
+    pub fn read_exact(self: TcpStream, buffer: MutSlice[byte]) -> Result[(), Error] {
+        self.read_exact_with(buffer, WaitOptions::new())
+    }
+
+    pub fn read_exact_with(self: TcpStream, buffer: MutSlice[byte], options: WaitOptions) -> Result[
+        (),
+        Error,
+    ] {
+        let wait = Wait::new(options, "read exact TCP");
+        defer wait.stop();
+        wait.acquire(self.socket.reader, self.socket.ended)?;
+        defer self.socket.reader.send(());
+        self.socket.with_fd("read exact TCP", |_| Result::Ok(()))?;
+        let mut offset = 0;
+        while offset < buffer.len() {
+            let count = stream_read(self.socket, buffer.sub(offset, buffer.len()), wait)?;
+            if count == 0 {
+                return Result::Err(
+                    error(
+                        ErrorKind::UnexpectedEof,
+                        "read exact TCP",
+                        "peer closed before filling buffer",
+                    ),
+                );
+            }
+            offset += count;
+        }
+        Result::Ok(())
+    }
+
+    pub fn write(self: TcpStream, buffer: Slice[byte]) -> Result[isize, Error] {
+        self.write_with(buffer, WaitOptions::new())
+    }
+
+    pub fn write_with(self: TcpStream, buffer: Slice[byte], options: WaitOptions) -> Result[
+        isize,
+        Error,
+    ] {
+        let wait = Wait::new(options, "write TCP");
+        defer wait.stop();
+        wait.acquire(self.socket.writer, self.socket.ended)?;
+        defer self.socket.writer.send(());
+        if buffer.len() == 0 {
+            return self.socket.with_fd("write TCP", |_| Result::Ok(0));
+        }
+        stream_write(self.socket, buffer.to_vec().as_mut_slice(), wait)
+    }
+
+    pub fn write_all(self: TcpStream, buffer: Slice[byte]) -> Result[(), Error] {
+        self.write_all_with(buffer, WaitOptions::new())
+    }
+
+    pub fn write_all_with(self: TcpStream, buffer: Slice[byte], options: WaitOptions) -> Result[
+        (),
+        Error,
+    ] {
+        let wait = Wait::new(options, "write all TCP");
+        defer wait.stop();
+        wait.acquire(self.socket.writer, self.socket.ended)?;
+        defer self.socket.writer.send(());
+        self.socket.with_fd("write all TCP", |_| Result::Ok(()))?;
+        let data = buffer.to_vec().as_mut_slice();
+        let mut offset = 0;
+        while offset < data.len() {
+            let count = stream_write(self.socket, data.sub(offset, data.len()), wait)?;
+            if count == 0 {
+                return Result::Err(
+                    error(ErrorKind::WriteZero, "write all TCP", "socket accepted no bytes"),
+                );
+            }
+            offset += count;
+        }
+        Result::Ok(())
+    }
+}

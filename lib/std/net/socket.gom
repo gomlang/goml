@@ -1,0 +1,92 @@
+package net;
+
+use module::io::{Error, ErrorKind};
+
+struct Socket {
+    fd: Channel[Option[usize]],
+    reactor: Reactor,
+    id: usize,
+    reader: Channel[()],
+    writer: Channel[()],
+    ended: Channel[()],
+}
+
+fn socket_from_fd(fd: usize) -> Result[Socket, Error] {
+    let result = shared_reactor().and_then(|reactor| reactor.register(fd).map(|id| (reactor, id)));
+    let (reactor, id) = match result {
+        Ok(value) => value,
+        Err(value) => {
+            let _ = close_fd(fd);
+            return Result::Err(value);
+        },
+    };
+    let handle = Channel::new(1);
+    handle.send(Option::Some(fd));
+    let reader = Channel::new(1);
+    reader.send(());
+    let writer = Channel::new(1);
+    writer.send(());
+    Result::Ok(Socket { fd: handle, reactor, id, reader, writer, ended: Channel::new(0) })
+}
+
+impl Socket {
+    fn with_fd[T](self: Socket, operation: string, action: (usize) -> Result[T, Error]) -> Result[
+        T,
+        Error,
+    ] {
+        let value = self.fd.recv().unwrap_or(Option::None);
+        defer self.fd.send(value);
+        action(value.ok_or(closed(operation))?)
+    }
+
+    fn close(self: Socket) -> Result[(), Error] {
+        let value = self.fd.recv().unwrap_or(Option::None);
+        defer self.fd.send(Option::None);
+        if let Some(fd) = value {
+            self.reactor.remove(self.id);
+            self.ended.close();
+            close_fd(fd)
+        } else {
+            Result::Ok(())
+        }
+    }
+
+    fn is_closed(self: Socket) -> bool {
+        select {
+            recv(self.ended) as _ => true,
+            default => false,
+        }
+    }
+
+    fn wait(self: Socket, writing: bool, wait: Wait) -> Result[(), Error] {
+        wait.check()?;
+        let ready = self.with_fd(wait.operation, |_| self.reactor.arm(self.id, writing))?;
+        defer self.reactor.disarm(self.id, writing);
+        select {
+            recv(ready) as value => value.unwrap_or(Result::Err(closed(wait.operation))),
+            recv(self.ended) as _ => Result::Err(closed(wait.operation)),
+            recv(wait.cancel) as _ => Result::Err(wait.cancelled()),
+            recv(wait.expired) as _ => Result::Err(wait.timed_out()),
+        }
+    }
+
+    fn perform[T](self: Socket, writing: bool, wait: Wait, action: (usize) -> Result[T, Error]) -> Result[
+        T,
+        Error,
+    ] {
+        loop {
+            wait.check()?;
+            let result = self.with_fd(wait.operation, action);
+            if let Err(value) = result {
+                if value.raw_os_code() == Option::Some(4) {
+                    continue;
+                }
+                if value.kind() == ErrorKind::WouldBlock {
+                    self.wait(writing, wait)?;
+                    continue;
+                }
+            }
+            return result;
+        }
+    }
+}

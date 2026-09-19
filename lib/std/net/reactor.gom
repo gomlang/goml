@@ -1,0 +1,274 @@
+package net;
+
+use module::io::{Error, ErrorKind};
+use module::os::linux::syscall;
+use module::os::linux::syscall::{Arg};
+
+struct Registration {
+    fd: usize,
+    reader: Option[Channel[Result[(), Error]]],
+    writer: Option[Channel[Result[(), Error]]],
+    failure: Option[Error],
+}
+
+struct ReactorState {
+    entries: HashMap[usize, Registration],
+    next_id: Ref[usize],
+    failure: Ref[Option[Error]],
+}
+
+struct Reactor {
+    fd: usize,
+    state: Channel[ReactorState],
+}
+
+static REACTOR: OnceCell[Channel[Option[Reactor]]] = OnceCell::new();
+
+fn notify_ready(waiter: Option[Channel[Result[(), Error]]], result: Result[(), Error]) -> () {
+    if let Some(channel) = waiter {
+        select {
+            send(channel, result) => (),
+            default => (),
+        }
+    }
+}
+
+fn epoll_update(reactor: Reactor, id: usize, entry: Registration, command: usize) -> Result[
+    (),
+    Error,
+] {
+    let data = zeroes(12);
+    let mask: u64 = 0x40000000
+        | if entry.reader.is_some() {
+            1
+        } else {
+            0
+        }
+        | if entry.writer.is_some() {
+            4
+        } else {
+            0
+        };
+    put_le(data.as_mut_slice(), 0, mask, 4);
+    put_le(data.as_mut_slice(), 4, id.to_u64(), 8);
+    invoke(
+        syscall::SYS_EPOLL_CTL,
+        [
+            Arg::Word(reactor.fd),
+            Arg::Word(command),
+            Arg::Word(entry.fd),
+            Arg::Buffer(data.as_mut_slice()),
+            Arg::Word(0),
+            Arg::Word(0),
+        ],
+        "update epoll",
+    ).map(|_| ())
+}
+
+fn reactor_dispatch(reactor: Reactor, state: ReactorState, id: usize, mask: u64) -> () {
+    if let Some(previous) = state.entries[id] {
+        let mut entry = previous;
+        if mask & 0x19 != 0 {
+            notify_ready(entry.reader, Result::Ok(()));
+            entry = Registration { reader: Option::None, ..entry };
+        }
+        if mask & 0x1c != 0 {
+            notify_ready(entry.writer, Result::Ok(()));
+            entry = Registration { writer: Option::None, ..entry };
+        }
+        if entry.reader.is_some() || entry.writer.is_some() {
+            if let Err(value) = epoll_update(reactor, id, entry, 3) {
+                notify_ready(entry.reader, Result::Err(value));
+                notify_ready(entry.writer, Result::Err(value));
+                entry = Registration {
+                    reader: Option::None,
+                    writer: Option::None,
+                    failure: Option::Some(value),
+                    ..entry,
+                };
+            }
+        }
+        state.entries.set(id, entry);
+    }
+}
+
+fn reactor_run(reactor: Reactor) -> () {
+    let data = zeroes(12 * 64);
+    loop {
+        let batch = invoke(
+            syscall::SYS_EPOLL_WAIT,
+            [
+                Arg::Word(reactor.fd),
+                Arg::Buffer(data.as_mut_slice()),
+                Arg::Word(64),
+                Arg::Word((-1).to_usize()),
+                Arg::Word(0),
+                Arg::Word(0),
+            ],
+            "wait epoll",
+        );
+        let state = match reactor.state.recv() {
+            Some(value) => value,
+            None => return,
+        };
+        match batch {
+            Ok(count) => {
+                for index in 0..count.to_isize() {
+                    reactor_dispatch(
+                        reactor,
+                        state,
+                        get_le(data.as_slice(), index * 12 + 4, 8).to_usize(),
+                        get_le(data.as_slice(), index * 12, 4),
+                    );
+                }
+                reactor.state.send(state);
+            },
+            Err(value) => {
+                state.failure.set(Option::Some(value));
+                for (_, entry) in state.entries.entries() {
+                    notify_ready(entry.reader, Result::Err(value));
+                    notify_ready(entry.writer, Result::Err(value));
+                }
+                let _ = close_fd(reactor.fd);
+                reactor.state.send(state);
+                return;
+            },
+        }
+    }
+}
+
+#[allow(unstructured_go)]
+fn create_reactor() -> Result[Reactor, Error] {
+    let fd = invoke(
+        syscall::SYS_EPOLL_CREATE1,
+        [Arg::Word(0x80000), Arg::Word(0), Arg::Word(0), Arg::Word(0), Arg::Word(0), Arg::Word(0)],
+        "create epoll",
+    )?;
+    let state = Channel::new(1);
+    state.send(
+        ReactorState {
+            entries: HashMap::new(),
+            next_id: Ref::new(1),
+            failure: Ref::new(Option::None),
+        },
+    );
+    let reactor = Reactor { fd, state };
+    go || reactor_run(reactor);
+    Result::Ok(reactor)
+}
+
+fn shared_reactor() -> Result[Reactor, Error] {
+    let cell = REACTOR.get_or_init(
+        || {
+            let channel = Channel::new(1);
+            channel.send(Option::None);
+            channel
+        },
+    );
+    let previous = cell.recv().unwrap_or(Option::None);
+    if let Some(reactor) = previous {
+        let state = reactor.state.recv().ok_or(closed("epoll state"))?;
+        let failed = state.failure.get().is_some();
+        reactor.state.send(state);
+        if !failed {
+            cell.send(previous);
+            return Result::Ok(reactor);
+        }
+    }
+    let result = create_reactor();
+    cell.send(
+        match result {
+            Ok(value) => Option::Some(value),
+            Err(_) => Option::None,
+        },
+    );
+    result
+}
+
+impl Reactor {
+    fn register(self: Reactor, fd: usize) -> Result[usize, Error] {
+        let state = self.state.recv().ok_or(closed("register socket"))?;
+        defer self.state.send(state);
+        if let Some(value) = state.failure.get() {
+            return Result::Err(value);
+        }
+        let id = state.next_id.get();
+        if id == 0 {
+            return Result::Err(
+                error(ErrorKind::Other, "register socket", "registration identifiers exhausted"),
+            );
+        }
+        state.next_id.set(id + 1);
+        let entry = Registration {
+            fd,
+            reader: Option::None,
+            writer: Option::None,
+            failure: Option::None,
+        };
+        epoll_update(self, id, entry, 1)?;
+        state.entries.set(id, entry);
+        Result::Ok(id)
+    }
+
+    fn arm(self: Reactor, id: usize, writing: bool) -> Result[Channel[Result[(), Error]], Error] {
+        let state = self.state.recv().ok_or(closed("wait socket"))?;
+        defer self.state.send(state);
+        if let Some(value) = state.failure.get() {
+            return Result::Err(value);
+        }
+        let entry = state.entries[id].ok_or(closed("wait socket"))?;
+        if let Some(value) = entry.failure {
+            return Result::Err(value);
+        }
+        let channel = Channel::new(1);
+        let entry = if writing {
+            Registration { writer: Option::Some(channel), ..entry }
+        } else {
+            Registration { reader: Option::Some(channel), ..entry }
+        };
+        epoll_update(self, id, entry, 3)?;
+        state.entries.set(id, entry);
+        Result::Ok(channel)
+    }
+
+    fn disarm(self: Reactor, id: usize, writing: bool) -> () {
+        if let Some(state) = self.state.recv() {
+            defer self.state.send(state);
+            if state.failure.get().is_some() {
+                return;
+            }
+            if let Some(entry) = state.entries[id] {
+                let entry = if writing {
+                    Registration { writer: Option::None, ..entry }
+                } else {
+                    Registration { reader: Option::None, ..entry }
+                };
+                let entry = match epoll_update(self, id, entry, 3) {
+                    Ok(()) => entry,
+                    Err(value) => {
+                        notify_ready(entry.reader, Result::Err(value));
+                        notify_ready(entry.writer, Result::Err(value));
+                        Registration {
+                            reader: Option::None,
+                            writer: Option::None,
+                            failure: Option::Some(value),
+                            ..entry,
+                        }
+                    },
+                };
+                state.entries.set(id, entry);
+            }
+        }
+    }
+
+    fn remove(self: Reactor, id: usize) -> () {
+        if let Some(state) = self.state.recv() {
+            defer self.state.send(state);
+            if let Some(entry) = state.entries.remove_value(id) {
+                if state.failure.get().is_none() {
+                    let _ = epoll_update(self, id, entry, 2);
+                }
+            }
+        }
+    }
+}

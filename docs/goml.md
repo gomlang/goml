@@ -2847,12 +2847,13 @@ Public APIs include:
 - `env::args`, current-directory and executable queries, and environment-variable reads
 - `ffi::String`, `Rune`, `Ptr`, `Error`, `Func`, `RawSlice`, `RawMap`, and explicit Go boundary adapters
 - `fs::read_file_structured`, `write_file_structured`, structured byte I/O, directory operations, path inspection, and `sha256_file`
-- `fs::notify` Linux amd64 file and recursive-directory notifications, event filters, independent multi-path registrations, cancellable reads, bounded subscriptions, rename cookies, and rescan signals
+- `fs::notify` Linux amd64 file and recursive-directory notifications, event filters, ignore rules with subtree pruning, independent multi-path registrations, cancellable reads, bounded subscriptions, rename cookies, and rescan signals
 - `fs::walkdir::{walk, WalkDir, WalkIterator, DirEntry, Error}` for lazy directory traversal, depth bounds, pruning, link following, and contextual errors
 - `io::print`, `println`, `eprint`, `eprintln`, and byte-oriented standard stream I/O
 - `iter::empty`, `once`, `from_fn`, iterator adapters, and single-pass consumers
 - `json::Value`, `parse`, `encode`, serde `Serialize` and `Deserialize` re-exports, `to_value`, `from_value`, `try_to_string`, `from_string`, `field`, and typed `as_*` accessors
 - `math` f32/f64 elementary functions, IEEE 754 classification, and the `E`, `PI`, `TAU`, `SQRT_2`, `LN_2`, and `LN_10` constants
+- `net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket, WaitOptions}` for Linux amd64 syscall-backed IPv4/IPv6 networking, shared epoll readiness, timeouts, and cancellation
 - `num` structured parsing plus checked and saturating `i64` arithmetic
 - `os::linux::syscall` Linux amd64 calls by number, six machine-word arguments, scoped mutable byte buffers, raw return values, and numeric errno
 - `path::join`, `clean`, `is_absolute`, component inspection, and `absolute_structured`
@@ -3018,7 +3019,55 @@ The caller is responsible for the syscall ABI, valid addresses, buffer lengths, 
 
 Buffer lifetimes cover synchronous calls only. Operations that retain a pointer after returning, nested pointer graphs, and arbitrary Go object memory are outside this buffer API. The runtime uses scheduling-aware `Syscall6`, not `RawSyscall6`. It performs one call without automatic `EINTR` retry or completion of partial reads/writes. Per-thread operations require thread-affinity handling that this API does not provide. Raw changes to threads, process creation, signal handlers, or the Go runtime's address space can violate runtime invariants; accepting a number does not make every kernel operation safe to use from GoML. Calls remain subject to kernel availability, process permissions, and sandbox policy.
 
-The initial constant set is `SYS_READ`, `SYS_WRITE`, `SYS_CLOSE`, `SYS_FSTAT`, `SYS_POLL`, `SYS_MMAP`, `SYS_MUNMAP`, `SYS_GETPID`, `SYS_GETUID`, `SYS_GETPPID`, `SYS_GETDENTS64`, `SYS_CLOCK_GETTIME`, `SYS_INOTIFY_ADD_WATCH`, `SYS_INOTIFY_RM_WATCH`, `SYS_OPENAT`, `SYS_NEWFSTATAT`, `SYS_PIPE2`, and `SYS_INOTIFY_INIT1`, plus `EINTR`, `EBADF`, `EAGAIN`, `EINVAL`, and `ENOSYS`. Other numbers can be passed directly. This package uses ordinary imports, functions, enums, arrays, and mutable slices; it introduces no new grammar or `unsafe` syntax and cannot be used in `comptime`.
+The exported syscall constants are `SYS_READ`, `SYS_WRITE`, `SYS_CLOSE`, `SYS_FSTAT`, `SYS_POLL`, `SYS_MMAP`, `SYS_MUNMAP`, `SYS_GETPID`, `SYS_SOCKET`, `SYS_CONNECT`, `SYS_SENDTO`, `SYS_RECVFROM`, `SYS_SHUTDOWN`, `SYS_BIND`, `SYS_LISTEN`, `SYS_GETSOCKNAME`, `SYS_GETPEERNAME`, `SYS_SETSOCKOPT`, `SYS_GETSOCKOPT`, `SYS_GETUID`, `SYS_GETPPID`, `SYS_GETDENTS64`, `SYS_CLOCK_GETTIME`, `SYS_EPOLL_WAIT`, `SYS_EPOLL_CTL`, `SYS_INOTIFY_ADD_WATCH`, `SYS_INOTIFY_RM_WATCH`, `SYS_OPENAT`, `SYS_NEWFSTATAT`, `SYS_ACCEPT4`, `SYS_EPOLL_CREATE1`, `SYS_PIPE2`, and `SYS_INOTIFY_INIT1`, plus `EINTR`, `EBADF`, `EAGAIN`, `EINVAL`, and `ENOSYS`. Other numbers can be passed directly. This package uses ordinary imports, functions, enums, arrays, and mutable slices; it introduces no new grammar or `unsafe` syntax and cannot be used in `comptime`.
+
+### Networking
+
+`std::net` implements IPv4/IPv6 TCP and UDP in GoML using Linux amd64 socket syscalls. It does not delegate networking to Go's `net` package. All sockets are nonblocking and close-on-exec; a lazy shared epoll worker wakes waiting GoML tasks through channels. One epoll descriptor and one worker remain for the lifetime of the process, independent of the number of sockets. The implementation uses one-shot, level-triggered readiness and registration identities that prevent queued events from targeting a reused descriptor. Native layouts and readiness handling follow [socket](https://man7.org/linux/man-pages/man2/socket.2.html), [connect](https://man7.org/linux/man-pages/man2/connect.2.html), [accept](https://man7.org/linux/man-pages/man2/accept.2.html), and [epoll_ctl](https://man7.org/linux/man-pages/man2/epoll_ctl.2.html).
+
+`IpAddr` is `V4([byte; 4])` or `V6([u16; 8])`. `IpAddr::parse(string)` accepts numeric addresses, including compressed IPv6 and an IPv4 tail in IPv6. IPv4 octets use decimal without leading zeroes. `SocketAddr` exposes `ip: IpAddr`, `port: u16`, and `scope_id: u32`; `new(ip, port)` sets scope zero. `SocketAddr::parse` accepts `127.0.0.1:8080`, `[::1]:8080`, or `[fe80::1%3]:8080`. IPv6 scope IDs are numeric; interface names and hostnames are unsupported. Scope must be zero for IPv4. Both address types support equality, debug output, and `to_string()`; IPv6 output uses lowercase hexadecimal with the longest first zero run compressed. Port zero asks the kernel to assign a port when binding; read it with `local_addr()`.
+
+All operations return `Result[T, net::Error]`; `Error` and `ErrorKind` re-export `std::io` types. Errors retain operation names and numeric errno when available. Cancellation is `Interrupted`, timeout is `TimedOut`, use after close is `InvalidInput`, and premature TCP EOF in `read_exact` is `UnexpectedEof`. Connection errors not represented by `io::ErrorKind`, such as connection refused or reset, use `Other` with `raw_os_code()`. Address parsing failures are `InvalidInput`.
+
+| Type and operation | Result value and behavior |
+| --- | --- |
+| `TcpListener::bind(address)` | `TcpListener`; binds with address reuse enabled and backlog 128 |
+| `TcpListener::bind_with_backlog(address, backlog: isize)` | `TcpListener`; backlog must fit a positive signed 32-bit value |
+| `TcpListener.accept()` | `(TcpStream, SocketAddr)`; waits for one incoming connection and returns its peer address |
+| `TcpStream::connect(address)` | `TcpStream`; waits for connection establishment and checks the socket error after readiness |
+| `TcpStream.read(buffer: MutSlice[byte])` | `isize` byte count; may read fewer bytes than requested; zero indicates EOF for a nonempty buffer |
+| `TcpStream.write(buffer: Slice[byte])` | `isize` byte count; may write fewer bytes than requested |
+| `TcpStream.read_exact(buffer)` / `write_all(buffer)` | `()`; loops until complete, EOF, or error |
+| `TcpStream.shutdown(Shutdown::Read / Write / Both)` | `()`; shuts down a direction without releasing the descriptor |
+| `TcpStream.set_nodelay(bool)` | `()`; enables or disables TCP_NODELAY |
+| `TcpStream.peer_addr()` | `SocketAddr` |
+| `UdpSocket::bind(address)` | `UdpSocket` |
+| `UdpSocket.send_to(data: Slice[byte], destination: SocketAddr)` | `isize`; sends one datagram, including an empty datagram |
+| `UdpSocket.recv_from(buffer: MutSlice[byte])` | `Datagram` with public `source`, copied `len`, full `datagram_len`, and `truncated` fields |
+| All three socket types: `local_addr()`, `close()`, `is_closed()` | `SocketAddr`, `()`, and a plain `bool`, respectively |
+
+UDP receives consume exactly one datagram, including when the buffer is empty. Excess bytes are discarded; `datagram_len` and `truncated` report this according to Linux [MSG_TRUNC semantics](https://man7.org/linux/man-pages/man2/recv.2.html). A zero-length UDP receive is a valid datagram, not EOF. TCP zero-length reads and writes complete without data transfer on an open socket. Sending uses `MSG_NOSIGNAL` so a broken connection becomes an error. Send methods copy the immutable input into a syscall buffer; callers must not concurrently mutate input or receive buffers.
+
+`WaitOptions::new()` waits indefinitely. `.with_timeout(time::Duration)` and `.with_cancel(task::CancelToken)` return modified options. `accept_with(options)`, `connect_with(address, options)`, `read_with(buffer, options)`, `read_exact_with(buffer, options)`, `write_with(buffer, options)`, `write_all_with(buffer, options)`, `send_to_with(data, destination, options)`, and `recv_from_with(buffer, options)` apply these settings. A timeout covers the whole operation, including waiting behind another reader or writer and all partial transfers; it does not restart after progress. Zero timeout returns `TimedOut` without attempting I/O. Completed I/O may win a race with cancellation or timeout. After a failed `read_exact` or `write_all`, some bytes may already have transferred; the buffer is not rolled back and the error does not report a partial count. Use individual `read`/`write` calls when tracking progress is required.
+
+Socket values are shared handles. Multiple reads or multiple writes serialize per socket; one reader and one writer can progress concurrently. Concurrent `close()` wakes active and queued operations, releases the socket once, and is idempotent. Failed binds and connects release their descriptors. Always close sockets explicitly or with `defer`; garbage collection does not close them. IPv6 sockets are IPv6-only, so bind separate IPv4 and IPv6 listeners when both are needed. DNS resolution, Unix-domain sockets, TLS, HTTP, and other platforms are outside this initial API. It uses existing imports, enums, methods, channels, and tasks and adds no grammar or compile-time networking.
+
+```goml
+use std::net;
+use std::time;
+
+fn echo_once() -> Result[(), net::Error] {
+    let address = net::SocketAddr::parse("127.0.0.1:8080")?;
+    let listener = net::TcpListener::bind(address)?;
+    defer { let _ = listener.close(); };
+    let wait = net::WaitOptions::new().with_timeout(time::Duration::from_seconds(10));
+    let (stream, _) = listener.accept_with(wait)?;
+    defer { let _ = stream.close(); };
+    let buffer = Vec::from_array([0, 0, 0, 0]);
+    let count = stream.read_with(buffer.as_mut_slice(), wait)?;
+    stream.write_all_with(buffer.slice(0, count), wait)
+}
+```
 
 ### Directory traversal
 
@@ -3074,6 +3123,8 @@ Traversal uses an explicit stack rather than recursive calls; memory scales with
 `watch_with(path, options: Options)` configures a single watcher. `Options::new()` uses `recursive = false` and `mask = CHANGES`; `with_recursive(bool)` and `with_mask(u32)` return adjusted options. Both fields are public. A requested mask must be a nonempty subset of `ALL_EVENTS`. The available request bits are `ACCESS`, `MODIFY`, `ATTRIB`, `CLOSE_WRITE`, `CLOSE_NOWRITE`, `OPEN`, `MOVED_FROM`, `MOVED_TO`, `CREATE`, `DELETE`, `DELETE_SELF`, and `MOVE_SELF`. `CHANGES` includes these except `ACCESS`, `CLOSE_NOWRITE`, and `OPEN`. Recursive directory topology events, root lifecycle events, and recovery notifications are always delivered even when excluded by the requested filter, so filtering cannot disable recursive maintenance.
 
 `Event` has public `path: string`, `mask: u32`, `cookie: u32`, and `rescan: bool` fields. Paths are absolute. `has(mask)` tests whether any requested mask bit is present, and `is_dir()` tests `IS_DIR`. In addition to requested event bits, masks may contain `UNMOUNT`, `Q_OVERFLOW`, `IGNORED`, or `IS_DIR`. Matching nonzero cookies connect `MOVED_FROM` and `MOVED_TO` events within a registration; cookies are not persistent object identities.
+
+Build ignore rules with `Options::new().with_ignored_names(Vec::from_array([".git", "node_modules"]))` or `with_ignore((absolute_path: string, is_directory: bool) -> bool)`. Repeated calls combine rules with OR. Name rules match literal basenames at every depth and snapshot the supplied vector; they are not glob patterns. An ignored directory prunes its entire subtree, avoiding recursive watches and scans there. Rules apply to initial discovery, new directories, renames, and overflow recovery, including registrations in `WatchSet` and subscriptions. Moving a visible directory into an ignored path removes its subtree watches; moving it back installs watches and requests a rescan. The root itself and recovery signals are never ignored. Construct options through `new()`; predicates must be stable, quick, and must not call back into their watcher because they run while its state is locked.
 
 `Watcher.try_read() -> Result[Vec[Event], fs::Error]` reads one available batch without waiting for new kernel events. `Watcher.read(timeout: time::Duration)` has the same return type and waits for a nonempty batch, returning an empty vector on timeout. A zero timeout checks immediately. `read_with(cancel: task::CancelToken, timeout)` returns `Result[task::WaitResult[Vec[Event]], fs::Error]`; cancellation returns `Cancelled` and leaves the watcher available. A read that wins a race with cancellation may return `Completed(events)`. Waits check cancellation and close in intervals of at most 50 ms. Timeouts and cancellation bound waiting for kernel events, not directory scans or time spent waiting for another operation to release shared state.
 
@@ -3343,7 +3394,8 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | Go binding generator | `goml bind-go <CONFIG>` selects explicit package/symbol allowlists and finite Go-checked generic arguments; emits raw bindings with protected deterministic output |
 | Go-callable export | Annotate a supported public function with `#[go_export("Name")]` and generate a Go package with `goml export-go` |
 | Traverse a directory tree | `std::fs::walkdir` Linux amd64 syscall-backed depth-first iteration with depth bounds, pruning, optional link following, and per-path errors |
-| Watch a directory tree for changes | Use `fs::notify::watch_recursive` or `WatchSet` on Linux amd64, consume timed reads or scoped subscriptions, handle `Event.rescan`, and close the handle |
+| Watch a directory tree for changes | Use `fs::notify::watch_recursive` or `WatchSet` on Linux amd64, prune ignored paths through `Options`, consume timed reads or scoped subscriptions, handle `Event.rescan`, and close the handle |
+| TCP and UDP networking | `std::net` Linux amd64 syscall-backed sockets with numeric IPv4/IPv6 addresses, shared epoll readiness, explicit close, timeouts, and task cancellation |
 | Treat a GoML integer or struct as a kernel pointer/layout | Use `syscall::Arg::Buffer` for synchronous byte storage on Linux amd64; encode the native ABI explicitly and inspect `SyscallResult.errno` |
 | Unannotated user `extern fn` | Use a normal GoML function or `#[go_ffi("import/path", "ExportedSymbol")] extern fn`; project commands validate Go calls by default (`--ffi-check required`) |
 | Call an ordinary function from `comptime` | Mark a supported free function with `#[comptime]` |
