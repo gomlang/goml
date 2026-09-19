@@ -1,0 +1,129 @@
+package ipc;
+
+use std::bytes::endian;
+use std::io::{Error};
+use std::internal::linux as kernel;
+use std::os::linux::fd;
+use std::os::linux::abi;
+use std::os::linux::syscall;
+use std::testing;
+
+fn raw_descriptor() -> usize {
+    let descriptor = testing::expect_ok(fd::memfd("ancillary-parser", 0), "memfd");
+    testing::expect_ok(descriptor.into_raw(), "release memfd")
+}
+
+fn expect_closed(raw: usize) -> () {
+    let result = testing::expect_ok(syscall::syscall6(syscall::SYS_FCNTL, [raw, fd::F_GETFD, 0, 0, 0, 0]), "inspect descriptor");
+    testing::assert_eq(result.errno, syscall::EBADF);
+}
+
+fn rights(raw: Slice[usize]) -> Vec[byte] {
+    let data = kernel::zeroes(control_space(raw.len()));
+    let _ = endian::write_u64(data.as_mut_slice(), 0, (16 + raw.len() * 4).to_u64(), endian::Endian::Little);
+    let _ = endian::write_i32(data.as_mut_slice(), 8, 1, endian::Endian::Little);
+    let _ = endian::write_i32(data.as_mut_slice(), 12, 1, endian::Endian::Little);
+    for index in 0..raw.len() {
+        let _ = endian::write_i32(data.as_mut_slice(), 16 + index * 4, raw[index].to_i32(), endian::Endian::Little);
+    }
+    data
+}
+
+#[test]
+fn malformed_ancillary_records_close_preceding_descriptors() -> () {
+    for length in 1..16 {
+        testing::assert(receive_descriptors(kernel::zeroes(length).as_slice(), 2, 0).is_err());
+    }
+    let raw = raw_descriptor();
+    let data = rights(Vec::from_array([raw]).as_slice());
+    for _ in 0..16 {
+        data.push(0);
+    }
+    testing::assert(receive_descriptors(data.as_slice(), 2, 0).is_err());
+    expect_closed(raw);
+    let raw = raw_descriptor();
+    let data = rights(Vec::from_array([raw]).as_slice());
+    let _ = endian::write_u64(data.as_mut_slice(), 0, 21, endian::Endian::Little);
+    testing::assert(receive_descriptors(data.as_slice(), 2, 0).is_err());
+    expect_closed(raw);
+    let raw = raw_descriptor();
+    let data = rights(Vec::from_array([raw]).as_slice());
+    for _ in 0..8 {
+        data.push(0);
+    }
+    testing::assert(receive_descriptors(data.as_slice(), 2, 0).is_err());
+    expect_closed(raw);
+}
+
+#[test]
+fn truncated_or_excess_rights_are_closed() -> () {
+    for flags in Vec::from_array([0, MSG_CTRUNC]) {
+        let first = raw_descriptor();
+        let second = raw_descriptor();
+        let data = rights(Vec::from_array([first, second]).as_slice());
+        testing::assert(receive_descriptors(data.as_slice(), 1, flags).is_err());
+        expect_closed(first);
+        expect_closed(second);
+    }
+    let raw = raw_descriptor();
+    let data = rights(Vec::from_array([raw]).as_slice());
+    testing::assert(receive_descriptors(data.as_slice(), 1, MSG_CTRUNC).is_err());
+    expect_closed(raw);
+}
+
+#[test]
+fn failed_adoption_closes_prior_and_remaining_descriptors() -> () {
+    let first = raw_descriptor();
+    let invalid_raw = raw_descriptor();
+    let third = raw_descriptor();
+    close_raw(invalid_raw);
+    let data = rights(Vec::from_array([first, invalid_raw, third]).as_slice());
+    testing::assert(receive_descriptors(data.as_slice(), 3, 0).is_err());
+    expect_closed(first);
+    expect_closed(third);
+}
+
+#[test]
+fn ancillary_rights_preserve_order_and_last_unaligned_record() -> () {
+    let first = raw_descriptor();
+    let second = raw_descriptor();
+    let third = raw_descriptor();
+    let data = rights(Vec::from_array([first, second, third]).as_slice());
+    let descriptors = testing::expect_ok(receive_descriptors(data.slice(0, 28), 3, 0), "unaligned final rights record");
+    testing::assert_eq(descriptors.len(), 3);
+    for index in 0..descriptors.len() {
+        let raw = testing::expect_ok(descriptors[index].with_raw_fd(|raw| Result::Ok(raw)), "inspect received number");
+        testing::assert_eq(raw, Vec::from_array([first, second, third])[index]);
+        testing::expect_ok(descriptors[index].close(), "close adopted rights");
+    }
+}
+
+#[test]
+fn borrows_are_released_when_an_action_or_later_borrow_fails() -> () {
+    let first = testing::expect_ok(fd::memfd("first-borrow", 0), "first memfd");
+    let second = testing::expect_ok(fd::memfd("second-borrow", 0), "second memfd");
+    testing::expect_ok(second.close(), "close second");
+    let result: Result[(), Error] = fd::with_raw_fds(Vec::from_array([first, second]).as_slice(), |_| Result::Ok(()));
+    testing::assert(result.is_err());
+    let result: Result[(), Error] = fd::with_raw_fds(Vec::from_array([first, first]).as_slice(), |_| Result::Err(invalid("borrow", "failure")));
+    testing::assert(result.is_err());
+    testing::expect_ok(first.close(), "borrow releases all active guards");
+}
+
+#[test]
+fn epoll_internal_identifiers_hide_wakeups_and_removed_watches() -> () {
+    let descriptor = testing::expect_ok(fd::memfd("watch-identity", 0), "identity fd");
+    defer testing::expect_ok(descriptor.close(), "close identity fd");
+    let watches = Vec::from_array([
+        Watch { descriptor, token: 0, id: 2 },
+        Watch { descriptor, token: 0xffffffffffffffff, id: 3 },
+    ]);
+    testing::assert_none(ready_event(abi::EpollEvent { events: EPOLLIN, data: 0 }, watches.as_slice()));
+    testing::assert_none(ready_event(abi::EpollEvent { events: EPOLLIN, data: 1 }, watches.as_slice()));
+    let zero = testing::expect_some(ready_event(abi::EpollEvent { events: EPOLLIN, data: 2 }, watches.as_slice()), "zero token");
+    testing::assert_eq(zero.data, 0);
+    testing::assert_eq(zero.events, EPOLLIN);
+    let maximum = testing::expect_some(ready_event(abi::EpollEvent { events: EPOLLOUT, data: 3 }, watches.as_slice()), "maximum token");
+    testing::assert_eq(maximum.data, 0xffffffffffffffff);
+    testing::assert_eq(maximum.events, EPOLLOUT);
+}

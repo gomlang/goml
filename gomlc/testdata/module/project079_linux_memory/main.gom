@@ -1,0 +1,231 @@
+package main;
+
+use std::io;
+use std::os::linux::fd;
+use std::os::linux::memory;
+use std::os::linux::syscall;
+use std::testing;
+
+fn bytes(length: isize, value: byte) -> Vec[byte] {
+    let output: Vec[byte] = Vec::with_capacity(length);
+    for _ in 0..length {
+        output.push(value);
+    }
+    output
+}
+
+fn expect_errno[T](value: Result[T, io::Error], code: usize) -> () {
+    let error = testing::expect_err(value, "expected operating system error");
+    testing::assert(error.raw_os_code() == Option::Some(code.to_isize()));
+}
+
+fn check_anonymous() -> () {
+    let length = memory::PAGE_SIZE + 3;
+    let mapping = testing::expect_ok(
+        memory::anonymous(length, memory::PROT_READ | memory::PROT_WRITE, memory::MAP_PRIVATE),
+        "anonymous mmap",
+    );
+    defer testing::expect_ok(mapping.close(), "cleanup anonymous mmap");
+    testing::assert(mapping.len() == length);
+    testing::assert(!mapping.is_closed());
+    let output = bytes(length, 7);
+    testing::expect_ok(
+        mapping.read_exact_at(output.as_mut_slice(), 0),
+        "read zero initialized mapping",
+    );
+    testing::assert(output == bytes(length, 0));
+    let input = b"pages";
+    testing::expect_ok(
+        mapping.write_all_at(input.as_slice(), memory::PAGE_SIZE - 2),
+        "write across page boundary",
+    );
+    let copied = bytes(5, 0);
+    testing::assert(
+        testing::expect_ok(
+            mapping.read_at(copied.as_mut_slice(), memory::PAGE_SIZE - 2),
+            "copy mapped data",
+        )
+            == 5,
+    );
+    testing::assert(copied == input);
+    let resident = testing::expect_ok(mapping.residency(), "query page residency");
+    testing::assert(resident.len() == 2 && resident[0] && resident[1]);
+    let empty: Vec[byte] = Vec::new();
+    testing::assert(
+        testing::expect_ok(mapping.read_at(empty.as_mut_slice(), length), "empty end read") == 0,
+    );
+    testing::assert(mapping.read_at(copied.as_mut_slice(), length - 4).is_err());
+    testing::assert(mapping.read_at(copied.as_mut_slice(), -1).is_err());
+    testing::assert(mapping.write_at(input.as_slice(), 0x7fffffffffffffff).is_err());
+    testing::expect_ok(mapping.protect(memory::PROT_READ), "read only mapping");
+    expect_errno(mapping.write_at(input.as_slice(), 0), syscall::EACCES);
+    testing::expect_ok(
+        mapping.read_exact_at(copied.as_mut_slice(), memory::PAGE_SIZE - 2),
+        "read protected mapping",
+    );
+    testing::assert(mapping.protect(16).is_err());
+    testing::expect_ok(
+        mapping.read_exact_at(copied.as_mut_slice(), memory::PAGE_SIZE - 2),
+        "failed protect retains old permission",
+    );
+    testing::expect_ok(mapping.protect(memory::PROT_NONE), "inaccessible mapping");
+    expect_errno(mapping.read_at(copied.as_mut_slice(), 0), syscall::EACCES);
+    testing::expect_ok(
+        mapping.protect(memory::PROT_READ | memory::PROT_WRITE),
+        "restore mapping access",
+    );
+    testing::expect_ok(mapping.advise(memory::MADV_DONTNEED), "discard anonymous pages");
+    testing::expect_ok(mapping.read_exact_at(output.as_mut_slice(), 0), "read discarded pages");
+    testing::assert(output == bytes(length, 0));
+    testing::expect_ok(mapping.sync(memory::MS_SYNC), "synchronize anonymous mapping");
+    expect_errno(mapping.advise(0xffff), syscall::EINVAL);
+    expect_errno(mapping.sync(memory::MS_ASYNC | memory::MS_SYNC), syscall::EINVAL);
+    match mapping.lock(0) {
+        Ok(_) => testing::expect_ok(mapping.unlock(), "unlock pages"),
+        Err(error) => testing::assert(
+            error.raw_os_code() == Option::Some(syscall::EPERM.to_isize())
+                || error.raw_os_code() == Option::Some(syscall::ENOMEM.to_isize())
+                || error.raw_os_code() == Option::Some(syscall::EAGAIN.to_isize()),
+        ),
+    }
+    let alias = mapping;
+    testing::expect_ok(alias.close(), "unmap shared owner");
+    testing::assert(mapping.is_closed());
+    testing::expect_ok(mapping.close(), "idempotent unmap");
+    expect_errno(mapping.read_at(copied.as_mut_slice(), 0), syscall::EBADF);
+    expect_errno(mapping.write_at(input.as_slice(), 0), syscall::EBADF);
+    expect_errno(mapping.protect(memory::PROT_READ), syscall::EBADF);
+    expect_errno(mapping.residency(), syscall::EBADF);
+    expect_errno(mapping.sync(memory::MS_SYNC), syscall::EBADF);
+    expect_errno(mapping.advise(memory::MADV_NORMAL), syscall::EBADF);
+    expect_errno(mapping.lock(0), syscall::EBADF);
+    expect_errno(mapping.unlock(), syscall::EBADF);
+    testing::assert(memory::anonymous(0, memory::PROT_READ, memory::MAP_PRIVATE).is_err());
+    testing::assert(memory::anonymous(-1, memory::PROT_READ, memory::MAP_PRIVATE).is_err());
+    testing::assert(
+        memory::anonymous(1, memory::PROT_READ, memory::MAP_PRIVATE | memory::MAP_FIXED).is_err(),
+    );
+    testing::assert(memory::anonymous(1, 16, memory::MAP_PRIVATE).is_err());
+}
+
+fn check_file() -> () {
+    let descriptor = testing::expect_ok(fd::memfd("mapping", 0), "create backing file");
+    defer testing::expect_ok(descriptor.close(), "close backing file");
+    testing::expect_ok(descriptor.truncate((memory::PAGE_SIZE * 2).to_i64()), "size backing file");
+    let shared = testing::expect_ok(
+        memory::file(
+            descriptor,
+            memory::PAGE_SIZE,
+            memory::PAGE_SIZE.to_i64(),
+            memory::PROT_READ | memory::PROT_WRITE,
+            memory::MAP_SHARED,
+        ),
+        "shared file mmap",
+    );
+    defer testing::expect_ok(shared.close(), "close shared mapping");
+    let second = testing::expect_ok(
+        memory::file(
+            descriptor,
+            memory::PAGE_SIZE,
+            memory::PAGE_SIZE.to_i64(),
+            memory::PROT_READ | memory::PROT_WRITE,
+            memory::MAP_SHARED,
+        ),
+        "second shared mapping",
+    );
+    defer testing::expect_ok(second.close(), "close second mapping");
+    let private = testing::expect_ok(
+        memory::file(
+            descriptor,
+            memory::PAGE_SIZE,
+            memory::PAGE_SIZE.to_i64(),
+            memory::PROT_READ | memory::PROT_WRITE,
+            memory::MAP_PRIVATE,
+        ),
+        "private file mmap",
+    );
+    defer testing::expect_ok(private.close(), "close private mapping");
+    testing::expect_ok(shared.write_all_at(b"shared".as_slice(), 0), "write shared pages");
+    testing::expect_ok(shared.sync(memory::MS_SYNC), "flush mapped file");
+    let output = bytes(6, 0);
+    testing::expect_ok(
+        descriptor.read_at(output.as_mut_slice(), memory::PAGE_SIZE.to_i64()),
+        "read backing file",
+    );
+    testing::assert(output == b"shared");
+    testing::expect_ok(second.read_exact_at(output.as_mut_slice(), 0), "read shared mapping");
+    testing::assert(output == b"shared");
+    testing::expect_ok(private.write_all_at(b"secret".as_slice(), 0), "private copy on write");
+    testing::expect_ok(private.read_exact_at(output.as_mut_slice(), 0), "read private copy");
+    testing::assert(output == b"secret");
+    testing::expect_ok(
+        shared.read_exact_at(output.as_mut_slice(), 0),
+        "shared mapping retains original",
+    );
+    testing::assert(output == b"shared");
+    testing::assert(memory::file(descriptor, 1, 1, memory::PROT_READ, memory::MAP_PRIVATE).is_err());
+    testing::assert(
+        memory::file(descriptor, 1, -4096, memory::PROT_READ, memory::MAP_PRIVATE).is_err(),
+    );
+    testing::assert(
+        memory::file(
+            descriptor,
+            1,
+            0,
+            memory::PROT_READ,
+            memory::MAP_ANONYMOUS | memory::MAP_PRIVATE,
+        ).is_err(),
+    );
+    testing::expect_ok(descriptor.close(), "close descriptor while mapped");
+    testing::expect_ok(second.write_all_at(b"living".as_slice(), 0), "mapping outlives descriptor");
+    testing::expect_ok(shared.read_exact_at(output.as_mut_slice(), 0), "remaining shared mapping");
+    testing::assert(output == b"living");
+}
+
+fn check_truncated() -> () {
+    let descriptor = testing::expect_ok(fd::memfd("truncated-mapping", 0), "truncation file");
+    defer testing::expect_ok(descriptor.close(), "close truncation file");
+    let length = memory::PAGE_SIZE * 2;
+    testing::expect_ok(descriptor.truncate(length.to_i64()), "size truncation file");
+    let mapping = testing::expect_ok(
+        memory::file(
+            descriptor,
+            length,
+            0,
+            memory::PROT_READ | memory::PROT_WRITE,
+            memory::MAP_SHARED,
+        ),
+        "mapping for truncation",
+    );
+    defer testing::expect_ok(mapping.close(), "close truncated mapping");
+    testing::expect_ok(descriptor.truncate(memory::PAGE_SIZE.to_i64()), "truncate second page");
+    let output = bytes(length, 42);
+    let count = testing::expect_ok(
+        mapping.read_at(output.as_mut_slice(), 0),
+        "partial read before inaccessible page",
+    );
+    testing::assert(count == memory::PAGE_SIZE);
+    testing::assert(
+        output[0] == 0 && output[memory::PAGE_SIZE - 1] == 0 && output[memory::PAGE_SIZE] == 42,
+    );
+    testing::assert(
+        testing::expect_ok(
+            mapping.write_at(output.as_slice(), 0),
+            "partial write before inaccessible page",
+        )
+            == memory::PAGE_SIZE,
+    );
+    expect_errno(mapping.read_exact_at(output.as_mut_slice(), 0), syscall::EFAULT);
+    expect_errno(mapping.write_all_at(output.as_slice(), 0), syscall::EFAULT);
+    testing::expect_ok(descriptor.truncate(0), "truncate entire mapping");
+    expect_errno(mapping.read_at(output.as_mut_slice(), 0), syscall::EFAULT);
+    expect_errno(mapping.write_at(output.as_slice(), 0), syscall::EFAULT);
+}
+
+fn main() -> () {
+    check_anonymous();
+    check_file();
+    check_truncated();
+    check_concurrency();
+    println("linux memory: anonymous, file, copy, protection, residency, truncation, lifecycle");
+}

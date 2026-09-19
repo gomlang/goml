@@ -1,0 +1,163 @@
+package main;
+
+use std::os::linux::fd;
+use std::os::linux::syscall;
+use std::os::linux::syscall::{Arg};
+use std::task;
+use std::testing;
+use std::time;
+
+fn check_descriptor_concurrency() -> () {
+    let file = testing::expect_ok(fd::memfd("borrowed", 0), "borrow test");
+    let entered: Channel[()] = Channel::new(0);
+    let release: Channel[()] = Channel::new(0);
+    let closed: Channel[()] = Channel::new(2);
+    task::scope(
+        |scope: task::Scope| {
+            let borrower = scope.spawn(
+                |_| {
+                    testing::expect_ok(
+                        file.with_raw_fd(
+                            |raw| {
+                                entered.send(());
+                                let _ = release.recv();
+                                let result = syscall::syscall6(
+                                    syscall::SYS_FCNTL,
+                                    [raw, fd::F_GETFD, 0, 0, 0, 0],
+                                ).map_err(
+                                    |value| fd::Error::new(
+                                        fd::ErrorKind::Other,
+                                        "borrow",
+                                        Option::None,
+                                        Option::None,
+                                        value.to_string(),
+                                    ),
+                                )?;
+                                testing::assert(result.is_ok());
+                                Result::Ok(())
+                            },
+                        ),
+                        "active borrow",
+                    );
+                },
+            );
+            let _ = entered.recv();
+            let first = scope.spawn(
+                |_| {
+                    testing::expect_ok(file.close(), "first close");
+                    closed.send(());
+                },
+            );
+            let second = scope.spawn(
+                |_| {
+                    testing::expect_ok(file.close(), "second close");
+                    closed.send(());
+                },
+            );
+            while !file.is_closed() {
+                time::sleep(time::Duration::from_milliseconds(1));
+            }
+            testing::assert(file.stat().is_err());
+            let premature = select {
+                recv(closed) as _ => true,
+                default => false,
+            };
+            testing::assert(!premature);
+            release.send(());
+            borrower.join();
+            first.join();
+            second.join();
+            let _ = closed.recv();
+            let _ = closed.recv();
+        },
+    );
+    testing::expect_ok(file.close(), "idempotent close");
+    let event = testing::expect_ok(
+        syscall::syscall6_with_buffers(
+            syscall::SYS_EVENTFD2,
+            [
+                Arg::Word(0),
+                Arg::Word(0x80000),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+            ],
+        ),
+        "eventfd",
+    );
+    testing::assert(event.is_ok());
+    let event = testing::expect_ok(fd::Fd::from_raw(event.r1.to_isize()), "adopt eventfd");
+    defer testing::expect_ok(event.close(), "cleanup");
+    task::scope(
+        |scope: task::Scope| {
+            let ready: Channel[()] = Channel::new(0);
+            let reader = scope.spawn(
+                |_| {
+                    let output = b"????????";
+                    ready.send(());
+                    testing::expect_ok(
+                        event.read_exact(output.as_mut_slice()),
+                        "blocking event read",
+                    );
+                    testing::assert(output == Vec::from_array([1, 0, 0, 0, 0, 0, 0, 0]));
+                },
+            );
+            let _ = ready.recv();
+            testing::expect_ok(
+                event.write_all(Vec::from_array([1, 0, 0, 0, 0, 0, 0, 0]).as_slice()),
+                "concurrent event write",
+            );
+            reader.join();
+        },
+    );
+}
+
+fn check_bulk_descriptor_borrows() -> () {
+    let first = testing::expect_ok(fd::memfd("bulk-borrow", 0), "bulk descriptor");
+    let second = testing::expect_ok(fd::memfd("closed-borrow", 0), "closed descriptor");
+    testing::expect_ok(second.close(), "close second descriptor");
+    let called = Ref::new(false);
+    let failed: Result[(), fd::Error] = fd::with_raw_fds(
+        Vec::from_array([first, second]).as_slice(),
+        |_| {
+            called.set(true);
+            Result::Ok(())
+        },
+    );
+    testing::assert(failed.is_err() && !called.get());
+    let aliases: Vec[fd::Fd] = Vec::with_capacity(4096);
+    for _ in 0..4096 {
+        aliases.push(first);
+    }
+    testing::expect_ok(
+        fd::with_raw_fds(
+            aliases.as_slice(),
+            |raw| {
+                testing::assert_eq(raw.len(), 4096);
+                for value in raw {
+                    testing::assert_eq(value, raw[0]);
+                }
+                Result::Ok(())
+            },
+        ),
+        "bulk alias borrows",
+    );
+    let failed: Result[(), fd::Error] = fd::with_raw_fds(
+        Vec::from_array([first]).as_slice(),
+        |_| {
+            Result::Err(
+                fd::Error::new(
+                    fd::ErrorKind::Other,
+                    "bulk test",
+                    Option::None,
+                    Option::None,
+                    "callback failure",
+                ),
+            )
+        },
+    );
+    testing::assert(failed.is_err());
+    testing::assert(first.stat().is_ok());
+    testing::expect_ok(first.close(), "all borrowed references released");
+}

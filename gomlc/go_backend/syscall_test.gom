@@ -21,7 +21,12 @@ fn linux_syscall_buffers_survive_gc_and_block_without_stalling_scheduler() -> ()
     emit_runtime_hook_items(
         items,
         Vec::from_array(
-            [resources::RuntimeHook::Standard(resources::StandardRuntimeHook::LinuxSyscall6)],
+            [
+                resources::RuntimeHook::Standard(resources::StandardRuntimeHook::LinuxSyscall6),
+                resources::RuntimeHook::Standard(
+                    resources::StandardRuntimeHook::LinuxSyscall6Pointers,
+                ),
+            ],
         ),
         Vec::new(),
     );
@@ -46,6 +51,7 @@ fn linux_syscall_buffers_survive_gc_and_block_without_stalling_scheduler() -> ()
         \\package syscalltest
         \\import (
         \\    "bytes"
+        \\    "encoding/binary"
         \\    "os"
         \\    "runtime"
         \\    "syscall"
@@ -96,6 +102,85 @@ fn linux_syscall_buffers_survive_gc_and_block_without_stalling_scheduler() -> ()
         \\        if !got._0 || got._3 != 0 || got._1 != uint(len(expected)) { t.Fatal(got) }
         \\        if result := <-done; !bytes.Equal(result, expected) { t.Fatal(result) }
         \\    }
+        \\}
+        \\func TestPointerGraphs(t *testing.T) {
+        \\    fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_DGRAM|syscall.SOCK_CLOEXEC, 0)
+        \\    if err != nil { t.Fatal(err) }
+        \\    defer syscall.Close(fds[0])
+        \\    defer syscall.Close(fds[1])
+        \\    first, second := []byte("nested"), []byte("-message")
+        \\    vectors := make([]byte, 32)
+        \\    binary.LittleEndian.PutUint64(vectors[8:], uint64(len(first)))
+        \\    binary.LittleEndian.PutUint64(vectors[24:], uint64(len(second)))
+        \\    header := make([]byte, 56)
+        \\    binary.LittleEndian.PutUint64(header[24:], 2)
+        \\    got := _goml_runtime_std_os_linux_syscall6_pointers(syscall.SYS_SENDMSG, [6]uint{uint(fds[0]), 0, syscall.MSG_NOSIGNAL}, [6][]byte{nil, header}, [][]byte{header[16:24], vectors[:8], vectors[16:24]}, [][]byte{vectors, first, second})
+        \\    if !got._0 || got._3 != 0 || got._1 != uint(len(first)+len(second)) { t.Fatal(got) }
+        \\    if !bytes.Equal(header[16:24], make([]byte, 8)) || !bytes.Equal(vectors[:8], make([]byte, 8)) { t.Fatal("pointer fields were not restored") }
+        \\    received := make([]byte, 32)
+        \\    n, err := syscall.Read(fds[1], received)
+        \\    if err != nil || string(received[:n]) != "nested-message" { t.Fatal(received, err) }
+        \\}
+        \\func TestPointerRestoration(t *testing.T) {
+        \\    storage := []byte("0123456789abcdef")
+        \\    saved := append([]byte(nil), storage...)
+        \\    target := []byte("target")
+        \\    for _, number := range []uint{syscall.SYS_GETPID, 0x7fffffff} {
+        \\        got := _goml_runtime_std_os_linux_syscall6_pointers(number, [6]uint{}, [6][]byte{}, [][]byte{storage[:8], storage[1:9], storage[8:]}, [][]byte{target, storage[:1], nil})
+        \\        if !got._0 || (number == syscall.SYS_GETPID && got._3 != 0) || (number != syscall.SYS_GETPID && got._3 != uint(syscall.ENOSYS)) { t.Fatal(got) }
+        \\        if !bytes.Equal(storage, saved) { t.Fatal(storage) }
+        \\    }
+        \\}
+        \\func TestNestedBlockingReadAndGC(t *testing.T) {
+        \\    previous := runtime.GOMAXPROCS(1)
+        \\    defer runtime.GOMAXPROCS(previous)
+        \\    fds := make([]int, 2)
+        \\    if err := syscall.Pipe(fds); err != nil { t.Fatal(err) }
+        \\    defer syscall.Close(fds[0])
+        \\    defer syscall.Close(fds[1])
+        \\    for iteration := 0; iteration < 8; iteration++ {
+        \\        ready := make(chan struct{})
+        \\        done := make(chan []byte)
+        \\        go func() {
+        \\            buffer := make([]byte, 32)
+        \\            backing := make([]byte, 17)
+        \\            vector := backing[1:]
+        \\            binary.LittleEndian.PutUint64(vector[8:], uint64(len(buffer)))
+        \\            close(ready)
+        \\            got := _goml_runtime_std_os_linux_syscall6_pointers(syscall.SYS_READV, [6]uint{uint(fds[0]), 0, 1}, [6][]byte{nil, vector}, [][]byte{vector[:8]}, [][]byte{buffer})
+        \\            if !got._0 || got._3 != 0 || got._1 != uint(len(buffer)) || !bytes.Equal(vector[:8], make([]byte, 8)) { done <- nil; return }
+        \\            done <- buffer
+        \\        }()
+        \\        <-ready
+        \\        time.Sleep(time.Millisecond)
+        \\        for i := 0; i < 4; i++ { runtime.GC() }
+        \\        expected := bytes.Repeat([]byte{byte(iteration + 1)}, 32)
+        \\        if n, err := syscall.Write(fds[1], expected); err != nil || n != len(expected) { t.Fatal(n, err) }
+        \\        if result := <-done; !bytes.Equal(result, expected) { t.Fatal(result) }
+        \\    }
+        \\}
+        \\func TestManyPointersAndEmptyGraph(t *testing.T) {
+        \\    got := _goml_runtime_std_os_linux_syscall6_pointers(syscall.SYS_GETPID, [6]uint{}, [6][]byte{}, nil, nil)
+        \\    if !got._0 || got._3 != 0 || got._1 != uint(os.Getpid()) { t.Fatal(got) }
+        \\    fds := make([]int, 2)
+        \\    if err := syscall.Pipe(fds); err != nil { t.Fatal(err) }
+        \\    defer syscall.Close(fds[0])
+        \\    defer syscall.Close(fds[1])
+        \\    vectors := make([]byte, 128)
+        \\    slots, targets := make([][]byte, 8), make([][]byte, 8)
+        \\    for i := range 8 {
+        \\        slots[i] = vectors[i*16:i*16+8]
+        \\        targets[i] = []byte{byte(i+1)}
+        \\        binary.LittleEndian.PutUint64(vectors[i*16+8:], 1)
+        \\    }
+        \\    got = _goml_runtime_std_os_linux_syscall6_pointers(syscall.SYS_WRITEV, [6]uint{uint(fds[1]), 0, 8}, [6][]byte{nil, vectors}, slots, targets)
+        \\    if !got._0 || got._3 != 0 || got._1 != 8 { t.Fatal(got) }
+        \\    received := make([]byte, 8)
+        \\    n, err := syscall.Read(fds[0], received)
+        \\    if err != nil || n != 8 || !bytes.Equal(received, []byte{1,2,3,4,5,6,7,8}) { t.Fatal(received, err) }
+        \\    got = _goml_runtime_std_os_linux_syscall6_pointers(syscall.SYS_WRITEV, [6]uint{uint(fds[1]), 0, 1}, [6][]byte{nil, vectors}, slots[:1], [][]byte{nil})
+        \\    if !got._0 || got._3 != uint(syscall.EFAULT) { t.Fatal(got) }
+        \\    if !bytes.Equal(vectors[:8], make([]byte, 8)) { t.Fatal("null pointer field was not restored") }
         \\}
     ;
     testing::assert(fs::write_file_structured(path::join(root, "runtime_test.go"), host).is_ok());

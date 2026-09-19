@@ -1,0 +1,264 @@
+package main;
+
+use std::fs;
+use std::io;
+use std::os::linux::abi;
+use std::os::linux::fd;
+use std::os::linux::syscall;
+use std::testing;
+
+fn check_file(root: string) -> () {
+    let file = testing::expect_ok(
+        fd::open(root + "/data", fd::O_CREAT | fd::O_EXCL | fd::O_RDWR, 0x180),
+        "open file",
+    );
+    defer testing::expect_ok(file.close(), "cleanup");
+    testing::assert_eq(
+        testing::expect_ok(file.descriptor_flags(), "descriptor flags") & fd::FD_CLOEXEC,
+        fd::FD_CLOEXEC,
+    );
+    testing::expect_ok(file.write_all(b"abcdef".as_slice()), "write all");
+    testing::assert_eq(testing::expect_ok(file.seek(0, fd::SEEK_SET), "seek"), 0);
+    let first = b"??";
+    let second = b"????";
+    testing::assert_eq(
+        testing::expect_ok(
+            file.read_vectored(
+                Vec::from_array([first.as_mut_slice(), second.as_mut_slice()]).as_slice(),
+            ),
+            "readv",
+        ),
+        6,
+    );
+    testing::assert(first == b"ab");
+    testing::assert(second == b"cdef");
+    let high: i64 = 0x100000007;
+    testing::assert_eq(
+        testing::expect_ok(
+            file.write_vectored_at(
+                Vec::from_array([b"HIGH".as_slice(), b"!".as_slice()]).as_slice(),
+                high,
+            ),
+            "pwritev high offset",
+        ),
+        5,
+    );
+    let left = b"??";
+    let right = b"???";
+    testing::assert_eq(
+        testing::expect_ok(
+            file.read_vectored_at(
+                Vec::from_array([left.as_mut_slice(), right.as_mut_slice()]).as_slice(),
+                high,
+            ),
+            "preadv high offset",
+        ),
+        5,
+    );
+    testing::assert(left == b"HI");
+    testing::assert(right == b"GH!");
+    testing::assert_eq(testing::expect_ok(file.seek(0, fd::SEEK_CUR), "position unchanged"), 6);
+    testing::assert_eq(testing::expect_ok(file.stat(), "large stat").size, high + 5);
+    testing::expect_ok(file.truncate(6), "truncate");
+    testing::assert_eq(testing::expect_ok(file.write_at(b"XY".as_slice(), 2), "pwrite"), 2);
+    let output = b"??????";
+    testing::assert_eq(testing::expect_ok(file.read_at(output.as_mut_slice(), 0), "pread"), 6);
+    testing::assert(output == b"abXYef");
+    let invalid = testing::expect_err(
+        file.read_vectored_at(Vec::from_array([output.as_mut_slice()]).as_slice(), -1),
+        "negative position",
+    );
+    testing::assert_eq(invalid.raw_os_code().unwrap_or(-1), syscall::EINVAL.to_isize());
+    testing::expect_ok(file.chmod(0x1a0), "chmod");
+    testing::assert_eq(testing::expect_ok(file.stat(), "stat").mode & 0x1ff, 0x1a0);
+    testing::expect_ok(file.chown(0xffffffff, 0xffffffff), "unchanged ownership");
+    testing::expect_ok(file.sync(), "fsync");
+    testing::expect_ok(file.sync_data(), "fdatasync");
+    let duplicate = testing::expect_ok(file.duplicate(), "duplicate");
+    testing::assert_eq(testing::expect_ok(duplicate.seek(0, fd::SEEK_SET), "duplicate seek"), 0);
+    let byte = b"?";
+    testing::assert_eq(testing::expect_ok(file.read(byte.as_mut_slice()), "shared offset"), 1);
+    testing::assert(byte == b"a");
+    testing::assert_eq(testing::expect_ok(duplicate.seek(0, fd::SEEK_CUR), "shared position"), 1);
+    let alias = duplicate;
+    testing::expect_ok(duplicate.close(), "close duplicate");
+    testing::expect_ok(alias.close(), "close duplicate twice");
+    testing::assert(alias.is_closed());
+    testing::assert_eq(
+        testing::expect_err(alias.read(byte.as_mut_slice()), "closed read").raw_os_code().unwrap_or(
+            -1,
+        ),
+        syscall::EBADF.to_isize(),
+    );
+    testing::assert(file.stat().is_ok());
+    testing::expect_ok(file.seek(0, fd::SEEK_SET), "seek start");
+    testing::expect_ok(file.read_exact(output.as_mut_slice()), "read exact");
+    testing::assert_eq(
+        testing::expect_err(file.read_exact(byte.as_mut_slice()), "eof").kind(),
+        io::ErrorKind::UnexpectedEof,
+    );
+    testing::expect_ok(file.flock(fd::LOCK_EX | fd::LOCK_NB), "flock");
+    testing::expect_ok(file.flock(fd::LOCK_UN), "flock unlock");
+    let lock = abi::Flock {
+        kind: fd::F_WRLCK.to_i16(),
+        whence: fd::SEEK_SET.to_i16(),
+        start: 0,
+        length: 1,
+        pid: 0,
+    };
+    testing::expect_ok(file.record_lock(fd::F_OFD_SETLK, lock), "ofd lock");
+    let other = testing::expect_ok(
+        fd::open(root + "/data", fd::O_RDWR, 0),
+        "other file description",
+    );
+    defer testing::expect_ok(other.close(), "cleanup");
+    let conflict = testing::expect_ok(other.record_lock(fd::F_OFD_GETLK, lock), "ofd lock query");
+    testing::assert_eq(conflict.kind, fd::F_WRLCK.to_i16());
+    testing::assert_eq(conflict.pid, -1);
+    testing::expect_ok(
+        file.record_lock(
+            fd::F_OFD_SETLK,
+            abi::Flock { kind: fd::F_UNLCK.to_i16(), whence: 0, start: 0, length: 1, pid: 0 },
+        ),
+        "ofd unlock",
+    );
+    testing::assert(file.record_lock(fd::F_GETFL, lock).is_err());
+}
+
+fn check_paths(root: string) -> () {
+    let directory = testing::expect_ok(
+        fd::open(root, fd::O_RDONLY | fd::O_DIRECTORY, 0),
+        "open directory",
+    );
+    defer testing::expect_ok(directory.close(), "cleanup");
+    let strange = Vec::from_array([0xff.to_u8(), 0xfe.to_u8()]);
+    let file = testing::expect_ok(
+        directory.open_at_bytes(strange.as_slice(), fd::O_CREAT | fd::O_RDWR, 0x180),
+        "byte path",
+    );
+    testing::expect_ok(file.close(), "close byte path");
+    let resolved = testing::expect_ok(
+        directory.open_at2(
+            "data",
+            abi::OpenHow {
+                flags: fd::O_RDONLY.to_u64(),
+                mode: 0,
+                resolve: fd::RESOLVE_BENEATH.to_u64(),
+            },
+        ),
+        "openat2",
+    );
+    testing::expect_ok(resolved.close(), "close resolved");
+    testing::assert(
+        directory.open_at2(
+            "../",
+            abi::OpenHow {
+                flags: fd::O_RDONLY.to_u64(),
+                mode: 0,
+                resolve: fd::RESOLVE_BENEATH.to_u64(),
+            },
+        ).is_err(),
+    );
+    testing::assert(directory.open_at_bytes(b"bad\0name".as_slice(), fd::O_CREAT, 0x180).is_err());
+    testing::expect_ok(
+        directory.with_raw_fd(
+            |raw| {
+                let dir = raw.to_isize();
+                fd::mkdir_at(dir, "sub", 0x1c0)?;
+                fd::link_at(dir, "data", dir, "hard", 0)?;
+                fd::symlink_at("data", dir, "link")?;
+                testing::assert(
+                    testing::expect_ok(fd::readlink_at(dir, "link"), "readlink") == b"data",
+                );
+                testing::assert_eq(
+                    fd::stat_at(dir, "link", fd::AT_SYMLINK_NOFOLLOW)?.mode.to_usize() & fd::S_IFMT,
+                    fd::S_IFLNK,
+                );
+                testing::assert_eq(fd::stat_at(dir, "hard", 0)?.nlink, 2);
+                let extended = fd::statx_at(dir, "data", 0, fd::STATX_BASIC_STATS.to_u32())?;
+                testing::assert_eq(extended.size, 6);
+                testing::assert_eq(extended.ino, fd::stat_at(dir, "data", 0)?.ino);
+                fd::chmod_at(dir, "hard", 0x180, 0)?;
+                fd::chown_at(dir, "hard", 0xffffffff, 0xffffffff, 0)?;
+                fd::utimens_at(
+                    dir,
+                    "data",
+                    abi::Timespec { seconds: 1234567890, nanoseconds: 123 },
+                    abi::Timespec { seconds: 1234567891, nanoseconds: 456 },
+                    0,
+                )?;
+                let stat = fd::stat_at(dir, "data", 0)?;
+                testing::assert_eq(stat.atime.seconds, 1234567890);
+                testing::assert_eq(stat.mtime.nanoseconds, 456);
+                fd::rename_at(dir, "hard", dir, "renamed", fd::RENAME_NOREPLACE)?;
+                testing::assert_eq(
+                    testing::expect_err(
+                        fd::rename_at(dir, "renamed", dir, "data", fd::RENAME_NOREPLACE),
+                        "rename collision",
+                    ).raw_os_code().unwrap_or(-1),
+                    syscall::EEXIST.to_isize(),
+                );
+                fd::unlink_at(dir, "renamed", 0)?;
+                fd::unlink_at(dir, "link", 0)?;
+                fd::unlink_at(dir, "sub", fd::AT_REMOVEDIR)?;
+                testing::assert(fd::stat_at_bytes(dir, strange.as_slice(), 0).is_ok());
+                Result::Ok(())
+            },
+        ),
+        "directory operations",
+    );
+    let mut found = false;
+    loop {
+        let entries = testing::expect_ok(directory.read_dir(), "read directory");
+        if entries.is_empty() {
+            break;
+        }
+        for entry in entries {
+            if entry.name == strange {
+                found = true;
+            }
+        }
+    }
+    testing::assert(found);
+    testing::expect_ok(
+        directory.with_raw_fd(|raw| fd::unlink_at_bytes(raw.to_isize(), strange.as_slice(), 0)),
+        "unlink byte path",
+    );
+}
+
+fn check_memfd() -> () {
+    let file = testing::expect_ok(fd::memfd("goml-fd", fd::MFD_ALLOW_SEALING), "memfd");
+    testing::expect_ok(file.allocate(0, 0, 4096), "allocate");
+    testing::expect_ok(file.fcntl(fd::F_ADD_SEALS, fd::F_SEAL_GROW), "seal");
+    testing::assert(
+        testing::expect_ok(file.fcntl(fd::F_GET_SEALS, 0), "get seals") & fd::F_SEAL_GROW != 0,
+    );
+    testing::assert(file.truncate(8192).is_err());
+    let raw = testing::expect_ok(file.into_raw(), "release ownership");
+    testing::assert(file.is_closed());
+    let adopted = testing::expect_ok(fd::Fd::from_raw(raw.to_isize()), "adopt");
+    testing::assert_eq(testing::expect_ok(adopted.stat(), "adopted stat").size, 4096);
+    let raw = testing::expect_ok(adopted.into_raw(), "release checked adoption");
+    let owned = testing::expect_ok(fd::Fd::from_owned_raw(raw.to_isize()), "adopt owned descriptor");
+    testing::assert_eq(testing::expect_ok(owned.stat(), "owned stat").size, 4096);
+    testing::expect_ok(owned.close(), "owned close");
+    testing::assert(fd::Fd::from_raw(-1).is_err());
+    testing::assert(fd::Fd::from_owned_raw(-1).is_err());
+    testing::assert(fd::Fd::from_owned_raw(0x80000000).is_err());
+}
+
+fn main() -> () {
+    let root = "_artifact/linux-fd";
+    let _ = fs::remove_dir_all(root);
+    testing::expect_ok(fs::create_dir_all(root), "test directory");
+    defer testing::expect_ok(fs::remove_dir_all(root), "cleanup");
+    check_records();
+    check_file(root);
+    check_paths(root);
+    check_memfd();
+    check_descriptor_concurrency();
+    check_bulk_descriptor_borrows();
+    println(
+        "linux fd: ABI layouts, ownership, file IO, vectors, sparse offsets, metadata, byte paths, locks, and concurrency passed",
+    );
+}

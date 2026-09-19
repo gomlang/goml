@@ -1,0 +1,105 @@
+package main;
+
+use std::os::linux::fd;
+use std::os::linux::ipc;
+use std::task;
+use std::testing;
+use std::time;
+
+fn check_epoll() -> () {
+    let epoll = testing::expect_ok(ipc::Epoll::new(), "epoll");
+    defer testing::expect_ok(epoll.close(), "close epoll");
+    let pipe = testing::expect_ok(ipc::pipe(fd::O_NONBLOCK), "epoll pipe");
+    defer testing::expect_ok(pipe.reader.close(), "close epoll reader");
+    defer testing::expect_ok(pipe.writer.close(), "close epoll writer");
+    testing::expect_ok(
+        epoll.add(pipe.reader, ipc::EPOLLIN | ipc::EPOLLONESHOT, 0xfedcba9876543210),
+        "register",
+    );
+    testing::assert(epoll.add(pipe.reader, ipc::EPOLLIN, 0xfedcba9876543210).is_err());
+    testing::assert(testing::expect_ok(epoll.wait(4, 0), "empty epoll").is_empty());
+    testing::expect_ok(pipe.writer.write_all(b"x".as_slice()), "wake epoll");
+    let ready = testing::expect_ok(epoll.wait(4, 1000), "epoll ready");
+    testing::assert_eq(ready.len(), 1);
+    testing::assert_eq(ready[0].data, 0xfedcba9876543210);
+    testing::assert(ready[0].events & ipc::EPOLLIN != 0);
+    testing::assert(testing::expect_ok(epoll.wait(4, 0), "oneshot disabled").is_empty());
+    testing::expect_ok(epoll.modify(0xfedcba9876543210, ipc::EPOLLIN), "rearm");
+    testing::assert_eq(testing::expect_ok(epoll.wait(4, 0), "rearmed").len(), 1);
+    let old_number = testing::expect_ok(
+        pipe.reader.with_raw_fd(|raw| Result::Ok(raw)),
+        "reader number",
+    );
+    let unrelated = testing::expect_ok(ipc::eventfd(0, ipc::EFD_NONBLOCK), "unrelated eventfd");
+    defer testing::expect_ok(unrelated.close(), "close unrelated");
+    testing::expect_ok(pipe.reader.close(), "release original watched number");
+    let reused_number = testing::expect_ok(
+        unrelated.fcntl(fd::F_DUPFD_CLOEXEC, old_number),
+        "reuse original number",
+    );
+    let reused = testing::expect_ok(fd::Fd::from_raw(reused_number.to_isize()), "adopt reused");
+    defer testing::expect_ok(reused.close(), "close reused");
+    testing::assert_eq(reused_number, old_number);
+    let retained = testing::expect_ok(epoll.wait(4, 0), "watch survives close and number reuse");
+    testing::assert_eq(retained.len(), 1);
+    testing::assert_eq(retained[0].data, 0xfedcba9876543210);
+    testing::expect_ok(epoll.remove(0xfedcba9876543210), "remove retained watch");
+    testing::assert(epoll.remove(0xfedcba9876543210).is_err());
+    testing::assert(testing::expect_ok(epoll.wait(4, 0), "removed").is_empty());
+    testing::assert(epoll.wait(0, 0).is_err());
+    testing::assert(epoll.wait(1, -2).is_err());
+    testing::expect_ok(epoll.close(), "close epoll early");
+    testing::expect_ok(epoll.close(), "close epoll twice");
+    testing::assert(epoll.wait(1, 0).is_err());
+    testing::assert(epoll.add(unrelated, ipc::EPOLLIN, 1).is_err());
+}
+
+fn check_concurrency() -> () {
+    let event = testing::expect_ok(ipc::eventfd(0, 0), "blocking eventfd");
+    defer testing::expect_ok(event.close(), "close blocking eventfd");
+    let entered: Channel[()] = Channel::new(0);
+    task::scope(
+        |scope: task::Scope| {
+            let reader = scope.spawn(
+                |_| {
+                    entered.send(());
+                    testing::assert_eq(
+                        testing::expect_ok(ipc::read_counter(event), "concurrent counter read"),
+                        7,
+                    );
+                },
+            );
+            let _ = entered.recv();
+            testing::expect_ok(ipc::write_counter(event, 7), "concurrent counter write");
+            reader.join();
+        },
+    );
+}
+
+fn check_epoll_close_wakes_waiters() -> () {
+    let epoll = testing::expect_ok(ipc::Epoll::new(), "empty epoll");
+    let entered: Channel[()] = Channel::new(2);
+    task::scope(
+        |scope: task::Scope| {
+            let first = scope.spawn(
+                |_| {
+                    entered.send(());
+                    testing::assert(epoll.wait(1, -1).is_err());
+                },
+            );
+            let second = scope.spawn(
+                |_| {
+                    entered.send(());
+                    testing::assert(epoll.wait(1, -1).is_err());
+                },
+            );
+            let _ = entered.recv();
+            let _ = entered.recv();
+            time::sleep(time::Duration::from_milliseconds(20));
+            testing::expect_ok(epoll.close(), "close wakes every infinite waiter");
+            first.join();
+            second.join();
+        },
+    );
+    testing::expect_ok(epoll.close(), "closed epoll remains idempotent");
+}

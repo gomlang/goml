@@ -1,0 +1,152 @@
+package main;
+
+use std::os::linux::abi;
+use std::os::linux::fd;
+use std::os::linux::process;
+use std::os::linux::syscall;
+use std::testing;
+
+fn check_system() -> () {
+    let pid = testing::expect_ok(process::pid(), "getpid");
+    testing::assert(pid > 0);
+    testing::assert(testing::expect_ok(process::parent_pid(), "getppid") > 0);
+    testing::assert(testing::expect_ok(process::thread_id(), "gettid") > 0);
+    let users = testing::expect_ok(process::user_ids(), "getresuid");
+    testing::assert_eq(users.real, testing::expect_ok(process::uid(), "getuid"));
+    testing::assert_eq(users.effective, testing::expect_ok(process::effective_uid(), "geteuid"));
+    let groups = testing::expect_ok(process::group_ids(), "getresgid");
+    testing::assert_eq(groups.real, testing::expect_ok(process::gid(), "getgid"));
+    testing::assert_eq(groups.effective, testing::expect_ok(process::effective_gid(), "getegid"));
+    let _ = testing::expect_ok(process::groups(), "getgroups");
+    testing::assert(testing::expect_ok(process::process_group(0), "getpgid") > 0);
+    testing::assert(testing::expect_ok(process::session(0), "getsid") > 0);
+    testing::assert(process::process_group(0x100000000).is_err());
+    let usage = testing::expect_ok(process::resource_usage(process::RUSAGE_SELF), "getrusage");
+    testing::assert(usage.user_time.seconds >= 0);
+    testing::assert(usage.system_time.seconds >= 0);
+    testing::assert(usage.max_rss > 0);
+    let _ = testing::expect_ok(
+        process::resource_usage(process::RUSAGE_THREAD),
+        "thread resource usage",
+    );
+    let limit = testing::expect_ok(process::resource_limit(0, process::RLIMIT_NOFILE), "get limit");
+    testing::assert(limit.current > 0 && limit.current <= limit.maximum);
+    let old = testing::expect_ok(
+        process::set_resource_limit(0, process::RLIMIT_NOFILE, limit),
+        "set same limit",
+    );
+    testing::assert_eq(old.current, limit.current);
+    testing::assert_eq(old.maximum, limit.maximum);
+    let error = testing::expect_err(
+        process::set_resource_limit(
+            0,
+            process::RLIMIT_NOFILE,
+            abi::Rlimit { current: 2, maximum: 1 },
+        ),
+        "invalid limit",
+    );
+    testing::assert(error.raw_os_code() == Option::Some(syscall::EINVAL.to_isize()));
+    let priority = testing::expect_ok(
+        process::priority(process::PRIO_PROCESS, pid.to_u32()),
+        "getpriority",
+    );
+    testing::assert(priority >= -20 && priority <= 19);
+    testing::assert(process::set_priority(process::PRIO_PROCESS, pid.to_u32(), 20).is_err());
+    testing::expect_ok(process::kill(pid, 0), "signal zero");
+    testing::assert(process::kill(pid, 65).is_err());
+    let handle = testing::expect_ok(process::pidfd_open(pid, 0), "pidfd open");
+    testing::expect_ok(process::pidfd_signal(handle, 0), "pidfd signal zero");
+    testing::expect_ok(handle.close(), "close pidfd");
+}
+
+fn check_status() -> () {
+    let exited = process::WaitStatus { raw: 37 << 8 };
+    testing::assert(exited.exited());
+    testing::assert(exited.exit_code() == Option::Some(37));
+    testing::assert(
+        !exited.signaled() && !exited.stopped() && !exited.continued() && !exited.success(),
+    );
+    let killed = process::WaitStatus { raw: 9 };
+    testing::assert(killed.signaled());
+    testing::assert(killed.signal() == Option::Some(process::SIGKILL));
+    testing::assert(!killed.core_dumped());
+    testing::assert(process::WaitStatus { raw: 0x8b }.core_dumped());
+    let stopped = process::WaitStatus { raw: (19 << 8) | 0x7f };
+    testing::assert(stopped.stopped());
+    testing::assert(stopped.stop_signal() == Option::Some(process::SIGSTOP));
+    testing::assert(process::WaitStatus { raw: 0xffff }.continued());
+    testing::assert(process::WaitStatus { raw: 0 }.success());
+}
+
+fn check_command() -> () {
+    let relative = testing::expect_ok(
+        process::Command::new("./sh").current_dir("/bin").arg("-c").arg("exit 7").spawn(),
+        "relative executable in child directory",
+    );
+    testing::assert(
+        testing::expect_ok(relative.wait(), "wait relative executable").status.exit_code()
+            == Option::Some(7),
+    );
+    let output = testing::expect_ok(fd::memfd("child-output", 0), "output file");
+    defer testing::expect_ok(output.close(), "close output");
+    let error_output = testing::expect_ok(fd::memfd("child-error", 0), "error file");
+    defer testing::expect_ok(error_output.close(), "close error output");
+    let extra = testing::expect_ok(fd::memfd("child-extra", 0), "extra file");
+    defer testing::expect_ok(extra.close(), "close extra");
+    let input = testing::expect_ok(fd::memfd("child-input", 0), "input file");
+    defer testing::expect_ok(input.close(), "close input");
+    testing::expect_ok(input.write_all(b"input\n".as_slice()), "prepare input");
+    testing::expect_ok(input.seek(0, fd::SEEK_SET), "rewind input");
+    let child = testing::expect_ok(
+        process::Command::new("/bin/sh").arg("-c").arg(
+            "read line; printf '%s:%s:%s:%s' \"$line\" \"$GOML_VALUE\" \"$PWD\" \"${HOME-unset}\"; printf error >&2; printf extra >&3; exit 23",
+        ).env_clear().env("GOML_VALUE", "first").env("GOML_VALUE", "last").current_dir("/").stdin(
+            input,
+        ).stdout(output).stderr(error_output).extra_fd(extra).spawn(),
+        "spawn redirected child",
+    );
+    let result = testing::expect_ok(child.wait(), "wait child");
+    testing::assert_eq(result.pid, child.pid());
+    testing::assert(result.status.exit_code() == Option::Some(23));
+    testing::assert(result.usage.max_rss > 0);
+    let again = testing::expect_ok(child.wait(), "repeat wait");
+    testing::assert_eq(again.status.raw, result.status.raw);
+    let cached = testing::expect_ok(child.try_wait(), "cached try wait").unwrap_or(result);
+    testing::assert_eq(cached.pid, child.pid());
+    let bytes = b"??????????????????";
+    testing::assert_eq(
+        testing::expect_ok(output.read_at(bytes.as_mut_slice(), 0), "read output"),
+        18,
+    );
+    testing::assert(bytes == b"input:last:/:unset");
+    let bytes = b"?????";
+    testing::expect_ok(error_output.read_at(bytes.as_mut_slice(), 0), "read stderr");
+    testing::assert(bytes == b"error");
+    testing::expect_ok(extra.read_at(bytes.as_mut_slice(), 0), "read extra fd");
+    testing::assert(bytes == b"extra");
+    let missing = testing::expect_err(
+        process::Command::new("/goml/nonexistent/program").spawn(),
+        "missing executable",
+    );
+    testing::assert(missing.raw_os_code() == Option::Some(syscall::ENOENT.to_isize()));
+    let missing_path = testing::expect_err(
+        process::Command::new("goml-nonexistent-process-5cc0f310").spawn(),
+        "missing executable in PATH",
+    );
+    testing::assert(missing_path.raw_os_code() == Option::Some(syscall::ENOENT.to_isize()));
+    testing::assert(process::Command::new("/bin/true").env("BAD=KEY", "value").spawn().is_err());
+    testing::assert(process::Command::new("/bin/true").env("", "value").spawn().is_err());
+    let handle = testing::expect_ok(fd::memfd("closed", 0), "closed input");
+    testing::expect_ok(handle.close(), "close input before spawn");
+    testing::assert(process::Command::new("/bin/true").stdin(handle).spawn().is_err());
+}
+
+fn main() -> () {
+    check_system();
+    check_status();
+    check_command();
+    check_child_concurrency();
+    check_sessions();
+    check_stop_continue();
+    println("linux process: ids signals wait resource limits spawn descriptors concurrency");
+}

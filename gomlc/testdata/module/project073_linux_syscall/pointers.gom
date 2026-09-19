@@ -1,0 +1,280 @@
+package main;
+
+use module::kernel;
+use std::bytes::endian;
+use std::os::linux::syscall;
+use std::os::linux::syscall::{Arg, Pointer};
+use std::testing;
+
+fn zeroes(length: isize) -> Vec[byte] {
+    let bytes: Vec[byte] = Vec::new();
+    for _ in 0..length {
+        bytes.push(0);
+    }
+    bytes
+}
+
+fn put_word(bytes: Vec[byte], offset: isize, value: usize) -> () {
+    testing::expect_ok(
+        endian::write_u64(bytes.as_mut_slice(), offset, value.to_u64(), endian::Endian::Little),
+        "encode word",
+    )
+}
+
+fn word(bytes: Vec[byte], offset: isize) -> usize {
+    testing::expect_ok(
+        endian::read_u64(bytes.as_slice(), offset, endian::Endian::Little),
+        "decode word",
+    ).to_usize()
+}
+
+fn descriptor(bytes: Vec[byte], offset: isize) -> usize {
+    testing::expect_ok(
+        endian::read_u32(bytes.as_slice(), offset, endian::Endian::Little),
+        "decode descriptor",
+    ).to_usize()
+}
+
+fn pointer(bytes: Vec[byte], offset: isize, target: MutSlice[byte]) -> Pointer {
+    Pointer { buffer: bytes.as_mut_slice(), offset, target }
+}
+
+fn invoke_pointers(number: usize, args: [Arg; 6], pointers: Vec[Pointer]) -> syscall::SyscallResult {
+    testing::expect_ok(
+        syscall::syscall6_with_pointers(number, args, pointers.as_slice()),
+        "syscall pointers",
+    )
+}
+
+fn check_vectors() -> () {
+    let fds = zeroes(8);
+    testing::assert(
+        kernel::invoke(
+            syscall::SYS_PIPE2,
+            [
+                Arg::Buffer(fds.as_mut_slice()),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+            ],
+        ).is_ok(),
+    );
+    let read_fd = descriptor(fds, 0);
+    let write_fd = descriptor(fds, 4);
+    defer kernel::close(read_fd);
+    defer kernel::close(write_fd);
+    let input = b"!vector-io!";
+    let vectors = zeroes(48);
+    put_word(vectors, 8, 6);
+    put_word(vectors, 40, 3);
+    let empty = zeroes(0);
+    let written = invoke_pointers(
+        syscall::SYS_WRITEV,
+        [
+            Arg::Word(write_fd),
+            Arg::Buffer(vectors.as_mut_slice()),
+            Arg::Word(3),
+            Arg::Word(0),
+            Arg::Word(0),
+            Arg::Word(0),
+        ],
+        Vec::from_array(
+            [
+                pointer(vectors, 0, input.slice_mut(1, 7)),
+                pointer(vectors, 16, empty.as_mut_slice()),
+                pointer(vectors, 32, input.slice_mut(7, 10)),
+            ],
+        ),
+    );
+    testing::assert_eq(testing::expect_ok(written.into_result(), "writev"), 9);
+    testing::assert_eq(word(vectors, 0), 0);
+    testing::assert_eq(word(vectors, 16), 0);
+    testing::assert_eq(word(vectors, 32), 0);
+    let output = b"???????????";
+    let read = invoke_pointers(
+        syscall::SYS_READV,
+        [
+            Arg::Word(read_fd),
+            Arg::Buffer(vectors.as_mut_slice()),
+            Arg::Word(3),
+            Arg::Word(0),
+            Arg::Word(0),
+            Arg::Word(0),
+        ],
+        Vec::from_array(
+            [
+                pointer(vectors, 0, output.slice_mut(1, 7)),
+                pointer(vectors, 16, empty.as_mut_slice()),
+                pointer(vectors, 32, output.slice_mut(7, 10)),
+            ],
+        ),
+    );
+    testing::assert_eq(testing::expect_ok(read.into_result(), "readv"), 9);
+    testing::assert(output == b"?vector-io?");
+    for offset in Vec::from_array([-1, 1, 8, 0x7fffffffffffffff]) {
+        let bytes = b"original";
+        let invalid = syscall::syscall6_with_pointers(
+            syscall::SYS_CLOSE,
+            [
+                Arg::Word(write_fd),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+            ],
+            Vec::from_array(
+                [
+                    pointer(bytes, 0, input.as_mut_slice()),
+                    pointer(bytes, offset, input.as_mut_slice()),
+                ],
+            ).as_slice(),
+        );
+        match invalid {
+            Err(syscall::Error::InvalidPointer { index, offset: actual, length }) => {
+                testing::assert_eq(index, 1);
+                testing::assert_eq(actual, offset);
+                testing::assert_eq(length, 8);
+            },
+            _ => testing::fail("expected invalid pointer"),
+        }
+        testing::assert(bytes == b"original");
+    }
+    testing::assert(kernel::raw(syscall::SYS_FCNTL, [write_fd, 1, 0, 0, 0, 0]).is_ok());
+    let saved = b"!original?";
+    let missing = invoke_pointers(
+        0x7fffffff,
+        [Arg::Word(0), Arg::Word(0), Arg::Word(0), Arg::Word(0), Arg::Word(0), Arg::Word(0)],
+        Vec::from_array(
+            [Pointer { buffer: saved.slice_mut(1, 9), offset: 0, target: input.as_mut_slice() }],
+        ),
+    );
+    testing::assert_eq(missing.errno, syscall::ENOSYS);
+    testing::assert(saved == b"!original?");
+}
+
+fn check_messages() -> () {
+    let fds = zeroes(8);
+    testing::assert(
+        kernel::invoke(
+            syscall::SYS_SOCKETPAIR,
+            [
+                Arg::Word(1),
+                Arg::Word(0x80002),
+                Arg::Word(0),
+                Arg::Buffer(fds.as_mut_slice()),
+                Arg::Word(0),
+                Arg::Word(0),
+            ],
+        ).is_ok(),
+    );
+    let sender = descriptor(fds, 0);
+    let receiver = descriptor(fds, 4);
+    defer kernel::close(sender);
+    defer kernel::close(receiver);
+    let content = b"nested-message";
+    let vectors = zeroes(32);
+    put_word(vectors, 8, 6);
+    put_word(vectors, 24, 8);
+    let header = zeroes(56);
+    put_word(header, 24, 2);
+    let control = zeroes(24);
+    put_word(control, 0, 20);
+    testing::expect_ok(
+        endian::write_u32(control.as_mut_slice(), 8, 1, endian::Endian::Little),
+        "control level",
+    );
+    testing::expect_ok(
+        endian::write_u32(control.as_mut_slice(), 12, 1, endian::Endian::Little),
+        "control type",
+    );
+    testing::expect_ok(
+        endian::write_u32(control.as_mut_slice(), 16, sender.to_u32(), endian::Endian::Little),
+        "control descriptor",
+    );
+    put_word(header, 40, 24);
+    let sent = invoke_pointers(
+        syscall::SYS_SENDMSG,
+        [
+            Arg::Word(sender),
+            Arg::Buffer(header.as_mut_slice()),
+            Arg::Word(0x4000),
+            Arg::Word(0),
+            Arg::Word(0),
+            Arg::Word(0),
+        ],
+        Vec::from_array(
+            [
+                pointer(vectors, 0, content.slice_mut(0, 6)),
+                pointer(header, 16, vectors.as_mut_slice()),
+                pointer(vectors, 16, content.slice_mut(6, 14)),
+                pointer(header, 32, control.as_mut_slice()),
+            ],
+        ),
+    );
+    testing::assert_eq(testing::expect_ok(sent.into_result(), "sendmsg"), 14);
+    testing::assert_eq(word(header, 16), 0);
+    testing::assert_eq(word(header, 32), 0);
+    let output = zeroes(14);
+    control.as_mut_slice().fill(0);
+    let received = invoke_pointers(
+        syscall::SYS_RECVMSG,
+        [
+            Arg::Word(receiver),
+            Arg::Buffer(header.as_mut_slice()),
+            Arg::Word(0x40000000),
+            Arg::Word(0),
+            Arg::Word(0),
+            Arg::Word(0),
+        ],
+        Vec::from_array(
+            [
+                pointer(header, 16, vectors.as_mut_slice()),
+                pointer(vectors, 0, output.slice_mut(0, 6)),
+                pointer(vectors, 16, output.slice_mut(6, 14)),
+                pointer(header, 32, control.as_mut_slice()),
+            ],
+        ),
+    );
+    testing::assert_eq(testing::expect_ok(received.into_result(), "recvmsg"), 14);
+    testing::assert(output == content);
+    testing::assert_eq(word(header, 16), 0);
+    testing::assert_eq(word(header, 32), 0);
+    testing::assert_eq(word(header, 40), 24);
+    testing::assert_eq(word(control, 0), 20);
+    testing::assert_eq(descriptor(control, 8), 1);
+    testing::assert_eq(descriptor(control, 12), 1);
+    let transferred = descriptor(control, 16);
+    defer kernel::close(transferred);
+    testing::assert_eq(
+        testing::expect_ok(
+            kernel::raw(syscall::SYS_FCNTL, [transferred, 1, 0, 0, 0, 0]).into_result(),
+            "received fd flags",
+        )
+            & 1,
+        1,
+    );
+}
+
+fn check_errno() -> () {
+    testing::assert_eq(syscall::SYS_READV, 19);
+    testing::assert_eq(syscall::SYS_SENDMSG, 46);
+    testing::assert_eq(syscall::SYS_IO_URING_SETUP, 425);
+    testing::assert_eq(syscall::SYS_OPENAT2, 437);
+    testing::assert_eq(syscall::SYS_RSEQ_SLICE_YIELD, 471);
+    testing::assert_eq(syscall::EWOULDBLOCK, syscall::EAGAIN);
+    testing::assert_eq(syscall::EDEADLOCK, syscall::EDEADLK);
+    testing::assert_eq(syscall::EFSCORRUPTED, syscall::EUCLEAN);
+    testing::assert_eq(syscall::Errno(syscall::EFAULT).to_string(), "EFAULT");
+    testing::assert_eq(syscall::Errno(syscall::EWOULDBLOCK).to_string(), "EAGAIN");
+    testing::assert_eq(syscall::Errno(9999).to_string(), "errno 9999");
+    testing::assert(syscall::errno_name(0).is_none());
+    testing::assert(syscall::errno_name(9999).is_none());
+    let bad = kernel::raw(syscall::SYS_CLOSE, [(-1).to_usize(), 0, 0, 0, 0, 0]);
+    match bad.into_result() {
+        Err(error) => testing::assert(error == syscall::Errno(syscall::EBADF)),
+        Ok(_) => testing::fail("expected EBADF"),
+    }
+}

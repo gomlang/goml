@@ -1,0 +1,247 @@
+package main;
+
+use std::fs;
+use std::io;
+use std::os::linux::abi;
+use std::os::linux::fd;
+use std::os::linux::ipc;
+use std::os::linux::memory as mapping;
+use std::testing;
+
+fn check_pipe() -> () {
+    let pipe = testing::expect_ok(ipc::pipe(fd::O_NONBLOCK), "pipe");
+    defer testing::expect_ok(pipe.reader.close(), "close reader");
+    defer testing::expect_ok(pipe.writer.close(), "close writer");
+    testing::assert_eq(
+        testing::expect_ok(pipe.reader.descriptor_flags(), "pipe flags") & fd::FD_CLOEXEC,
+        fd::FD_CLOEXEC,
+    );
+    let bytes = b"????";
+    let empty = testing::expect_err(pipe.reader.read(bytes.as_mut_slice()), "empty pipe");
+    testing::assert(empty.kind() == io::ErrorKind::WouldBlock);
+    let interests = Vec::from_array(
+        [ipc::PollInterest { descriptor: pipe.reader, events: ipc::POLLIN }],
+    );
+    testing::assert(testing::expect_ok(ipc::poll(interests.as_slice(), 0), "empty poll").is_empty());
+    testing::expect_ok(pipe.writer.write_all(b"pipe".as_slice()), "write pipe");
+    let ready = testing::expect_ok(ipc::poll(interests.as_slice(), 1000), "pipe poll");
+    testing::assert_eq(ready.len(), 1);
+    testing::assert_eq(ready[0].index, 0);
+    testing::assert(ready[0].events & ipc::POLLIN != 0);
+    testing::expect_ok(pipe.reader.read_exact(bytes.as_mut_slice()), "read pipe");
+    testing::assert(bytes == b"pipe");
+    testing::expect_ok(pipe.writer.close(), "close writer early");
+    let ended = testing::expect_ok(ipc::poll(interests.as_slice(), 0), "pipe hangup");
+    testing::assert(ended[0].events & ipc::POLLHUP != 0);
+    testing::assert_eq(testing::expect_ok(pipe.reader.read(bytes.as_mut_slice()), "pipe eof"), 0);
+    testing::assert(ipc::poll(interests.as_slice(), -2).is_err());
+}
+
+fn check_messages() -> () {
+    let pair = testing::expect_ok(
+        ipc::socket_pair(ipc::SOCK_SEQPACKET, ipc::SOCK_NONBLOCK),
+        "socketpair",
+    );
+    defer testing::expect_ok(pair.first.close(), "close first");
+    defer testing::expect_ok(pair.second.close(), "close second");
+    let sender = testing::expect_ok(pair.first.duplicate(), "duplicate endpoint");
+    defer testing::expect_ok(sender.close(), "close duplicate endpoint");
+    testing::expect_ok(pair.first.close(), "close original endpoint");
+    let memory = testing::expect_ok(fd::memfd("rights", 0), "transfer memfd");
+    defer testing::expect_ok(memory.close(), "close memfd");
+    testing::expect_ok(memory.write_all(b"shared".as_slice()), "write memfd");
+    let descriptors = Vec::from_array([memory]);
+    testing::assert_eq(
+        testing::expect_ok(
+            ipc::send_message(sender, b"fd".as_slice(), descriptors.as_slice(), 0),
+            "send rights",
+        ),
+        2,
+    );
+    let data = b"????????";
+    let received = testing::expect_ok(
+        ipc::receive_message(pair.second, data.as_mut_slice(), 1, 0),
+        "receive rights",
+    );
+    testing::assert_eq(received.byte_count, 2);
+    testing::assert_eq(received.copied, 2);
+    testing::assert(data.slice(0, 2) == b"fd".as_slice());
+    testing::assert_eq(received.descriptors.len(), 1);
+    let transferred = received.descriptors[0];
+    defer testing::expect_ok(transferred.close(), "close received fd");
+    testing::assert_eq(
+        testing::expect_ok(transferred.descriptor_flags(), "received flags") & fd::FD_CLOEXEC,
+        fd::FD_CLOEXEC,
+    );
+    testing::assert_eq(testing::expect_ok(transferred.seek(0, fd::SEEK_CUR), "shared offset"), 6);
+    let content = b"??????";
+    testing::assert_eq(
+        testing::expect_ok(transferred.read_at(content.as_mut_slice(), 0), "read transferred memfd"),
+        6,
+    );
+    testing::assert(content == b"shared");
+    testing::expect_ok(memory.truncate(4096), "size shared memory");
+    let original_mapping = testing::expect_ok(
+        mapping::file(
+            memory,
+            4096,
+            0,
+            mapping::PROT_READ | mapping::PROT_WRITE,
+            mapping::MAP_SHARED,
+        ),
+        "map original memfd",
+    );
+    defer testing::expect_ok(original_mapping.close(), "close original mapping");
+    let received_mapping = testing::expect_ok(
+        mapping::file(
+            transferred,
+            4096,
+            0,
+            mapping::PROT_READ | mapping::PROT_WRITE,
+            mapping::MAP_SHARED,
+        ),
+        "map received memfd",
+    );
+    defer testing::expect_ok(received_mapping.close(), "close received mapping");
+    testing::expect_ok(
+        original_mapping.write_all_at(b"mapped".as_slice(), 64),
+        "write original shared mapping",
+    );
+    testing::expect_ok(
+        received_mapping.read_exact_at(content.as_mut_slice(), 64),
+        "read received shared mapping",
+    );
+    testing::assert(content == b"mapped");
+    testing::expect_ok(
+        received_mapping.write_all_at(b"rights".as_slice(), 64),
+        "write received shared mapping",
+    );
+    testing::expect_ok(
+        original_mapping.read_exact_at(content.as_mut_slice(), 64),
+        "read original shared mapping",
+    );
+    testing::assert(content == b"rights");
+    testing::assert(ipc::send_message(sender, b"".as_slice(), descriptors.as_slice(), 0).is_err());
+    testing::assert(ipc::receive_message(pair.second, data.as_mut_slice(), -1, 0).is_err());
+    let empty = testing::expect_err(
+        ipc::receive_message(pair.second, data.as_mut_slice(), 0, 0),
+        "empty recv",
+    );
+    testing::assert(empty.kind() == io::ErrorKind::WouldBlock);
+    let before = testing::expect_ok(fs::read_dir("/proc/self/fd"), "count fds").len();
+    let many = Vec::from_array([memory, memory, memory, memory]);
+    for limit in 0..2 {
+        for _ in 0..16 {
+            testing::expect_ok(
+                ipc::send_message(sender, b"x".as_slice(), many.as_slice(), 0),
+                "send truncated rights",
+            );
+            testing::assert(
+                ipc::receive_message(pair.second, data.as_mut_slice(), limit, 0).is_err(),
+            );
+        }
+    }
+    testing::assert_eq(
+        testing::expect_ok(fs::read_dir("/proc/self/fd"), "recount fds").len(),
+        before,
+    );
+    let none: Vec[fd::Fd] = Vec::new();
+    testing::expect_ok(
+        ipc::send_message(sender, b"abcdef".as_slice(), none.as_slice(), 0),
+        "send truncated data",
+    );
+    let tiny = b"???";
+    let truncated = testing::expect_ok(
+        ipc::receive_message(pair.second, tiny.as_mut_slice(), 0, ipc::MSG_TRUNC),
+        "truncated data",
+    );
+    testing::assert_eq(truncated.byte_count, 6);
+    testing::assert_eq(truncated.copied, 3);
+    testing::assert(truncated.flags & ipc::MSG_TRUNC != 0);
+    testing::assert(tiny == b"abc");
+    testing::expect_ok(ipc::shutdown(sender, ipc::SHUT_WR), "shutdown sender");
+    testing::assert(ipc::send_message(sender, b"x".as_slice(), none.as_slice(), 0).is_err());
+    let datagrams = testing::expect_ok(ipc::socket_pair(ipc::SOCK_DGRAM, 0), "datagram pair");
+    defer testing::expect_ok(datagrams.first.close(), "close datagram first");
+    defer testing::expect_ok(datagrams.second.close(), "close datagram second");
+    testing::assert_eq(
+        testing::expect_ok(
+            ipc::send_message(datagrams.first, b"".as_slice(), none.as_slice(), 0),
+            "empty datagram send",
+        ),
+        0,
+    );
+    testing::assert_eq(
+        testing::expect_ok(
+            ipc::receive_message(datagrams.second, b"".as_mut_slice(), 0, 0),
+            "empty datagram receive",
+        ).byte_count,
+        0,
+    );
+}
+
+fn check_counters() -> () {
+    let event = testing::expect_ok(ipc::eventfd(2, ipc::EFD_NONBLOCK), "eventfd");
+    defer testing::expect_ok(event.close(), "close eventfd");
+    testing::expect_ok(ipc::write_counter(event, 3), "increment eventfd");
+    testing::assert_eq(testing::expect_ok(ipc::read_counter(event), "read eventfd"), 5);
+    let empty = testing::expect_err(ipc::read_counter(event), "drained eventfd");
+    testing::assert(empty.kind() == io::ErrorKind::WouldBlock);
+    testing::assert(ipc::write_counter(event, 0xffffffffffffffff).is_err());
+    let semaphore = testing::expect_ok(
+        ipc::eventfd(2, ipc::EFD_SEMAPHORE | ipc::EFD_NONBLOCK),
+        "semaphore",
+    );
+    defer testing::expect_ok(semaphore.close(), "close semaphore");
+    testing::assert_eq(testing::expect_ok(ipc::read_counter(semaphore), "first semaphore"), 1);
+    testing::assert_eq(testing::expect_ok(ipc::read_counter(semaphore), "second semaphore"), 1);
+    testing::assert(ipc::read_counter(semaphore).is_err());
+    let timer = testing::expect_ok(ipc::timerfd(ipc::CLOCK_MONOTONIC, ipc::TFD_NONBLOCK), "timerfd");
+    defer testing::expect_ok(timer.close(), "close timerfd");
+    let zero = abi::Timespec { seconds: 0, nanoseconds: 0 };
+    let old = testing::expect_ok(
+        ipc::set_timer(
+            timer,
+            0,
+            abi::Itimerspec {
+                interval: zero,
+                value: abi::Timespec { seconds: 0, nanoseconds: 1000000 },
+            },
+        ),
+        "arm timer",
+    );
+    testing::assert_eq(old.value.seconds, 0);
+    testing::assert_eq(old.value.nanoseconds, 0);
+    let armed = testing::expect_ok(ipc::get_timer(timer), "get timer");
+    testing::assert_eq(armed.interval.seconds, 0);
+    let interests = Vec::from_array([ipc::PollInterest { descriptor: timer, events: ipc::POLLIN }]);
+    testing::assert_eq(
+        testing::expect_ok(ipc::poll(interests.as_slice(), 5000), "timer ready").len(),
+        1,
+    );
+    testing::assert_eq(testing::expect_ok(ipc::read_counter(timer), "timer expiration"), 1);
+    testing::expect_ok(
+        ipc::set_timer(timer, 0, abi::Itimerspec { interval: zero, value: zero }),
+        "disarm timer",
+    );
+    testing::assert(
+        ipc::set_timer(
+            timer,
+            0,
+            abi::Itimerspec {
+                interval: zero,
+                value: abi::Timespec { seconds: 0, nanoseconds: 1000000000 },
+            },
+        ).is_err(),
+    );
+}
+
+fn main() -> () {
+    check_pipe();
+    check_messages();
+    check_counters();
+    check_epoll();
+    check_concurrency();
+    check_epoll_close_wakes_waiters();
+    println("linux ipc: pipes, descriptor messages, counters, timers, readiness, lifetimes");
+}

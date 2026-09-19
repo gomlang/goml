@@ -1,0 +1,120 @@
+package main;
+
+use std::os::linux::process;
+use std::testing;
+use std::task;
+use std::time;
+
+fn cleanup_child(child: process::Child) -> () {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn check_child_concurrency() -> () {
+    let child = testing::expect_ok(
+        process::Command::new("/bin/sleep").arg("60").spawn(),
+        "spawn sleeping child",
+    );
+    defer cleanup_child(child);
+    testing::assert(testing::expect_ok(child.try_wait(), "initial try wait").is_none());
+    task::scope(
+        |scope: task::Scope| {
+            let entered: Channel[()] = Channel::new(0);
+            let first = scope.spawn(
+                |_| {
+                    entered.send(());
+                    testing::expect_ok(child.wait(), "first blocking waiter")
+                },
+            );
+            let _ = entered.recv();
+            time::sleep(time::Duration::from_milliseconds(1));
+            testing::assert(
+                testing::expect_ok(child.try_wait(), "try wait during blocking wait").is_none(),
+            );
+            let second = scope.spawn(|_| testing::expect_ok(child.wait(), "second blocking waiter"));
+            testing::expect_ok(child.signal(0), "signal during wait");
+            testing::expect_ok(child.kill(), "kill during wait");
+            let first_result = first.join();
+            let second_result = second.join();
+            testing::assert(first_result.status.signal() == Option::Some(process::SIGKILL));
+            testing::assert_eq(first_result.status.raw, second_result.status.raw);
+            testing::assert_eq(first_result.pid, second_result.pid);
+        },
+    );
+    testing::assert(child.signal(0).is_err());
+    let final_result = testing::expect_ok(child.wait(), "cached wait after signal error");
+    testing::assert(final_result.status.signal() == Option::Some(process::SIGKILL));
+}
+
+fn check_sessions() -> () {
+    let session = testing::expect_ok(
+        process::Command::new("/bin/sleep").arg("60").new_session(true).spawn(),
+        "new child session",
+    );
+    defer cleanup_child(session);
+    testing::assert_eq(
+        testing::expect_ok(process::session(session.pid()), "child session"),
+        session.pid(),
+    );
+    testing::assert_eq(
+        testing::expect_ok(process::process_group(session.pid()), "child session group"),
+        session.pid(),
+    );
+    testing::expect_ok(session.kill(), "kill session child");
+    testing::expect_ok(session.wait(), "reap session child");
+    let group = testing::expect_ok(
+        process::Command::new("/bin/sleep").arg("60").new_process_group(true).spawn(),
+        "new child group",
+    );
+    defer cleanup_child(group);
+    testing::assert_eq(
+        testing::expect_ok(process::process_group(group.pid()), "child group"),
+        group.pid(),
+    );
+    testing::assert_eq(
+        testing::expect_ok(process::session(group.pid()), "inherited child session"),
+        testing::expect_ok(process::session(0), "parent session"),
+    );
+    testing::expect_ok(group.kill(), "kill group child");
+    testing::expect_ok(group.wait(), "reap group child");
+    let combined = testing::expect_ok(
+        process::Command::new("/bin/sleep").arg("60").new_session(true).new_process_group(true).spawn(),
+        "new session already establishes process group",
+    );
+    defer cleanup_child(combined);
+    testing::assert_eq(
+        testing::expect_ok(process::session(combined.pid()), "combined child session"),
+        combined.pid(),
+    );
+    testing::assert_eq(
+        testing::expect_ok(process::process_group(combined.pid()), "combined child group"),
+        combined.pid(),
+    );
+    testing::expect_ok(combined.kill(), "kill combined child");
+    testing::expect_ok(combined.wait(), "reap combined child");
+}
+
+fn check_stop_continue() -> () {
+    let child = testing::expect_ok(
+        process::Command::new("/bin/sleep").arg("60").spawn(),
+        "spawn stoppable child",
+    );
+    defer cleanup_child(child);
+    testing::assert(child.wait_event(0x100000000).is_err());
+    testing::expect_ok(child.signal(process::SIGSTOP), "stop child");
+    let stopped = testing::expect_ok(child.wait_event(process::WUNTRACED), "observe stop");
+    let stopped = testing::expect_some(stopped, "stopped child outcome");
+    testing::assert(stopped.status.stop_signal() == Option::Some(process::SIGSTOP));
+    testing::expect_ok(child.signal(process::SIGCONT), "continue child");
+    let continued = testing::expect_ok(
+        child.wait_event(process::WCONTINUED),
+        "observe continuation",
+    );
+    let continued = testing::expect_some(continued, "continued child outcome");
+    testing::assert(continued.status.continued());
+    testing::expect_ok(child.kill(), "kill continued child");
+    testing::assert(
+        testing::expect_ok(child.wait(), "reap continued child").status.signal()
+            == Option::Some(process::SIGKILL),
+    );
+}
