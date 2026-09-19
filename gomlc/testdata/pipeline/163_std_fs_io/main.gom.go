@@ -659,22 +659,6 @@ type _goml_m_Result____bool____std_p_fs_p_Error_Err struct {
 
 func (_ _goml_m_Result____bool____std_p_fs_p_Error_Err) is_goml_m_Result____bool____std_p_fs_p_Error() {}
 
-type _goml_m_Result____Vec_l_std_p_fs_p_DirEntry_r_____std_p_fs_p_Error interface {
-    is_goml_m_Result____Vec_l_std_p_fs_p_DirEntry_r_____std_p_fs_p_Error()
-}
-
-type _goml_m_Result____Vec_l_std_p_fs_p_DirEntry_r_____std_p_fs_p_Error_Ok struct {
-    _0 *_goml_vec__goml_m_std_p_fs_p_DirEntry
-}
-
-func (_ _goml_m_Result____Vec_l_std_p_fs_p_DirEntry_r_____std_p_fs_p_Error_Ok) is_goml_m_Result____Vec_l_std_p_fs_p_DirEntry_r_____std_p_fs_p_Error() {}
-
-type _goml_m_Result____Vec_l_std_p_fs_p_DirEntry_r_____std_p_fs_p_Error_Err struct {
-    _0 _goml_m_std_p_fs_p_Error
-}
-
-func (_ _goml_m_Result____Vec_l_std_p_fs_p_DirEntry_r_____std_p_fs_p_Error_Err) is_goml_m_Result____Vec_l_std_p_fs_p_DirEntry_r_____std_p_fs_p_Error() {}
-
 type _goml_m_Result____Vec_l_string_r_____std_p_fs_p_Error interface {
     is_goml_m_Result____Vec_l_string_r_____std_p_fs_p_Error()
 }
@@ -690,6 +674,22 @@ type _goml_m_Result____Vec_l_string_r_____std_p_fs_p_Error_Err struct {
 }
 
 func (_ _goml_m_Result____Vec_l_string_r_____std_p_fs_p_Error_Err) is_goml_m_Result____Vec_l_string_r_____std_p_fs_p_Error() {}
+
+type _goml_m_Result____Vec_l_std_p_fs_p_DirEntry_r_____std_p_fs_p_Error interface {
+    is_goml_m_Result____Vec_l_std_p_fs_p_DirEntry_r_____std_p_fs_p_Error()
+}
+
+type _goml_m_Result____Vec_l_std_p_fs_p_DirEntry_r_____std_p_fs_p_Error_Ok struct {
+    _0 *_goml_vec__goml_m_std_p_fs_p_DirEntry
+}
+
+func (_ _goml_m_Result____Vec_l_std_p_fs_p_DirEntry_r_____std_p_fs_p_Error_Ok) is_goml_m_Result____Vec_l_std_p_fs_p_DirEntry_r_____std_p_fs_p_Error() {}
+
+type _goml_m_Result____Vec_l_std_p_fs_p_DirEntry_r_____std_p_fs_p_Error_Err struct {
+    _0 _goml_m_std_p_fs_p_Error
+}
+
+func (_ _goml_m_Result____Vec_l_std_p_fs_p_DirEntry_r_____std_p_fs_p_Error_Err) is_goml_m_Result____Vec_l_std_p_fs_p_DirEntry_r_____std_p_fs_p_Error() {}
 
 type Option__char uint64
 
