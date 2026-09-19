@@ -1,0 +1,68 @@
+package main;
+
+use module::go_backend;
+use module::simd;
+use std::fs;
+use std::path;
+use std::process;
+use std::testing;
+use std::utf8;
+use utf8::BytesUtf8;
+
+fn run_simd_test_go(directory: string, argument: string) -> Result[string, string] {
+    let output = process::Command::new("go").args(Vec::from_array(["run", argument])).current_dir(
+        directory,
+    ).env("GO111MODULE", "off").env("GOWORK", "off").output_structured().map_err(
+        |error| error.to_string(),
+    )?;
+    if !output.status().success() {
+        return Result::Err(output.stderr().to_string_utf8().unwrap_or("invalid Go output"))
+    }
+    output.stdout().to_string_utf8().map_err(|_| "invalid Go output")
+}
+
+fn exercise_simd_native_pipeline(directory: string) -> Result[(), string] {
+    let source = "use std::simd; "
+        + "fn calculate(a: simd::f32x4, b: simd::f32x4, c: simd::f32x4) -> simd::f32x4 { "
+        + "let sum = a.add(b); sum.mul(sum).sub(a).div(c) } "
+        + "fn main() -> () { "
+        + "let bits: Vec[u32] = Vec::from_array([0, 2147483648, 1, 8388607, 8388608, 1065353216, 3212836864, 1073741824, 2139095039, 2139095040, 4286578688, 2143289345]); "
+        + "for index in 0..bits.len() { "
+        + "let a = simd::f32x4::from_array([float32_from_bits(bits[index]), float32_from_bits(bits[(index + 1) % bits.len()]), float32_from_bits(bits[(index + 2) % bits.len()]), float32_from_bits(bits[(index + 3) % bits.len()])]); "
+        + "let b = simd::f32x4::splat(1.5); let c = simd::f32x4::splat(2.5); "
+        + "let result = calculate(a, b, c).to_array(); "
+        + "for lane in 0..4 { let value = result[lane].to_bits(); "
+        + "if value & 2139095040 == 2139095040 && value & 8388607 != 0 { println(2143289344) } else { println(value) } } } }";
+    let generated = go_backend::encode(compile_source("simd-native.gom", source).go_value);
+    let native = simd::native_source(generated)?.ok_or("SIMD kernel was not extracted")?;
+    if !native.assembly.contains("ADDPS") || !native.assembly.contains("MULPS")
+        || !native.assembly.contains("SUBPS")
+        || !native.assembly.contains("DIVPS") {
+        return Result::Err("missing SSE2 arithmetic")
+    }
+    if native.assembly.contains("CALL") || native.assembly.contains("(SP)") {
+        return Result::Err("SIMD kernel spilled intermediates or called another function")
+    }
+    let main_path = path::join(directory, "main.go");
+    fs::write_file_structured(main_path, generated).map_err(|error| error.to_string())?;
+    let scalar = run_simd_test_go(directory, "main.go")?;
+    fs::write_file_structured(main_path, native.source).map_err(|error| error.to_string())?;
+    fs::write_file_structured(path::join(directory, "kernels_amd64.s"), native.assembly).map_err(
+        |error| error.to_string(),
+    )?;
+    let vector = run_simd_test_go(directory, ".")?;
+    if scalar != vector {
+        return Result::Err("scalar and SSE2 results differ")
+    }
+    Result::Ok(())
+}
+
+#[test]
+fn simd_native_kernels_match_scalar_float_edges() -> () {
+    let temporary = temp_go_path("simd-native.gom", "simd-differential");
+    let result = exercise_simd_native_pipeline(path::parent(temporary).unwrap_or(""));
+    cleanup_temp_directory(temporary);
+    if let Err(error) = result {
+        testing::fail(error)
+    }
+}
