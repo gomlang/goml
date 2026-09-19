@@ -66,3 +66,193 @@ fn simd_native_kernels_match_scalar_float_edges() -> () {
         testing::fail(error)
     }
 }
+
+fn simd_extended_source(lanes: isize) -> string {
+    let vector = f"simd::f32x{lanes}";
+    let mask = f"simd::mask32x{lanes}";
+    let mut source = "use std::simd; "
+        + f"fn single(a: {vector}, b: {vector}) -> {vector} {{ a.add(b) }} "
+        + f"fn product(a: {vector}, b: {vector}, c: {vector}) -> {vector} {{ let sum = a.add(b); sum.mul(sum).sub(a).div(c) }} "
+        + f"fn total(a: {vector}) -> f32 {{ a.reduce_sum() }} "
+        + f"fn choose(a: {vector}, b: {vector}) -> {vector} {{ a.simd_lt(b).select(a, b) }} "
+        + f"fn mixed(m: {mask}, s: f32, a: {vector}, n: {mask}) -> {vector} {{ m.bitxor(n).select(a, {vector}::splat(s)) }} "
+        + f"fn logical(a: {mask}, b: {mask}) -> {mask} {{ a.bitand(b).bitor(a.bitnot()).bitxor(b) }} "
+        + f"fn every(a: {mask}) -> bool {{ a.all() }} "
+        + f"fn some(a: {mask}) -> bool {{ a.any() }} "
+        + f"fn equal(a: {vector}, b: {vector}) -> bool {{ a == b }} "
+        + "fn single_avx2() -> () { println(12) } fn constant_constant_1() -> () { println(24) } ";
+    let mut constants = "";
+    let mut left = "";
+    let mut right = "";
+    for lane in 0..lanes {
+        if lane > 0 {
+            constants = constants + ", ";
+            left = left + ", ";
+            right = right + ", ";
+        }
+        constants = constants + "1.0000000596046447753906250000000000000001";
+        left = left + f"float32_from_bits(bits[(index + {lane}) % bits.len()])";
+        right = right + f"float32_from_bits(bits[(other + {lane}) % bits.len()])";
+    }
+    source = source
+        + f"fn constant(a: {vector}) -> {vector} {{ a.add({vector}::from_array([{constants}])) }} ";
+    for op in Vec::from_array(["eq", "ne", "lt", "le", "gt", "ge"]) {
+        source = source
+            + f"fn compare_{op}(a: {vector}, b: {vector}) -> {mask} {{ a.simd_{op}(b) }} ";
+    }
+    source = source
+        + "fn show(value: f32) -> () { let bits = value.to_bits(); if bits & 2139095040 == 2139095040 && bits & 8388607 != 0 { println(2143289344) } else { println(bits) } } "
+        + "fn main() -> () { single_avx2(); constant_constant_1(); let bits: Vec[u32] = Vec::from_array([0, 2147483648, 1, 8388607, 8388608, 1065353216, 3212836864, 1073741824, 2139095039, 2139095040, 4286578688, 2143289345, 2139095041, 4290772993]); "
+        + "for index in 0..bits.len() { for other in 0..bits.len() { "
+        + f"let a = {vector}::from_array([{left}]); let b = {vector}::from_array([{right}]); "
+        + f"let added = single(a, b).to_array(); let result = product(a, b, {vector}::splat(2.5)).to_array(); let selected = choose(a, b).to_array(); let fixed = constant(a).to_array(); "
+        + f"for lane in 0..{lanes} {{ show(added[lane]); show(result[lane]); println(selected[lane].to_bits()); show(fixed[lane]); }} show(total(a)); println(equal(a, b)); ";
+    for op in Vec::from_array(["eq", "ne", "lt", "le", "gt", "ge"]) {
+        source = source + f"println(compare_{op}(a, b).to_bitmask()); ";
+    }
+    source = source + "} } for bits in 0..256 { "
+        + f"let a = {mask}::from_bitmask(bits.to_u8()); let b = {mask}::from_bitmask((255 - bits).to_u8()); "
+        + "println(logical(a, b).to_bitmask()); println(every(a)); println(some(a)); "
+        + f"let result = mixed(a, float32_from_bits(2147483648), {vector}::splat(float32_from_bits(2143289345)), b).to_array(); "
+        + f"for lane in 0..{lanes} {{ println(result[lane].to_bits()); }} }} }}";
+    source
+}
+
+fn exercise_simd_extended_pipeline(directory: string, lanes: isize) -> Result[(), string] {
+    let generated = go_backend::encode(
+        compile_source("simd-extended.gom", simd_extended_source(lanes)).go_value,
+    );
+    let native = simd::native_source(generated)?.ok_or("SIMD kernels were not extracted")?;
+    let prefix = if lanes == 8 {
+        "_goml_simd_avx2_"
+    } else {
+        ""
+    };
+    for name in Vec::from_array(
+        [
+            "single",
+            "product",
+            "total",
+            "choose",
+            "mixed",
+            "logical",
+            "every",
+            "some",
+            "equal",
+            "constant",
+            "compare_eq",
+            "compare_ne",
+            "compare_lt",
+            "compare_le",
+            "compare_gt",
+            "compare_ge",
+        ],
+    ) {
+        if !native.assembly.contains(f"TEXT ·{prefix}{name}(SB)") {
+            return Result::Err(f"missing native {name} for {lanes} lanes")
+        }
+    }
+    for instruction in Vec::from_array(
+        [
+            "ADDPS",
+            "SUBPS",
+            "MULPS",
+            "DIVPS",
+            "CMPPS",
+            "ANDPS",
+            "ANDNPS",
+            "ORPS",
+            "XORPS",
+            "MOVMSKPS",
+        ],
+    ) {
+        if !native.assembly.contains(instruction) {
+            return Result::Err("missing SIMD instruction " + instruction)
+        }
+    }
+    if native.assembly.contains("CALL") || native.assembly.contains("(SP)") {
+        return Result::Err("SIMD kernels spilled or called another function")
+    }
+    let main_path = path::join(directory, "main.go");
+    let assembly_path = path::join(directory, "kernels_amd64.s");
+    fs::write_file_structured(main_path, generated).map_err(|error| error.to_string())?;
+    let scalar = run_simd_test_go(directory, "main.go")?;
+    let cpu_flags = fs::read_file_structured("/proc/cpuinfo").unwrap_or("");
+    let native_source = if lanes == 8 && cpu_flags.contains(" avx2 ") && cpu_flags.contains(" avx ") {
+        native.source
+            + "\nfunc init() { if !_goml_simd_has_avx2 { panic(\"AVX2-capable host was not detected\") } }\n"
+    } else {
+        native.source
+    };
+    fs::write_file_structured(main_path, native_source).map_err(|error| error.to_string())?;
+    fs::write_file_structured(assembly_path, native.assembly).map_err(|error| error.to_string())?;
+    let vector = run_simd_test_go(directory, ".")?;
+    if scalar != vector {
+        return Result::Err(f"scalar and native {lanes}-lane results differ")
+    }
+    if lanes == 8 {
+        if !native.assembly.contains("XGETBV") || !native.assembly.contains("VZEROUPPER") {
+            return Result::Err("missing AVX2 feature detection or transition cleanup")
+        }
+        fs::write_file_structured(
+            main_path,
+            native.source + "\nfunc init() { _goml_simd_has_avx2 = false }\n",
+        ).map_err(|error| error.to_string())?;
+        if scalar != run_simd_test_go(directory, ".")? {
+            return Result::Err("AVX2 runtime fallback differs")
+        }
+        let disabled = simd::native_source_with_avx2(generated, false)?.ok_or(
+            "missing disabled SIMD source",
+        )?;
+        if disabled.assembly.contains("Y0") || disabled.source.contains("_goml_simd_has_avx2") {
+            return Result::Err("AVX2 was not disabled")
+        }
+        fs::write_file_structured(main_path, disabled.source).map_err(|error| error.to_string())?;
+        fs::write_file_structured(assembly_path, disabled.assembly).map_err(
+            |error| error.to_string(),
+        )?;
+        if scalar != run_simd_test_go(directory, ".")? {
+            return Result::Err("SSE2-only fallback differs")
+        }
+    }
+    Result::Ok(())
+}
+
+#[test]
+fn simd_sse2_comparisons_masks_reductions_and_constants_match_scalar() -> () {
+    let temporary = temp_go_path("simd-extended.gom", "simd-sse2");
+    let result = exercise_simd_extended_pipeline(path::parent(temporary).unwrap_or(""), 4);
+    cleanup_temp_directory(temporary);
+    if let Err(error) = result {
+        testing::fail(error)
+    }
+}
+
+#[test]
+fn simd_avx2_comparisons_masks_reductions_and_fallbacks_match_scalar() -> () {
+    let temporary = temp_go_path("simd-extended.gom", "simd-avx2");
+    let result = exercise_simd_extended_pipeline(path::parent(temporary).unwrap_or(""), 8);
+    cleanup_temp_directory(temporary);
+    if let Err(error) = result {
+        testing::fail(error)
+    }
+}
+
+#[test]
+fn simd_extraction_preserves_unsupported_computation() -> () {
+    let source = "use std::simd; "
+        + "fn narrowed(a: simd::f32x4) -> simd::f32x4 { let value: f64 = 1.000000059604644775390625; a.add(simd::f32x4::splat(value.to_f32())) } "
+        + "fn effect(a: simd::f32x4, b: simd::f32x4) -> simd::f32x4 { println(42); a.add(b) } "
+        + "fn branch(a: simd::f32x4, b: simd::f32x4) -> simd::f32x4 { if a.simd_lt(b).any() { a.add(b) } else { a.sub(b) } } "
+        + "fn mixed_width(a: simd::f32x4) -> simd::f32x4 { a.add(simd::f32x4::splat(simd::f32x8::splat(2.0).reduce_sum())) } "
+        + "fn main() -> () { let a = simd::f32x4::splat(0.0); println(narrowed(a).to_array()[0].to_bits()); println(effect(a, a).to_array()[0].to_bits()); println(branch(a, a).to_array()[0].to_bits()); println(mixed_width(a).to_array()[0].to_bits()); }";
+    let generated = go_backend::encode(compile_source("simd-fallback.gom", source).go_value);
+    let assembly = testing::expect_ok(simd::native_source(generated), "valid native metadata").map(
+        |native| native.assembly,
+    ).unwrap_or("");
+    for name in Vec::from_array(["effect", "branch"]) {
+        testing::assert(generated.contains(f"func {name}("));
+        testing::assert(!assembly.contains(f"TEXT ·{name}(SB)"));
+        testing::assert(!assembly.contains(f"TEXT ·_goml_simd_avx2_{name}(SB)"));
+    }
+}

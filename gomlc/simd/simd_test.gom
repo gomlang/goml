@@ -2,18 +2,24 @@ package simd;
 
 use std::testing;
 
+fn float_type(lanes: isize) -> VectorType {
+    VectorType { element: Element::F32, lanes }
+}
+
 #[test]
 fn rejects_invalid_simd_graphs_and_metadata() -> () {
+    let ty = float_type(4);
+    let params = Vec::from_array([Parameter { name: "value", kind: ValueKind::Vector(ty) }]);
     testing::assert(
-        emit_sse2(
+        emit_amd64(
             "invalid",
-            Vec::from_array(["a"]),
+            params,
             Vec::from_array([Node::Input(0), Node::Binary { op: Operator::Add, left: 0, right: 2 }]),
-            1,
+            Output::Vector(1),
         ).is_none(),
     );
     testing::assert(
-        emit_sse2("invalid", Vec::from_array(["a"]), Vec::from_array([Node::Input(1)]), 0).is_none(),
+        emit_amd64("invalid", params, Vec::from_array([Node::Input(1)]), Output::Vector(0)).is_none(),
     );
     testing::assert(
         testing::expect_ok(native_source("package main\n"), "valid scalar source").is_none(),
@@ -24,10 +30,16 @@ fn rejects_invalid_simd_graphs_and_metadata() -> () {
 
 #[test]
 fn sse2_register_allocation_preserves_shared_inputs() -> () {
+    let ty = float_type(4);
     let output = testing::expect_some(
-        emit_sse2(
+        emit_amd64(
             "kernel",
-            Vec::from_array(["a", "b"]),
+            Vec::from_array(
+                [
+                    Parameter { name: "a", kind: ValueKind::Vector(ty) },
+                    Parameter { name: "b", kind: ValueKind::Vector(ty) },
+                ],
+            ),
             Vec::from_array(
                 [
                     Node::Input(0),
@@ -37,12 +49,140 @@ fn sse2_register_allocation_preserves_shared_inputs() -> () {
                     Node::Binary { op: Operator::Sub, left: 3, right: 0 },
                 ],
             ),
-            4,
+            Output::Vector(4),
         ),
         "valid SIMD graph",
     );
-    testing::assert(output.contains("MOVUPS X0, X2\n"));
     testing::assert(output.contains("ADDPS X1, X2\n"));
-    testing::assert(output.contains("MULPS X2, X2\n"));
-    testing::assert(output.contains("SUBPS X0, X2\n"));
+    testing::assert(output.contains("SUBPS X0,"));
+    testing::assert(!output.contains("ADDPS X1, X0\n"));
+}
+
+#[test]
+fn simd_graph_validation_checks_kinds_and_dead_nodes() -> () {
+    let ty = float_type(4);
+    let params = Vec::from_array([Parameter { name: "value", kind: ValueKind::Vector(ty) }]);
+    testing::assert(
+        emit_amd64("wrong_result", params, Vec::from_array([Node::Input(0)]), Output::Scalar(0)).is_none(),
+    );
+    testing::assert(
+        emit_amd64(
+            "bad_dead_node",
+            params,
+            Vec::from_array([Node::Input(0), Node::Splat { ty, value: 8 }]),
+            Output::Vector(0),
+        ).is_none(),
+    );
+    testing::assert(
+        emit_amd64(
+            "bad_constant",
+            Vec::new(),
+            Vec::from_array([Node::Constant { ty, bits: Vec::from_array([0, 0, 0]) }]),
+            Output::Vector(0),
+        ).is_none(),
+    );
+    testing::assert(
+        emit_amd64(
+            "bad_width",
+            Vec::new(),
+            Vec::from_array(
+                [Node::Constant { ty: float_type(3), bits: Vec::from_array([0, 0, 0]) }],
+            ),
+            Output::Vector(0),
+        ).is_none(),
+    );
+    testing::assert(
+        emit_amd64(
+            "bad_conversion",
+            params,
+            Vec::from_array(
+                [
+                    Node::Input(0),
+                    Node::Convert {
+                        value: 0,
+                        to: VectorType { element: Element::F64, lanes: 2 },
+                        bitcast: false,
+                    },
+                ],
+            ),
+            Output::Vector(1),
+        ).is_none(),
+    );
+}
+
+#[test]
+fn simd_register_pressure_falls_back_without_spilling() -> () {
+    let nodes: Vec[Node] = Vec::new();
+    for index in 0..13 {
+        nodes.push(
+            Node::Constant { ty: float_type(4), bits: Vec::from_array([index.to_u64(), 0, 0, 0]) },
+        );
+    }
+    let mut result = 0;
+    for index in 1..13 {
+        nodes.push(Node::Binary { op: Operator::Add, left: result, right: index });
+        result = nodes.len() - 1;
+    }
+    testing::assert(emit_amd64("pressure", Vec::new(), nodes, Output::Vector(result)).is_none());
+}
+
+#[test]
+fn simd_layout_aligns_mixed_parameters_and_results() -> () {
+    for lanes in Vec::from_array([4, 8]) {
+        let ty = float_type(lanes);
+        let params = Vec::from_array(
+            [
+                Parameter { name: "mask", kind: ValueKind::Mask(mask_type(ty)) },
+                Parameter { name: "scalar", kind: ValueKind::Scalar(Element::F32) },
+                Parameter { name: "vector", kind: ValueKind::Vector(ty) },
+                Parameter { name: "last", kind: ValueKind::Mask(mask_type(ty)) },
+            ],
+        );
+        let output = testing::expect_some(
+            emit_amd64(
+                "layout",
+                params,
+                Vec::from_array(
+                    [
+                        Node::Input(0),
+                        Node::Input(1),
+                        Node::Input(2),
+                        Node::Input(3),
+                        Node::Splat { ty, value: 1 },
+                        Node::Binary { op: Operator::Xor, left: 0, right: 3 },
+                        Node::Select { mask: 5, left: 4, right: 2 },
+                    ],
+                ),
+                Output::Vector(6),
+            ),
+            "mixed layout",
+        );
+        for location in Vec::from_array(
+            [
+                "mask+0(FP)",
+                "scalar+4(FP)",
+                "vector+8(FP)",
+                f"last+{8 + lanes * 4}(FP)",
+                f"ret+{16 + lanes * 4}(FP)",
+            ],
+        ) {
+            testing::assert(output.contains(location));
+        }
+        if lanes == 8 {
+            testing::assert(output.contains("VZEROUPPER"));
+            testing::assert(output.contains("VPBROADCASTD"));
+        }
+    }
+}
+
+#[test]
+fn fma_dispatch_requires_its_own_cpu_feature() -> () {
+    let ty = float_type(4);
+    let params = Vec::from_array([Parameter { name: "value", kind: ValueKind::Vector(ty) }]);
+    let nodes = Vec::from_array([Node::Input(0), Node::Fma { left: 0, right: 0, addend: 0 }]);
+    let features = testing::expect_some(kernel_features(params, nodes), "FMA features");
+    testing::assert(!features.0 && features.1);
+    testing::assert(feature_detection_assembly(false).contains("0x1c001000"));
+    testing::assert(feature_detection_assembly(false).contains("XGETBV"));
+    testing::assert(!feature_detection_assembly(false).contains("MOVL $7, AX"));
 }

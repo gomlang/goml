@@ -1,0 +1,222 @@
+package main;
+
+use module::go_backend;
+use module::simd;
+use std::fs;
+use std::path;
+use std::testing;
+
+fn exercise_simd_numeric_source(
+    directory: string,
+    source: string,
+    kernels: Vec[string],
+    oracle: string,
+) -> Result[(), string] {
+    let generated = go_backend::encode(
+        compile_source("simd-numeric.gom", source.replace(" fn ", "\nfn ").replace("; ", ";\n")).go_value,
+    );
+    let generated = if oracle == "" {
+        generated
+    } else {
+        generated.replace("package main\n", "package main\nimport _simd_big \"math/big\"\n")
+    };
+    let native = simd::native_source(generated)?.ok_or("numeric SIMD kernels were not extracted")?;
+    for name in kernels {
+        if !generated.contains(f"func {name}(") {
+            continue
+        }
+        if !native.assembly.contains(f"·{name}(SB)") && !native.assembly.contains(f"_{name}(SB)") {
+            return Result::Err("missing numeric SIMD kernel " + name)
+        }
+    }
+    let main_path = path::join(directory, "main.go");
+    let assembly_path = path::join(directory, "kernels_amd64.s");
+    fs::write_file_structured(main_path, generated + oracle).map_err(|error| error.to_string())?;
+    let scalar = run_simd_test_go(directory, "main.go")?;
+    fs::write_file_structured(main_path, native.source + oracle).map_err(|error| error.to_string())?;
+    fs::write_file_structured(assembly_path, native.assembly).map_err(|error| error.to_string())?;
+    let actual = run_simd_test_go(directory, ".")?;
+    if scalar != actual {
+        let expected = scalar.split("\n");
+        let found = actual.split("\n");
+        let count = if expected.len() < found.len() {
+            expected.len()
+        } else {
+            found.len()
+        };
+        for index in 0..count {
+            if expected[index] != found[index] {
+                return Result::Err(
+                    f"numeric SIMD mismatch at output line {index}: scalar {expected[index]}, native {found[index]}",
+                )
+            }
+        }
+        return Result::Err("numeric SIMD output lengths differ")
+    }
+    let disabled = simd::native_source_with_avx2(generated, false)?.ok_or("missing SSE2 source")?;
+    fs::write_file_structured(main_path, disabled.source + oracle).map_err(
+        |error| error.to_string(),
+    )?;
+    fs::write_file_structured(assembly_path, disabled.assembly).map_err(|error| error.to_string())?;
+    if scalar != run_simd_test_go(directory, ".")? {
+        return Result::Err("numeric SSE2-only fallback differs")
+    }
+    let mut fallback = native.source;
+    if fallback.contains("var _goml_simd_has_avx2") {
+        fallback = fallback + "\nfunc init() { _goml_simd_has_avx2 = false }\n";
+    }
+    if fallback.contains("var _goml_simd_has_fma") {
+        fallback = fallback + "\nfunc init() { _goml_simd_has_fma = false }\n";
+    }
+    fs::write_file_structured(main_path, fallback + oracle).map_err(|error| error.to_string())?;
+    fs::write_file_structured(assembly_path, native.assembly).map_err(|error| error.to_string())?;
+    if scalar != run_simd_test_go(directory, ".")? {
+        return Result::Err("numeric CPU fallback differs")
+    }
+    Result::Ok(())
+}
+
+fn simd_integer_source(bits: isize) -> (string, Vec[string]) {
+    let mut source = "use std::simd; ";
+    let mut main = "fn main() -> () { let bits: Vec[u64] = Vec::from_array([0, 1, 2, 127, 128, 255, 256, 32767, 32768, 65535, 65536, 2147483647, 2147483648, 4294967295, 4294967296, 9223372036854775807, 9223372036854775808, 18446744073709551615]); let mut state: u64 = 1337; for _ in 0..32 { state = state * 6364136223846793005 + 1442695040888963407; bits.push(state); } ";
+    let kernels: Vec[string] = Vec::new();
+    for signed in Vec::from_array([true, false]) {
+        let element = if signed {
+            "i"
+        } else {
+            "u"
+        }
+            + bits.to_string();
+        for width in Vec::from_array([128, 256]) {
+            let lanes = width / bits;
+            let name = element + "x" + lanes.to_string();
+            let ty = "simd::" + name;
+            let mask = f"simd::mask{bits}x{lanes}";
+            let cast = if element == "u64" {
+                ""
+            } else {
+                ".to_u64()"
+            };
+            let input_cast = if element == "u64" {
+                ""
+            } else {
+                ".to_" + element + "()"
+            };
+            let bitmask = if lanes <= 8 {
+                "u8"
+            } else if lanes <= 16 {
+                "u16"
+            } else {
+                "u32"
+            };
+            source = source
+                + f"fn show_{name}(value: {ty}) -> () {{ let a = value.to_array(); for i in 0..{lanes} {{ println(a[i]{cast}); }} }} ";
+            let mut left = "";
+            let mut right = "";
+            for lane in 0..lanes {
+                if lane > 0 {
+                    left = left + ", ";
+                    right = right + ", ";
+                }
+                left = left + f"bits[(index + {lane}) % bits.len()]{input_cast}";
+                right = right + f"bits[(other + {lane * 3}) % bits.len()]{input_cast}";
+            }
+            main = main
+                + f"for index in 0..bits.len() {{ for iteration in 0..4 {{ let other = if iteration == 0 {{ index }} else {{ (index * 7 + iteration * 13) % bits.len() }}; let a = {ty}::from_array([{left}]); let b = {ty}::from_array([{right}]); ";
+            for operation in Vec::from_array(
+                [
+                    "add",
+                    "sub",
+                    "mul",
+                    "min",
+                    "max",
+                    "bitand",
+                    "bitor",
+                    "bitxor",
+                    "saturating_add",
+                    "saturating_sub",
+                    "interleave_low",
+                    "interleave_high",
+                    "deinterleave_even",
+                    "deinterleave_odd",
+                ],
+            ) {
+                let kernel = f"kernel_{name}_{operation}";
+                source = source + f"fn {kernel}(a: {ty}, b: {ty}) -> {ty} {{ a.{operation}(b) }} ";
+                main = main + f"show_{name}({kernel}(a, b)); ";
+                if bits <= 16 || !operation.starts_with("saturating_") {
+                    kernels.push(kernel);
+                }
+            }
+            for operation in Vec::from_array(["eq", "ne", "lt", "le", "gt", "ge"]) {
+                let kernel = f"kernel_{name}_{operation}";
+                source = source
+                    + f"fn {kernel}(a: {ty}, b: {ty}) -> {mask} {{ a.simd_{operation}(b) }} ";
+                main = main + f"println({kernel}(a, b).to_bitmask().to_u64()); ";
+                kernels.push(kernel);
+            }
+            for operation in Vec::from_array(["neg", "abs", "bitnot", "reverse"]) {
+                let kernel = f"kernel_{name}_{operation}";
+                source = source + f"fn {kernel}(a: {ty}) -> {ty} {{ a.{operation}() }} ";
+                main = main + f"show_{name}({kernel}(a)); ";
+                kernels.push(kernel);
+            }
+            for operation in Vec::from_array(["sum", "product", "min", "max", "and", "or", "xor"]) {
+                let kernel = f"kernel_{name}_reduce_{operation}";
+                source = source + f"fn {kernel}(a: {ty}) -> {element} {{ a.reduce_{operation}() }} ";
+                main = main + f"println({kernel}(a){cast}); ";
+                kernels.push(kernel);
+            }
+            for operation in Vec::from_array(["shl", "shr"]) {
+                for count in Vec::from_array([0, 1, bits - 1, bits, bits + 1]) {
+                    let kernel = f"kernel_{name}_{operation}_{count}";
+                    source = source + f"fn {kernel}(a: {ty}) -> {ty} {{ a.{operation}({count}) }} ";
+                    main = main + f"show_{name}({kernel}(a)); ";
+                    kernels.push(kernel);
+                }
+            }
+            let kernel = f"kernel_{name}_choose";
+            source = source
+                + f"fn {kernel}(mask: {mask}, a: {ty}, b: {ty}) -> {ty} {{ mask.select(a, b) }} ";
+            kernels.push(kernel);
+            main = main
+                + f"show_{name}({kernel}({mask}::from_bitmask(bits[index].to_{bitmask}()), a, b)); }} }} ";
+        }
+    };
+    (source + main + "}", kernels)
+}
+
+fn assert_integer_simd(bits: isize) -> () {
+    let temporary = temp_go_path(f"simd-integer-{bits}.gom", "simd-integer");
+    let (source, kernels) = simd_integer_source(bits);
+    let result = exercise_simd_numeric_source(
+        path::parent(temporary).unwrap_or(""),
+        source,
+        kernels,
+        "",
+    );
+    cleanup_temp_directory(temporary);
+    if let Err(error) = result {
+        testing::fail(error);
+    }
+}
+
+#[test]
+fn simd_integer_bytes_match_scalar() -> () {
+    assert_integer_simd(8)
+}
+
+#[test]
+fn simd_integer_words_match_scalar() -> () {
+    assert_integer_simd(16)
+}
+
+#[test]
+fn simd_integer_dwords_match_scalar() -> () {
+    assert_integer_simd(32)
+}
+
+#[test]
+fn simd_integer_qwords_match_scalar() -> () {
+    assert_integer_simd(64)
+}
