@@ -728,3 +728,142 @@ fn empty_watch_sets_cancel_and_accept_new_registrations() -> () {
         ),
     );
 }
+
+#[test]
+fn ignore_prunes_subtrees_and_preserves_root_control_events() -> () {
+    let root = temporary("ignore-prune");
+    defer testing::expect_ok(fs::remove_dir_all(root), "cleanup");
+    testing::expect_ok(fs::create_dir_all(path::join(root, "cache/deep")), "ignored subtree");
+    testing::expect_ok(fs::create_dir_all(path::join(root, "src/nested")), "visible subtree");
+    let names = Vec::from_array(["cache"]);
+    let options = Options::new().with_ignored_names(names).with_recursive(true).with_mask(MODIFY).with_ignore(
+        |name, directory| !directory && name.ends_with(".tmp"),
+    );
+    names.push("src");
+    let state = testing::expect_ok(open_state(root, options), "open watcher");
+    defer testing::expect_ok(close_state(state), "close watcher");
+    testing::assert_eq(state.watches.len(), 3);
+    let root_wd = wd_for(state, root);
+    let events = testing::expect_ok(
+        process_events(
+            state,
+            Vec::from_array(
+                [
+                    raw(root_wd, MODIFY, 0, "ignored.tmp"),
+                    raw(root_wd, MODIFY, 0, "visible"),
+                    raw(root_wd, CREATE | IS_DIR, 0, "cache"),
+                ],
+            ),
+        ),
+        "filter events",
+    );
+    testing::assert_eq(events.len(), 1);
+    testing::assert_eq(events[0].path, path::join(root, "visible"));
+    let _ = testing::expect_ok(
+        process_events(state, Vec::from_array([raw(-1, Q_OVERFLOW, 0, "")])),
+        "rebuild",
+    );
+    testing::assert_eq(state.watches.len(), 3);
+    let all_ignored = testing::expect_ok(
+        open_state(root, Options::new().with_recursive(true).with_ignore(|_, _| true)),
+        "ignore all children",
+    );
+    defer testing::expect_ok(close_state(all_ignored), "close");
+    testing::assert_eq(all_ignored.watches.len(), 1);
+    let events = testing::expect_ok(
+        process_events(
+            all_ignored,
+            Vec::from_array([raw(wd_for(all_ignored, root), DELETE_SELF, 0, "")]),
+        ),
+        "root lifecycle",
+    );
+    testing::assert_eq(events.len(), 1);
+    testing::assert(all_ignored.fd.get().is_none());
+}
+
+#[test]
+fn ignore_handles_moves_across_visibility_boundaries() -> () {
+    let root = temporary("ignore-moves");
+    defer testing::expect_ok(fs::remove_dir_all(root), "cleanup");
+    testing::expect_ok(fs::create_dir_all(path::join(root, "visible/nested")), "subtree");
+    let state = testing::expect_ok(
+        open_state(
+            root,
+            Options::new().with_recursive(true).with_ignored_names(Vec::from_array(["ignored"])),
+        ),
+        "open",
+    );
+    defer testing::expect_ok(close_state(state), "close");
+    let root_wd = wd_for(state, root);
+    let old_child = wd_for(state, path::join(root, "visible/nested"));
+    testing::expect_ok(fs::rename(path::join(root, "visible"), path::join(root, "ignored")), "hide");
+    let events = testing::expect_ok(
+        process_events(
+            state,
+            Vec::from_array(
+                [
+                    raw(root_wd, MOVED_FROM | IS_DIR, 81, "visible"),
+                    raw(root_wd, MOVED_TO | IS_DIR, 81, "ignored"),
+                    raw(old_child, MODIFY, 0, "hidden-event"),
+                ],
+            ),
+        ),
+        "move into ignored tree",
+    );
+    testing::assert_eq(events.len(), 1);
+    testing::assert_eq(events[0].path, path::join(root, "visible"));
+    testing::assert_eq(state.watches.len(), 1);
+    testing::assert_eq(state.moves.len(), 0);
+    testing::expect_ok(
+        fs::rename(path::join(root, "ignored"), path::join(root, "returned")),
+        "show",
+    );
+    let events = testing::expect_ok(
+        process_events(
+            state,
+            Vec::from_array(
+                [
+                    raw(root_wd, MOVED_FROM | IS_DIR, 82, "ignored"),
+                    raw(root_wd, MOVED_TO | IS_DIR, 82, "returned"),
+                ],
+            ),
+        ),
+        "move out of ignored tree",
+    );
+    testing::assert_eq(events.len(), 1);
+    testing::assert(events[0].rescan);
+    testing::assert_eq(events[0].path, path::join(root, "returned"));
+    testing::assert_eq(state.watches.len(), 3);
+    testing::assert_eq(state.moves.len(), 0);
+}
+
+#[test]
+fn ignore_rechecks_descendants_after_parent_rename() -> () {
+    let root = temporary("ignore-rename-path");
+    defer testing::expect_ok(fs::remove_dir_all(root), "cleanup");
+    testing::expect_ok(fs::create_dir_all(path::join(root, "old/private/deep")), "private subtree");
+    testing::expect_ok(fs::create_dir(path::join(root, "old/public")), "public subtree");
+    let hidden = path::join(root, "new/private");
+    let state = testing::expect_ok(
+        open_state(root, Options::new().with_recursive(true).with_ignore(|name, _| name == hidden)),
+        "open",
+    );
+    defer testing::expect_ok(close_state(state), "close");
+    testing::assert_eq(state.watches.len(), 5);
+    testing::expect_ok(fs::rename(path::join(root, "old"), path::join(root, "new")), "rename");
+    let root_wd = wd_for(state, root);
+    let _ = testing::expect_ok(
+        process_events(
+            state,
+            Vec::from_array(
+                [
+                    raw(root_wd, MOVED_FROM | IS_DIR, 83, "old"),
+                    raw(root_wd, MOVED_TO | IS_DIR, 83, "new"),
+                ],
+            ),
+        ),
+        "process rename",
+    );
+    testing::assert_eq(state.watches.len(), 3);
+    let _ = wd_for(state, path::join(root, "new/public"));
+}

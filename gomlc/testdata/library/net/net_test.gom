@@ -1,0 +1,635 @@
+package net;
+
+use std::fs;
+use std::io::{Error, ErrorKind};
+use std::os::linux::syscall;
+use std::os::linux::syscall::{Arg};
+use std::task;
+use std::testing;
+use std::time;
+
+#[go_ffi("runtime", "NumGoroutine")]
+extern fn goroutines() -> isize;
+
+fn address(value: string) -> SocketAddr {
+    testing::expect_ok(SocketAddr::parse(value), "parse address")
+}
+
+fn options() -> WaitOptions {
+    WaitOptions::new().with_timeout(time::Duration::from_seconds(3))
+}
+
+fn short_wait() -> WaitOptions {
+    WaitOptions::new().with_timeout(time::Duration::from_milliseconds(15))
+}
+
+fn pair() -> (TcpStream, TcpStream) {
+    let listener = testing::expect_ok(TcpListener::bind(address("127.0.0.1:0")), "bind");
+    defer testing::expect_ok(listener.close(), "close listener");
+    let local = testing::expect_ok(listener.local_addr(), "local address");
+    let client = testing::expect_ok(TcpStream::connect_with(local, options()), "connect");
+    let (server, _) = testing::expect_ok(listener.accept_with(options()), "accept");
+    (client, server)
+}
+
+fn registered() -> isize {
+    let reactor = testing::expect_ok(shared_reactor(), "reactor");
+    let state = testing::expect_some(reactor.state.recv(), "reactor lock");
+    defer reactor.state.send(state);
+    state.entries.len()
+}
+
+fn socket_descriptors() -> isize {
+    let mut count = 0;
+    for name in testing::expect_ok(fs::read_dir("/proc/self/fd"), "descriptor list") {
+        let path = ("/proc/self/fd/" + name).to_bytes();
+        path.push(0);
+        let buffer = zeroes(128);
+        let result = call(
+            89,
+            [
+                Arg::Buffer(path.as_mut_slice()),
+                Arg::Buffer(buffer.as_mut_slice()),
+                Arg::Word(128),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+            ],
+            "readlink",
+        );
+        if let Ok(size) = result {
+            if size >= 8 && buffer.slice(0, 8).to_vec() == b"socket:[" {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+fn is_waiting(socket: Socket, writing: bool) -> bool {
+    let state = testing::expect_some(socket.reactor.state.recv(), "reactor lock");
+    defer socket.reactor.state.send(state);
+    match state.entries[socket.id] {
+        Some(entry) => if writing {
+            entry.writer.is_some()
+        } else {
+            entry.reader.is_some()
+        },
+        None => false,
+    }
+}
+
+fn await_waiter(socket: Socket, writing: bool) -> () {
+    let started = time::Instant::now();
+    while !is_waiting(socket, writing) {
+        if started.elapsed().as_seconds() >= 3 {
+            testing::fail("operation did not register with epoll");
+        }
+        time::sleep(time::Duration::from_milliseconds(1));
+    }
+}
+
+#[test]
+fn parses_and_formats_numeric_addresses() -> () {
+    for (input, expected) in Vec::from_array(
+        [
+            ("127.0.0.1:80", "127.0.0.1:80"),
+            ("0.0.0.0:0", "0.0.0.0:0"),
+            ("255.255.255.255:65535", "255.255.255.255:65535"),
+            ("[0:0:0:0:0:0:0:1]:443", "[::1]:443"),
+            ("[2001:0DB8:0:0:1:0:0:1]:80", "[2001:db8::1:0:0:1]:80"),
+            ("[::]:0", "[::]:0"),
+            ("[fe80::1%4294967295]:1", "[fe80::1%4294967295]:1"),
+            ("[::ffff:192.0.2.1]:99", "[::ffff:c000:201]:99"),
+            ("[1:0:2:3:4:5:6:7]:8", "[1:0:2:3:4:5:6:7]:8"),
+            ("[1:2:3:4:5:6:0:0]:9", "[1:2:3:4:5:6::]:9"),
+        ],
+    ) {
+        let parsed = address(input);
+        testing::assert_eq(parsed.to_string(), expected);
+        testing::assert_eq(address(expected), parsed);
+    }
+    for value in Vec::from_array(
+        [
+            "",
+            "localhost:80",
+            "127.1:80",
+            "01.2.3.4:80",
+            "256.2.3.4:0",
+            "1.2.3.4:-1",
+            "1.2.3.4:65536",
+            "1.2.3.4: 8",
+            "1.2.3.4:+8",
+            "1.2.3.4:8x",
+            "1.2.3.4:9999999999999999999999",
+            "::1:80",
+            "[127.0.0.1]:80",
+            "[1:2:3:4:5:6:7]:0",
+            "[1:2:3:4:5:6:7:8:9]:0",
+            "[1:2:3:4:5:6:7:8::]:0",
+            "[:::]:0",
+            "[1::2::3]:0",
+            "[12345::]:0",
+            "[fe80::1%eth0]:0",
+            "[fe80::1%4294967296]:0",
+            "[::1%]:0",
+            "[1.2.3.4::]:0",
+            "[::ffff:01.2.3.4]:0",
+            "[::1]:0:1",
+            "[::1]0",
+            "[::1]:",
+            "[::1]:０",
+        ],
+    ) {
+        testing::assert_eq(
+            testing::expect_err(SocketAddr::parse(value), "invalid address " + value).kind(),
+            ErrorKind::InvalidInput,
+        );
+    }
+}
+
+#[test]
+fn encodes_native_socket_addresses_and_rejects_truncation() -> () {
+    for input in Vec::from_array(["1.2.3.4:4660", "[2001:db8::abcd%12]:65535"]) {
+        let value = address(input);
+        let data = testing::expect_ok(encode_address(value), "encode");
+        testing::assert_eq(testing::expect_ok(decode_address(data.as_slice()), "decode"), value);
+        testing::assert_eq(data[2].to_u16() * 256 + data[3].to_u16(), value.port);
+        for size in 0..data.len() {
+            testing::assert_err(decode_address(data.slice(0, size)));
+        }
+    }
+    testing::assert_err(decode_address(zeroes(28).as_slice()));
+    testing::assert_err(encode_address(SocketAddr { scope_id: 1, ..address("127.0.0.1:0") }));
+}
+
+#[test]
+fn tcp_streams_transfer_partial_data_and_half_close() -> () {
+    let (client, server) = pair();
+    defer testing::expect_ok(client.close(), "close client");
+    defer testing::expect_ok(server.close(), "close server");
+    task::scope(
+        |scope: task::Scope| {
+            let writer = scope.spawn(
+                |_: task::CancelToken| {
+                    testing::expect_ok(
+                        client.write_all_with(b"a".as_slice(), options()),
+                        "first write",
+                    );
+                    testing::expect_ok(
+                        client.write_all_with(b"bcdef".as_slice(), options()),
+                        "second write",
+                    );
+                    testing::expect_ok(client.shutdown(Shutdown::Write), "shutdown write");
+                    let reply = zeroes(2);
+                    testing::expect_ok(
+                        client.read_exact_with(reply.as_mut_slice(), options()),
+                        "reply",
+                    );
+                    testing::assert(reply == b"ok");
+                },
+            );
+            let data = zeroes(6);
+            testing::expect_ok(server.read_exact_with(data.as_mut_slice(), options()), "read exact");
+            testing::assert(data == b"abcdef");
+            testing::assert_eq(
+                testing::expect_ok(server.read_with(data.as_mut_slice(), options()), "EOF"),
+                0,
+            );
+            testing::assert_eq(
+                testing::expect_err(
+                    server.read_exact_with(data.as_mut_slice(), options()),
+                    "short EOF",
+                ).kind(),
+                ErrorKind::UnexpectedEof,
+            );
+            testing::expect_ok(server.write_all_with(b"ok".as_slice(), options()), "reply");
+            writer.join();
+        },
+    );
+    testing::assert_err(client.write_with(b"after shutdown".as_slice(), options()));
+}
+
+#[test]
+fn tcp_deadlines_and_cancellation_leave_stream_usable() -> () {
+    let (client, server) = pair();
+    defer testing::expect_ok(client.close(), "close client");
+    defer testing::expect_ok(server.close(), "close server");
+    let data = zeroes(1);
+    testing::assert_eq(
+        testing::expect_err(server.read_with(data.as_mut_slice(), short_wait()), "timeout").kind(),
+        ErrorKind::TimedOut,
+    );
+    task::scope(
+        |scope: task::Scope| {
+            let reader = scope.spawn(
+                |cancel: task::CancelToken| server.read_with(
+                    data.as_mut_slice(),
+                    options().with_cancel(cancel),
+                ),
+            );
+            await_waiter(server.socket, false);
+            scope.cancel();
+            testing::assert_eq(
+                testing::expect_err(reader.join(), "cancel read").kind(),
+                ErrorKind::Interrupted,
+            );
+            testing::assert_eq(
+                testing::expect_err(
+                    client.write_with(b"x".as_slice(), options().with_cancel(scope.token())),
+                    "pre-cancel write",
+                ).kind(),
+                ErrorKind::Interrupted,
+            );
+        },
+    );
+    testing::assert(!is_waiting(server.socket, false));
+    testing::expect_ok(client.write_all(b"y".as_slice()), "write after cancel");
+    testing::expect_ok(server.read_exact_with(data.as_mut_slice(), options()), "read after cancel");
+    testing::assert(data == b"y");
+}
+
+#[test]
+fn close_wakes_active_and_queued_reads() -> () {
+    let (client, server) = pair();
+    defer testing::expect_ok(client.close(), "close client");
+    task::scope(
+        |scope: task::Scope| {
+            let first = scope.spawn(|_: task::CancelToken| server.read(zeroes(1).as_mut_slice()));
+            await_waiter(server.socket, false);
+            let second = scope.spawn(|_: task::CancelToken| server.read(zeroes(1).as_mut_slice()));
+            testing::assert_eq(
+                testing::expect_err(
+                    server.read_with(zeroes(1).as_mut_slice(), short_wait()),
+                    "queued timeout",
+                ).kind(),
+                ErrorKind::TimedOut,
+            );
+            testing::expect_ok(server.close(), "close pending reads");
+            testing::assert_err(first.join());
+            testing::assert_err(second.join());
+        },
+    );
+    testing::assert(server.is_closed());
+    testing::expect_ok(server.close(), "idempotent close");
+    testing::assert_err(server.local_addr());
+    testing::assert_err(server.read(zeroes(0).as_mut_slice()));
+    testing::assert_err(server.write_all(b"".as_slice()));
+}
+
+#[test]
+fn listener_waits_cancel_timeout_and_close() -> () {
+    let listener = testing::expect_ok(TcpListener::bind(address("127.0.0.1:0")), "bind");
+    testing::assert_eq(
+        testing::expect_err(listener.accept_with(short_wait()), "accept timeout").kind(),
+        ErrorKind::TimedOut,
+    );
+    task::scope(
+        |scope: task::Scope| {
+            let acceptor = scope.spawn(
+                |cancel: task::CancelToken| listener.accept_with(options().with_cancel(cancel)),
+            );
+            await_waiter(listener.socket, false);
+            scope.cancel();
+            testing::assert_eq(
+                testing::expect_err(acceptor.join(), "accept cancel").kind(),
+                ErrorKind::Interrupted,
+            );
+        },
+    );
+    task::scope(
+        |scope: task::Scope| {
+            let acceptor = scope.spawn(|_: task::CancelToken| listener.accept());
+            await_waiter(listener.socket, false);
+            testing::expect_ok(listener.close(), "close accepting listener");
+            testing::assert_err(acceptor.join());
+        },
+    );
+}
+
+#[test]
+fn tcp_ipv6_and_udp_ipv6_use_native_addresses() -> () {
+    let listener = testing::expect_ok(TcpListener::bind(address("[::1]:0")), "IPv6 listener");
+    defer testing::expect_ok(listener.close(), "close listener");
+    let local = testing::expect_ok(listener.local_addr(), "IPv6 address");
+    let client = testing::expect_ok(TcpStream::connect_with(local, options()), "IPv6 connect");
+    defer testing::expect_ok(client.close(), "close client");
+    let (server, peer) = testing::expect_ok(listener.accept_with(options()), "IPv6 accept");
+    defer testing::expect_ok(server.close(), "close server");
+    testing::assert_eq(peer.ip.to_string(), "::1");
+    testing::expect_ok(client.write_all(b"v6".as_slice()), "IPv6 write");
+    let data = zeroes(2);
+    testing::expect_ok(server.read_exact_with(data.as_mut_slice(), options()), "IPv6 read");
+    testing::assert(data == b"v6");
+    udp_roundtrip("[::1]:0");
+}
+
+fn udp_roundtrip(bind: string) -> () {
+    let left = testing::expect_ok(UdpSocket::bind(address(bind)), "UDP bind left");
+    defer testing::expect_ok(left.close(), "UDP close left");
+    let right = testing::expect_ok(UdpSocket::bind(address(bind)), "UDP bind right");
+    defer testing::expect_ok(right.close(), "UDP close right");
+    let destination = testing::expect_ok(right.local_addr(), "UDP local");
+    let sender = testing::expect_ok(left.local_addr(), "UDP sender");
+    testing::assert_eq(
+        testing::expect_ok(
+            left.send_to_with(b"abcde".as_slice(), destination, options()),
+            "UDP send",
+        ),
+        5,
+    );
+    let data = zeroes(3);
+    let message = testing::expect_ok(
+        right.recv_from_with(data.as_mut_slice(), options()),
+        "UDP recv",
+    );
+    testing::assert_eq(message.source, sender);
+    testing::assert(message.len == 3 && message.datagram_len == 5 && message.truncated);
+    testing::assert(data == b"abc");
+    testing::expect_ok(left.send_to(b"".as_slice(), destination), "zero length datagram");
+    let message = testing::expect_ok(
+        right.recv_from_with(zeroes(0).as_mut_slice(), options()),
+        "consume empty datagram",
+    );
+    testing::assert(message.len == 0 && message.datagram_len == 0 && !message.truncated);
+    testing::expect_ok(left.send_to(b"x".as_slice(), destination), "nonempty datagram");
+    let message = testing::expect_ok(
+        right.recv_from_with(zeroes(0).as_mut_slice(), options()),
+        "zero capacity buffer",
+    );
+    testing::assert(message.len == 0 && message.datagram_len == 1 && message.truncated);
+    testing::assert_eq(
+        testing::expect_err(right.recv_from_with(data.as_mut_slice(), short_wait()), "UDP timeout").kind(),
+        ErrorKind::TimedOut,
+    );
+}
+
+#[test]
+fn udp_preserves_datagram_boundaries_truncation_and_empty_messages() -> () {
+    udp_roundtrip("127.0.0.1:0");
+}
+
+#[test]
+fn udp_cancellation_close_and_oversized_packets() -> () {
+    let socket = testing::expect_ok(UdpSocket::bind(address("127.0.0.1:0")), "UDP bind");
+    let local = testing::expect_ok(socket.local_addr(), "local");
+    testing::assert(
+        testing::expect_err(socket.send_to(zeroes(65536).as_slice(), local), "oversized UDP").raw_os_code()
+            == Option::Some(90),
+    );
+    task::scope(
+        |scope: task::Scope| {
+            let receiver = scope.spawn(
+                |cancel: task::CancelToken| socket.recv_from_with(
+                    zeroes(1).as_mut_slice(),
+                    options().with_cancel(cancel),
+                ),
+            );
+            await_waiter(socket.socket, false);
+            scope.cancel();
+            testing::assert_eq(
+                testing::expect_err(receiver.join(), "UDP cancel").kind(),
+                ErrorKind::Interrupted,
+            );
+        },
+    );
+    task::scope(
+        |scope: task::Scope| {
+            let receiver = scope.spawn(
+                |_: task::CancelToken| socket.recv_from(zeroes(1).as_mut_slice()),
+            );
+            await_waiter(socket.socket, false);
+            testing::expect_ok(socket.close(), "close UDP");
+            testing::assert_err(receiver.join());
+        },
+    );
+    testing::expect_ok(socket.close(), "repeated UDP close");
+}
+
+#[test]
+fn nonblocking_cloexec_flags_and_failed_operations_release_descriptors() -> () {
+    let initial = registered();
+    let descriptor_count = socket_descriptors();
+    let listener = testing::expect_ok(TcpListener::bind(address("127.0.0.1:0")), "bind");
+    let local = testing::expect_ok(listener.local_addr(), "local");
+    for _ in 0..12 {
+        let value = testing::expect_err(TcpListener::bind(local), "duplicate bind");
+        testing::assert(value.raw_os_code() == Option::Some(98));
+        testing::assert_eq(registered(), initial + 1);
+        testing::assert_eq(socket_descriptors(), descriptor_count + 1);
+    }
+    let client = testing::expect_ok(TcpStream::connect_with(local, options()), "connect");
+    let (server, _) = testing::expect_ok(listener.accept_with(options()), "accept");
+    for socket in Vec::from_array([listener.socket, client.socket, server.socket]) {
+        testing::expect_ok(
+            socket.with_fd(
+                "check flags",
+                |fd| {
+                    let descriptor = invoke(
+                        72,
+                        [
+                            Arg::Word(fd),
+                            Arg::Word(1),
+                            Arg::Word(0),
+                            Arg::Word(0),
+                            Arg::Word(0),
+                            Arg::Word(0),
+                        ],
+                        "F_GETFD",
+                    )?;
+                    let status = invoke(
+                        72,
+                        [
+                            Arg::Word(fd),
+                            Arg::Word(3),
+                            Arg::Word(0),
+                            Arg::Word(0),
+                            Arg::Word(0),
+                            Arg::Word(0),
+                        ],
+                        "F_GETFL",
+                    )?;
+                    testing::assert(descriptor & 1 != 0 && status & 0x800 != 0);
+                    Result::Ok(())
+                },
+            ),
+            "socket flags",
+        );
+    }
+    testing::expect_ok(client.close(), "close client");
+    testing::expect_ok(server.close(), "close server");
+    testing::expect_ok(listener.close(), "close listener");
+    for _ in 0..12 {
+        testing::assert(
+            testing::expect_err(TcpStream::connect_with(local, options()), "refused connection").raw_os_code()
+                == Option::Some(111),
+        );
+        testing::assert_eq(registered(), initial);
+        testing::assert_eq(socket_descriptors(), descriptor_count);
+    }
+    testing::assert_err(TcpListener::bind_with_backlog(local, 0));
+    testing::assert_err(
+        TcpStream::connect_with(local, WaitOptions::new().with_timeout(time::Duration::zero())),
+    );
+    testing::assert_eq(registered(), initial);
+    testing::assert_eq(socket_descriptors(), descriptor_count);
+}
+
+#[test]
+fn shared_reactor_handles_many_idle_sockets_without_per_socket_workers() -> () {
+    let _ = testing::expect_ok(shared_reactor(), "initialize reactor");
+    time::sleep(time::Duration::from_milliseconds(5));
+    let before = goroutines();
+    let count = registered();
+    let sockets = Vec::new();
+    for _ in 0..128 {
+        sockets.push(testing::expect_ok(UdpSocket::bind(address("127.0.0.1:0")), "idle UDP"));
+    }
+    testing::assert(goroutines() <= before + 2);
+    testing::assert_eq(registered(), count + 128);
+    for socket in sockets {
+        testing::expect_ok(socket.close(), "close idle socket");
+    }
+    testing::assert_eq(registered(), count);
+}
+
+#[test]
+fn old_epoll_events_do_not_target_reused_file_descriptors() -> () {
+    for _ in 0..32 {
+        let old = testing::expect_ok(UdpSocket::bind(address("127.0.0.1:0")), "old socket");
+        let old_id = old.socket.id;
+        testing::expect_ok(old.close(), "close old");
+        let current = testing::expect_ok(UdpSocket::bind(address("127.0.0.1:0")), "new socket");
+        defer testing::expect_ok(current.close(), "close new");
+        testing::assert(current.socket.id != old_id);
+        let ready = testing::expect_ok(
+            current.socket.reactor.arm(current.socket.id, false),
+            "arm reader",
+        );
+        let reactor = current.socket.reactor;
+        let state = testing::expect_some(reactor.state.recv(), "lock reactor");
+        reactor_dispatch(reactor, state, old_id, 0x19);
+        reactor.state.send(state);
+        let stale = select {
+            recv(ready) as _ => true,
+            default => false,
+        };
+        testing::assert(!stale);
+        current.socket.reactor.disarm(current.socket.id, false);
+    }
+}
+
+#[test]
+fn pending_write_times_out_and_close_unblocks_backpressure() -> () {
+    let (client, server) = pair();
+    defer testing::expect_ok(server.close(), "close server");
+    testing::expect_ok(
+        client.socket.with_fd("send buffer", |fd| socket_option(fd, 1, 7, 4096)),
+        "small send buffer",
+    );
+    testing::expect_ok(
+        server.socket.with_fd("receive buffer", |fd| socket_option(fd, 1, 8, 4096)),
+        "small receive buffer",
+    );
+    let data = zeroes(2 * 1024 * 1024);
+    testing::assert_eq(
+        testing::expect_err(client.write_all_with(data.as_slice(), short_wait()), "write timeout").kind(),
+        ErrorKind::TimedOut,
+    );
+    task::scope(
+        |scope: task::Scope| {
+            let writer = scope.spawn(|_: task::CancelToken| client.write_all(data.as_slice()));
+            await_waiter(client.socket, true);
+            testing::expect_ok(client.close(), "close writing stream");
+            testing::assert_err(writer.join());
+        },
+    );
+}
+
+#[test]
+fn read_exact_deadline_does_not_restart_after_partial_progress() -> () {
+    let (client, server) = pair();
+    defer testing::expect_ok(client.close(), "close client");
+    defer testing::expect_ok(server.close(), "close server");
+    testing::expect_ok(client.write_all(b"a".as_slice()), "initial data");
+    task::scope(
+        |scope: task::Scope| {
+            let writer = scope.spawn(
+                |_: task::CancelToken| {
+                    for _ in 0..31 {
+                        time::sleep(time::Duration::from_milliseconds(10));
+                        if client.write_all(b"b".as_slice()).is_err() {
+                            break;
+                        }
+                    }
+                },
+            );
+            let buffer = zeroes(32);
+            let result = server.read_exact_with(
+                buffer.as_mut_slice(),
+                WaitOptions::new().with_timeout(time::Duration::from_milliseconds(60)),
+            );
+            testing::assert_eq(
+                testing::expect_err(result, "whole read deadline").kind(),
+                ErrorKind::TimedOut,
+            );
+            testing::assert_eq(buffer[0], 97);
+            testing::expect_ok(client.close(), "stop writer");
+            writer.join();
+        },
+    );
+}
+
+#[test]
+fn simultaneous_read_and_write_waiters_preserve_each_other() -> () {
+    let (client, server) = pair();
+    defer testing::expect_ok(client.close(), "close client");
+    defer testing::expect_ok(server.close(), "close server");
+    testing::expect_ok(
+        client.socket.with_fd("send buffer", |fd| socket_option(fd, 1, 7, 4096)),
+        "small send buffer",
+    );
+    let data = zeroes(2 * 1024 * 1024);
+    task::scope(
+        |scope: task::Scope| {
+            let writer = scope.spawn(
+                |_: task::CancelToken| client.write_all_with(data.as_slice(), options()),
+            );
+            await_waiter(client.socket, true);
+            let reader = scope.spawn(
+                |_: task::CancelToken| client.read_with(zeroes(1).as_mut_slice(), options()),
+            );
+            await_waiter(client.socket, false);
+            testing::expect_ok(server.write_all(b"x".as_slice()), "wake client reader");
+            testing::assert_eq(testing::expect_ok(reader.join(), "client read"), 1);
+            testing::expect_ok(
+                server.read_exact_with(zeroes(data.len()).as_mut_slice(), options()),
+                "drain writer",
+            );
+            testing::expect_ok(writer.join(), "client write");
+        },
+    );
+}
+
+#[test]
+fn concurrent_handle_copies_close_the_descriptor_once() -> () {
+    for _ in 0..24 {
+        let socket = testing::expect_ok(UdpSocket::bind(address("127.0.0.1:0")), "bind");
+        let fd = testing::expect_ok(
+            socket.socket.with_fd("capture fd", |value| Result::Ok(value)),
+            "descriptor",
+        );
+        task::scope(
+            |scope: task::Scope| {
+                let closer = scope.spawn(|_: task::CancelToken| socket.close());
+                testing::expect_ok(socket.close(), "close copy");
+                testing::expect_ok(closer.join(), "concurrent close");
+            },
+        );
+        let result = testing::expect_ok(
+            syscall::syscall6(72, [fd, 1, 0, 0, 0, 0]),
+            "F_GETFD after close",
+        );
+        testing::assert_eq(result.errno, syscall::EBADF);
+    }
+}
