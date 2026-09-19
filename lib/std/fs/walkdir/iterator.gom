@@ -1,0 +1,128 @@
+package walkdir;
+
+use module::fs;
+use module::path;
+
+enum Work {
+    Visit(string, isize),
+    Leave(DirEntry, Option[string]),
+}
+
+pub struct WalkIterator {
+    options: WalkDir,
+    started: Ref[bool],
+    done: Ref[bool],
+    pending: Ref[Option[DirEntry]],
+    work: Vec[Work],
+    ancestors: HashMap[string, string],
+}
+
+impl WalkIterator {
+    pub fn skip_current_dir(self: WalkIterator) -> () {
+        self.pending.set(Option::None);
+    }
+
+    pub fn close(self: WalkIterator) -> () {
+        self.done.set(true);
+        self.pending.set(Option::None);
+        self.work.clear();
+        for (name, _) in self.ancestors.entries() {
+            self.ancestors.remove(name);
+        }
+    }
+}
+
+fn descend(iterator: WalkIterator, entry: DirEntry) -> Result[(), Error] {
+    let canonical = if iterator.options.follow {
+        let name = match fs::canonicalize(entry.path()) {
+            Ok(value) => value,
+            Err(error) => {
+                iterator.work.push(Work::Leave(entry, Option::None));
+                return Result::Err(from_fs(error, entry.path(), entry.depth()));
+            },
+        };
+        if let Some(ancestor) = iterator.ancestors[name] {
+            iterator.work.push(Work::Leave(entry, Option::None));
+            return Result::Err(loop_error(entry, ancestor));
+        }
+        iterator.ancestors.insert(name, entry.path());
+        Option::Some(name)
+    } else {
+        Option::None
+    };
+    iterator.work.push(Work::Leave(entry, canonical));
+    let names = fs::read_dir_names_structured(entry.path()).map_err(
+        |error| from_fs(error, entry.path(), entry.depth()),
+    )?;
+    let mut index = names.len();
+    while index > 0 {
+        index -= 1;
+        iterator.work.push(Work::Visit(path::join(entry.path(), names[index]), entry.depth() + 1));
+    }
+    Result::Ok(())
+}
+
+impl Iterator for WalkIterator {
+    type Item = Result[DirEntry, Error];
+
+    fn next(self: WalkIterator) -> Option[Result[DirEntry, Error]] {
+        if self.done.get() {
+            return Option::None;
+        }
+        if !self.started.get() {
+            self.started.set(true);
+            let valid_maximum = match self.options.maximum {
+                Some(value) => value >= self.options.minimum,
+                None => true,
+            };
+            if self.options.minimum < 0 || !valid_maximum {
+                self.close();
+                return Option::Some(Result::Err(invalid_options(self.options.root)));
+            }
+        }
+        if let Some(entry) = self.pending.get() {
+            self.pending.set(Option::None);
+            if let Err(error) = descend(self, entry) {
+                return Option::Some(Result::Err(error));
+            }
+        }
+        while let Some(work) = self.work.pop() {
+            match work {
+                Leave(entry, canonical) => {
+                    if let Some(name) = canonical {
+                        self.ancestors.remove(name);
+                    }
+                    if self.options.postorder && entry.depth() >= self.options.minimum {
+                        return Option::Some(Result::Ok(entry));
+                    }
+                },
+                Visit(name, depth) => {
+                    let entry = match read_entry(name, depth, self.options.follow) {
+                        Ok(value) => value,
+                        Err(error) => return Option::Some(Result::Err(error)),
+                    };
+                    if !(self.options.predicate)(entry) {
+                        continue;
+                    }
+                    let below_maximum = match self.options.maximum {
+                        Some(value) => depth < value,
+                        None => true,
+                    };
+                    if entry.file_type().is_dir() && below_maximum {
+                        if !self.options.postorder && depth >= self.options.minimum {
+                            self.pending.set(Option::Some(entry));
+                            return Option::Some(Result::Ok(entry));
+                        }
+                        if let Err(error) = descend(self, entry) {
+                            return Option::Some(Result::Err(error));
+                        }
+                    } else if depth >= self.options.minimum {
+                        return Option::Some(Result::Ok(entry));
+                    }
+                },
+            }
+        }
+        self.close();
+        Option::None
+    }
+}

@@ -2810,6 +2810,7 @@ use std::env;
 use std::ffi;
 use std::fs;
 use std::fs::notify;
+use std::fs::walkdir;
 use std::io;
 use std::iter;
 use std::json;
@@ -2847,6 +2848,7 @@ Public APIs include:
 - `ffi::String`, `Rune`, `Ptr`, `Error`, `Func`, `RawSlice`, `RawMap`, and explicit Go boundary adapters
 - `fs::read_file_structured`, `write_file_structured`, structured byte I/O, directory operations, path inspection, and `sha256_file`
 - `fs::notify` Linux amd64 file and recursive-directory notifications, event filters, independent multi-path registrations, cancellable reads, bounded subscriptions, rename cookies, and rescan signals
+- `fs::walkdir::{walk, WalkDir, WalkIterator, DirEntry, Error}` for lazy directory traversal, depth bounds, pruning, link following, and contextual errors
 - `io::print`, `println`, `eprint`, `eprintln`, and byte-oriented standard stream I/O
 - `iter::empty`, `once`, `from_fn`, iterator adapters, and single-pass consumers
 - `json::Value`, `parse`, `encode`, serde `Serialize` and `Deserialize` re-exports, `to_value`, `from_value`, `try_to_string`, `from_string`, `field`, and typed `as_*` accessors
@@ -2957,7 +2959,7 @@ Text search indices are UTF-8 byte offsets, matching the indices accepted by the
 
 `fs::create_dir`, `rename`, `copy`, `hard_link`, and `symbolic_link` are eager operations returning `fs::Error`. `copy` reads and writes the complete file and currently creates the destination with portable `0644` permissions; it does not preserve source metadata.
 
-`fs::metadata` and `symlink_metadata` return value-only metadata including file type, length, portable permission bits, and modification time. `read_dir_structured` eagerly snapshots directory entries. `atomic_write` writes, synchronizes, closes, and atomically renames a same-directory temporary file before returning; temporary cleanup stays inside the runtime call. `replace` exposes the host atomic rename operation under replacement semantics.
+`fs::metadata` and `symlink_metadata` return value-only metadata including file type, length, portable permission bits, and modification time. `read_dir_structured` eagerly snapshots directory entries. `read_dir_names_structured` returns sorted names without fetching each child's metadata, preserving structured listing errors; a disappearing child does not invalidate the other names. `atomic_write` writes, synchronizes, closes, and atomically renames a same-directory temporary file before returning; temporary cleanup stays inside the runtime call. `replace` exposes the host atomic rename operation under replacement semantics.
 
 `io::read_stdin_structured`, `read_stdin_exact_structured`, `write_stdout_structured`, and `write_stderr_structured` provide structured errors for standard streams. `read_stdin_to_string` validates the complete input as UTF-8 and reports `InvalidData` on failure. A negative exact-read length reports `InvalidInput` before accessing stdin.
 
@@ -3017,6 +3019,47 @@ The caller is responsible for the syscall ABI, valid addresses, buffer lengths, 
 Buffer lifetimes cover synchronous calls only. Operations that retain a pointer after returning, nested pointer graphs, and arbitrary Go object memory are outside this buffer API. The runtime uses scheduling-aware `Syscall6`, not `RawSyscall6`. It performs one call without automatic `EINTR` retry or completion of partial reads/writes. Per-thread operations require thread-affinity handling that this API does not provide. Raw changes to threads, process creation, signal handlers, or the Go runtime's address space can violate runtime invariants; accepting a number does not make every kernel operation safe to use from GoML. Calls remain subject to kernel availability, process permissions, and sandbox policy.
 
 The initial constant set is `SYS_READ`, `SYS_WRITE`, `SYS_CLOSE`, `SYS_POLL`, `SYS_MMAP`, `SYS_MUNMAP`, `SYS_GETPID`, `SYS_GETUID`, `SYS_GETPPID`, `SYS_CLOCK_GETTIME`, `SYS_INOTIFY_ADD_WATCH`, `SYS_INOTIFY_RM_WATCH`, `SYS_OPENAT`, `SYS_PIPE2`, and `SYS_INOTIFY_INIT1`, plus `EINTR`, `EBADF`, `EAGAIN`, `EINVAL`, and `ENOSYS`. Other numbers can be passed directly. This package uses ordinary imports, functions, enums, arrays, and mutable slices; it introduces no new grammar or `unsafe` syntax and cannot be used in `comptime`.
+
+### Directory traversal
+
+`std::fs::walkdir` implements lazy, iterative depth-first traversal using `std::fs`. `walk(root: string) -> WalkIterator` uses the defaults from `WalkDir::new(root)`: include the root at depth zero, visit directories before their contents, sort siblings by file name, impose no depth limit, and do not follow symbolic links, including a root link. A file root yields one entry. Construction performs no filesystem I/O; the first iterator step checks the root.
+
+`WalkDir` is a reusable value builder. Each `iter()` or `IntoIterator::into_iter()` creates an independent `WalkIterator`, so it can also be used directly in `for`. Builder methods return a modified value:
+
+| Method | Behavior |
+| --- | --- |
+| `min_depth(isize)` | Hide entries shallower than the bound while still traversing them. |
+| `max_depth(isize)` | Include this depth but never read directories below it. |
+| `follow_links(bool)` | Follow file and directory symbolic links, including the root. |
+| `contents_first(bool)` | Yield a directory after its descendants instead of before them. |
+| `filter_entry((DirEntry) -> bool)` | Reject an entry and prune its entire subtree. Repeated filters are combined with short-circuiting AND. |
+
+Negative bounds or `min_depth > max_depth` produce one `InvalidInput` error before filesystem access, followed by exhaustion. The predicate runs after metadata is obtained, before descending, and even for entries hidden by `min_depth`; it also prunes correctly with `contents_first(true)`. Use `std::iter::filter` when only output should be filtered without pruning.
+
+`WalkIterator` implements `Iterator` with `Item = Result[DirEntry, Error]` and composes with `std::iter`. In preorder, call `skip_current_dir()` immediately after receiving a directory to skip its descendants. The directory is not opened until the next `next()` call. Skipping before iteration, after a file or error, or in contents-first order does nothing. `close()` clears pending work and permanently exhausts the iterator; it is idempotent. Exhaustion is permanent. Copies of an iterator share progress and must be used by one consumer; copies of the builder can start independent walks.
+
+`DirEntry` exposes `path()`, `file_name() -> Option[string]`, `depth()`, `file_type()`, `metadata()`, and `path_is_symlink()`. Metadata is a snapshot taken before yielding the entry. When following a link, `file_type()` and `metadata()` describe the target while `path_is_symlink()` remains true. Paths retain the supplied root spelling and use `path::join` for children; they are not replaced with canonical target paths.
+
+`Error` exposes `path()`, `depth()`, `kind()`, `fs_error()`, and `loop_ancestor() -> Option[string]`, plus `ToString` and `Debug`. The underlying `fs::Error` retains its operation and available raw OS code. A failed entry or directory emits an error and traversal continues with remaining branches. Errors are not suppressed by `min_depth`. A directory-read error follows its entry in preorder and precedes its entry in contents-first order. With link following enabled, canonical ancestor paths detect directory-link loops; these return `InvalidData` with the offending path and the ancestor's traversal path, then skip that subtree. Sibling aliases to the same directory are each traversed. Dangling links are ordinary link entries by default and metadata errors when followed; a link chain rejected by the OS reports its filesystem error without a loop ancestor.
+
+```goml
+use std::fs::walkdir;
+use std::io;
+
+fn main() -> () {
+    let tree = walkdir::WalkDir::new(".")
+        .max_depth(8)
+        .filter_entry(|entry| entry.file_name() != Option::Some(".git"));
+    for item in tree {
+        match item {
+            Ok(entry) => println(entry.path()),
+            Err(error) => io::eprintln(error.to_string()),
+        }
+    }
+}
+```
+
+Each visited directory's names are read into memory and its handle is closed before iteration continues. Traversal uses an explicit stack rather than recursive calls; memory scales with pending names along the active branch, not a snapshot of the entire tree. There is no retained descriptor or mandatory cleanup when abandoning a walk. Changes during traversal can produce stale metadata, missing entries, or errors; enumeration is not a filesystem snapshot. Paths use UTF-8 strings and host path rules. Canonical-path loop detection does not identify bind-mount aliases; use a depth limit for such trees. Link policy is not a security boundary against concurrent path replacement. This API uses ordinary imports, closures, traits, and `for` syntax and adds no grammar or compile-time filesystem access.
 
 ### Filesystem notifications
 
@@ -3293,6 +3336,7 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | Go interface adapter | `#[go_interface(RawType, Wrapper, method = "GoMethod")]` generates a checked native-interface wrapper and trait implementation; `from_trait` explicitly creates a typed Go bridge retaining the supplied dyn object; nil/typed-nil and multiple results are preserved |
 | Go binding generator | `goml bind-go <CONFIG>` selects explicit package/symbol allowlists and finite Go-checked generic arguments; emits raw bindings with protected deterministic output |
 | Go-callable export | Annotate a supported public function with `#[go_export("Name")]` and generate a Go package with `goml export-go` |
+| Traverse a directory tree | `std::fs::walkdir` lazy depth-first iteration with depth bounds, pruning, optional link following, and per-path errors |
 | Watch a directory tree for changes | Use `fs::notify::watch_recursive` or `WatchSet` on Linux amd64, consume timed reads or scoped subscriptions, handle `Event.rescan`, and close the handle |
 | Treat a GoML integer or struct as a kernel pointer/layout | Use `syscall::Arg::Buffer` for synchronous byte storage on Linux amd64; encode the native ABI explicitly and inspect `SyscallResult.errno` |
 | Unannotated user `extern fn` | Use a normal GoML function or `#[go_ffi("import/path", "ExportedSymbol")] extern fn`; project commands validate Go calls by default (`--ffi-check required`) |
