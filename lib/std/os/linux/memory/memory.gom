@@ -1,0 +1,339 @@
+package memory;
+
+pub use module::io::{Error, ErrorKind};
+use module::internal::linux as kernel;
+use module::os::linux::abi;
+use module::os::linux::fd;
+use module::os::linux::syscall;
+use module::os::linux::syscall::{Arg};
+
+struct State {
+    address: Option[usize],
+    protection: usize,
+}
+
+pub struct Mapping {
+    state: Channel[State],
+    length: isize,
+}
+
+fn invalid(operation: string, message: string) -> Error {
+    kernel::error(ErrorKind::InvalidInput, operation, message)
+}
+
+fn map(raw: usize, length: isize, offset: i64, protection: usize, flags: usize) -> Result[
+    Mapping,
+    Error,
+] {
+    if length <= 0 {
+        return Result::Err(invalid("mmap", "mapping length must be positive"))
+    }
+    if offset < 0 || offset % PAGE_SIZE.to_i64() != 0 {
+        return Result::Err(invalid("mmap", "file offset must be nonnegative and page aligned"))
+    }
+    if flags & (MAP_FIXED | MAP_FIXED_NOREPLACE | MAP_GROWSDOWN | MAP_HUGETLB | MAP_UNINITIALIZED)
+        != 0 {
+        return Result::Err(
+            invalid(
+                "mmap",
+                "fixed, growing, explicit huge-page and uninitialized mappings require raw syscalls",
+            ),
+        )
+    }
+    if protection & (PROT_READ | PROT_WRITE | PROT_EXEC | PROT_SEM) != protection {
+        return Result::Err(invalid("mmap", "unsupported protection flags"))
+    }
+    let address = kernel::invoke(
+        syscall::SYS_MMAP,
+        [
+            Arg::Word(0),
+            Arg::Word(length.to_usize()),
+            Arg::Word(protection),
+            Arg::Word(flags),
+            Arg::Word(raw),
+            Arg::Word(offset.to_usize()),
+        ],
+        "mmap",
+    )?;
+    let state = Channel::new(1);
+    state.send(State { address: Option::Some(address), protection });
+    Result::Ok(Mapping { state, length })
+}
+
+pub fn anonymous(length: isize, protection: usize, flags: usize) -> Result[Mapping, Error] {
+    map(0xffffffffffffffff, length, 0, protection, flags | MAP_ANONYMOUS)
+}
+
+pub fn file(descriptor: fd::Fd, length: isize, offset: i64, protection: usize, flags: usize) -> Result[
+    Mapping,
+    Error,
+] {
+    if flags & MAP_ANONYMOUS != 0 {
+        return Result::Err(invalid("mmap file", "file mapping cannot use MAP_ANONYMOUS"))
+    }
+    descriptor.with_raw_fd(|raw| map(raw, length, offset, protection, flags))
+}
+
+fn transfer(address: usize, buffer: MutSlice[byte], write: bool) -> Result[isize, Error] {
+    let operation = if write {
+        "write mapped memory"
+    } else {
+        "read mapped memory"
+    };
+    let local = abi::Iovec { base: 0, length: buffer.len().to_usize() }.encode();
+    let remote = abi::Iovec { base: address, length: buffer.len().to_usize() }.encode();
+    let pid = kernel::invoke(
+        syscall::SYS_GETPID,
+        [Arg::Word(0), Arg::Word(0), Arg::Word(0), Arg::Word(0), Arg::Word(0), Arg::Word(0)],
+        operation,
+    )?;
+    let pointers = Vec::from_array(
+        [syscall::Pointer { buffer: local.as_mut_slice(), offset: 0, target: buffer }],
+    );
+    let number = if write {
+        syscall::SYS_PROCESS_VM_WRITEV
+    } else {
+        syscall::SYS_PROCESS_VM_READV
+    };
+    let count = kernel::invoke_pointers(
+        number,
+        [
+            Arg::Word(pid),
+            Arg::Buffer(local.as_mut_slice()),
+            Arg::Word(1),
+            Arg::Buffer(remote.as_mut_slice()),
+            Arg::Word(1),
+            Arg::Word(0),
+        ],
+        pointers.as_slice(),
+        operation,
+    )?;
+    if count > buffer.len().to_usize() {
+        return Result::Err(
+            kernel::error(
+                ErrorKind::InvalidData,
+                operation,
+                "kernel returned an invalid byte count",
+            ),
+        )
+    }
+    Result::Ok(count.to_isize())
+}
+
+impl Mapping {
+    pub fn len(self: Mapping) -> isize {
+        self.length
+    }
+
+    fn use_mapping[T](self: Mapping, operation: string, action: (usize, usize) -> Result[T, Error]) -> Result[
+        T,
+        Error,
+    ] {
+        let state = self.state.recv().ok_or(kernel::errno_error(operation, syscall::EBADF))?;
+        defer self.state.send(state);
+        let address = state.address.ok_or(kernel::errno_error(operation, syscall::EBADF))?;
+        action(address, state.protection)
+    }
+
+    fn copy(self: Mapping, buffer: MutSlice[byte], offset: isize, write: bool, exact: bool) -> Result[
+        isize,
+        Error,
+    ] {
+        let operation = if write {
+            "write mapped memory"
+        } else {
+            "read mapped memory"
+        };
+        self.use_mapping(
+            operation,
+            |address, protection| {
+                if offset < 0 || offset > self.length || buffer.len() > self.length - offset {
+                    return Result::Err(invalid(operation, "byte range is outside the mapping"))
+                }
+                if buffer.len() == 0 {
+                    return Result::Ok(0)
+                }
+                let needed = if write {
+                    PROT_WRITE
+                } else {
+                    PROT_READ
+                };
+                if protection & needed == 0 {
+                    return Result::Err(kernel::errno_error(operation, syscall::EACCES))
+                }
+                let mut count = 0;
+                loop {
+                    let transferred = transfer(
+                        address + offset.to_usize() + count.to_usize(),
+                        buffer.sub(count, buffer.len()),
+                        write,
+                    )?;
+                    count += transferred;
+                    if !exact || count == buffer.len() {
+                        return Result::Ok(count)
+                    }
+                    if transferred == 0 {
+                        let kind = if write {
+                            ErrorKind::WriteZero
+                        } else {
+                            ErrorKind::UnexpectedEof
+                        };
+                        return Result::Err(
+                            kernel::error(kind, operation, "memory copy made no progress"),
+                        )
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn read_at(self: Mapping, output: MutSlice[byte], offset: isize) -> Result[isize, Error] {
+        self.copy(output, offset, false, false)
+    }
+
+    pub fn write_at(self: Mapping, input: Slice[byte], offset: isize) -> Result[isize, Error] {
+        self.copy(input.to_vec().as_mut_slice(), offset, true, false)
+    }
+
+    pub fn read_exact_at(self: Mapping, output: MutSlice[byte], offset: isize) -> Result[(), Error] {
+        self.copy(output, offset, false, true).map(|_| ())
+    }
+
+    pub fn write_all_at(self: Mapping, input: Slice[byte], offset: isize) -> Result[(), Error] {
+        self.copy(input.to_vec().as_mut_slice(), offset, true, true).map(|_| ())
+    }
+
+    pub fn protect(self: Mapping, protection: usize) -> Result[(), Error] {
+        let mut state = self.state.recv().ok_or(kernel::errno_error("mprotect", syscall::EBADF))?;
+        let result = match state.address {
+            Some(address) => {
+                if protection & (PROT_READ | PROT_WRITE | PROT_EXEC | PROT_SEM) != protection {
+                    Result::Err(invalid("mprotect", "unsupported protection flags"))
+                } else {
+                    kernel::invoke(
+                        syscall::SYS_MPROTECT,
+                        [
+                            Arg::Word(address),
+                            Arg::Word(self.length.to_usize()),
+                            Arg::Word(protection),
+                            Arg::Word(0),
+                            Arg::Word(0),
+                            Arg::Word(0),
+                        ],
+                        "mprotect",
+                    ).map(|_| ())
+                }
+            },
+            None => Result::Err(kernel::errno_error("mprotect", syscall::EBADF)),
+        };
+        if result.is_ok() {
+            state.protection = protection;
+        }
+        self.state.send(state);
+        result
+    }
+
+    fn command(self: Mapping, number: usize, argument: usize, operation: string) -> Result[
+        (),
+        Error,
+    ] {
+        self.use_mapping(
+            operation,
+            |address, _| kernel::invoke(
+                number,
+                [
+                    Arg::Word(address),
+                    Arg::Word(self.length.to_usize()),
+                    Arg::Word(argument),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                ],
+                operation,
+            ).map(|_| ()),
+        )
+    }
+
+    pub fn sync(self: Mapping, flags: usize) -> Result[(), Error] {
+        self.command(syscall::SYS_MSYNC, flags, "msync")
+    }
+
+    pub fn advise(self: Mapping, advice: usize) -> Result[(), Error] {
+        self.command(syscall::SYS_MADVISE, advice, "madvise")
+    }
+
+    pub fn lock(self: Mapping, flags: usize) -> Result[(), Error] {
+        let number = if flags == 0 {
+            syscall::SYS_MLOCK
+        } else {
+            syscall::SYS_MLOCK2
+        };
+        self.command(number, flags, "mlock")
+    }
+
+    pub fn unlock(self: Mapping) -> Result[(), Error] {
+        self.command(syscall::SYS_MUNLOCK, 0, "munlock")
+    }
+
+    pub fn residency(self: Mapping) -> Result[Vec[bool], Error] {
+        self.use_mapping(
+            "mincore",
+            |address, _| {
+                let pages = (self.length - 1) / PAGE_SIZE + 1;
+                let output = kernel::zeroes(pages);
+                kernel::invoke(
+                    syscall::SYS_MINCORE,
+                    [
+                        Arg::Word(address),
+                        Arg::Word(self.length.to_usize()),
+                        Arg::Buffer(output.as_mut_slice()),
+                        Arg::Word(0),
+                        Arg::Word(0),
+                        Arg::Word(0),
+                    ],
+                    "mincore",
+                )?;
+                let resident: Vec[bool] = Vec::with_capacity(pages);
+                for value in output {
+                    resident.push(value & 1 != 0);
+                }
+                Result::Ok(resident)
+            },
+        )
+    }
+
+    pub fn close(self: Mapping) -> Result[(), Error] {
+        let mut state = self.state.recv().ok_or(kernel::errno_error("munmap", syscall::EBADF))?;
+        let result = match state.address {
+            Some(address) => kernel::invoke(
+                syscall::SYS_MUNMAP,
+                [
+                    Arg::Word(address),
+                    Arg::Word(self.length.to_usize()),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                ],
+                "munmap",
+            ).map(|_| ()),
+            None => Result::Ok(()),
+        };
+        if result.is_ok() {
+            state.address = Option::None;
+        }
+        self.state.send(state);
+        result
+    }
+
+    pub fn is_closed(self: Mapping) -> bool {
+        match self.state.recv() {
+            Some(state) => {
+                let closed = state.address.is_none();
+                self.state.send(state);
+                closed
+            },
+            None => true,
+        }
+    }
+}

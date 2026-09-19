@@ -1,0 +1,184 @@
+package process;
+
+use module::bytes::endian;
+use module::internal::linux as kernel;
+use module::io::{Error, ErrorKind};
+use module::os::linux::abi;
+use module::os::linux::fd;
+use module::os::linux::syscall;
+use module::os::linux::syscall::{Arg};
+
+pub struct WaitStatus {
+    pub raw: u32,
+}
+
+impl WaitStatus {
+    pub fn exited(self: WaitStatus) -> bool {
+        self.raw & 0x7f == 0
+    }
+
+    pub fn signaled(self: WaitStatus) -> bool {
+        let signal = self.raw & 0x7f;
+        signal != 0 && signal != 0x7f
+    }
+
+    pub fn stopped(self: WaitStatus) -> bool {
+        self.raw & 0xff == 0x7f
+    }
+
+    pub fn continued(self: WaitStatus) -> bool {
+        self.raw == 0xffff
+    }
+
+    pub fn core_dumped(self: WaitStatus) -> bool {
+        self.signaled() && self.raw & 0x80 != 0
+    }
+
+    pub fn exit_code(self: WaitStatus) -> Option[isize] {
+        if self.exited() {
+            Option::Some(((self.raw >> 8) & 0xff).to_isize())
+        } else {
+            Option::None
+        }
+    }
+
+    pub fn signal(self: WaitStatus) -> Option[usize] {
+        if self.signaled() {
+            Option::Some((self.raw & 0x7f).to_usize())
+        } else {
+            Option::None
+        }
+    }
+
+    pub fn stop_signal(self: WaitStatus) -> Option[usize] {
+        if self.stopped() {
+            Option::Some(((self.raw >> 8) & 0xff).to_usize())
+        } else {
+            Option::None
+        }
+    }
+
+    pub fn success(self: WaitStatus) -> bool {
+        self.exit_code() == Option::Some(0)
+    }
+}
+
+pub struct WaitOutcome {
+    pub pid: isize,
+    pub status: WaitStatus,
+    pub usage: abi::Rusage,
+}
+
+pub fn wait(pid: isize, options: usize) -> Result[Option[WaitOutcome], Error] {
+    checked_pid(pid, "wait4")?;
+    if options > 0xffffffff {
+        return Result::Err(kernel::errno_error("wait4", syscall::EINVAL))
+    }
+    let status = kernel::zeroes(4);
+    let usage = kernel::zeroes(abi::Rusage::size());
+    let reaped = kernel::invoke(
+        syscall::SYS_WAIT4,
+        [
+            Arg::Word(pid.to_usize()),
+            Arg::Buffer(status.as_mut_slice()),
+            Arg::Word(options),
+            Arg::Buffer(usage.as_mut_slice()),
+            Arg::Word(0),
+            Arg::Word(0),
+        ],
+        "wait4",
+    )?;
+    if reaped == 0 {
+        return Result::Ok(Option::None)
+    }
+    let raw = endian::read_u32(status.as_slice(), 0, endian::Endian::Little).map_err(
+        |_| kernel::error(ErrorKind::InvalidData, "wait4", "invalid wait status buffer"),
+    )?;
+    let usage = abi::Rusage::decode(usage.as_slice()).map_err(
+        |_| kernel::error(ErrorKind::InvalidData, "wait4", "invalid resource usage buffer"),
+    )?;
+    Result::Ok(
+        Option::Some(WaitOutcome { pid: reaped.to_isize(), status: WaitStatus { raw }, usage }),
+    )
+}
+
+pub struct Child {
+    pid_value: isize,
+    handle: fd::Fd,
+    outcome: Channel[Option[Result[WaitOutcome, Error]]],
+}
+
+fn child(pid: isize, handle: fd::Fd) -> Child {
+    let outcome = Channel::new(1);
+    outcome.send(Option::None);
+    Child { pid_value: pid, handle, outcome }
+}
+
+impl Child {
+    pub fn pid(self: Child) -> isize {
+        self.pid_value
+    }
+
+    pub fn signal(self: Child, signal: usize) -> Result[(), Error] {
+        pidfd_signal(self.handle, signal)
+    }
+
+    pub fn kill(self: Child) -> Result[(), Error] {
+        self.signal(SIGKILL)
+    }
+
+    pub fn wait(self: Child) -> Result[WaitOutcome, Error] {
+        self.wait_inner(0)?.ok_or(
+            kernel::error(ErrorKind::Other, "wait child", "blocking wait returned no child"),
+        )
+    }
+
+    pub fn try_wait(self: Child) -> Result[Option[WaitOutcome], Error] {
+        self.wait_inner(WNOHANG)
+    }
+
+    pub fn wait_event(self: Child, options: usize) -> Result[Option[WaitOutcome], Error] {
+        if options & (WNOHANG | WUNTRACED | WCONTINUED) != options {
+            return Result::Err(kernel::errno_error("wait child event", syscall::EINVAL))
+        }
+        self.wait_inner(options)
+    }
+
+    fn wait_inner(self: Child, options: usize) -> Result[Option[WaitOutcome], Error] {
+        let previous = if options & WNOHANG != 0 {
+            select {
+                recv(self.outcome) as value => value.unwrap_or(Option::None),
+                default => return Result::Ok(Option::None),
+            }
+        } else {
+            self.outcome.recv().unwrap_or(Option::None)
+        };
+        if let Some(result) = previous {
+            self.outcome.send(previous);
+            return result.map(Option::Some)
+        }
+        let result = wait(self.pid_value, options);
+        match result {
+            Ok(Some(value)) => {
+                if value.status.exited() || value.status.signaled() {
+                    let _ = self.handle.close();
+                    self.outcome.send(Option::Some(Result::Ok(value)));
+                } else {
+                    self.outcome.send(Option::None);
+                }
+            },
+            Ok(None) => {
+                self.outcome.send(Option::None);
+            },
+            Err(error) => {
+                if error.raw_os_code() == Option::Some(syscall::ECHILD.to_isize()) {
+                    let _ = self.handle.close();
+                    self.outcome.send(Option::Some(Result::Err(error)));
+                } else {
+                    self.outcome.send(Option::None);
+                }
+            },
+        }
+        result
+    }
+}

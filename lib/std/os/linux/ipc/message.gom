@@ -1,0 +1,204 @@
+package ipc;
+
+use module::bytes::endian;
+use module::internal::linux as kernel;
+use module::io::{Error};
+use module::os::linux::abi;
+use module::os::linux::fd;
+use module::os::linux::syscall;
+use module::os::linux::syscall::{Arg};
+
+pub struct ReceivedMessage {
+    pub byte_count: usize,
+    pub copied: isize,
+    pub flags: usize,
+    pub descriptors: Vec[fd::Fd],
+}
+
+fn message(data: MutSlice[byte], control: MutSlice[byte]) -> Result[abi::Message, Error] {
+    let vectors = abi::Iovecs::new(Vec::from_array([data]).as_slice()).map_err(
+        |value| invalid("message", value),
+    )?;
+    abi::Message::new(kernel::zeroes(0).as_mut_slice(), vectors, control).map_err(
+        |value| invalid("message", value),
+    )
+}
+
+fn control_space(count: isize) -> isize {
+    if count == 0 {
+        0
+    } else {
+        16 + (count * 4 + 7) / 8 * 8
+    }
+}
+
+pub fn send_message(socket: fd::Fd, data: Slice[byte], descriptors: Slice[fd::Fd], flags: usize) -> Result[
+    isize,
+    Error,
+] {
+    if descriptors.len() > 253 {
+        return Result::Err(invalid("sendmsg", "at most 253 descriptors may be sent"))
+    }
+    if descriptors.len() != 0 && data.len() == 0 {
+        return Result::Err(
+            invalid("sendmsg", "descriptor transfer requires at least one data byte"),
+        )
+    }
+    let payload = data.to_vec();
+    let control = kernel::zeroes(control_space(descriptors.len()));
+    if descriptors.len() != 0 {
+        let _ = endian::write_u64(
+            control.as_mut_slice(),
+            0,
+            (16 + descriptors.len() * 4).to_u64(),
+            endian::Endian::Little,
+        );
+        let _ = endian::write_i32(control.as_mut_slice(), 8, 1, endian::Endian::Little);
+        let _ = endian::write_i32(control.as_mut_slice(), 12, 1, endian::Endian::Little);
+    }
+    let header = message(payload.as_mut_slice(), control.as_mut_slice())?;
+    socket.with_raw_fd(
+        |socket_raw| fd::with_raw_fds(
+            descriptors,
+            |raw| {
+                for index in 0..raw.len() {
+                    let _ = endian::write_i32(
+                        control.as_mut_slice(),
+                        16 + index * 4,
+                        raw[index].to_i32(),
+                        endian::Endian::Little,
+                    );
+                }
+                let count = kernel::invoke_pointers(
+                    syscall::SYS_SENDMSG,
+                    [
+                        Arg::Word(socket_raw),
+                        Arg::Buffer(header.buffer()),
+                        Arg::Word(flags | MSG_NOSIGNAL),
+                        Arg::Word(0),
+                        Arg::Word(0),
+                        Arg::Word(0),
+                    ],
+                    header.pointers(),
+                    "sendmsg",
+                )?;
+                if count > data.len().to_usize() {
+                    Result::Err(corrupt("sendmsg"))
+                } else {
+                    Result::Ok(count.to_isize())
+                }
+            },
+        ),
+    )
+}
+
+fn receive_descriptors(control: Slice[byte], maximum: isize, flags: usize) -> Result[
+    Vec[fd::Fd],
+    Error,
+] {
+    let raw: Vec[usize] = Vec::new();
+    defer {
+        for descriptor in raw {
+            close_raw(descriptor);
+        }
+    };
+    let mut offset = 0;
+    while control.len() - offset >= 16 {
+        let header = abi::Cmsghdr::decode(control.sub(offset, control.len())).map_err(
+            |_| corrupt("recvmsg"),
+        )?;
+        if header.length < 16 || header.length > (control.len() - offset).to_usize() {
+            return Result::Err(corrupt("recvmsg"))
+        }
+        let length = header.length.to_isize();
+        if header.level == 1 && header.kind == 1 {
+            let count = (length - 16) / 4;
+            for index in 0..count {
+                let value = endian::read_i32(
+                    control,
+                    offset + 16 + index * 4,
+                    endian::Endian::Little,
+                ).map_err(|_| corrupt("recvmsg"))?;
+                if value < 0 {
+                    return Result::Err(corrupt("recvmsg"))
+                }
+                raw.push(value.to_usize());
+            }
+            if (length - 16) % 4 != 0 {
+                return Result::Err(corrupt("recvmsg"))
+            }
+        }
+        let aligned = (length + 7) / 8 * 8;
+        if aligned > control.len() - offset {
+            offset = control.len();
+        } else {
+            offset += aligned;
+        }
+    }
+    if offset != control.len() {
+        return Result::Err(corrupt("recvmsg"))
+    }
+    if flags & MSG_CTRUNC != 0 || raw.len() > maximum {
+        return Result::Err(
+            invalid("recvmsg", "ancillary data was truncated or exceeded the descriptor limit"),
+        )
+    }
+    let result: Vec[fd::Fd] = Vec::with_capacity(raw.len());
+    let retained = Ref::new(false);
+    defer {
+        if !retained.get() {
+            for descriptor in result {
+                let _ = descriptor.close();
+            }
+        }
+    };
+    while raw.len() != 0 {
+        result.push(adopt(raw.remove(0))?);
+    }
+    retained.set(true);
+    Result::Ok(result)
+}
+
+pub fn receive_message(socket: fd::Fd, output: MutSlice[byte], max_descriptors: isize, flags: usize) -> Result[
+    ReceivedMessage,
+    Error,
+] {
+    if max_descriptors < 0 || max_descriptors > 253 {
+        return Result::Err(invalid("recvmsg", "descriptor limit must be between 0 and 253"))
+    }
+    let control = kernel::zeroes(control_space(max_descriptors));
+    let header = message(output, control.as_mut_slice())?;
+    let count = socket.with_raw_fd(
+        |raw| kernel::invoke_pointers(
+            syscall::SYS_RECVMSG,
+            [
+                Arg::Word(raw),
+                Arg::Buffer(header.buffer()),
+                Arg::Word(flags | MSG_CMSG_CLOEXEC),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+            ],
+            header.pointers(),
+            "recvmsg",
+        ),
+    )?;
+    let returned = header.header().map_err(|_| corrupt("recvmsg"))?;
+    if returned.control_len > control.len().to_usize() {
+        let _ = receive_descriptors(control.as_slice(), 0, MSG_CTRUNC);
+        return Result::Err(corrupt("recvmsg"))
+    }
+    let descriptors = receive_descriptors(
+        control.slice(0, returned.control_len.to_isize()),
+        max_descriptors,
+        returned.flags.to_usize(),
+    )?;
+    let copied = if count > output.len().to_usize() {
+        output.len()
+    } else {
+        count.to_isize()
+    };
+    Result::Ok(
+        ReceivedMessage { byte_count: count, copied, flags: returned.flags.to_usize(), descriptors },
+    )
+}

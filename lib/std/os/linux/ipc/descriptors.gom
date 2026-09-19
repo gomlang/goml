@@ -1,0 +1,217 @@
+package ipc;
+
+use module::bytes::endian;
+use module::internal::linux as kernel;
+use module::io::{Error, ErrorKind};
+use module::os::linux::abi;
+use module::os::linux::fd;
+use module::os::linux::syscall;
+use module::os::linux::syscall::{Arg};
+
+pub struct Pipe {
+    pub reader: fd::Fd,
+    pub writer: fd::Fd,
+}
+
+pub struct SocketPair {
+    pub first: fd::Fd,
+    pub second: fd::Fd,
+}
+
+fn invalid(operation: string, message: string) -> Error {
+    kernel::error(ErrorKind::InvalidInput, operation, message)
+}
+
+fn corrupt(operation: string) -> Error {
+    kernel::error(ErrorKind::InvalidData, operation, "invalid kernel response")
+}
+
+fn close_raw(raw: usize) -> () {
+    let _ = kernel::call(
+        syscall::SYS_CLOSE,
+        [Arg::Word(raw), Arg::Word(0), Arg::Word(0), Arg::Word(0), Arg::Word(0), Arg::Word(0)],
+        "close descriptor",
+    );
+}
+
+fn adopt(raw: usize) -> Result[fd::Fd, Error] {
+    match fd::Fd::from_raw(raw.to_isize()) {
+        Ok(descriptor) => Result::Ok(descriptor),
+        Err(error) => {
+            close_raw(raw);
+            Result::Err(error)
+        },
+    }
+}
+
+fn adopt_pair(data: Slice[byte]) -> Result[(fd::Fd, fd::Fd), Error] {
+    let first_raw = endian::read_i32(data, 0, endian::Endian::Little).map_err(
+        |_| corrupt("descriptor pair"),
+    )?.to_usize();
+    let second_raw = endian::read_i32(data, 4, endian::Endian::Little).map_err(
+        |_| corrupt("descriptor pair"),
+    )?.to_usize();
+    let first = match adopt(first_raw) {
+        Ok(value) => value,
+        Err(error) => {
+            close_raw(second_raw);
+            return Result::Err(error)
+        },
+    };
+    match adopt(second_raw) {
+        Ok(second) => Result::Ok((first, second)),
+        Err(error) => {
+            let _ = first.close();
+            Result::Err(error)
+        },
+    }
+}
+
+pub fn pipe(flags: usize) -> Result[Pipe, Error] {
+    let data = kernel::zeroes(8);
+    kernel::invoke(
+        syscall::SYS_PIPE2,
+        [
+            Arg::Buffer(data.as_mut_slice()),
+            Arg::Word(flags | fd::O_CLOEXEC),
+            Arg::Word(0),
+            Arg::Word(0),
+            Arg::Word(0),
+            Arg::Word(0),
+        ],
+        "pipe2",
+    )?;
+    let (reader, writer) = adopt_pair(data.as_slice())?;
+    Result::Ok(Pipe { reader, writer })
+}
+
+pub fn socket_pair(kind: usize, flags: usize) -> Result[SocketPair, Error] {
+    let data = kernel::zeroes(8);
+    kernel::invoke(
+        syscall::SYS_SOCKETPAIR,
+        [
+            Arg::Word(1),
+            Arg::Word(kind | flags | SOCK_CLOEXEC),
+            Arg::Word(0),
+            Arg::Buffer(data.as_mut_slice()),
+            Arg::Word(0),
+            Arg::Word(0),
+        ],
+        "socketpair",
+    )?;
+    let (first, second) = adopt_pair(data.as_slice())?;
+    Result::Ok(SocketPair { first, second })
+}
+
+pub fn shutdown(socket: fd::Fd, direction: usize) -> Result[(), Error] {
+    socket.with_raw_fd(
+        |raw| kernel::invoke(
+            syscall::SYS_SHUTDOWN,
+            [
+                Arg::Word(raw),
+                Arg::Word(direction),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+            ],
+            "shutdown",
+        ).map(|_| ()),
+    )
+}
+
+pub fn eventfd(initial: u32, flags: usize) -> Result[fd::Fd, Error] {
+    let raw = kernel::invoke(
+        syscall::SYS_EVENTFD2,
+        [
+            Arg::Word(initial.to_usize()),
+            Arg::Word(flags | EFD_CLOEXEC),
+            Arg::Word(0),
+            Arg::Word(0),
+            Arg::Word(0),
+            Arg::Word(0),
+        ],
+        "eventfd2",
+    )?;
+    adopt(raw)
+}
+
+pub fn read_counter(descriptor: fd::Fd) -> Result[u64, Error] {
+    let data = kernel::zeroes(8);
+    let count = descriptor.read(data.as_mut_slice())?;
+    if count != 8 {
+        return Result::Err(corrupt("read counter"))
+    }
+    endian::read_u64(data.as_slice(), 0, endian::Endian::Little).map_err(
+        |_| corrupt("read counter"),
+    )
+}
+
+pub fn write_counter(descriptor: fd::Fd, value: u64) -> Result[(), Error] {
+    let data = kernel::zeroes(8);
+    let _ = endian::write_u64(data.as_mut_slice(), 0, value, endian::Endian::Little);
+    let count = descriptor.write(data.as_slice())?;
+    if count == 8 {
+        Result::Ok(())
+    } else {
+        Result::Err(corrupt("write counter"))
+    }
+}
+
+pub fn timerfd(clock: usize, flags: usize) -> Result[fd::Fd, Error] {
+    let raw = kernel::invoke(
+        syscall::SYS_TIMERFD_CREATE,
+        [
+            Arg::Word(clock),
+            Arg::Word(flags | TFD_CLOEXEC),
+            Arg::Word(0),
+            Arg::Word(0),
+            Arg::Word(0),
+            Arg::Word(0),
+        ],
+        "timerfd_create",
+    )?;
+    adopt(raw)
+}
+
+pub fn set_timer(timer: fd::Fd, flags: usize, value: abi::Itimerspec) -> Result[
+    abi::Itimerspec,
+    Error,
+] {
+    let input = value.encode();
+    let previous = kernel::zeroes(abi::Itimerspec::size());
+    timer.with_raw_fd(
+        |raw| kernel::invoke(
+            syscall::SYS_TIMERFD_SETTIME,
+            [
+                Arg::Word(raw),
+                Arg::Word(flags),
+                Arg::Buffer(input.as_mut_slice()),
+                Arg::Buffer(previous.as_mut_slice()),
+                Arg::Word(0),
+                Arg::Word(0),
+            ],
+            "timerfd_settime",
+        ),
+    )?;
+    abi::Itimerspec::decode(previous.as_slice()).map_err(|_| corrupt("timerfd_settime"))
+}
+
+pub fn get_timer(timer: fd::Fd) -> Result[abi::Itimerspec, Error] {
+    let output = kernel::zeroes(abi::Itimerspec::size());
+    timer.with_raw_fd(
+        |raw| kernel::invoke(
+            syscall::SYS_TIMERFD_GETTIME,
+            [
+                Arg::Word(raw),
+                Arg::Buffer(output.as_mut_slice()),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+            ],
+            "timerfd_gettime",
+        ),
+    )?;
+    abi::Itimerspec::decode(output.as_slice()).map_err(|_| corrupt("timerfd_gettime"))
+}

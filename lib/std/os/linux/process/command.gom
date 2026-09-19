@@ -1,0 +1,223 @@
+package process;
+
+use module::env;
+use module::internal::linux as kernel;
+use module::io::{Error, ErrorKind};
+use module::os::linux::fd;
+use module::os::linux::syscall;
+use module::os::linux::syscall::{Arg};
+use module::utf8;
+
+pub struct Command {
+    program: string,
+    arguments: Vec[string],
+    directory: string,
+    environment: Vec[(string, string)],
+    inherit_environment: bool,
+    files: Vec[Option[fd::Fd]],
+    new_session: bool,
+    new_process_group: bool,
+}
+
+impl Command {
+    pub fn new(program: string) -> Command {
+        Command {
+            program,
+            arguments: Vec::new(),
+            directory: "",
+            environment: Vec::new(),
+            inherit_environment: true,
+            files: Vec::from_array([Option::None, Option::None, Option::None]),
+            new_session: false,
+            new_process_group: false,
+        }
+    }
+
+    pub fn arg(self: Command, argument: string) -> Command {
+        self.arguments.push(argument);
+        self
+    }
+
+    pub fn args(self: Command, arguments: Slice[string]) -> Command {
+        for argument in arguments {
+            self.arguments.push(argument);
+        }
+        self
+    }
+
+    pub fn current_dir(self: Command, directory: string) -> Command {
+        let mut result = self;
+        result.directory = directory;
+        result
+    }
+
+    pub fn env(self: Command, key: string, value: string) -> Command {
+        self.environment.push((key, value));
+        self
+    }
+
+    pub fn env_clear(self: Command) -> Command {
+        self.environment.clear();
+        let mut result = self;
+        result.inherit_environment = false;
+        result
+    }
+
+    pub fn stdin(self: Command, handle: fd::Fd) -> Command {
+        self.files[0] = Option::Some(handle);
+        self
+    }
+
+    pub fn stdout(self: Command, handle: fd::Fd) -> Command {
+        self.files[1] = Option::Some(handle);
+        self
+    }
+
+    pub fn stderr(self: Command, handle: fd::Fd) -> Command {
+        self.files[2] = Option::Some(handle);
+        self
+    }
+
+    pub fn extra_fd(self: Command, handle: fd::Fd) -> Command {
+        self.files.push(Option::Some(handle));
+        self
+    }
+
+    pub fn new_session(self: Command, enabled: bool) -> Command {
+        let mut result = self;
+        result.new_session = enabled;
+        result
+    }
+
+    pub fn new_process_group(self: Command, enabled: bool) -> Command {
+        let mut result = self;
+        result.new_process_group = enabled;
+        result
+    }
+
+    pub fn spawn(self: Command) -> Result[Child, Error] {
+        let environment = self.resolved_environment()?;
+        let owners = Vec::new();
+        let positions = Vec::new();
+        let files = Vec::with_capacity(self.files.len());
+        for index in 0..self.files.len() {
+            match self.files[index] {
+                Some(handle) => {
+                    owners.push(handle);
+                    positions.push(index);
+                    files.push(0);
+                },
+                None => {
+                    files.push(index.to_usize());
+                },
+            }
+        }
+        fd::with_raw_fds(
+            owners.as_slice(),
+            |borrowed| {
+                for index in 0..positions.len() {
+                    files[positions[index]] = borrowed[index];
+                }
+                spawn_raw(self, environment, files)
+            },
+        )
+    }
+
+    fn resolved_environment(self: Command) -> Result[Vec[string], Error] {
+        let entries = if self.inherit_environment {
+            env::vars()
+        } else {
+            Vec::new()
+        };
+        for (key, value) in self.environment {
+            let bytes = utf8::encode(key);
+            if bytes.is_empty() || bytes.as_slice().contains(0) || bytes.as_slice().contains(61)
+                || utf8::encode(value).as_slice().contains(0) {
+                return Result::Err(
+                    kernel::error(
+                        ErrorKind::InvalidInput,
+                        "spawn",
+                        "invalid environment key or value",
+                    ),
+                )
+            }
+            let mut replaced = false;
+            for index in 0..entries.len() {
+                if entries[index].0 == key {
+                    entries[index] = (key, value);
+                    replaced = true;
+                }
+            }
+            if !replaced {
+                entries.push((key, value));
+            }
+        }
+        let result = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            result.push(key + "=" + value);
+        }
+        Result::Ok(result)
+    }
+}
+
+fn spawn_raw(command: Command, environment: Vec[string], files: Vec[usize]) -> Result[Child, Error] {
+    let (ok, pid, raw, code, message) = kernel::spawn(
+        command.program,
+        command.arguments,
+        command.directory,
+        environment,
+        files,
+        command.new_session,
+        command.new_process_group,
+    );
+    if !ok {
+        return Result::Err(
+            if code == 0 {
+                kernel::error(ErrorKind::Other, "spawn", message)
+            } else {
+                let error = kernel::errno_error("spawn", code);
+                Error::new(
+                    error.kind(),
+                    "spawn",
+                    Option::Some(command.program),
+                    error.raw_os_code(),
+                    message,
+                )
+            },
+        )
+    }
+    match fd::Fd::from_owned_raw(raw) {
+        Ok(handle) => Result::Ok(child(pid, handle)),
+        Err(error) => {
+            let signaled = kernel::invoke(
+                syscall::SYS_PIDFD_SEND_SIGNAL,
+                [
+                    Arg::Word(raw.to_usize()),
+                    Arg::Word(SIGKILL),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                ],
+                "cleanup child",
+            );
+            if signaled.is_err() {
+                let _ = kill(pid, SIGKILL);
+            }
+            let _ = kernel::call(
+                syscall::SYS_CLOSE,
+                [
+                    Arg::Word(raw.to_usize()),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                ],
+                "cleanup child",
+            );
+            let _ = wait(pid, 0);
+            Result::Err(error)
+        },
+    }
+}

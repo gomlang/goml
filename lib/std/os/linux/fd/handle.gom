@@ -1,0 +1,216 @@
+package fd;
+
+pub use module::io::{Error, ErrorKind};
+use module::internal::linux as kernel;
+use module::os::linux::syscall;
+use module::os::linux::syscall::{Arg};
+
+struct State {
+    raw: Option[usize],
+    active: isize,
+    closing: bool,
+    idle: Channel[()],
+}
+
+pub struct Fd {
+    state: Channel[State],
+}
+
+fn closed(operation: string) -> Error {
+    kernel::errno_error(operation, syscall::EBADF)
+}
+
+fn owned(raw: usize) -> Fd {
+    let state = Channel::new(1);
+    state.send(State { raw: Option::Some(raw), active: 0, closing: false, idle: Channel::new(0) });
+    Fd { state }
+}
+
+fn raw_close(raw: usize) -> Result[(), Error] {
+    kernel::call(
+        syscall::SYS_CLOSE,
+        [Arg::Word(raw), Arg::Word(0), Arg::Word(0), Arg::Word(0), Arg::Word(0), Arg::Word(0)],
+        "close descriptor",
+    ).map(|_| ())
+}
+
+pub fn with_raw_fds[T](descriptors: Slice[Fd], action: (Slice[usize]) -> Result[T, Error]) -> Result[
+    T,
+    Error,
+] {
+    let owners = descriptors.to_vec();
+    let acquired: Vec[Fd] = Vec::with_capacity(owners.len());
+    let raw: Vec[usize] = Vec::with_capacity(owners.len());
+    defer {
+        for descriptor in acquired {
+            descriptor.release();
+        }
+    };
+    for descriptor in owners {
+        let number = descriptor.acquire("borrow descriptors")?;
+        acquired.push(descriptor);
+        raw.push(number);
+    }
+    action(raw.as_slice())
+}
+
+impl Fd {
+    pub fn from_owned_raw(raw: isize) -> Result[Fd, Error] {
+        if raw < 0 || raw > 0x7fffffff {
+            Result::Err(closed("adopt owned descriptor"))
+        } else {
+            Result::Ok(owned(raw.to_usize()))
+        }
+    }
+
+    pub fn from_raw(raw: isize) -> Result[Fd, Error] {
+        if raw < 0 || raw > 0x7fffffff {
+            return Result::Err(closed("adopt descriptor"))
+        }
+        kernel::invoke(
+            syscall::SYS_FCNTL,
+            [
+                Arg::Word(raw.to_usize()),
+                Arg::Word(F_GETFD),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+            ],
+            "adopt descriptor",
+        )?;
+        Result::Ok(owned(raw.to_usize()))
+    }
+
+    fn acquire(self: Fd, operation: string) -> Result[usize, Error] {
+        let mut state = self.state.recv().ok_or(closed(operation))?;
+        if state.closing || state.raw.is_none() {
+            self.state.send(state);
+            return Result::Err(closed(operation))
+        }
+        if state.active == 0 {
+            state.idle = Channel::new(0);
+        }
+        state.active += 1;
+        let raw = state.raw.unwrap_or(0);
+        self.state.send(state);
+        Result::Ok(raw)
+    }
+
+    fn release(self: Fd) -> () {
+        if let Some(mut state) = self.state.recv() {
+            state.active -= 1;
+            if state.active == 0 {
+                state.idle.close();
+            }
+            self.state.send(state);
+        }
+    }
+
+    fn use_fd[T](self: Fd, operation: string, action: (usize) -> Result[T, Error]) -> Result[
+        T,
+        Error,
+    ] {
+        let raw = self.acquire(operation)?;
+        defer self.release();
+        action(raw)
+    }
+
+    pub fn with_raw_fd[T](self: Fd, action: (usize) -> Result[T, Error]) -> Result[T, Error] {
+        self.use_fd("borrow descriptor", action)
+    }
+
+    fn take(self: Fd) -> Option[usize] {
+        loop {
+            match self.state.recv() {
+                None => return Option::None,
+                Some(mut state) => {
+                    state.closing = true;
+                    let idle = state.idle;
+                    if state.active == 0 {
+                        let raw = state.raw;
+                        state.raw = Option::None;
+                        self.state.send(state);
+                        return raw;
+                    }
+                    self.state.send(state);
+                    let _ = idle.recv();
+                },
+            }
+        }
+    }
+
+    pub fn into_raw(self: Fd) -> Result[usize, Error] {
+        self.take().ok_or(closed("release descriptor"))
+    }
+
+    pub fn close(self: Fd) -> Result[(), Error] {
+        match self.take() {
+            Some(raw) => raw_close(raw),
+            None => Result::Ok(()),
+        }
+    }
+
+    pub fn is_closed(self: Fd) -> bool {
+        match self.state.recv() {
+            Some(state) => {
+                let result = state.closing || state.raw.is_none();
+                self.state.send(state);
+                result
+            },
+            None => true,
+        }
+    }
+
+    pub fn duplicate(self: Fd) -> Result[Fd, Error] {
+        self.use_fd(
+            "duplicate descriptor",
+            |raw| kernel::invoke(
+                syscall::SYS_FCNTL,
+                [
+                    Arg::Word(raw),
+                    Arg::Word(F_DUPFD_CLOEXEC),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                ],
+                "duplicate descriptor",
+            ).map(owned),
+        )
+    }
+
+    pub fn descriptor_flags(self: Fd) -> Result[usize, Error] {
+        self.fcntl(F_GETFD, 0)
+    }
+
+    pub fn status_flags(self: Fd) -> Result[usize, Error] {
+        self.fcntl(F_GETFL, 0)
+    }
+
+    pub fn set_descriptor_flags(self: Fd, flags: usize) -> Result[(), Error] {
+        self.fcntl(F_SETFD, flags).map(|_| ())
+    }
+
+    pub fn set_status_flags(self: Fd, flags: usize) -> Result[(), Error] {
+        self.fcntl(F_SETFL, flags).map(|_| ())
+    }
+
+    pub fn fcntl(self: Fd, command: usize, argument: usize) -> Result[usize, Error] {
+        self.use_fd(
+            "fcntl",
+            |raw| kernel::invoke(
+                syscall::SYS_FCNTL,
+                [
+                    Arg::Word(raw),
+                    Arg::Word(command),
+                    Arg::Word(argument),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                ],
+                "fcntl",
+            ),
+        )
+    }
+}

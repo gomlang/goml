@@ -117,6 +117,8 @@ bootstrap:
     just _bootstrap-stage3
 
 _ci-scripts:
+    python3 tools/syscall/generate.py --check
+    python3 tools/syscall/layouts.py --check --verify-headers
     bash -n tools/release/release.sh tools/release/test.sh tools/release/package.sh tools/release/smoke.sh tools/release/lsp_smoke.sh
     bash -n tools/lib/install.sh tools/lib/test.sh tools/lib/finalize-toolchain.sh tools/goml-go-meta/build.sh
     cd tools/goml-go-meta && go test -race ./...

@@ -1,0 +1,293 @@
+package ipc;
+
+use module::internal::linux as kernel;
+use module::io::{Error};
+use module::os::linux::abi;
+use module::os::linux::fd;
+use module::os::linux::syscall;
+use module::os::linux::syscall::{Arg};
+
+pub struct PollInterest {
+    pub descriptor: fd::Fd,
+    pub events: i16,
+}
+
+pub struct PollEvent {
+    pub index: isize,
+    pub events: i16,
+}
+
+pub fn poll(interests: Slice[PollInterest], timeout_ms: i32) -> Result[Vec[PollEvent], Error] {
+    if timeout_ms < -1 {
+        return Result::Err(invalid("poll", "timeout must be -1 or nonnegative"))
+    }
+    if interests.len() > 0x7fffffff {
+        return Result::Err(invalid("poll", "too many descriptors"))
+    }
+    let descriptors: Vec[fd::Fd] = Vec::with_capacity(interests.len());
+    for interest in interests {
+        descriptors.push(interest.descriptor);
+    }
+    fd::with_raw_fds(
+        descriptors.as_slice(),
+        |raw| {
+            let data: Vec[byte] = Vec::with_capacity(raw.len() * 8);
+            for index in 0..raw.len() {
+                let entry = abi::PollFd {
+                    fd: raw[index].to_i32(),
+                    events: interests[index].events,
+                    revents: 0,
+                }.encode();
+                for value in entry {
+                    data.push(value);
+                }
+            }
+            let count = kernel::call(
+                syscall::SYS_POLL,
+                [
+                    Arg::Buffer(data.as_mut_slice()),
+                    Arg::Word(raw.len().to_usize()),
+                    Arg::Word(timeout_ms.to_usize()),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                ],
+                "poll",
+            )?;
+            if count > interests.len().to_usize() {
+                return Result::Err(corrupt("poll"))
+            }
+            let result: Vec[PollEvent] = Vec::with_capacity(count.to_isize());
+            for index in 0..raw.len() {
+                let record = abi::PollFd::decode(data.slice(index * 8, (index + 1) * 8)).map_err(
+                    |_| corrupt("poll"),
+                )?;
+                if record.revents != 0 {
+                    result.push(PollEvent { index, events: record.revents });
+                }
+            }
+            Result::Ok(result)
+        },
+    )
+}
+
+struct Watch {
+    descriptor: fd::Fd,
+    token: u64,
+    id: u64,
+}
+
+struct EpollState {
+    closed: bool,
+    watches: Vec[Watch],
+}
+
+pub struct Epoll {
+    descriptor: fd::Fd,
+    wakeup: fd::Fd,
+    next_id: Ref[u64],
+    state: Channel[EpollState],
+}
+
+fn ready_event(record: abi::EpollEvent, watches: Slice[Watch]) -> Option[abi::EpollEvent] {
+    if record.data == 0 {
+        return Option::None
+    }
+    for watch in watches {
+        if watch.id == record.data {
+            return Option::Some(abi::EpollEvent { events: record.events, data: watch.token })
+        }
+    }
+    Option::None
+}
+
+fn epoll_control(epoll: fd::Fd, descriptor: fd::Fd, command: usize, token: u64, events: u32) -> Result[
+    (),
+    Error,
+] {
+    let data = abi::EpollEvent { events, data: token }.encode();
+    epoll.with_raw_fd(
+        |epoll_raw| descriptor.with_raw_fd(
+            |raw| kernel::invoke(
+                syscall::SYS_EPOLL_CTL,
+                [
+                    Arg::Word(epoll_raw),
+                    Arg::Word(command),
+                    Arg::Word(raw),
+                    Arg::Buffer(data.as_mut_slice()),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                ],
+                "epoll_ctl",
+            ).map(|_| ()),
+        ),
+    )
+}
+
+impl Epoll {
+    pub fn new() -> Result[Epoll, Error] {
+        let raw = kernel::invoke(
+            syscall::SYS_EPOLL_CREATE1,
+            [
+                Arg::Word(fd::O_CLOEXEC),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+                Arg::Word(0),
+            ],
+            "epoll_create1",
+        )?;
+        let descriptor = adopt(raw)?;
+        let wakeup = match eventfd(0, EFD_NONBLOCK) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = descriptor.close();
+                return Result::Err(error)
+            },
+        };
+        if let Err(error) = epoll_control(descriptor, wakeup, 1, 0, EPOLLIN) {
+            let _ = wakeup.close();
+            let _ = descriptor.close();
+            return Result::Err(error)
+        }
+        let state = Channel::new(1);
+        state.send(EpollState { closed: false, watches: Vec::new() });
+        Result::Ok(Epoll { descriptor, wakeup, next_id: Ref::new(1), state })
+    }
+
+    fn with_watches[T](self: Epoll, action: (Vec[Watch]) -> Result[T, Error]) -> Result[T, Error] {
+        let state = self.state.recv().ok_or(kernel::errno_error("epoll", syscall::EBADF))?;
+        defer self.state.send(state);
+        if state.closed {
+            return Result::Err(kernel::errno_error("epoll", syscall::EBADF))
+        }
+        action(state.watches)
+    }
+
+    pub fn add(self: Epoll, descriptor: fd::Fd, events: u32, token: u64) -> Result[(), Error] {
+        self.with_watches(
+            |watches| {
+                for watch in watches {
+                    if watch.token == token {
+                        return Result::Err(kernel::errno_error("epoll add", syscall::EEXIST))
+                    }
+                }
+                let id = self.next_id.get();
+                if id == 0 {
+                    return Result::Err(invalid("epoll add", "watch identifiers are exhausted"))
+                }
+                let retained = descriptor.duplicate()?;
+                match epoll_control(self.descriptor, retained, 1, id, events) {
+                    Ok(_) => {
+                        watches.push(Watch { descriptor: retained, token, id });
+                        self.next_id.set(
+                            if id == 0xffffffffffffffff {
+                                0
+                            } else {
+                                id + 1
+                            },
+                        );
+                        Result::Ok(())
+                    },
+                    Err(error) => {
+                        let _ = retained.close();
+                        Result::Err(error)
+                    },
+                }
+            },
+        )
+    }
+
+    pub fn modify(self: Epoll, token: u64, events: u32) -> Result[(), Error] {
+        self.with_watches(
+            |watches| {
+                for watch in watches {
+                    if watch.token == token {
+                        return epoll_control(self.descriptor, watch.descriptor, 3, watch.id, events)
+                    }
+                }
+                Result::Err(kernel::errno_error("epoll modify", syscall::ENOENT))
+            },
+        )
+    }
+
+    pub fn remove(self: Epoll, token: u64) -> Result[(), Error] {
+        self.with_watches(
+            |watches| {
+                for index in 0..watches.len() {
+                    let watch = watches[index];
+                    if watch.token == token {
+                        epoll_control(self.descriptor, watch.descriptor, 2, watch.id, 0)?;
+                        let _ = watches.remove(index);
+                        return watch.descriptor.close()
+                    }
+                }
+                Result::Err(kernel::errno_error("epoll remove", syscall::ENOENT))
+            },
+        )
+    }
+
+    pub fn wait(self: Epoll, max_events: isize, timeout_ms: i32) -> Result[
+        Vec[abi::EpollEvent],
+        Error,
+    ] {
+        if max_events <= 0 || max_events > 0x7fffffff || timeout_ms < -1 {
+            return Result::Err(invalid("epoll_wait", "invalid event count or timeout"))
+        }
+        let data = kernel::zeroes(max_events * abi::EpollEvent::size());
+        let count = self.descriptor.with_raw_fd(
+            |raw| kernel::call(
+                syscall::SYS_EPOLL_WAIT,
+                [
+                    Arg::Word(raw),
+                    Arg::Buffer(data.as_mut_slice()),
+                    Arg::Word(max_events.to_usize()),
+                    Arg::Word(timeout_ms.to_usize()),
+                    Arg::Word(0),
+                    Arg::Word(0),
+                ],
+                "epoll_wait",
+            ),
+        )?;
+        if count > max_events.to_usize() {
+            return Result::Err(corrupt("epoll_wait"))
+        }
+        self.with_watches(
+            |watches| {
+                let result: Vec[abi::EpollEvent] = Vec::with_capacity(count.to_isize());
+                for index in 0..count.to_isize() {
+                    let record = abi::EpollEvent::decode(data.slice(index * 12, (index + 1) * 12)).map_err(
+                        |_| corrupt("epoll_wait"),
+                    )?;
+                    if let Some(event) = ready_event(record, watches.as_slice()) {
+                        result.push(event);
+                    }
+                }
+                Result::Ok(result)
+            },
+        )
+    }
+
+    pub fn close(self: Epoll) -> Result[(), Error] {
+        let mut state = self.state.recv().ok_or(kernel::errno_error("epoll close", syscall::EBADF))?;
+        if state.closed {
+            self.state.send(state);
+            return Result::Ok(())
+        }
+        if let Err(error) = write_counter(self.wakeup, 1) {
+            self.state.send(state);
+            return Result::Err(error)
+        }
+        state.closed = true;
+        let watches = state.watches;
+        state.watches = Vec::new();
+        self.state.send(state);
+        let result = self.descriptor.close();
+        let _ = self.wakeup.close();
+        for watch in watches {
+            let _ = watch.descriptor.close();
+        }
+        result
+    }
+}

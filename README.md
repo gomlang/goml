@@ -21,7 +21,7 @@ GoML is statically typed and garbage-collected, with Rust-like syntax, monomorph
 
 ## Development
 
-Run recipes from the repository root. The toolchain build requires Linux amd64, Go 1.25+, `just`, Bash, curl, tar, and sha256sum. Tests require a C compiler for Go's race detector; full CI also uses Node 20+, npm, and jq. See [.justfile](.justfile) for all commands and [gomlgo's README](gomlgo/README.md) for its separate Go 1.26 requirements.
+Run recipes from the repository root. The toolchain build requires Linux amd64, Go 1.25+, `just`, Bash, curl, tar, and sha256sum. Tests require a C compiler for Go's race detector; full CI also uses Node 20+, npm, jq, Python 3, and Linux development headers for checking the generated syscall ABI and record layouts. See [.justfile](.justfile) for all commands and [gomlgo's README](gomlgo/README.md) for its separate Go 1.26 requirements.
 
 ```sh
 just make

@@ -432,7 +432,7 @@ This form is the newtype pattern. Construct it with `UserId(value)`, access its 
 
 GoML has no Rust reference or lifetime syntax, pointer arithmetic, slice literals, or union types. Use `Ref[T]` for shared mutable storage, `Option[T]` for optional values, and `Slice[T]` or `MutSlice[T]` for read-only or mutable contiguous views. `std::ffi::Ptr[T]` and external Go type aliases can carry nullable Go pointers; they remain distinct from `Ref[T]` and numeric types.
 
-On Linux amd64, `std::os::linux::syscall` accepts numeric machine words and scoped byte-buffer arguments for low-level kernel calls. It does not add pointer casts, pointer arithmetic, or native struct layout to the language.
+On Linux amd64, `std::os::linux::syscall` accepts numeric machine words, scoped byte-buffer arguments, and explicit pointer fields between byte buffers for low-level kernel calls. It does not add pointer casts, pointer arithmetic, or native struct layout to the language.
 
 `A + B` is only usable as a trait bound or supertrait list. The parser reserves `dyn A + B`, but the type checker deliberately rejects multiple dyn bounds in the current object model.
 
@@ -2855,7 +2855,12 @@ Public APIs include:
 - `math` f32/f64 elementary functions, IEEE 754 classification, and the `E`, `PI`, `TAU`, `SQRT_2`, `LN_2`, and `LN_10` constants
 - `net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket, WaitOptions}` for Linux amd64 syscall-backed IPv4/IPv6 networking, shared epoll readiness, timeouts, and cancellation
 - `num` structured parsing plus checked and saturating `i64` arithmetic
-- `os::linux::syscall` Linux amd64 calls by number, six machine-word arguments, scoped mutable byte buffers, raw return values, and numeric errno
+- `os::linux::syscall` Linux amd64 calls by number, six machine-word arguments, scoped mutable byte-buffer graphs, raw return values, and named errno
+- `os::linux::abi` checked Linux amd64 record codecs and `Iovecs`/`Message` nested-buffer builders
+- `os::linux::fd` owned Linux descriptors, scalar/vector/positional I/O, metadata, byte paths, directory-relative operations, locks, and anonymous memory files
+- `os::linux::process` IDs, signals, pidfds, child creation/waiting, resource usage, limits, and priorities
+- `os::linux::memory` anonymous/file mappings, checked copied access, protection, sync/advice, page locking, and residency
+- `os::linux::ipc` pipes, Unix socket pairs, descriptor passing, eventfd, timerfd, poll, and epoll
 - `path::join`, `clean`, `is_absolute`, component inspection, and `absolute_structured`
 - `process::Command`, structured whole-process execution, `ExitStatus`, `Output`, `exit`, and `look_path_structured`
 - `rand::ALGORITHM`, `next_u64`, deterministic byte generation, integer ranges, and shuffle with an explicit seed
@@ -2982,6 +2987,8 @@ Paths remain UTF-8 `string` values. `path::separator` reports the host separator
 
 `SyscallResult` has public `r1`, `r2`, and `errno` fields, all `usize`, preserving the values reported by Go's `syscall.Syscall6`. `is_ok()` tests `errno == 0`. A kernel failure still returns `Ok(SyscallResult)` with a nonzero errno; callers must inspect it. The outer `Err(Error::UnsupportedTarget)` reports that the executing target is not Linux amd64, before any syscall is issued. Other Go targets are not guaranteed to compile. Syscall numbers, layouts, and constants are specific to the Linux amd64 ABI; this package does not select numbers for another architecture.
 
+`SyscallResult::into_result()` converts a successful first return word to `Ok(usize)` and a nonzero errno to `Err(Errno)`. The public tuple field in `Errno(pub usize)` preserves the numeric code, including unknown future codes. `Errno::name()` and `errno_name(usize)` return `Option[string]` with the canonical symbolic name; aliases resolve to the original name, such as `EWOULDBLOCK` to `EAGAIN`. `to_string()` returns that name, or `"errno N"` for an unknown code. Zero has no errno name.
+
 ```goml
 use std::os::linux::syscall;
 
@@ -3015,11 +3022,194 @@ fn write_once(fd: usize, data: Vec[byte]) -> Result[syscall::SyscallResult, sysc
 }
 ```
 
-The caller is responsible for the syscall ABI, valid addresses, buffer lengths, alignment, native structure encoding, resource cleanup, and synchronization. Byte buffers can carry explicitly encoded native records; ordinary GoML structs have no kernel-layout guarantee. `Word` does not retain or pin any Go allocation, so a Go-managed address must not be smuggled through an integer. Numeric addresses returned by operations such as `mmap` remain raw words and require appropriate explicit cleanup such as `munmap`.
+`syscall6_with_pointers(number: usize, args: [Arg; 6], pointers: Slice[Pointer])` extends the buffer API to synchronous native structures containing pointers, including `iovec` arrays and `msghdr` records. `Pointer` has public `buffer: MutSlice[byte]`, `offset: isize`, and `target: MutSlice[byte]` fields. Each descriptor temporarily writes the target's address into the eight-byte little-endian pointer field at the offset within the buffer view; an empty target writes zero. Root buffers use `Arg::Buffer`, and descriptors may connect intermediate buffers to other buffers at any depth, including aliases and cycles. Every participating allocation is pinned before pointer fields are installed and remains pinned until the call and pointer restoration finish. There is no limit of six nested buffers.
 
-Buffer lifetimes cover synchronous calls only. Operations that retain a pointer after returning, nested pointer graphs, and arbitrary Go object memory are outside this buffer API. The runtime uses scheduling-aware `Syscall6`, not `RawSyscall6`. It performs one call without automatic `EINTR` retry or completion of partial reads/writes. Per-thread operations require thread-affinity handling that this API does not provide. Raw changes to threads, process creation, signal handlers, or the Go runtime's address space can violate runtime invariants; accepting a number does not make every kernel operation safe to use from GoML. Calls remain subject to kernel availability, process permissions, and sandbox policy.
+Every pointer slot is bounds-checked before any mutation or syscall. An invalid slot returns `Error::InvalidPointer { index, offset, length }`, identifying the descriptor and its buffer view. Descriptors are installed in list order. All original pointer-field bytes are restored on return, including kernel errors; overlapping slots are restored to their original bytes as well. Kernel writes outside these slots remain visible. Treat pointer slots as temporary input fields: kernel output written into them is discarded during restoration. Buffers and pointer fields must not be read, mutated, or used by another syscall concurrently with the call.
 
-The exported syscall constants are `SYS_READ`, `SYS_WRITE`, `SYS_CLOSE`, `SYS_FSTAT`, `SYS_POLL`, `SYS_MMAP`, `SYS_MUNMAP`, `SYS_GETPID`, `SYS_SOCKET`, `SYS_CONNECT`, `SYS_SENDTO`, `SYS_RECVFROM`, `SYS_SHUTDOWN`, `SYS_BIND`, `SYS_LISTEN`, `SYS_GETSOCKNAME`, `SYS_GETPEERNAME`, `SYS_SETSOCKOPT`, `SYS_GETSOCKOPT`, `SYS_GETUID`, `SYS_GETPPID`, `SYS_GETDENTS64`, `SYS_CLOCK_GETTIME`, `SYS_EPOLL_WAIT`, `SYS_EPOLL_CTL`, `SYS_INOTIFY_ADD_WATCH`, `SYS_INOTIFY_RM_WATCH`, `SYS_OPENAT`, `SYS_NEWFSTATAT`, `SYS_ACCEPT4`, `SYS_EPOLL_CREATE1`, `SYS_PIPE2`, and `SYS_INOTIFY_INIT1`, plus `EINTR`, `EBADF`, `EAGAIN`, `EINVAL`, and `ENOSYS`. Other numbers can be passed directly. This package uses ordinary imports, functions, enums, arrays, and mutable slices; it introduces no new grammar or `unsafe` syntax and cannot be used in `comptime`.
+For example, Linux amd64 `iovec` records contain an eight-byte pointer followed by an eight-byte length. This writes two views with one kernel operation, using the native layout documented by [readv/writev](https://man7.org/linux/man-pages/man2/readv.2.html):
+
+```goml
+use std::bytes::endian;
+use std::os::linux::syscall;
+use std::os::linux::syscall::{Arg, Pointer};
+
+fn write_pair(fd: usize, first: MutSlice[byte], second: MutSlice[byte]) -> Result[syscall::SyscallResult, syscall::Error] {
+    let vectors: Vec[byte] = Vec::new();
+    for _ in 0..32 { vectors.push(0); }
+    let _ = endian::write_u64(vectors.as_mut_slice(), 8, first.len().to_u64(), endian::Endian::Little);
+    let _ = endian::write_u64(vectors.as_mut_slice(), 24, second.len().to_u64(), endian::Endian::Little);
+    let pointers = Vec::from_array([
+        Pointer { buffer: vectors.as_mut_slice(), offset: 0, target: first },
+        Pointer { buffer: vectors.as_mut_slice(), offset: 16, target: second },
+    ]);
+    syscall::syscall6_with_pointers(syscall::SYS_WRITEV, [
+        Arg::Word(fd), Arg::Buffer(vectors.as_mut_slice()), Arg::Word(2),
+        Arg::Word(0), Arg::Word(0), Arg::Word(0),
+    ], pointers.as_slice())
+}
+```
+
+The caller is responsible for the syscall ABI, valid addresses, buffer lengths, alignment, native structure encoding, resource cleanup, and synchronization. Byte buffers can carry explicitly encoded native records; ordinary GoML structs have no kernel-layout guarantee. Pointer-slot bounds checks do not validate syscall-specific structure layouts or lengths stored in those records. `Word` does not retain or pin any Go allocation, so a Go-managed address must not be smuggled through an integer. Numeric addresses returned by operations such as `mmap` remain raw words and require appropriate explicit cleanup such as `munmap`.
+
+Buffer lifetimes cover synchronous calls only, including nested pointer graphs supplied through `Pointer`. Operations that retain a pointer after returning and arbitrary Go object memory are outside this buffer API. The runtime uses scheduling-aware `Syscall6`, not `RawSyscall6`. It performs one call without automatic `EINTR` retry or completion of partial reads/writes. Per-thread operations require thread-affinity handling that this API does not provide. Raw changes to threads, process creation, signal handlers, or the Go runtime's address space can violate runtime invariants; accepting a number does not make every kernel operation safe to use from GoML. Calls remain subject to kernel availability, process permissions, and sandbox policy.
+
+The package exports all 385 native amd64 `SYS_*` numbers in the pinned [Linux 7.2 syscall table](https://github.com/torvalds/linux/blob/v7.2/arch/x86/entry/syscalls/syscall_64.tbl), excluding the separate x32 ABI. This includes legacy entries and newer interfaces such as `SYS_OPENAT2`, `SYS_CLONE3`, `SYS_PIDFD_OPEN`, `SYS_IO_URING_SETUP`, and `SYS_LANDLOCK_CREATE_RULESET`. A constant does not guarantee that the running kernel implements or permits the call. All 136 errno constants and aliases from the same release's `asm-generic/errno-base.h` and `errno.h` are exported. Other numbers can still be passed directly. The numeric manifest and upstream SHA-256 checksums live in `tools/syscall/linux-amd64.json`; `python3 tools/syscall/generate.py` regenerates constants, `--check` verifies them offline, and `--check --verify-upstream` also checks the original kernel files. This package uses ordinary imports, functions, enums, arrays, and mutable slices; it introduces no new grammar or `unsafe` syntax and cannot be used in `comptime`.
+
+### Linux amd64 ABI records
+
+`std::os::linux::abi` provides public-field records with `Type::size() -> isize`, `encode() -> Vec[byte]`, and `Type::decode(Slice[byte]) -> Result[Type, endian::BoundsError]`. Encoding uses the Linux amd64 little-endian layout, including zeroed padding. Decoding requires the whole record and accepts trailing bytes. These codecs validate byte bounds; the kernel validates semantic values such as time ranges and flags. Ordinary GoML structs still have no native layout guarantee.
+
+| Records | Encoded sizes in bytes |
+| --- | --- |
+| `Timespec { seconds, nanoseconds }`, `Timeval { seconds, microseconds }` | 16 each |
+| `Itimerspec { interval, value }` | 32 |
+| `Rlimit { current, maximum }` | 16 |
+| `PollFd { fd, events, revents }`, `EpollEvent { events, data }` | 8, 12 (packed) |
+| `Iovec { base, length }`, `Msghdr`, `Cmsghdr { length, level, kind }` | 16, 56, 16 |
+| `Flock { kind, whence, start, length, pid }`, `OpenHow { flags, mode, resolve }` | 32, 24 |
+| `Stat`, `Statx`, `StatxTimestamp { seconds, nanoseconds }` | 144, 256, 16 |
+| `Rusage` | 144 |
+
+`Stat` exposes device/inode/link identifiers, mode and ownership, size/block information, and `atime`, `mtime`, `ctime` as `Timespec`. `Statx` also exposes `mask`, attributes, birth time, device major/minor identifiers, mount ID, and direct-I/O alignment. Check its returned mask before using optional fields. Fields after the direct-I/O alignment prefix are currently reserved by this codec. `Rusage` carries user/system `Timeval` values and the Linux resource counters. Pointer-valued record fields are machine words; use the nested-buffer builders to reference Go-managed storage.
+
+`Iovecs::new(buffers: Slice[MutSlice[byte]]) -> Result[Iovecs, string]` accepts up to 1024 views and creates the encoded vector array and pointer descriptors. `buffer()`, `pointers()`, and `len()` supply the arguments for `readv`, `writev`, and related calls. `Message::new(name: MutSlice[byte], vectors: Iovecs, control: MutSlice[byte]) -> Result[Message, string]` constructs an `msghdr` graph for synchronous `sendmsg`/`recvmsg`; empty name/control views represent null pointers. Its `buffer()` and `pointers()` are used together with `syscall6_with_pointers`, and `header()` decodes lengths and flags after the call. Pointer slots are restored by that call. Builders retain the views and do not copy their contents. A builder, its views, and its graph must not be accessed concurrently while a call is using it; editing embedded lengths requires following the raw syscall ABI.
+
+The layout manifest is `tools/syscall/linux-amd64-layouts.json`. Run `python3 tools/syscall/layouts.py`, then `goml fmt` in `lib/std`, to regenerate the codecs. `python3 tools/syscall/layouts.py --check --verify-headers` checks canonical output and compiles C assertions for every size, offset, and field width against Linux amd64 system headers. This API uses ordinary structs and methods and adds no grammar.
+
+### Linux amd64 file descriptors
+
+`std::os::linux::fd` provides explicit descriptor ownership and returns `Result[..., io::Error]`; it re-exports `Error` and `ErrorKind`. Errors retain `raw_os_code()` when the kernel supplies errno. Calls that can be interrupted retry `EINTR`, except `close` and the request-dependent raw `ioctl`. Nonblocking operations return `WouldBlock` for `EAGAIN`. These interfaces do not add readiness waits or cancellation.
+
+`open(path: string, flags: usize, mode: u32)`, `open_at(directory: isize, path: string, flags: usize, mode: u32)`, and `open_at2(directory: isize, path: string, how: abi::OpenHow)` return `Fd`. `open_at_bytes` and `open_at2_bytes` accept raw `Slice[byte]` paths. Paths reject embedded NUL and otherwise preserve their bytes; string paths are encoded as UTF-8. `Fd` also has `open_at`, `open_at_bytes`, and `open_at2` methods that keep the directory descriptor alive during the operation. `memfd(name: string, flags: usize)` creates an anonymous memory-backed file. Open, memfd, and duplication operations set close-on-exec atomically. Flags include `O_*`, `AT_*`, `RESOLVE_*`, `MFD_*`, and `F_SEAL_*`; a flag or syscall constant does not guarantee kernel/filesystem support.
+
+Assigning or passing an `Fd` shares its close state. `close()` is explicit and idempotent; there is no finalizer. It rejects new operations, waits for active operations/borrows, and closes the raw descriptor once, without retrying a failed close. `is_closed()` becomes true when closing begins. Blocking I/O must finish before close can return; closing does not cancel it. Operations on the same open handle may run concurrently. Callers must synchronize shared buffers and any compound sequence involving the shared file offset.
+
+`duplicate()` creates an independent descriptor owner while preserving the kernel's shared file description and offset. `Fd::from_raw(raw: isize)` validates and adopts an existing descriptor without changing its flags; the caller transfers sole responsibility for closing it on success. `Fd::from_owned_raw(raw: isize)` only checks the numeric range and adopts an already-owned descriptor without an `fcntl` probe; use it for successful syscall results, and ensure the number is valid and exclusively owned. `into_raw()` waits for active operations and transfers that responsibility back, invalidating all aliases. `with_raw_fd[T](action: (usize) -> Result[T, Error])` keeps the descriptor open for the callback. `fd::with_raw_fds[T](descriptors: Slice[Fd], action: (Slice[usize]) -> Result[T, Error])` borrows a whole list iteratively, including repeated aliases, and releases every successful borrow if a later acquisition or the callback fails. The callback must not close, replace, retain, or re-adopt the raw number, or call `close`/`into_raw` on the same shared handle. Free functions accepting a raw directory number require the caller to keep it valid; use `with_raw_fd` for an owned directory or `AT_FDCWD` for the current directory.
+
+| Operations on `Fd` | Behavior |
+| --- | --- |
+| `read(MutSlice[byte])`, `write(Slice[byte])` | Return the transferred byte count; reads return zero at EOF |
+| `read_at(output, offset: i64)`, `write_at(input, offset: i64)` | Positional I/O without moving the file offset |
+| `read_vectored(Slice[MutSlice[byte]])`, `write_vectored(Slice[Slice[byte]])` | Scatter/gather I/O, at most 1024 buffers |
+| `read_vectored_at(outputs, offset: i64)`, `write_vectored_at(inputs, offset: i64)` | Full 64-bit positional scatter/gather I/O |
+| `read_exact(output)`, `write_all(input)` | Loop over short transfers; report `UnexpectedEof` or `WriteZero` when progress stops |
+| `seek(offset: i64, whence: usize)` | Return the new `u64` position; `SEEK_SET/CUR/END/DATA/HOLE` |
+| `stat()`, `truncate(length: i64)`, `chmod(mode: u32)`, `chown(uid: u32, gid: u32)` | Metadata and file changes; `0xffffffff` leaves an ownership ID unchanged |
+| `sync()`, `sync_data()`, `allocate(mode: usize, offset: i64, length: i64)` | `fsync`, `fdatasync`, and `fallocate` with `FALLOC_FL_*` flags |
+| `descriptor_flags()`, `set_descriptor_flags(flags)`, `status_flags()`, `set_status_flags(flags)` | Descriptor and open-file status flags |
+| `flock(operation: usize)`, `record_lock(command: usize, lock: abi::Flock)` | Whole-file and POSIX/OFD byte-range locks; the latter returns the resulting `Flock` |
+| `fcntl(command: usize, argument: usize)`, `ioctl(request: usize, buffer: MutSlice[byte])` | Raw word-argument fcntl and synchronous buffer ioctl; caller supplies the request ABI |
+| `read_dir()` | Read one batch of `Vec[DirEntry]`, empty at EOF, advancing the directory offset |
+
+Writes copy immutable input views into temporary buffers. Neither input copying nor kernel I/O permits concurrent mutation of those views. `read_exact` and `write_all` can have made partial progress when returning an error. Positional writes retain Linux `O_APPEND` behavior, which can append regardless of the supplied offset. Raw `fcntl` duplication commands return a raw descriptor owned by the caller; `duplicate()` is the managed alternative. `ioctl` requires a buffer large enough for the request and cannot register memory for use after return.
+
+Directory-relative free functions are `stat_at`, `statx_at`, `mkdir_at`, `unlink_at`, `rename_at`, `link_at`, `symlink_at`, `readlink_at`, `chmod_at`, `chown_at`, and `utimens_at`, each with a `_bytes` variant. Rename uses `renameat2` and supports `RENAME_NOREPLACE`, `RENAME_EXCHANGE`, and `RENAME_WHITEOUT`; unlink uses `AT_REMOVEDIR` for directories. `utimens_at` takes access and modification `Timespec` values, including `UTIME_NOW`/`UTIME_OMIT` in the nanoseconds field. `readlink_at` returns raw target bytes. `DirEntry` preserves raw `name: Vec[byte]`, `inode: u64`, `next_offset: i64`, and Linux `kind: byte`; `.` and `..` are included and unknown kinds are retained. Directory order and offset cookies are kernel-defined.
+
+```gom
+use std::os::linux::fd;
+
+fn append_bytes(path: string, bytes: Slice[byte]) -> Result[(), fd::Error] {
+    let file = fd::open(path, fd::O_WRONLY | fd::O_CREAT | fd::O_APPEND, 0x180)?;
+    let written = file.write_all(bytes);
+    let closed = file.close();
+    written?;
+    closed
+}
+```
+
+These interfaces support Linux amd64 only. They use ordinary imports, structs, functions, and methods and add no native pointer or `unsafe` syntax.
+
+### Linux amd64 processes
+
+`std::os::linux::process` provides Linux process operations and re-exports `io::Error`/`ErrorKind`. PID arguments must fit signed 32 bits; signal numbers range from zero through 64. Zero checks existence/permission, and negative or zero PIDs retain the kernel's process-group selection semantics for `kill` and `wait`. Exported `SIG*` constants use native Linux numbers, including 32/33, rather than glibc's adjusted real-time range.
+
+| Functions | Result or behavior |
+| --- | --- |
+| `pid()`, `parent_pid()`, `thread_id()` | `Result[isize, Error]` |
+| `uid()`, `effective_uid()`, `gid()`, `effective_gid()` | `Result[u32, Error]` |
+| `user_ids()`, `group_ids()`, `groups()` | Real/effective/saved `ResIds`, or supplementary `Vec[u32]` |
+| `process_group(pid)`, `session(pid)` | Group/session ID; zero selects the caller |
+| `set_process_group(pid, group)`, `create_session()` | Apply Linux group/session rules |
+| `kill(pid, signal)`, `signal_thread(group, thread, signal)` | Process/group signaling and `tgkill` |
+| `pidfd_open(pid, flags)`, `pidfd_signal(handle, signal)` | Owned close-on-exec `fd::Fd` and signaling through a stable process handle |
+| `wait(pid, options)` | `Result[Option[WaitOutcome], Error]`; `None` when `WNOHANG` finds no ready child |
+| `resource_usage(who)` | `abi::Rusage`; `RUSAGE_SELF`, `RUSAGE_CHILDREN`, `RUSAGE_THREAD` |
+| `resource_limit(pid, resource)`, `set_resource_limit(pid, resource, limit)` | Read or atomically replace `abi::Rlimit`, returning the previous limit on replacement |
+| `priority(which, who)`, `set_priority(which, who, value)` | Normal nice values from -20 to 19 with kernel permission checks |
+
+`WaitOutcome` exposes `pid`, `status: WaitStatus`, and `usage: abi::Rusage`. `WaitStatus { raw: u32 }` has `exited`, `signaled`, `stopped`, `continued`, `core_dumped`, and `success` predicates plus optional `exit_code`, `signal`, and `stop_signal`. Wait options include `WNOHANG`, `WUNTRACED`, and `WCONTINUED`. Resource limits expose all 16 `RLIMIT_*` selectors and `RLIM_INFINITY`; Linux maximum RSS is in KiB. `thread_id`, `RUSAGE_THREAD`, and `PRIO_PROCESS` with `who == 0` refer to the executing OS thread, which can change as GoML tasks are scheduled. They do not identify or configure a stable GoML task. Resource-limit setters update the kernel directly. Go child creation may restore its original `RLIMIT_NOFILE` soft limit when the current soft value equals the initial hard limit minus one, including after an explicit raw update to that value; other current values are inherited normally.
+
+`Command::new(program)` builds an asynchronous child command. Its chaining methods are `arg(string)`, `args(Slice[string])`, `current_dir(string)`, `env(key, value)`, `env_clear()`, `stdin(fd)`, `stdout(fd)`, `stderr(fd)`, `extra_fd(fd)`, `new_session(bool)`, and `new_process_group(bool)`. `spawn()` returns a `Child`. The builtin runtime uses Go's [runtime-coordinated ForkExec](https://go.dev/src/syscall/exec_linux.go); GoML code does not issue raw fork/clone. Program names without a slash use the parent's PATH through Go's `exec.LookPath`; paths containing a slash are executed after applying the child working directory. Command environment changes apply to the child. Environment is inherited at spawn unless cleared, and later overrides win. Keys must be nonempty and contain neither NUL nor `=`; values reject NUL. An empty working directory means inherit.
+
+Standard descriptors 0/1/2 are inherited by default. Explicit descriptors remain borrowed throughout spawn. Extra descriptors occupy consecutive child slots beginning at 3. The child receives separate descriptor-table entries referring to the same file descriptions; the parent's owners remain open. A new session also creates a new process group; enabling both options has the same effect as `new_session(true)`. Command values share their argument, environment, and descriptor lists through ordinary `Vec` semantics; do not mutate a command concurrently with spawning it.
+
+Spawn requests an atomic pidfd using Linux `CLONE_PIDFD`, requiring the corresponding kernel capability. `Child.pid()` returns its numeric PID, while `signal(signal)` and `kill()` use the pidfd to avoid PID reuse. `wait()` reaps once and caches the outcome across aliases; simultaneous waiters receive the cached result. `try_wait()` returns `None` while the child is running or another waiter owns the wait operation. `wait_event(options)` additionally observes stop/continue events with the supported wait flags. Signaling remains possible while another task waits. Terminal reaping closes the internal pidfd; subsequent signals report a closed descriptor. Call `wait()` after a successful spawn, including after `kill()`; dropping a child does not kill or reap it. Its `Child` owns terminal reaping, so other wait APIs and automatic SIGCHLD reaping must not take that responsibility.
+
+```gom
+use std::os::linux::process;
+
+fn child_status() -> Result[isize, process::Error] {
+    let child = process::Command::new("/bin/sh").arg("-c").arg("exit 7").spawn()?;
+    let result = child.wait()?;
+    Result::Ok(result.status.exit_code().unwrap_or(-1))
+}
+```
+
+Credential mutation, signal-handler replacement, and signal-mask replacement are not provided as convenience wrappers because they require coordination with the multithreaded runtime. These process APIs support Linux amd64 only, use ordinary language constructs, and add no syntax.
+
+### Linux amd64 memory mappings
+
+`std::os::linux::memory::anonymous(length: isize, protection: usize, flags: usize)` and `file(descriptor: fd::Fd, length: isize, offset: i64, protection: usize, flags: usize)` return `Result[Mapping, io::Error]`. The package re-exports `Error` and `ErrorKind`. Anonymous mappings add `MAP_ANONYMOUS`; callers choose `MAP_PRIVATE` or `MAP_SHARED`. File mappings borrow the descriptor during `mmap` and remain valid after it closes. `MAP_PRIVATE` provides copy-on-write behavior, while `MAP_SHARED` exposes shared backing-file changes.
+
+Length must be positive, and file offsets must be nonnegative multiples of `PAGE_SIZE` (4096 on Linux amd64). Copied access is limited to the requested length, including when the last mapped page is partial. `Mapping` rejects fixed-address, growing-stack, explicit hugetlb, and uninitialized mapping flags. These specialized operations remain accessible through raw syscalls. Managed mappings expose no raw address, Go slice view, executable function pointer, remap, or partial unmap.
+
+| `Mapping` methods | Behavior |
+| --- | --- |
+| `len()`, `is_closed()` | Requested length and shared lifecycle state |
+| `read_at(output: MutSlice[byte], offset: isize)`, `write_at(input: Slice[byte], offset: isize)` | Checked copied access, returning the actual byte count |
+| `read_exact_at(output, offset)`, `write_all_at(input, offset)` | Repeat short transfers until complete or error |
+| `protect(protection)` | Change the whole mapping's protection using `PROT_NONE/READ/WRITE/EXEC/SEM` |
+| `sync(flags)`, `advise(advice)` | Whole-mapping `msync` and `madvise` |
+| `lock(flags)`, `unlock()` | Whole-mapping `mlock`/`mlock2` and `munlock`; `MLOCK_ONFAULT` is supported |
+| `residency()` | One boolean per base page from `mincore`, describing a momentary snapshot |
+| `close()` | Explicit, idempotent unmap across aliases |
+
+Copying uses [process_vm_readv/process_vm_writev](https://man7.org/linux/man-pages/man2/process_vm_readv.2.html) against the current process, with local Go buffers pinned only during the call. It has syscall/allocation overhead and can return `ENOSYS`/`EPERM` under unsupported kernels or syscall restrictions. Inaccessible or truncated file pages return short copies or `EFAULT` without directly dereferencing mapped storage from Go. Errors retain the kernel errno. Exact operations can modify a prefix before an error; writes copy the immutable input first. Do not concurrently mutate caller buffers during a call.
+
+Aliases share a channel that serializes copying, protection changes, other operations, and unmap. `close()` waits for active access, unmaps once, and preserves the mapping if unmap fails so it can be retried. Other operations after close return `EBADF`; `len()` retains the requested length. There is no finalizer. Reads require explicit `PROT_READ` and writes explicit `PROT_WRITE`, even where amd64 hardware implies additional permissions. Missing declared access returns `EACCES`. Independent mappings and other processes require their own synchronization; mapped bytes are not an atomic IPC protocol.
+
+```gom
+use std::os::linux::memory;
+
+fn mapped_bytes() -> Result[Vec[byte], memory::Error] {
+    let region = memory::anonymous(4096, memory::PROT_READ | memory::PROT_WRITE, memory::MAP_PRIVATE)?;
+    defer { let _ = region.close(); };
+    region.write_all_at(b"hello".as_slice(), 0)?;
+    let output = b"?????";
+    region.read_exact_at(output.as_mut_slice(), 0)?;
+    Result::Ok(output)
+}
+```
+
+The package exposes Linux protection, mapping, synchronization, advice, and locking constants; a constant does not guarantee kernel support. Operations obey kernel permissions and resource limits. This package is Linux amd64 only and introduces no pointer or layout syntax.
+
+### Linux amd64 IPC and readiness
+
+`std::os::linux::ipc` uses owned `fd::Fd` values and structured `io::Error` results. `pipe(flags)` returns `Pipe { reader, writer }`; `socket_pair(kind, flags)` returns `SocketPair { first, second }` using the Unix domain. Socket kinds include `SOCK_STREAM`, `SOCK_DGRAM`, and `SOCK_SEQPACKET`. Flags include nonblocking operation; newly created descriptors always have close-on-exec. `shutdown(socket, direction)` supports `SHUT_RD`, `SHUT_WR`, and `SHUT_RDWR`. Close each returned descriptor explicitly.
+
+`send_message(socket, data: Slice[byte], descriptors: Slice[fd::Fd], flags)` sends one message with optional `SCM_RIGHTS` descriptors, returns the transferred byte count, and adds `MSG_NOSIGNAL`. It copies payload input and borrows all descriptors for the call. At most 253 descriptors can be sent, and descriptor transfer requires at least one payload byte. A partial stream send may already transfer the rights; retrying the entire descriptor-bearing send can duplicate them at the receiver.
+
+`receive_message(socket, output: MutSlice[byte], max_descriptors: isize, flags)` returns `ReceivedMessage { byte_count: usize, copied: isize, flags: usize, descriptors: Vec[fd::Fd] }`. It atomically sets close-on-exec on received descriptors with `MSG_CMSG_CLOEXEC`. The limit is 0–253. `MSG_TRUNC` can make `byte_count` larger than `copied`; zero-byte datagrams are valid. Control truncation or a descriptor-limit error closes the received descriptors and returns an error after the receive; the payload is consumed unless `MSG_PEEK` was requested. On success the caller owns every returned descriptor. Immutable send inputs and mutable receive buffers must not be mutated concurrently with these calls.
+
+`eventfd(initial: u32, flags)` returns a counter descriptor; `EFD_NONBLOCK` and `EFD_SEMAPHORE` control its behavior. `read_counter(fd)` and `write_counter(fd, value: u64)` perform the exact eight-byte counter operation. `timerfd(clock, flags)` creates a timer descriptor; `set_timer(timer, flags, value: abi::Itimerspec)` returns the previous setting and `get_timer(timer)` reads it. A zero value disarms the timer, an interval makes it periodic, and `TFD_TIMER_ABSTIME` selects absolute expiration. Read expirations through `read_counter`; nonblocking empty counters report `WouldBlock`.
+
+`poll(interests: Slice[PollInterest], timeout_ms: i32)` borrows all descriptors and returns `Vec[PollEvent]`. `PollInterest { descriptor, events: i16 }` specifies a `POLL*` mask; `PollEvent { index, events }` identifies the ready input entry. A timeout of -1 waits indefinitely, zero polls immediately, and positive values are milliseconds. Poll returns `EINTR` instead of restarting a finite timeout.
+
+`Epoll::new()` creates a shared reactor handle that must be closed explicitly. `add(descriptor, events: u32, token: u64)` duplicates and retains the watched file description, so the caller can close its original owner without invalidating the watch. Tokens must be unique among current watches and can use any `u64` value. `modify(token, events)` updates/rearms a watch; `remove(token)` unregisters it and closes its retained descriptor. `wait(max_events: isize, timeout_ms: i32)` returns `Vec[abi::EpollEvent]`, with each `data` field holding the supplied token. It supports `EPOLL*` masks, including edge-triggered and one-shot modes; callers must follow the kernel's draining/rearming rules. Interrupted waits return `EINTR`.
+
+Each epoll registration uses an internal identity that is never reused; events for removed registrations are discarded, which can produce an empty result during concurrent removal. Adding/modifying/removing watches can proceed during waits. `close()` wakes every blocked waiter through a private eventfd before releasing descriptors; those waiters return `EBADF`. Closing is idempotent across aliases and closes all retained watches. Empty indefinitely waiting epoll instances can therefore be closed from another task.
+
+Shared-memory IPC uses `fd::memfd`, `memory::file(..., MAP_SHARED)`, and descriptor transfer together. Each process owns its descriptor and mapping separately and supplies synchronization for shared contents. Pipes, sockets, counters, timers, poll, and epoll are Linux amd64 only; these wrappers add no grammar.
 
 ### Networking
 
@@ -3396,12 +3586,19 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | Traverse a directory tree | `std::fs::walkdir` Linux amd64 syscall-backed depth-first iteration with depth bounds, pruning, optional link following, and per-path errors |
 | Watch a directory tree for changes | Use `fs::notify::watch_recursive` or `WatchSet` on Linux amd64, prune ignored paths through `Options`, consume timed reads or scoped subscriptions, handle `Event.rescan`, and close the handle |
 | TCP and UDP networking | `std::net` Linux amd64 syscall-backed sockets with numeric IPv4/IPv6 addresses, shared epoll readiness, explicit close, timeouts, and task cancellation |
-| Treat a GoML integer or struct as a kernel pointer/layout | Use `syscall::Arg::Buffer` for synchronous byte storage on Linux amd64; encode the native ABI explicitly and inspect `SyscallResult.errno` |
+| Create and supervise a Linux child | `std::os::linux::process::Command` with runtime-coordinated spawn, stable pidfd signals, and shared wait results |
+| Access mapped memory | `std::os::linux::memory::Mapping` checked copied access with explicit shared unmap state |
+| Pass descriptors or wait for Linux readiness | `std::os::linux::ipc` Unix messages, eventfd/timerfd, poll, and epoll |
+| Use Linux descriptor operations | `std::os::linux::fd` for explicit shared ownership, scalar/vector I/O, byte paths, metadata, locks, and directory-relative operations |
+| Encode a Linux amd64 native record | `std::os::linux::abi` checked byte codecs and `Iovecs`/`Message` builders |
+| Treat a GoML integer or struct as a kernel pointer/layout | Use `syscall::Arg::Buffer` and `syscall::Pointer` for synchronous byte-buffer graphs on Linux amd64; encode the native ABI explicitly and inspect `SyscallResult.errno` or `into_result()` |
 | Unannotated user `extern fn` | Use a normal GoML function or `#[go_ffi("import/path", "ExportedSymbol")] extern fn`; project commands validate Go calls by default (`--ffi-check required`) |
 | Call an ordinary function from `comptime` | Mark a supported free function with `#[comptime]` |
 | Capture a runtime local in `comptime` | Pass a literal or compile-time value to a `#[comptime]` function |
 
 ## Informal Grammar Quick Facts
+
+Linux syscall buffers, `Pointer` descriptors, `Errno` values, ABI codecs, descriptor/process/memory/IPC wrappers use the ordinary struct, enum, array, slice, and call forms below. Native kernel layouts are encoded into bytes; there is no pointer-cast, native-layout, or `unsafe` grammar.
 
 The following EBNF only describes the canonical form that should be generated; `?` means optional, `*` means repeated, and the terminator is placed in quotes.
 
