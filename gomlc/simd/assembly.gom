@@ -1,0 +1,240 @@
+package simd;
+
+use std::text;
+
+struct AssemblyContext {
+    name: string,
+    avx: bool,
+    builder: text::StringBuilder,
+    data: text::StringBuilder,
+    serial: Ref[isize],
+}
+
+fn write(context: AssemblyContext, value: string) -> () {
+    context.builder.write_string(value)
+}
+
+fn register(ty: VectorType, index: isize) -> string {
+    if vector_bytes(ty) == 32 {
+        f"Y{index}"
+    } else {
+        f"X{index}"
+    }
+}
+
+fn prefix(context: AssemblyContext) -> string {
+    if context.avx {
+        "V"
+    } else {
+        ""
+    }
+}
+
+fn float_suffix(ty: VectorType) -> string {
+    if element_bits(ty.element) == 64 {
+        "PD"
+    } else {
+        "PS"
+    }
+}
+
+fn scalar_suffix(element: Element) -> string {
+    if element_bits(element) == 64 {
+        "SD"
+    } else {
+        "SS"
+    }
+}
+
+fn int_suffix(element: Element, avx: bool) -> string {
+    match element_bits(element) {
+        8 => "B",
+        16 => "W",
+        32 => if avx {
+            "D"
+        } else {
+            "L"
+        },
+        _ => "Q",
+    }
+}
+
+fn align_offset(offset: isize, alignment: isize) -> isize {
+    ((offset + alignment - 1) / alignment) * alignment
+}
+
+fn value_size(kind: ValueKind) -> isize {
+    match kind {
+        Vector(ty) => vector_bytes(ty),
+        Mask(ty) => mask_bytes(ty),
+        Scalar(element) => element_bits(element) / 8,
+    }
+}
+
+fn value_alignment(kind: ValueKind) -> isize {
+    match kind {
+        Vector(ty) => element_bits(ty.element) / 8,
+        _ => value_size(kind),
+    }
+}
+
+fn kind_vector(kind: ValueKind) -> VectorType {
+    match kind {
+        Vector(ty) | Mask(ty) => ty,
+        Scalar(element) => VectorType { element, lanes: 128 / element_bits(element) },
+    }
+}
+
+fn copy_register(context: AssemblyContext, ty: VectorType, from: isize, to: isize) -> () {
+    if from != to {
+        write(context, f"    {prefix(context)}MOVUPS {register(ty, from)}, {register(ty, to)}\n");
+    }
+}
+
+fn all_bits(element: Element) -> u64 {
+    if element_bits(element) == 64 {
+        18446744073709551615
+    } else {
+        (1.to_u64() << element_bits(element)) - 1
+    }
+}
+
+fn repeated_bits(ty: VectorType, bits: u64) -> Vec[u64] {
+    let result: Vec[u64] = Vec::new();
+    for _ in 0..ty.lanes {
+        result.push(bits);
+    }
+    result
+}
+
+fn vector_constant(context: AssemblyContext, ty: VectorType, values: Vec[u64]) -> string {
+    let index = context.serial.get();
+    context.serial.set(index + 1);
+    let name = f"{context.name}_constant_{index}";
+    let size = element_bits(ty.element) / 8;
+    for lane in 0..values.len() {
+        context.data.write_string(f"DATA {name}<>+{lane * size}(SB)/{size}, ${values[lane]}\n");
+    }
+    context.data.write_string(f"GLOBL {name}<>(SB), 24, ${values.len() * size}\n");
+    f"{name}<>(SB)"
+}
+
+fn load_constant(context: AssemblyContext, ty: VectorType, values: Vec[u64], target: isize) -> () {
+    let source = vector_constant(context, ty, values);
+    write(context, f"    {prefix(context)}MOVUPS {source}, {register(ty, target)}\n");
+}
+
+fn emit_instruction(
+    context: AssemblyContext,
+    ty: VectorType,
+    sse: string,
+    avx: string,
+    left: isize,
+    right: isize,
+    target: isize,
+) -> () {
+    if context.avx {
+        write(
+            context,
+            f"    {avx} {register(ty, right)}, {register(ty, left)}, {register(ty, target)}\n",
+        );
+    } else {
+        copy_register(context, ty, left, target);
+        write(context, f"    {sse} X{right}, X{target}\n");
+    }
+}
+
+fn emit_bits(
+    context: AssemblyContext,
+    ty: VectorType,
+    op: Operator,
+    left: isize,
+    right: isize,
+    target: isize,
+) -> () {
+    let instruction = match op {
+        And => "ANDPS",
+        Or => "ORPS",
+        _ => "XORPS",
+    };
+    emit_instruction(context, ty, instruction, "V" + instruction, left, right, target)
+}
+
+fn emit_shift(
+    context: AssemblyContext,
+    ty: VectorType,
+    source: isize,
+    target: isize,
+    amount: isize,
+    direction: string,
+) -> () {
+    let suffix = int_suffix(ty.element, context.avx);
+    if context.avx {
+        write(
+            context,
+            f"    VPS{direction}{suffix} ${amount}, {register(ty, source)}, {register(ty, target)}\n",
+        );
+    } else {
+        copy_register(context, ty, source, target);
+        write(context, f"    PS{direction}{suffix} ${amount}, X{target}\n");
+    }
+}
+
+fn emit_not(context: AssemblyContext, ty: VectorType, source: isize, target: isize) -> () {
+    if context.avx {
+        write(context, f"    VPCMPEQD {register(ty, 15)}, {register(ty, 15)}, {register(ty, 15)}\n");
+    } else {
+        write(context, "    PCMPEQL X15, X15\n");
+    }
+    emit_bits(context, ty, Operator::Xor, source, 15, target)
+}
+
+fn emit_select(
+    context: AssemblyContext,
+    ty: VectorType,
+    mask: isize,
+    left: isize,
+    right: isize,
+    target: isize,
+) -> () {
+    if context.avx {
+        write(
+            context,
+            f"    VANDPS {register(ty, left)}, {register(ty, mask)}, {register(ty, 14)}\n    VANDNPS {register(ty, right)}, {register(ty, mask)}, {register(ty, 15)}\n    VORPS {register(ty, 15)}, {register(ty, 14)}, {register(ty, target)}\n",
+        );
+    } else {
+        write(
+            context,
+            f"    MOVUPS X{mask}, X14\n    MOVUPS X{mask}, X15\n    ANDPS X{left}, X14\n    ANDNPS X{right}, X15\n    MOVUPS X14, X{target}\n    ORPS X15, X{target}\n",
+        );
+    }
+}
+
+pub fn kernel_features(parameters: Vec[Parameter], nodes: Vec[Node]) -> Option[(bool, bool)] {
+    let kinds = node_kinds(parameters, nodes)?;
+    let mut avx2 = false;
+    let mut fma = false;
+    for kind in kinds {
+        match kind {
+            Vector(ty) | Mask(ty) => {
+                avx2 = avx2 || vector_bytes(ty) == 32;
+            },
+            _ => (),
+        }
+    }
+    for node in nodes {
+        match node {
+            Fma { .. } => {
+                fma = true;
+            },
+            Unary {
+                op: UnaryOperator::Floor | UnaryOperator::Ceil | UnaryOperator::Trunc | UnaryOperator::Round | UnaryOperator::RoundTiesEven,
+                ..,
+            } => {
+                avx2 = true;
+            },
+            _ => (),
+        }
+    }
+    Option::Some((avx2, fma))
+}

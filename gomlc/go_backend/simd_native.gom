@@ -2,31 +2,447 @@ package go_backend;
 
 use module::simd;
 use module::pretty;
+use module::resources;
 use std::json;
+use std::num;
 
 enum SimdValue {
     Vector(isize),
+    Mask(isize),
+    Scalar(isize),
+    Literal(string),
+    Bits {
+        element: simd::Element,
+        bits: u64,
+    },
+    Array {
+        element: simd::Element,
+        values: Vec[SimdValue],
+    },
+    Predicate(simd::Output),
     Record(Vec[(string, SimdValue)]),
 }
 
 struct SimdEvaluation {
     functions: HashMap[string, Function],
+    intrinsics: HashMap[string, SimdIntrinsic],
+    types: HashMap[string, (string, simd::ValueKind)],
     nodes: Vec[simd::Node],
+    kinds: Vec[simd::ValueKind],
     budget: Ref[isize],
+    operations: Ref[isize],
 }
 
-fn simd_native_operator(name: string) -> Option[simd::Operator] {
-    if name == simd_intrinsic_name("simd.f32x4.add") {
-        Option::Some(simd::Operator::Add)
-    } else if name == simd_intrinsic_name("simd.f32x4.sub") {
-        Option::Some(simd::Operator::Sub)
-    } else if name == simd_intrinsic_name("simd.f32x4.mul") {
-        Option::Some(simd::Operator::Mul)
-    } else if name == simd_intrinsic_name("simd.f32x4.div") {
-        Option::Some(simd::Operator::Div)
-    } else {
-        Option::None
+fn simd_push_node(context: SimdEvaluation, node: simd::Node, kind: simd::ValueKind) -> isize {
+    let index = context.nodes.len();
+    context.nodes.push(node);
+    context.kinds.push(kind);
+    index
+}
+
+fn simd_number_bits(value: string, element: simd::Element) -> Option[u64] {
+    if element == simd::Element::F32 {
+        return match num::parse_float32_structured(value) {
+            Ok(value) => Option::Some(value.to_bits().to_u64()),
+            Err(_) => Option::None,
+        }
     }
+    if element == simd::Element::F64 {
+        return match num::parse_float64_structured(value) {
+            Ok(value) => Option::Some(value.to_bits()),
+            Err(_) => Option::None,
+        }
+    }
+    let negative = value.starts_with("-");
+    let digits = if negative {
+        value.byte_slice(1, value.byte_len())
+    } else {
+        value
+    };
+    let mut bits = match num::parse_uint_structured(digits) {
+        Ok(value) => value.to_u64(),
+        Err(_) => return Option::None,
+    };
+    if negative {
+        bits = 0.to_u64() - bits;
+    }
+    let width = simd::element_bits(element);
+    if width < 64 {
+        bits = bits & ((1.to_u64() << width) - 1);
+    }
+    Option::Some(bits)
+}
+
+fn simd_value_bits(value: SimdValue, element: simd::Element) -> Option[u64] {
+    match value {
+        Literal(value) => simd_number_bits(value, element),
+        Bits { element: from, bits } => {
+            if from == element {
+                return Option::Some(bits)
+            }
+            if simd::is_float(from) {
+                if from == simd::Element::F32 && element == simd::Element::F64 {
+                    return Option::Some(float32_from_bits(bits.to_u32()).to_f64().to_bits())
+                }
+                if from == simd::Element::F64 && element == simd::Element::F32 {
+                    return Option::Some(float64_from_bits(bits).to_f32().to_bits().to_u64())
+                }
+                return Option::None
+            }
+            let width = simd::element_bits(from);
+            let signed = if simd::is_signed(from) && width < 64
+                && bits & (1.to_u64() << (width - 1)) != 0 {
+                (bits | (18446744073709551615 << width)).to_i64()
+            } else {
+                bits.to_i64()
+            };
+            simd_number_bits(
+                if simd::is_signed(from) {
+                    signed.to_string()
+                } else {
+                    bits.to_string()
+                },
+                element,
+            )
+        },
+        _ => Option::None,
+    }
+}
+
+fn simd_scalar_node(context: SimdEvaluation, value: SimdValue, element: simd::Element) -> Option[
+    isize,
+] {
+    if let Scalar(index) = value {
+        if context.kinds[index] == simd::ValueKind::Scalar(element) {
+            return Option::Some(index)
+        }
+        return Option::None
+    }
+    let bits = simd_value_bits(value, element)?;
+    Option::Some(
+        simd_push_node(
+            context,
+            simd::Node::Scalar { element, bits },
+            simd::ValueKind::Scalar(element),
+        ),
+    )
+}
+
+fn simd_vector_node(context: SimdEvaluation, value: SimdValue, ty: simd::VectorType) -> Option[
+    isize,
+] {
+    if let Vector(index) = value {
+        if context.kinds[index] == simd::ValueKind::Vector(ty) {
+            return Option::Some(index)
+        }
+        return Option::None
+    }
+    let Array { element, values } = value else {
+        return Option::None
+    };
+    if element != ty.element || values.len() != ty.lanes {
+        return Option::None
+    }
+    let bits: Vec[u64] = Vec::new();
+    for value in values {
+        bits.push(simd_value_bits(value, element)?);
+    }
+    Option::Some(
+        simd_push_node(context, simd::Node::Constant { ty, bits }, simd::ValueKind::Vector(ty)),
+    )
+}
+
+fn simd_mask_node(context: SimdEvaluation, value: SimdValue, ty: simd::VectorType) -> Option[isize] {
+    let ty = simd::mask_type(ty);
+    if let Mask(index) = value {
+        if context.kinds[index] == simd::ValueKind::Mask(ty) {
+            return Option::Some(index)
+        }
+        return Option::None
+    }
+    let bits = simd_value_bits(value, simd::Element::U32)?;
+    if bits >= (1.to_u64() << ty.lanes) {
+        return Option::None
+    }
+    Option::Some(
+        simd_push_node(
+            context,
+            simd::Node::MaskConstant { ty, bits: bits.to_u32() },
+            simd::ValueKind::Mask(ty),
+        ),
+    )
+}
+
+fn simd_native_binary(operation: string) -> Option[simd::Operator] {
+    match operation {
+        "add" | "reduce_sum" => Option::Some(simd::Operator::Add),
+        "sub" => Option::Some(simd::Operator::Sub),
+        "mul" | "reduce_product" => Option::Some(simd::Operator::Mul),
+        "div" => Option::Some(simd::Operator::Div),
+        "eq" => Option::Some(simd::Operator::Eq),
+        "ne" => Option::Some(simd::Operator::Ne),
+        "lt" | "gt" => Option::Some(simd::Operator::Lt),
+        "le" | "ge" => Option::Some(simd::Operator::Le),
+        "bitand" | "reduce_and" => Option::Some(simd::Operator::And),
+        "bitor" | "reduce_or" => Option::Some(simd::Operator::Or),
+        "bitxor" | "reduce_xor" => Option::Some(simd::Operator::Xor),
+        "min" | "reduce_min" => Option::Some(simd::Operator::Min),
+        "max" | "reduce_max" => Option::Some(simd::Operator::Max),
+        "saturating_add" => Option::Some(simd::Operator::SaturatingAdd),
+        "saturating_sub" => Option::Some(simd::Operator::SaturatingSub),
+        _ => Option::None,
+    }
+}
+
+fn simd_native_unary(operation: string) -> Option[simd::UnaryOperator] {
+    match operation {
+        "bitnot" => Option::Some(simd::UnaryOperator::Not),
+        "neg" => Option::Some(simd::UnaryOperator::Neg),
+        "abs" => Option::Some(simd::UnaryOperator::Abs),
+        "sqrt" => Option::Some(simd::UnaryOperator::Sqrt),
+        "floor" => Option::Some(simd::UnaryOperator::Floor),
+        "ceil" => Option::Some(simd::UnaryOperator::Ceil),
+        "trunc" => Option::Some(simd::UnaryOperator::Trunc),
+        "round" => Option::Some(simd::UnaryOperator::Round),
+        "round_ties_even" => Option::Some(simd::UnaryOperator::RoundTiesEven),
+        _ => Option::None,
+    }
+}
+
+fn simd_evaluate_intrinsic(context: SimdEvaluation, spec: SimdIntrinsic, values: Vec[SimdValue]) -> Option[
+    SimdValue,
+] {
+    context.operations.set(context.operations.get() + 1);
+    let ty = spec.ty;
+    let vector = simd::ValueKind::Vector(ty);
+    let mask = simd::ValueKind::Mask(simd::mask_type(ty));
+    if spec.operation.starts_with("reduce_") {
+        if values.len() != 1 {
+            return Option::None
+        }
+        let value = simd_vector_node(context, values[0], ty)?;
+        let op = simd_native_binary(spec.operation)?;
+        return Option::Some(
+            SimdValue::Scalar(
+                simd_push_node(
+                    context,
+                    simd::Node::Reduce { op, value },
+                    simd::ValueKind::Scalar(ty.element),
+                ),
+            ),
+        )
+    }
+    if let Some(op) = simd_native_binary(spec.operation) {
+        if values.len() != 2 {
+            return Option::None
+        }
+        let mut left = if spec.mask {
+            simd_mask_node(context, values[0], ty)?
+        } else {
+            simd_vector_node(context, values[0], ty)?
+        };
+        let mut right = if spec.mask {
+            simd_mask_node(context, values[1], ty)?
+        } else {
+            simd_vector_node(context, values[1], ty)?
+        };
+        if spec.operation == "gt" || spec.operation == "ge" {
+            let swapped = left;
+            left = right;
+            right = swapped;
+        }
+        let masked = spec.mask || simd::is_comparison(op);
+        let index = simd_push_node(
+            context,
+            simd::Node::Binary { op, left, right },
+            if masked {
+                mask
+            } else {
+                vector
+            },
+        );
+        return Option::Some(
+            if masked {
+                SimdValue::Mask(index)
+            } else {
+                SimdValue::Vector(index)
+            },
+        )
+    }
+    if let Some(op) = simd_native_unary(spec.operation) {
+        if values.len() != 1 {
+            return Option::None
+        }
+        let value = if spec.mask {
+            simd_mask_node(context, values[0], ty)?
+        } else {
+            simd_vector_node(context, values[0], ty)?
+        };
+        let index = simd_push_node(
+            context,
+            simd::Node::Unary { op, value },
+            if spec.mask {
+                mask
+            } else {
+                vector
+            },
+        );
+        return Option::Some(
+            if spec.mask {
+                SimdValue::Mask(index)
+            } else {
+                SimdValue::Vector(index)
+            },
+        )
+    }
+    if spec.operation == "select" || spec.operation == "mul_add" {
+        if values.len() != 3 {
+            return Option::None
+        }
+        let left = simd_vector_node(
+            context,
+            values[if spec.operation == "select" {
+                1
+            } else {
+                0
+            }],
+            ty,
+        )?;
+        let right = simd_vector_node(
+            context,
+            values[if spec.operation == "select" {
+                2
+            } else {
+                1
+            }],
+            ty,
+        )?;
+        let node = if spec.operation == "select" {
+            simd::Node::Select { mask: simd_mask_node(context, values[0], ty)?, left, right }
+        } else {
+            simd::Node::Fma { left, right, addend: simd_vector_node(context, values[2], ty)? }
+        };
+        return Option::Some(SimdValue::Vector(simd_push_node(context, node, vector)))
+    }
+    if spec.operation == "shuffle" || spec.operation == "swizzle" {
+        let swizzle = spec.operation == "swizzle";
+        if values.len()
+            != if swizzle {
+                2
+            } else {
+                3
+            } {
+            return Option::None
+        }
+        let left = simd_vector_node(context, values[0], ty)?;
+        let right = if swizzle {
+            left
+        } else {
+            simd_vector_node(context, values[1], ty)?
+        };
+        let SimdValue::Array { values: indices, .. } = values[values.len() - 1] else {
+            return Option::None
+        };
+        let order: Vec[isize] = Vec::new();
+        for index in indices {
+            let index = simd_value_bits(index, simd::Element::U32)?;
+            order.push(
+                if index
+                    >= (ty.lanes
+                        * if swizzle {
+                            1
+                        } else {
+                            2
+                        }).to_u64() {
+                    -1
+                } else {
+                    index.to_isize()
+                },
+            );
+        }
+        return Option::Some(
+            SimdValue::Vector(
+                simd_push_node(context, simd::Node::Shuffle { left, right, indices: order }, vector),
+            ),
+        )
+    }
+    if spec.operation == "shl" || spec.operation == "shr" {
+        if values.len() != 2 {
+            return Option::None
+        }
+        let value = simd_vector_node(context, values[0], ty)?;
+        let count = (simd_value_bits(values[1], simd::Element::U32)?
+            % simd::element_bits(ty.element).to_u64()).to_isize();
+        return Option::Some(
+            SimdValue::Vector(
+                simd_push_node(
+                    context,
+                    simd::Node::Shift { value, count, left: spec.operation == "shl" },
+                    vector,
+                ),
+            ),
+        )
+    }
+    if values.len() != 1 {
+        return Option::None
+    }
+    if let Some(to) = simd_conversion_type(spec) {
+        let bitcast = spec.operation == "to_bits" || spec.operation == "from_bits";
+        let from = if spec.operation == "from_bits" {
+            simd::mask_type(ty)
+        } else {
+            ty
+        };
+        let value = simd_vector_node(context, values[0], from)?;
+        return Option::Some(
+            SimdValue::Vector(
+                simd_push_node(
+                    context,
+                    simd::Node::Convert { value, to, bitcast },
+                    simd::ValueKind::Vector(to),
+                ),
+            ),
+        )
+    }
+    match spec.operation {
+        "splat" => {
+            let value = simd_scalar_node(context, values[0], ty.element)?;
+            Option::Some(
+                SimdValue::Vector(simd_push_node(context, simd::Node::Splat { ty, value }, vector)),
+            )
+        },
+        "all" => Option::Some(
+            SimdValue::Predicate(simd::Output::All(simd_mask_node(context, values[0], ty)?)),
+        ),
+        "any" => Option::Some(
+            SimdValue::Predicate(simd::Output::Any(simd_mask_node(context, values[0], ty)?)),
+        ),
+        _ => Option::None,
+    }
+}
+
+fn simd_evaluation_type(context: SimdEvaluation, ty: Type) -> bool {
+    if simd_type_element(ty).is_some() {
+        return true
+    }
+    match ty {
+        Bool => true,
+        Array { len, elem } => len > 0 && len <= 32 && simd_type_element(elem).is_some(),
+        Named { name } => context.types[name].is_some(),
+        _ => false,
+    }
+}
+
+fn simd_coerce_value(value: SimdValue, ty: Type) -> Option[SimdValue] {
+    if let Some(element) = simd_type_element(ty) {
+        match value {
+            Literal(_) | Bits { .. } => return Option::Some(
+                SimdValue::Bits { element, bits: simd_value_bits(value, element)? },
+            ),
+            _ => (),
+        }
+    }
+    Option::Some(value)
 }
 
 fn simd_evaluate_expression(
@@ -41,13 +457,64 @@ fn simd_evaluate_expression(
     context.budget.set(context.budget.get() - 1);
     match expression {
         Var { name } => locals[name],
+        Float { value } | Int { value } => Option::Some(SimdValue::Literal(value)),
+        Convert { ty, expr } | Cast { ty, expr } => {
+            let value = simd_evaluate_expression(context, locals, expr, depth + 1)?;
+            let element = simd_type_element(ty)?;
+            match value {
+                Scalar(index) if context.kinds[index] == simd::ValueKind::Scalar(element) => Option::Some(
+                    value,
+                ),
+                Mask(_) if !simd::is_float(element) => Option::Some(value),
+                _ => Option::Some(
+                    SimdValue::Bits { element, bits: simd_value_bits(value, element)? },
+                ),
+            }
+        },
+        Unary { op: UnaryOp::Neg, expr } => {
+            let value = simd_evaluate_expression(context, locals, expr, depth + 1)?;
+            match value {
+                Literal(value) => Option::Some(SimdValue::Literal("-" + value)),
+                Bits { element, bits } => {
+                    let negative = if simd::is_float(element) {
+                        bits ^ (1.to_u64() << (simd::element_bits(element) - 1))
+                    } else {
+                        0.to_u64() - bits
+                    };
+                    Option::Some(SimdValue::Bits { element, bits: negative })
+                },
+                _ => Option::None,
+            }
+        },
+        Binary { op: BinaryOp::BitAnd, lhs, rhs } => {
+            let left = simd_evaluate_expression(context, locals, lhs, depth + 1)?;
+            let right = simd_value_bits(
+                simd_evaluate_expression(context, locals, rhs, depth + 1)?,
+                simd::Element::U64,
+            )?;
+            if let Mask(index) = left {
+                let simd::ValueKind::Mask(ty) = context.kinds[index] else {
+                    return Option::None
+                };
+                if right == (1.to_u64() << ty.lanes) - 1 {
+                    return Option::Some(left)
+                }
+                return Option::None
+            }
+            Option::Some(
+                SimdValue::Bits {
+                    element: simd::Element::U64,
+                    bits: simd_value_bits(left, simd::Element::U64)? & right,
+                },
+            )
+        },
         Field { expr, field_name } => {
-            let Some(SimdValue::Record(fields)) = simd_evaluate_expression(
+            let SimdValue::Record(fields) = simd_evaluate_expression(
                 context,
                 locals,
                 expr,
                 depth + 1,
-            ) else {
+            )? else {
                 return Option::None
             };
             for (name, value) in fields {
@@ -62,28 +529,30 @@ fn simd_evaluate_expression(
             for (name, expression) in fields {
                 values.push(
                     (name, simd_evaluate_expression(context, locals, expression, depth + 1)?),
-                )
+                );
             }
             Option::Some(SimdValue::Record(values))
+        },
+        ArrayLiteral { ty: Type::Array { len, elem }, items } if len == items.len() => {
+            let element = simd_type_element(elem)?;
+            let values: Vec[SimdValue] = Vec::new();
+            for item in items {
+                values.push(
+                    simd_coerce_value(
+                        simd_evaluate_expression(context, locals, item, depth + 1)?,
+                        elem,
+                    )?,
+                );
+            }
+            Option::Some(SimdValue::Array { element, values })
         },
         Call { func: Expr::Var { name }, args } => {
             let values: Vec[SimdValue] = Vec::new();
             for arg in args {
-                values.push(simd_evaluate_expression(context, locals, arg, depth + 1)?)
+                values.push(simd_evaluate_expression(context, locals, arg, depth + 1)?);
             }
-            if let Some(op) = simd_native_operator(name) {
-                if values.len() != 2 {
-                    return Option::None
-                }
-                let SimdValue::Vector(left) = values[0] else {
-                    return Option::None
-                };
-                let SimdValue::Vector(right) = values[1] else {
-                    return Option::None
-                };
-                let result = context.nodes.len();
-                context.nodes.push(simd::Node::Binary { op, left, right });
-                Option::Some(SimdValue::Vector(result))
+            if let Some(spec) = context.intrinsics[name] {
+                simd_evaluate_intrinsic(context, spec, values)
             } else {
                 simd_evaluate_function(context, context.functions[name]?, values, depth + 1)
             }
@@ -98,34 +567,43 @@ fn simd_evaluate_function(
     arguments: Vec[SimdValue],
     depth: isize,
 ) -> Option[SimdValue] {
-    if depth > 64 || function.params.len() != arguments.len() {
+    if depth > 64 || function.params.len() != arguments.len()
+        || !simd_evaluation_type(context, function.ret_ty?) {
         return Option::None
     }
     let locals: HashMap[string, SimdValue] = HashMap::new();
-    let declared: HashMap[string, bool] = HashMap::new();
+    let declared: HashMap[string, Type] = HashMap::new();
     for index in 0..arguments.len() {
-        locals[function.params[index].0] = arguments[index];
-        declared[function.params[index].0] = true;
+        let (name, ty) = function.params[index];
+        if !simd_evaluation_type(context, ty) {
+            return Option::None
+        }
+        locals[name] = simd_coerce_value(arguments[index], ty)?;
+        declared[name] = ty;
     }
     for statement in function.body.stmts {
         match statement {
-            Var { name, value, .. } => {
-                declared[name] = true;
-                if let Some(expression) = value {
-                    locals[name] = simd_evaluate_expression(context, locals, expression, depth + 1)?;
-                }
-            },
-            Assign { name, value: expression } => {
-                if declared[name].is_none() {
+            Var { name, value, ty } => {
+                if !simd_evaluation_type(context, ty) {
                     return Option::None
                 }
-                locals[name] = simd_evaluate_expression(context, locals, expression, depth + 1)?;
+                declared[name] = ty;
+                if let Some(expression) = value {
+                    locals[name] = simd_coerce_value(
+                        simd_evaluate_expression(context, locals, expression, depth + 1)?,
+                        ty,
+                    )?;
+                }
             },
-            Return { expr: Some(expression) } => return simd_evaluate_expression(
-                context,
-                locals,
-                expression,
-                depth + 1,
+            Assign { name, value } => {
+                locals[name] = simd_coerce_value(
+                    simd_evaluate_expression(context, locals, value, depth + 1)?,
+                    declared[name]?,
+                )?;
+            },
+            Return { expr: Some(expression) } => return simd_coerce_value(
+                simd_evaluate_expression(context, locals, expression, depth + 1)?,
+                function.ret_ty?,
             ),
             _ => return Option::None,
         }
@@ -133,71 +611,169 @@ fn simd_evaluate_function(
     Option::None
 }
 
-fn simd_f32x4_field(file: File) -> Option[(string, string)] {
-    let expected = go_user_type_name("std::simd::f32x4");
-    for item in file.items {
-        if let Struct(value) = item {
-            if value.name == expected && value.fields.len() == 1 {
-                if let Type::Array { len: 4, elem: Type::Float32 } = value.fields[0].1 {
-                    return Option::Some((value.name, value.fields[0].0))
-                }
-            }
+fn simd_record_value(value: SimdValue, field: string) -> Option[SimdValue] {
+    if let Record(fields) = value {
+        if fields.len() == 1 && fields[0].0 == field {
+            return Option::Some(fields[0].1)
         }
     }
     Option::None
 }
 
-fn simd_is_vector_type(ty: Type, name: string) -> bool {
-    match ty {
-        Named { name: actual } => actual == name,
-        _ => false,
-    }
-}
-
 fn simd_native_function(
     functions: HashMap[string, Function],
+    intrinsics: HashMap[string, SimdIntrinsic],
+    types: HashMap[string, (string, simd::ValueKind)],
     function: Function,
-    vector: (string, string),
 ) -> Option[json::Value] {
-    if !simd_is_vector_type(function.ret_ty?, vector.0) || function.params.is_empty()
-        || function.params.len() > 8 {
+    if function.params.len() > 8 {
         return Option::None
     }
-    let context = SimdEvaluation { functions, nodes: Vec::new(), budget: Ref::new(4096) };
+    let ret_ty = function.ret_ty?;
+    let context = SimdEvaluation {
+        functions,
+        intrinsics,
+        types,
+        nodes: Vec::new(),
+        kinds: Vec::new(),
+        budget: Ref::new(4096),
+        operations: Ref::new(0),
+    };
     let args: Vec[SimdValue] = Vec::new();
-    let parameters: Vec[string] = Vec::new();
-    for index in 0..function.params.len() {
-        let (name, ty) = function.params[index];
-        if !simd_is_vector_type(ty, vector.0) {
-            return Option::None
+    let parameters: Vec[simd::Parameter] = Vec::new();
+    for (name, ty) in function.params {
+        if let Type::Named { name: type_name } = ty {
+            let (field, kind) = types[type_name]?;
+            let index = simd_push_node(context, simd::Node::Input(parameters.len()), kind);
+            parameters.push(simd::Parameter { name, kind });
+            let value = match kind {
+                Vector(_) => SimdValue::Vector(index),
+                Mask(_) => SimdValue::Mask(index),
+                _ => return Option::None,
+            };
+            args.push(SimdValue::Record(Vec::from_array([(field, value)])));
+        } else {
+            let element = simd_type_element(ty)?;
+            let kind = simd::ValueKind::Scalar(element);
+            let index = simd_push_node(context, simd::Node::Input(parameters.len()), kind);
+            parameters.push(simd::Parameter { name, kind });
+            args.push(SimdValue::Scalar(index));
         }
-        parameters.push(name);
-        context.nodes.push(simd::Node::Input(index));
-        args.push(SimdValue::Record(Vec::from_array([(vector.1, SimdValue::Vector(index))])));
     }
-    let SimdValue::Record(fields) = simd_evaluate_function(context, function, args, 0)? else {
-        return Option::None
-    };
-    if fields.len() != 1 || fields[0].0 != vector.1
-        || context.nodes.len() < function.params.len() + 2 {
+    let value = simd_evaluate_function(context, function, args, 0)?;
+    if context.operations.get() == 0 {
         return Option::None
     }
-    let SimdValue::Vector(result) = fields[0].1 else {
-        return Option::None
+    let output = if let Type::Named { name } = ret_ty {
+        let (field, kind) = types[name]?;
+        let value = simd_record_value(value, field)?;
+        match kind {
+            Vector(ty) => simd::Output::Vector(simd_vector_node(context, value, ty)?),
+            Mask(ty) => simd::Output::Mask(simd_mask_node(context, value, ty)?),
+            _ => return Option::None,
+        }
+    } else {
+        match value {
+            Scalar(index) => {
+                if context.kinds[index] != simd::ValueKind::Scalar(simd_type_element(ret_ty)?) {
+                    return Option::None
+                }
+                simd::Output::Scalar(index)
+            },
+            Mask(index) => {
+                let simd::ValueKind::Mask(ty) = context.kinds[index] else {
+                    return Option::None
+                };
+                if simd_type_element(ret_ty) != simd_type_element(simd_bitmask_type(ty)) {
+                    return Option::None
+                }
+                simd::Output::Mask(index)
+            },
+            Predicate(output) => {
+                let Type::Bool = ret_ty else {
+                    return Option::None
+                };
+                output
+            },
+            _ => return Option::None,
+        }
     };
-    let assembly = simd::emit_sse2(function.name, parameters, context.nodes, result)?;
-    let declaration = pretty::pretty(
+    let features = simd::kernel_features(parameters, context.nodes)?;
+    let avx2 = features.0;
+    let fma = features.1;
+    let name = if avx2 || fma {
+        go_generated_ident(
+            "_goml_simd_"
+                + if avx2 {
+                    "avx2_"
+                } else {
+                    ""
+                }
+                + if fma {
+                    "fma_"
+                } else {
+                    ""
+                }
+                + function.name,
+        )
+    } else {
+        function.name
+    };
+    let assembly = simd::emit_amd64(name, parameters, context.nodes, output)?;
+    let mut declaration = pretty::pretty(
         100,
         pretty::concat(
             Vec::from_array(
                 [
-                    pretty::text("func " + function.name),
+                    pretty::text("func " + name),
                     named_params_doc(function.params),
                     optional_result_doc(function.ret_ty),
                 ],
             ),
         ),
     );
+    if avx2 || fma {
+        let arguments: Vec[Expr] = Vec::new();
+        for (name, _) in function.params {
+            arguments.push(simd_var(name));
+        }
+        let condition = if avx2 && fma {
+            simd_binary(
+                BinaryOp::And,
+                simd_var("_goml_simd_has_avx2"),
+                simd_var("_goml_simd_has_fma"),
+            )
+        } else {
+            simd_var(
+                if avx2 {
+                    "_goml_simd_has_avx2"
+                } else {
+                    "_goml_simd_has_fma"
+                },
+            )
+        };
+        let stmts = Vec::from_array(
+            [
+                Stmt::If {
+                    cond: condition,
+                    then_: Block {
+                        stmts: Vec::from_array([simd_return(simd_call(name, arguments))]),
+                    },
+                    else_: Option::None,
+                },
+            ],
+        );
+        for statement in function.body.stmts {
+            stmts.push(statement);
+        }
+        let wrapper = Function {
+            name: function.name,
+            params: function.params,
+            ret_ty: function.ret_ty,
+            body: Block { stmts },
+        };
+        declaration = declaration + "\n\n" + pretty::pretty(100, function_doc(wrapper));
+    }
     Option::Some(
         json::object(
             Vec::from_array(
@@ -205,6 +781,8 @@ fn simd_native_function(
                     ("fallback", json::Value::String(pretty::pretty(100, function_doc(function)))),
                     ("declaration", json::Value::String(declaration)),
                     ("assembly", json::Value::String(assembly)),
+                    ("avx2", json::Value::Bool(avx2)),
+                    ("fma", json::Value::Bool(fma)),
                 ],
             ),
         ),
@@ -212,20 +790,47 @@ fn simd_native_function(
 }
 
 fn simd_native_metadata(file: File) -> string {
-    let Some(vector) = simd_f32x4_field(file) else {
+    let types: HashMap[string, (string, simd::ValueKind)] = HashMap::new();
+    for ty in simd::vector_types() {
+        for item in file.items {
+            if let Struct(value) = item {
+                if value.fields.len() != 1 {
+                    continue
+                }
+                let (field, field_type) = value.fields[0];
+                if value.name == go_user_type_name("std::simd::" + simd::vector_name(ty)) {
+                    if let Type::Array { len, elem } = field_type {
+                        if len == ty.lanes && simd_type_element(elem) == Option::Some(ty.element) {
+                            types[value.name] = (field, simd::ValueKind::Vector(ty));
+                        }
+                    }
+                } else if value.name == go_user_type_name("std::simd::" + simd::mask_name(ty))
+                    && simd_type_element(field_type) == simd_type_element(simd_bitmask_type(ty)) {
+                    types[value.name] = (field, simd::ValueKind::Mask(simd::mask_type(ty)));
+                }
+            }
+        }
+    }
+    if types.len() == 0 {
         return ""
-    };
+    }
     let functions: HashMap[string, Function] = HashMap::new();
     for item in file.items {
         if let Function(value) = item {
             functions[value.name] = value;
         }
     }
+    let intrinsics: HashMap[string, SimdIntrinsic] = HashMap::new();
+    for spec in resources::intrinsic_abi_specs() {
+        if let Some(value) = simd_intrinsic(spec.key) {
+            intrinsics[simd_intrinsic_name(spec.key)] = value;
+        }
+    }
     let kernels: Vec[json::Value] = Vec::new();
     for item in file.items {
         if let Function(value) = item {
-            if let Some(kernel) = simd_native_function(functions, value, vector) {
-                kernels.push(kernel)
+            if let Some(kernel) = simd_native_function(functions, intrinsics, types, value) {
+                kernels.push(kernel);
             }
         }
     }

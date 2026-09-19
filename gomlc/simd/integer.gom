@@ -1,0 +1,296 @@
+package simd;
+
+fn emit_integer_compare(
+    context: AssemblyContext,
+    ty: VectorType,
+    op: Operator,
+    left: isize,
+    right: isize,
+    target: isize,
+) -> () {
+    let bits = element_bits(ty.element);
+    let suffix = int_suffix(ty.element, context.avx);
+    if op == Operator::Eq || op == Operator::Ne {
+        if bits == 64 && !context.avx {
+            copy_register(context, ty, left, target);
+            write(
+                context,
+                f"    PCMPEQL X{right}, X{target}\n    PSHUFD $177, X{target}, X14\n    PAND X14, X{target}\n",
+            );
+        } else {
+            emit_instruction(
+                context,
+                ty,
+                "PCMPEQ" + suffix,
+                "VPCMPEQ" + suffix,
+                left,
+                right,
+                target,
+            );
+        }
+        if op == Operator::Ne {
+            emit_not(context, ty, target, target);
+        }
+        return ()
+    }
+    let lhs = if op == Operator::Le {
+        right
+    } else {
+        left
+    };
+    let rhs = if op == Operator::Le {
+        left
+    } else {
+        right
+    };
+    if bits == 64 && !context.avx {
+        load_constant(
+            context,
+            ty,
+            repeated_bits(
+                ty,
+                if is_signed(ty.element) {
+                    2147483648
+                } else {
+                    9223372039002259456
+                },
+            ),
+            14,
+        );
+        emit_bits(context, ty, Operator::Xor, lhs, 14, 15);
+        emit_bits(context, ty, Operator::Xor, rhs, 14, target);
+        write(
+            context,
+            f"    PCMPGTL X15, X{target}\n    PSHUFD $160, X{target}, X14\n    PSHUFD $245, X{target}, X{target}\n    MOVUPS X{lhs}, X15\n    PCMPEQL X{rhs}, X15\n    PSHUFD $245, X15, X15\n    PAND X15, X14\n    POR X14, X{target}\n",
+        );
+    } else if !is_signed(ty.element) {
+        load_constant(context, ty, repeated_bits(ty, 1.to_u64() << (bits - 1)), 14);
+        emit_bits(context, ty, Operator::Xor, lhs, 14, 15);
+        emit_bits(context, ty, Operator::Xor, rhs, 14, target);
+        emit_instruction(context, ty, "PCMPGT" + suffix, "VPCMPGT" + suffix, target, 15, target);
+    } else {
+        emit_instruction(context, ty, "PCMPGT" + suffix, "VPCMPGT" + suffix, rhs, lhs, target);
+    }
+    if op == Operator::Le {
+        emit_not(context, ty, target, target);
+    }
+}
+
+fn emit_integer_mul(
+    context: AssemblyContext,
+    ty: VectorType,
+    left: isize,
+    right: isize,
+    target: isize,
+) -> () {
+    let bits = element_bits(ty.element);
+    if bits == 16 {
+        emit_instruction(context, ty, "PMULLW", "VPMULLW", left, right, target);
+    } else if bits == 32 && context.avx {
+        emit_instruction(context, ty, "", "VPMULLD", left, right, target);
+    } else if bits == 32 {
+        copy_register(context, ty, left, 14);
+        write(
+            context,
+            f"    PMULULQ X{right}, X14\n    MOVUPS X{left}, X15\n    PSRLQ $32, X15\n    MOVUPS X{right}, X{target}\n    PSRLQ $32, X{target}\n    PMULULQ X15, X{target}\n    PSHUFD $136, X14, X14\n    PSHUFD $136, X{target}, X{target}\n    PUNPCKLLQ X{target}, X14\n    MOVUPS X14, X{target}\n",
+        );
+    } else if bits == 64 {
+        emit_shift(context, ty, left, 14, 32, "RL");
+        emit_instruction(context, ty, "PMULULQ", "VPMULUDQ", 14, right, 14);
+        emit_shift(context, ty, right, 15, 32, "RL");
+        emit_instruction(context, ty, "PMULULQ", "VPMULUDQ", 15, left, 15);
+        emit_instruction(context, ty, "PADDQ", "VPADDQ", 14, 15, 14);
+        emit_shift(context, ty, 14, 14, 32, "LL");
+        emit_instruction(context, ty, "PMULULQ", "VPMULUDQ", left, right, target);
+        emit_instruction(context, ty, "PADDQ", "VPADDQ", target, 14, target);
+    } else {
+        let words = VectorType { element: Element::U16, lanes: ty.lanes / 2 };
+        emit_shift(context, words, left, 14, 8, "RL");
+        emit_shift(context, words, right, 15, 8, "RL");
+        emit_instruction(context, words, "PMULLW", "VPMULLW", 14, 15, 14);
+        emit_shift(context, words, 14, 14, 8, "LL");
+        emit_instruction(context, words, "PMULLW", "VPMULLW", left, right, target);
+        load_constant(context, words, repeated_bits(words, 255), 15);
+        emit_bits(context, ty, Operator::And, target, 15, target);
+        emit_bits(context, ty, Operator::Or, target, 14, target);
+    }
+}
+
+fn emit_integer_binary(
+    context: AssemblyContext,
+    ty: VectorType,
+    op: Operator,
+    left: isize,
+    right: isize,
+    target: isize,
+) -> Option[()] {
+    if is_comparison(op) {
+        emit_integer_compare(context, ty, op, left, right, target);
+        return Option::Some(())
+    }
+    match op {
+        And | Or | Xor => emit_bits(context, ty, op, left, right, target),
+        Mul => emit_integer_mul(context, ty, left, right, target),
+        Min | Max => {
+            emit_integer_compare(context, ty, Operator::Lt, left, right, target);
+            if op == Operator::Min {
+                emit_select(context, ty, target, left, right, target);
+            } else {
+                emit_select(context, ty, target, right, left, target);
+            }
+        },
+        Add | Sub | SaturatingAdd | SaturatingSub => {
+            let operation = if op == Operator::Add || op == Operator::SaturatingAdd {
+                "PADD"
+            } else {
+                "PSUB"
+            };
+            let saturated = op == Operator::SaturatingAdd || op == Operator::SaturatingSub;
+            if saturated && element_bits(ty.element) > 16 {
+                return Option::None
+            }
+            let saturation = if saturated {
+                if is_signed(ty.element) {
+                    "S"
+                } else {
+                    "US"
+                }
+            } else {
+                ""
+            };
+            emit_instruction(
+                context,
+                ty,
+                operation + saturation + int_suffix(ty.element, false),
+                "V" + operation + saturation + int_suffix(ty.element, true),
+                left,
+                right,
+                target,
+            );
+        },
+        _ => return Option::None,
+    }
+    Option::Some(())
+}
+
+fn emit_integer_unary(
+    context: AssemblyContext,
+    ty: VectorType,
+    op: UnaryOperator,
+    source: isize,
+    target: isize,
+) -> Option[()] {
+    match op {
+        Not => emit_not(context, ty, source, target),
+        Neg => {
+            emit_bits(context, ty, Operator::Xor, target, target, target);
+            emit_integer_binary(context, ty, Operator::Sub, target, source, target)?;
+        },
+        Abs => {
+            if !is_signed(ty.element) {
+                copy_register(context, ty, source, target);
+                return Option::Some(())
+            }
+            let bits = element_bits(ty.element);
+            if bits == 8 {
+                emit_bits(context, ty, Operator::Xor, 15, 15, 15);
+                emit_instruction(context, ty, "PCMPGTB", "VPCMPGTB", 15, source, 15);
+            } else if bits == 64 {
+                write(
+                    context,
+                    f"    {prefix(context)}PSHUFD $245, {register(ty, source)}, {register(ty, 15)}\n",
+                );
+                emit_shift(
+                    context,
+                    VectorType { element: Element::I32, lanes: ty.lanes * 2 },
+                    15,
+                    15,
+                    31,
+                    "RA",
+                );
+            } else {
+                emit_shift(context, ty, source, 15, bits - 1, "RA");
+            }
+            emit_bits(context, ty, Operator::Xor, source, 15, target);
+            emit_integer_binary(context, ty, Operator::Sub, target, 15, target)?;
+        },
+        _ => return Option::None,
+    }
+    Option::Some(())
+}
+
+fn emit_integer_shift(
+    context: AssemblyContext,
+    ty: VectorType,
+    source: isize,
+    target: isize,
+    count: isize,
+    left: bool,
+) -> () {
+    let bits = element_bits(ty.element);
+    let signed = is_signed(ty.element) && !left;
+    if bits == 8 {
+        let words = VectorType { element: Element::U16, lanes: ty.lanes / 2 };
+        if signed {
+            emit_shift(context, words, source, 14, 8, "LL");
+            emit_shift(context, words, 14, 14, 8 + count, "RA");
+            emit_shift(context, words, source, target, count, "RA");
+            load_constant(context, words, repeated_bits(words, 65280), 15);
+            emit_bits(context, ty, Operator::And, target, 15, target);
+            load_constant(context, words, repeated_bits(words, 255), 15);
+            emit_bits(context, ty, Operator::And, 14, 15, 14);
+            emit_bits(context, ty, Operator::Or, target, 14, target);
+        } else {
+            emit_shift(
+                context,
+                words,
+                source,
+                target,
+                count,
+                if left {
+                    "LL"
+                } else {
+                    "RL"
+                },
+            );
+            let mask = if left {
+                (255 << count) & 255
+            } else {
+                255 >> count
+            };
+            load_constant(context, ty, repeated_bits(ty, mask.to_u64()), 15);
+            emit_bits(context, ty, Operator::And, target, 15, target);
+        }
+    } else if signed && bits == 64 && count != 0 {
+        write(
+            context,
+            f"    {prefix(context)}PSHUFD $245, {register(ty, source)}, {register(ty, 15)}\n",
+        );
+        emit_shift(
+            context,
+            VectorType { element: Element::I32, lanes: ty.lanes * 2 },
+            15,
+            15,
+            31,
+            "RA",
+        );
+        emit_shift(context, ty, 15, 15, 64 - count, "LL");
+        emit_shift(context, ty, source, target, count, "RL");
+        emit_bits(context, ty, Operator::Or, target, 15, target);
+    } else {
+        emit_shift(
+            context,
+            ty,
+            source,
+            target,
+            count,
+            if left {
+                "LL"
+            } else if signed && bits != 64 {
+                "RA"
+            } else {
+                "RL"
+            },
+        );
+    }
+}

@@ -1,0 +1,207 @@
+package simd;
+
+fn emit_float_compare(
+    context: AssemblyContext,
+    ty: VectorType,
+    predicate: isize,
+    left: isize,
+    right: isize,
+    target: isize,
+) -> () {
+    let suffix = float_suffix(ty);
+    if context.avx {
+        write(
+            context,
+            f"    VCMP{suffix} ${predicate}, {register(ty, right)}, {register(ty, left)}, {register(ty, target)}\n",
+        );
+    } else {
+        copy_register(context, ty, left, target);
+        write(context, f"    CMP{suffix} X{right}, X{target}, ${predicate}\n");
+    }
+}
+
+fn emit_float_minmax(
+    context: AssemblyContext,
+    ty: VectorType,
+    op: Operator,
+    left: isize,
+    right: isize,
+    target: isize,
+) -> () {
+    copy_register(context, ty, left, 12);
+    copy_register(context, ty, right, 13);
+    let operation = if op == Operator::Min {
+        "MIN"
+    } else {
+        "MAX"
+    }
+        + float_suffix(ty);
+    emit_instruction(context, ty, operation, "V" + operation, 12, 13, target);
+    emit_float_compare(context, ty, 0, 12, 13, 14);
+    emit_bits(
+        context,
+        ty,
+        if op == Operator::Min {
+            Operator::Or
+        } else {
+            Operator::And
+        },
+        12,
+        13,
+        15,
+    );
+    emit_bits(context, ty, Operator::Xor, 15, target, 15);
+    emit_bits(context, ty, Operator::And, 15, 14, 15);
+    emit_bits(context, ty, Operator::Xor, target, 15, target);
+    emit_float_compare(context, ty, 3, 13, 13, 14);
+    emit_bits(context, ty, Operator::Xor, 12, target, 15);
+    emit_bits(context, ty, Operator::And, 15, 14, 15);
+    emit_bits(context, ty, Operator::Xor, target, 15, target);
+}
+
+fn emit_float_binary(
+    context: AssemblyContext,
+    ty: VectorType,
+    op: Operator,
+    left: isize,
+    right: isize,
+    target: isize,
+) -> Option[()] {
+    match op {
+        Eq | Ne | Lt | Le => emit_float_compare(
+            context,
+            ty,
+            match op {
+                Eq => 0,
+                Ne => 4,
+                Lt => 1,
+                _ => 2,
+            },
+            left,
+            right,
+            target,
+        ),
+        Min | Max => emit_float_minmax(context, ty, op, left, right, target),
+        And | Or | Xor => emit_bits(context, ty, op, left, right, target),
+        Add | Sub | Mul | Div => {
+            let operation = match op {
+                Add => "ADD",
+                Sub => "SUB",
+                Mul => "MUL",
+                _ => "DIV",
+            }
+                + float_suffix(ty);
+            emit_instruction(context, ty, operation, "V" + operation, left, right, target);
+        },
+        _ => return Option::None,
+    }
+    Option::Some(())
+}
+
+fn emit_float_unary(
+    context: AssemblyContext,
+    ty: VectorType,
+    op: UnaryOperator,
+    source: isize,
+    target: isize,
+) -> Option[()] {
+    let suffix = float_suffix(ty);
+    match op {
+        Neg | Abs => {
+            let sign = 1.to_u64() << (element_bits(ty.element) - 1);
+            load_constant(
+                context,
+                ty,
+                repeated_bits(
+                    ty,
+                    if op == UnaryOperator::Neg {
+                        sign
+                    } else {
+                        sign - 1
+                    },
+                ),
+                15,
+            );
+            emit_bits(
+                context,
+                ty,
+                if op == UnaryOperator::Neg {
+                    Operator::Xor
+                } else {
+                    Operator::And
+                },
+                source,
+                15,
+                target,
+            );
+        },
+        Sqrt => write(
+            context,
+            f"    {prefix(context)}SQRT{suffix} {register(ty, source)}, {register(ty, target)}\n",
+        ),
+        Floor | Ceil | Trunc | RoundTiesEven => {
+            let mode = 8
+                + match op {
+                    Floor => 1,
+                    Ceil => 2,
+                    Trunc => 3,
+                    _ => 0,
+                };
+            write(
+                context,
+                f"    VROUND{suffix} ${mode}, {register(ty, source)}, {register(ty, target)}\n",
+            );
+        },
+        Round => {
+            emit_float_unary(context, ty, UnaryOperator::Abs, source, 12)?;
+            write(context, f"    VROUND{suffix} $11, {register(ty, 12)}, {register(ty, 13)}\n");
+            emit_float_binary(context, ty, Operator::Sub, 12, 13, 14)?;
+            let half: u64 = if ty.element == Element::F32 {
+                1056964608
+            } else {
+                4602678819172646912
+            };
+            let one: u64 = if ty.element == Element::F32 {
+                1065353216
+            } else {
+                4607182418800017408
+            };
+            load_constant(context, ty, repeated_bits(ty, half), 15);
+            emit_float_compare(context, ty, 2, 15, 14, 14);
+            load_constant(context, ty, repeated_bits(ty, one), 15);
+            emit_bits(context, ty, Operator::And, 14, 15, 14);
+            emit_float_binary(context, ty, Operator::Add, 13, 14, target)?;
+            load_constant(
+                context,
+                ty,
+                repeated_bits(ty, 1.to_u64() << (element_bits(ty.element) - 1)),
+                15,
+            );
+            emit_bits(context, ty, Operator::And, 15, source, 15);
+            emit_bits(context, ty, Operator::Or, target, 15, target);
+        },
+        _ => return Option::None,
+    }
+    Option::Some(())
+}
+
+fn emit_float_reduce(
+    context: AssemblyContext,
+    ty: VectorType,
+    op: Operator,
+    source: isize,
+    target: isize,
+) -> Option[()] {
+    copy_register(context, ty, source, target);
+    let mut step = 1;
+    while step < ty.lanes {
+        let indices: Vec[isize] = Vec::new();
+        for lane in 0..ty.lanes {
+            indices.push(lane ^ step);
+        }
+        emit_shuffle(context, ty, target, target, 15, indices);
+        emit_float_binary(context, ty, op, target, 15, target)?;
+        step *= 2;
+    }
+    Option::Some(())
+}

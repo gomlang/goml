@@ -2,37 +2,220 @@ package simd;
 
 use std::text;
 
-pub enum Operator {
-    Add,
-    Sub,
-    Mul,
-    Div,
-}
-
-pub enum Node {
-    Input(isize),
-    Binary {
-        op: Operator,
-        left: isize,
-        right: isize,
-    },
-}
-
-fn instruction(op: Operator) -> string {
-    match op {
-        Add => "ADDPS",
-        Sub => "SUBPS",
-        Mul => "MULPS",
-        Div => "DIVPS",
+fn emit_mask_input(context: AssemblyContext, ty: VectorType, source: string, target: isize) -> () {
+    let load = match mask_bytes(ty) {
+        1 => "MOVBLZX",
+        2 => "MOVWLZX",
+        _ => "MOVL",
+    };
+    write(context, f"    {load} {source}, AX\n");
+    let bits = element_bits(ty.element);
+    if bits >= 16 {
+        let unit = if bits == 16 {
+            16
+        } else {
+            32
+        };
+        let packed = VectorType {
+            element: if unit == 16 {
+                Element::U16
+            } else {
+                Element::U32
+            },
+            lanes: vector_bytes(ty) * 8 / unit,
+        };
+        let values: Vec[u64] = Vec::new();
+        for lane in 0..packed.lanes {
+            values.push(1.to_u64() << (lane / (bits / unit)));
+        }
+        let constant = vector_constant(context, packed, values);
+        write(context, f"    MOVQ AX, X{target}\n");
+        if vector_bytes(ty) == 32 {
+            write(
+                context,
+                f"    VPBROADCAST{if unit == 16 { "W" } else { "D" }} X{target}, Y{target}\n",
+            );
+        } else {
+            if unit == 16 {
+                write(context, f"    PSHUFLW $0, X{target}, X{target}\n");
+            }
+            write(context, f"    PSHUFD $0, X{target}, X{target}\n");
+        }
+        write(context, f"    {prefix(context)}MOVUPS {constant}, {register(ty, 15)}\n");
+        emit_instruction(context, ty, "PAND", "VPAND", target, 15, target);
+        emit_instruction(
+            context,
+            ty,
+            if unit == 16 {
+                "PCMPEQW"
+            } else {
+                "PCMPEQL"
+            },
+            if unit == 16 {
+                "VPCMPEQW"
+            } else {
+                "VPCMPEQD"
+            },
+            target,
+            15,
+            target,
+        );
+    } else {
+        for chunk in 0..vector_bytes(ty) / 16 {
+            let output = if chunk == 0 {
+                target
+            } else {
+                14
+            };
+            for word in 0..2 {
+                let general = if word == 0 {
+                    "R8"
+                } else {
+                    "R9"
+                };
+                write(context, f"    XORQ {general}, {general}\n");
+                for byte in 0..8 {
+                    let lane = chunk * 16 + word * 8 + byte;
+                    write(
+                        context,
+                        f"    MOVQ AX, BX\n    SHRQ ${lane}, BX\n    ANDQ $1, BX\n    NEGQ BX\n    ANDQ $255, BX\n    SHLQ ${byte * 8}, BX\n    ORQ BX, {general}\n",
+                    );
+                }
+            }
+            write(
+                context,
+                f"    MOVQ R8, X{output}\n    MOVQ R9, X15\n    PUNPCKLQDQ X15, X{output}\n",
+            );
+            if chunk == 1 {
+                write(context, f"    VINSERTF128 $1, X14, Y{target}, Y{target}\n");
+            }
+        }
     }
 }
 
-pub fn emit_sse2(name: string, parameters: Vec[string], nodes: Vec[Node], result: isize) -> Option[
+fn emit_mask_output(context: AssemblyContext, ty: VectorType, source: isize) -> () {
+    let bits = element_bits(ty.element);
+    if bits == 32 || bits == 64 {
+        write(
+            context,
+            f"    {prefix(context)}MOVMSK{float_suffix(ty)} {register(ty, source)}, AX\n",
+        );
+    } else {
+        write(context, f"    {prefix(context)}PMOVMSKB {register(ty, source)}, AX\n");
+        if bits == 16 {
+            write(context, "    XORL BX, BX\n");
+            for lane in 0..ty.lanes {
+                write(
+                    context,
+                    f"    MOVL AX, CX\n    SHRL ${lane * 2}, CX\n    ANDL $1, CX\n    SHLL ${lane}, CX\n    ORL CX, BX\n",
+                );
+            }
+            write(context, "    MOVL BX, AX\n");
+        }
+    }
+}
+
+fn emit_splat(context: AssemblyContext, ty: VectorType, source: isize, target: isize) -> () {
+    let bits = element_bits(ty.element);
+    if vector_bytes(ty) == 32 {
+        let suffix = match bits {
+            8 => "B",
+            16 => "W",
+            32 => "D",
+            _ => "Q",
+        };
+        write(context, f"    VPBROADCAST{suffix} X{source}, Y{target}\n");
+    } else {
+        if bits == 8 {
+            copy_register(context, ty, source, target);
+            write(
+                context,
+                f"    PUNPCKLBW X{target}, X{target}\n    PSHUFLW $0, X{target}, X{target}\n    PSHUFD $0, X{target}, X{target}\n",
+            );
+        } else if bits == 16 {
+            write(
+                context,
+                f"    PSHUFLW $0, X{source}, X{target}\n    PSHUFD $0, X{target}, X{target}\n",
+            );
+        } else {
+            write(
+                context,
+                f"    {prefix(context)}PSHUFD ${if bits == 64 { 68 } else { 0 }}, X{source}, X{target}\n",
+            );
+        }
+    }
+}
+
+fn emit_integer_reduce(
+    context: AssemblyContext,
+    ty: VectorType,
+    op: Operator,
+    source: isize,
+    target: isize,
+) -> Option[()] {
+    for lane in 0..ty.lanes {
+        extract_lane(context, ty, source, lane);
+        let bits = element_bits(ty.element);
+        if is_signed(ty.element) && bits < 64 {
+            write(context, f"    SHLQ ${64 - bits}, AX\n    SARQ ${64 - bits}, AX\n");
+        }
+        if lane == 0 {
+            write(context, "    MOVQ AX, R8\n");
+        } else {
+            let instruction = match op {
+                Add => "ADDQ",
+                Mul => "IMULQ",
+                And => "ANDQ",
+                Or => "ORQ",
+                Xor => "XORQ",
+                Min | Max => "",
+                _ => return Option::None,
+            };
+            if instruction != "" {
+                write(context, f"    {instruction} AX, R8\n");
+            } else {
+                let condition = if is_signed(ty.element) {
+                    if op == Operator::Min {
+                        "LT"
+                    } else {
+                        "GT"
+                    }
+                } else if op == Operator::Min {
+                    "CS"
+                } else {
+                    "HI"
+                };
+                write(context, f"    CMPQ AX, R8\n    CMOVQ{condition} AX, R8\n");
+            }
+        }
+    }
+    write(context, f"    MOVQ R8, X{target}\n");
+    Option::Some(())
+}
+
+pub fn emit_amd64(name: string, parameters: Vec[Parameter], nodes: Vec[Node], output: Output) -> Option[
     string,
 ] {
+    let result = output_node(output);
     if result < 0 || result >= nodes.len() || parameters.len() > 8 {
         return Option::None
     }
+    let kinds = node_kinds(parameters, nodes)?;
+    match (output, kinds[result]) {
+        (Output::Vector(_), ValueKind::Vector(_)) | (Output::Scalar(_), ValueKind::Scalar(_)) | (
+            Output::Mask(_),
+            ValueKind::Mask(_),
+        ) | (Output::All(_), ValueKind::Mask(_)) | (Output::Any(_), ValueKind::Mask(_)) => (),
+        _ => return Option::None,
+    }
+    let (avx2, fma) = kernel_features(parameters, nodes)?;
+    let context = AssemblyContext {
+        name,
+        avx: avx2 || fma,
+        builder: text::StringBuilder::new(),
+        data: text::StringBuilder::new(),
+        serial: Ref::new(0),
+    };
     let live: Vec[bool] = Vec::new();
     let uses: Vec[isize] = Vec::new();
     let registers: Vec[isize] = Vec::new();
@@ -46,38 +229,64 @@ pub fn emit_sse2(name: string, parameters: Vec[string], nodes: Vec[Node], result
     let mut cursor = nodes.len() - 1;
     while cursor >= 0 {
         if live[cursor] {
-            if let Binary { left, right, .. } = nodes[cursor] {
-                if left < 0 || right < 0 || left >= cursor || right >= cursor {
-                    return Option::None
-                }
-                live[left] = true;
-                live[right] = true;
-                uses[left] += 1;
-                uses[right] += 1;
+            for operand in operands(nodes[cursor]) {
+                live[operand] = true;
+                uses[operand] += 1;
             }
         }
         cursor -= 1;
     }
-    let occupied: Vec[bool] = Vec::new();
-    for _ in 0..16 {
-        occupied.push(false)
+    let offsets: Vec[isize] = Vec::new();
+    let mut offset = 0;
+    for parameter in parameters {
+        offset = align_offset(offset, value_alignment(parameter.kind));
+        offsets.push(offset);
+        offset += value_size(parameter.kind);
     }
-    let builder = text::StringBuilder::new();
-    builder.write_string(f"TEXT ·{name}(SB), 4, $0-{(parameters.len() + 1) * 16}\n");
+    let result_offset = align_offset(offset, 8);
+    let result_size = match output {
+        All(_) | Any(_) => 1,
+        _ => value_size(kinds[result]),
+    };
+    let occupied: Vec[bool] = Vec::new();
+    for _ in 0..12 {
+        occupied.push(false);
+    }
+    write(context, f"TEXT ·{name}(SB), 4, $0-{result_offset + result_size}\n");
     for index in 0..nodes.len() {
         if !live[index] {
             continue
         }
+        let inputs = operands(nodes[index]);
+        let reusable = match nodes[index] {
+            Binary {
+                op: Operator::Add | Operator::Sub | Operator::Div | Operator::And | Operator::Or | Operator::Xor,
+                ..,
+            } => true,
+            Unary {
+                op: UnaryOperator::Not | UnaryOperator::Sqrt | UnaryOperator::Floor | UnaryOperator::Ceil | UnaryOperator::Trunc | UnaryOperator::RoundTiesEven,
+                ..,
+            } => true,
+            Splat { .. } => true,
+            _ => false,
+        };
         let mut target = -1;
-        if let Binary { left, right, .. } = nodes[index] {
-            if uses[left] == 1 || (left == right && uses[left] == 2) {
-                target = registers[left];
+        if reusable && !inputs.is_empty() {
+            let candidate = inputs[0];
+            let mut count = 0;
+            for operand in inputs {
+                if operand == candidate {
+                    count += 1;
+                }
+            }
+            if uses[candidate] == count {
+                target = registers[candidate];
             }
         }
         if target < 0 {
-            for register in 0..16 {
-                if !occupied[register] {
-                    target = register;
+            for candidate in 0..12 {
+                if !occupied[candidate] {
+                    target = candidate;
                     break
                 }
             }
@@ -87,38 +296,182 @@ pub fn emit_sse2(name: string, parameters: Vec[string], nodes: Vec[Node], result
         }
         occupied[target] = true;
         registers[index] = target;
+        let ty = kind_vector(kinds[index]);
         match nodes[index] {
             Input(parameter) => {
-                if parameter < 0 || parameter >= parameters.len() {
-                    return Option::None
+                let source = f"{parameters[parameter].name}+{offsets[parameter]}(FP)";
+                match kinds[index] {
+                    Vector(_) => write(
+                        context,
+                        f"    {prefix(context)}MOVUPS {source}, {register(ty, target)}\n",
+                    ),
+                    Mask(_) => emit_mask_input(context, ty, source, target),
+                    Scalar(element) => {
+                        if is_float(element) {
+                            write(context, f"    MOV{scalar_suffix(element)} {source}, X{target}\n");
+                        } else {
+                            let instruction = match element_bits(element) {
+                                8 => "MOVBLZX",
+                                16 => "MOVWLZX",
+                                32 => "MOVL",
+                                _ => "MOVQ",
+                            };
+                            write(
+                                context,
+                                f"    {instruction} {source}, AX\n    MOVQ AX, X{target}\n",
+                            );
+                        }
+                    },
                 }
-                builder.write_string(
-                    f"    MOVUPS {parameters[parameter]}+{parameter * 16}(FP), X{target}\n",
-                );
+            },
+            Constant { ty, bits } => load_constant(context, ty, bits, target),
+            Scalar { bits, .. } => write(context, f"    MOVQ ${bits}, AX\n    MOVQ AX, X{target}\n"),
+            MaskConstant { ty, bits } => {
+                let values: Vec[u64] = Vec::new();
+                for lane in 0..ty.lanes {
+                    values.push(
+                        if bits & (1 << lane) != 0 {
+                            all_bits(ty.element)
+                        } else {
+                            0
+                        },
+                    );
+                }
+                load_constant(context, ty, values, target);
             },
             Binary { op, left, right } => {
-                let lhs = registers[left];
-                let rhs = registers[right];
-                if lhs < 0 || rhs < 0 {
-                    return Option::None
-                }
-                if lhs != target {
-                    builder.write_string(f"    MOVUPS X{lhs}, X{target}\n");
-                }
-                builder.write_string(f"    {instruction(op)} X{rhs}, X{target}\n");
-                uses[left] -= 1;
-                uses[right] -= 1;
-                if uses[left] == 0 && lhs != target {
-                    occupied[lhs] = false;
-                }
-                if uses[right] == 0 && rhs != target {
-                    occupied[rhs] = false;
+                let input = kind_vector(kinds[left]);
+                if is_float(input.element) {
+                    emit_float_binary(context, input, op, registers[left], registers[right], target)?;
+                } else {
+                    emit_integer_binary(
+                        context,
+                        input,
+                        op,
+                        registers[left],
+                        registers[right],
+                        target,
+                    )?;
                 }
             },
+            Unary { op, value } => {
+                if is_float(ty.element) {
+                    emit_float_unary(context, ty, op, registers[value], target)?;
+                } else {
+                    emit_integer_unary(context, ty, op, registers[value], target)?;
+                }
+            },
+            Splat { ty, value } => emit_splat(context, ty, registers[value], target),
+            Select { mask, left, right } => emit_select(
+                context,
+                ty,
+                registers[mask],
+                registers[left],
+                registers[right],
+                target,
+            ),
+            Reduce { op, value } => {
+                let input = kind_vector(kinds[value]);
+                if is_float(input.element) {
+                    emit_float_reduce(context, input, op, registers[value], target)?;
+                } else {
+                    emit_integer_reduce(context, input, op, registers[value], target)?;
+                }
+            },
+            Shuffle { left, right, indices } => emit_shuffle(
+                context,
+                ty,
+                registers[left],
+                registers[right],
+                target,
+                indices,
+            ),
+            Convert { value, to, bitcast } => {
+                emit_convert(
+                    context,
+                    kind_vector(kinds[value]),
+                    to,
+                    bitcast,
+                    registers[value],
+                    target,
+                )?;
+            },
+            Shift { value, count, left } => emit_integer_shift(
+                context,
+                ty,
+                registers[value],
+                target,
+                count,
+                left,
+            ),
+            Fma { left, right, addend } => {
+                copy_register(context, ty, registers[left], target);
+                write(
+                    context,
+                    f"    VFMADD213{float_suffix(ty)} {register(ty, registers[addend])}, {register(ty, registers[right])}, {register(ty, target)}\n",
+                );
+            },
+        }
+        for operand in inputs {
+            uses[operand] -= 1;
+            if uses[operand] == 0 && registers[operand] != target {
+                occupied[registers[operand]] = false;
+            }
         }
     }
-    builder.write_string(
-        f"    MOVUPS X{registers[result]}, ret+{parameters.len() * 16}(FP)\n    RET\n",
-    );
-    Option::Some(builder.finish())
+    let source = registers[result];
+    match output {
+        Vector(_) => write(
+            context,
+            f"    {prefix(context)}MOVUPS {register(kind_vector(kinds[result]), source)}, ret+{result_offset}(FP)\n",
+        ),
+        Scalar(_) => {
+            let ValueKind::Scalar(element) = kinds[result] else {
+                return Option::None
+            };
+            if is_float(element) {
+                write(
+                    context,
+                    f"    MOV{scalar_suffix(element)} X{source}, ret+{result_offset}(FP)\n",
+                );
+            } else {
+                let instruction = match element_bits(element) {
+                    8 => "MOVB",
+                    16 => "MOVW",
+                    32 => "MOVL",
+                    _ => "MOVQ",
+                };
+                write(
+                    context,
+                    f"    MOVQ X{source}, AX\n    {instruction} AX, ret+{result_offset}(FP)\n",
+                );
+            }
+        },
+        Mask(_) | All(_) | Any(_) => {
+            let ty = kind_vector(kinds[result]);
+            emit_mask_output(context, ty, source);
+            match output {
+                All(_) => write(
+                    context,
+                    f"    CMPL AX, ${(1.to_u64() << ty.lanes) - 1}\n    SETEQ AL\n",
+                ),
+                Any(_) => write(context, "    TESTL AX, AX\n    SETNE AL\n"),
+                _ => (),
+            }
+            let instruction = if result_size == 1 {
+                "MOVB"
+            } else if result_size == 2 {
+                "MOVW"
+            } else {
+                "MOVL"
+            };
+            write(context, f"    {instruction} AX, ret+{result_offset}(FP)\n");
+        },
+    }
+    if context.avx {
+        write(context, "    VZEROUPPER\n");
+    }
+    write(context, "    RET\n");
+    write(context, context.data.finish());
+    Option::Some(context.builder.finish())
 }

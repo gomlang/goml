@@ -60,7 +60,7 @@ The single `_` is a wildcard character, not an ordinary variable name. The curre
 
 - Package names, package aliases in `use package as alias`, functions, methods, parameters, local bindings and fields must start with a lowercase letter or `_`; imported item aliases may follow the naming convention of the imported item;
 - Structures, enumerations, traits, enumeration variants, generic parameters, and associated types must start with a capital letter;
-- The SIMD type spellings `f32x4` and `mask32x4` are also accepted as structure and type-alias names and in type positions. They are ordinary scoped names, supplied by `std::simd`, rather than globally reserved keywords;
+- The fixed-width vector and mask type spellings listed under [Portable SIMD](#portable-simd), including `u8x16`, `i32x8`, `f32x4`, `f64x4`, and `mask32x4`, are also accepted as structure and type-alias names and in type positions. They are ordinary scoped names, supplied by `std::simd`, rather than globally reserved keywords;
 - Paths retain the appropriate case for the referenced name.
 
 Enumeration construction should use `Enum::Variant`. Patterns may omit `Enum::` because their expected type determines the variant owner.
@@ -372,7 +372,7 @@ All files in the same package can use private top-level items. The trait impl me
 | unsigned integer | `usize`, `u8`, `u16`, `u32`, `u64` | `usize` corresponds to the target Go platform's `uint`; the others have fixed widths |
 | byte | `byte` | Transparent builtin alias of `u8` |
 | floating point | `f32`, `f64` | IEEE floating point |
-| SIMD vector and mask | `simd::f32x4`, `simd::mask32x4` | Four floating-point lanes and a four-lane mask, imported from `std::simd` |
+| SIMD vectors and masks | `simd::u8x16`, `simd::i32x8`, `simd::f32x4`, `simd::f64x4`, matching masks | Fixed 128/256-bit integer and floating-point vectors, imported from `std::simd` |
 | string | `string` | Go string backend |
 | character | `char` | Compile to Go `rune` |
 | tuple | `(i32, string)` | Nonempty tuples in type syntax have at least two elements |
@@ -2945,32 +2945,60 @@ Text search indices are UTF-8 byte offsets, matching the indices accepted by the
 
 ### Portable SIMD
 
-`use std::simd;` imports the fixed-width value types `f32x4` and `mask32x4`. The package implements its own operations and amd64 SSE2 backend, without importing Go SIMD packages or third-party SIMD libraries.
+`use std::simd;` imports fixed-width value types with portable scalar implementations and GoML-owned amd64 SSE2/AVX2 assembly backends. The implementation does not import Go SIMD packages or third-party SIMD libraries.
+
+| Element | 128-bit vector | 256-bit vector | Matching masks |
+| --- | --- | --- | --- |
+| `i8`, `u8` | `i8x16`, `u8x16` | `i8x32`, `u8x32` | `mask8x16`, `mask8x32` |
+| `i16`, `u16` | `i16x8`, `u16x8` | `i16x16`, `u16x16` | `mask16x8`, `mask16x16` |
+| `i32`, `u32` | `i32x4`, `u32x4` | `i32x8`, `u32x8` | `mask32x4`, `mask32x8` |
+| `i64`, `u64` | `i64x2`, `u64x2` | `i64x4`, `u64x4` | `mask64x2`, `mask64x4` |
+| `f32` | `f32x4` | `f32x8` | `mask32x4`, `mask32x8` |
+| `f64` | `f64x2` | `f64x4` | `mask64x2`, `mask64x4` |
+
+All vectors provide `from_array`, `to_array`, `splat`, `from_slice`, and `copy_to_slice`. Array conversions use the corresponding fixed-size scalar array and copy their elements. `from_slice(values, offset)` returns `Option[Vector]`; `copy_to_slice(values, offset)` returns `bool`. Both validate the complete range before accessing memory, require no special alignment, and reject negative offsets or incomplete vectors. An invalid store leaves the destination unchanged.
+
+All vectors provide `add`, `sub`, `mul`, `neg`, `abs`, `min`, `max`, `reduce_sum`, `reduce_product`, `reduce_min`, and `reduce_max`. Integer arithmetic wraps at the element width, including reductions. Negating or taking the absolute value of the minimum signed integer preserves that minimum; unsigned `abs` is the identity. Integer vectors also provide `bitand`, `bitor`, `bitxor`, `bitnot`, `shl(count: u32)`, `shr(count: u32)`, `saturating_add`, `saturating_sub`, `reduce_and`, `reduce_or`, and `reduce_xor`. Shift counts are reduced modulo the element width. Signed right shifts extend the sign bit. Saturating arithmetic clamps to the scalar type's range. Integer vectors do not provide division.
+
+Floating-point vectors additionally provide `div`, `sqrt`, `floor`, `ceil`, `trunc`, `round`, `round_ties_even`, `mul_add`, `is_nan`, `is_infinite`, and `is_finite`. `round` breaks halfway ties away from zero; `round_ties_even` chooses the nearest even integer. Ordinary arithmetic rounds each operation to the element type, so `a.mul(b).add(c)` has two roundings. `a.mul_add(b, c)` computes the fused result with one rounding, including in the scalar fallback. Reductions use a balanced tree with rounding at each operation. For example, four-lane `reduce_sum` computes `(lane0 + lane1) + (lane2 + lane3)`.
+
+Floating-point `min` and `max` return the numeric operand when exactly one operand is NaN, and NaN when both are NaN. For equal zeros, `min` chooses negative zero if present and `max` chooses positive zero if present. Arithmetic NaN payloads are unspecified. Comparisons follow scalar rules, including unordered NaNs and equality of positive and negative zero.
+
+`simd_eq`, `simd_ne`, `simd_lt`, `simd_le`, `simd_gt`, and `simd_ge` return the matching mask; vector `==` returns a single `bool` testing all lanes. Masks provide `from_array`, `to_array`, `splat`, `from_bitmask`, `to_bitmask`, `all`, `any`, `bitand`, `bitor`, `bitxor`, `bitnot`, and `select(if_true, if_false)`. Bit zero corresponds to lane zero; unused high bits are discarded. Bitmasks use `u8` for up to eight lanes, `u16` for sixteen lanes, and `u32` for thirty-two lanes. `select` accepts any matching vector through the public `SimdSelect[M]` trait and copies lane bits without arithmetic.
 
 ```goml
 use std::simd;
 
-fn combine(a: simd::f32x4, b: simd::f32x4, c: simd::f32x4) -> simd::f32x4 {
-    a.mul(b).add(c)
+fn select_scaled(a: simd::f64x4, b: simd::f64x4, scale: f64) -> simd::f64x4 {
+    a.simd_gt(b).select(a, b).mul(simd::f64x4::splat(scale))
 }
 
-fn example() -> [f32; 4] {
-    let a = simd::f32x4::from_array([1.0, 2.0, 3.0, 4.0]);
-    let b = simd::f32x4::splat(2.0);
-    let c = simd::f32x4::splat(1.0);
-    combine(a, b, c).to_array()
+fn blend_bytes(a: simd::u8x16, b: simd::u8x16) -> simd::u8x16 {
+    a.simd_lt(b).select(a.saturating_add(b), a)
 }
 ```
 
-Vectors provide `from_array`, `to_array`, `splat`, `add`, `sub`, `mul`, `div`, and `reduce_sum`. Arithmetic rounds each operation to `f32`; multiply followed by add is not fused. `reduce_sum` evaluates `(lane0 + lane1) + (lane2 + lane3)`. Floating-point comparisons follow scalar rules, including unordered NaNs and equality of positive and negative zero. NaN payload bits produced by arithmetic are unspecified.
+`swizzle(indices: [u32; N])` selects lanes from one vector. `shuffle(other, indices: [u32; N])` selects from the concatenation of the receiver and `other`. Indices outside `0..N` or `0..2*N`, respectively, produce zero lanes. `reverse`, `interleave_low`, `interleave_high`, `deinterleave_even`, and `deinterleave_odd` provide common fixed rearrangements. Interleaving alternates elements of the two complete vectors and returns the lower or upper half of that sequence; deinterleaving selects even or odd positions from their concatenation. These operations apply across the full vector, including across 128-bit halves of a 256-bit vector.
 
-`simd_eq`, `simd_ne`, `simd_lt`, `simd_le`, `simd_gt`, and `simd_ge` return a mask. Vector `==` tests equality of all lanes and returns `bool`. Masks provide `from_array([bool; 4])`, `to_array()`, `splat(bool)`, `from_bitmask(u8)`, `to_bitmask()`, `all()`, `any()`, `bitand`, `bitor`, `bitxor`, `bitnot`, and `select(if_true, if_false)`. Bit zero corresponds to lane zero; `from_bitmask` discards bits above bit three. Selection copies the chosen lane without floating-point arithmetic.
+Numeric conversions use `to_i8`, `to_u8`, `to_i16`, `to_u16`, `to_i32`, `to_u32`, `to_i64`, `to_u64`, `to_f32`, or `to_f64` when the destination vector exists with the same lane count and a different element type. Integer conversions extend according to the source signedness and discard excess high bits when narrowing. Floating-point to integer conversions truncate toward zero, clamp out-of-range values to the destination range, and map NaN to zero. Integer to floating-point and `f64` to `f32` conversions round to nearest, ties to even. Floating-point `to_bits` and `from_bits` convert to and from the matching unsigned integer vector without changing any bits.
 
-`f32x4::from_slice(values: Slice[f32], offset: isize) -> Option[f32x4]` loads four lanes after checking the complete range. `value.copy_to_slice(values: MutSlice[f32], offset: isize) -> bool` validates the complete range before writing and returns false without modifying the destination for invalid ranges. Neither operation requires special alignment. Vectors and masks have value semantics; array conversions copy their elements.
+```goml
+use std::simd;
 
-The initial native backend extracts straight-line functions with one to eight `f32x4` parameters, an `f32x4` result, and at least two vector arithmetic operations. It follows supported pure helper calls, uses SSE2 registers for intermediate values, and falls back to scalar code when control flow, register pressure, or unsupported expressions prevent extraction. Slice checks, masks, and reductions currently use the scalar implementation. Native functions are leaf functions with no allocations or callbacks.
+fn widen_and_scale(values: simd::i16x8) -> simd::f32x8 {
+    values.to_i32().to_f32().mul(simd::f32x8::splat(0.5))
+}
 
-On amd64, `goml build/run/test` and `gomlc run-single` compile eligible kernels with the GoML-generated assembly. Other architectures retain scalar code. `GOML_SIMD=scalar` forces the scalar implementation for differential testing. Exported standalone Go source retains complete scalar implementations; its embedded native metadata is consumed by the GoML build commands. There are currently no integer vectors, configurable lane counts, gather/scatter, vector arithmetic operators, or automatic vectorization of ordinary scalar loops.
+fn fused(a: simd::f32x4, b: simd::f32x4, c: simd::f32x4) -> simd::f32x4 {
+    a.mul_add(b, c)
+}
+```
+
+On amd64, `goml build/run/test` and `gomlc run-single` extract supported straight-line functions into generated `.s` files. Kernels may combine different supported vector types, matching masks, scalar broadcasts, conversions, and reductions, and may follow pure helper calls. They accept up to eight parameters and keep intermediates in registers. Unsupported expressions, control flow, or excessive register pressure retain the scalar implementation. Slice operations and dynamic shuffle indices remain scalar. Some numeric conversions and 32/64-bit saturating arithmetic also use scalar implementations. Integer reductions may use scalar instructions inside the native kernel. Native kernels have no allocations, callbacks, or stack spills.
+
+Basic 128-bit kernels use SSE2. Kernels using 256-bit vectors or native floating-point rounding require AVX2; eligible 128-bit FMA kernels require FMA independently of AVX2. Dispatch checks CPU features and operating-system preservation of XMM/YMM state with CPUID and XGETBV. Unsupported features retain the scalar path. AVX/FMA kernels execute `VZEROUPPER` before returning. Set `GOML_SIMD=scalar` when building to disable native kernels, or `GOML_SIMD=sse2` to disable generated AVX2 and FMA kernels. Other architectures and exported standalone Go source retain scalar implementations; GoML build commands consume the native metadata embedded in generated Go source.
+
+There are currently no configurable lane counts, gather/scatter, vector arithmetic operators, AVX-512 kernels, or automatic vectorization of ordinary scalar loops. SIMD uses the existing struct, import, trait, and method-call grammar and adds no expression syntax. Assembly snapshots under `gomlc/testdata/simd/` are generated and checked by `just update-golden` and `just verify-golden`.
 
 ### Randomness and cryptographic helpers
 
@@ -3584,7 +3612,7 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | Avoid | GoML form |
 | --- | --- |
 | `Vec<isize>` | `Vec[isize]` |
-| `Simd[f32, 4]` or vector `a + b` | Import `std::simd`, use `simd::f32x4` and `a.add(b)` |
+| `Simd[T, N]` or vector `a + b` | Import `std::simd`, select a fixed 128/256-bit vector type, and use `a.add(b)` |
 | `fn id<T>(x: T) -> T` | `fn id[T](x: T) -> T` |
 | `id::<i32>(1)` | `id::[i32](1)` |
 | Ordinary function `id[i32](1)` | `id::[i32](1)`, or rely on parameter/result type inference |
@@ -3668,7 +3696,11 @@ go_ffi_extern = (go_ffi_attribute | go_method_attribute) visibility? "extern" "f
 
 function      = "fn" lower_ident generic_params? param_list return_type? where_clause? block
 type_alias    = "type" type_ident type_names? "=" type ";"
-type_ident    = upper_ident | "f32x4" | "mask32x4"
+type_ident    = upper_ident | simd_type_ident
+simd_type_ident = ("i8" | "u8" | "mask8") ("x16" | "x32")
+                | ("i16" | "u16" | "mask16") ("x8" | "x16")
+                | ("i32" | "u32" | "f32" | "mask32") ("x4" | "x8")
+                | ("i64" | "u64" | "f64" | "mask64") ("x2" | "x4")
 constant      = "const" ident ":" type "=" expression ";"
 static        = "static" ident ":" type "=" expression ";"
 method        = visibility? "fn" lower_ident generic_params? param_list return_type? where_clause? block

@@ -1,0 +1,201 @@
+package simd;
+
+fn extract_lane(context: AssemblyContext, ty: VectorType, source: isize, lane: isize) -> () {
+    let size = element_bits(ty.element) / 8;
+    let offset = lane * size;
+    if offset >= 16 {
+        write(context, f"    VEXTRACTF128 $1, Y{source}, X14\n");
+    } else {
+        write(context, f"    {prefix(context)}MOVUPS X{source}, X14\n");
+    }
+    if offset % 16 != 0 {
+        write(context, f"    PSRLDQ ${offset % 16}, X14\n");
+    }
+    write(context, "    MOVQ X14, AX\n");
+    match size {
+        1 => write(context, "    ANDL $255, AX\n"),
+        2 => write(context, "    ANDL $65535, AX\n"),
+        4 => write(context, "    MOVL AX, AX\n"),
+        _ => (),
+    }
+}
+
+fn emit_shuffle(
+    context: AssemblyContext,
+    ty: VectorType,
+    left: isize,
+    right: isize,
+    target: isize,
+    indices: Vec[isize],
+) -> () {
+    let mut all_left = true;
+    let mut all_right = true;
+    for index in indices {
+        all_left = all_left && index >= 0 && index < ty.lanes;
+        all_right = all_right && index >= ty.lanes && index < ty.lanes * 2;
+    }
+    if left == right {
+        let mut valid = true;
+        for index in indices {
+            valid = valid && index >= 0 && index < ty.lanes * 2;
+        }
+        if valid {
+            all_left = true;
+        }
+    }
+    let bits = element_bits(ty.element);
+    if (all_left || all_right) && bits >= 32 {
+        let source = if all_left {
+            left
+        } else {
+            right
+        };
+        if vector_bytes(ty) == 32 && bits == 32 {
+            let order: Vec[u64] = Vec::new();
+            for index in indices {
+                order.push((index % ty.lanes).to_u64());
+            }
+            load_constant(context, ty, order, 14);
+            write(context, f"    VPERMPS Y{source}, Y14, Y{target}\n");
+        } else {
+            let mut immediate = 0;
+            if bits == 64 && vector_bytes(ty) == 32 {
+                for lane in 0..4 {
+                    immediate = immediate | ((indices[lane] % 4) << (lane * 2));
+                }
+                write(context, f"    VPERMQ ${immediate}, Y{source}, Y{target}\n");
+            } else {
+                for lane in 0..4 {
+                    let selected = if bits == 32 {
+                        indices[lane] % 4
+                    } else {
+                        (indices[lane / 2] % 2) * 2 + lane % 2
+                    };
+                    immediate = immediate | (selected << (lane * 2));
+                }
+                write(context, f"    {prefix(context)}PSHUFD ${immediate}, X{source}, X{target}\n");
+            }
+        }
+        return ()
+    }
+    let size = bits / 8;
+    for chunk in 0..vector_bytes(ty) / 16 {
+        let output = if chunk == 0 {
+            target
+        } else {
+            15
+        };
+        write(context, f"    PXOR X{output}, X{output}\n");
+        for lane in 0..16 / size {
+            let index = indices[chunk * (16 / size) + lane];
+            if index >= 0 && index < ty.lanes * 2 {
+                extract_lane(
+                    context,
+                    ty,
+                    if index < ty.lanes {
+                        left
+                    } else {
+                        right
+                    },
+                    index % ty.lanes,
+                );
+                write(context, "    MOVQ AX, X14\n");
+                if lane != 0 {
+                    write(context, f"    PSLLDQ ${lane * size}, X14\n");
+                }
+                write(context, f"    POR X14, X{output}\n");
+            }
+        }
+        if chunk == 1 {
+            write(context, f"    VINSERTF128 $1, X15, Y{target}, Y{target}\n");
+        }
+    }
+}
+
+fn emit_convert(
+    context: AssemblyContext,
+    from: VectorType,
+    to: VectorType,
+    bitcast: bool,
+    source: isize,
+    target: isize,
+) -> Option[()] {
+    let input = register(from, source);
+    let output = register(to, target);
+    let from_bits = element_bits(from.element);
+    let to_bits = element_bits(to.element);
+    if bitcast || (!is_float(from.element) && !is_float(to.element) && from_bits == to_bits) {
+        copy_register(context, to, source, target);
+        return Option::Some(())
+    }
+    if from.element == Element::F32 && to.element == Element::F64 {
+        write(context, f"    VCVTPS2PD {input}, {output}\n");
+        return Option::Some(())
+    }
+    if from.element == Element::F64 && to.element == Element::F32 {
+        write(context, f"    VCVTPD2PSY {input}, {output}\n");
+        return Option::Some(())
+    }
+    if from.element == Element::I32 && to.element == Element::F32 {
+        write(
+            context,
+            f"    {if context.avx { "VCVTDQ2PS" } else { "CVTPL2PS" }} {input}, {output}\n",
+        );
+        return Option::Some(())
+    }
+    if from.element == Element::I32 && to.element == Element::F64 {
+        write(context, f"    VCVTDQ2PD {input}, {output}\n");
+        return Option::Some(())
+    }
+    if from.element == Element::F32 && to.element == Element::I32 {
+        write(
+            context,
+            f"    {if context.avx { "VCVTTPS2DQ" } else { "CVTTPS2PL" }} {input}, {output}\n",
+        );
+        load_constant(context, from, repeated_bits(from, 1325400064), 14);
+        emit_float_compare(context, from, 2, 14, source, 14);
+        load_constant(context, to, repeated_bits(to, 2147483647), 15);
+        emit_bits(context, to, Operator::Xor, 15, target, 15);
+        emit_bits(context, to, Operator::And, 15, 14, 15);
+        emit_bits(context, to, Operator::Xor, target, 15, target);
+        emit_float_compare(context, from, 3, source, source, 14);
+        if context.avx {
+            write(context, f"    VANDNPS {output}, {register(from, 14)}, {output}\n");
+        } else {
+            write(context, f"    ANDNPS X{target}, X14\n    MOVUPS X14, X{target}\n");
+        }
+        return Option::Some(())
+    }
+    if !is_float(from.element) && !is_float(to.element) {
+        if to_bits == from_bits * 2 {
+            let suffix = match from_bits {
+                8 => "BW",
+                16 => "WD",
+                _ => "DQ",
+            };
+            write(
+                context,
+                f"    VPMOV{if is_signed(from.element) { "SX" } else { "ZX" }}{suffix} {input}, {output}\n",
+            );
+            return Option::Some(())
+        }
+        if from_bits == to_bits * 2 {
+            write(context, f"    PXOR X{target}, X{target}\n");
+            for lane in 0..to.lanes {
+                extract_lane(context, from, source, lane);
+                match to_bits {
+                    8 => write(context, "    ANDL $255, AX\n"),
+                    16 => write(context, "    ANDL $65535, AX\n"),
+                    _ => write(context, "    MOVL AX, AX\n"),
+                }
+                write(context, "    MOVQ AX, X14\n");
+                if lane != 0 {
+                    write(context, f"    PSLLDQ ${lane * to_bits / 8}, X14\n");
+                }
+                write(context, f"    POR X14, X{target}\n");
+            }
+            return Option::Some(())
+        }
+    }
+    Option::None
+}
