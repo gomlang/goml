@@ -1,0 +1,105 @@
+package main;
+
+use module::ffi;
+use module::simd;
+use std::env;
+use std::fs;
+use std::io;
+use std::path;
+
+fn prepare_simd_directory(context: ffi::GoBuildContext, input: string, source: string) -> Result[
+    string,
+    string,
+] {
+    let mut parent = path::parent(
+        path::absolute_structured(input).map_err(|error| error.to_string())?,
+    ).ok_or("SIMD source has no parent directory")?;
+    if context.go111module == "on" {
+        let relative = path::relative(context.module_dir, parent).map_err(|error| error.to_string())?;
+        if relative == ".." || relative.starts_with("../") {
+            parent = path::join(context.module_dir, "_artifact/simd-native");
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+    }
+    let native = simd::native_source(source)?.ok_or("missing SIMD metadata")?;
+    let mut suffix = 0;
+    let directory = loop {
+        let directory = path::join(parent, f"goml_simd_native_{suffix}");
+        match fs::create_dir(directory) {
+            Ok(()) => break directory,
+            Err(error) => if error.kind() == io::ErrorKind::AlreadyExists {
+                suffix += 1;
+            } else {
+                return Result::Err(error.to_string())
+            },
+        }
+    };
+    let written = fs::write_file_structured(path::join(directory, "main.go"), native.source).and_then(
+        |_| fs::write_file_structured(path::join(directory, "kernels_amd64.s"), native.assembly),
+    );
+    if let Err(error) = written {
+        let _ = fs::remove_dir_all(directory);
+        return Result::Err(error.to_string())
+    }
+    Result::Ok(directory)
+}
+
+fn build_go_with_simd(context: ffi::GoBuildContext, arguments: Vec[string], input: string) -> Result[
+    (),
+    string,
+] {
+    let source = fs::read_file_structured(input).map_err(|error| error.to_string())?;
+    let native = context.goarch == "amd64" && source.contains(simd::NATIVE_MARKER)
+        && env::var_structured("GOML_SIMD").unwrap_or("") != "scalar";
+    let directory = if native {
+        Option::Some(prepare_simd_directory(context, input, source)?)
+    } else {
+        Option::None
+    };
+    if let Some(directory) = directory {
+        let relative = match path::relative(context.module_dir, directory) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = fs::remove_dir_all(directory);
+                return Result::Err(error.to_string())
+            },
+        };
+        arguments.push(
+            if relative.starts_with("../") || relative == ".." || relative == "." {
+                relative
+            } else {
+                "./" + relative
+            },
+        );
+    } else {
+        arguments.push(input);
+    }
+    if context.go111module == "on" {
+        arguments.insert(1, "-mod=readonly");
+    }
+    let result = foreign_go_process(context, arguments).status_structured().map_err(
+        |error| error.to_string(),
+    );
+    if let Some(directory) = directory {
+        let _ = fs::remove_dir_all(directory);
+    }
+    if result?.success() {
+        Result::Ok(())
+    } else {
+        Result::Err("Go build failed")
+    }
+}
+
+fn run_simd_go_build_command(args: Vec[string]) -> () {
+    if args.len() != 6 || args[2] != "--input" || args[4] != "--output" {
+        fail("expected __simd-go-build --input <source> --output <executable>")
+    }
+    let result = env::current_dir_structured().map_err(|error| error.to_string()).and_then(
+        |directory| resolve_foreign_build_context("go", directory),
+    ).and_then(
+        |context| build_go_with_simd(context, Vec::from_array(["build", "-o", args[5]]), args[3]),
+    );
+    if let Err(error) = result {
+        fail(error)
+    }
+}

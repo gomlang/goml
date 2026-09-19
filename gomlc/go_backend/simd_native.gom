@@ -1,0 +1,243 @@
+package go_backend;
+
+use module::simd;
+use module::pretty;
+use std::json;
+
+enum SimdValue {
+    Vector(isize),
+    Record(Vec[(string, SimdValue)]),
+}
+
+struct SimdEvaluation {
+    functions: HashMap[string, Function],
+    nodes: Vec[simd::Node],
+    budget: Ref[isize],
+}
+
+fn simd_native_operator(name: string) -> Option[simd::Operator] {
+    if name == simd_intrinsic_name("simd.f32x4.add") {
+        Option::Some(simd::Operator::Add)
+    } else if name == simd_intrinsic_name("simd.f32x4.sub") {
+        Option::Some(simd::Operator::Sub)
+    } else if name == simd_intrinsic_name("simd.f32x4.mul") {
+        Option::Some(simd::Operator::Mul)
+    } else if name == simd_intrinsic_name("simd.f32x4.div") {
+        Option::Some(simd::Operator::Div)
+    } else {
+        Option::None
+    }
+}
+
+fn simd_evaluate_expression(
+    context: SimdEvaluation,
+    locals: HashMap[string, SimdValue],
+    expression: Expr,
+    depth: isize,
+) -> Option[SimdValue] {
+    if depth > 64 || context.budget.get() <= 0 {
+        return Option::None
+    }
+    context.budget.set(context.budget.get() - 1);
+    match expression {
+        Var { name } => locals[name],
+        Field { expr, field_name } => {
+            let Some(SimdValue::Record(fields)) = simd_evaluate_expression(
+                context,
+                locals,
+                expr,
+                depth + 1,
+            ) else {
+                return Option::None
+            };
+            for (name, value) in fields {
+                if name == field_name {
+                    return Option::Some(value)
+                }
+            }
+            Option::None
+        },
+        StructLiteral { fields, .. } => {
+            let values: Vec[(string, SimdValue)] = Vec::new();
+            for (name, expression) in fields {
+                values.push(
+                    (name, simd_evaluate_expression(context, locals, expression, depth + 1)?),
+                )
+            }
+            Option::Some(SimdValue::Record(values))
+        },
+        Call { func: Expr::Var { name }, args } => {
+            let values: Vec[SimdValue] = Vec::new();
+            for arg in args {
+                values.push(simd_evaluate_expression(context, locals, arg, depth + 1)?)
+            }
+            if let Some(op) = simd_native_operator(name) {
+                if values.len() != 2 {
+                    return Option::None
+                }
+                let SimdValue::Vector(left) = values[0] else {
+                    return Option::None
+                };
+                let SimdValue::Vector(right) = values[1] else {
+                    return Option::None
+                };
+                let result = context.nodes.len();
+                context.nodes.push(simd::Node::Binary { op, left, right });
+                Option::Some(SimdValue::Vector(result))
+            } else {
+                simd_evaluate_function(context, context.functions[name]?, values, depth + 1)
+            }
+        },
+        _ => Option::None,
+    }
+}
+
+fn simd_evaluate_function(
+    context: SimdEvaluation,
+    function: Function,
+    arguments: Vec[SimdValue],
+    depth: isize,
+) -> Option[SimdValue] {
+    if depth > 64 || function.params.len() != arguments.len() {
+        return Option::None
+    }
+    let locals: HashMap[string, SimdValue] = HashMap::new();
+    let declared: HashMap[string, bool] = HashMap::new();
+    for index in 0..arguments.len() {
+        locals[function.params[index].0] = arguments[index];
+        declared[function.params[index].0] = true;
+    }
+    for statement in function.body.stmts {
+        match statement {
+            Var { name, value, .. } => {
+                declared[name] = true;
+                if let Some(expression) = value {
+                    locals[name] = simd_evaluate_expression(context, locals, expression, depth + 1)?;
+                }
+            },
+            Assign { name, value: expression } => {
+                if declared[name].is_none() {
+                    return Option::None
+                }
+                locals[name] = simd_evaluate_expression(context, locals, expression, depth + 1)?;
+            },
+            Return { expr: Some(expression) } => return simd_evaluate_expression(
+                context,
+                locals,
+                expression,
+                depth + 1,
+            ),
+            _ => return Option::None,
+        }
+    }
+    Option::None
+}
+
+fn simd_f32x4_field(file: File) -> Option[(string, string)] {
+    let expected = go_user_type_name("std::simd::f32x4");
+    for item in file.items {
+        if let Struct(value) = item {
+            if value.name == expected && value.fields.len() == 1 {
+                if let Type::Array { len: 4, elem: Type::Float32 } = value.fields[0].1 {
+                    return Option::Some((value.name, value.fields[0].0))
+                }
+            }
+        }
+    }
+    Option::None
+}
+
+fn simd_is_vector_type(ty: Type, name: string) -> bool {
+    match ty {
+        Named { name: actual } => actual == name,
+        _ => false,
+    }
+}
+
+fn simd_native_function(
+    functions: HashMap[string, Function],
+    function: Function,
+    vector: (string, string),
+) -> Option[json::Value] {
+    if !simd_is_vector_type(function.ret_ty?, vector.0) || function.params.is_empty()
+        || function.params.len() > 8 {
+        return Option::None
+    }
+    let context = SimdEvaluation { functions, nodes: Vec::new(), budget: Ref::new(4096) };
+    let args: Vec[SimdValue] = Vec::new();
+    let parameters: Vec[string] = Vec::new();
+    for index in 0..function.params.len() {
+        let (name, ty) = function.params[index];
+        if !simd_is_vector_type(ty, vector.0) {
+            return Option::None
+        }
+        parameters.push(name);
+        context.nodes.push(simd::Node::Input(index));
+        args.push(SimdValue::Record(Vec::from_array([(vector.1, SimdValue::Vector(index))])));
+    }
+    let SimdValue::Record(fields) = simd_evaluate_function(context, function, args, 0)? else {
+        return Option::None
+    };
+    if fields.len() != 1 || fields[0].0 != vector.1
+        || context.nodes.len() < function.params.len() + 2 {
+        return Option::None
+    }
+    let SimdValue::Vector(result) = fields[0].1 else {
+        return Option::None
+    };
+    let assembly = simd::emit_sse2(function.name, parameters, context.nodes, result)?;
+    let declaration = pretty::pretty(
+        100,
+        pretty::concat(
+            Vec::from_array(
+                [
+                    pretty::text("func " + function.name),
+                    named_params_doc(function.params),
+                    optional_result_doc(function.ret_ty),
+                ],
+            ),
+        ),
+    );
+    Option::Some(
+        json::object(
+            Vec::from_array(
+                [
+                    ("fallback", json::Value::String(pretty::pretty(100, function_doc(function)))),
+                    ("declaration", json::Value::String(declaration)),
+                    ("assembly", json::Value::String(assembly)),
+                ],
+            ),
+        ),
+    )
+}
+
+fn simd_native_metadata(file: File) -> string {
+    let Some(vector) = simd_f32x4_field(file) else {
+        return ""
+    };
+    let functions: HashMap[string, Function] = HashMap::new();
+    for item in file.items {
+        if let Function(value) = item {
+            functions[value.name] = value;
+        }
+    }
+    let kernels: Vec[json::Value] = Vec::new();
+    for item in file.items {
+        if let Function(value) = item {
+            if let Some(kernel) = simd_native_function(functions, value, vector) {
+                kernels.push(kernel)
+            }
+        }
+    }
+    if kernels.is_empty() {
+        ""
+    } else {
+        let payload = json::object(
+            Vec::from_array(
+                [("version", json::Value::Number("1")), ("kernels", json::Value::Array(kernels))],
+            ),
+        );
+        "\nconst _goml_simd_native = " + json::encode(json::Value::String(json::encode(payload)))
+            + "\n"
+    }
+}

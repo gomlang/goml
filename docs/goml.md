@@ -60,6 +60,7 @@ The single `_` is a wildcard character, not an ordinary variable name. The curre
 
 - Package names, package aliases in `use package as alias`, functions, methods, parameters, local bindings and fields must start with a lowercase letter or `_`; imported item aliases may follow the naming convention of the imported item;
 - Structures, enumerations, traits, enumeration variants, generic parameters, and associated types must start with a capital letter;
+- The SIMD type spellings `f32x4` and `mask32x4` are also accepted as structure and type-alias names and in type positions. They are ordinary scoped names, supplied by `std::simd`, rather than globally reserved keywords;
 - Paths retain the appropriate case for the referenced name.
 
 Enumeration construction should use `Enum::Variant`. Patterns may omit `Enum::` because their expected type determines the variant owner.
@@ -371,6 +372,7 @@ All files in the same package can use private top-level items. The trait impl me
 | unsigned integer | `usize`, `u8`, `u16`, `u32`, `u64` | `usize` corresponds to the target Go platform's `uint`; the others have fixed widths |
 | byte | `byte` | Transparent builtin alias of `u8` |
 | floating point | `f32`, `f64` | IEEE floating point |
+| SIMD vector and mask | `simd::f32x4`, `simd::mask32x4` | Four floating-point lanes and a four-lane mask, imported from `std::simd` |
 | string | `string` | Go string backend |
 | character | `char` | Compile to Go `rune` |
 | tuple | `(i32, string)` | Nonempty tuples in type syntax have at least two elements |
@@ -2941,6 +2943,35 @@ Text search indices are UTF-8 byte offsets, matching the indices accepted by the
 
 `std::math` delegates elementary operations to Go's `math` package and follows its IEEE 754 special-value behavior. The f32 forms calculate through f64 and round the result back to f32. Results therefore use the target Go toolchain's correctly rounded conversions but do not promise bit-for-bit equality across different operating systems or processor implementations for every transcendental function.
 
+### Portable SIMD
+
+`use std::simd;` imports the fixed-width value types `f32x4` and `mask32x4`. The package implements its own operations and amd64 SSE2 backend, without importing Go SIMD packages or third-party SIMD libraries.
+
+```goml
+use std::simd;
+
+fn combine(a: simd::f32x4, b: simd::f32x4, c: simd::f32x4) -> simd::f32x4 {
+    a.mul(b).add(c)
+}
+
+fn example() -> [f32; 4] {
+    let a = simd::f32x4::from_array([1.0, 2.0, 3.0, 4.0]);
+    let b = simd::f32x4::splat(2.0);
+    let c = simd::f32x4::splat(1.0);
+    combine(a, b, c).to_array()
+}
+```
+
+Vectors provide `from_array`, `to_array`, `splat`, `add`, `sub`, `mul`, `div`, and `reduce_sum`. Arithmetic rounds each operation to `f32`; multiply followed by add is not fused. `reduce_sum` evaluates `(lane0 + lane1) + (lane2 + lane3)`. Floating-point comparisons follow scalar rules, including unordered NaNs and equality of positive and negative zero. NaN payload bits produced by arithmetic are unspecified.
+
+`simd_eq`, `simd_ne`, `simd_lt`, `simd_le`, `simd_gt`, and `simd_ge` return a mask. Vector `==` tests equality of all lanes and returns `bool`. Masks provide `from_array([bool; 4])`, `to_array()`, `splat(bool)`, `from_bitmask(u8)`, `to_bitmask()`, `all()`, `any()`, `bitand`, `bitor`, `bitxor`, `bitnot`, and `select(if_true, if_false)`. Bit zero corresponds to lane zero; `from_bitmask` discards bits above bit three. Selection copies the chosen lane without floating-point arithmetic.
+
+`f32x4::from_slice(values: Slice[f32], offset: isize) -> Option[f32x4]` loads four lanes after checking the complete range. `value.copy_to_slice(values: MutSlice[f32], offset: isize) -> bool` validates the complete range before writing and returns false without modifying the destination for invalid ranges. Neither operation requires special alignment. Vectors and masks have value semantics; array conversions copy their elements.
+
+The initial native backend extracts straight-line functions with one to eight `f32x4` parameters, an `f32x4` result, and at least two vector arithmetic operations. It follows supported pure helper calls, uses SSE2 registers for intermediate values, and falls back to scalar code when control flow, register pressure, or unsupported expressions prevent extraction. Slice checks, masks, and reductions currently use the scalar implementation. Native functions are leaf functions with no allocations or callbacks.
+
+On amd64, `goml build/run/test` and `gomlc run-single` compile eligible kernels with the GoML-generated assembly. Other architectures retain scalar code. `GOML_SIMD=scalar` forces the scalar implementation for differential testing. Exported standalone Go source retains complete scalar implementations; its embedded native metadata is consumed by the GoML build commands. There are currently no integer vectors, configurable lane counts, gather/scatter, vector arithmetic operators, or automatic vectorization of ordinary scalar loops.
+
 ### Randomness and cryptographic helpers
 
 `std::crypto::hash::sha256` returns the lowercase hexadecimal SHA-256 digest of a byte buffer, and `sha256_file` hashes a complete file before returning. `std::crypto::rand::bytes` reads the requested number of bytes from the operating-system cryptographic random source. These APIs do not expose hasher or random-source handles.
@@ -3553,6 +3584,7 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | Avoid | GoML form |
 | --- | --- |
 | `Vec<isize>` | `Vec[isize]` |
+| `Simd[f32, 4]` or vector `a + b` | Import `std::simd`, use `simd::f32x4` and `a.add(b)` |
 | `fn id<T>(x: T) -> T` | `fn id[T](x: T) -> T` |
 | `id::<i32>(1)` | `id::[i32](1)` |
 | Ordinary function `id[i32](1)` | `id::[i32](1)`, or rely on parameter/result type inference |
@@ -3635,7 +3667,8 @@ go_ffi_extern = (go_ffi_attribute | go_method_attribute) visibility? "extern" "f
                 param_list return_type? ";"
 
 function      = "fn" lower_ident generic_params? param_list return_type? where_clause? block
-type_alias    = "type" upper_ident type_names? "=" type ";"
+type_alias    = "type" type_ident type_names? "=" type ";"
+type_ident    = upper_ident | "f32x4" | "mask32x4"
 constant      = "const" ident ":" type "=" expression ";"
 static        = "static" ident ":" type "=" expression ";"
 method        = visibility? "fn" lower_ident generic_params? param_list return_type? where_clause? block
@@ -3645,7 +3678,7 @@ param_list    = "(" (parameter ("," parameter)*)? ")"
 parameter     = lower_ident ":" type | "self"
 return_type   = "->" type
 
-struct_def    = "struct" upper_ident type_names?
+struct_def    = "struct" type_ident type_names?
                 ("{" struct_fields? "}" | "(" newtype_field ","? ")" ";")
 struct_fields = struct_field ("," struct_field)* ","?
 struct_field  = visibility? lower_ident ":" type
