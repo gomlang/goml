@@ -6,6 +6,8 @@
 lexer → parser → CST → AST → HIR → TAST → Core → Mono → Lift → ANF → Go
 ```
 
+Generated Go code and Go FFI target Go 1.26. Building the compiler and its generated programs requires Go 1.26 or newer.
+
 Run repository recipes from the repository root. On Linux amd64, a fresh checkout downloads the checksum-pinned binary stage0 and uses it to build the stage2 toolchain directly:
 
 ```sh

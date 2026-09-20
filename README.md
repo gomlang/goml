@@ -6,7 +6,7 @@ The "ml" in goml nods to the [ML (programming language)](https://en.wikipedia.or
 
 goml aims to empower gophers with a more powerful type system but without leaving the Go ecosystem.
 
-GoML is statically typed and garbage-collected, with Rust-like syntax, monomorphized generics, and no ownership or lifetime system. The compiler, project driver, tests, formatter, and language server are implemented in GoML and compile to Go.
+GoML is statically typed and garbage-collected, with Rust-like syntax, monomorphized generics, and no ownership or lifetime system. The compiler, project driver, tests, formatter, and language server are implemented in GoML and compile to Go. Generated Go code and Go interoperability target Go 1.26.
 
 ## Documentation
 
@@ -21,7 +21,7 @@ GoML is statically typed and garbage-collected, with Rust-like syntax, monomorph
 
 ## Development
 
-Run recipes from the repository root. The toolchain build requires Linux amd64, Go 1.25+, `just`, Bash, curl, tar, and sha256sum. Tests require a C compiler for Go's race detector; full CI also uses Node 20+, npm, jq, Python 3, and Linux development headers for checking the generated syscall ABI and record layouts. See [.justfile](.justfile) for all commands and [gomlgo's README](gomlgo/README.md) for its separate Go 1.26 requirements.
+Run recipes from the repository root. The toolchain build requires Linux amd64, Go 1.26+, `just`, Bash, curl, tar, and sha256sum. Tests require a C compiler for Go's race detector; full CI also uses Node 20+, npm, jq, Python 3, and Linux development headers for checking the generated syscall ABI and record layouts. See [.justfile](.justfile) for all commands. The independent [gomlgo frontend and interpreter](gomlgo/README.md) targets Go 1.26 and requires Go 1.26.x for execution and differential tests.
 
 ```sh
 just make

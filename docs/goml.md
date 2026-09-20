@@ -4,6 +4,8 @@ This guide describes the GoML syntax, type rules, tools, and public library APIs
 
 GoML is a statically typed language with garbage collection. Its syntax is close to Rust, while its semantics are closer to ML. The compiler monomorphizes generics and lambda-lifts GoML closures before emitting Go. Explicit Go FFI can preserve native generic types and function values. GoML has no ownership, borrowing, lifetimes, or manual memory management.
 
+Generated Go code and Go FFI use Go 1.26 as their compatibility baseline. Building the toolchain, compiling generated programs, and validating Go bindings require Go 1.26 or newer. The independent [gomlgo frontend and interpreter](../gomlgo/README.md) targets Go 1.26 language and standard-library behavior; its execution and differential tests require Go 1.26.x.
+
 Quick navigation: [packages](#modules-packages-and-imports), [types](#type), [control flow](#control-flow), [patterns](#patterns), [traits](#trait-and-impl), [compile-time evaluation](#compile-time-evaluation), [Go FFI](#go-ffi), [tests](#tests), [prelude](#built-in-prelude), [standard library](#standard-library-package), and [verification](#verify-generated-code).
 
 Build and installation instructions are in the [repository README](../README.md) and [release guide](releasing.md). See [formatting](formatting.md) for canonical source layout and [compile-time evaluation architecture](comptime.md) for CTIR internals.

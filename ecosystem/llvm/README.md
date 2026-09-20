@@ -14,7 +14,7 @@ The current adapter targets Linux amd64 and the LLVM 18 development installation
 - Headers: `/usr/lib/llvm-18/include`.
 - Shared library: `/usr/lib/llvm-18/lib/libLLVM-18.so`.
 - Verification tools: `/usr/lib/llvm-18/bin`.
-- A C compiler, Go 1.25 or newer and enabled cgo are required.
+- A C compiler, Go 1.26 or newer and enabled cgo are required.
 
 The default include and linker paths are declared in `adapter/adapter.go`.
 `CGO_CFLAGS` and `CGO_LDFLAGS` can supply paths for another LLVM 18 installation;

@@ -30,7 +30,7 @@ The current bootstrap uses toolchain prefixes under `stage0`, `stage2`, and `sta
 
 ## Development Workflow
 
-Requirements: Linux amd64, Go 1.25+, a C compiler for race-detector tests, Node 20+, npm, `just`, Bash, curl, tar, sha256sum, and jq. See the gomlgo README for its additional Go-version requirements.
+Requirements: Linux amd64, Go 1.26+, a C compiler for race-detector tests, Node 20+, npm, `just`, Bash, curl, tar, sha256sum, and jq. Generated Go code and Go FFI target Go 1.26. The gomlgo interpreter and differential tests require Go 1.26.x; see its README for details.
 
 Run recipes from the repository root; [.justfile](.justfile) is the command reference.
 

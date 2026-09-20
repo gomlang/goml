@@ -2,6 +2,8 @@
 
 Releases use strict `vX.Y.Z` tags and currently publish Linux amd64 binaries.
 
+The Go compatibility baseline is Go 1.26. Build and validate releases with Go 1.26.x; users need Go 1.26 or newer to compile generated programs and validate Go FFI. The archives do not bundle a Go toolchain.
+
 The root [VERSION](../VERSION) file is authoritative. `goml`, `gomlc`, `gomlfmt`, `gomllsp`, and the VS Code extension must use the same version. The metadata helper `goml-go-meta` is packaged alongside them.
 
 ## Version policy

@@ -1,6 +1,6 @@
 # gomlgo
 
-`gomlgo` is an independent GoML module implementing a Go 1.26 scanner, recursive-descent parser, package type checker, and source importer. The compatibility target is Go 1.26.5; the default toolchain path is `/usr/lib/go-1.26`. Production code does not call `go/scanner`, `go/parser`, `go/types`, `go/constant`, or `go/importer`.
+`gomlgo` is an independent GoML module implementing a Go 1.26 scanner, recursive-descent parser, package type checker, and source importer. The language and standard-library compatibility target is Go 1.26.x, matching the GoML toolchain baseline. Production code does not call `go/scanner`, `go/parser`, `go/types`, `go/constant`, or `go/importer`.
 
 The frontend accepts source as `std::bytes::Bytes`, preserving invalid UTF-8 and physical byte offsets. The scanner implements the complete Go token set, literal validation, comments, BOM and NUL handling, Unicode identifiers, and automatic semicolon insertion. Tokens retain kind, literal, start/end offsets, and whether a semicolon is synthetic.
 
@@ -14,15 +14,15 @@ Syntax paths are opaque, immutable handles. Use `node.path.to_string()` to rende
 
 Type facts retain independent constant snapshots. `FactConstant::SmallInt(i64)` stores signed 64-bit integers directly; larger values retain copied arbitrary-precision storage. Use `type_fact_constant` and `type_fact_constant_kind` to read the exact value and kind across storage variants.
 
-The source importer evaluates `//go:build` and `// +build` constraints, GOOS/GOARCH and release tags, custom tags, cgo selection, platform filename suffixes, import cycles, and source dependencies. It selects ordinary, internal-test, and external-test package sources separately. Its default target is `linux/amd64`, cgo disabled, with `/usr/lib/go-1.26/src` as the source root.
+The source importer evaluates `//go:build` and `// +build` constraints, GOOS/GOARCH and release tags, custom tags, cgo selection, platform filename suffixes, import cycles, and source dependencies. It selects ordinary, internal-test, and external-test package sources separately. Its default target is `linux/amd64`, cgo disabled, with the selected Go toolchain’s `GOROOT/src` as the source root. Each load configuration captures its source root once; failure to discover a compatible toolchain is reported when an import needs it.
 
 `checker::CheckConfig` exposes `go_version`, target `sizes`, `ignore_func_bodies`, `fake_import_c`, `disable_unused_import_check`, `enable_alias`, and explicit import availability/failure inputs. The default is Go 1.26, gc/amd64 sizes, function bodies enabled, cgo import emulation disabled, unused-import checks enabled, and materialized aliases.
 
-`oracle/` is test-only Go code built with `/usr/lib/go-1.26/bin/go`. It exposes `version`, `scan`, `parse-file`, `parse-expr`, `type-check-package`, and `constant-eval` over stdin/stdout JSON. Type-check requests contain a package path, Go version, target, source files, and checker configuration; responses contain diagnostics, package metadata, normalized scopes and objects, and all `go/types.Info` sections. The test protocol also has `collect_info`; acceptance-only GOROOT runs set it to false so the oracle does not normalize data that will not be compared. GoML differential runners invoke the oracle only as an independent reference process.
+`oracle/` is test-only Go code built with the selected Go 1.26.x executable. It exposes `version`, `scan`, `parse-file`, `parse-expr`, `type-check-package`, and `constant-eval` over stdin/stdout JSON. Type-check requests contain a package path, Go version, target, source files, and checker configuration; responses contain diagnostics, package metadata, normalized scopes and objects, and all `go/types.Info` sections. The test protocol also has `collect_info`; acceptance-only GOROOT runs set it to false so the oracle does not normalize data that will not be compared. GoML differential runners invoke the oracle only as an independent reference process.
 
 ## Commands
 
-Run these recipes from the repository root. `just test` and `just ci` do not include this independent suite. The oracle build uses `${GOMLGO_GO:-/usr/lib/go-1.26/bin/go}`. `GOMLGO_GO` also selects the interpreter's Go executable, while the GOROOT recipes below explicitly use `/usr/lib/go-1.26/src`.
+Run these recipes from the repository root. `just test` and `just ci` do not include this independent suite. Set `GOMLGO_GO` to a Go 1.26.x executable to select the oracle, source importer, interpreter, and GOROOT differential corpus together. When unset, selection uses `/usr/lib/go-1.26/bin/go` if present, then `go` on `PATH`; an explicitly empty value selects `go` on `PATH`. The recipes derive `GOROOT/src` from that executable and disable automatic Go toolchain switching. The main GoML build uses `go` on `PATH`, which must also meet its Go 1.26 minimum. For example, `PATH=/path/to/go1.26/bin:$PATH GOMLGO_GO=/path/to/go1.26/bin/go just gomlgo-test`.
 
 ```bash
 just gomlgo-test
@@ -93,7 +93,7 @@ The official type corpus recipes also run in a resource-limited user systemd sco
 
 ## Compatibility coverage
 
-Differential results depend on the checked-out sources, exact Go toolchain, target, and selected corpus. Use the commands above to obtain current results; historical file counts and zero-difference totals are not a compatibility guarantee.
+Differential results depend on the checked-out sources, exact Go 1.26 patch release, target, and selected corpus. Run `bash gomlgo/toolchain/go.sh version` to record the selected reference version. Fixtures that explicitly request older Go language versions remain version-gating regression tests. Use the commands above to obtain current results; historical file counts and zero-difference totals are not a compatibility guarantee.
 
 | Area | Comparison | Reproduce |
 | --- | --- | --- |

@@ -1,5 +1,7 @@
 # Allowlisted binding generation
 
+Binding generation and validation require Go 1.26 or newer, matching GoML's Go compatibility baseline. The selected Go toolchain supplies the native package declarations and checks the generated wrappers.
+
 The configuration uses versioned JSON and explicitly selects each native function and type. The command is `goml bind-go <CONFIG>`, with optional `--compiler <COMPILER>` and `--dry-run`; `gomlc bind-go <CONFIG>` also works directly. Relative output paths resolve from the configuration file, within the existing GoML and Go module roots. Generation must not create or modify dependency manifests or execute Go package initializers.
 
 ```json
