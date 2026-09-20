@@ -2,9 +2,10 @@
 
 This directory exercises GoML through reusable libraries, each with its own
 `goml.toml`, public API, documentation, and external tests. Implementations are
-independent GoML modules. SQLite additionally uses an explicit Go adapter.
+independent GoML modules. Libraries with native integration document their
+ordinary Go FFI adapters and system dependencies.
 
-All thirteen libraries have implementations, public documentation, independent
+The libraries below have implementations, public documentation, independent
 consumers and executable verification. The table records their implemented scope;
 individual READMEs describe API semantics and limits. [ROADMAP.md](ROADMAP.md)
 tracks completed improvements and the remaining functional gaps.
@@ -24,6 +25,11 @@ tracks completed improvements and the remaining functional gaps.
 | [lsp](lsp/README.md) | JSON-RPC framing, document synchronization, UTF-16 positions, synchronous/deferred dispatch, cancellation and deadlines | Implemented; module, consumer and subprocess interoperability tests pass |
 | [markdown](markdown/README.md) | Block and inline parsing, AST, HTML rendering, escaping, links, code, lists and reference conformance | Implemented; 652/652 CommonMark examples, entity, module and consumer checks pass |
 | [diff](diff/README.md) | Myers and linear-space Hirschberg differences, unified patches, checked application, context and newline preservation | Implemented; tests and GNU interoperability pass |
+| [bitflags](bitflags/README.md) | Typed integer flag sets, third-party derives, unknown-bit policies, set algebra, name iteration, text and numeric Serde | Implemented; 10 library tests, consumer, 16 derive diagnostics and 4,601 Rust reference comparisons pass |
+| [logos](logos/README.md) | Typed UTF-8 lexers, regex/literal rules, longest match, priorities, callbacks/extras, mode switching and bounded Thompson NFA matching | Implemented; 11 library tests, consumer, race checks and 3,155 Python reference cases pass |
+| [tempfile](tempfile/README.md) | Secure temporary files/directories, anonymous files, atomic persistence, ownership transfer, scoped cleanup and memory-to-disk spooling | Implemented; 24 library tests and race checks, consumer and 160 concurrent filesystem comparisons pass |
+| [reqwest](reqwest/README.md) | HTTP(S)/HTTP2 clients, request builders, JSON/form/multipart, redirects, cancellation, TLS policy and bounded responses | Implemented; 10 library tests and race checks, 4 native race tests, consumer and Python HTTP interoperability pass |
+| [llvm](llvm/README.md) | LLVM 18 typed handles, IR construction/parsing, verification, optimization, bitcode and native object/assembly output | Implemented; 7 library tests, 4 native tests and race checks, consumer and 9,624 linked-function comparisons pass |
 
 Validation includes module-local public API tests, separate consuming modules,
 deterministic negative cases, reference interoperability where applicable, and
@@ -60,7 +66,7 @@ python3 ecosystem/verify.py
 python3 ecosystem/verify.py lsp markdown diff
 ```
 
-With no module arguments, the verifier checks all thirteen libraries and their
+With no module arguments, the verifier checks all registered libraries and their
 consumers. A missing module or failed check is an error. It creates an isolated,
 content-addressed registry snapshot under `ecosystem/_artifact/`, leaving the
 user's registry untouched. Consumers resolve normal versioned dependencies from
@@ -74,7 +80,12 @@ SQLite also requires its declared native Go dependencies to be fetched before
 readonly compilation (`cd ecosystem/sqlite && go mod download all`). The NumPy
 reference check uses CPython 3.12 on Linux amd64. Reference programs and wheels
 are downloaded into ignored `_artifact/` directories as documented by each
-library; race checks require the repository's C compiler prerequisite.
+library; race checks require the repository's C compiler prerequisite. The
+bitflags reference checker additionally requires `rustc` and downloads a
+checksum-pinned reference crate; the GoML library itself has no Rust dependency.
+The LLVM binding requires LLVM 18 development headers and `libLLVM-18` under
+`/usr/lib/llvm-18`, plus a C compiler and enabled cgo. Its verification also uses
+the LLVM command-line tools in that installation to check emitted IR and bitcode.
 
 Compiler limitations found during implementation remain documented in
 [FINDINGS.md](FINDINGS.md). The four compiler regression reproducers are included

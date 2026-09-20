@@ -76,6 +76,41 @@ They distinguish supported designs from current compiler or API boundaries.
   native lock-contention tests and race-detector builds. A separate Python engine
   agrees across 243 sequences and 2,754 operations, including file interchange.
 
+- Bitflags derives validate integer-backed newtypes and emit trait methods plus
+  definition metadata through the ordinary public derive interface. Default
+  trait methods, typed iterators, and explicit text/numeric Serde wrappers work
+  across a versioned dependency. Exhaustive byte-set algebra and 4,601 comparisons
+  with Rust bitflags cover aliases, overlapping flags, unknown bits and parsing.
+  GoML's derive output does not currently generate associated constants or
+  inherent implementations, so this library uses module constants and methods.
+
+- Logos implements a recursive regex AST, bounded Thompson NFA construction,
+  generic callbacks with extras/error types and cross-package iterator methods
+  without a native regex adapter. Reusable grammars work across independent
+  concurrent lexers; Python exhaustive-prefix matching checks 3,155 cases.
+
+- Tempfile combines the public random, Linux descriptor and I/O APIs into
+  exclusive creation, descriptor-relative directory cleanup, atomic persistence,
+  shared resource lifecycles and in-memory spooling. Real filesystem checks and
+  the race detector cover ownership transfer, symlinks, concurrent creation and
+  explicit cleanup without assuming destructors or GC finalizers.
+
+- Reqwest uses an ordinary Go FFI transport with GoML request/response types,
+  redirect policy and scoped cancellation. Native HTTP/HTTPS servers and Python
+  interoperability exercise certificate validation, HTTP/2, bounded bodies,
+  multipart, sensitive-header isolation and connection reuse. Public byte
+  boundaries copy bytes explicitly: `bytes::Bytes::to_vec()` is not an isolation
+  guarantee for later mutations of the returned `Vec`.
+
+- LLVM exposes distinct GoML handle types over an opaque Go FFI interface and
+  a cgo binding to LLVM 18. Context locking, module generations and explicit
+  closure preserve native ownership without language lifetimes or destructors.
+  Black-box tests cover IR/bitcode round trips, invalid operand combinations,
+  cross-context references and stale handles after optimization. Native and
+  GoML race checks cover shared lifecycles; four independently linked code
+  variants agree across 9,624 function results. This design requires ordinary
+  native dependencies but no compiler or builtin changes.
+
 ## Fixed compiler regressions
 
 The development compiler now passes all four retained reproducers in `repros/`:
@@ -106,6 +141,12 @@ valid API designs, but their original compiler workarounds are no longer require
   projection can require an explicit parameter annotation. Consumer tests retain
   this syntax. A typed intermediate `Result[T, string]` also resolves `Self` for
   static trait calls before chaining `map_err`.
+- Imported trait bounds in downstream generic helpers can still need a
+  package-qualified spelling. The bitflags consumer's `F: Flags` checked but
+  failed during monomorphization with a missing trait implementation; using
+  `F: flags::Flags` through its explicit package alias passes linking and the
+  reference matrix. Helpers defined in the trait's own package work with the
+  unqualified bound. The consumer retains the qualified spelling.
 - Scalar conversion is available through `std::num::{ToFloat, TryToInt}`.
   Integer-to-float rounding and checked float-to-integer conversion are verified
   against native Go across all rounding modes, boundary values and random bit

@@ -1,0 +1,339 @@
+package logos;
+
+enum State {
+    Epsilon(Vec[isize]),
+    Consume(Matcher, isize),
+    Accept(isize),
+}
+
+struct Compiler {
+    states: Vec[State],
+    options: Options,
+    rule: isize,
+    work: Ref[isize],
+}
+
+impl Compiler {
+    fn push(self: Compiler, state: State) -> Result[isize, CompileError] {
+        if self.states.len() >= self.options.max_states {
+            return Result::Err(
+                CompileError {
+                    rule: self.rule,
+                    offset: 0,
+                    message: "automaton state limit exceeded",
+                },
+            )
+        }
+        let index = self.states.len();
+        self.states.push(state);
+        Result::Ok(index)
+    }
+
+    fn expression(self: Compiler, value: Expression, next: isize) -> Result[isize, CompileError] {
+        if !spend(self.work, 1, self.options.max_states * 8) {
+            return Result::Err(
+                CompileError {
+                    rule: self.rule,
+                    offset: 0,
+                    message: "automaton expansion limit exceeded",
+                },
+            )
+        }
+        match value {
+            Empty => Result::Ok(next),
+            Atom(matcher, _) => self.push(State::Consume(matcher, next)),
+            Concat(parts) => {
+                let mut start = next;
+                let mut index = parts.len();
+                while index > 0 {
+                    index -= 1;
+                    start = self.expression(parts[index], start)?;
+                }
+                Result::Ok(start)
+            },
+            Alternate(parts) => {
+                let starts: Vec[isize] = Vec::new();
+                for part in parts {
+                    starts.push(self.expression(part, next)?);
+                }
+                self.push(State::Epsilon(starts))
+            },
+            Repeat(part, minimum, maximum) => {
+                let mut start = next;
+                if let Some(maximum) = maximum {
+                    for _ in minimum..maximum {
+                        let branch = self.expression(part.get(), start)?;
+                        start = self.push(State::Epsilon(Vec::from_array([branch, start])))?;
+                    }
+                } else {
+                    let head = self.push(State::Epsilon(Vec::new()))?;
+                    let branch = self.expression(part.get(), head)?;
+                    self.states[head] = State::Epsilon(Vec::from_array([branch, next]));
+                    start = head;
+                }
+                for _ in 0..minimum {
+                    start = self.expression(part.get(), start)?;
+                }
+                Result::Ok(start)
+            },
+        }
+    }
+}
+
+pub struct Grammar[T, X, E] {
+    states: FrozenVec[State],
+    roots: FrozenVec[isize],
+    rules: FrozenVec[Rule[T, X, E]],
+    priorities: FrozenVec[isize],
+    options: Options,
+}
+
+impl[T, X, E] Grammar[T, X, E] {
+    pub fn compile(rules: Vec[Rule[T, X, E]]) -> Result[Grammar[T, X, E], CompileError] {
+        Grammar::compile_with(rules, Options::new())
+    }
+
+    pub fn compile_with(rules: Vec[Rule[T, X, E]], options: Options) -> Result[
+        Grammar[T, X, E],
+        CompileError,
+    ] {
+        if options.max_pattern_bytes < 1 || options.max_depth < 1 || options.max_depth > 256
+            || options.max_repeat < 1
+            || options.max_repeat > 1000000
+            || options.max_states < 1
+            || options.max_states > 1000000
+            || options.max_token_bytes < 1
+            || options.max_work < 1 {
+            return Result::Err(
+                CompileError { rule: -1, offset: 0, message: "invalid lexer budgets" },
+            )
+        }
+        if rules.is_empty() {
+            return Result::Err(
+                CompileError { rule: -1, offset: 0, message: "a grammar needs at least one rule" },
+            )
+        }
+        let states: Vec[State] = Vec::new();
+        let roots: Vec[isize] = Vec::new();
+        let priorities: Vec[isize] = Vec::new();
+        let work = Ref::new(0);
+        for index in 0..rules.len() {
+            let rule = rules[index];
+            let expression = parse_pattern(rule, index, options)?;
+            let compiler = Compiler { states, options, rule: index, work };
+            let accept = compiler.push(State::Accept(index))?;
+            roots.push(compiler.expression(expression, accept)?);
+            let score = rule.priority.unwrap_or(priority(expression));
+            if score < 0 {
+                return Result::Err(
+                    CompileError { rule: index, offset: 0, message: "priority must be nonnegative" },
+                )
+            }
+            priorities.push(score);
+        }
+        Result::Ok(
+            Grammar {
+                states: states.freeze(),
+                roots: roots.freeze(),
+                rules: rules.freeze(),
+                priorities: priorities.freeze(),
+                options,
+            },
+        )
+    }
+
+    pub fn state_count(self: Grammar[T, X, E]) -> isize {
+        self.states.len()
+    }
+
+    pub fn rule_count(self: Grammar[T, X, E]) -> isize {
+        self.rules.len()
+    }
+
+    pub fn lexer(self: Grammar[T, X, E], source: string, extras: X) -> Lexer[T, X, E] {
+        Lexer {
+            grammar: self,
+            context: Context {
+                source,
+                cursor: Ref::new(Span { start: 0, end: 0 }),
+                extras: Ref::new(extras),
+            },
+        }
+    }
+
+    pub fn lexer_at(self: Grammar[T, X, E], source: string, offset: isize, extras: X) -> Result[
+        Lexer[T, X, E],
+        string,
+    ] {
+        if offset < 0 || offset > source.byte_len() || !source.is_char_boundary(offset) {
+            return Result::Err("lexer offset must be a UTF-8 boundary inside the source")
+        }
+        Result::Ok(
+            Lexer {
+                grammar: self,
+                context: Context {
+                    source,
+                    cursor: Ref::new(Span { start: offset, end: offset }),
+                    extras: Ref::new(extras),
+                },
+            },
+        )
+    }
+}
+
+fn spend(work: Ref[isize], amount: isize, limit: isize) -> bool {
+    if amount > limit - work.get() {
+        return false
+    }
+    work.set(work.get() + amount);
+    true
+}
+
+fn closure(
+    states: FrozenVec[State],
+    seeds: Vec[isize],
+    work: Ref[isize],
+    limit: isize,
+    visited: Vec[isize],
+    stamp: isize,
+) -> Result[Vec[isize], ()] {
+    let result: Vec[isize] = Vec::new();
+    while let Some(index) = seeds.pop() {
+        if !spend(work, 1, limit) {
+            return Result::Err(())
+        }
+        if visited[index] == stamp {
+            continue
+        }
+        visited[index] = stamp;
+        match states.get(index) {
+            Epsilon(next) => for target in next {
+                seeds.push(target);
+            },
+            _ => result.push(index),
+        }
+    }
+    Result::Ok(result)
+}
+
+enum Scan {
+    Match(isize, isize),
+    Ambiguous(isize, Vec[isize]),
+    Unexpected(isize),
+    Budget(isize),
+}
+
+fn scan[T, X, E](grammar: Grammar[T, X, E], source: string, start: isize, work: Ref[isize]) -> Scan {
+    if !spend(work, grammar.states.len(), grammar.options.max_work) {
+        return Scan::Budget(next_boundary(source, start))
+    }
+    let visited: Vec[isize] = Vec::with_capacity(grammar.states.len());
+    for _ in 0..grammar.states.len() {
+        visited.push(-1);
+    }
+    let seeds: Vec[isize] = Vec::new();
+    for index in 0..grammar.roots.len() {
+        seeds.push(grammar.roots.get(index));
+    }
+    let mut active = match closure(
+        grammar.states,
+        seeds,
+        work,
+        grammar.options.max_work,
+        visited,
+        start,
+    ) {
+        Ok(active) => active,
+        Err(_) => return Scan::Budget(next_boundary(source, start)),
+    };
+    let mut offset = start;
+    let mut best_end = start;
+    let mut best: Vec[isize] = Vec::new();
+    while offset < source.byte_len() {
+        let end = next_boundary(source, offset);
+        if end - start > grammar.options.max_token_bytes {
+            return Scan::Budget(
+                if offset > start {
+                    offset
+                } else {
+                    end
+                },
+            )
+        }
+        let value = source.get(offset);
+        let next: Vec[isize] = Vec::new();
+        for index in active {
+            if let Consume(matcher, target) = grammar.states.get(index) {
+                if !spend(work, matcher.parts.len() + 1, grammar.options.max_work) {
+                    return Scan::Budget(
+                        if offset > start {
+                            offset
+                        } else {
+                            end
+                        },
+                    )
+                }
+                if matcher.matches(value) {
+                    next.push(target);
+                }
+            }
+        }
+        if next.is_empty() {
+            break
+        }
+        offset = end;
+        active = match closure(
+            grammar.states,
+            next,
+            work,
+            grammar.options.max_work,
+            visited,
+            offset,
+        ) {
+            Ok(next) => next,
+            Err(_) => return Scan::Budget(offset),
+        };
+        let current: Vec[isize] = Vec::new();
+        let mut score = -1;
+        for index in active {
+            if let Accept(rule) = grammar.states.get(index) {
+                let candidate = grammar.priorities.get(rule);
+                if candidate > score {
+                    current.clear();
+                    score = candidate;
+                }
+                if candidate == score {
+                    current.push(rule);
+                }
+            }
+        }
+        if !current.is_empty() {
+            best_end = offset;
+            best = current;
+        }
+        let mut has_transition = false;
+        for index in active {
+            if let Consume(_, _) = grammar.states.get(index) {
+                has_transition = true;
+                break;
+            }
+        }
+        if !has_transition {
+            break
+        }
+    }
+    if best.len() == 1 {
+        Scan::Match(best_end, best[0])
+    } else if best.len() > 1 {
+        best.sort_by(|a, b| a - b);
+        Scan::Ambiguous(best_end, best)
+    } else {
+        Scan::Unexpected(
+            if offset > start {
+                offset
+            } else {
+                next_boundary(source, start)
+            },
+        )
+    }
+}

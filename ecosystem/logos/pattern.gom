@@ -1,0 +1,511 @@
+package logos;
+
+use std::unicode;
+
+enum ClassPart {
+    Range(char, char),
+    Digit(bool),
+    Word(bool),
+    Space(bool),
+    Property(string, bool),
+}
+
+struct Matcher {
+    parts: Vec[ClassPart],
+    negated: bool,
+    ignore_case: bool,
+}
+
+fn ascii_lower(value: char) -> char {
+    if value >= 'A' && value <= 'Z' {
+        char_from_u32(value.to_u32() + 32).unwrap_or(value)
+    } else {
+        value
+    }
+}
+
+fn part_matches(part: ClassPart, value: char, ignore_case: bool) -> bool {
+    match part {
+        Range(start, end) => {
+            if value >= start && value <= end {
+                return true
+            }
+            if !ignore_case {
+                return false
+            }
+            let lower = ascii_lower(value);
+            if lower >= start && lower <= end {
+                return true
+            }
+            if lower >= 'a' && lower <= 'z' {
+                let upper = char_from_u32(lower.to_u32() - 32).unwrap_or(lower);
+                return upper >= start && upper <= end
+            }
+            false
+        },
+        Digit(negative) => (value >= '0' && value <= '9') != negative,
+        Word(negative) => ((value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z')
+            || (value >= '0' && value <= '9')
+            || value == '_')
+            != negative,
+        Space(negative) => (value == ' ' || value == '\t' || value == '\n' || value == '\r'
+            || value == '\u000b'
+            || value == '\u000c')
+            != negative,
+        Property(name, negative) => {
+            let matched = match name {
+                "L" | "Letter" => unicode::is_letter(value),
+                "N" | "Number" => unicode::is_number(value),
+                "White_Space" => unicode::is_whitespace(value),
+                "Lowercase" => unicode::is_lowercase(value),
+                "Uppercase" => unicode::is_uppercase(value),
+                "ASCII" => value.to_u32() < 128,
+                _ => false,
+            };
+            matched != negative
+        },
+    }
+}
+
+impl Matcher {
+    fn matches(self: Matcher, value: char) -> bool {
+        let mut found = false;
+        for part in self.parts {
+            if part_matches(part, value, self.ignore_case) {
+                found = true;
+                break;
+            }
+        }
+        found != self.negated
+    }
+}
+
+enum Expression {
+    Empty,
+    Atom(Matcher, isize),
+    Concat(Vec[Expression]),
+    Alternate(Vec[Expression]),
+    Repeat(Ref[Expression], isize, Option[isize]),
+}
+
+struct Parser {
+    text: string,
+    offset: Ref[isize],
+    rule: isize,
+    options: Options,
+    ignore_case: bool,
+    dot_all: bool,
+}
+
+impl Parser {
+    fn error(self: Parser, message: string) -> CompileError {
+        CompileError { rule: self.rule, offset: self.offset.get(), message }
+    }
+
+    fn peek(self: Parser) -> Option[char] {
+        if self.offset.get() >= self.text.byte_len() {
+            Option::None
+        } else {
+            Option::Some(self.text.get(self.offset.get()))
+        }
+    }
+
+    fn take(self: Parser) -> Option[char] {
+        let result = self.peek();
+        if result.is_some() {
+            self.offset.set(next_boundary(self.text, self.offset.get()));
+        }
+        result
+    }
+
+    fn eat(self: Parser, value: char) -> bool {
+        if self.peek() == Option::Some(value) {
+            self.take();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn literal(self: Parser, value: char) -> Expression {
+        Expression::Atom(
+            Matcher {
+                parts: Vec::from_array([ClassPart::Range(value, value)]),
+                negated: false,
+                ignore_case: self.ignore_case,
+            },
+            2,
+        )
+    }
+
+    fn expression(self: Parser, depth: isize) -> Result[Expression, CompileError] {
+        if depth > self.options.max_depth {
+            return Result::Err(self.error("pattern nesting limit exceeded"))
+        }
+        let alternatives: Vec[Expression] = Vec::new();
+        alternatives.push(self.sequence(depth)?);
+        while self.eat('|') {
+            alternatives.push(self.sequence(depth)?);
+        }
+        if alternatives.len() == 1 {
+            Result::Ok(alternatives[0])
+        } else {
+            Result::Ok(Expression::Alternate(alternatives))
+        }
+    }
+
+    fn sequence(self: Parser, depth: isize) -> Result[Expression, CompileError] {
+        let parts: Vec[Expression] = Vec::new();
+        loop {
+            match self.peek() {
+                None | Some(')') | Some('|') => break,
+                _ => parts.push(self.repeated(depth)?),
+            }
+        }
+        if parts.len() == 0 {
+            Result::Ok(Expression::Empty)
+        } else if parts.len() == 1 {
+            Result::Ok(parts[0])
+        } else {
+            Result::Ok(Expression::Concat(parts))
+        }
+    }
+
+    fn number(self: Parser) -> Result[isize, CompileError] {
+        let mut value = 0;
+        let mut digits = 0;
+        while let Some(ch) = self.peek() {
+            if ch < '0' || ch > '9' {
+                break
+            }
+            let digit = (ch.to_u32() - '0'.to_u32()).to_isize();
+            if value > (self.options.max_repeat - digit) / 10 || digit > self.options.max_repeat {
+                return Result::Err(self.error("repetition limit exceeded"))
+            }
+            value = value * 10 + digit;
+            digits += 1;
+            self.take();
+        }
+        if digits == 0 {
+            Result::Err(self.error("expected repetition count"))
+        } else {
+            Result::Ok(value)
+        }
+    }
+
+    fn repeated(self: Parser, depth: isize) -> Result[Expression, CompileError] {
+        let value = self.atom(depth)?;
+        let mut bounds: Option[(isize, Option[isize])] = Option::None;
+        if self.eat('*') {
+            bounds = Option::Some((0, Option::None));
+        } else if self.eat('+') {
+            bounds = Option::Some((1, Option::None));
+        } else if self.eat('?') {
+            bounds = Option::Some((0, Option::Some(1)));
+        } else if self.eat('{') {
+            let minimum = self.number()?;
+            let maximum = if self.eat(',') {
+                if self.peek() == Option::Some('}') {
+                    Option::None
+                } else {
+                    Option::Some(self.number()?)
+                }
+            } else {
+                Option::Some(minimum)
+            };
+            if !self.eat('}') {
+                return Result::Err(self.error("expected closing repetition brace"))
+            }
+            if let Some(maximum) = maximum {
+                if maximum < minimum {
+                    return Result::Err(self.error("repetition maximum is smaller than minimum"))
+                }
+            }
+            bounds = Option::Some((minimum, maximum));
+        }
+        if let Some((minimum, maximum)) = bounds {
+            match self.peek() {
+                Some('*') | Some('+') | Some('?') | Some('{') => return Result::Err(
+                    self.error("stacked or lazy repetitions are unsupported"),
+                ),
+                _ => (),
+            }
+            Result::Ok(Expression::Repeat(Ref::new(value), minimum, maximum))
+        } else {
+            Result::Ok(value)
+        }
+    }
+
+    fn atom(self: Parser, depth: isize) -> Result[Expression, CompileError] {
+        let ch = self.take().ok_or(self.error("expected pattern"))?;
+        match ch {
+            '(' => {
+                if self.eat('?') && !self.eat(':') {
+                    return Result::Err(
+                        self.error("only non-capturing (?:...) groups are supported after (?"),
+                    )
+                }
+                let value = self.expression(depth + 1)?;
+                if !self.eat(')') {
+                    return Result::Err(self.error("unclosed group"))
+                }
+                Result::Ok(value)
+            },
+            '[' => self.character_class(),
+            '.' => Result::Ok(
+                Expression::Atom(
+                    Matcher {
+                        parts: if self.dot_all {
+                            Vec::new()
+                        } else {
+                            Vec::from_array([ClassPart::Range('\n', '\n')])
+                        },
+                        negated: true,
+                        ignore_case: false,
+                    },
+                    1,
+                ),
+            ),
+            '\\' => {
+                let part = self.escape()?;
+                let score = match part {
+                    Range(_, _) => 2,
+                    _ => 1,
+                };
+                Result::Ok(
+                    Expression::Atom(
+                        Matcher {
+                            parts: Vec::from_array([part]),
+                            negated: false,
+                            ignore_case: self.ignore_case,
+                        },
+                        score,
+                    ),
+                )
+            },
+            '*' | '+' | '?' | '{' | '}' | ']' => Result::Err(
+                self.error("unexpected regex metacharacter"),
+            ),
+            '^' | '$' => Result::Err(
+                self.error("anchors are unsupported; rules are implicitly anchored"),
+            ),
+            _ => Result::Ok(self.literal(ch)),
+        }
+    }
+
+    fn hex(self: Parser, count: isize, braced: bool) -> Result[char, CompileError] {
+        let mut value: u32 = 0;
+        let mut digits = 0;
+        while digits < count {
+            if braced && self.peek() == Option::Some('}') {
+                break
+            }
+            let ch = self.take().ok_or(self.error("incomplete hexadecimal escape"))?;
+            let digit = match ch {
+                '0'..='9' => ch.to_u32() - '0'.to_u32(),
+                'a'..='f' => ch.to_u32() - 'a'.to_u32() + 10,
+                'A'..='F' => ch.to_u32() - 'A'.to_u32() + 10,
+                _ => return Result::Err(self.error("invalid hexadecimal escape")),
+            };
+            value = value * 16 + digit;
+            digits += 1;
+        }
+        if digits == 0 || (braced && !self.eat('}')) {
+            return Result::Err(self.error("invalid braced Unicode escape"))
+        }
+        char_from_u32(value).ok_or(self.error("escape is not a Unicode scalar value"))
+    }
+
+    fn escape(self: Parser) -> Result[ClassPart, CompileError] {
+        let ch = self.take().ok_or(self.error("trailing backslash"))?;
+        let value = match ch {
+            'd' => return Result::Ok(ClassPart::Digit(false)),
+            'D' => return Result::Ok(ClassPart::Digit(true)),
+            'w' => return Result::Ok(ClassPart::Word(false)),
+            'W' => return Result::Ok(ClassPart::Word(true)),
+            's' => return Result::Ok(ClassPart::Space(false)),
+            'S' => return Result::Ok(ClassPart::Space(true)),
+            'p' | 'P' => {
+                if !self.eat('{') {
+                    return Result::Err(self.error("expected Unicode property braces"))
+                }
+                let start = self.offset.get();
+                while let Some(value) = self.peek() {
+                    if value == '}' {
+                        break
+                    }
+                    self.take();
+                }
+                let name = self.text.byte_slice(start, self.offset.get());
+                if !self.eat('}') {
+                    return Result::Err(self.error("unclosed Unicode property"))
+                }
+                match name {
+                    "L" | "Letter" | "N" | "Number" | "White_Space" | "Lowercase" | "Uppercase" | "ASCII" => (),
+                    _ => return Result::Err(self.error("unsupported Unicode property: " + name)),
+                }
+                return Result::Ok(ClassPart::Property(name, ch == 'P'))
+            },
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'f' => '\u000c',
+            'v' => '\u000b',
+            'a' => '\u0007',
+            '0' => '\u0000',
+            'x' => self.hex(2, false)?,
+            'u' => {
+                if self.eat('{') {
+                    self.hex(6, true)?
+                } else {
+                    self.hex(4, false)?
+                }
+            },
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '-' | '/' | '"' | '\'' => ch,
+            _ => return Result::Err(self.error("unsupported escape")),
+        };
+        Result::Ok(ClassPart::Range(value, value))
+    }
+
+    fn class_part(self: Parser) -> Result[ClassPart, CompileError] {
+        let ch = self.take().ok_or(self.error("unclosed character class"))?;
+        if ch == '\\' {
+            self.escape()
+        } else if ch == '[' {
+            Result::Err(self.error("nested character classes are unsupported"))
+        } else {
+            Result::Ok(ClassPart::Range(ch, ch))
+        }
+    }
+
+    fn character_class(self: Parser) -> Result[Expression, CompileError] {
+        let negated = self.eat('^');
+        let parts: Vec[ClassPart] = Vec::new();
+        while self.peek() != Option::Some(']') {
+            if self.peek().is_none() {
+                return Result::Err(self.error("unclosed character class"))
+            }
+            let remaining = self.text.byte_slice(self.offset.get(), self.text.byte_len());
+            if remaining.starts_with("&&") || remaining.starts_with("--")
+                || remaining.starts_with("~~") {
+                return Result::Err(self.error("character class set operations are unsupported"))
+            }
+            let part = self.class_part()?;
+            if self.eat('-') {
+                if self.peek() == Option::Some(']') {
+                    parts.push(part);
+                    parts.push(ClassPart::Range('-', '-'));
+                } else {
+                    let last = self.class_part()?;
+                    match (part, last) {
+                        (Range(start, _), Range(end, _)) => {
+                            if start > end {
+                                return Result::Err(self.error("reversed character range"))
+                            }
+                            parts.push(ClassPart::Range(start, end));
+                        },
+                        _ => return Result::Err(
+                            self.error("range endpoints must be literal characters"),
+                        ),
+                    }
+                }
+            } else {
+                parts.push(part);
+            }
+        }
+        self.take();
+        if parts.is_empty() {
+            return Result::Err(self.error("empty character class"))
+        }
+        Result::Ok(Expression::Atom(Matcher { parts, negated, ignore_case: self.ignore_case }, 1))
+    }
+}
+
+fn nullable(value: Expression) -> bool {
+    match value {
+        Empty => true,
+        Atom(_, _) => false,
+        Concat(parts) => {
+            for part in parts {
+                if !nullable(part) {
+                    return false
+                }
+            }
+            true
+        },
+        Alternate(parts) => {
+            for part in parts {
+                if nullable(part) {
+                    return true
+                }
+            }
+            false
+        },
+        Repeat(part, minimum, _) => minimum == 0 || nullable(part.get()),
+    }
+}
+
+fn priority(value: Expression) -> isize {
+    match value {
+        Empty => 0,
+        Atom(_, score) => score,
+        Concat(parts) => {
+            let mut score = 0;
+            for part in parts {
+                score += priority(part);
+            }
+            score
+        },
+        Alternate(parts) => {
+            let mut score = priority(parts[0]);
+            for part in parts {
+                let current = priority(part);
+                if current < score {
+                    score = current;
+                }
+            }
+            score
+        },
+        Repeat(part, minimum, _) => minimum * priority(part.get()),
+    }
+}
+
+fn parse_pattern[T, X, E](rule: Rule[T, X, E], index: isize, options: Options) -> Result[
+    Expression,
+    CompileError,
+] {
+    let text = match rule.pattern {
+        Literal(text) | Regex(text) => text,
+    };
+    let parser = Parser {
+        text,
+        offset: Ref::new(0),
+        rule: index,
+        options,
+        ignore_case: rule.ignore_case,
+        dot_all: rule.dot_all,
+    };
+    if text.byte_len() > options.max_pattern_bytes {
+        return Result::Err(parser.error("pattern byte limit exceeded"))
+    }
+    let expression = match rule.pattern {
+        Literal(_) => {
+            let parts: Vec[Expression] = Vec::new();
+            while let Some(ch) = parser.take() {
+                parts.push(parser.literal(ch));
+            }
+            Expression::Concat(parts)
+        },
+        Regex(_) => {
+            let expression = parser.expression(0)?;
+            if parser.peek().is_some() {
+                return Result::Err(parser.error("unexpected closing group"))
+            }
+            expression
+        },
+    };
+    if nullable(expression) {
+        return Result::Err(parser.error("token rules must not match empty input"))
+    }
+    Result::Ok(expression)
+}

@@ -1,0 +1,201 @@
+package tempfile;
+
+use std::crypto::rand;
+use std::env;
+use std::io;
+use std::os::linux::fd;
+use std::path;
+
+pub struct Builder {
+    parent_value: Option[string],
+    prefix_value: string,
+    suffix_value: string,
+    random_bytes_value: isize,
+    attempts_value: isize,
+}
+
+pub fn temp_dir() -> string {
+    match env::var_structured("TMPDIR") {
+        Ok(value) if value != "" => value,
+        _ => "/tmp",
+    }
+}
+
+fn valid_fragment(value: string) -> bool {
+    for index in 0..value.byte_len() {
+        let byte = value.byte_get(index);
+        if byte == 0 || byte == b'/' || byte == b'\\' {
+            return false
+        }
+    }
+    true
+}
+
+impl Builder {
+    pub fn new() -> Builder {
+        Builder {
+            parent_value: Option::None,
+            prefix_value: ".goml-",
+            suffix_value: "",
+            random_bytes_value: 16,
+            attempts_value: 128,
+        }
+    }
+
+    pub fn parent(self: Builder, parent: string) -> Builder {
+        Builder { parent_value: Option::Some(parent), ..self }
+    }
+
+    pub fn prefix(self: Builder, prefix: string) -> Builder {
+        Builder { prefix_value: prefix, ..self }
+    }
+
+    pub fn suffix(self: Builder, suffix: string) -> Builder {
+        Builder { suffix_value: suffix, ..self }
+    }
+
+    pub fn random_bytes(self: Builder, count: isize) -> Builder {
+        Builder { random_bytes_value: count, ..self }
+    }
+
+    pub fn attempts(self: Builder, count: isize) -> Builder {
+        Builder { attempts_value: count, ..self }
+    }
+
+    fn validate(self: Builder) -> Result[(), io::Error] {
+        if !valid_fragment(self.prefix_value) || !valid_fragment(self.suffix_value) {
+            return Result::Err(
+                failure(
+                    io::ErrorKind::InvalidInput,
+                    "temporary name",
+                    "prefix and suffix must not contain separators or NUL",
+                ),
+            )
+        }
+        if self.random_bytes_value < 8 || self.random_bytes_value > 64 {
+            return Result::Err(
+                failure(
+                    io::ErrorKind::InvalidInput,
+                    "temporary name",
+                    "random byte count must be between 8 and 64",
+                ),
+            )
+        }
+        if self.attempts_value < 1 || self.attempts_value > 1024 {
+            return Result::Err(
+                failure(
+                    io::ErrorKind::InvalidInput,
+                    "temporary name",
+                    "attempt count must be between 1 and 1024",
+                ),
+            )
+        }
+        if self.prefix_value.byte_len() > 255 || self.suffix_value.byte_len() > 255
+            || self.prefix_value.byte_len() + self.suffix_value.byte_len()
+                + self.random_bytes_value * 2
+                > 255 {
+            return Result::Err(
+                failure(io::ErrorKind::InvalidInput, "temporary name", "name exceeds 255 bytes"),
+            )
+        }
+        Result::Ok(())
+    }
+
+    fn name(self: Builder) -> Result[string, io::Error] {
+        let random = rand::bytes(self.random_bytes_value).map_err(
+            |message| failure(io::ErrorKind::Other, "secure random name", message),
+        )?;
+        let alphabet = "0123456789abcdef";
+        let mut name = self.prefix_value;
+        for value in random.as_slice() {
+            let high = (value >> 4).to_isize();
+            let low = (value & 15).to_isize();
+            name += alphabet.byte_slice(high, high + 1);
+            name += alphabet.byte_slice(low, low + 1);
+        }
+        Result::Ok(name + self.suffix_value)
+    }
+
+    fn create(self: Builder, directory: bool) -> Result[Managed, io::Error] {
+        self.validate()?;
+        let parent_path = absolute_path(self.parent_value.unwrap_or(temp_dir()))?;
+        let parent = fd::open(parent_path, fd::O_RDONLY | fd::O_DIRECTORY, 0)?;
+        let transferred = Ref::new(false);
+        defer {
+            if !transferred.get() {
+                let _ = parent.close();
+            }
+        };
+        for _ in 0..self.attempts_value {
+            let name = self.name()?;
+            let created = if directory {
+                parent.with_raw_fd(|raw| fd::mkdir_at(raw.to_isize(), name, 0o700)).and_then(
+                    |_| {
+                        let opened = parent.open_at(
+                            name,
+                            fd::O_RDONLY | fd::O_DIRECTORY | fd::O_NOFOLLOW,
+                            0,
+                        );
+                        if opened.is_err() {
+                            let _ = parent.with_raw_fd(
+                                |raw| fd::unlink_at(raw.to_isize(), name, fd::AT_REMOVEDIR),
+                            );
+                        }
+                        opened
+                    },
+                )
+            } else {
+                parent.open_at(name, fd::O_RDWR | fd::O_CREAT | fd::O_EXCL | fd::O_NOFOLLOW, 0o600)
+            };
+            match created {
+                Ok(descriptor) => {
+                    transferred.set(true);
+                    return Result::Ok(
+                        managed(descriptor, parent, name, path::join(parent_path, name), directory),
+                    )
+                },
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
+                Err(error) => return Result::Err(error),
+            }
+        }
+        Result::Err(
+            failure(
+                io::ErrorKind::AlreadyExists,
+                "create temporary resource",
+                "random name collision limit reached",
+            ),
+        )
+    }
+
+    pub fn tempfile(self: Builder) -> Result[NamedTempFile, io::Error] {
+        self.create(false).map(|owned| NamedTempFile { owned })
+    }
+
+    pub fn tempdir(self: Builder) -> Result[TempDir, io::Error] {
+        self.create(true).map(|owned| TempDir { owned })
+    }
+
+    pub fn anonymous(self: Builder) -> Result[File, io::Error] {
+        let named = self.tempfile()?;
+        defer {
+            let _ = named.close();
+        };
+        named.into_file()
+    }
+}
+
+pub fn tempfile() -> Result[File, io::Error] {
+    Builder::new().anonymous()
+}
+
+pub fn tempfile_in(parent: string) -> Result[File, io::Error] {
+    Builder::new().parent(parent).anonymous()
+}
+
+pub fn tempdir() -> Result[TempDir, io::Error] {
+    Builder::new().tempdir()
+}
+
+pub fn tempdir_in(parent: string) -> Result[TempDir, io::Error] {
+    Builder::new().parent(parent).tempdir()
+}

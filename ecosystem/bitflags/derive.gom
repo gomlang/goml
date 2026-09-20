@@ -1,0 +1,229 @@
+package bitflags;
+
+#[comptime_derive]
+fn one_expr(value: MetaExpr) -> MetaExprList {
+    let list = meta_expr_list_new();
+    meta_expr_list_push(list, value);
+    list
+}
+
+#[comptime_derive]
+fn one_type(value: MetaType) -> MetaTypeList {
+    let list = meta_type_list_new();
+    meta_type_list_push(list, value);
+    list
+}
+
+#[comptime_derive]
+fn storage_width(name: string) -> isize {
+    match name {
+        "i8" | "u8" | "byte" => 8,
+        "i16" | "u16" => 16,
+        "i32" | "u32" => 32,
+        "i64" | "u64" | "isize" | "usize" => 64,
+        _ => {
+            compile_error("Flags requires one primitive integer field")
+        },
+    }
+}
+
+#[comptime_derive]
+fn declaration_value(attribute: MetaAttribute, index: isize, mask: u64) -> u64 {
+    let text = meta_attribute_argument_text(attribute, index);
+    let mut bits: u64 = 0;
+    let mut start = 0;
+    for end in 0..=text.byte_len() {
+        if end != text.byte_len() && text.byte_get(end) != b'|' {
+            continue;
+        }
+        let part = strip_ascii(text.byte_slice(start, end));
+        if part == "" {
+            compile_error("empty flag mask component")
+        }
+        let mut found = Option::None;
+        if part == "~0" {
+            found = Option::Some(mask);
+        } else if part.starts_with("0x") {
+            found = number(part.byte_slice(2, part.byte_len()), 16, mask);
+        } else if part.starts_with("0b") {
+            found = number(part.byte_slice(2, part.byte_len()), 2, mask);
+        } else if part.starts_with("0o") {
+            found = number(part.byte_slice(2, part.byte_len()), 8, mask);
+        } else if part.byte_get(0) >= b'0' && part.byte_get(0) <= b'9' {
+            found = number(part, 10, mask);
+        } else {
+            for previous in 0..index {
+                if part != "unnamed" && meta_attribute_argument_name(attribute, previous) == part {
+                    found = Option::Some(declaration_value(attribute, previous, mask));
+                }
+            }
+        }
+        match found {
+            Some(value) => {
+                bits |= value;
+            },
+            None => compile_error("invalid or out-of-range flag mask component: " + part),
+        }
+        start = end + 1;
+    }
+    bits
+}
+
+#[comptime_derive]
+fn receiver(input: DeriveInput) -> MetaParamList {
+    let parameters = meta_param_list_new();
+    meta_param_list_push(parameters, "self", derive_target_type(input));
+    parameters
+}
+
+#[comptime_derive]
+fn mask_expr(value: u64) -> MetaExpr {
+    meta_expr_integer(decimal(value), meta_type_call_site("u64"))
+}
+
+#[comptime_derive(Flags)]
+pub fn derive_flags(input: DeriveInput) -> DeriveOutput {
+    if derive_item_kind(input) != 0 || derive_field_count(input) != 1
+        || derive_generic_count(input) != 0 {
+        compile_error("Flags derive requires a non-generic struct with exactly one integer field")
+    }
+    let storage = derive_field_type(input, 0);
+    if meta_type_kind(storage) != "primitive" && meta_type_kind(storage) != "named" {
+        compile_error("Flags requires one primitive integer field")
+    }
+    let width = storage_width(meta_type_name(storage));
+    let mask: u64 = if width == 64 {
+        18446744073709551615
+    } else {
+        (1.to_u64() << width) - 1
+    };
+    let mut attribute_index = -1;
+    for index in 0..derive_attribute_count(input) {
+        if meta_attribute_name(derive_attribute(input, index)) == "flags" {
+            if attribute_index >= 0 {
+                compile_error("Flags accepts exactly one flags attribute")
+            }
+            attribute_index = index;
+        }
+    }
+    if attribute_index < 0 {
+        compile_error("Flags requires #[flags(...)]")
+    }
+    let attribute = derive_attribute(input, attribute_index);
+    if !meta_attribute_has_argument_list(attribute) {
+        compile_error("Flags requires #[flags(...)]")
+    }
+    let count = meta_attribute_argument_count(attribute);
+    if count > 256 {
+        compile_error("Flags supports at most 256 declarations")
+    }
+    let definitions = meta_expr_list_new();
+    let mut known: u64 = 0;
+    let mut named: u64 = 0;
+    for index in 0..count {
+        if meta_attribute_argument_kind(attribute, index) != "named"
+            || meta_attribute_argument_value_kind(attribute, index) != "string" {
+            compile_error("flags declarations require NAME = \"mask\"")
+        }
+        let name = meta_attribute_argument_name(attribute, index);
+        if name.starts_with("0x") {
+            compile_error("flag names cannot start with 0x")
+        }
+        for previous in 0..index {
+            if name != "unnamed" && name == meta_attribute_argument_name(attribute, previous) {
+                compile_error("duplicate flag name: " + name)
+            }
+        }
+        let bits = declaration_value(attribute, index, mask);
+        known |= bits;
+        if name != "unnamed" {
+            named |= bits;
+        }
+        let arguments = one_expr(
+            meta_expr_string(
+                if name == "unnamed" {
+                    ""
+                } else {
+                    name
+                },
+            ),
+        );
+        meta_expr_list_push(arguments, mask_expr(bits));
+        meta_expr_list_push(definitions, meta_expr_call(input, "Flag::new", arguments));
+    }
+    let output = derive_output_new(input, "Flags");
+    let field = derive_field_name(input, 0);
+    let stored = meta_expr_field(meta_expr_var("self"), field);
+    let widened = if meta_type_name(storage) == "u64" {
+        stored
+    } else {
+        meta_expr_method_call(stored, "to_u64", meta_expr_list_new())
+    };
+    derive_output_add_method(
+        output,
+        meta_method(
+            "bits",
+            receiver(input),
+            meta_type_call_site("u64"),
+            meta_expr_binary(5, widened, mask_expr(mask)),
+        ),
+    );
+    let parameters = meta_param_list_new();
+    meta_param_list_push(parameters, "bits", meta_type_call_site("u64"));
+    let fields = meta_expr_field_list_new();
+    let conversion = "to_"
+        + if meta_type_name(storage) == "byte" {
+            "u8"
+        } else {
+            meta_type_name(storage)
+        };
+    meta_expr_field_list_push(
+        fields,
+        field,
+        if meta_type_name(storage) == "u64" {
+            meta_expr_var("bits")
+        } else {
+            meta_expr_method_call(meta_expr_var("bits"), conversion, meta_expr_list_new())
+        },
+    );
+    derive_output_add_method(
+        output,
+        meta_method(
+            "from_bits_retain",
+            parameters,
+            derive_target_type(input),
+            meta_expr_target_struct(input, fields),
+        ),
+    );
+    derive_output_add_method(
+        output,
+        meta_method("storage_mask", receiver(input), meta_type_call_site("u64"), mask_expr(mask)),
+    );
+    derive_output_add_method(
+        output,
+        meta_method("known_mask", receiver(input), meta_type_call_site("u64"), mask_expr(known)),
+    );
+    derive_output_add_method(
+        output,
+        meta_method("named_mask", receiver(input), meta_type_call_site("u64"), mask_expr(named)),
+    );
+    derive_output_add_method(
+        output,
+        meta_method(
+            "type_name",
+            receiver(input),
+            meta_type_call_site("string"),
+            meta_expr_string(derive_item_name(input)),
+        ),
+    );
+    derive_output_add_method(
+        output,
+        meta_method(
+            "definitions",
+            receiver(input),
+            meta_type_apply(meta_type_call_site("Vec"), one_type(meta_type_named(input, "Flag"))),
+            meta_expr_call_site("Vec::from_array", one_expr(meta_expr_array(definitions))),
+        ),
+    );
+    output
+}

@@ -1,0 +1,288 @@
+package tempfile;
+
+use std::io;
+use io::{Read, Write};
+
+struct Memory {
+    data: Vec[byte],
+    position: i64,
+}
+
+enum SpoolState {
+    Memory(Memory),
+    Disk(File),
+    Closed,
+}
+
+pub struct SpooledTempFile {
+    limit: isize,
+    builder: Builder,
+    state: Channel[SpoolState],
+}
+
+fn memory_position(memory: Memory, position: SeekFrom) -> Result[i64, io::Error] {
+    let (base, offset) = match position {
+        Start(value) => (0, value),
+        Current(value) => (memory.position, value),
+        End(value) => (memory.data.len().to_i64(), value),
+    };
+    if offset < -base || offset > 9223372036854775807 - base {
+        Result::Err(
+            failure(
+                io::ErrorKind::InvalidInput,
+                "seek spooled file",
+                "offset is negative or exceeds i64",
+            ),
+        )
+    } else {
+        Result::Ok(base + offset)
+    }
+}
+
+impl SpooledTempFile {
+    pub fn new(limit: isize) -> Result[SpooledTempFile, io::Error] {
+        SpooledTempFile::with_builder(limit, Builder::new())
+    }
+
+    pub fn with_builder(limit: isize, builder: Builder) -> Result[SpooledTempFile, io::Error] {
+        if limit < 0 {
+            return Result::Err(
+                failure(
+                    io::ErrorKind::InvalidInput,
+                    "spooled file",
+                    "memory limit must be non-negative",
+                ),
+            )
+        }
+        builder.validate()?;
+        let state = Channel::new(1);
+        state.send(SpoolState::Memory(Memory { data: Vec::new(), position: 0 }));
+        Result::Ok(SpooledTempFile { limit, builder, state })
+    }
+
+    fn locked[T](self: SpooledTempFile, action: (Ref[SpoolState]) -> Result[T, io::Error]) -> Result[
+        T,
+        io::Error,
+    ] {
+        let state = Ref::new(self.state.recv().ok_or(inactive())?);
+        defer {
+            self.state.send(state.get());
+        };
+        action(state)
+    }
+
+    fn roll(self: SpooledTempFile, state: Ref[SpoolState]) -> Result[File, io::Error] {
+        match state.get() {
+            Closed => Result::Err(inactive()),
+            Disk(file) => Result::Ok(file),
+            Memory(memory) => {
+                let file = self.builder.anonymous()?;
+                let transferred = Ref::new(false);
+                defer {
+                    if !transferred.get() {
+                        let _ = file.close();
+                    }
+                };
+                file.write_all(memory.data.as_slice())?;
+                let _ = file.seek(SeekFrom::Start(memory.position))?;
+                state.set(SpoolState::Disk(file));
+                transferred.set(true);
+                Result::Ok(file)
+            },
+        }
+    }
+
+    pub fn rollover(self: SpooledTempFile) -> Result[(), io::Error] {
+        self.locked(|state| self.roll(state).map(|_| ()))
+    }
+
+    pub fn is_rolled(self: SpooledTempFile) -> bool {
+        self.locked(
+            |state| Result::Ok(
+                match state.get() {
+                    Disk(_) => true,
+                    _ => false,
+                },
+            ),
+        ).unwrap_or(false)
+    }
+
+    pub fn is_closed(self: SpooledTempFile) -> bool {
+        self.locked(
+            |state| Result::Ok(
+                match state.get() {
+                    Closed => true,
+                    _ => false,
+                },
+            ),
+        ).unwrap_or(true)
+    }
+
+    pub fn len(self: SpooledTempFile) -> Result[i64, io::Error] {
+        self.locked(
+            |state| match state.get() {
+                Memory(memory) => Result::Ok(memory.data.len().to_i64()),
+                Disk(file) => file.len(),
+                Closed => Result::Err(inactive()),
+            },
+        )
+    }
+
+    pub fn seek(self: SpooledTempFile, position: SeekFrom) -> Result[u64, io::Error] {
+        self.locked(
+            |state| match state.get() {
+                Memory(mut memory) => {
+                    memory.position = memory_position(memory, position)?;
+                    state.set(SpoolState::Memory(memory));
+                    Result::Ok(memory.position.to_u64())
+                },
+                Disk(file) => file.seek(position),
+                Closed => Result::Err(inactive()),
+            },
+        )
+    }
+
+    pub fn rewind(self: SpooledTempFile) -> Result[(), io::Error] {
+        self.seek(SeekFrom::Start(0)).map(|_| ())
+    }
+
+    pub fn set_len(self: SpooledTempFile, length: i64) -> Result[(), io::Error] {
+        if length < 0 {
+            return Result::Err(
+                failure(io::ErrorKind::InvalidInput, "set spooled length", "negative length"),
+            )
+        }
+        self.locked(
+            |state| {
+                if length > self.limit.to_i64() {
+                    return self.roll(state)?.set_len(length)
+                }
+                match state.get() {
+                    Memory(memory) => {
+                        while memory.data.len().to_i64() < length {
+                            memory.data.push(0);
+                        }
+                        memory.data.truncate(length.to_isize());
+                        Result::Ok(())
+                    },
+                    Disk(file) => file.set_len(length),
+                    Closed => Result::Err(inactive()),
+                }
+            },
+        )
+    }
+
+    pub fn sync_all(self: SpooledTempFile) -> Result[(), io::Error] {
+        self.locked(
+            |state| match state.get() {
+                Closed => Result::Err(inactive()),
+                Memory(_) => Result::Ok(()),
+                Disk(file) => file.sync_all(),
+            },
+        )
+    }
+
+    pub fn into_file(self: SpooledTempFile) -> Result[File, io::Error] {
+        self.locked(
+            |state| {
+                let file = self.roll(state)?;
+                state.set(SpoolState::Closed);
+                Result::Ok(file)
+            },
+        )
+    }
+
+    pub fn close(self: SpooledTempFile) -> Result[(), io::Error] {
+        self.locked(
+            |state| {
+                let previous = state.get();
+                state.set(SpoolState::Closed);
+                match previous {
+                    Disk(file) => file.close(),
+                    _ => Result::Ok(()),
+                }
+            },
+        )
+    }
+}
+
+impl io::Read for SpooledTempFile {
+    fn read(self: SpooledTempFile, buffer: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.locked(
+            |state| match state.get() {
+                Closed => Result::Err(inactive()),
+                Disk(file) => file.read(buffer),
+                Memory(mut memory) => {
+                    if memory.position >= memory.data.len().to_i64() {
+                        return Result::Ok(0)
+                    }
+                    let remaining = memory.data.len() - memory.position.to_isize();
+                    let count = if remaining < buffer.len() {
+                        remaining
+                    } else {
+                        buffer.len()
+                    };
+                    for index in 0..count {
+                        buffer[index] = memory.data[memory.position.to_isize() + index];
+                    }
+                    memory.position += count.to_i64();
+                    state.set(SpoolState::Memory(memory));
+                    Result::Ok(count)
+                },
+            },
+        )
+    }
+}
+
+impl io::Write for SpooledTempFile {
+    fn write(self: SpooledTempFile, buffer: Slice[byte]) -> Result[isize, io::Error] {
+        self.locked(
+            |state| match state.get() {
+                Closed => Result::Err(inactive()),
+                Disk(file) => file.write(buffer),
+                Memory(mut memory) => {
+                    if buffer.len() == 0 {
+                        return Result::Ok(0)
+                    }
+                    if memory.position > 9223372036854775807 - buffer.len().to_i64() {
+                        return Result::Err(
+                            failure(
+                                io::ErrorKind::InvalidInput,
+                                "write spooled file",
+                                "offset exceeds i64",
+                            ),
+                        )
+                    }
+                    let end = memory.position + buffer.len().to_i64();
+                    if end > self.limit.to_i64() {
+                        return self.roll(state)?.write(buffer)
+                    }
+                    while memory.data.len().to_i64() < end {
+                        memory.data.push(0);
+                    }
+                    for index in 0..buffer.len() {
+                        memory.data[memory.position.to_isize() + index] = buffer[index];
+                    }
+                    memory.position = end;
+                    state.set(SpoolState::Memory(memory));
+                    Result::Ok(buffer.len())
+                },
+            },
+        )
+    }
+
+    fn flush(self: SpooledTempFile) -> Result[(), io::Error] {
+        self.locked(
+            |state| match state.get() {
+                Closed => Result::Err(inactive()),
+                _ => Result::Ok(()),
+            },
+        )
+    }
+}
+
+impl io::Close for SpooledTempFile {
+    fn close(self: SpooledTempFile) -> Result[(), io::Error] {
+        self.close()
+    }
+}
