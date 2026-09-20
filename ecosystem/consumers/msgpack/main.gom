@@ -1,0 +1,203 @@
+package main;
+
+use ecosystem::msgpack;
+use ecosystem::msgpack::{Serialize, Deserialize, Binary};
+use std::env;
+use std::io;
+use std::json;
+use std::process;
+
+#[derive(Serialize, Deserialize)]
+pub enum State {
+    Idle,
+    Move(i32, i32),
+    Named {
+        value: u16,
+        label: string,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Message {
+    pub id: u64,
+    pub name: string,
+    pub active: bool,
+    pub payload: Binary,
+    pub points: Vec[(i32, f64)],
+    pub state: State,
+    pub maybe: Option[string],
+}
+
+fn nibble(byte: u8) -> Result[u8, string] {
+    if byte >= 48 && byte <= 57 {
+        Result::Ok(byte - 48)
+    } else if byte >= 97 && byte <= 102 {
+        Result::Ok(byte - 87)
+    } else {
+        Result::Err("invalid hex digit")
+    }
+}
+
+fn unhex(value: string) -> Result[Vec[u8], string] {
+    if value.byte_len() % 2 != 0 {
+        return Result::Err("odd hex length")
+    }
+    let bytes = value.to_bytes();
+    let output = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        output.push(nibble(bytes[index])? * 16 + nibble(bytes[index + 1])?);
+        index += 2;
+    }
+    Result::Ok(output)
+}
+
+fn hex(value: Vec[u8]) -> string {
+    let digits = "0123456789abcdef".to_bytes();
+    let output = Vec::with_capacity(value.len() * 2);
+    for byte in value {
+        output.push(digits[(byte / 16).to_isize()]);
+        output.push(digits[(byte % 16).to_isize()]);
+    }
+    string_from_utf8(output).1
+}
+
+fn member(value: json::Value, name: string) -> Option[json::Value] {
+    json::field(value, name)
+}
+
+fn flag(value: json::Value, name: string) -> bool {
+    member(value, name).and_then(|field| json::as_bool(field)).unwrap_or(false)
+}
+
+fn handle(request: json::Value) -> Result[json::Value, string] {
+    let encoded = unhex(
+        member(request, "hex").and_then(|field| json::as_string(field)).ok_or("missing hex")?,
+    )?;
+    let operation = member(request, "operation").and_then(|field| json::as_string(field)).unwrap_or(
+        "repack",
+    );
+    let options = msgpack::Options {
+        limits: msgpack::Limits::standard(),
+        structs_as_arrays: flag(request, "compact"),
+        variants_as_indices: flag(request, "compact"),
+        tagged_options: flag(request, "tagged"),
+        allow_invalid_utf8: flag(request, "raw"),
+    };
+    if operation == "timestamp" {
+        let timestamp = msgpack::Timestamp::from_value(
+            msgpack::unpack(encoded.as_slice()).map_err(|problem| problem.to_string())?,
+        ).map_err(|problem| problem.to_string())?;
+        let repacked = msgpack::pack(timestamp.to_value().map_err(|problem| problem.to_string())?).map_err(
+            |problem| problem.to_string(),
+        )?;
+        return Result::Ok(
+            json::Value::Object(
+                Vec::from_array(
+                    [
+                        ("hex", json::Value::String(hex(repacked))),
+                        ("seconds", json::Value::String(timestamp.seconds.to_string())),
+                        ("nanoseconds", json::Value::Number(timestamp.nanoseconds.to_string())),
+                    ],
+                ),
+            ),
+        )
+    }
+    if operation == "stream" {
+        let chunk = member(request, "chunk").and_then(|field| json::as_int(field)).unwrap_or(1);
+        if chunk < 1 {
+            return Result::Err("chunk must be positive")
+        }
+        let stream = msgpack::Unpacker::new(options).map_err(|problem| problem.to_string())?;
+        let results = Vec::new();
+        let mut start = 0;
+        while start < encoded.len() {
+            let end = if chunk > encoded.len() - start {
+                encoded.len()
+            } else {
+                start + chunk
+            };
+            stream.push(encoded.slice(start, end)).map_err(|problem| problem.to_string())?;
+            while let Some(value) = stream.next().map_err(|problem| problem.to_string())? {
+                results.push(
+                    json::Value::String(
+                        hex(
+                            msgpack::pack_with_options(value, options).map_err(
+                                |problem| problem.to_string(),
+                            )?,
+                        ),
+                    ),
+                );
+            }
+            start = end;
+        }
+        stream.finish().map_err(|problem| problem.to_string())?;
+        return Result::Ok(
+            json::Value::Object(Vec::from_array([("values", json::Value::Array(results))])),
+        )
+    }
+    let repacked = if operation == "typed" {
+        let value: Message = msgpack::from_slice_with_options(encoded.as_slice(), options).map_err(
+            |problem| problem.to_string(),
+        )?;
+        msgpack::to_vec_with_options(value, options).map_err(|problem| problem.to_string())?
+    } else {
+        let value = msgpack::unpack_with_options(encoded.as_slice(), options).map_err(
+            |problem| problem.to_string(),
+        )?;
+        msgpack::pack_with_options(value, options).map_err(|problem| problem.to_string())?
+    };
+    Result::Ok(json::Value::Object(Vec::from_array([("hex", json::Value::String(hex(repacked)))])))
+}
+
+pub fn exercise() -> Result[(), string] {
+    let value = Message {
+        id: 18446744073709551615,
+        name: "GoML 中文",
+        active: true,
+        payload: Binary { data: Vec::from_array([0, 255]) },
+        points: Vec::from_array([(-1, 2.5)]),
+        state: State::Named { value: 99, label: "ready" },
+        maybe: Option::Some("present"),
+    };
+    let encoded = msgpack::to_vec(value).map_err(|problem| problem.to_string())?;
+    let decoded: Message = msgpack::from_slice(encoded.as_slice()).map_err(
+        |problem| problem.to_string(),
+    )?;
+    if decoded.id != value.id || decoded.name != value.name
+        || decoded.payload.data != value.payload.data
+        || decoded.points != value.points {
+        return Result::Err("consumer round trip failed")
+    }
+    Result::Ok(())
+}
+
+fn run() -> Result[(), string] {
+    if env::args().len() == 1 {
+        exercise()?;
+        println("msgpack consumer: ok");
+        return Result::Ok(())
+    }
+    let input = io::read_stdin_to_string().map_err(|problem| problem.to_string())?;
+    let requests = json::as_array(json::parse(input)?).ok_or("expected array")?;
+    let responses = Vec::new();
+    for request in requests {
+        responses.push(
+            match handle(request) {
+                Ok(value) => value,
+                Err(message) => json::Value::Object(
+                    Vec::from_array([("error", json::Value::String(message))]),
+                ),
+            },
+        );
+    }
+    println(json::encode(json::Value::Array(responses)));
+    Result::Ok(())
+}
+
+fn main() -> () {
+    if let Err(message) = run() {
+        io::eprintln(message);
+        process::exit(1);
+    }
+}

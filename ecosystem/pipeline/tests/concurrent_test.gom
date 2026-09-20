@@ -1,0 +1,639 @@
+package tests;
+
+use ecosystem::pipeline;
+use ecosystem::pipeline::{Stream, RunOptions, ParallelOptions, Order, Control, ErrorKind};
+use std::task;
+use std::time;
+use std::testing;
+
+struct Counter {
+    gate: Channel[()],
+    value: Ref[isize],
+}
+
+impl Counter {
+    fn new() -> Counter {
+        let gate = Channel::new(1);
+        gate.send(());
+        Counter { gate, value: Ref::new(0) }
+    }
+
+    fn add(self: Counter, delta: isize) -> isize {
+        let _ = self.gate.recv();
+        defer self.gate.send(());
+        self.value.set(self.value.get() + delta);
+        self.value.get()
+    }
+
+    fn get(self: Counter) -> isize {
+        self.add(0)
+    }
+
+    fn maximum(self: Counter, value: isize) -> () {
+        let _ = self.gate.recv();
+        defer self.gate.send(());
+        if value > self.value.get() {
+            self.value.set(value);
+        }
+    }
+}
+
+fn signal[T](channel: Channel[T]) -> T {
+    let timer = time::Timer::new(time::Duration::from_seconds(3));
+    defer {
+        let _ = timer.stop();
+    };
+    let result = select {
+        recv(channel) as value => value,
+        recv(timer.done()) as _ => Option::None,
+    };
+    testing::expect_some(result, "timed rendezvous")
+}
+
+fn parallel_options(order: Order) -> ParallelOptions {
+    ParallelOptions { max_in_flight: 4, ..ParallelOptions::new(3, 2, order) }
+}
+
+#[test]
+fn ordered_reassembly_includes_filtered_positions_and_bounds_read_ahead() -> () {
+    let scopes = task::active_scope_count();
+    for drop_head in Vec::from_array([false, true]) {
+        let produced = Counter::new();
+        let tails: Channel[isize] = Channel::new(4);
+        let release: Channel[()] = Channel::new(0);
+        let emitted: Channel[isize] = Channel::new(100);
+        let source = numbers(30).inspect(
+            |_, _| {
+                let _ = produced.add(1);
+                Result::Ok(())
+            },
+        );
+        let mapped = testing::expect_ok(
+            source.parallel_filter_map(
+                parallel_options(Order::Input),
+                |cancel, value| {
+                    if value == 0 {
+                        let _ = task::recv_with(cancel, release);
+                    } else if value < 4 {
+                        tails.send(value);
+                    }
+                    Result::Ok(
+                        if drop_head && value == 0 {
+                            Option::None
+                        } else {
+                            Option::Some(value * 2)
+                        },
+                    )
+                },
+            ),
+            "ordered mapper",
+        );
+        task::scope(
+            |scope| {
+                let worker = scope.spawn(
+                    |_| mapped.for_each(
+                        RunOptions::standard().with_timeout(time::Duration::from_seconds(3)),
+                        |_, value| {
+                            emitted.send(value);
+                            Result::Ok(Control::Continue)
+                        },
+                    ),
+                );
+                for _ in 0..3 {
+                    let _ = signal(tails);
+                }
+                testing::assert(produced.get() <= 5);
+                testing::assert(
+                    select {
+                        recv(emitted) as _ => false,
+                        default => true,
+                    },
+                );
+                release.close();
+                let report = testing::expect_ok(worker.join(), "ordered run");
+                testing::assert_eq(
+                    report.emitted,
+                    if drop_head {
+                        29
+                    } else {
+                        30
+                    },
+                );
+                for value in if drop_head {
+                    1
+                } else {
+                    0
+                }..30 {
+                    testing::assert_eq(signal(emitted), value * 2);
+                }
+            },
+        );
+    }
+    testing::assert_eq(task::active_scope_count(), scopes);
+}
+
+#[test]
+fn completion_order_can_emit_while_first_input_is_blocked() -> () {
+    let release: Channel[()] = Channel::new(0);
+    let emitted: Channel[isize] = Channel::new(100);
+    let mapped = testing::expect_ok(
+        numbers(20).parallel_map(
+            parallel_options(Order::Completion),
+            |cancel, value| {
+                if value == 0 {
+                    let _ = task::recv_with(cancel, release);
+                }
+                Result::Ok(value)
+            },
+        ),
+        "unordered mapper",
+    );
+    task::scope(
+        |scope| {
+            let worker = scope.spawn(
+                |_| mapped.for_each(
+                    RunOptions::standard().with_timeout(time::Duration::from_seconds(3)),
+                    |_, value| {
+                        emitted.send(value);
+                        Result::Ok(Control::Continue)
+                    },
+                ),
+            );
+            let first = signal(emitted);
+            testing::assert(first != 0);
+            release.close();
+            testing::assert_eq(testing::expect_ok(worker.join(), "unordered run").emitted, 20);
+            let seen: HashMap[isize, bool] = HashMap::new();
+            seen.insert(first, true);
+            for _ in 1..20 {
+                let value = signal(emitted);
+                testing::assert(seen.get(value).is_none());
+                seen.insert(value, true);
+            }
+            testing::assert_eq(seen.len(), 20);
+        },
+    );
+}
+
+#[test]
+fn worker_limit_and_sink_backpressure_are_enforced() -> () {
+    let active = Counter::new();
+    let peak = Counter::new();
+    let produced = Counter::new();
+    let started: Channel[()] = Channel::new(3);
+    let workers_release: Channel[()] = Channel::new(0);
+    let sink_entered: Channel[()] = Channel::new(1);
+    let sink_release: Channel[()] = Channel::new(0);
+    let stream = numbers(100).inspect(
+        |_, _| {
+            let _ = produced.add(1);
+            Result::Ok(())
+        },
+    );
+    let mapped = testing::expect_ok(
+        stream.parallel_map(
+            parallel_options(Order::Input),
+            |cancel, value| {
+                let now = active.add(1);
+                peak.maximum(now);
+                defer {
+                    let _ = active.add(-1);
+                };
+                if value < 3 {
+                    started.send(());
+                }
+                let _ = task::recv_with(cancel, workers_release);
+                Result::Ok(value)
+            },
+        ),
+        "workers",
+    );
+    task::scope(
+        |scope| {
+            let worker = scope.spawn(
+                |_| mapped.for_each(
+                    RunOptions::standard().with_timeout(time::Duration::from_seconds(3)),
+                    |cancel, value| {
+                        if value == 0 {
+                            sink_entered.send(());
+                            let _ = task::recv_with(cancel, sink_release);
+                        }
+                        Result::Ok(Control::Continue)
+                    },
+                ),
+            );
+            for _ in 0..3 {
+                let _ = signal(started);
+            }
+            testing::assert_eq(active.get(), 3);
+            testing::assert_eq(peak.get(), 3);
+            testing::assert(produced.get() <= 5);
+            workers_release.close();
+            let _ = signal(sink_entered);
+            testing::assert(produced.get() <= 5);
+            sink_release.close();
+            testing::assert_eq(testing::expect_ok(worker.join(), "backpressure run").emitted, 100);
+        },
+    );
+    testing::assert_eq(active.get(), 0);
+    testing::assert(peak.get() <= 3);
+}
+
+#[test]
+fn rendezvous_channels_and_small_in_flight_windows_do_not_deadlock() -> () {
+    for capacity in 0..4 {
+        for order in Vec::from_array([Order::Input, Order::Completion]) {
+            for window in 1..6 {
+                let options = ParallelOptions {
+                    max_in_flight: window,
+                    ..ParallelOptions::new(4, capacity, order),
+                };
+                let mapped = testing::expect_ok(
+                    numbers(71).parallel_filter_map(
+                        options,
+                        |_, value| Result::Ok(
+                            if value % 3 == 0 {
+                                Option::None
+                            } else {
+                                Option::Some(value * value)
+                            },
+                        ),
+                    ),
+                    "bounded mapper",
+                );
+                let actual = collect(mapped);
+                testing::assert_eq(actual.len(), 47);
+                let mut sum = 0;
+                for value in actual {
+                    sum += value;
+                }
+                testing::assert_eq(sum, 77879);
+                if order == Order::Input {
+                    let expected = collect(
+                        numbers(71).filter(|value| value % 3 != 0).map(|value| value * value),
+                    );
+                    testing::assert(actual == expected);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cancellation_unblocks_all_stages_and_waits_for_worker_cleanup() -> () {
+    let scopes = task::active_scope_count();
+    let active = Counter::new();
+    let entered: Channel[()] = Channel::new(1);
+    let never: Channel[()] = Channel::new(0);
+    let endless: Stream[isize, string] = pipeline::repeat(1);
+    let stage = testing::expect_ok(
+        endless.parallel_map(
+            parallel_options(Order::Input),
+            |cancel, value| {
+                let _ = active.add(1);
+                defer {
+                    let _ = active.add(-1);
+                };
+                select {
+                    send(entered,()) => (),
+                    default => (),
+                }
+                let _ = task::recv_with(cancel, never);
+                Result::Ok(value)
+            },
+        ),
+        "blocked mapper",
+    );
+    let stage = stage.inspect(|_, _| Result::Ok(()));
+    task::scope(
+        |scope| {
+            let worker = scope.spawn(
+                |cancel| {
+                    stage.collect(RunOptions::standard().with_cancel(cancel))
+                },
+            );
+            let _ = signal(entered);
+            scope.cancel();
+            testing::assert_eq(
+                testing::expect_err(worker.join(), "cancelled run").kind,
+                ErrorKind::Cancelled,
+            );
+        },
+    );
+    testing::assert_eq(active.get(), 0);
+    testing::assert_eq(task::active_scope_count(), scopes);
+}
+
+#[test]
+fn timeout_stops_blocked_source_mapper_and_receiver() -> () {
+    let scopes = task::active_scope_count();
+    let never: Channel[isize] = Channel::new(0);
+    let source: Stream[isize, string] = pipeline::from_receiver(never.receiver());
+    let started = time::Instant::now();
+    let options = RunOptions::standard().with_timeout(time::Duration::from_milliseconds(30));
+    testing::assert_eq(
+        testing::expect_err(source.collect(options), "receiver deadline").kind,
+        ErrorKind::Timeout,
+    );
+    let mapped = testing::expect_ok(
+        numbers(10).parallel_map(
+            parallel_options(Order::Input),
+            |cancel, value| {
+                let _ = time::sleep_with(cancel, time::Duration::from_seconds(10));
+                Result::Ok(value)
+            },
+        ),
+        "slow mapper",
+    );
+    testing::assert_eq(
+        testing::expect_err(mapped.collect(options), "mapper deadline").kind,
+        ErrorKind::Timeout,
+    );
+    testing::assert(started.elapsed().compare(time::Duration::from_seconds(2)) < 0);
+    testing::assert_eq(task::active_scope_count(), scopes);
+}
+
+#[test]
+fn source_and_worker_errors_cancel_siblings_and_keep_causes() -> () {
+    let scopes = task::active_scope_count();
+    let active = Counter::new();
+    let mapped = testing::expect_ok(
+        numbers(1000).parallel_map(
+            parallel_options(Order::Input),
+            |cancel, value| {
+                let _ = active.add(1);
+                defer {
+                    let _ = active.add(-1);
+                };
+                if value == 2 {
+                    return Result::Err("worker failure")
+                }
+                let _ = time::sleep_with(cancel, time::Duration::from_seconds(10));
+                Result::Ok(value)
+            },
+        ),
+        "fallible workers",
+    );
+    let problem = testing::expect_err(
+        mapped.collect(RunOptions::standard().with_timeout(time::Duration::from_seconds(2))),
+        "worker error",
+    );
+    testing::assert_eq(problem.kind, ErrorKind::Stage);
+    testing::assert(problem.cause == Option::Some("worker failure"));
+    testing::assert(problem.index == Option::Some(2));
+    testing::assert_eq(active.get(), 0);
+    let source: Stream[isize, string] = pipeline::from_producer(
+        |_, emit| {
+            let _ = emit(1);
+            Result::Err("source failure")
+        },
+    );
+    let mapped = testing::expect_ok(source.buffer(0), "buffered source");
+    let problem = testing::expect_err(mapped.collect(RunOptions::standard()), "source error");
+    testing::assert(problem.cause == Option::Some("source failure"));
+    testing::assert_eq(task::active_scope_count(), scopes);
+}
+
+#[test]
+fn sink_stop_and_failure_cancel_infinite_upstream_and_nested_pools() -> () {
+    let scopes = task::active_scope_count();
+    let generated = Counter::new();
+    let source: Stream[isize, string] = pipeline::generate(
+        || |cancel| {
+            if cancel.is_cancelled() {
+                Result::Ok(Option::None)
+            } else {
+                Result::Ok(Option::Some(generated.add(1)))
+            }
+        },
+    );
+    let stage = testing::expect_ok(
+        source.parallel_map(parallel_options(Order::Input), |_, value| Result::Ok(value)),
+        "first pool",
+    );
+    let stage = testing::expect_ok(
+        stage.parallel_filter(parallel_options(Order::Input), |_, value| Result::Ok(value % 2 == 0)),
+        "second pool",
+    );
+    let stage = testing::expect_ok(stage.buffer(0), "buffer");
+    testing::assert_eq(collect(testing::expect_ok(stage.take(5), "take")).len(), 5);
+    testing::assert(generated.get() < 40);
+    let problem = testing::expect_err(
+        stage.for_each(RunOptions::standard(), |_, _| Result::Err("sink failed")),
+        "sink error",
+    );
+    testing::assert(problem.cause == Option::Some("sink failed"));
+    testing::assert_eq(task::active_scope_count(), scopes);
+}
+
+#[test]
+fn merge_is_bounded_and_zip_cancels_the_longer_input() -> () {
+    let scopes = task::active_scope_count();
+    let merged = testing::expect_ok(
+        pipeline::merge(Vec::from_array([numbers(5), numbers(8).map(|value| value + 10)]), 0),
+        "merge",
+    );
+    let result = collect(merged);
+    testing::assert_eq(result.len(), 13);
+    let seen: HashMap[isize, bool] = HashMap::new();
+    for value in result {
+        testing::assert(seen.get(value).is_none());
+        seen.insert(value, true);
+    }
+    let repeated: Stream[string, string] = pipeline::repeat("x");
+    let zipped = collect(testing::expect_ok(numbers(3).zip(repeated, 1), "zip"));
+    testing::assert(zipped == Vec::from_array([(0, "x"), (1, "x"), (2, "x")]));
+    let never: Channel[isize] = Channel::new(0);
+    let waiting: Stream[isize, string] = pipeline::from_receiver(never.receiver());
+    testing::assert(
+        collect(testing::expect_ok(waiting.zip(numbers(0), 0), "empty right")).is_empty(),
+    );
+    testing::assert(
+        collect(testing::expect_ok(numbers(0).zip(waiting, 0), "empty left")).is_empty(),
+    );
+    let sources: Vec[Stream[isize, string]] = Vec::new();
+    testing::assert(
+        collect(testing::expect_ok(pipeline::merge(sources, 0), "empty merge")).is_empty(),
+    );
+    testing::assert_eq(task::active_scope_count(), scopes);
+}
+
+#[test]
+fn merge_and_zip_propagate_errors_and_early_stop() -> () {
+    let scopes = task::active_scope_count();
+    let broken: Stream[isize, string] = pipeline::from_producer(|_, _| Result::Err("branch error"));
+    let never: Channel[isize] = Channel::new(0);
+    let waiting: Stream[isize, string] = pipeline::from_receiver(never.receiver());
+    for stream in Vec::from_array(
+        [
+            testing::expect_ok(pipeline::merge(Vec::from_array([broken, waiting]), 0), "merge"),
+            testing::expect_ok(broken.zip(waiting, 0), "zip").map(|pair| pair.0),
+            testing::expect_ok(waiting.zip(broken, 0), "zip").map(|pair| pair.0),
+        ],
+    ) {
+        let problem = testing::expect_err(
+            stream.collect(RunOptions::standard().with_timeout(time::Duration::from_seconds(2))),
+            "branch failure",
+        );
+        testing::assert(problem.cause == Option::Some("branch error"));
+    }
+    let infinite: Stream[isize, string] = pipeline::repeat(7);
+    let merged = testing::expect_ok(
+        pipeline::merge(Vec::from_array([infinite, infinite]), 1),
+        "infinite merge",
+    );
+    testing::assert_eq(collect(testing::expect_ok(merged.take(3), "take")).len(), 3);
+    testing::assert_eq(task::active_scope_count(), scopes);
+}
+
+#[test]
+fn cleanup_errors_after_early_stop_are_observed_after_joining() -> () {
+    let scopes = task::active_scope_count();
+    let source: Stream[isize, string] = pipeline::from_producer(
+        |cancel, emit| {
+            let _ = emit(1);
+            let _ = cancel.done().recv();
+            Result::Err("cleanup failed")
+        },
+    );
+    for stream in Vec::from_array(
+        [
+            testing::expect_ok(source.buffer(0), "buffer"),
+            testing::expect_ok(pipeline::merge(Vec::from_array([source]), 0), "merge"),
+            testing::expect_ok(source.zip(numbers(1), 0), "zip").map(|pair| pair.0),
+        ],
+    ) {
+        let limited = testing::expect_ok(stream.take(1), "take");
+        let problem = testing::expect_err(
+            limited.collect(RunOptions::standard().with_timeout(time::Duration::from_seconds(2))),
+            "cleanup error",
+        );
+        testing::assert_eq(problem.kind, ErrorKind::Stage);
+        testing::assert(problem.cause == Option::Some("cleanup failed"));
+    }
+    testing::assert_eq(task::active_scope_count(), scopes);
+}
+
+#[test]
+fn whole_run_timeout_is_not_reset_by_continued_progress() -> () {
+    let source: Stream[isize, string] = pipeline::generate(
+        || |cancel| {
+            match time::sleep_with(cancel, time::Duration::from_milliseconds(5)) {
+                task::WaitResult::Completed(()) => Result::Ok(Option::Some(1)),
+                task::WaitResult::Cancelled => Result::Ok(Option::None),
+            }
+        },
+    );
+    let started = time::Instant::now();
+    let problem = testing::expect_err(
+        source.collect(RunOptions::standard().with_timeout(time::Duration::from_milliseconds(40))),
+        "absolute deadline",
+    );
+    testing::assert_eq(problem.kind, ErrorKind::Timeout);
+    testing::assert(started.elapsed().compare(time::Duration::from_seconds(1)) < 0);
+}
+
+#[test]
+fn upstream_failure_cancels_blocked_downstream_callbacks_immediately() -> () {
+    let scopes = task::active_scope_count();
+    for block_mapper in Vec::from_array([false, true]) {
+        let entered: Channel[()] = Channel::new(1);
+        let pool = testing::expect_ok(
+            numbers(2).parallel_map(
+                ParallelOptions::new(2, 0, Order::Input),
+                |cancel, value| {
+                    if value == 1 {
+                        let _ = task::recv_with(cancel, entered);
+                        return Result::Err("upstream failed")
+                    }
+                    Result::Ok(value)
+                },
+            ),
+            "pool",
+        ).named("workers");
+        let stream = if block_mapper {
+            pool.try_map(
+                |cancel, value| {
+                    entered.send(());
+                    let _ = cancel.done().recv();
+                    Result::Ok(value)
+                },
+            )
+        } else {
+            pool
+        };
+        let started = time::Instant::now();
+        let problem = testing::expect_err(
+            stream.for_each(
+                RunOptions::standard().with_timeout(time::Duration::from_seconds(2)),
+                |cancel, _| {
+                    if !block_mapper {
+                        entered.send(());
+                        let _ = cancel.done().recv();
+                    }
+                    Result::Ok(Control::Continue)
+                },
+            ),
+            "propagated failure",
+        );
+        testing::assert_eq(problem.kind, ErrorKind::Stage);
+        testing::assert(problem.cause == Option::Some("upstream failed"));
+        testing::assert_eq(problem.stage, "workers/parallel map");
+        testing::assert(started.elapsed().compare(time::Duration::from_seconds(1)) < 0);
+    }
+    testing::assert_eq(task::active_scope_count(), scopes);
+}
+
+#[test]
+fn early_stop_is_local_and_failures_do_not_cancel_callers_scope() -> () {
+    let repeated: Stream[isize, string] = pipeline::repeat(9);
+    let first = testing::expect_ok(testing::expect_ok(repeated.buffer(1), "buffer").take(2), "take");
+    let second = testing::expect_ok(numbers(3).buffer(0), "second buffer");
+    testing::assert(collect(first.concat(second)) == Vec::from_array([9, 9, 0, 1, 2]));
+    task::scope(
+        |scope| {
+            let options = RunOptions::standard().with_cancel(scope.token());
+            let broken = numbers(4).try_map(
+                |_, value| if value == 1 {
+                    Result::Err("failed child")
+                } else {
+                    Result::Ok(value)
+                },
+            );
+            testing::assert_eq(
+                testing::expect_err(broken.collect(options), "child failure").kind,
+                ErrorKind::Stage,
+            );
+            testing::assert(!scope.token().is_cancelled());
+            testing::assert(
+                testing::expect_ok(numbers(2).collect(options), "next child")
+                    == Vec::from_array([0, 1]),
+            );
+        },
+    );
+}
+
+#[test]
+fn concurrent_runs_have_independent_operator_state() -> () {
+    let stream = numbers(50).scan(
+        || 0,
+        |_, sum, value| Result::Ok((sum + value, Option::Some(sum + value))),
+    );
+    let stream = testing::expect_ok(
+        stream.parallel_map(parallel_options(Order::Input), |_, value| Result::Ok(value * 3)),
+        "parallel sums",
+    ).enumerate();
+    task::scope(
+        |scope| {
+            let first = scope.spawn(|_| collect(stream));
+            let second = scope.spawn(|_| collect(stream));
+            for result in Vec::from_array([first.join(), second.join()]) {
+                testing::assert_eq(result.len(), 50);
+                for index in 0..50 {
+                    testing::assert_eq(result[index].0, index);
+                    testing::assert_eq(result[index].1, index * (index + 1) / 2 * 3);
+                }
+            }
+        },
+    );
+}
