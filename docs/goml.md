@@ -721,6 +721,8 @@ let trait_call = Convert::[i32]::convert::[string](value, fallback);
 
 Top-level functions and methods may introduce their own type parameters. A method's parameters are distinct from the parameters of its enclosing trait or impl and may have their own bounds and `where` predicates. Local named functions do not exist; use closures. Closures do not have generics. Structures, enumerations, traits, and impl blocks can also have type parameters.
 
+A free function may use a type parameter only in its body, with no occurrence in its parameter or result types. Supply such arguments explicitly, for example `schema::[User]()`, including when taking a function value. Those arguments are retained across package interfaces and specialization; an unused generic definition does not generate an unspecialized executable body.
+
 GoML monomorphizes generic calls. Recursive generic code must produce a limited number of concrete instances and cannot continually change to a new nested type with each recursive call.
 
 ## Blocks, bindings and assignments
@@ -944,6 +946,7 @@ let valid = !values[0];
 - Floating-point values implement `PartialEq + PartialOrd`, but not `Eq + Ord + Hash`. In particular, NaN is unequal to itself and its `partial_cmp` result is `None`.
 - Every integer type provides `to_isize`, `to_i8`, `to_i16`, `to_i32`, `to_i64`, `to_usize`, `to_u8`, `to_u16`, `to_u32`, and `to_u64` for the other integer types. Identity methods are omitted. `byte` uses the `u8` methods, `char` provides `to_u32`, and `u32` to `char` uses `char_from_u32`, which returns `Option[char]`.
 - `f32` provides `to_bits` and `to_f64`; `f64` provides `to_bits` and `to_f32`. The prelude functions `float32_from_bits` and `float64_from_bits` reconstruct values from their IEEE 754 bit patterns. The `f64` to `f32` conversion uses round-to-nearest, ties-to-even; the reverse conversion is exact.
+- Import `std::num::{ToFloat, TryToInt}` for scalar integer `.to_f32()` / `.to_f64()` and checked float `.try_to_i32()` / `.try_to_u64()` conversions, with analogous methods for every integer width. Float-to-integer methods truncate toward zero and reject nonfinite or out-of-range results.
 - Expression `as` is reserved for creating `dyn Trait` values. Numeric conversions use the integer and floating-point methods above; other non-`dyn` targets are rejected. The separate `as` form in `use package as alias;` still selects an import alias.
 
 There are no exponentiation, null coalescing or user-defined operators.
@@ -1658,6 +1661,8 @@ impl[T] Box[T] {
 
 Method type arguments are normally inferred. Write `box_value.map::[string](convert)` when explicit arguments are needed, or `Box::[i32]::map::[string](box_value, convert)` in associated form.
 
+Concrete and nested specializations also support associated constructors, for example `impl Box[f64]` and `impl[T] Box[Vec[T]]`. In `Box::[Vec[string]]::repeated("x")`, the owner argument denotes `Vec[string]`, while the implementation parameter `T` is `string`. Omitting owner arguments creates inference variables; an expected result such as `let value: Box[f64] = Box::empty();` can select a specialization. If several candidates remain, use explicit owner arguments; ambiguous lookup reports a diagnostic.
+
 ### Method parsing and UFCS
 
 For specific values, use:
@@ -1828,7 +1833,9 @@ Derive names have their own namespace, but ordinary `use` declarations populate 
 
 `std::serde` owns the format-independent `Serialize`, `Deserialize`, `Serializer`, and `Deserializer` traits and the two derives. Typed formats use `Serialize::serialize` and `Deserialize::deserialize`: the format handle is a method-level generic parameter, so monomorphization produces ordinary static calls without a runtime serializer trait object, Go interface dispatch, or runtime reflection. A derived struct emits fields directly and a derived enum emits its declaration index, wire name, shape, and payload directly. Derived named-field decoding accepts arbitrary field order, skips unknown fields, and rejects duplicate or missing fields. Struct fields, enum variants, and named variant fields support `#[serde(rename = "wire_name")]`.
 
-`serde::Value` remains the explicit dynamic data model. It retains exact signed and unsigned integer widths, floating-point widths, enum declaration indexes, field order, and variant shape. `Sequence`, `Tuple`, and `Optional` are distinct, and `Value::Number(string)` represents a textual number whose destination type is not yet known. `serde::to_value` and `serde::from_value` connect typed values to this model through `ValueSerializer` and `ValueDeserializer`; both return `Result`, and using them intentionally constructs or consumes a complete value tree. Unit, booleans, strings, chars, numeric primitives, `Value`, `Vec[T]`, `Option[T]`, and two- or three-element tuples have standard direct implementations.
+`serde::Value` remains the explicit dynamic data model. It retains exact signed and unsigned integer widths, floating-point widths, enum declaration indexes, field order, and variant shape. `Binary(Vec[byte])`, `Map(Vec[(Value, Value)])`, and `Extension { tag: i8, data: Vec[byte] }` preserve binary payloads, ordered arbitrary-key map entries (including duplicates), and opaque extension data. `Sequence`, `Tuple`, and `Optional` are distinct, and `Value::Number(string)` represents a textual number whose destination type is not yet known. `serde::to_value` and `serde::from_value` connect typed values to this model through `ValueSerializer` and `ValueDeserializer`; both return `Result`, and using them intentionally constructs or consumes a complete value tree. Unit, booleans, strings, chars, numeric primitives, `Value`, `Vec[T]`, `Option[T]`, and two- or three-element tuples have standard direct implementations.
+
+`Serializer::serialize_extension(tag, data)` and `Deserializer::deserialize_extension()` are optional events with recoverable unsupported defaults. Format implementations opt in explicitly. The value serializer copies binary and extension payloads and retains maps as `Value::Map`; the value deserializer also accepts the legacy sequence-of-key/value-tuples map representation. JSON and TOML reject extension events, and Bincode has no extension representation. TOML preserves its previous value-bridge encoding of binary as integer arrays and maps as arrays of key/value pairs. `json::try_from_serde_value` rejects extensions recursively. The older infallible `json::from_serde_value` remains a lossy projection: binary becomes an integer array, maps become arrays of pairs, and extensions become `{ "tag": ..., "data": [...] }`. Prefer checked conversion for format validation.
 
 `Serialize` and `Deserialize` have no `Value` fallback methods and `Deserialize` does not require a runtime schema. Handwritten implementations must implement the generic direct protocol. `Schema` remains available only for explicit dynamic operations such as `bincode::decode_value`; it is not derived or consulted by typed decoding.
 
@@ -2602,7 +2609,7 @@ API:
 - `reference.set(value) -> ()`
 - `ptr_eq(a, b) -> bool`, compare reference identities
 
-The built-in `PartialEq`, `Eq`, and `Hash` implementations for `Ref[T]` use reference identity and do not require `T` to implement those traits. Mutating the referenced value therefore does not change equality or hashing. `Ref[T]` does not implement `Default`, because implicit allocation and recursive default construction would be surprising.
+The built-in `PartialEq`, `Eq`, and `Hash` implementations for `Ref[T]` use reference identity and do not require `T` to implement those traits. Mutating the referenced value therefore does not change equality or hashing. Separate allocations have distinct identities even when `T` is `()`, an empty struct, or another zero-sized type. Copies of one reference keep its identity. `Ref[T]` does not implement `Default`, because implicit allocation and recursive default construction would be surprising.
 
 ### Fixed arrays
 
@@ -2804,6 +2811,7 @@ use std::bytes::endian;
 use std::channel;
 use std::cmp;
 use std::collections;
+use std::context;
 use std::crypto;
 use std::encoding::base64;
 use std::encoding::hex;
@@ -2817,6 +2825,8 @@ use std::io;
 use std::iter;
 use std::json;
 use std::math;
+use std::net;
+use std::net::tls;
 use std::num;
 use std::os::linux::syscall;
 use std::path;
@@ -2842,6 +2852,7 @@ Public APIs include:
 - `cmp::Ordering`, `Ord`, `Reverse`, comparison helpers, and two-value minimum, maximum, and clamping operations. `Ordering` is a builtin type re-exported by `cmp`.
 - `collections::Arena`, `BinaryHeap`, `BitSet`, `BTreeMap`, `BTreeSet`, `Deque`, `HashSet`, `IndexMap`, `IndexSet`, `IndexVec`, `Interner`, and `Stack`; hash-backed collections require `Hash + Eq`, while tree collections and heaps use `cmp::Ord`
 - `collections::sort`, `stable_sort`, `binary_search`, `min`, `max`, and their comparator variants. The sorting, search, selection, and deduplication methods on `Vec[T]` are the canonical forms.
+- `context::{Context, CancelHandle, Deadline}` and scoped `with_cancel`, `with_timeout`, and `with_deadline`
 - `crypto::hash` one-shot SHA-256 and `crypto::rand` operating-system random bytes
 - `encoding::hex` lowercase and uppercase hexadecimal encoding plus checked decoding
 - `encoding::base64` RFC 4648 standard and URL-safe encoding with padded and unpadded variants
@@ -2851,12 +2862,13 @@ Public APIs include:
 - `fs::read_file_structured`, `write_file_structured`, structured byte I/O, directory operations, path inspection, and `sha256_file`
 - `fs::notify` Linux amd64 file and recursive-directory notifications, event filters, ignore rules with subtree pruning, independent multi-path registrations, cancellable reads, bounded subscriptions, rename cookies, and rescan signals
 - `fs::walkdir::{walk, WalkDir, WalkIterator, DirEntry, Error}` for lazy directory traversal, depth bounds, pruning, link following, and contextual errors
-- `io::print`, `println`, `eprint`, `eprintln`, and byte-oriented standard stream I/O
+- `io::{Read, Write, BufRead, Close}`, `Cursor`, `Take`, `BufReader`, `BufWriter`, `copy`, `stdin`, `stdout`, `stderr`, and the existing standard-stream functions
 - `iter::empty`, `once`, `from_fn`, iterator adapters, and single-pass consumers
 - `json::Value`, `parse`, `encode`, serde `Serialize` and `Deserialize` re-exports, `to_value`, `from_value`, `try_to_string`, `from_string`, `field`, and typed `as_*` accessors
 - `math` f32/f64 elementary functions, IEEE 754 classification, and the `E`, `PI`, `TAU`, `SQRT_2`, `LN_2`, and `LN_10` constants
 - `net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket, WaitOptions}` for Linux amd64 syscall-backed IPv4/IPv6 networking, shared epoll readiness, timeouts, and cancellation
-- `num` structured parsing plus checked and saturating `i64` arithmetic
+- `net::resolve`, `resolve_with`, `TcpStream::connect_host`, and `net::tls` verified TLS clients
+- `num` structured parsing, scalar conversion traits, explicit rounding modes, plus checked and saturating `i64` arithmetic
 - `os::linux::syscall` Linux amd64 calls by number, six machine-word arguments, scoped mutable byte-buffer graphs, raw return values, and named errno
 - `os::linux::abi` checked Linux amd64 record codecs and `Iovecs`/`Message` nested-buffer builders
 - `os::linux::fd` owned Linux descriptors, scalar/vector/positional I/O, metadata, byte paths, directory-relative operations, locks, and anonymous memory files
@@ -3028,11 +3040,46 @@ There are currently no configurable lane counts, gather/scatter, vector arithmet
 
 `io::read_stdin_structured`, `read_stdin_exact_structured`, `write_stdout_structured`, and `write_stderr_structured` provide structured errors for standard streams. `read_stdin_to_string` validates the complete input as UTF-8 and reports `InvalidData` on failure. A negative exact-read length reports `InvalidInput` before accessing stdin.
 
+### Composable I/O
+
+Import `std::io::{Read, Write, BufRead, Close}` to compose streams through generic bounds. `Read::read(MutSlice[byte])` and `Write::write(Slice[byte])` return the transferred byte count; short transfers are normal and zero from a nonempty read means EOF. Counts outside the supplied buffer are invalid. `read_exact` and `write_all` complete partial transfers, retry `Interrupted`, and report `UnexpectedEof` or `WriteZero` when progress stops. Errors may follow partial progress and do not roll back data.
+
+`Read::read_to_end(limit)` returns `bytes::Bytes`; `read_to_string(limit)` additionally validates UTF-8. Limits are nonnegative byte counts. Both reject oversized input, consuming at most one extra byte to detect overflow; use `Take::new(reader, limit)` when bytes beyond a limit must remain unread. `io::copy(reader, writer)` copies until EOF and returns a `u64` count; it does not flush or close either stream.
+
+`BufRead::fill_buf` exposes the currently buffered bytes and `consume(amount)` checks the available range. `read_until(delimiter, limit)` includes a found delimiter; `read_line(limit)` includes the newline, validates UTF-8, and returns `None` only at EOF with no bytes. A final unterminated line may exactly fill the limit. Treat a buffer view as valid only until the next operation on that reader.
+
+`Cursor::new(bytes)` copies its initial data and shares position among handle copies. It implements `Read`, `Write`, and `BufRead`; writes overwrite or append, `set_position` accepts offsets through the current length, and `bytes()` returns a copy. `BufReader::new(reader)` and `BufWriter::new(writer)` use 8 KiB buffers; `with_capacity(stream, size)` rejects nonpositive sizes. Buffered writers require explicit `flush`; failed writes retain only the unsent suffix for retry. A buffered wrapper implements `Close` when the underlying stream does; writer close flushes first. These in-memory adapters require callers to serialize shared access and have no finalizers.
+
+`stdin()` implements `Read`, `stdout()` and `stderr()` implement `Write`, and `TcpStream`, `net::tls::TlsStream`, and Linux `fd::Fd` implement `Read`, `Write`, and `Close`. Existing inherent socket methods remain available. For cancellation, call the socket's context-aware methods directly; the generic traits carry no context parameter.
+
+```goml
+use std::bytes;
+use std::io;
+use std::io::{BufRead};
+
+fn first_line(data: bytes::Bytes) -> Result[Option[string], io::Error] {
+    let reader = io::BufReader::new(io::Cursor::new(data));
+    reader.read_line(4096)
+}
+```
+
 ### Numeric parsing and checked arithmetic
 
 Numeric parsing returns `Result[_, num::ParseIntError]` or `Result[_, num::ParseFloatError]`. Integer radix parsing accepts radix `0` or `2..36`; radix `0` recognizes `0b`, `0o`, and `0x` prefixes and permits Go-style digit separators. Invalid radices, malformed input, and overflow return `Result::Err`. Floating-point parsing supports decimal and hexadecimal IEEE 754 input, signed exponents, digit separators, `inf`, `infinity`, and `NaN`, and rounds directly to the requested `f32` or `f64` width.
 
 `num::parse_int_structured`, radix and unsigned variants, and the structured float parsers return domain parse errors. The `checked_*_int64` operations return `None` on overflow; the corresponding `saturating_*_int64` operations clamp to the signed 64-bit bounds.
+
+`std::num::ToFloat` supplies `.to_f32()` and `.to_f64()` for every scalar integer width. Conversions round directly to the destination IEEE 754 width using nearest, ties to even; `u64` to `f32` does not round through `f64`. Large integers can lose precision.
+
+`std::num::TryToInt` supplies `.try_to_isize()`, `.try_to_i8/i16/i32/i64()`, and unsigned counterparts for both `f32` and `f64`. These truncate toward zero before checking the destination range, returning `FloatConversionError::NonFinite` for NaN/infinity or `OutOfRange` for overflow. Consequently `(-0.9).try_to_u64()` succeeds with zero. `float_to_i64(value, rounding)` and `float_to_u64(value, rounding)` accept `Rounding::{TowardZero, Floor, Ceil, NearestAway, NearestEven}` for explicit rounding followed by the same range checks. These methods require the corresponding trait imports and add no cast syntax.
+
+```goml
+use std::num::{ToFloat, TryToInt};
+
+let count: u64 = 9007199254740993;
+let approximate: f64 = count.to_f64();
+let truncated = (12.75).try_to_i32();
+```
 
 ### Environment, paths, and processes
 
@@ -3299,7 +3346,7 @@ UDP receives consume exactly one datagram, including when the buffer is empty. E
 
 `WaitOptions::new()` waits indefinitely. `.with_timeout(time::Duration)` and `.with_cancel(task::CancelToken)` return modified options. `accept_with(options)`, `connect_with(address, options)`, `read_with(buffer, options)`, `read_exact_with(buffer, options)`, `write_with(buffer, options)`, `write_all_with(buffer, options)`, `send_to_with(data, destination, options)`, and `recv_from_with(buffer, options)` apply these settings. A timeout covers the whole operation, including waiting behind another reader or writer and all partial transfers; it does not restart after progress. Zero timeout returns `TimedOut` without attempting I/O. Completed I/O may win a race with cancellation or timeout. After a failed `read_exact` or `write_all`, some bytes may already have transferred; the buffer is not rolled back and the error does not report a partial count. Use individual `read`/`write` calls when tracking progress is required.
 
-Socket values are shared handles. Multiple reads or multiple writes serialize per socket; one reader and one writer can progress concurrently. Concurrent `close()` wakes active and queued operations, releases the socket once, and is idempotent. Failed binds and connects release their descriptors. Always close sockets explicitly or with `defer`; garbage collection does not close them. IPv6 sockets are IPv6-only, so bind separate IPv4 and IPv6 listeners when both are needed. DNS resolution, Unix-domain sockets, TLS, HTTP, and other platforms are outside this initial API. It uses existing imports, enums, methods, channels, and tasks and adds no grammar or compile-time networking.
+Socket values are shared handles. Multiple reads or multiple writes serialize per socket; one reader and one writer can progress concurrently. Concurrent `close()` wakes active and queued operations, releases the socket once, and is idempotent. Failed binds and connects release their descriptors. Always close sockets explicitly or with `defer`; garbage collection does not close them. IPv6 sockets are IPv6-only, so bind separate IPv4 and IPv6 listeners when both are needed. Unix-domain listeners, HTTP, and other platforms are outside this socket API. DNS and TLS clients are provided by the APIs below. It uses existing imports, enums, methods, channels, and tasks and adds no grammar or compile-time networking.
 
 ```goml
 use std::net;
@@ -3315,6 +3362,29 @@ fn echo_once() -> Result[(), net::Error] {
     let buffer = Vec::from_array([0, 0, 0, 0]);
     let count = stream.read_with(buffer.as_mut_slice(), wait)?;
     stream.write_all_with(buffer.slice(0, count), wait)
+}
+```
+
+### DNS and TLS clients
+
+`net::resolve(host, port)` and `resolve_with(host, port, context)` return deduplicated numeric `SocketAddr` values using the host resolver; numeric inputs bypass DNS. Empty or NUL-containing names fail with `InvalidInput`. Resolution observes cancellation and deadlines, with a 30-second maximum when the context has no deadline. `TcpStream::connect_host(host, port, context)` resolves once and tries addresses in resolver order under the same context. Supply a deadline to bound the entire connection attempt.
+
+`WaitOptions::with_context(context)` adds parent cancellation and an absolute deadline to TCP/UDP operations. Existing `with_cancel` tokens remain active too; the effective timeout is the earlier of the context deadline and `with_timeout`. Context cancellation reports `Interrupted`, expiration reports `TimedOut`, and a timed-out TCP wait leaves the socket usable.
+
+`std::net::tls` provides `connect(host, port, config)` and `connect_with(host, port, config, context)`. `ClientConfig::new(server_name)` verifies the certificate chain and server name using system roots, requires TLS 1.2 or newer, and limits DNS, dial, and handshake together to 30 seconds. Hosts are bare names or numeric addresses without a port or IPv6 brackets. Configuration builders are `with_ca_pem` (a nonempty PEM bundle replaces system roots; an empty bundle selects system roots), `with_client_certificate(certificate_pem, private_key_pem)`, `with_alpn`, `with_minimum_version(Version::Tls12 / Tls13)`, and `with_connect_timeout`. There is no insecure verification switch. Client certificates and private keys must be supplied together; ALPN identifiers are 1–255 bytes.
+
+`TlsStream::connection_info()` returns the negotiated version and ALPN protocol. `read_with`, `write_with`, `read_exact_with`, and `write_all_with` accept a `context::Context`; exact/all operations hold their direction's gate and keep one deadline across all partial transfers. A reader and writer can run concurrently, while operations in one direction serialize. Cancelling or timing out active TLS I/O closes the connection to interrupt the native operation; create a new connection afterward. Cancellation detected before native I/O begins, including while waiting for a gate, leaves the connection open. Explicit local close reports `BrokenPipe` to interrupted operations; remote EOF remains a successful zero-byte read. `close()` is explicit, shared, idempotent, and wakes blocked operations. Exact reads report `UnexpectedEof` when the peer closes before filling the buffer. Partial data may already have transferred on failure.
+
+```goml
+use std::context;
+use std::io;
+use std::net::tls;
+use std::time;
+
+fn connect_example() -> Result[tls::TlsStream, io::Error] {
+    context::with_timeout(context::Context::background(), time::Duration::from_seconds(5), |ctx, _| {
+        tls::connect_with("example.com", 443, tls::ClientConfig::new("example.com"), ctx)
+    })
 }
 ```
 
@@ -3583,6 +3653,12 @@ GoML has no lifetime or linear type system, so a `Scope` value can currently esc
 
 `race(bodies)` returns the first completed value, cancels the remaining bodies, and still waits for every losing body to exit. It returns `None` for an empty input. A body that does not cooperate with cancellation can therefore delay the return from `race`.
 
+### Cancellation contexts
+
+`std::context` combines cooperative cancellation and monotonic deadlines. `Context::background()` never cancels and has no deadline; `Context::from_token(token)` adapts an existing task token. `with_cancel(parent, callback)`, `with_timeout(parent, duration, callback)`, and `with_deadline(parent, Deadline::after(duration), callback)` invoke `callback(context, cancel_handle)` inside a lexical task scope. A child inherits the earlier deadline, propagates parent cancellation, and cancels when the callback returns. Internal watcher tasks and timers are joined or stopped before the scope exits; an escaped child context is already cancelled.
+
+`CancelHandle::cancel()` is idempotent. The first cancellation cause is retained as `Error::Cancelled` or `Error::DeadlineExceeded`. `Context::check()` returns `Result[(), Error]`; `error()`, `deadline()`, and `remaining()` expose optional state. `done()` is a `Receiver[()]` usable in `select`; `token()` exposes an optional task token for existing APIs. `sleep(duration)` waits cooperatively and reports the cancellation cause. `Deadline` uses `time::Instant`, so wall-clock adjustments do not move it. Cancellation does not forcibly stop arbitrary user code or blocking I/O without context support.
+
 ### `collections::IndexMap[K, V]`
 
 `IndexMap` is an insertion-ordered hash map. Its key type must implement `Eq` and `Hash`, while actual key comparison uses `PartialEq`:
@@ -3632,7 +3708,7 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | `switch` | `match` |
 | `null`, `nil` | `Option::None` for optional values; `ffi::null()` for raw Go pointers; `ffi::nil_error()` for Go errors |
 | `throw`, exception | `Result` and `?` |
-| `float_value.to_i32()` | Floating point to integer conversion is not supported; use dedicated parsing or conversion APIs |
+| `float_value.to_i32()` | Import `std::num::TryToInt` and use `float_value.try_to_i32()`; handle nonfinite and range errors |
 | `dyn A + B` | Use one dyn-safe trait; multiple bounds are reserved syntax but not yet supported |
 | `dyn TraitWithAssociatedType` | Bind every associated type, for example `dyn Iterator[Item = isize]` |
 | Use `type UserId = u64;` when `UserId` must be distinct | Use `struct UserId(u64);` and construct it explicitly |
@@ -3645,7 +3721,7 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | Go-callable export | Annotate a supported public function with `#[go_export("Name")]` and generate a Go package with `goml export-go` |
 | Traverse a directory tree | `std::fs::walkdir` Linux amd64 syscall-backed depth-first iteration with depth bounds, pruning, optional link following, and per-path errors |
 | Watch a directory tree for changes | Use `fs::notify::watch_recursive` or `WatchSet` on Linux amd64, prune ignored paths through `Options`, consume timed reads or scoped subscriptions, handle `Event.rescan`, and close the handle |
-| TCP and UDP networking | `std::net` Linux amd64 syscall-backed sockets with numeric IPv4/IPv6 addresses, shared epoll readiness, explicit close, timeouts, and task cancellation |
+| TCP and UDP networking | `std::net` sockets, DNS resolution, shared epoll readiness, explicit close, and context-aware waits; `std::net::tls` for verified TLS clients |
 | Create and supervise a Linux child | `std::os::linux::process::Command` with runtime-coordinated spawn, stable pidfd signals, and shared wait results |
 | Access mapped memory | `std::os::linux::memory::Mapping` checked copied access with explicit shared unmap state |
 | Pass descriptors or wait for Linux readiness | `std::os::linux::ipc` Unix messages, eventfd/timerfd, poll, and epoll |
@@ -3659,6 +3735,8 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 ## Informal Grammar Quick Facts
 
 Linux syscall buffers, `Pointer` descriptors, `Errno` values, ABI codecs, descriptor/process/memory/IPC wrappers use the ordinary struct, enum, array, slice, and call forms below. Native kernel layouts are encoded into bytes; there is no pointer-cast, native-layout, or `unsafe` grammar.
+
+I/O traits, cancellation contexts, DNS/TLS, scalar conversion traits, and Serde extension events use the existing imports, generic bounds, enums, methods, and calls. They introduce no new grammar. Explicit generic calls retain the `::[Type]` form even when their type arguments do not appear in the function signature.
 
 The following EBNF only describes the canonical form that should be generated; `?` means optional, `*` means repeated, and the terminator is placed in quotes.
 

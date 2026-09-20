@@ -76,42 +76,29 @@ They distinguish supported designs from current compiler or API boundaries.
   native lock-contention tests and race-detector builds. A separate Python engine
   agrees across 243 sequences and 2,754 operations, including file interchange.
 
-## Zero-size reference identities
+## Fixed compiler regressions
 
-`repros/unit_identity` stores separately allocated unit references in a vector.
-On the current development toolchain it prints `true` for equality of the two
-unit references, and `false` for separately allocated boolean references. Direct
-local allocations can give different results, so the vector storage is part of
-the reproducer. This also caused real cross-graph handle tests to fail when
-graph identity used `Ref[()]`.
+The development compiler now passes all four retained reproducers in `repros/`:
 
-```sh
-cd ecosystem/repros/unit_identity
-../../../stage2/bin/goml run
-```
+- `unit_identity`: separately allocated `Ref[()]` values remain distinct when
+  stored in containers. Empty structs, nested zero-size values and zero-length
+  arrays also have stable reference equality and hashing. Graph handles now use
+  `Ref[()]` directly and retain cross-graph rejection tests.
+- `erased_generic`: free-function type arguments used only in the body survive
+  specialization. Unused generic definitions compile, explicit calls and function
+  values execute, and generic forwarding works across package interfaces.
+- `specialized_static`: constructors in `impl Box[f64]` accept inferred or explicit
+  owner arguments. Nested implementations such as `impl[T] Box[Vec[T]]` retain
+  their complete owner type in exported interfaces. Ambiguous calls require an
+  explicit owner type or expected result.
+- `ffi_error_alias`: importing `std::ffi` no longer substitutes its `Error` alias
+  for the distinct canonical `std::io::Error` type.
 
-Graph identity now uses `Ref[bool]`. Cross-graph equality and rejected foreign
-handles pass for library and independently compiled consumer instances. No
-compiler or runtime changes are included in this workaround.
-
-## Erased generic function parameters
-
-`repros/erased_generic` is a minimal reproducer. Its generic function uses `T`
-only in its body, returning an ordinary `isize`. The module type-checks, but
-linking reports `generic parameter T remained after specialization`, even when
-that function is unused. This was reproduced while implementing the CLI schema
-accessor, then reduced independently of derives and the CLI library.
-
-```sh
-cd ecosystem/repros/erased_generic
-../../../stage2/bin/goml check
-../../../stage2/bin/goml build
-```
-
-The library uses `TypedCommand[T]` as the schema accessor's return type. That
-retains the type parameter in the public signature and passes compilation and
-consumer tests. The reproducer is intentionally excluded from the normal
-passing-library matrix; it is evidence for a future compiler fix.
+`python3 ecosystem/verify.py` runs these reproducers after the library matrix.
+Compiler pipeline fixtures 286–288 and module fixtures 084–087 cover these fixes,
+including serialization through independently compiled interfaces. The existing
+`TypedCommand[T]`, ndarray module constructor, and SQLite transport package remain
+valid API designs, but their original compiler workarounds are no longer required.
 
 ## Type inference and standard-library interfaces
 
@@ -119,9 +106,10 @@ passing-library matrix; it is evidence for a future compiler fix.
   projection can require an explicit parameter annotation. Consumer tests retain
   this syntax. A typed intermediate `Result[T, string]` also resolves `Self` for
   static trait calls before chaining `map_err`.
-- Scalar integer-to-float methods are not part of the current public API. The
-  property generator creates uniform-grid fractions through IEEE-754 bit
-  construction and `float64_from_bits`.
+- Scalar conversion is available through `std::num::{ToFloat, TryToInt}`.
+  Integer-to-float rounding and checked float-to-integer conversion are verified
+  against native Go across all rounding modes, boundary values and random bit
+  patterns. Existing bit-based generator code remains valid.
 - `Debug` is not universally implemented for standard generic containers. Tests
   compare container values through `PartialEq`, while scalar assertions retain
   detailed diagnostics.
@@ -133,53 +121,39 @@ passing-library matrix; it is evidence for a future compiler fix.
   precisely match those spellings/signatures. Ecosystem derives use the actual
   exported API, also used by the standard library.
 
+## Standard-library capabilities
+
+`std::io` now provides `Read`, `Write`, `BufRead`, `Close`, bounded reads, copying,
+in-memory cursors, limiting and buffered adapters, and standard-stream handles.
+TCP, TLS and Linux descriptors implement the stream traits. Partial transfers,
+failed flush retries, exact limits, binary stdin and malformed stream counts have
+regression coverage. Buffered adapters require serialized shared access and
+explicit flushing/closing.
+
+`std::context` provides scoped cancellation, inherited monotonic deadlines and
+sleep. Existing TCP/UDP waits compose contexts with legacy cancel tokens and
+retain whole-operation deadlines. `std::net` adds DNS and named-host connection;
+`std::net::tls` adds certificate-verified clients, custom roots, mutual TLS, ALPN,
+version policy, deadlines, and cancellation. Local TLS tests use an ephemeral CA
+and server and run under Go's race detector. Active TLS I/O cancellation closes
+the connection; TCP readiness cancellation leaves the socket reusable. TLS
+keeps local close and cancellation distinct from remote EOF, including when the
+native read returns EOF during a concurrent shutdown.
+
 ## Serde format boundaries
 
-The standard Serde event protocol includes binary and arbitrary-key map events,
-so an external format can support typed `Binary` and `Pairs[K, V]` wrappers without
-changing the standard library. It has no extension event. Its separate dynamic
-`std::serde::Value` representation also lacks binary, extension and arbitrary-key
-map variants. MessagePack therefore supplies its own full-fidelity dynamic value
-and timestamp helpers, while keeping its ordinary typed path directly on the
-standard event protocol. Unsupported `deserialize_any` cases return errors
-instead of silently changing the wire type.
+The standard dynamic model now preserves `Binary`, ordered arbitrary-key `Map`
+entries and `Extension` values. Optional extension events have recoverable
+unsupported defaults, so ordinary format implementations need not implement them.
+MessagePack implements the new events, adds a typed `Extension` wrapper and
+round-trips binary, duplicate/arbitrary map keys and opaque extension payloads
+through `std::serde::Value` without changing wire types. Its own dynamic model
+still supports invalid UTF-8 raw strings and timestamp helpers.
 
-## Associated constructors in concrete generic specializations
-
-`repros/specialized_static` reproduces a lookup limitation for an associated
-constructor declared in `impl Box[f64]`. `Box::from_float(...)` reports method
-not found even when the result is explicitly `Box[f64]`. The explicit spelling
-`Box::[f64]::from_float(...)` instead reports that the method expects zero owner
-type arguments. The intentionally failing module is excluded from verification.
-
-```sh
-cd ecosystem/repros/specialized_static
-../../../stage2/bin/goml check
-```
-
-Ndarray exposes `linspace` as a module function. Specialized instance methods,
-including `Array[f64]` statistics and factorizations, work across the dependency
-boundary and pass the independent consumer tests. No compiler change is included.
-
-## FFI Error alias collides with unrelated package error types
-
-`repros/ffi_error_alias` imports `std::ffi` and `std::io` in one package. Checking
-then treats `io::read_stdin_to_string()`'s error as `go[].error`, so its normal
-`to_string` call fails. Ignoring the error payload allows checking but linking
-reports an ANF mismatch between `Result[string, std::io::Error]` and
-`Result[string, go[].error]`. This occurs without a custom native adapter.
-
-```sh
-cd ecosystem/repros/ffi_error_alias
-../../../stage2/bin/goml check
-```
-
-The SQLite consumer reads standard input in a separate `transport` package that
-imports only standard I/O and returns `Result[string, string]`. This prevents the
-I/O error type from being resolved in the FFI-importing package. That arrangement
-passes checking, linking and execution; it does not fix the compiler limitation.
-SQLite's public error type is named `DbError`, with an opaque retained native
-cause rather than a public raw Go error return.
+JSON, TOML and Bincode do not acquire an extension wire format. Their checked
+APIs reject extension values. TOML retains the previous integer-array and
+key/value-pair-array projections for binary and map events. The legacy infallible JSON projection is explicitly
+lossy; use checked conversion when representation matters.
 
 ## FFI metadata graph size
 

@@ -1,0 +1,191 @@
+package io;
+
+use module::bytes;
+use module::utf8;
+use utf8::BytesUtf8;
+
+fn stream_error(kind: ErrorKind, operation: string, message: string) -> Error {
+    Error::new(kind, operation, Option::None, Option::None, message)
+}
+
+fn valid_count(count: isize, length: isize, operation: string) -> Result[isize, Error] {
+    if count < 0 || count > length {
+        Result::Err(
+            stream_error(ErrorKind::InvalidData, operation, "invalid byte count returned by stream"),
+        )
+    } else {
+        Result::Ok(count)
+    }
+}
+
+pub trait Read {
+    fn read(self: Self, buffer: MutSlice[byte]) -> Result[isize, Error];
+    fn read_exact(self: Self, buffer: MutSlice[byte]) -> Result[(), Error] {
+        let mut offset = 0;
+        while offset < buffer.len() {
+            let count = match self.read(buffer.sub(offset, buffer.len())) {
+                Ok(count) => valid_count(count, buffer.len() - offset, "read exact")?,
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) => return Result::Err(error),
+            };
+            if count == 0 {
+                return Result::Err(
+                    stream_error(
+                        ErrorKind::UnexpectedEof,
+                        "read exact",
+                        "stream ended before the buffer was filled",
+                    ),
+                )
+            }
+            offset += count;
+        }
+        Result::Ok(())
+    }
+    fn read_to_end(self: Self, limit: isize) -> Result[bytes::Bytes, Error] {
+        if limit < 0 {
+            return Result::Err(
+                stream_error(ErrorKind::InvalidInput, "read to end", "limit must be non-negative"),
+            )
+        }
+        let result = bytes::Bytes::new();
+        let buffer = byte_buffer(8192);
+        loop {
+            let remaining = limit - result.len();
+            let capacity = if remaining < buffer.len() {
+                remaining + 1
+            } else {
+                buffer.len()
+            };
+            let count = match self.read(buffer.slice_mut(0, capacity)) {
+                Ok(count) => valid_count(count, capacity, "read to end")?,
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) => return Result::Err(error),
+            };
+            if count == 0 {
+                return Result::Ok(result)
+            }
+            if count > remaining {
+                return Result::Err(
+                    stream_error(ErrorKind::InvalidData, "read to end", "stream exceeds byte limit"),
+                )
+            }
+            result.extend_from_slice(buffer.slice(0, count))
+        }
+    }
+    fn read_to_string(self: Self, limit: isize) -> Result[string, Error] {
+        self.read_to_end(limit)?.to_string_utf8().map_err(
+            |error| stream_error(ErrorKind::InvalidData, "read to string", error.to_string()),
+        )
+    }
+}
+
+pub trait Write {
+    fn write(self: Self, buffer: Slice[byte]) -> Result[isize, Error];
+    fn flush(self: Self) -> Result[(), Error] {
+        Result::Ok(())
+    }
+    fn write_all(self: Self, buffer: Slice[byte]) -> Result[(), Error] {
+        let mut offset = 0;
+        while offset < buffer.len() {
+            let count = match self.write(buffer.sub(offset, buffer.len())) {
+                Ok(count) => valid_count(count, buffer.len() - offset, "write all")?,
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) => return Result::Err(error),
+            };
+            if count == 0 {
+                return Result::Err(
+                    stream_error(ErrorKind::WriteZero, "write all", "stream made no progress"),
+                )
+            }
+            offset += count;
+        }
+        Result::Ok(())
+    }
+}
+
+pub trait Close {
+    fn close(self: Self) -> Result[(), Error];
+}
+
+pub trait BufRead: Read {
+    fn fill_buf(self: Self) -> Result[Slice[byte], Error];
+    fn consume(self: Self, amount: isize) -> Result[(), Error];
+    fn read_until(self: Self, delimiter: byte, limit: isize) -> Result[bytes::Bytes, Error] {
+        if limit < 0 {
+            return Result::Err(
+                stream_error(ErrorKind::InvalidInput, "read until", "limit must be non-negative"),
+            )
+        }
+        let result = bytes::Bytes::new();
+        loop {
+            let buffer = self.fill_buf()?;
+            if buffer.len() == 0 {
+                return Result::Ok(result)
+            }
+            let mut count = 0;
+            let mut found = false;
+            while count < buffer.len() && count < limit - result.len() {
+                let value = buffer[count];
+                count += 1;
+                if value == delimiter {
+                    found = true;
+                    break
+                }
+            }
+            result.extend_from_slice(buffer.sub(0, count));
+            self.consume(count)?;
+            if found {
+                return Result::Ok(result)
+            }
+            if result.len() == limit {
+                if self.fill_buf()?.len() == 0 {
+                    return Result::Ok(result)
+                }
+                return Result::Err(
+                    stream_error(
+                        ErrorKind::InvalidData,
+                        "read until",
+                        "delimiter not found within byte limit",
+                    ),
+                )
+            }
+        }
+    }
+    fn read_line(self: Self, limit: isize) -> Result[Option[string], Error] {
+        let bytes = self.read_until(b'\n', limit)?;
+        if bytes.is_empty() {
+            return Result::Ok(Option::None)
+        }
+        bytes.to_string_utf8().map(|line| Option::Some(line)).map_err(
+            |error| stream_error(ErrorKind::InvalidData, "read line", error.to_string()),
+        )
+    }
+}
+
+fn byte_buffer(length: isize) -> bytes::Bytes {
+    let buffer = bytes::Bytes::with_capacity(length);
+    for _ in 0..length {
+        buffer.push(0)
+    }
+    buffer
+}
+
+pub fn copy[R: Read, W: Write](reader: R, writer: W) -> Result[u64, Error] {
+    let buffer = byte_buffer(8192);
+    let mut total: u64 = 0;
+    loop {
+        let count = match reader.read(buffer.as_mut_slice()) {
+            Ok(count) => valid_count(count, buffer.len(), "copy")?,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Result::Err(error),
+        };
+        if count == 0 {
+            return Result::Ok(total)
+        }
+        writer.write_all(buffer.slice(0, count))?;
+        if total > 18446744073709551615 - count.to_u64() {
+            return Result::Err(stream_error(ErrorKind::InvalidData, "copy", "byte count overflow"))
+        }
+        total += count.to_u64();
+    }
+}

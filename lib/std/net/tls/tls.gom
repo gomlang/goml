@@ -1,0 +1,392 @@
+package tls;
+
+use module::context;
+use module::task;
+use module::io;
+use module::time;
+
+pub enum Version {
+    Tls12,
+    Tls13,
+}
+
+pub struct ClientConfig {
+    server_name: string,
+    roots: Vec[byte],
+    certificate: Vec[byte],
+    private_key: Vec[byte],
+    protocols: Vec[string],
+    minimum: Version,
+    timeout: time::Duration,
+}
+
+impl ClientConfig {
+    pub fn new(server_name: string) -> ClientConfig {
+        ClientConfig {
+            server_name,
+            roots: Vec::new(),
+            certificate: Vec::new(),
+            private_key: Vec::new(),
+            protocols: Vec::new(),
+            minimum: Version::Tls12,
+            timeout: time::Duration::from_seconds(30),
+        }
+    }
+
+    pub fn with_ca_pem(self: ClientConfig, pem: Slice[byte]) -> ClientConfig {
+        ClientConfig { roots: copied(pem), ..self }
+    }
+
+    pub fn with_client_certificate(
+        self: ClientConfig,
+        certificate: Slice[byte],
+        private_key: Slice[byte],
+    ) -> ClientConfig {
+        ClientConfig { certificate: copied(certificate), private_key: copied(private_key), ..self }
+    }
+
+    pub fn with_alpn(self: ClientConfig, protocols: Vec[string]) -> ClientConfig {
+        ClientConfig { protocols: protocols.copy(), ..self }
+    }
+
+    pub fn with_minimum_version(self: ClientConfig, minimum: Version) -> ClientConfig {
+        ClientConfig { minimum, ..self }
+    }
+
+    pub fn with_connect_timeout(self: ClientConfig, timeout: time::Duration) -> ClientConfig {
+        ClientConfig { timeout, ..self }
+    }
+}
+
+pub struct ConnectionInfo {
+    pub version: Version,
+    pub negotiated_protocol: string,
+}
+
+pub struct TlsStream {
+    id: i64,
+    read_gate: Channel[()],
+    write_gate: Channel[()],
+    closed: Channel[()],
+    close_gate: Channel[()],
+}
+
+fn copied(data: Slice[byte]) -> Vec[byte] {
+    let result: Vec[byte] = Vec::with_capacity(data.len());
+    for byte in data {
+        result.push(byte)
+    }
+    result
+}
+
+fn error(kind: io::ErrorKind, operation: string, message: string) -> io::Error {
+    io::Error::new(kind, operation, Option::None, Option::None, message)
+}
+
+fn runtime_error(kind: isize, operation: string, message: string) -> io::Error {
+    error(
+        match kind {
+            2 => io::ErrorKind::Interrupted,
+            3 => io::ErrorKind::TimedOut,
+            5 => io::ErrorKind::BrokenPipe,
+            _ => io::ErrorKind::Other,
+        },
+        operation,
+        message,
+    )
+}
+
+fn context_error(operation: string, value: context::Error) -> io::Error {
+    error(
+        match value {
+            Cancelled => io::ErrorKind::Interrupted,
+            DeadlineExceeded => io::ErrorKind::TimedOut,
+        },
+        operation,
+        value.to_string(),
+    )
+}
+
+fn check_context(context: context::Context, operation: string) -> Result[(), io::Error] {
+    context.check().map_err(|value| context_error(operation, value))
+}
+
+fn cancellation_id(context: context::Context) -> i64 {
+    context.token().map(|token| token.runtime_id()).unwrap_or(0)
+}
+
+fn operation_timeout(context: context::Context) -> i64 {
+    context.remaining().map(|duration| duration.as_nanoseconds()).unwrap_or(-1)
+}
+
+pub fn connect(host: string, port: u16, config: ClientConfig) -> Result[TlsStream, io::Error] {
+    connect_with(host, port, config, context::Context::background())
+}
+
+pub fn connect_with(host: string, port: u16, config: ClientConfig, context: context::Context) -> Result[
+    TlsStream,
+    io::Error,
+] {
+    check_context(context, "TLS connect")?;
+    if host.byte_len() == 0 || host.to_bytes().contains(0) || config.server_name.byte_len() == 0
+        || config.server_name.to_bytes().contains(0) {
+        return Result::Err(
+            error(
+                io::ErrorKind::InvalidInput,
+                "TLS connect",
+                "host and verification name must be non-empty and contain no NUL",
+            ),
+        )
+    }
+    if config.certificate.is_empty() != config.private_key.is_empty() {
+        return Result::Err(
+            error(
+                io::ErrorKind::InvalidInput,
+                "TLS connect",
+                "client certificate and private key must be provided together",
+            ),
+        )
+    }
+    for protocol in config.protocols {
+        if protocol.byte_len() == 0 || protocol.byte_len() > 255 {
+            return Result::Err(
+                error(
+                    io::ErrorKind::InvalidInput,
+                    "TLS connect",
+                    "ALPN identifiers must contain 1 to 255 bytes",
+                ),
+            )
+        }
+    }
+    let host = if host.contains(":") {
+        "[" + host + "]"
+    } else {
+        host
+    };
+    let address = host + ":" + port.to_string();
+    let timeout = match context.remaining() {
+        Some(remaining) if remaining.compare(config.timeout) < 0 => remaining,
+        _ => config.timeout,
+    };
+    let (ok, id, kind, message) = __goml_std_net_tls_connect(
+        address,
+        config.server_name,
+        config.roots.copy(),
+        config.certificate.copy(),
+        config.private_key.copy(),
+        config.protocols.copy(),
+        match config.minimum {
+            Tls12 => 771,
+            Tls13 => 772,
+        },
+        cancellation_id(context),
+        timeout.as_nanoseconds(),
+    );
+    if !ok {
+        check_context(context, "TLS connect")?;
+        return Result::Err(runtime_error(kind, "TLS connect", message))
+    }
+    let read_gate = Channel::new(1);
+    let write_gate = Channel::new(1);
+    let close_gate = Channel::new(1);
+    read_gate.send(());
+    write_gate.send(());
+    close_gate.send(());
+    let stream = TlsStream { id, read_gate, write_gate, close_gate, closed: Channel::new(0) };
+    if let Err(error) = check_context(context, "TLS connect") {
+        let _ = stream.close();
+        return Result::Err(error)
+    }
+    Result::Ok(stream)
+}
+
+impl TlsStream {
+    fn acquire(self: TlsStream, gate: Channel[()], context: context::Context, operation: string) -> Result[
+        (),
+        io::Error,
+    ] {
+        check_context(context, operation)?;
+        select {
+            recv(self.closed) as _ => Result::Err(
+                error(io::ErrorKind::BrokenPipe, operation, "TLS stream is closed"),
+            ),
+            recv(context.done()) as _ => {
+                check_context(context, operation)?;
+                Result::Err(error(io::ErrorKind::Interrupted, operation, "operation cancelled"))
+            },
+            recv(gate) as _ => if self.is_closed() {
+                gate.send(());
+                Result::Err(error(io::ErrorKind::BrokenPipe, operation, "TLS stream is closed"))
+            } else {
+                Result::Ok(())
+            },
+        }
+    }
+
+    pub fn close(self: TlsStream) -> Result[(), io::Error] {
+        let _ = self.close_gate.recv();
+        defer self.close_gate.send(());
+        if self.is_closed() {
+            return Result::Ok(())
+        }
+        self.closed.close();
+        let message = __goml_std_net_tls_close(self.id);
+        if message == "" {
+            Result::Ok(())
+        } else {
+            Result::Err(error(io::ErrorKind::Other, "TLS close", message))
+        }
+    }
+
+    pub fn is_closed(self: TlsStream) -> bool {
+        select {
+            recv(self.closed) as _ => true,
+            default => false,
+        }
+    }
+
+    pub fn connection_info(self: TlsStream) -> Result[ConnectionInfo, io::Error] {
+        let (ok, version, negotiated_protocol) = __goml_std_net_tls_state(self.id);
+        if !ok {
+            return Result::Err(
+                error(io::ErrorKind::BrokenPipe, "TLS state", "TLS stream is closed"),
+            )
+        }
+        Result::Ok(
+            ConnectionInfo {
+                version: if version == 772 {
+                    Version::Tls13
+                } else {
+                    Version::Tls12
+                },
+                negotiated_protocol,
+            },
+        )
+    }
+
+    fn read_locked(self: TlsStream, buffer: MutSlice[byte], context: context::Context) -> Result[
+        isize,
+        io::Error,
+    ] {
+        check_context(context, "TLS read")?;
+        if buffer.len() == 0 {
+            return Result::Ok(0)
+        }
+        let (count, kind, message) = __goml_std_net_tls_read(
+            self.id,
+            buffer,
+            cancellation_id(context),
+            operation_timeout(context),
+        );
+        if message != "" {
+            let _ = self.close();
+            if count == 0 {
+                check_context(context, "TLS read")?;
+                return Result::Err(runtime_error(kind, "TLS read", message))
+            }
+        }
+        Result::Ok(count)
+    }
+
+    fn write_locked(self: TlsStream, buffer: Slice[byte], context: context::Context) -> Result[
+        isize,
+        io::Error,
+    ] {
+        check_context(context, "TLS write")?;
+        if buffer.len() == 0 {
+            return Result::Ok(0)
+        }
+        let (count, kind, message) = __goml_std_net_tls_write(
+            self.id,
+            buffer,
+            cancellation_id(context),
+            operation_timeout(context),
+        );
+        if message != "" {
+            let _ = self.close();
+            if count == 0 {
+                check_context(context, "TLS write")?;
+                return Result::Err(runtime_error(kind, "TLS write", message))
+            }
+        }
+        Result::Ok(count)
+    }
+
+    pub fn read_with(self: TlsStream, buffer: MutSlice[byte], context: context::Context) -> Result[
+        isize,
+        io::Error,
+    ] {
+        self.acquire(self.read_gate, context, "TLS read")?;
+        defer self.read_gate.send(());
+        self.read_locked(buffer, context)
+    }
+
+    pub fn write_with(self: TlsStream, buffer: Slice[byte], context: context::Context) -> Result[
+        isize,
+        io::Error,
+    ] {
+        self.acquire(self.write_gate, context, "TLS write")?;
+        defer self.write_gate.send(());
+        self.write_locked(buffer, context)
+    }
+
+    pub fn read_exact_with(self: TlsStream, buffer: MutSlice[byte], context: context::Context) -> Result[
+        (),
+        io::Error,
+    ] {
+        self.acquire(self.read_gate, context, "TLS read exact")?;
+        defer self.read_gate.send(());
+        let mut offset = 0;
+        while offset < buffer.len() {
+            let count = self.read_locked(buffer.sub(offset, buffer.len()), context)?;
+            if count == 0 {
+                return Result::Err(
+                    error(
+                        io::ErrorKind::UnexpectedEof,
+                        "TLS read exact",
+                        "stream ended before filling the buffer",
+                    ),
+                )
+            }
+            offset += count;
+        }
+        Result::Ok(())
+    }
+
+    pub fn write_all_with(self: TlsStream, buffer: Slice[byte], context: context::Context) -> Result[
+        (),
+        io::Error,
+    ] {
+        self.acquire(self.write_gate, context, "TLS write all")?;
+        defer self.write_gate.send(());
+        let mut offset = 0;
+        while offset < buffer.len() {
+            let count = self.write_locked(buffer.sub(offset, buffer.len()), context)?;
+            if count == 0 {
+                return Result::Err(
+                    error(io::ErrorKind::WriteZero, "TLS write all", "stream made no progress"),
+                )
+            }
+            offset += count;
+        }
+        Result::Ok(())
+    }
+}
+
+impl io::Read for TlsStream {
+    fn read(self: TlsStream, buffer: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.read_with(buffer, context::Context::background())
+    }
+}
+
+impl io::Write for TlsStream {
+    fn write(self: TlsStream, buffer: Slice[byte]) -> Result[isize, io::Error] {
+        self.write_with(buffer, context::Context::background())
+    }
+}
+
+impl io::Close for TlsStream {
+    fn close(self: TlsStream) -> Result[(), io::Error] {
+        self.close()
+    }
+}

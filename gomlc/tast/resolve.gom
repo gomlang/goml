@@ -225,10 +225,6 @@ fn pattern_owner_is_builtin_enum(ctx: Checker, name: string) -> bool {
         && find_struct_by_exact_name(ctx, name).is_none()
 }
 
-fn nominal_type_is_defined(ctx: Checker, name: string) -> bool {
-    find_struct_by_name(ctx, name).is_some() || find_enum_by_name(ctx, name).is_some()
-}
-
 fn find_variant(value: EnumInfo, index: isize) -> Option[EnumVariantInfo] {
     if index >= 0 && index < value.variants.len() {
         Option::Some(value.variants[index])
@@ -860,47 +856,56 @@ fn resolve_user_method(
     ctx: Checker,
     receiver: Type,
     name: string,
-    trait_name: Option[string],
-    allow_bare_owner: bool,
-    owner_explicit: Vec[Type],
     method_explicit: Vec[Type],
+    expected: Option[Type],
 ) -> Option[ResolvedCallable] {
+    let inherent: Vec[MethodCandidate] = Vec::new();
+    let traits: Vec[MethodCandidate] = Vec::new();
     for value in ctx.methods {
-        let trait_matches = match (trait_name, value.trait_ref) {
-            (Some(expected), Some(reference)) => {
-                names_match(expected, reference.name)
-            },
-            (None, _) => true,
-            _ => false,
-        };
-        if trait_matches && value.function.name == name
-            && receiver_matches(ctx.builtin, value.for_type, receiver) {
-            let candidate = instantiate_method_candidate(
-                ctx,
-                value,
-                owner_explicit,
-                method_explicit,
-            );
-            if (allow_bare_owner && !value.owner_generics.is_empty()
-                && match prune(receiver) {
-                    Con { name: _ } => true,
-                    _ => false,
-                })
-                || unify(candidate.owner, receiver) {
-                return Option::Some(
-                    ResolvedCallable {
-                        callable: candidate.callable.callable,
-                        ty: candidate.callable.ty,
-                        predicates: append_predicates(
-                            candidate.owner_predicates,
-                            candidate.callable.predicates,
-                        ),
-                    },
-                )
+        if value.function.name == name && receiver_matches(ctx.builtin, value.for_type, receiver) {
+            let candidate = instantiate_method_candidate(ctx, value, Vec::new(), method_explicit);
+            let return_matches = match (expected, prune(candidate.callable.ty)) {
+                (Some(expected), Func { ret_ty, .. }) => call_types_compatible(ret_ty, expected),
+                _ => true,
+            };
+            if call_types_compatible(candidate.owner, receiver) && return_matches {
+                match value.trait_ref {
+                    Some(_) => traits.push(candidate),
+                    None => inherent.push(candidate),
+                }
             }
         }
     }
-    Option::None
+    let candidates = if inherent.is_empty() {
+        traits
+    } else {
+        inherent
+    };
+    if candidates.len() == 1 {
+        let candidate = candidates[0];
+        let _ = unify(candidate.owner, receiver);
+        Option::Some(
+            ResolvedCallable {
+                callable: candidate.callable.callable,
+                ty: candidate.callable.ty,
+                predicates: append_predicates(
+                    candidate.owner_predicates,
+                    candidate.callable.predicates,
+                ),
+            },
+        )
+    } else if candidates.is_empty() {
+        Option::None
+    } else {
+        push_diagnostic(ctx, f"ambiguous method: {name}");
+        Option::Some(
+            ResolvedCallable {
+                callable: Callable::Function("<error>"),
+                ty: Type::Error,
+                predicates: Vec::new(),
+            },
+        )
+    }
 }
 
 fn method_matches_call(
@@ -2580,6 +2585,9 @@ fn find_type_alias(ctx: Checker, name: string) -> Option[TypeAliasInfo] {
             return Option::Some(value)
         }
     }
+    if canonical != short_name(canonical) {
+        return Option::None
+    }
     let mut found = Option::None;
     for value in ctx.type_aliases {
         if short_name(value.name) == short_name(canonical) {
@@ -3101,17 +3109,38 @@ fn explicit_types(ctx: Checker, values: Vec[hir::TypeExpr]) -> Vec[Type] {
     result
 }
 
+fn static_owner_type(ctx: Checker, owner: string, explicit: Vec[Type]) -> Type {
+    let arity = match nominal_arity(ctx, owner) {
+        Some(arity) => arity,
+        None => return nominal_type(ctx.builtin, owner, explicit),
+    };
+    if !explicit.is_empty() {
+        if explicit.len() != arity {
+            push_diagnostic(
+                ctx,
+                f"Type {owner} expects {arity} owner type arguments, but got {explicit.len()}",
+            )
+        }
+        return nominal_type(ctx.builtin, owner, explicit)
+    }
+    let args: Vec[Type] = Vec::new();
+    for _ in 0..arity {
+        args.push(fresh_type(ctx.counter, VarKind::Any))
+    }
+    nominal_type(ctx.builtin, owner, args)
+}
+
 fn resolve_static_member(
     ctx: Checker,
     owner: string,
     member: string,
     owner_type_args: Vec[hir::TypeExpr],
     member_type_args: Vec[hir::TypeExpr],
+    expected: Option[Type],
 ) -> Option[ResolvedCallable] {
     let owner = canonical_imported_name(ctx, owner);
     let owner_explicit = explicit_types(ctx, owner_type_args);
     let method_explicit = explicit_types(ctx, member_type_args);
-    let bare_owner = owner_explicit.is_empty();
     match explicit_function_scheme(ctx, owner, member) {
         Some(scheme) => {
             let value = instantiate_scheme_candidate(ctx, scheme, method_explicit);
@@ -3126,37 +3155,8 @@ fn resolve_static_member(
         None => match resolve_trait_static(ctx, owner, member, owner_explicit, method_explicit) {
             Some(value) => Option::Some(value),
             None => {
-                let owner_ty = nominal_type(ctx.builtin, owner, owner_explicit);
-                match resolve_user_method(
-                    ctx,
-                    owner_ty,
-                    member,
-                    Option::None,
-                    true,
-                    owner_explicit,
-                    method_explicit,
-                ) {
-                    Some(value) => if bare_owner && nominal_type_is_defined(ctx, owner) {
-                        Option::Some(
-                            ResolvedCallable {
-                                callable: match value.callable {
-                                    InherentMethod { receiver_ty: _, method_name: name } => {
-                                        Callable::InherentMethod {
-                                            receiver_ty: owner_ty,
-                                            method_name: name,
-                                        }
-                                    },
-                                    other => other,
-                                },
-                                ty: value.ty,
-                                predicates: value.predicates,
-                            },
-                        )
-                    } else {
-                        Option::Some(value)
-                    },
-                    None => Option::None,
-                }
+                let owner_ty = static_owner_type(ctx, owner, owner_explicit);
+                resolve_user_method(ctx, owner_ty, member, method_explicit, expected)
             },
         },
     }

@@ -1,0 +1,235 @@
+package context;
+
+use module::task;
+use module::time;
+
+pub enum Error {
+    Cancelled,
+    DeadlineExceeded,
+}
+
+impl ToString for Error {
+    fn to_string(self: Error) -> string {
+        match self {
+            Cancelled => "operation cancelled",
+            DeadlineExceeded => "deadline exceeded",
+        }
+    }
+}
+
+impl Debug for Error {
+    fn debug(self: Error) -> string {
+        self.to_string()
+    }
+}
+
+pub struct Deadline {
+    started: time::Instant,
+    duration: time::Duration,
+}
+
+impl Deadline {
+    pub fn after(duration: time::Duration) -> Deadline {
+        Deadline { started: time::Instant::now(), duration }
+    }
+
+    pub fn remaining(self: Deadline) -> time::Duration {
+        self.duration.checked_subtract(self.started.elapsed()).unwrap_or(time::Duration::zero())
+    }
+
+    pub fn is_elapsed(self: Deadline) -> bool {
+        self.remaining().is_zero()
+    }
+}
+
+pub struct CancelHandle {
+    scope: task::Scope,
+    reason: Channel[Option[Error]],
+}
+
+impl CancelHandle {
+    fn cancel_with(self: CancelHandle, reason: Error) -> () {
+        let current = self.reason.recv().unwrap_or(Option::None);
+        let first = current.is_none();
+        self.reason.send(
+            if first {
+                Option::Some(reason)
+            } else {
+                current
+            },
+        );
+        if first {
+            self.scope.cancel()
+        }
+    }
+
+    pub fn cancel(self: CancelHandle) -> () {
+        self.cancel_with(Error::Cancelled)
+    }
+}
+
+pub struct Context {
+    token_value: Option[task::CancelToken],
+    signal: Receiver[()],
+    deadline_value: Option[Deadline],
+    cancellation: Option[CancelHandle],
+}
+
+impl Context {
+    pub fn background() -> Context {
+        let never: Channel[()] = Channel::new(0);
+        Context {
+            token_value: Option::None,
+            signal: never.receiver(),
+            deadline_value: Option::None,
+            cancellation: Option::None,
+        }
+    }
+
+    pub fn from_token(token: task::CancelToken) -> Context {
+        Context {
+            token_value: Option::Some(token),
+            signal: token.done(),
+            deadline_value: Option::None,
+            cancellation: Option::None,
+        }
+    }
+
+    pub fn token(self: Context) -> Option[task::CancelToken] {
+        self.token_value
+    }
+
+    pub fn done(self: Context) -> Receiver[()] {
+        self.signal
+    }
+
+    pub fn deadline(self: Context) -> Option[Deadline] {
+        self.deadline_value
+    }
+
+    pub fn remaining(self: Context) -> Option[time::Duration] {
+        self.deadline_value.map(|deadline| deadline.remaining())
+    }
+
+    pub fn error(self: Context) -> Option[Error] {
+        if let Some(cancel) = self.cancellation {
+            let current = cancel.reason.recv().unwrap_or(Option::None);
+            cancel.reason.send(current);
+            if current.is_some() {
+                return current
+            }
+        }
+        if let Some(deadline) = self.deadline_value {
+            if deadline.is_elapsed() {
+                if let Some(cancel) = self.cancellation {
+                    cancel.cancel_with(Error::DeadlineExceeded);
+                    let current = cancel.reason.recv().unwrap_or(Option::None);
+                    cancel.reason.send(current);
+                    return current
+                }
+                return Option::Some(Error::DeadlineExceeded)
+            }
+        }
+        if let Some(token) = self.token_value {
+            if token.is_cancelled() {
+                return Option::Some(Error::Cancelled)
+            }
+        }
+        Option::None
+    }
+
+    pub fn check(self: Context) -> Result[(), Error] {
+        match self.error() {
+            Some(error) => Result::Err(error),
+            None => Result::Ok(()),
+        }
+    }
+
+    pub fn sleep(self: Context, duration: time::Duration) -> Result[(), Error] {
+        self.check()?;
+        let timer = time::Timer::new(duration);
+        defer {
+            let _ = timer.stop();
+        };
+        select {
+            recv(self.signal) as _ => self.check(),
+            recv(timer.done()) as _ => self.check(),
+        }
+    }
+}
+
+fn earlier_deadline(parent: Option[Deadline], requested: Option[Deadline]) -> Option[Deadline] {
+    match (parent, requested) {
+        (Some(parent), Some(requested)) => if parent.remaining().compare(requested.remaining()) <= 0 {
+            Option::Some(parent)
+        } else {
+            Option::Some(requested)
+        },
+        (Some(parent), None) => Option::Some(parent),
+        (None, value) => value,
+    }
+}
+
+fn run[T](parent: Context, requested: Option[Deadline], body: (Context, CancelHandle) -> T) -> T {
+    task::scope(
+        |scope| {
+            let reason: Channel[Option[Error]] = Channel::new(1);
+            reason.send(Option::None);
+            let cancel = CancelHandle { scope, reason };
+            defer cancel.cancel();
+            let context = Context {
+                token_value: Option::Some(scope.token()),
+                signal: scope.token().done(),
+                deadline_value: earlier_deadline(parent.deadline(), requested),
+                cancellation: Option::Some(cancel),
+            };
+            if let Some(error) = parent.error() {
+                cancel.cancel_with(error)
+            }
+            if let Some(deadline) = context.deadline() {
+                if deadline.is_elapsed() {
+                    cancel.cancel_with(Error::DeadlineExceeded)
+                }
+            }
+            if parent.token().is_some() {
+                let _ = scope.spawn(
+                    |token| {
+                        select {
+                            recv(parent.done()) as _ => cancel.cancel_with(
+                                parent.error().unwrap_or(Error::Cancelled),
+                            ),
+                            recv(token.done()) as _ => (),
+                        }
+                    },
+                );
+            }
+            if let Some(deadline) = context.deadline() {
+                let _ = scope.spawn(
+                    |token| {
+                        let timer = time::Timer::new(deadline.remaining());
+                        defer {
+                            let _ = timer.stop();
+                        };
+                        select {
+                            recv(timer.done()) as _ => cancel.cancel_with(Error::DeadlineExceeded),
+                            recv(token.done()) as _ => (),
+                        }
+                    },
+                );
+            }
+            body(context, cancel)
+        },
+    )
+}
+
+pub fn with_cancel[T](parent: Context, body: (Context, CancelHandle) -> T) -> T {
+    run(parent, Option::None, body)
+}
+
+pub fn with_timeout[T](parent: Context, timeout: time::Duration, body: (Context, CancelHandle) -> T) -> T {
+    run(parent, Option::Some(Deadline::after(timeout)), body)
+}
+
+pub fn with_deadline[T](parent: Context, deadline: Deadline, body: (Context, CancelHandle) -> T) -> T {
+    run(parent, Option::Some(deadline), body)
+}

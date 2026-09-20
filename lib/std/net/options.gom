@@ -2,16 +2,22 @@ package net;
 
 use module::io::{Error, ErrorKind};
 use module::task;
+use module::context;
 use module::time;
 
 pub struct WaitOptions {
     timeout: Option[time::Duration],
     cancel: Option[task::CancelToken],
+    context: Option[context::Context],
 }
 
 impl WaitOptions {
     pub fn new() -> WaitOptions {
-        WaitOptions { timeout: Option::None, cancel: Option::None }
+        WaitOptions { timeout: Option::None, cancel: Option::None, context: Option::None }
+    }
+
+    pub fn with_context(self: WaitOptions, context: context::Context) -> WaitOptions {
+        WaitOptions { context: Option::Some(context), ..self }
     }
 
     pub fn with_timeout(self: WaitOptions, timeout: time::Duration) -> WaitOptions {
@@ -27,6 +33,8 @@ struct Wait {
     timer: Option[time::Timer],
     expired: Receiver[()],
     cancel: Receiver[()],
+    context_signal: Receiver[()],
+    context: Option[context::Context],
     started: time::Instant,
     timeout: Option[time::Duration],
     operation: string,
@@ -34,6 +42,22 @@ struct Wait {
 
 impl Wait {
     fn new(options: WaitOptions, operation: string) -> Wait {
+        let options = if let Some(context) = options.context {
+            let timeout = match (options.timeout, context.remaining()) {
+                (Some(left), Some(right)) => Option::Some(
+                    if left.compare(right) < 0 {
+                        left
+                    } else {
+                        right
+                    },
+                ),
+                (Some(left), None) => Option::Some(left),
+                (None, right) => right,
+            };
+            WaitOptions { timeout, ..options }
+        } else {
+            options
+        };
         let never: Channel[()] = Channel::new(0);
         let started = time::Instant::now();
         let timer = options.timeout.map(|duration| time::Timer::new(duration));
@@ -41,6 +65,8 @@ impl Wait {
             timer,
             expired: timer.map(|value| value.done()).unwrap_or(never.receiver()),
             cancel: options.cancel.map(|value| value.done()).unwrap_or(never.receiver()),
+            context_signal: options.context.map(|value| value.done()).unwrap_or(never.receiver()),
+            context: options.context,
             started,
             timeout: options.timeout,
             operation,
@@ -54,6 +80,11 @@ impl Wait {
     }
 
     fn cancelled(self: Wait) -> Error {
+        if let Some(context) = self.context {
+            if let Some(context::Error::DeadlineExceeded) = context.error() {
+                return self.timed_out()
+            }
+        }
         error(ErrorKind::Interrupted, self.operation, "operation cancelled")
     }
 
@@ -64,6 +95,7 @@ impl Wait {
     fn check(self: Wait) -> Result[(), Error] {
         let cancelled = select {
             recv(self.cancel) as _ => true,
+            recv(self.context_signal) as _ => true,
             default => false,
         };
         if cancelled {
@@ -83,6 +115,7 @@ impl Wait {
             recv(gate) as _ => Result::Ok(()),
             recv(closed_signal) as _ => Result::Err(closed(self.operation)),
             recv(self.cancel) as _ => Result::Err(self.cancelled()),
+            recv(self.context_signal) as _ => Result::Err(self.cancelled()),
             recv(self.expired) as _ => Result::Err(self.timed_out()),
         }
     }

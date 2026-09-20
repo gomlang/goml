@@ -1,0 +1,707 @@
+package go_backend;
+
+use module::resources;
+use module::ast;
+use module::repr;
+
+fn network_named(name: string) -> Type {
+    Type::Named { name }
+}
+
+fn network_int(value: isize) -> Expr {
+    Expr::Int { value: value.to_string() }
+}
+
+fn network_text(value: string) -> Expr {
+    Expr::String { value }
+}
+
+fn network_var(name: string, ty: Type, value: Expr) -> Stmt {
+    Stmt::Var { name, ty, value: Option::Some(value) }
+}
+
+fn network_if(cond: Expr, stmts: Vec[Stmt]) -> Stmt {
+    Stmt::If { cond, then_: Block { stmts }, else_: Option::None }
+}
+
+fn network_binary(op: BinaryOp, lhs: Expr, rhs: Expr) -> Expr {
+    Expr::Binary { op, lhs, rhs }
+}
+
+fn network_pointer(name: string) -> Type {
+    Type::Pointer { elem: network_named(name) }
+}
+
+fn network_address(value: Expr) -> Expr {
+    Expr::Unary { op: UnaryOp::Address, expr: value }
+}
+
+fn network_empty(name: string) -> Expr {
+    Expr::StructLiteral { ty: network_named(name), fields: Vec::new() }
+}
+
+fn network_global(name: string) -> string {
+    go_generated_ident("_goml_tls_" + name)
+}
+
+fn network_bytes(name: string) -> Expr {
+    task_field(name, "items")
+}
+
+fn network_context(stmts: Vec[Stmt]) -> () {
+    stmts.push(
+        network_var(
+            "ctx",
+            network_named("_goml_context.Context"),
+            task_call("_goml_context.Background", Vec::new()),
+        ),
+    );
+    stmts.push(
+        network_if(
+            network_binary(BinaryOp::NotEq, task_var("cancel_id"), network_int(0)),
+            Vec::from_array(
+                [
+                    Stmt::Assign {
+                        name: "ctx",
+                        value: task_call(
+                            task_context_name(),
+                            Vec::from_array([task_var("cancel_id")]),
+                        ),
+                    },
+                ],
+            ),
+        ),
+    );
+    stmts.push(
+        network_if(
+            network_binary(BinaryOp::GreaterEq, task_var("timeout"), network_int(0)),
+            Vec::from_array(
+                [
+                    Stmt::Var {
+                        name: "cancel",
+                        ty: network_named("_goml_context.CancelFunc"),
+                        value: Option::None,
+                    },
+                    Stmt::MultiAssign {
+                        names: Vec::from_array(["ctx", "cancel"]),
+                        value: task_call(
+                            "_goml_context.WithTimeout",
+                            Vec::from_array(
+                                [
+                                    task_var("ctx"),
+                                    Expr::Convert {
+                                        ty: network_named("_goml_time.Duration"),
+                                        expr: task_var("timeout"),
+                                    },
+                                ],
+                            ),
+                        ),
+                    },
+                    Stmt::Defer { call: task_call("cancel", Vec::new()) },
+                ],
+            ),
+        ),
+    );
+}
+
+fn network_error_kind(fallback: isize) -> Expr {
+    task_call(
+        network_global("error_kind"),
+        Vec::from_array([task_var("ctx"), network_int(fallback)]),
+    )
+}
+
+fn network_result_type(value: repr::Type) -> Type {
+    std_tuple_type(Vec::from_array([repr::Type::Bool, value, repr::Type::Int, repr::Type::String]))
+}
+
+fn network_result(value_type: repr::Type, ok: bool, value: Expr, message: Expr) -> Stmt {
+    task_return(
+        std_tuple_expr(
+            network_result_type(value_type),
+            Vec::from_array(
+                [
+                    Expr::Bool { value: ok },
+                    value,
+                    if ok {
+                        network_int(0)
+                    } else {
+                        network_error_kind(1)
+                    },
+                    message,
+                ],
+            ),
+        ),
+    )
+}
+
+fn network_resolve_item(key: string) -> Item {
+    let value_type = std_vec_type(repr::Type::String);
+    let stmts: Vec[Stmt] = Vec::new();
+    network_context(stmts);
+    stmts.push(
+        Stmt::Var { name: "addresses", ty: Type::Slice { elem: Type::String }, value: Option::None },
+    );
+    stmts.push(Stmt::Var { name: "err", ty: network_named("error"), value: Option::None });
+    stmts.push(
+        Stmt::MultiAssign {
+            names: Vec::from_array(["addresses", "err"]),
+            value: task_call(
+                "_goml_net.DefaultResolver.LookupHost",
+                Vec::from_array([task_var("ctx"), task_var("host")]),
+            ),
+        },
+    );
+    stmts.push(
+        network_if(
+            std_error_condition(),
+            Vec::from_array(
+                [
+                    network_result(
+                        value_type,
+                        false,
+                        std_vec_expr(repr::Type::String, Expr::Nil),
+                        std_error_string(),
+                    ),
+                ],
+            ),
+        ),
+    );
+    stmts.push(
+        network_result(
+            value_type,
+            true,
+            std_vec_expr(repr::Type::String, task_var("addresses")),
+            network_text(""),
+        ),
+    );
+    std_function_item(
+        key,
+        Vec::from_array(
+            [("host", Type::String), ("cancel_id", Type::Int64), ("timeout", Type::Int64)],
+        ),
+        network_result_type(value_type),
+        stmts,
+    )
+}
+
+fn network_registry_items() -> Vec[Item] {
+    let connection = network_pointer("_goml_tls.Conn");
+    let map = Type::Map { key: Type::Int64, value: connection };
+    let items = Vec::from_array(
+        [
+            Item::Global(
+                Global {
+                    name: network_global("mu"),
+                    ty: Option::Some(network_named("_goml_sync.Mutex")),
+                    value: network_empty("_goml_sync.Mutex"),
+                },
+            ),
+            Item::Global(
+                Global {
+                    name: network_global("next"),
+                    ty: Option::Some(Type::Int64),
+                    value: network_int(1),
+                },
+            ),
+            Item::Global(
+                Global {
+                    name: network_global("connections"),
+                    ty: Option::Some(map),
+                    value: Expr::Make { ty: map, args: Vec::new() },
+                },
+            ),
+        ],
+    );
+    let stmts = Vec::from_array(
+        [
+            task_expr(task_method(network_global("mu"), "Lock", Vec::new())),
+            Stmt::Defer { call: task_method(network_global("mu"), "Unlock", Vec::new()) },
+            task_return(
+                Expr::Index { base: task_var(network_global("connections")), index: task_var("id") },
+            ),
+        ],
+    );
+    items.push(
+        Item::Function(
+            Function {
+                name: network_global("lookup"),
+                params: Vec::from_array([("id", Type::Int64)]),
+                ret_ty: Option::Some(connection),
+                body: Block { stmts },
+            },
+        ),
+    );
+    items.push(
+        Item::Function(
+            Function {
+                name: network_global("error_kind"),
+                params: Vec::from_array(
+                    [("ctx", network_named("_goml_context.Context")), ("fallback", Type::Int)],
+                ),
+                ret_ty: Option::Some(Type::Int),
+                body: Block {
+                    stmts: Vec::from_array(
+                        [
+                            network_if(
+                                network_binary(
+                                    BinaryOp::Eq,
+                                    task_method("ctx", "Err", Vec::new()),
+                                    task_var("_goml_context.DeadlineExceeded"),
+                                ),
+                                Vec::from_array([task_return(network_int(3))]),
+                            ),
+                            network_if(
+                                network_binary(
+                                    BinaryOp::Eq,
+                                    task_method("ctx", "Err", Vec::new()),
+                                    task_var("_goml_context.Canceled"),
+                                ),
+                                Vec::from_array([task_return(network_int(2))]),
+                            ),
+                            task_return(task_var("fallback")),
+                        ],
+                    ),
+                },
+            },
+        ),
+    );
+    items
+}
+
+fn network_connect_item(key: string) -> Item {
+    let stmts: Vec[Stmt] = Vec::new();
+    network_context(stmts);
+    stmts.push(
+        Stmt::Var { name: "roots", ty: network_pointer("_goml_x509.CertPool"), value: Option::None },
+    );
+    stmts.push(
+        network_if(
+            network_binary(
+                BinaryOp::Greater,
+                task_call("len", Vec::from_array([network_bytes("ca")])),
+                network_int(0),
+            ),
+            Vec::from_array(
+                [
+                    Stmt::Assign {
+                        name: "roots",
+                        value: task_call("_goml_x509.NewCertPool", Vec::new()),
+                    },
+                    network_if(
+                        Expr::Unary {
+                            op: UnaryOp::Not,
+                            expr: task_method(
+                                "roots",
+                                "AppendCertsFromPEM",
+                                Vec::from_array([network_bytes("ca")]),
+                            ),
+                        },
+                        Vec::from_array(
+                            [
+                                network_result(
+                                    repr::Type::Int64,
+                                    false,
+                                    network_int(0),
+                                    network_text("CA bundle contains no certificates"),
+                                ),
+                            ],
+                        ),
+                    ),
+                ],
+            ),
+        ),
+    );
+    stmts.push(
+        network_var(
+            "config",
+            network_pointer("_goml_tls.Config"),
+            network_address(
+                Expr::StructLiteral {
+                    ty: network_named("_goml_tls.Config"),
+                    fields: Vec::from_array(
+                        [
+                            ("ServerName", task_var("server_name")),
+                            ("RootCAs", task_var("roots")),
+                            ("NextProtos", network_bytes("protocols")),
+                            ("MinVersion", task_var("minimum")),
+                        ],
+                    ),
+                },
+            ),
+        ),
+    );
+    stmts.push(Stmt::Var { name: "err", ty: network_named("error"), value: Option::None });
+    stmts.push(
+        network_if(
+            network_binary(
+                BinaryOp::Greater,
+                task_call("len", Vec::from_array([network_bytes("certificate")])),
+                network_int(0),
+            ),
+            Vec::from_array(
+                [
+                    Stmt::Var {
+                        name: "pair",
+                        ty: network_named("_goml_tls.Certificate"),
+                        value: Option::None,
+                    },
+                    Stmt::MultiAssign {
+                        names: Vec::from_array(["pair", "err"]),
+                        value: task_call(
+                            "_goml_tls.X509KeyPair",
+                            Vec::from_array(
+                                [network_bytes("certificate"), network_bytes("private_key")],
+                            ),
+                        ),
+                    },
+                    network_if(
+                        std_error_condition(),
+                        Vec::from_array(
+                            [
+                                network_result(
+                                    repr::Type::Int64,
+                                    false,
+                                    network_int(0),
+                                    std_error_string(),
+                                ),
+                            ],
+                        ),
+                    ),
+                    Stmt::FieldAssign {
+                        target: task_var("config"),
+                        field_name: "Certificates",
+                        value: Expr::ArrayLiteral {
+                            ty: Type::Slice { elem: network_named("_goml_tls.Certificate") },
+                            items: Vec::from_array([task_var("pair")]),
+                        },
+                    },
+                ],
+            ),
+        ),
+    );
+    stmts.push(
+        network_var("dialer", network_named("_goml_net.Dialer"), network_empty("_goml_net.Dialer")),
+    );
+    stmts.push(Stmt::Var { name: "raw", ty: network_named("_goml_net.Conn"), value: Option::None });
+    stmts.push(
+        Stmt::MultiAssign {
+            names: Vec::from_array(["raw", "err"]),
+            value: task_method(
+                "dialer",
+                "DialContext",
+                Vec::from_array([task_var("ctx"), network_text("tcp"), task_var("address")]),
+            ),
+        },
+    );
+    stmts.push(
+        network_if(
+            std_error_condition(),
+            Vec::from_array(
+                [network_result(repr::Type::Int64, false, network_int(0), std_error_string())],
+            ),
+        ),
+    );
+    stmts.push(
+        network_var(
+            "conn",
+            network_pointer("_goml_tls.Conn"),
+            task_call("_goml_tls.Client", Vec::from_array([task_var("raw"), task_var("config")])),
+        ),
+    );
+    stmts.push(
+        Stmt::Assign {
+            name: "err",
+            value: task_method("conn", "HandshakeContext", Vec::from_array([task_var("ctx")])),
+        },
+    );
+    stmts.push(
+        network_if(
+            std_error_condition(),
+            Vec::from_array(
+                [
+                    task_expr(task_method("raw", "Close", Vec::new())),
+                    network_result(repr::Type::Int64, false, network_int(0), std_error_string()),
+                ],
+            ),
+        ),
+    );
+    stmts.push(task_expr(task_method(network_global("mu"), "Lock", Vec::new())));
+    stmts.push(Stmt::Defer { call: task_method(network_global("mu"), "Unlock", Vec::new()) });
+    stmts.push(network_var("id", Type::Int64, task_var(network_global("next"))));
+    stmts.push(
+        Stmt::Assign {
+            name: network_global("next"),
+            value: network_binary(BinaryOp::Add, task_var("id"), network_int(1)),
+        },
+    );
+    stmts.push(
+        Stmt::IndexAssign {
+            base: task_var(network_global("connections")),
+            index: task_var("id"),
+            value: task_var("conn"),
+        },
+    );
+    stmts.push(network_result(repr::Type::Int64, true, task_var("id"), network_text("")));
+    std_function_item(
+        key,
+        Vec::from_array(
+            [
+                ("address", Type::String),
+                ("server_name", Type::String),
+                ("ca", lower_type(std_vec_type(repr::Type::Uint8))),
+                ("certificate", lower_type(std_vec_type(repr::Type::Uint8))),
+                ("private_key", lower_type(std_vec_type(repr::Type::Uint8))),
+                ("protocols", lower_type(std_vec_type(repr::Type::String))),
+                ("minimum", Type::Uint16),
+                ("cancel_id", Type::Int64),
+                ("timeout", Type::Int64),
+            ],
+        ),
+        network_result_type(repr::Type::Int64),
+        stmts,
+    )
+}
+
+fn network_io_item(key: string, writing: bool) -> Item {
+    let stmts: Vec[Stmt] = Vec::new();
+    let ret = std_tuple_type(
+        Vec::from_array([repr::Type::Int, repr::Type::Int, repr::Type::String]),
+    );
+    stmts.push(
+        network_var(
+            "conn",
+            network_pointer("_goml_tls.Conn"),
+            task_call(network_global("lookup"), Vec::from_array([task_var("id")])),
+        ),
+    );
+    stmts.push(
+        network_if(
+            network_binary(BinaryOp::Eq, task_var("conn"), Expr::Nil),
+            Vec::from_array(
+                [
+                    task_return(
+                        std_tuple_expr(
+                            ret,
+                            Vec::from_array(
+                                [
+                                    network_int(0),
+                                    network_int(5),
+                                    network_text("TLS stream is closed"),
+                                ],
+                            ),
+                        ),
+                    ),
+                ],
+            ),
+        ),
+    );
+    network_context(stmts);
+    let signal = Type::Chan { elem: Type::Unit, direction: ast::ChannelDirection::Both };
+    stmts.push(network_var("aborted", signal, Expr::Make { ty: signal, args: Vec::new() }));
+    let abort = Expr::FuncLit {
+        params: Vec::new(),
+        ret_ty: Type::Void,
+        body: Block {
+            stmts: Vec::from_array(
+                [
+                    task_expr(task_method("conn", "Close", Vec::new())),
+                    task_expr(task_call("close", Vec::from_array([task_var("aborted")]))),
+                ],
+            ),
+        },
+    };
+    stmts.push(
+        network_var(
+            "stop",
+            Type::Func { params: Vec::new(), ret_ty: Type::Bool },
+            task_call("_goml_context.AfterFunc", Vec::from_array([task_var("ctx"), abort])),
+        ),
+    );
+    stmts.push(Stmt::Defer { call: task_call("stop", Vec::new()) });
+    stmts.push(Stmt::Var { name: "err", ty: network_named("error"), value: Option::None });
+    stmts.push(Stmt::Var { name: "count", ty: Type::Int, value: Option::None });
+    stmts.push(
+        Stmt::MultiAssign {
+            names: Vec::from_array(["count", "err"]),
+            value: task_method(
+                "conn",
+                if writing {
+                    "Write"
+                } else {
+                    "Read"
+                },
+                Vec::from_array([task_var("buffer")]),
+            ),
+        },
+    );
+    stmts.push(
+        network_if(
+            Expr::Unary { op: UnaryOp::Not, expr: task_call("stop", Vec::new()) },
+            Vec::from_array(
+                [
+                    task_expr(Expr::Receive { channel: task_var("aborted") }),
+                    Stmt::Assign { name: "err", value: task_method("ctx", "Err", Vec::new()) },
+                ],
+            ),
+        ),
+    );
+    stmts.push(
+        network_if(
+            network_binary(
+                BinaryOp::And,
+                std_error_condition(),
+                network_binary(
+                    BinaryOp::Eq,
+                    task_call(network_global("lookup"), Vec::from_array([task_var("id")])),
+                    Expr::Nil,
+                ),
+            ),
+            Vec::from_array(
+                [
+                    task_return(
+                        std_tuple_expr(
+                            ret,
+                            Vec::from_array(
+                                [
+                                    task_var("count"),
+                                    network_error_kind(5),
+                                    network_text("TLS stream is closed"),
+                                ],
+                            ),
+                        ),
+                    ),
+                ],
+            ),
+        ),
+    );
+    stmts.push(
+        network_if(
+            network_binary(
+                BinaryOp::And,
+                std_error_condition(),
+                network_binary(BinaryOp::NotEq, task_var("err"), task_var("_goml_io.EOF")),
+            ),
+            Vec::from_array(
+                [
+                    task_return(
+                        std_tuple_expr(
+                            ret,
+                            Vec::from_array(
+                                [task_var("count"), network_error_kind(1), std_error_string()],
+                            ),
+                        ),
+                    ),
+                ],
+            ),
+        ),
+    );
+    stmts.push(
+        task_return(
+            std_tuple_expr(
+                ret,
+                Vec::from_array([task_var("count"), network_int(0), network_text("")]),
+            ),
+        ),
+    );
+    std_function_item(
+        key,
+        Vec::from_array(
+            [
+                ("id", Type::Int64),
+                ("buffer", Type::Slice { elem: Type::Uint8 }),
+                ("cancel_id", Type::Int64),
+                ("timeout", Type::Int64),
+            ],
+        ),
+        ret,
+        stmts,
+    )
+}
+
+fn network_close_item(key: string) -> Item {
+    let stmts = Vec::from_array(
+        [
+            task_expr(task_method(network_global("mu"), "Lock", Vec::new())),
+            network_var(
+                "conn",
+                network_pointer("_goml_tls.Conn"),
+                Expr::Index { base: task_var(network_global("connections")), index: task_var("id") },
+            ),
+            task_expr(
+                task_call(
+                    "delete",
+                    Vec::from_array([task_var(network_global("connections")), task_var("id")]),
+                ),
+            ),
+            task_expr(task_method(network_global("mu"), "Unlock", Vec::new())),
+            network_if(
+                network_binary(BinaryOp::Eq, task_var("conn"), Expr::Nil),
+                Vec::from_array([task_return(network_text(""))]),
+            ),
+            network_var("err", network_named("error"), task_method("conn", "Close", Vec::new())),
+            network_if(std_error_condition(), Vec::from_array([task_return(std_error_string())])),
+            task_return(network_text("")),
+        ],
+    );
+    std_function_item(key, Vec::from_array([("id", Type::Int64)]), Type::String, stmts)
+}
+
+fn network_state_item(key: string) -> Item {
+    let ret = std_tuple_type(
+        Vec::from_array([repr::Type::Bool, repr::Type::Uint16, repr::Type::String]),
+    );
+    let stmts = Vec::from_array(
+        [
+            network_var(
+                "conn",
+                network_pointer("_goml_tls.Conn"),
+                task_call(network_global("lookup"), Vec::from_array([task_var("id")])),
+            ),
+            network_if(
+                network_binary(BinaryOp::Eq, task_var("conn"), Expr::Nil),
+                Vec::from_array(
+                    [
+                        task_return(
+                            std_tuple_expr(
+                                ret,
+                                Vec::from_array(
+                                    [Expr::Bool { value: false }, network_int(0), network_text("")],
+                                ),
+                            ),
+                        ),
+                    ],
+                ),
+            ),
+            network_var(
+                "state",
+                network_named("_goml_tls.ConnectionState"),
+                task_method("conn", "ConnectionState", Vec::new()),
+            ),
+            task_return(
+                std_tuple_expr(
+                    ret,
+                    Vec::from_array(
+                        [
+                            Expr::Bool { value: true },
+                            task_field("state", "Version"),
+                            task_field("state", "NegotiatedProtocol"),
+                        ],
+                    ),
+                ),
+            ),
+        ],
+    );
+    std_function_item(key, Vec::from_array([("id", Type::Int64)]), ret, stmts)
+}
+
+fn network_runtime_hook_item(hook: resources::NetworkRuntimeHook, key: string) -> Item {
+    match hook {
+        Resolve => network_resolve_item(key),
+        TlsConnect => network_connect_item(key),
+        TlsRead => network_io_item(key, false),
+        TlsWrite => network_io_item(key, true),
+        TlsClose => network_close_item(key),
+        TlsState => network_state_item(key),
+    }
+}

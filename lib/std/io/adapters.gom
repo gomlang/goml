@@ -1,0 +1,366 @@
+package io;
+
+use module::bytes;
+
+pub struct Cursor {
+    data: bytes::Bytes,
+    offset: Ref[isize],
+}
+
+impl Cursor {
+    pub fn new(data: bytes::Bytes) -> Cursor {
+        Cursor { data: bytes::Bytes::from_vec(data.to_vec().copy()), offset: Ref::new(0) }
+    }
+
+    pub fn position(self: Cursor) -> isize {
+        self.offset.get()
+    }
+
+    pub fn set_position(self: Cursor, position: isize) -> Result[(), Error] {
+        if position < 0 || position > self.data.len() {
+            Result::Err(
+                stream_error(
+                    ErrorKind::InvalidInput,
+                    "seek cursor",
+                    "position is outside the buffer",
+                ),
+            )
+        } else {
+            self.offset.set(position);
+            Result::Ok(())
+        }
+    }
+
+    pub fn bytes(self: Cursor) -> bytes::Bytes {
+        bytes::Bytes::from_vec(self.data.to_vec().copy())
+    }
+}
+
+impl Read for Cursor {
+    fn read(self: Cursor, buffer: MutSlice[byte]) -> Result[isize, Error] {
+        let available = self.data.len() - self.offset.get();
+        let count = if available < buffer.len() {
+            available
+        } else {
+            buffer.len()
+        };
+        for index in 0..count {
+            buffer[index] = self.data.get(self.offset.get() + index);
+        }
+        self.offset.set(self.offset.get() + count);
+        Result::Ok(count)
+    }
+}
+
+impl Write for Cursor {
+    fn write(self: Cursor, buffer: Slice[byte]) -> Result[isize, Error] {
+        if buffer.len() > 9223372036854775807 - self.offset.get() {
+            return Result::Err(
+                stream_error(ErrorKind::InvalidInput, "write cursor", "buffer length overflow"),
+            )
+        }
+        for index in 0..buffer.len() {
+            let position = self.offset.get() + index;
+            if position < self.data.len() {
+                self.data.set(position, buffer[index])
+            } else {
+                self.data.push(buffer[index])
+            }
+        }
+        self.offset.set(self.offset.get() + buffer.len());
+        Result::Ok(buffer.len())
+    }
+}
+
+impl BufRead for Cursor {
+    fn fill_buf(self: Cursor) -> Result[Slice[byte], Error] {
+        Result::Ok(self.data.slice(self.offset.get(), self.data.len()))
+    }
+
+    fn consume(self: Cursor, amount: isize) -> Result[(), Error] {
+        if amount < 0 || amount > self.data.len() - self.offset.get() {
+            Result::Err(
+                stream_error(
+                    ErrorKind::InvalidInput,
+                    "consume cursor",
+                    "amount exceeds buffered bytes",
+                ),
+            )
+        } else {
+            self.offset.set(self.offset.get() + amount);
+            Result::Ok(())
+        }
+    }
+}
+
+pub struct Take[R] {
+    reader: R,
+    remaining_value: Ref[isize],
+}
+
+impl[R: Read] Take[R] {
+    pub fn new(reader: R, limit: isize) -> Result[Take[R], Error] {
+        if limit < 0 {
+            Result::Err(stream_error(ErrorKind::InvalidInput, "take", "limit must be non-negative"))
+        } else {
+            Result::Ok(Take { reader, remaining_value: Ref::new(limit) })
+        }
+    }
+
+    pub fn remaining(self: Take[R]) -> isize {
+        self.remaining_value.get()
+    }
+}
+
+impl[R: Read] Read for Take[R] {
+    fn read(self: Take[R], buffer: MutSlice[byte]) -> Result[isize, Error] {
+        let capacity = if buffer.len() < self.remaining_value.get() {
+            buffer.len()
+        } else {
+            self.remaining_value.get()
+        };
+        if capacity == 0 {
+            return Result::Ok(0)
+        }
+        let count = valid_count(self.reader.read(buffer.sub(0, capacity))?, capacity, "take")?;
+        self.remaining_value.set(self.remaining_value.get() - count);
+        Result::Ok(count)
+    }
+}
+
+pub struct BufReader[R] {
+    reader: R,
+    buffer: bytes::Bytes,
+    offset: Ref[isize],
+    length: Ref[isize],
+}
+
+impl[R: Read] BufReader[R] {
+    pub fn new(reader: R) -> BufReader[R] {
+        BufReader { reader, buffer: byte_buffer(8192), offset: Ref::new(0), length: Ref::new(0) }
+    }
+
+    pub fn with_capacity(reader: R, capacity: isize) -> Result[BufReader[R], Error] {
+        if capacity <= 0 {
+            Result::Err(
+                stream_error(
+                    ErrorKind::InvalidInput,
+                    "buffered reader",
+                    "capacity must be positive",
+                ),
+            )
+        } else {
+            Result::Ok(
+                BufReader {
+                    reader,
+                    buffer: byte_buffer(capacity),
+                    offset: Ref::new(0),
+                    length: Ref::new(0),
+                },
+            )
+        }
+    }
+
+    pub fn buffered_len(self: BufReader[R]) -> isize {
+        self.length.get() - self.offset.get()
+    }
+}
+
+impl[R: Read] BufRead for BufReader[R] {
+    fn fill_buf(self: BufReader[R]) -> Result[Slice[byte], Error] {
+        if self.offset.get() == self.length.get() {
+            loop {
+                match self.reader.read(self.buffer.as_mut_slice()) {
+                    Ok(count) => {
+                        self.length.set(valid_count(count, self.buffer.len(), "buffered read")?);
+                        self.offset.set(0);
+                        break
+                    },
+                    Err(error) if error.kind() == ErrorKind::Interrupted => (),
+                    Err(error) => return Result::Err(error),
+                }
+            }
+        }
+        Result::Ok(self.buffer.slice(self.offset.get(), self.length.get()))
+    }
+
+    fn consume(self: BufReader[R], amount: isize) -> Result[(), Error] {
+        if amount < 0 || amount > self.buffered_len() {
+            Result::Err(
+                stream_error(
+                    ErrorKind::InvalidInput,
+                    "consume buffer",
+                    "amount exceeds buffered bytes",
+                ),
+            )
+        } else {
+            self.offset.set(self.offset.get() + amount);
+            Result::Ok(())
+        }
+    }
+}
+
+impl[R: Read] Read for BufReader[R] {
+    fn read(self: BufReader[R], buffer: MutSlice[byte]) -> Result[isize, Error] {
+        if buffer.len() == 0 {
+            return Result::Ok(0)
+        }
+        let available = self.fill_buf()?;
+        let count = if available.len() < buffer.len() {
+            available.len()
+        } else {
+            buffer.len()
+        };
+        for index in 0..count {
+            buffer[index] = available[index];
+        }
+        self.consume(count)?;
+        Result::Ok(count)
+    }
+}
+
+impl[R: Read + Close] Close for BufReader[R] {
+    fn close(self: BufReader[R]) -> Result[(), Error] {
+        self.reader.close()
+    }
+}
+
+pub struct BufWriter[W] {
+    writer: W,
+    buffer: bytes::Bytes,
+    offset: Ref[isize],
+    capacity: isize,
+}
+
+impl[W: Write] BufWriter[W] {
+    pub fn new(writer: W) -> BufWriter[W] {
+        BufWriter { writer, buffer: bytes::Bytes::new(), offset: Ref::new(0), capacity: 8192 }
+    }
+
+    pub fn with_capacity(writer: W, capacity: isize) -> Result[BufWriter[W], Error] {
+        if capacity <= 0 {
+            Result::Err(
+                stream_error(
+                    ErrorKind::InvalidInput,
+                    "buffered writer",
+                    "capacity must be positive",
+                ),
+            )
+        } else {
+            Result::Ok(
+                BufWriter { writer, buffer: bytes::Bytes::new(), offset: Ref::new(0), capacity },
+            )
+        }
+    }
+
+    pub fn buffered_len(self: BufWriter[W]) -> isize {
+        self.buffer.len() - self.offset.get()
+    }
+
+    fn drain(self: BufWriter[W]) -> Result[(), Error] {
+        while self.offset.get() < self.buffer.len() {
+            let remaining = self.buffer.slice(self.offset.get(), self.buffer.len());
+            let count = match self.writer.write(remaining) {
+                Ok(count) => valid_count(count, remaining.len(), "flush buffer")?,
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) => return Result::Err(error),
+            };
+            if count == 0 {
+                return Result::Err(
+                    stream_error(ErrorKind::WriteZero, "flush buffer", "stream made no progress"),
+                )
+            }
+            self.offset.set(self.offset.get() + count)
+        }
+        self.buffer.clear();
+        self.offset.set(0);
+        Result::Ok(())
+    }
+}
+
+impl[W: Write] Write for BufWriter[W] {
+    fn write(self: BufWriter[W], buffer: Slice[byte]) -> Result[isize, Error] {
+        if buffer.len() == 0 {
+            return Result::Ok(0)
+        }
+        if self.buffer.len() == self.capacity || self.offset.get() > 0 {
+            self.drain()?
+        }
+        let available = self.capacity - self.buffer.len();
+        let count = if buffer.len() < available {
+            buffer.len()
+        } else {
+            available
+        };
+        self.buffer.extend_from_slice(buffer.sub(0, count));
+        Result::Ok(count)
+    }
+
+    fn flush(self: BufWriter[W]) -> Result[(), Error] {
+        self.drain()?;
+        self.writer.flush()
+    }
+}
+
+impl[W: Write + Close] Close for BufWriter[W] {
+    fn close(self: BufWriter[W]) -> Result[(), Error] {
+        self.flush()?;
+        self.writer.close()
+    }
+}
+
+pub struct Stdout {}
+
+pub struct Stderr {}
+
+pub fn stdout() -> Stdout {
+    Stdout {}
+}
+
+pub fn stderr() -> Stderr {
+    Stderr {}
+}
+
+impl Write for Stdout {
+    fn write(self: Stdout, buffer: Slice[byte]) -> Result[isize, Error] {
+        let data = bytes::Bytes::new();
+        data.extend_from_slice(buffer);
+        write_stdout_structured(data)?;
+        Result::Ok(buffer.len())
+    }
+}
+
+impl Write for Stderr {
+    fn write(self: Stderr, buffer: Slice[byte]) -> Result[isize, Error] {
+        let data = bytes::Bytes::new();
+        data.extend_from_slice(buffer);
+        write_stderr_structured(data)?;
+        Result::Ok(buffer.len())
+    }
+}
+
+pub struct Stdin {}
+
+pub fn stdin() -> Stdin {
+    Stdin {}
+}
+
+impl Read for Stdin {
+    fn read(self: Stdin, buffer: MutSlice[byte]) -> Result[isize, Error] {
+        if buffer.len() == 0 {
+            return Result::Ok(0)
+        }
+        let (ok, data, kind, has_raw_code, raw_code, message) = __goml_std_host_read_stdin_chunk_v2(
+            buffer.len(),
+        );
+        if !ok {
+            return Result::Err(
+                structured_error("read stdin", kind, has_raw_code, raw_code, message),
+            )
+        }
+        for index in 0..data.len() {
+            buffer[index] = data[index];
+        }
+        Result::Ok(data.len())
+    }
+}

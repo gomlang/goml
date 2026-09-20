@@ -77,6 +77,6 @@ are downloaded into ignored `_artifact/` directories as documented by each
 library; race checks require the repository's C compiler prerequisite.
 
 Compiler limitations found during implementation remain documented in
-[FINDINGS.md](FINDINGS.md), with intentionally failing reproducers excluded from
-the passing library matrix. This work does not modify the compiler or standard
-library to conceal those boundaries.
+[FINDINGS.md](FINDINGS.md). The four compiler regression reproducers are included
+in the complete local verification run. Compiler fixes and the added standard-library
+capabilities are covered by separate regression fixtures.

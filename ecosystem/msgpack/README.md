@@ -3,7 +3,7 @@
 A native GoML implementation of the [MessagePack wire specification](https://github.com/msgpack/msgpack/blob/master/spec.md).
 The dynamic codec supports every wire type. The typed codec implements
 `std::serde::Serializer` and `Deserializer` directly, including generic structs,
-enums, tuples, options, sequences, binary data and maps with arbitrary key types.
+enums, tuples, options, sequences, binary data, extensions and maps with arbitrary key types.
 No Go FFI or runtime reflection is used. Python is only a verification dependency.
 
 ## Typed API
@@ -43,6 +43,7 @@ rejects trailing bytes.
 | `()`, `bool`, `string`, `char` | nil, boolean, UTF-8 string, one-scalar string | No implicit string/number conversion |
 | `Vec[T]`, tuples | array | Tuple length must match exactly |
 | `Vec[u8]` | array of integers | `Binary { data }` uses the binary wire family |
+| `Extension { tag, data }` | extension with an opaque signed tag and byte payload | Timestamp semantics remain explicit |
 | `Pairs[K, V]` | map | Ordered entries, arbitrary serializable keys, duplicate pairs preserved |
 | Struct | map keyed by field name | `structs_as_arrays` writes positional arrays |
 | Unit enum variant | variant name string | `variants_as_indices` writes declaration index |
@@ -99,11 +100,13 @@ UTF-8 is validated by default. `allow_invalid_utf8` decodes invalid string bytes
 as `RawString` and permits writing them. Valid raw input becomes `String`.
 Typed string/char decoding still requires valid UTF-8 even with this option.
 
-`std::serde::Value` has no binary, extension or arbitrary-map-key representation.
-Its `deserialize_any` path rejects those cases explicitly. Use `msgpack::Value`
-for full dynamic fidelity, `Binary` for typed binary fields and `Pairs` for typed
-maps. The current standard Serde event protocol has no extension event, so
-extensions/timestamps use the dynamic API rather than a magic struct convention.
+`std::serde::Value` preserves binary payloads, extensions and arbitrary-key maps
+through `Binary`, `Extension { tag, data }` and ordered `Map` entries. Its
+`deserialize_any` path supports those wire types directly. Use `Binary`,
+`Extension` and `Pairs` for typed fields. The encoder and decoder implement the
+standard extension events; formats that lack them return unsupported errors.
+`msgpack::Value` additionally supports raw invalid-UTF-8 strings and timestamp
+helpers. Integer widths and container headers still normalize on re-encoding.
 
 ## Incremental input and limits
 
@@ -157,7 +160,7 @@ python3 ecosystem/verify.py msgpack
 python3 ecosystem/msgpack/interop.py
 ```
 
-The library has 14 external tests covering integer boundaries, all length
+The library has 15 external tests covering integer boundaries, all length
 families (including 65,536-element maps/arrays), floating bits, Unicode and raw
 strings, arbitrary/duplicate map keys, timestamps, every truncation of selected
 nested values, limits, streaming compaction, all chunk sizes, direct Serde
