@@ -1,0 +1,212 @@
+package tests;
+
+use ecosystem::walkdir;
+use std::fs;
+use std::io;
+use std::os::linux::syscall;
+use std::os::linux::syscall::{Arg};
+use std::task;
+use std::testing;
+use std::time;
+use std::utf8;
+
+#[go_ffi("os", "Getpid")]
+extern fn getpid() -> isize;
+
+fn directory(label: string) -> string {
+    let root = "/tmp/goml-ecosystem-walkdir-" + label + "-" + getpid().to_string() + "-"
+        + time::SystemTime::now().unix_nanoseconds().to_string();
+    testing::expect_ok(fs::create_dir(root), "temporary directory");
+    root
+}
+
+fn next_entry(iterator: walkdir::WalkIterator) -> walkdir::DirEntry {
+    testing::expect_ok(testing::expect_some(iterator.next(), "next entry"), "entry")
+}
+
+#[test]
+fn bounds_are_validated_before_io_and_errors_are_fused() -> () {
+    for builder in Vec::from_array(
+        [
+            walkdir::WalkDir::new("missing").min_depth(-1),
+            walkdir::WalkDir::new("missing").max_depth(-1),
+            walkdir::WalkDir::new("missing").min_depth(2).max_depth(1),
+        ],
+    ) {
+        let iterator = builder.iter();
+        let error = testing::expect_err(
+            testing::expect_some(iterator.next(), "error"),
+            "invalid bounds",
+        );
+        testing::assert_eq(error.kind(), io::ErrorKind::InvalidInput);
+        testing::assert_eq(error.depth(), 0);
+        testing::assert_eq(error.path(), "missing");
+        testing::assert_none(iterator.next());
+        testing::assert_none(iterator.next());
+    }
+    let root = directory("nul");
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    let iterator = walkdir::walk(root + "\u0000suffix");
+    testing::assert_eq(
+        testing::expect_err(testing::expect_some(iterator.next(), "error"), "NUL").kind(),
+        io::ErrorKind::InvalidInput,
+    );
+    testing::assert_none(iterator.next());
+}
+
+#[test]
+fn unicode_paths_sort_by_name_and_metadata_remains_a_snapshot() -> () {
+    let root = directory("unicode");
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    for name in Vec::from_array(["中", "😀", "é", "a"]) {
+        testing::expect_ok(fs::write_file_structured(root + "/" + name, "data"), "file");
+    }
+    let iterator = walkdir::WalkDir::new(root).min_depth(1).iter();
+    defer iterator.close();
+    for name in Vec::from_array(["a", "é", "中", "😀"]) {
+        let entry = next_entry(iterator);
+        testing::assert(entry.file_name() == Option::Some(name));
+        testing::assert_eq(entry.metadata().len(), 4);
+        testing::expect_ok(
+            fs::write_file_structured(entry.path(), "longer contents"),
+            "replace content",
+        );
+        testing::assert_eq(entry.metadata().len(), 4);
+        testing::assert_eq(entry.depth(), 1);
+        testing::assert(entry.file_type().is_file());
+    }
+    testing::assert_none(iterator.next());
+}
+
+#[test]
+fn early_close_and_exhaustion_release_all_ancestor_descriptors() -> () {
+    let root = directory("descriptors");
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    testing::expect_ok(fs::create_dir_all(root + "/a/b/c/d"), "tree");
+    let before = testing::expect_ok(
+        fs::read_dir_names_structured("/proc/self/fd"),
+        "descriptor count",
+    ).len();
+    for _ in 0..32 {
+        let iterator = walkdir::walk(root);
+        for _ in 0..4 {
+            let _ = next_entry(iterator);
+        }
+        let shared = iterator;
+        iterator.close();
+        iterator.close();
+        testing::assert_none(shared.next());
+        let completed = walkdir::walk(root);
+        for item in completed {
+            testing::assert_ok(item);
+        }
+        testing::assert_none(completed.next());
+    }
+    let after = testing::expect_ok(
+        fs::read_dir_names_structured("/proc/self/fd"),
+        "descriptor count",
+    ).len();
+    testing::assert(after <= before + 2);
+}
+
+#[test]
+fn independent_iterators_allow_parallel_traversal_without_shared_progress() -> () {
+    let root = directory("parallel");
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    testing::expect_ok(fs::create_dir_all(root + "/a/b"), "tree");
+    testing::expect_ok(fs::write_file_structured(root + "/a/b/file", "data"), "file");
+    let builder = walkdir::WalkDir::new(root);
+    task::scope(
+        |scope: task::Scope| {
+            let first = scope.spawn(
+                |_: task::CancelToken| {
+                    let iterator = builder.iter();
+                    defer iterator.close();
+                    let mut count = 0;
+                    for item in iterator {
+                        testing::assert_ok(item);
+                        count += 1;
+                    }
+                    count
+                },
+            );
+            let second = builder.iter();
+            defer second.close();
+            let mut count = 0;
+            for item in second {
+                testing::assert_ok(item);
+                count += 1;
+            }
+            testing::assert_eq(count, 4);
+            testing::assert_eq(first.join(), count);
+        },
+    );
+}
+
+#[test]
+fn rejected_directory_subtrees_are_never_opened_even_in_postorder() -> () {
+    let root = directory("pruned");
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    testing::expect_ok(fs::create_dir_all(root + "/skip/deep"), "tree");
+    testing::expect_ok(fs::symbolic_link("../..", root + "/skip/deep/loop"), "cycle");
+    for postorder in Vec::from_array([false, true]) {
+        let builder = walkdir::WalkDir::new(root).follow_links(true).contents_first(postorder).filter_entry(
+            |entry| entry.file_name() != Option::Some("skip"),
+        );
+        let iterator = builder.iter();
+        testing::assert_eq(next_entry(iterator).path(), root);
+        testing::assert_none(iterator.next());
+    }
+}
+
+#[test]
+fn invalid_utf8_directory_entries_report_structured_error_and_release_resources() -> () {
+    let root = directory("utf8");
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    let name = utf8::encode(root + "/");
+    name.push(255);
+    name.push(0);
+    let current_directory: isize = -100;
+    let result = testing::expect_ok(
+        syscall::syscall6_with_buffers(
+            syscall::SYS_OPENAT,
+            [
+                Arg::Word(current_directory.to_usize()),
+                Arg::Buffer(name.as_mut_slice()),
+                Arg::Word(0x80041),
+                Arg::Word(0o600),
+                Arg::Word(0),
+                Arg::Word(0),
+            ],
+        ),
+        "create native filename",
+    );
+    testing::assert_eq(result.errno, 0);
+    testing::assert_eq(
+        testing::expect_ok(
+            syscall::syscall6(syscall::SYS_CLOSE, [result.r1, 0, 0, 0, 0, 0]),
+            "close file",
+        ).errno,
+        0,
+    );
+    let iterator = walkdir::walk(root);
+    let _ = next_entry(iterator);
+    let error = testing::expect_err(testing::expect_some(iterator.next(), "error"), "invalid UTF-8");
+    testing::assert_eq(error.kind(), io::ErrorKind::InvalidData);
+    testing::assert_eq(error.path(), root);
+    testing::assert_eq(error.depth(), 0);
+    testing::assert_none(iterator.next());
+    iterator.close();
+}

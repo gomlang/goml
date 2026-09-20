@@ -1,0 +1,340 @@
+package tests;
+
+use ecosystem::notify;
+use std::fs;
+use std::io;
+use std::os::linux::syscall;
+use std::os::linux::syscall::{Arg};
+use std::task;
+use std::testing;
+use std::time;
+use std::utf8;
+
+#[go_ffi("os", "Getpid")]
+extern fn getpid() -> isize;
+
+fn directory(label: string) -> string {
+    let root = "/tmp/goml-ecosystem-notify-" + label + "-" + getpid().to_string() + "-"
+        + time::SystemTime::now().unix_nanoseconds().to_string();
+    testing::expect_ok(fs::create_dir(root), "temporary directory");
+    root
+}
+
+fn write(name: string) -> () {
+    testing::expect_ok(fs::write_file_structured(name, "data"), "write");
+}
+
+fn observed(events: Vec[notify::Event], name: string, mask: u32) -> bool {
+    for event in events {
+        if event.path == name && event.has(mask) {
+            return true
+        }
+    }
+    false
+}
+
+#[test]
+fn registration_rejects_invalid_paths_masks_and_symlink_roots() -> () {
+    let root = directory("invalid");
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    write(root + "/file");
+    testing::expect_ok(fs::symbolic_link(root + "/file", root + "/link"), "link");
+    for name in Vec::from_array(["", root + "\u0000suffix", root + "/link"]) {
+        testing::assert_eq(
+            testing::expect_err(notify::watch(name), "invalid path").kind(),
+            io::ErrorKind::InvalidInput,
+        );
+    }
+    testing::assert_eq(
+        testing::expect_err(notify::watch(root + "/missing"), "missing").kind(),
+        io::ErrorKind::NotFound,
+    );
+    testing::assert_err(notify::watch_recursive(root + "/file"));
+    for mask in Vec::from_array([0, notify::Q_OVERFLOW, notify::ALL_EVENTS | notify::IS_DIR]) {
+        testing::assert_eq(
+            testing::expect_err(
+                notify::watch_with(root, notify::Options::new().with_mask(mask)),
+                "mask",
+            ).kind(),
+            io::ErrorKind::InvalidInput,
+        );
+    }
+    let event = notify::Event {
+        path: root,
+        mask: notify::CREATE | notify::IS_DIR,
+        cookie: 7,
+        rescan: true,
+    };
+    testing::assert(event.is_dir() && event.has(notify::CREATE | notify::MODIFY));
+    testing::assert(!event.has(notify::DELETE));
+}
+
+#[test]
+fn ignored_name_snapshot_and_mask_filter_preserve_visible_changes() -> () {
+    let root = directory("filter");
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    let names = Vec::from_array(["skip"]);
+    let options = notify::Options::new().with_mask(notify::MODIFY).with_ignored_names(names).with_ignore(
+        |name, _| name.ends_with(".tmp"),
+    );
+    names[0] = "visible";
+    let watcher = testing::expect_ok(notify::watch_with(root, options), "watch");
+    defer {
+        let _ = watcher.close();
+    };
+    write(root + "/skip");
+    write(root + "/ignored.tmp");
+    testing::assert(
+        testing::expect_ok(watcher.read(time::Duration::from_milliseconds(10)), "ignored").is_empty(),
+    );
+    write(root + "/visible");
+    let events = testing::expect_ok(watcher.read(time::Duration::from_seconds(2)), "visible");
+    testing::assert(observed(events, root + "/visible", notify::MODIFY));
+    for event in events {
+        testing::assert_eq(event.mask & notify::ALL_EVENTS, notify::MODIFY);
+    }
+}
+
+#[test]
+fn cancellation_interrupts_waiting_and_keeps_watcher_available() -> () {
+    let root = directory("cancel");
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    let watcher = testing::expect_ok(notify::watch(root), "watch");
+    defer {
+        let _ = watcher.close();
+    };
+    task::scope(
+        |scope: task::Scope| {
+            let started: Channel[()] = Channel::new(1);
+            let worker = scope.spawn(
+                |cancel: task::CancelToken| {
+                    started.send(());
+                    watcher.read_with(cancel, time::Duration::from_seconds(5))
+                },
+            );
+            let _ = started.recv();
+            scope.cancel();
+            match testing::expect_ok(worker.join(), "cancelled wait") {
+                task::WaitResult::Cancelled => (),
+                task::WaitResult::Completed(_) => testing::fail("wait must cancel"),
+            }
+        },
+    );
+    testing::assert(!watcher.is_closed());
+    write(root + "/after");
+    testing::assert(
+        observed(
+            testing::expect_ok(watcher.read(time::Duration::from_seconds(2)), "after cancellation"),
+            root + "/after",
+            notify::CREATE,
+        ),
+    );
+    testing::assert(
+        testing::expect_ok(watcher.read(time::Duration::zero()), "zero timeout").is_empty(),
+    );
+}
+
+#[test]
+fn subscriptions_reject_invalid_capacity_and_cancelled_scope_without_closing_source() -> () {
+    let root = directory("subscribe-invalid");
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    let watcher = testing::expect_ok(notify::watch(root), "watch");
+    defer {
+        let _ = watcher.close();
+    };
+    task::scope(
+        |scope: task::Scope| {
+            testing::assert_eq(
+                testing::expect_err(watcher.subscribe(scope, -1), "capacity").kind(),
+                io::ErrorKind::InvalidInput,
+            );
+            scope.cancel();
+            testing::assert_eq(
+                testing::expect_err(watcher.subscribe(scope, 1), "scope").kind(),
+                io::ErrorKind::Interrupted,
+            );
+        },
+    );
+    testing::assert(!watcher.is_closed());
+    write(root + "/still-open");
+    testing::assert(
+        observed(
+            testing::expect_ok(watcher.read(time::Duration::from_seconds(2)), "usable"),
+            root + "/still-open",
+            notify::CREATE,
+        ),
+    );
+}
+
+#[test]
+fn unbuffered_subscriptions_release_on_scope_cancel_and_concurrent_close() -> () {
+    let root = directory("backpressure");
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    for cancel_scope in Vec::from_array([true, false]) {
+        let watcher = testing::expect_ok(notify::watch(root), "watch");
+        task::scope(
+            |scope: task::Scope| {
+                let stream = testing::expect_ok(watcher.subscribe(scope, 0), "stream");
+                write(
+                    root
+                        + if cancel_scope {
+                            "/cancel"
+                        } else {
+                            "/close"
+                        },
+                );
+                if cancel_scope {
+                    scope.cancel();
+                    testing::assert_ok(stream.close());
+                } else {
+                    let first = scope.spawn(|_: task::CancelToken| stream.close());
+                    testing::assert_ok(watcher.close());
+                    testing::assert_ok(stream.close());
+                    testing::assert_ok(first.join());
+                }
+                testing::assert_ok(stream.close());
+                testing::assert_none(stream.events().recv());
+                let finished = select {
+                    recv(stream.done()) as _ => true,
+                    default => false,
+                };
+                testing::assert(finished);
+            },
+        );
+        testing::assert(watcher.is_closed());
+    }
+}
+
+#[test]
+fn watch_set_registration_errors_and_terminal_roots_are_isolated() -> () {
+    let root = directory("set");
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    testing::expect_ok(fs::create_dir(root + "/dying"), "directory");
+    let set = notify::WatchSet::new();
+    defer {
+        let _ = set.close();
+    };
+    let first = testing::expect_ok(set.add(root), "first");
+    let second = testing::expect_ok(set.add(root), "overlap");
+    let dying = testing::expect_ok(set.add(root + "/dying"), "dying");
+    testing::assert(first != second);
+    testing::assert_err(set.add(root + "/absent"));
+    testing::assert_eq(testing::expect_ok(set.watches(), "list").len(), 3);
+    testing::assert(testing::expect_ok(set.remove(first), "remove"));
+    testing::assert(!testing::expect_ok(set.remove(first), "repeat"));
+    testing::expect_ok(fs::remove_dir_all(root + "/dying"), "delete root");
+    let mut removed = false;
+    let mut terminal = false;
+    for notice in testing::expect_ok(set.read(time::Duration::from_seconds(2)), "notices") {
+        match notice {
+            notify::Notice::Event(id, event) => if id == dying && event.has(notify::DELETE_SELF) {
+                terminal = true;
+            },
+            notify::Notice::Removed(id) => if id == dying {
+                removed = true;
+            },
+            notify::Notice::Error(_, error) => testing::fail(error.to_string()),
+        }
+    }
+    testing::assert(terminal && removed);
+    testing::assert_eq(testing::expect_ok(set.watches(), "survivor").len(), 1);
+    write(root + "/alive");
+    let mut alive = false;
+    for notice in testing::expect_ok(
+        set.read(time::Duration::from_seconds(2)),
+        "surviving registration",
+    ) {
+        if let notify::Notice::Event(id, event) = notice {
+            if id == second && event.path == root + "/alive" && event.has(notify::CREATE) {
+                alive = true;
+            }
+        }
+    }
+    testing::assert(alive);
+    testing::assert_ok(set.close());
+    testing::assert_ok(set.close());
+    testing::assert_err(set.try_read());
+}
+
+#[test]
+fn invalid_utf8_event_closes_watcher_with_recoverable_error() -> () {
+    let root = directory("utf8");
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    let watcher = testing::expect_ok(notify::watch(root), "watch");
+    defer {
+        let _ = watcher.close();
+    };
+    let name = utf8::encode(root + "/");
+    name.push(255);
+    name.push(0);
+    let current_directory: isize = -100;
+    let result = testing::expect_ok(
+        syscall::syscall6_with_buffers(
+            syscall::SYS_OPENAT,
+            [
+                Arg::Word(current_directory.to_usize()),
+                Arg::Buffer(name.as_mut_slice()),
+                Arg::Word(0x80041),
+                Arg::Word(0o600),
+                Arg::Word(0),
+                Arg::Word(0),
+            ],
+        ),
+        "create native filename",
+    );
+    testing::assert_eq(result.errno, 0);
+    testing::assert_eq(
+        testing::expect_ok(
+            syscall::syscall6(syscall::SYS_CLOSE, [result.r1, 0, 0, 0, 0, 0]),
+            "close file",
+        ).errno,
+        0,
+    );
+    testing::assert_eq(
+        testing::expect_err(watcher.read(time::Duration::from_seconds(2)), "invalid UTF-8").kind(),
+        io::ErrorKind::InvalidData,
+    );
+    testing::assert(watcher.is_closed());
+    testing::assert_ok(watcher.close());
+}
+
+#[test]
+fn failed_registration_and_repeated_close_release_descriptors() -> () {
+    let root = directory("descriptors");
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    write(root + "/file");
+    let before = testing::expect_ok(
+        fs::read_dir_names_structured("/proc/self/fd"),
+        "descriptor count",
+    ).len();
+    for _ in 0..32 {
+        testing::assert_err(notify::watch_recursive(root + "/file"));
+        let watcher = testing::expect_ok(notify::watch(root), "watch");
+        testing::assert_ok(watcher.close());
+        testing::assert_ok(watcher.close());
+        let set = notify::WatchSet::new();
+        let _ = testing::expect_ok(set.add(root), "registration");
+        testing::assert_ok(set.close());
+    }
+    let after = testing::expect_ok(
+        fs::read_dir_names_structured("/proc/self/fd"),
+        "descriptor count",
+    ).len();
+    testing::assert(after <= before + 2);
+}

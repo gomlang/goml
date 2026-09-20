@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parent
 MODULES = (
     "parser", "proptest", "cli", "msgpack", "graph", "template", "redis",
     "pipeline", "ndarray", "sqlite", "lsp", "markdown", "diff",
-    "bitflags", "logos", "tempfile", "reqwest", "llvm",
+    "bitflags", "logos", "tempfile", "notify", "walkdir", "reqwest", "llvm",
     "rope", "tracing", "web", "ignore", "syntax", "cache", "bigint",
     "decimal", "incremental", "datetime",
 )
