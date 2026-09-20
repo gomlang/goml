@@ -26,6 +26,7 @@ fn validate_command(command: Command, depth: isize) -> Result[(), Error] {
         return Result::Err(problem(ErrorKind::InvalidSchema, "invalid command name"))
     }
     let names: HashMap[string, bool] = HashMap::new();
+    let spellings: HashMap[string, bool] = HashMap::new();
     let shorts: HashMap[char, bool] = HashMap::new();
     let positions: HashMap[isize, Argument] = HashMap::new();
     for argument in command.arguments {
@@ -36,6 +37,18 @@ fn validate_command(command: Command, depth: isize) -> Result[(), Error] {
             )
         }
         names.set(argument.name, true);
+        for spelling in argument.aliases.copy().pushed(argument.name) {
+            if !valid_name(spelling) || spelling == "help" || spelling == "version"
+                || spellings.contains(spelling) {
+                return Result::Err(
+                    problem(
+                        ErrorKind::InvalidSchema,
+                        f"invalid or duplicate option spelling: {spelling}",
+                    ),
+                )
+            }
+            spellings.set(spelling, true);
+        }
         if let Some(short) = argument.short_name {
             if shorts.contains(short) || short == 'h' || short == 'V' || short.to_u32() < 33
                 || short.to_u32() > 126
@@ -49,7 +62,9 @@ fn validate_command(command: Command, depth: isize) -> Result[(), Error] {
         }
         if let Some(index) = argument.position {
             if index < 0 || positions.contains(index) || argument.short_name.is_some()
-                || argument.action != Action::Value {
+                || argument.action != Action::Value
+                || argument.global_value
+                || !argument.aliases.is_empty() {
                 return Result::Err(problem(ErrorKind::InvalidSchema, "invalid positional argument"))
             }
             positions.set(index, argument);
@@ -106,12 +121,26 @@ fn validate_command(command: Command, depth: isize) -> Result[(), Error] {
             }
         }
     }
+    validate_groups(command, names)?;
     let commands: HashMap[string, bool] = HashMap::new();
-    for child in command.commands {
-        if commands.contains(child.name) {
-            return Result::Err(problem(ErrorKind::InvalidSchema, "duplicate subcommand"))
+    let own_names: HashMap[string, bool] = HashMap::new();
+    for spelling in command.aliases.copy().pushed(command.name) {
+        if !valid_name(spelling) || own_names.contains(spelling) {
+            return Result::Err(
+                problem(ErrorKind::InvalidSchema, "invalid or duplicate command alias"),
+            )
         }
-        commands.set(child.name, true);
+        own_names.set(spelling, true);
+    }
+    for child in command.commands {
+        for spelling in child.aliases.copy().pushed(child.name) {
+            if commands.contains(spelling) {
+                return Result::Err(
+                    problem(ErrorKind::InvalidSchema, "duplicate subcommand spelling"),
+                )
+            }
+            commands.set(spelling, true);
+        }
         validate_command(child, depth + 1)?;
     }
     Result::Ok(())
@@ -119,7 +148,7 @@ fn validate_command(command: Command, depth: isize) -> Result[(), Error] {
 
 fn long_argument(command: Command, name: string) -> Result[Argument, Error] {
     for argument in command.arguments {
-        if argument.position.is_none() && argument.name == name {
+        if argument.position.is_none() && (argument.name == name || argument.aliases.contains(name)) {
             return Result::Ok(argument)
         }
     }
@@ -164,16 +193,14 @@ fn option_value(arguments: Vec[string], index: isize, name: string) -> Result[st
     }
 }
 
-fn parse_command(command: Command, arguments: Vec[string], environment: (string) -> Option[string]) -> Result[
-    Matches,
-    Error,
-] {
-    let matches = Matches {
-        command: command.name,
-        values_by_name: HashMap::new(),
-        explicit_names: HashMap::new(),
-        children: Vec::new(),
-    };
+fn parse_command(
+    command: Command,
+    arguments: Vec[string],
+    environment: (string) -> Option[string],
+    parent: Matches,
+) -> Result[Matches, Error] {
+    let matches = empty_matches(command.name);
+    copy_globals(command, parent, matches);
     let mut index = 0;
     let mut positional = 0;
     let mut options = true;
@@ -254,16 +281,21 @@ fn parse_command(command: Command, arguments: Vec[string], environment: (string)
         let mut child_command: Option[Command] = Option::None;
         if options {
             for child in command.commands {
-                if child.name == token {
+                if child.name == token || child.aliases.contains(token) {
                     child_command = Option::Some(child);
                     break;
                 }
             }
         }
         if let Some(child) = child_command {
-            matches.children.push(
-                parse_command(child, arguments.slice(index, arguments.len()).to_vec(), environment)?,
-            );
+            let child_matches = parse_command(
+                child,
+                arguments.slice(index, arguments.len()).to_vec(),
+                environment,
+                matches,
+            )?;
+            copy_globals(command, child_matches, matches);
+            matches.children.push(child_matches);
             break;
         }
         let mut target: Option[Argument] = Option::None;
@@ -323,12 +355,13 @@ fn parse_command(command: Command, arguments: Vec[string], environment: (string)
     if command.subcommand_required && matches.children.is_empty() {
         return Result::Err(problem(ErrorKind::Usage, "a subcommand is required"))
     }
+    check_groups(command, matches)?;
     Result::Ok(matches)
 }
 
 impl Command {
     pub fn validate(self: Command) -> Result[(), Error] {
-        validate_command(self, 0)
+        validate_command(prepare_command(self, Vec::new(), 0)?, 0)
     }
 
     pub fn parse(self: Command, arguments: Vec[string]) -> Result[Matches, Error] {
@@ -340,8 +373,9 @@ impl Command {
         arguments: Vec[string],
         environment: (string) -> Option[string],
     ) -> Result[Matches, Error] {
-        self.validate()?;
-        parse_command(self, arguments, environment)
+        let command = prepare_command(self, Vec::new(), 0)?;
+        validate_command(command, 0)?;
+        parse_command(command, arguments, environment, empty_matches(""))
     }
 
     pub fn parse_env(self: Command) -> Result[Matches, Error] {

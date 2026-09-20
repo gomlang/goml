@@ -1,9 +1,10 @@
 package redis;
 
 use std::net;
+use std::io;
 
 pub struct Connection {
-    stream: net::TcpStream,
+    stream: Transport,
     options: ConnectionOptions,
     decoder: Decoder,
     gate: Channel[()],
@@ -25,14 +26,49 @@ impl Connection {
         Connection,
         Error,
     ] {
+        Connection::dial(
+            options,
+            operation,
+            |remaining| {
+                let stream = net::TcpStream::connect_with(address, remaining.wait_options())?;
+                if let Err(problem) = stream.set_nodelay(true) {
+                    let _ = stream.close();
+                    return Result::Err(problem)
+                }
+                Result::Ok(Transport::tcp(stream))
+            },
+        )
+    }
+
+    pub fn dial(
+        options: ConnectionOptions,
+        operation: Operation,
+        dialer: (Operation) -> Result[Transport, io::Error],
+    ) -> Result[Connection, Error] {
         let deadline = Deadline::new(operation);
         defer deadline.stop();
-        options.limits.validate()?;
-        if options.read_chunk_bytes < 1
-            || options.read_chunk_bytes > options.limits.max_buffer_bytes {
-            return Result::Err(error(ErrorKind::Limit, 0, "read chunk must fit the decoder buffer"))
+        validate_connection_options(options)?;
+        let stream = dialer(deadline.remaining()?).map_err(io_error)?;
+        Connection::attach(stream, options, deadline)
+    }
+
+    pub fn from_transport(stream: Transport, options: ConnectionOptions, operation: Operation) -> Result[
+        Connection,
+        Error,
+    ] {
+        let deadline = Deadline::new(operation);
+        defer deadline.stop();
+        if let Err(problem) = validate_connection_options(options) {
+            let _ = stream.close();
+            return Result::Err(problem)
         }
-        let stream = net::TcpStream::connect_with(address, deadline.options()?).map_err(io_error)?;
+        Connection::attach(stream, options, deadline)
+    }
+
+    fn attach(stream: Transport, options: ConnectionOptions, deadline: Deadline) -> Result[
+        Connection,
+        Error,
+    ] {
         let gate = Channel::new(1);
         gate.send(());
         let close_gate = Channel::new(1);
@@ -58,7 +94,6 @@ impl Connection {
     }
 
     fn initialize(self: Connection, deadline: Deadline) -> Result[(), Error] {
-        self.stream.set_nodelay(true).map_err(io_error)?;
         let version = if self.options.protocol == Protocol::Resp3 {
             "3"
         } else {
@@ -173,11 +208,11 @@ impl Connection {
 
     fn write(self: Connection, bytes: Slice[u8], deadline: Deadline) -> Result[(), Error] {
         self.open()?;
-        let options = deadline.options()?;
-        if let Err(problem) = self.stream.write_all_with(bytes, options) {
-            return Result::Err(self.fatal(io_error(problem), true, Vec::new()))
+        let operation = deadline.remaining()?;
+        if let Err(problem) = self.stream.write_all(bytes, operation) {
+            return Result::Err(self.fatal(problem, true, Vec::new()))
         }
-        Result::Ok(())
+        deadline.check().map_err(|problem| self.fatal(problem, true, Vec::new()))
     }
 
     fn frame(self: Connection, deadline: Deadline) -> Result[Decoded, Error] {
@@ -200,10 +235,11 @@ impl Connection {
             } else {
                 buffer.len()
             };
-            let count = self.stream.read_with(
+            let count = self.stream.read(
                 buffer.as_mut_slice().sub(0, length),
-                deadline.options()?,
-            ).map_err(io_error)?;
+                deadline.remaining()?,
+            )?;
+            deadline.check()?;
             if count == 0 {
                 return Result::Err(
                     error(ErrorKind::UnexpectedEof, 0, "Redis server closed the connection"),
@@ -374,4 +410,12 @@ impl Connection {
         let _: () = FromReply::from_reply(result?)?;
         Result::Ok(())
     }
+}
+
+fn validate_connection_options(options: ConnectionOptions) -> Result[(), Error] {
+    options.limits.validate()?;
+    if options.read_chunk_bytes < 1 || options.read_chunk_bytes > options.limits.max_buffer_bytes {
+        return Result::Err(error(ErrorKind::Limit, 0, "read chunk must fit the decoder buffer"))
+    }
+    Result::Ok(())
 }

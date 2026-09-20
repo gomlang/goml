@@ -37,7 +37,10 @@ boolean switch, and `Argument::counter` counts occurrences. The free functions
 `command`, `argument`, `flag` and `counter` provide equivalent constructors.
 
 Argument builders include `short`, `help`, `required`, `multiple`, `positional`,
-`default_value`, `env`, `possible_values`, `conflicts_with` and `requires`.
+`default_value`, `env`, `possible_values`, `conflicts_with`, `requires`, `alias`
+and `global`. `Command.alias` adds a subcommand spelling; matches always use
+canonical command/argument names. Aliases collide with canonical names and other
+aliases during schema validation, and cannot use reserved option names.
 Positional indices are contiguous from zero; a repeated positional must be last.
 Required positionals precede optional positionals. Commands and arguments are
 public records; `validate` checks the schema, including duplicate names/short
@@ -50,9 +53,23 @@ must use the equals form. Use `--` for positional values beginning with `-`.
 Scalar duplicates are rejected; repeated values preserve input order. Flags do
 not accept explicit values. `--help`/`-h` and `--version`/`-V` are reserved.
 
-Subcommands have their own schemas. Parent options precede the subcommand, and
-`Matches::subcommand` returns the child's matches. No global-option inheritance
-or fuzzy subcommand matching is applied. Schema nesting is capped at 64.
+Subcommands have their own schemas. Ordinary parent options precede the
+subcommand. Options marked `global(true)` can occur before or after any nested
+subcommand and appear in every descendant's help. Values and occurrence counts
+are available at their declaring command and each selected descendant through
+`Matches::subcommand`. Repeated values preserve order across levels; scalar
+duplicates still fail. Defaults/environment are evaluated after explicit input,
+and constraints are enforced at the declaring command. A child cannot shadow an
+inherited name, alias or short option. Global positionals are invalid. `--` stops
+option and subcommand recognition at the current level. Schema depth is capped at 64.
+
+`Command.group(ArgGroup::new(name, members))` defines a group of canonical argument
+names, allowing at most one distinct member by default. `required(true)` requires
+exactly one, while `bounds(minimum, maximum)` supports other cardinalities.
+Explicit arguments and environment values participate; defaults do not. Multiple
+occurrences of one argument count once. Groups may overlap but cannot contain
+unknown/duplicate members or invalid bounds. Help displays aliases, inherited
+options and group constraints.
 
 ## Values and environment
 
@@ -82,9 +99,10 @@ is optional, and `Vec[T]` is repeated. A count field must be `isize`. Derived
 bounds apply `ArgValue` to the actual scalar or container-element type.
 
 `#[command(...)]` accepts string `name`, `about`, and `version`. `#[arg(...)]`
-accepts switches `positional`, `required`, `optional`, `multiple`, and `count`,
+accepts switches `positional`, `required`, `optional`, `multiple`, `count`, and `global`,
 and string values `long`, `short`, `help`, `default`, `env`, `choices`, `conflicts`
-and `requires`. The last three use `|`-separated names/values. Empty string
+`requires` and `alias`. `choices`, `conflicts` and `requires` use `|`-separated
+names/values; `alias` supplies one additional long option spelling. Empty string
 defaults are preserved. Field underscores become hyphens in default option
 names. Positional indices follow field order. Unknown attributes produce
 compile-time diagnostics. Explicit command schemas handle subcommands.

@@ -1,8 +1,8 @@
 # ecosystem::diff
 
 Generic sequence differences and strict unified text patches, implemented in
-GoML. The sequence algorithm follows Myers' shortest-edit-path algorithm, with
-deterministic ties and explicit work and trace budgets.
+GoML. Select Myers' shortest-edit-path algorithm or a linear-space Hirschberg
+algorithm, both with deterministic ties and explicit work and workspace budgets.
 
 ```goml
 use ecosystem::diff;
@@ -21,6 +21,22 @@ returns a recoverable error rather than silently producing a nonminimal result.
 Empty-side changes take a direct path. Search costs are proportional to sequence
 length and edit distance; this implementation retains quadratic trace space in
 the edit distance, with the configured cap.
+
+`sequence_linear` / `sequence_linear_by` compute a shortest edit script using
+Hirschberg's LCS divide-and-conquer algorithm. They retain two reusable score
+rows of at most `min(old.len(), new.len()) + 1` cells each, an O(log(max(N, M)))
+explicit task stack, and the output. Common prefixes/suffixes and one-element
+segments use direct paths. There is no recursive call-stack growth or quadratic
+retained trace. `max_trace` bounds score-row cells; `max_work` bounds comparisons,
+row initialization, split selection and segment processing. Budget exhaustion
+returns an error without exposing a partial script.
+
+Worst-case time is O(NM), so this mode is useful when large edit distances would
+exhaust the Myers trace. It can choose a different equally minimal script on
+ties. `sequence_with`, `line_diff_with`, `character_diff_with` and `patch_with`
+accept `Options` and `Algorithm::Myers` or `Algorithm::Hirschberg`. Existing entry
+points retain Myers behavior. Algorithm selection is explicit; there is no
+automatic retry that silently resets the work budget.
 
 Results are coalesced `Op` records with `Equal`, `Delete` or `Insert` tags and
 half-open old/new index ranges. `distance` counts inserted/deleted elements;
@@ -58,15 +74,20 @@ the standard English spelling; generate reference patches with `LC_ALL=C`.
 python3 ecosystem/verify.py diff
 python3 ecosystem/diff/interop.py
 ecosystem/consumers/diff/_artifact/bin/diff produce old.txt new.txt change.patch
+ecosystem/consumers/diff/_artifact/bin/diff produce-linear old.txt new.txt change.patch
 ecosystem/consumers/diff/_artifact/bin/diff apply old.txt change.patch output.txt
 ```
 
 The tests exhaustively compare all pairs of binary sequences of lengths zero
 through five against an independent dynamic-programming distance oracle (3,969
-pairs), and validate edit ranges and inverse edits. Other tests cover Unicode,
+pairs per algorithm), and validate edit ranges and inverse edits. Workspace tests
+cover a large edit distance, exact score-row limits, bounded comparator calls,
+trimmed identical inputs and comparator direction when inputs are transposed.
+Other tests cover Unicode,
 CRLF, no-final-newline files, split hunks, malformed patches and conflict checks.
 The separate consumer adds randomized properties through the independently
 resolved `ecosystem::proptest` module. The interoperability script checks 48 cases
-in both directions with GNU diff and GNU patch.
+with both GoML generation algorithms and GNU patch, and verifies application of
+GNU diff output in the reverse direction.
 
 Algorithm reference: [Eugene W. Myers, An O(ND) Difference Algorithm and Its Variations](https://neil.fraser.name/writing/diff/myers.pdf).

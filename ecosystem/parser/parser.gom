@@ -8,7 +8,7 @@ pub struct Error {
 }
 
 pub struct Parser[T] {
-    run: (string, isize) -> Result[(T, isize), Error],
+    run: (ParseContext, string, isize) -> Result[(T, isize), Error],
 }
 
 pub fn error(offset: isize, expected: string) -> Error {
@@ -17,17 +17,35 @@ pub fn error(offset: isize, expected: string) -> Error {
 
 impl[T] Parser[T] {
     pub fn new(run: (string, isize) -> Result[(T, isize), Error]) -> Parser[T] {
+        Parser::with_context(|_, input, offset| run(input, offset))
+    }
+
+    pub fn with_context(run: (ParseContext, string, isize) -> Result[(T, isize), Error]) -> Parser[
+        T,
+    ] {
         Parser { run }
     }
 
     pub fn parse_at(self: Parser[T], input: string, offset: isize) -> Result[(T, isize), Error] {
+        self.parse_in(ParseContext::new(ParseLimits::standard())?, input, offset)
+    }
+
+    pub fn parse_in(self: Parser[T], context: ParseContext, input: string, offset: isize) -> Result[
+        (T, isize),
+        Error,
+    ] {
         if offset < 0 || offset > input.byte_len() {
             return Result::Err(error(offset, "valid input offset"))
         }
         if !input.is_char_boundary(offset) {
             return Result::Err(error(offset, "UTF-8 character boundary"))
         }
-        let (value, next) = (self.run)(input, offset)?;
+        let nested = context.nested(offset)?;
+        let result = (self.run)(nested, input, offset);
+        if let Some(problem) = context.limit_error() {
+            return Result::Err(problem)
+        }
+        let (value, next) = result?;
         if next < offset || next > input.byte_len() {
             return Result::Err(Error { offset, expected: "valid parser progress", committed: true })
         }
@@ -38,7 +56,14 @@ impl[T] Parser[T] {
     }
 
     pub fn parse(self: Parser[T], input: string) -> Result[T, Error] {
-        let (value, next) = self.parse_at(input, 0)?;
+        self.parse_with_limits(input, ParseLimits::standard())
+    }
+
+    pub fn parse_with_limits(self: Parser[T], input: string, limits: ParseLimits) -> Result[
+        T,
+        Error,
+    ] {
+        let (value, next) = self.parse_in(ParseContext::new(limits)?, input, 0)?;
         if next != input.byte_len() {
             Result::Err(error(next, "end of input"))
         } else {
@@ -47,19 +72,19 @@ impl[T] Parser[T] {
     }
 
     pub fn map[U](self: Parser[T], transform: (T) -> U) -> Parser[U] {
-        Parser::new(
-            |input, offset| {
-                let (value, next) = self.parse_at(input, offset)?;
+        Parser::with_context(
+            |context, input, offset| {
+                let (value, next) = self.parse_in(context, input, offset)?;
                 Result::Ok((transform(value), next))
             },
         )
     }
 
     pub fn then[U](self: Parser[T], other: Parser[U]) -> Parser[(T, U)] {
-        Parser::new(
-            |input, offset| {
-                let (left, next) = self.parse_at(input, offset)?;
-                let (right, end) = other.parse_at(input, next)?;
+        Parser::with_context(
+            |context, input, offset| {
+                let (left, next) = self.parse_in(context, input, offset)?;
+                let (right, end) = other.parse_in(context, input, next)?;
                 Result::Ok(((left, right), end))
             },
         )
@@ -74,15 +99,15 @@ impl[T] Parser[T] {
     }
 
     pub fn or(self: Parser[T], other: Parser[T]) -> Parser[T] {
-        Parser::new(
-            |input, offset| {
-                match self.parse_at(input, offset) {
+        Parser::with_context(
+            |context, input, offset| {
+                match self.parse_in(context, input, offset) {
                     Ok(value) => Result::Ok(value),
                     Err(first) => {
                         if first.committed {
                             return Result::Err(first)
                         }
-                        match other.parse_at(input, offset) {
+                        match other.parse_in(context, input, offset) {
                             Ok(value) => Result::Ok(value),
                             Err(second) => {
                                 if second.committed || second.offset > first.offset {
@@ -90,6 +115,10 @@ impl[T] Parser[T] {
                                 } else if first.offset > second.offset {
                                     Result::Err(first)
                                 } else {
+                                    context.charge(
+                                        first.expected.byte_len() + second.expected.byte_len(),
+                                        offset,
+                                    )?;
                                     Result::Err(
                                         error(
                                             first.offset,
@@ -106,9 +135,9 @@ impl[T] Parser[T] {
     }
 
     pub fn cut(self: Parser[T]) -> Parser[T] {
-        Parser::new(
-            |input, offset| {
-                match self.parse_at(input, offset) {
+        Parser::with_context(
+            |context, input, offset| {
+                match self.parse_in(context, input, offset) {
                     Ok(value) => Result::Ok(value),
                     Err(problem) => Result::Err(
                         Error {
@@ -123,12 +152,12 @@ impl[T] Parser[T] {
     }
 
     pub fn many(self: Parser[T]) -> Parser[Vec[T]] {
-        Parser::new(
-            |input, offset| {
+        Parser::with_context(
+            |context, input, offset| {
                 let values: Vec[T] = Vec::new();
                 let mut next = offset;
                 loop {
-                    match self.parse_at(input, next) {
+                    match self.parse_in(context, input, next) {
                         Ok((value, end)) => {
                             if end == next {
                                 return Result::Err(
@@ -155,9 +184,9 @@ impl[T] Parser[T] {
     }
 
     pub fn optional(self: Parser[T]) -> Parser[Option[T]] {
-        Parser::new(
-            |input, offset| {
-                match self.parse_at(input, offset) {
+        Parser::with_context(
+            |context, input, offset| {
+                match self.parse_in(context, input, offset) {
                     Ok((value, next)) => Result::Ok((Option::Some(value), next)),
                     Err(problem) => if problem.committed {
                         Result::Err(problem)
@@ -171,16 +200,17 @@ impl[T] Parser[T] {
 }
 
 pub fn pure[T](value: T) -> Parser[T] {
-    Parser::new(|_, offset| Result::Ok((value, offset)))
+    Parser::with_context(|_, _, offset| Result::Ok((value, offset)))
 }
 
 pub fn lazy[T](build: () -> Parser[T]) -> Parser[T] {
-    Parser::new(|input, offset| build().parse_at(input, offset))
+    Parser::with_context(|context, input, offset| build().parse_in(context, input, offset))
 }
 
 pub fn literal(expected: string) -> Parser[string] {
-    Parser::new(
-        |input, offset| {
+    Parser::with_context(
+        |context, input, offset| {
+            context.charge(expected.byte_len(), offset)?;
             if input.starts_with_at(offset, expected) {
                 Result::Ok((expected, offset + expected.byte_len()))
             } else {
@@ -191,10 +221,17 @@ pub fn literal(expected: string) -> Parser[string] {
 }
 
 pub fn take_while(predicate: (byte) -> bool, minimum: isize, expected: string) -> Parser[string] {
-    Parser::new(
-        |input, offset| {
+    Parser::with_context(
+        |context, input, offset| {
             let mut next = offset;
-            while next < input.byte_len() && predicate(input.byte_get(next)) {
+            if minimum < 0 {
+                return Result::Err(error(offset, "nonnegative minimum"))
+            }
+            while next < input.byte_len() {
+                context.charge(1, next)?;
+                if !predicate(input.byte_get(next)) {
+                    break;
+                }
                 next += 1;
             }
             if !input.is_char_boundary(next) {

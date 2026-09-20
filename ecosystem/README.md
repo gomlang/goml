@@ -6,23 +6,24 @@ independent GoML modules. SQLite additionally uses an explicit Go adapter.
 
 All thirteen libraries have implementations, public documentation, independent
 consumers and executable verification. The table records their implemented scope;
-individual READMEs describe API semantics and limits.
+individual READMEs describe API semantics and limits. [ROADMAP.md](ROADMAP.md)
+tracks completed improvements and the remaining functional gaps.
 
 | Module | Functional target | Status |
 | --- | --- | --- |
-| [parser](parser/README.md) | Combinators, recursive grammars, text and binary primitives, spans, contextual errors, bounded repetition and operator precedence | Implemented; module and consumer tests pass |
-| [proptest](proptest/README.md) | Composable generators, associated-type strategies, shrinking, bounded rejection, deterministic replay, collections and recursive data | Implemented; module and consumer tests pass |
-| [cli](cli/README.md) | Explicit command schema, options, positional arguments, subcommands, help, validation and third-party `Args` derive | Implemented; module and consumer tests pass |
+| [parser](parser/README.md) | Text/binary combinators, recursive grammars, shared work/depth budgets, spans, contextual errors and operator precedence | Implemented; module and consumer tests pass |
+| [proptest](proptest/README.md) | Composable and stateful generators, lazy budgeted shrinking, discard/coverage reports, persistent replay, unique collections and IEEE edge cases | Implemented; module and consumer tests pass |
+| [cli](cli/README.md) | Command schemas, aliases, inherited global options, argument groups, help, validation and third-party derives | Implemented; module and consumer tests pass |
 | [msgpack](msgpack/README.md) | MessagePack wire types, direct Serde integration, typed and dynamic APIs, malformed-input limits and interoperability | Implemented; 14 library tests, consumer checks and 2,490 reference interoperability cases pass |
 | [graph](graph/README.md) | Mutable directed/undirected graphs, stable IDs, traversal, components, topological order, shortest paths and spanning trees | Implemented; independent algorithm checks and consumer tests pass |
 | [template](template/README.md) | Expressions, lexical scopes, conditions, loops, filters, includes, inheritance, escaping and contextual diagnostics | Implemented; 11 library tests, 2 consumer tests and 1,367 Jinja shared-syntax comparisons pass |
-| [redis](redis/README.md) | RESP2/3 codec, typed commands, pipelining, transactions, Pub/Sub, cancellation, timeout and connection lifecycle | Implemented; 15 library tests and race checks, versioned consumer, 2,391 protocol cases and Redis 7.2.5 RESP2/3 interoperability pass |
+| [redis](redis/README.md) | RESP2/3 codec, typed commands, pipelining, transactions, Pub/Sub, injectable transport, cancellation and total deadlines | Implemented; 18 library tests and race checks, versioned consumers, 2,391 protocol cases and Redis 7.2.5 RESP2/3 interoperability pass |
 | [pipeline](pipeline/README.md) | Lazy streams, bounded parallel transforms, filtering, ordering, batching/windows, merge/zip, backpressure and cancellation | Implemented; 21 library tests and race checks, versioned consumer and 1,253 Python oracle cases pass |
 | [ndarray](ndarray/README.md) | Generic shared views, slicing, broadcasting, checked arithmetic, reductions, batched multiplication, LU/Cholesky/QR solves and SIMD | Implemented; 17 library tests, versioned consumer, 2,929 NumPy cases and native/SSE2/scalar builds pass |
 | [sqlite](sqlite/README.md) | Typed binding/rows, prepared statements, streaming queries, nested savepoints, rollback, cancellation and explicit resource management | Implemented; 13 GoML tests, 4 native tests, versioned consumer, 2,754 SQLite comparisons and race checks pass |
-| [lsp](lsp/README.md) | JSON-RPC framing, protocol types, document synchronization, UTF-16 positions, request lifecycle and dispatch | Implemented; module, consumer and subprocess interoperability tests pass |
+| [lsp](lsp/README.md) | JSON-RPC framing, document synchronization, UTF-16 positions, synchronous/deferred dispatch, cancellation and deadlines | Implemented; module, consumer and subprocess interoperability tests pass |
 | [markdown](markdown/README.md) | Block and inline parsing, AST, HTML rendering, escaping, links, code, lists and reference conformance | Implemented; 652/652 CommonMark examples, entity, module and consumer checks pass |
-| [diff](diff/README.md) | Sequence and text differences, unified patches, checked application, context and newline preservation | Implemented; tests and GNU interoperability pass |
+| [diff](diff/README.md) | Myers and linear-space Hirschberg differences, unified patches, checked application, context and newline preservation | Implemented; tests and GNU interoperability pass |
 
 Validation includes module-local public API tests, separate consuming modules,
 deterministic negative cases, reference interoperability where applicable, and

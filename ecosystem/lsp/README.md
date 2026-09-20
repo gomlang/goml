@@ -2,7 +2,7 @@
 
 A reusable GoML toolkit for language servers and LSP peers: bounded streaming
 frames, validated JSON-RPC messages, typed handler registration, request tracking,
-document synchronization, UTF-16 coordinates and a synchronous server lifecycle.
+document synchronization, UTF-16 coordinates and synchronous or deferred dispatch.
 The compiler's internal LSP implementation is not imported.
 
 The wire profile targets [LSP 3.17](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/)
@@ -18,7 +18,7 @@ coverage of every optional LSP feature or generated protocol type.
 | Messages | `Id`, `Message`, `RpcError`, `decode`, `decode_value`, `encode`, `encode_value` |
 | Documents | `Position`, `Range`, `TextEdit`, `Change`, `Document`, `Documents`, `utf16_length` |
 | Requests | `Session`, `RequestToken`, `Completed` |
-| Dispatch | `RequestContext`, `Router`, `Server`, `Phase`, `Event` |
+| Dispatch | `RequestContext`, `Router`, `Server`, `Phase`, `Event`, `Dispatch`, `PendingRequest` |
 | Feature helpers | `DocumentPosition`, `Location`, `Diagnostic`, `publish_diagnostics`, `hover`, `progress` |
 | Standard I/O | `Stdio::new`, `read_body`, `write` |
 
@@ -102,6 +102,8 @@ response and invalidates that token; tokens from other sessions, completed
 tokens and stale tokens after ID reuse are rejected. Cancellation does not
 automatically discard a successful or partial result: the handler decides its
 response, and every accepted request must eventually be completed.
+`Session.close` invalidates all incoming and outgoing tokens and prevents new
+registrations; it is idempotent. Server exit closes its session automatically.
 
 Outgoing `request` registration is separate from incoming requests, so each peer
 can use the same ID independently. `receive` correlates replies and rejects
@@ -133,13 +135,45 @@ Notification/transport failures are returned to the application for local
 diagnostics; they are not sent as unsolicited responses. The consumer demonstrates
 parse-error responses with null IDs and continuing after a malformed JSON body.
 
+### Deferred work and deadlines
+
+`Server.accept(message)` returns `Dispatch { event, request }`. Built-in
+lifecycle methods, document updates, cancellation and client replies produce an
+immediate event. A registered ordinary request produces a `PendingRequest`
+without invoking its handler. Duplicate IDs, pending limits and lifecycle rules
+still apply. The event loop can now process further messages before finishing
+that request.
+
+Call `Server.execute(pending)` to invoke its registered raw/typed handler and
+produce the final response, or `Server.complete(pending, result)` when the
+application has computed the result separately. Both reject foreign, completed
+and stale tokens before running user code. `pending.token()` supports cooperative
+cancellation and `params()` exposes the request parameters. Document snapshots
+should be captured before scheduling work when it needs a fixed source version.
+`execute` checks cancellation before invoking a handler; `complete` permits a
+successful partial result after client cancellation, as the protocol allows.
+
+`accept_with_timeout(message, Some(duration))` adds a total deadline for deferred
+work. `next_timeout()` gives the shortest remaining duration for an event-loop
+timer. Call `poll_timeouts()` when it fires and send every returned response.
+Expired requests finish once with RequestFailed (-32803); late completions are
+rejected, including after an ID is reused. `complete` and `execute` also check
+deadlines, so an overdue result cannot bypass a delayed timer poll. No timer or
+worker goroutine is created. Built-in immediate methods do not receive deadlines.
+
+Shutdown stops accepting ordinary work while allowing already accepted requests
+to finish. Exit invalidates remaining requests, clears deadline tracking and
+ends the protocol stream without generating additional responses.
+
 ## Execution and scope
 
 All mutable objects use shared storage and are intended for one owning event
 loop. `Server.handle` invokes callbacks synchronously; a cancellation message
 cannot interrupt a callback running on that same loop. Applications needing
-deferred work can use `Session` and `Router` directly, poll cancellation tokens,
-and complete requests after yielding to their event loop. This library does not
+deferred work can use `accept`, yield to their event loop, and call `execute` or
+`complete` later. Handler callbacks themselves remain synchronous and cannot be
+preempted. All server/session/token access must remain on the owning loop; worker
+tasks should receive immutable inputs and return results to that loop. This library does not
 provide a worker pool, timer scheduler or synchronization for concurrent mutation.
 
 Document changes currently rebuild strings and line indexes, so a batch of C

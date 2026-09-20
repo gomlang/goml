@@ -13,19 +13,45 @@ pub enum Error {
 }
 
 pub struct Parser[T] {
-    run: (Slice[byte], isize) -> Result[(T, isize), Error],
+    run: (parser::ParseContext, Slice[byte], isize) -> Result[(T, isize), Error],
 }
 
 impl[T] Parser[T] {
     pub fn new(run: (Slice[byte], isize) -> Result[(T, isize), Error]) -> Parser[T] {
+        Parser::with_context(|_, input, offset| run(input, offset))
+    }
+
+    pub fn with_context(
+        run: (parser::ParseContext, Slice[byte], isize) -> Result[(T, isize), Error],
+    ) -> Parser[T] {
         Parser { run }
     }
 
     pub fn parse_at(self: Parser[T], input: Slice[byte], offset: isize) -> Result[(T, isize), Error] {
+        self.parse_in(
+            parser::ParseContext::new(parser::ParseLimits::standard()).map_err(
+                |problem| Error::Invalid(problem),
+            )?,
+            input,
+            offset,
+        )
+    }
+
+    pub fn parse_in(
+        self: Parser[T],
+        context: parser::ParseContext,
+        input: Slice[byte],
+        offset: isize,
+    ) -> Result[(T, isize), Error] {
         if offset < 0 || offset > input.len() {
             return Result::Err(Error::Invalid(parser::error(offset, "valid binary offset")))
         }
-        let (value, next) = (self.run)(input, offset)?;
+        let nested = context.nested(offset).map_err(|problem| Error::Invalid(problem))?;
+        let result = (self.run)(nested, input, offset);
+        if let Some(problem) = context.limit_error() {
+            return Result::Err(Error::Invalid(problem))
+        }
+        let (value, next) = result?;
         if next < offset || next > input.len() {
             return Result::Err(
                 Error::Invalid(parser::error(offset, "valid binary parser progress")),
@@ -35,7 +61,15 @@ impl[T] Parser[T] {
     }
 
     pub fn parse(self: Parser[T], input: Slice[byte]) -> Result[T, Error] {
-        let (value, next) = self.parse_at(input, 0)?;
+        self.parse_with_limits(input, parser::ParseLimits::standard())
+    }
+
+    pub fn parse_with_limits(self: Parser[T], input: Slice[byte], limits: parser::ParseLimits) -> Result[
+        T,
+        Error,
+    ] {
+        let context = parser::ParseContext::new(limits).map_err(|problem| Error::Invalid(problem))?;
+        let (value, next) = self.parse_in(context, input, 0)?;
         if next != input.len() {
             return Result::Err(Error::Invalid(parser::error(next, "end of binary input")))
         }
@@ -43,18 +77,18 @@ impl[T] Parser[T] {
     }
 
     pub fn map[U](self: Parser[T], transform: (T) -> U) -> Parser[U] {
-        Parser::new(
-            |input, offset| {
-                let (value, next) = self.parse_at(input, offset)?;
+        Parser::with_context(
+            |context, input, offset| {
+                let (value, next) = self.parse_in(context, input, offset)?;
                 Result::Ok((transform(value), next))
             },
         )
     }
 
     pub fn try_map[U](self: Parser[T], transform: (T) -> Result[U, string]) -> Parser[U] {
-        Parser::new(
-            |input, offset| {
-                let (value, next) = self.parse_at(input, offset)?;
+        Parser::with_context(
+            |context, input, offset| {
+                let (value, next) = self.parse_in(context, input, offset)?;
                 let mapped = transform(value).map_err(
                     |message| Error::Invalid(parser::error(offset, message)),
                 )?;
@@ -64,10 +98,10 @@ impl[T] Parser[T] {
     }
 
     pub fn then[U](self: Parser[T], other: Parser[U]) -> Parser[(T, U)] {
-        Parser::new(
-            |input, offset| {
-                let (left, next) = self.parse_at(input, offset)?;
-                let (right, end) = other.parse_at(input, next)?;
+        Parser::with_context(
+            |context, input, offset| {
+                let (left, next) = self.parse_in(context, input, offset)?;
+                let (right, end) = other.parse_in(context, input, next)?;
                 Result::Ok(((left, right), end))
             },
         )
@@ -82,17 +116,17 @@ impl[T] Parser[T] {
     }
 
     pub fn and_then[U](self: Parser[T], build: (T) -> Parser[U]) -> Parser[U] {
-        Parser::new(
-            |input, offset| {
-                let (value, next) = self.parse_at(input, offset)?;
-                build(value).parse_at(input, next)
+        Parser::with_context(
+            |context, input, offset| {
+                let (value, next) = self.parse_in(context, input, offset)?;
+                build(value).parse_in(context, input, next)
             },
         )
     }
 
     pub fn repeat(self: Parser[T], count: isize, limit: isize) -> Parser[Vec[T]] {
-        Parser::new(
-            |input, offset| {
+        Parser::with_context(
+            |context, input, offset| {
                 if count < 0 || count > limit {
                     return Result::Err(
                         Error::Invalid(parser::error(offset, "bounded element count")),
@@ -101,7 +135,7 @@ impl[T] Parser[T] {
                 let result: Vec[T] = Vec::new();
                 let mut next = offset;
                 for _ in 0..count {
-                    let (value, end) = self.parse_at(input, next)?;
+                    let (value, end) = self.parse_in(context, input, next)?;
                     if end == next {
                         return Result::Err(
                             Error::Invalid(
@@ -119,8 +153,8 @@ impl[T] Parser[T] {
 }
 
 pub fn take(count: isize) -> Parser[Slice[byte]] {
-    Parser::new(
-        |input: Slice[byte], offset| {
+    Parser::with_context(
+        |context, input: Slice[byte], offset| {
             if count < 0 {
                 return Result::Err(Error::Invalid(parser::error(offset, "nonnegative byte count")))
             }
@@ -137,10 +171,11 @@ pub fn take(count: isize) -> Parser[Slice[byte]] {
 
 pub fn literal(expected: Slice[byte]) -> Parser[Slice[byte]] {
     let frozen = expected.to_vec().freeze();
-    Parser::new(
-        |input: Slice[byte], offset| {
+    Parser::with_context(
+        |context, input: Slice[byte], offset| {
             let mut index = 0;
             while index < frozen.len() {
+                context.charge(1, offset + index).map_err(|problem| Error::Invalid(problem))?;
                 if index >= input.len() - offset {
                     return Result::Err(
                         Error::Incomplete { offset: input.len(), needed: frozen.len() - index },
@@ -153,7 +188,7 @@ pub fn literal(expected: Slice[byte]) -> Parser[Slice[byte]] {
                 }
                 index += 1;
             }
-            take(frozen.len()).parse_at(input, offset)
+            take(frozen.len()).parse_in(context, input, offset)
         },
     )
 }
@@ -165,14 +200,14 @@ pub fn byte_value() -> Parser[byte] {
 pub fn length_prefixed(length: Parser[isize], maximum: isize) -> Parser[Slice[byte]] {
     length.and_then(
         |count| {
-            Parser::new(
-                |input, offset| {
+            Parser::with_context(
+                |context, input, offset| {
                     if count < 0 || count > maximum {
                         return Result::Err(
                             Error::Invalid(parser::error(offset, "bounded frame length")),
                         )
                     }
-                    take(count).parse_at(input, offset)
+                    take(count).parse_in(context, input, offset)
                 },
             )
         },

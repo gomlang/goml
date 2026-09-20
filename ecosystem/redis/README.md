@@ -3,7 +3,7 @@
 `ecosystem::redis` is a standalone GoML RESP2/RESP3 client. It includes an
 incremental binary codec, typed requests, heterogeneous pipelines, transactions,
 optimistic updates, subscriptions, bounded push handling, cancellation and TCP
-connection management. It uses `std::net`, `std::task` and `std::time`; it does not
+connection management and injectable transports. It uses `std::net`, `std::task` and `std::time`; it does not
 wrap a Go Redis client.
 
 ## Connection and typed commands
@@ -40,6 +40,33 @@ validates the returned protocol version, then selects the database. It therefore
 requires Redis 6 or newer even in RESP2 mode. Failed setup closes the socket.
 `close()` is idempotent and wakes active/queued operations; `quit()` exchanges
 QUIT and then closes. Applications should explicitly close connections.
+
+### Custom transports and dialing
+
+`Transport::new(read, write_all, close, is_closed)` adapts an ordered duplex byte
+stream. `Connection::from_transport` takes ownership immediately, including on
+invalid options or failed setup. `Connection::dial(options, operation, dialer)`
+validates options before dialing and gives the dialer the remaining `Operation`.
+The same total deadline covers dialing, transport setup and HELLO/SELECT. This
+allows applications to supply DNS resolution, TLS or Unix sockets without
+reimplementing RESP, pipelines, transactions or subscriptions. These adapters
+are supplied by the application; TLS and DNS implementations are not bundled.
+
+Each read/write callback receives the remaining timeout and cancellation token,
+available through `Operation.timeout()` and `cancel_token()`. Native socket
+adapters can use `wait_options()`. A read returns 0 at EOF; counts outside the
+provided buffer are rejected. A successful write must transmit all bytes.
+Callbacks must honor these limits, avoid retaining buffers after returning, and
+return structured `std::io::Error` values. The connection also checks the total
+deadline after callbacks return; it cannot preempt a callback that ignores it.
+
+The connection serializes reads and writes. `close` and `is_closed` may run
+concurrently with either callback: adapters must synchronize their state and
+make close wake blocked I/O. The connection calls its close callback once;
+directly shared `Transport` handles still require an idempotent close adapter.
+Do not use the underlying stream independently after transferring ownership.
+`Transport::tcp` wraps an already connected `std::net::TcpStream`; the normal
+`Connection::connect` entry point additionally enables TCP_NODELAY.
 
 The `commands` package provides typed factories for:
 
@@ -182,9 +209,9 @@ bound wire data and counts, not an exact process heap size. Cyclic caller-create
 values terminate at the encoder's depth limit. Decoder/builders are mutable and
 require external serialization if shared; `Connection` provides its own gate.
 
-Transport currently follows `std::net`: Linux amd64 numeric IPv4/IPv6 TCP
-addresses. DNS, TLS, Unix sockets, connection pools, Cluster redirection and
-Sentinel discovery are outside this implementation. Command availability depends
+The built-in transport follows `std::net`: Linux amd64 numeric IPv4/IPv6 TCP
+addresses. Custom transports extend that boundary. Connection pools, Cluster
+redirection and Sentinel discovery are outside this implementation. Command availability depends
 on the selected server version; unsupported commands return normal server errors.
 
 ## Validation
@@ -196,12 +223,14 @@ python3 ecosystem/verify.py redis
 python3 ecosystem/redis/race.py
 ```
 
-The verifier runs 15 library tests, an independent versioned consumer test,
+The verifier runs the library tests, independent versioned consumer tests,
 fresh/cached builds, a consumer smoke check and `interop.py`. Coverage includes
 all RESP tags, every fixture fragment boundary and truncation, binary payloads,
 100,000 one-byte feeds, numeric bounds, malformed/limited frames, concurrent
 requests, queued versus in-flight cancellation, total deadlines, partial pipeline
-errors, close wakeups, push overflow and resumable subscription reads.
+errors, close wakeups, push overflow and resumable subscription reads. Injected
+transport tests cover fragmented reads, setup cleanup, invalid read counts,
+structured dial errors, precancellation and the shared dialing/setup deadline.
 
 The interoperability script checks 2,391 independently constructed RESP cases
 and exercises command families, authentication failures, binary values, Lua,
