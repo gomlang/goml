@@ -1,7 +1,8 @@
 # goml_stats
 
-A small GoML project statistics tool, written in GoML and using only the standard
-library. It reports source files, physical lines, code lines, comment-only lines,
+A GoML project statistics tool using the `ecosystem::ignore` library for
+hierarchical Git ignore rules and filesystem traversal. It reports source files,
+physical lines, code lines, comment-only lines,
 blank lines, UTF-8 bytes, test files, discovered modules and package directories.
 Text tables and JSON reports support both interactive use and automation.
 
@@ -10,7 +11,7 @@ Text tables and JSON reports support both interactive use and automation.
 From the repository root:
 
 ```sh
-(cd ecosystem/goml_stats && ../../stage2/bin/goml build)
+python3 ecosystem/goml_stats/verify.py
 ecosystem/goml_stats/_artifact/bin/cmd/goml_stats/goml_stats .
 ecosystem/goml_stats/_artifact/bin/cmd/goml_stats/goml_stats gomlc --modules --packages
 ecosystem/goml_stats/_artifact/bin/cmd/goml_stats/goml_stats ecosystem --files
@@ -18,9 +19,11 @@ ecosystem/goml_stats/_artifact/bin/cmd/goml_stats/goml_stats . --exclude gomlc/t
 ecosystem/goml_stats/_artifact/bin/cmd/goml_stats/goml_stats . --json --files > ecosystem/goml_stats/_artifact/source-stats.json
 ```
 
-With an installed toolchain, `goml build` inside this directory is sufficient.
-The resulting `goml_stats` executable can be copied onto `PATH`. Filesystem
-traversal currently targets Linux amd64, matching `std::fs::walkdir`.
+The verification command resolves versioned dependencies from an isolated local
+registry snapshot and builds the tool. With the dependency available in a
+configured registry, `goml build` inside this directory also works. The resulting
+`goml_stats` executable can be copied onto `PATH`. Filesystem traversal currently
+targets Linux amd64, matching the standard filesystem APIs.
 
 ## Options
 
@@ -39,7 +42,8 @@ file. Options can appear before or after the path.
 | `--json` | Emit JSON with totals, module and package summaries |
 | `--exclude NAME_OR_PATH` | Exclude a basename anywhere or one root-relative path; repeatable |
 | `--exclude=NAME_OR_PATH` | Alternative spelling for an exclusion |
-| `--no-default-excludes` | Disable the built-in exclusions; explicit exclusions still apply |
+| `--no-default-excludes` | Disable the built-in exclusions; explicit exclusions and Git ignore rules still apply |
+| `--no-ignore` | Disable `.gitignore` and root `.git/info/exclude` loading |
 | `-h`, `--help` | Show usage |
 | `--` | End options, for example `goml_stats -- -example.gom` |
 
@@ -48,11 +52,23 @@ Default exclusions are `.git`, `.hg`, `.svn`, `.goml`, `_artifact`, `_bootstrap`
 directories are pruned before reading their contents. Basenames match at any
 depth; paths containing `/` match relative to the scan root. Exclusions can also
 match files. Absolute paths, empty exclusions and paths escaping the root are
-rejected. Glob patterns and `.gitignore` rules are not interpreted. Use
-`--exclude` for custom build-output directories or vendored source.
+rejected. Explicit exclusions remain literal names or paths.
+
+By default, the scanner reads `.gitignore` in the scan root and visited child
+directories, plus the root `.git/info/exclude` at lower priority. These rules
+support Git glob patterns, escaping, anchoring and negation. A negated file rule
+cannot restore a file inside a pruned parent directory. Ancestor `.gitignore`
+files and user-global Git configuration are not loaded. `--no-ignore` disables
+these files; it does not disable the built-in or explicit exclusions. Explicit
+exclusions take precedence over rule negation.
+
+For a linked Git worktree, the root `.git` file and its `commondir` metadata
+locate the shared `info/exclude`. This explicit Git metadata reference can point
+outside the scanned directory; ancestor `.gitignore` files are still not loaded.
 
 An explicitly supplied scan root is always visited, even when its name is on the
-exclusion list. Symbolic links inside the tree are skipped, including dangling
+exclusion list or matches an ignore rule. A single-file scan bypasses ignore
+rules. Symbolic links inside the tree are skipped, including dangling
 links and directory loops. A symbolic link supplied as the root is rejected.
 Only regular files with the case-sensitive `.gom` extension are counted; generated
 Go files, compiler snapshots and other file types are ignored. Distinct hard-link
@@ -112,10 +128,16 @@ default_excludes() -> Vec[string]
 normalize_exclude(value: string) -> Result[string, string]
 ```
 
-`Options` has public `excludes: Vec[string]` and `use_default_excludes: bool`
-fields. `Report`, `Group`, `FileStats` and `Counts` expose their data as public
-fields. The scanner reads one source file at a time and retains counts and paths;
+`Options` has public `excludes: Vec[string]`, `use_default_excludes: bool`
+and `use_gitignore: bool` fields. `Report`, `Group`, `FileStats` and `Counts` expose
+their data as public fields. The scanner reads one source file at a time and retains counts and paths;
 it does not retain all project source text.
+
+Traversal inherits the ignore library's standard resource limits, including
+100,000 entries per directory, 1,000,000 visited entries, 32,768 bytes per relative
+path and 1 MiB per ignore file. Exceeding a limit fails the scan instead of
+returning partial totals. The scanner disables the walker's depth cutoff so deep
+files are not silently omitted.
 
 Exit status is `0` for success, `1` for a scan/read failure and `2` for invalid
 arguments. Errors go to stderr; JSON goes only to stdout.
@@ -129,8 +151,9 @@ python3 ecosystem/goml_stats/verify.py
 The verifier checks formatting, runs nine GoML tests, builds the executable and
 runs CLI checks on temporary projects. Cases cover nested and empty modules,
 unassigned sources, per-file and aggregate consistency, test-file detection,
-exclusions, symbolic links, special files, invalid UTF-8, argument errors, JSON
+literal exclusions, hierarchical Git ignore rules and negation, symbolic links,
+special files, invalid UTF-8, argument errors, JSON
 escaping, deterministic output and 48 generated source files with known counts.
 Temporary fixtures, command logs and a verification report stay under
 `_artifact/verification/`. Verification needs Python 3 and the GoML toolchain, with
-no registry setup or external Python packages.
+no manual registry setup or external Python packages.

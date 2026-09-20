@@ -1,0 +1,252 @@
+package tracing;
+
+use std::context;
+use std::resource;
+use std::time;
+
+struct SpanState {
+    closed: bool,
+    fields: Fields,
+}
+
+pub struct TraceContext {
+    trace_id: u64,
+    span_id: u64,
+    sampled: bool,
+    visible_id: u64,
+    owner: Ref[State],
+    state: Ref[SpanState],
+}
+
+impl TraceContext {
+    pub fn trace_id(self: TraceContext) -> u64 {
+        self.trace_id
+    }
+
+    pub fn span_id(self: TraceContext) -> u64 {
+        self.span_id
+    }
+
+    pub fn sampled(self: TraceContext) -> bool {
+        self.sampled
+    }
+}
+
+pub struct Span {
+    tracer: Tracer,
+    context: TraceContext,
+    parent_id: u64,
+    metadata: Metadata,
+    started: time::Instant,
+    recorded: bool,
+}
+
+impl Tracer {
+    fn validate_parent(self: Tracer, parent: TraceContext) -> Result[(), Error] {
+        if !ptr_eq(self.state, parent.owner) {
+            return Result::Err(
+                Error {
+                    kind: ErrorKind::InvalidInput,
+                    message: "trace context belongs to another tracer",
+                },
+            )
+        }
+        if parent.state.get().closed {
+            return Result::Err(closed())
+        }
+        Result::Ok(())
+    }
+
+    fn allocate_id(self: Tracer) -> Result[u64, Error] {
+        let mut state = self.state.get();
+        if state.next_id == 18446744073709551615 {
+            return Result::Err(
+                Error { kind: ErrorKind::Exhausted, message: "trace identity exhausted" },
+            )
+        }
+        let value = state.next_id;
+        state.next_id += 1;
+        self.state.set(state);
+        Result::Ok(value)
+    }
+
+    fn sample_root(self: Tracer) -> Result[bool, Error] {
+        let mut state = self.state.get();
+        if state.next_root == 18446744073709551615 {
+            return Result::Err(
+                Error { kind: ErrorKind::Exhausted, message: "root sampling ordinal exhausted" },
+            )
+        }
+        let sampled = state.sampling.accepts(state.next_root);
+        state.next_root += 1;
+        self.state.set(state);
+        Result::Ok(sampled)
+    }
+
+    pub fn span(
+        self: Tracer,
+        ctx: context::Context,
+        parent: Option[TraceContext],
+        metadata: Metadata,
+        fields: Fields,
+    ) -> Result[Span, Error] {
+        self.lock(ctx)?;
+        defer self.gate.send(());
+        self.check_open()?;
+        if let Some(parent) = parent {
+            self.validate_parent(parent)?;
+        }
+        let id = self.allocate_id()?;
+        let state = self.state.get();
+        let root_sampled = match parent {
+            Some(parent) => parent.sampled,
+            None => self.sample_root()?,
+        };
+        let sampled = root_sampled;
+        let recorded = sampled && state.filter.enabled(metadata);
+        let trace_id = parent.map(|parent| parent.trace_id).unwrap_or(id);
+        let span = Span {
+            tracer: self,
+            context: TraceContext {
+                trace_id,
+                span_id: id,
+                sampled,
+                visible_id: if recorded {
+                    id
+                } else {
+                    parent.map(|parent| parent.visible_id).unwrap_or(0)
+                },
+                owner: self.state,
+                state: Ref::new(SpanState { closed: false, fields }),
+            },
+            parent_id: parent.map(|parent| parent.visible_id).unwrap_or(0),
+            metadata,
+            started: time::Instant::now(),
+            recorded,
+        };
+        if recorded {
+            let _ = self.publish(ctx, span.make_record(Kind::SpanStart, fields), true)?;
+        } else {
+            let _ = self.filtered();
+        }
+        let mut state = self.state.get();
+        state.metrics.live_spans += 1;
+        self.state.set(state);
+        Result::Ok(span)
+    }
+
+    pub fn event(
+        self: Tracer,
+        ctx: context::Context,
+        parent: Option[TraceContext],
+        metadata: Metadata,
+        fields: Fields,
+    ) -> Result[Delivery, Error] {
+        self.lock(ctx)?;
+        defer self.gate.send(());
+        self.check_open()?;
+        if let Some(parent) = parent {
+            self.validate_parent(parent)?;
+        }
+        let trace_id = match parent {
+            Some(parent) => parent.trace_id,
+            None => self.allocate_id()?,
+        };
+        let sampled = match parent {
+            Some(parent) => parent.sampled,
+            None => self.sample_root()?,
+        };
+        if !self.state.get().filter.enabled(metadata) || !sampled {
+            return Result::Ok(self.filtered())
+        }
+        self.publish(
+            ctx,
+            Record {
+                sequence: 0,
+                timestamp_ns: time::SystemTime::now().unix_nanoseconds(),
+                elapsed_ns: 0,
+                trace_id,
+                span_id: parent.map(|parent| parent.visible_id).unwrap_or(0),
+                parent_id: 0,
+                kind: Kind::Event,
+                metadata,
+                fields,
+            },
+            false,
+        )
+    }
+}
+
+impl Span {
+    fn make_record(self: Span, kind: Kind, fields: Fields) -> Record {
+        Record {
+            sequence: 0,
+            timestamp_ns: time::SystemTime::now().unix_nanoseconds(),
+            elapsed_ns: self.started.elapsed().as_nanoseconds(),
+            trace_id: self.context.trace_id,
+            span_id: self.context.span_id,
+            parent_id: self.parent_id,
+            kind,
+            metadata: self.metadata,
+            fields,
+        }
+    }
+
+    pub fn context(self: Span) -> TraceContext {
+        self.context
+    }
+
+    pub fn event(self: Span, ctx: context::Context, metadata: Metadata, fields: Fields) -> Result[
+        Delivery,
+        Error,
+    ] {
+        self.tracer.event(ctx, Option::Some(self.context), metadata, fields)
+    }
+
+    pub fn record(self: Span, ctx: context::Context, fields: Fields) -> Result[Delivery, Error] {
+        self.tracer.lock(ctx)?;
+        defer self.tracer.gate.send(());
+        self.tracer.check_open()?;
+        let mut state = self.context.state.get();
+        if state.closed {
+            return Result::Err(closed())
+        }
+        let fields = state.fields.merge(fields);
+        let delivery = if self.recorded {
+            self.tracer.publish(ctx, self.make_record(Kind::SpanUpdate, fields), false)?
+        } else {
+            self.tracer.filtered()
+        };
+        if delivery != Delivery::Dropped {
+            state.fields = fields;
+            self.context.state.set(state);
+        }
+        Result::Ok(delivery)
+    }
+
+    pub fn close(self: Span, ctx: context::Context) -> Result[(), Error] {
+        self.tracer.lock(ctx)?;
+        defer self.tracer.gate.send(());
+        let mut state = self.context.state.get();
+        if state.closed {
+            return Result::Ok(())
+        }
+        self.tracer.check_open()?;
+        if self.recorded {
+            let _ = self.tracer.publish(ctx, self.make_record(Kind::SpanEnd, state.fields), true)?;
+        }
+        state.closed = true;
+        self.context.state.set(state);
+        let mut tracer_state = self.tracer.state.get();
+        tracer_state.metrics.live_spans -= 1;
+        self.tracer.state.set(tracer_state);
+        Result::Ok(())
+    }
+
+    pub fn in_scope[T, E](self: Span, ctx: context::Context, body: (TraceContext) -> Result[T, E]) -> Result[
+        T,
+        resource::ScopeError[E, Error],
+    ] {
+        resource::with_cleanup(|| body(self.context), || self.close(ctx))
+    }
+}

@@ -1,0 +1,372 @@
+package rope;
+
+const CHUNK_BYTES: isize = 1024;
+
+const MAX_BYTES: isize = 9223372036854775806;
+
+#[derive(Debug, PartialEq, Eq)]
+struct Summary {
+    bytes: isize,
+    scalars: isize,
+    utf16: isize,
+    breaks: isize,
+    starts_lf: bool,
+    ends_cr: bool,
+}
+
+enum Node {
+    Empty,
+    Leaf(string, Summary),
+    Branch(Ref[Node], Ref[Node], Summary, isize),
+}
+
+fn empty_summary() -> Summary {
+    Summary { bytes: 0, scalars: 0, utf16: 0, breaks: 0, starts_lf: false, ends_cr: false }
+}
+
+fn measure(value: string) -> Summary {
+    let mut result = empty_summary();
+    result.bytes = value.byte_len();
+    result.starts_lf = value.starts_with("\n");
+    for ch in value.chars() {
+        result.scalars += 1;
+        result.utf16 += if ch.to_u32() > 65535 {
+            2
+        } else {
+            1
+        };
+        if ch == '\r' || (ch == '\n' && !result.ends_cr) {
+            result.breaks += 1;
+        }
+        result.ends_cr = ch == '\r';
+    }
+    result
+}
+
+fn combined(left: Summary, right: Summary) -> Summary {
+    if left.bytes == 0 {
+        return right
+    }
+    if right.bytes == 0 {
+        return left
+    }
+    Summary {
+        bytes: left.bytes + right.bytes,
+        scalars: left.scalars + right.scalars,
+        utf16: left.utf16 + right.utf16,
+        breaks: left.breaks + right.breaks
+            - if left.ends_cr && right.starts_lf {
+                1
+            } else {
+                0
+            },
+        starts_lf: left.starts_lf,
+        ends_cr: right.ends_cr,
+    }
+}
+
+fn summary(node: Ref[Node]) -> Summary {
+    match node.get() {
+        Empty => empty_summary(),
+        Leaf(_, value) | Branch(_, _, value, _) => value,
+    }
+}
+
+fn height(node: Ref[Node]) -> isize {
+    match node.get() {
+        Empty => 0,
+        Leaf(_, _) => 1,
+        Branch(_, _, _, value) => value,
+    }
+}
+
+fn leaf(value: string) -> Ref[Node] {
+    if value == "" {
+        Ref::new(Node::Empty)
+    } else {
+        let (_, owned) = string_from_utf8(value.to_bytes());
+        Ref::new(Node::Leaf(owned, measure(owned)))
+    }
+}
+
+fn branch(left: Ref[Node], right: Ref[Node]) -> Ref[Node] {
+    let lh = height(left);
+    let rh = height(right);
+    if lh == 0 {
+        return right
+    }
+    if rh == 0 {
+        return left
+    }
+    Ref::new(
+        Node::Branch(
+            left,
+            right,
+            combined(summary(left), summary(right)),
+            1
+                + if lh > rh {
+                    lh
+                } else {
+                    rh
+                },
+        ),
+    )
+}
+
+fn balanced(left: Ref[Node], right: Ref[Node]) -> Ref[Node] {
+    if height(left) > height(right) + 1 {
+        if let Branch(ll, lr, _, _) = left.get() {
+            if height(ll) >= height(lr) {
+                return branch(ll, branch(lr, right))
+            }
+            if let Branch(lrl, lrr, _, _) = lr.get() {
+                return branch(branch(ll, lrl), branch(lrr, right))
+            }
+        }
+    }
+    if height(right) > height(left) + 1 {
+        if let Branch(rl, rr, _, _) = right.get() {
+            if height(rr) >= height(rl) {
+                return branch(branch(left, rl), rr)
+            }
+            if let Branch(rll, rlr, _, _) = rl.get() {
+                return branch(branch(left, rll), branch(rlr, rr))
+            }
+        }
+    }
+    branch(left, right)
+}
+
+fn joined(left: Ref[Node], right: Ref[Node]) -> Ref[Node] {
+    if height(left) == 0 {
+        return right
+    }
+    if height(right) == 0 {
+        return left
+    }
+    if let (Leaf(a, _), Leaf(b, _)) = (left.get(), right.get()) {
+        if a.byte_len() + b.byte_len() <= CHUNK_BYTES {
+            return leaf(a + b)
+        }
+    }
+    if height(left) > height(right) + 1 {
+        if let Branch(ll, lr, _, _) = left.get() {
+            return balanced(ll, joined(lr, right))
+        }
+    }
+    if height(right) > height(left) + 1 {
+        if let Branch(rl, rr, _, _) = right.get() {
+            return balanced(joined(left, rl), rr)
+        }
+    }
+    branch(left, right)
+}
+
+fn split_node(node: Ref[Node], at: isize) -> (Ref[Node], Ref[Node]) {
+    if at == 0 {
+        return (leaf(""), node)
+    }
+    if at == summary(node).bytes {
+        return (node, leaf(""))
+    }
+    match node.get() {
+        Empty => (node, node),
+        Leaf(value, _) => (
+            leaf(value.byte_slice(0, at)),
+            leaf(value.byte_slice(at, value.byte_len())),
+        ),
+        Branch(left, right, _, _) => {
+            let left_bytes = summary(left).bytes;
+            if at < left_bytes {
+                let (before, after) = split_node(left, at);
+                (before, joined(after, right))
+            } else if at > left_bytes {
+                let (before, after) = split_node(right, at - left_bytes);
+                (joined(left, before), after)
+            } else {
+                (left, right)
+            }
+        },
+    }
+}
+
+fn build_nodes(nodes: Vec[Ref[Node]], start: isize, end: isize) -> Ref[Node] {
+    if start == end {
+        leaf("")
+    } else if end - start == 1 {
+        nodes[start]
+    } else {
+        let middle = start + (end - start) / 2;
+        branch(build_nodes(nodes, start, middle), build_nodes(nodes, middle, end))
+    }
+}
+
+fn node_from_string(value: string) -> Ref[Node] {
+    let nodes: Vec[Ref[Node]] = Vec::new();
+    let mut start = 0;
+    while start < value.byte_len() {
+        let mut end = start + CHUNK_BYTES;
+        if end > value.byte_len() {
+            end = value.byte_len();
+        }
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        nodes.push(leaf(value.byte_slice(start, end)));
+        start = end;
+    }
+    build_nodes(nodes, 0, nodes.len())
+}
+
+fn node_byte(node: Ref[Node], at: isize) -> byte {
+    match node.get() {
+        Empty => 0,
+        Leaf(value, _) => value.byte_get(at),
+        Branch(left, right, _, _) => {
+            let length = summary(left).bytes;
+            if at < length {
+                node_byte(left, at)
+            } else {
+                node_byte(right, at - length)
+            }
+        },
+    }
+}
+
+fn prefix(node: Ref[Node], end: isize) -> Summary {
+    if end == summary(node).bytes {
+        return summary(node)
+    }
+    match node.get() {
+        Empty => empty_summary(),
+        Leaf(value, _) => measure(value.byte_slice(0, end)),
+        Branch(left, right, _, _) => {
+            let length = summary(left).bytes;
+            if end <= length {
+                prefix(left, end)
+            } else {
+                combined(summary(left), prefix(right, end - length))
+            }
+        },
+    }
+}
+
+fn metric_count(value: Summary, encoding: Encoding) -> isize {
+    match encoding {
+        Bytes => value.bytes,
+        Scalars => value.scalars,
+        Utf16 => value.utf16,
+    }
+}
+
+fn metric_byte(node: Ref[Node], index: isize, encoding: Encoding) -> Option[isize] {
+    if index == 0 {
+        return Option::Some(0)
+    }
+    if index == metric_count(summary(node), encoding) {
+        return Option::Some(summary(node).bytes)
+    }
+    match node.get() {
+        Empty => Option::None,
+        Leaf(value, _) => {
+            let mut count = 0;
+            for (at, ch) in value.char_indices() {
+                if count == index {
+                    return Option::Some(at)
+                }
+                count += if encoding == Encoding::Utf16 && ch.to_u32() > 65535 {
+                    2
+                } else {
+                    1
+                };
+                if count > index {
+                    return Option::None
+                }
+            }
+            Option::None
+        },
+        Branch(left, right, _, _) => {
+            let count = metric_count(summary(left), encoding);
+            if index <= count {
+                metric_byte(left, index, encoding)
+            } else {
+                metric_byte(right, index - count, encoding).map(|at| summary(left).bytes + at)
+            }
+        },
+    }
+}
+
+fn break_byte(node: Ref[Node], index: isize, followed_lf: bool) -> isize {
+    if index == 0 {
+        return 0
+    }
+    match node.get() {
+        Empty => 0,
+        Leaf(value, _) => {
+            let mut count = 0;
+            for at in 0..value.byte_len() {
+                let ch = value.byte_get(at);
+                let next_lf = if at + 1 == value.byte_len() {
+                    followed_lf
+                } else {
+                    value.byte_get(at + 1) == b'\n'
+                };
+                if ch == b'\n' || (ch == b'\r' && !next_lf) {
+                    count += 1;
+                    if count == index {
+                        return at + 1
+                    }
+                }
+            }
+            value.byte_len()
+        },
+        Branch(left, right, _, _) => {
+            let left_summary = summary(left);
+            let next_lf = summary(right).starts_lf;
+            let count = left_summary.breaks
+                - if left_summary.ends_cr && next_lf {
+                    1
+                } else {
+                    0
+                };
+            if index <= count {
+                break_byte(left, index, next_lf)
+            } else {
+                left_summary.bytes + break_byte(right, index - count, followed_lf)
+            }
+        },
+    }
+}
+
+fn validate_node(node: Ref[Node]) -> Result[(Summary, isize, isize), Error] {
+    match node.get() {
+        Empty => Result::Ok((empty_summary(), 0, 0)),
+        Leaf(value, metadata) => {
+            if value == "" || value.byte_len() > CHUNK_BYTES || measure(value) != metadata {
+                return Result::Err(Error::Invariant("invalid leaf length or summary"))
+            }
+            validate_text(value)?;
+            Result::Ok((metadata, 1, 1))
+        },
+        Branch(left, right, metadata, depth) => {
+            let (lm, lh, lc) = validate_node(left)?;
+            let (rm, rh, rc) = validate_node(right)?;
+            if lh == 0 || rh == 0 || lh > rh + 1 || rh > lh + 1 {
+                return Result::Err(
+                    Error::Invariant("AVL balance or nonempty-child invariant failed"),
+                )
+            }
+            if combined(lm, rm) != metadata
+                || depth
+                    != 1
+                        + if lh > rh {
+                            lh
+                        } else {
+                            rh
+                        } {
+                return Result::Err(Error::Invariant("invalid branch summary or height"))
+            }
+            Result::Ok((metadata, depth, lc + rc))
+        },
+    }
+}

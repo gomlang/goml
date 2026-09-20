@@ -1,0 +1,145 @@
+package incremental;
+
+use std::context;
+
+impl Evaluation {
+    pub fn context(self: Evaluation) -> context::Context {
+        self.context_value
+    }
+
+    pub fn check(self: Evaluation) -> Result[(), Error] {
+        select {
+            recv(self.ended) as _ => return Result::Err(
+                failure(ErrorKind::ExpiredEvaluation, "evaluation is no longer active"),
+            ),
+            default => (),
+        }
+        self.context_value.check().map_err(cancelled)
+    }
+
+    fn enter(self: Evaluation) -> Result[(), Error] {
+        self.check()?;
+        select {
+            recv(self.access) as _ => {
+                if let Err(error) = self.check() {
+                    self.access.send(());
+                    return Result::Err(error)
+                }
+                Result::Ok(())
+            },
+            default => Result::Err(
+                failure(
+                    ErrorKind::ConcurrentEvaluation,
+                    "one evaluation cannot execute concurrent or reentrant reads",
+                ),
+            ),
+        }
+    }
+
+    fn finish(self: Evaluation) -> () {
+        let _ = self.access.recv();
+        select {
+            recv(self.ended) as _ => (),
+            default => self.ended.close(),
+        }
+        self.access.send(());
+    }
+
+    fn record(self: Evaluation, dependency: Dependency) -> () {
+        for previous in self.reads {
+            if ptr_eq(previous.identity, dependency.identity) {
+                return
+            }
+        }
+        self.reads.push(dependency);
+    }
+
+    pub fn input[T](self: Evaluation, input: Input[T]) -> Result[T, Error] {
+        self.enter()?;
+        defer self.access.send(());
+        self.database.check_owner(input.owner)?;
+        let state = input.state.get();
+        self.record(
+            Dependency {
+                identity: input.identity,
+                label: input.name,
+                observed: state.changed_at,
+                validate: |evaluation| {
+                    evaluation.check()?;
+                    Result::Ok(input.state.get().changed_at)
+                },
+            },
+        );
+        Result::Ok((input.policy.copy)(state.value))
+    }
+
+    pub fn query[K: Hash + Eq, V](self: Evaluation, query: Query[K, V], key: K) -> Result[V, Error] {
+        self.enter()?;
+        defer self.access.send(());
+        self.database.check_owner(query.owner)?;
+        let (value, changed, identity) = match query.ensure(self, key) {
+            Ok(value) => value,
+            Err(error) => {
+                self.record(
+                    Dependency {
+                        identity: Ref::new(()),
+                        label: query.name + "(failed)",
+                        observed: self.database.revision_value.get(),
+                        validate: |evaluation| Result::Ok(evaluation.database.revision_value.get()),
+                    },
+                );
+                return Result::Err(error)
+            },
+        };
+        self.record(
+            Dependency {
+                identity,
+                label: query.name + "(" + (query.label)(key) + ")",
+                observed: changed,
+                validate: |evaluation| {
+                    let (_, revision, _) = query.ensure(evaluation, key)?;
+                    Result::Ok(revision)
+                },
+            },
+        );
+        Result::Ok((query.policy.copy)(value))
+    }
+
+    fn child(self: Evaluation, identity: Ref[()], label: string) -> Result[Evaluation, Error] {
+        let path = self.path.copy();
+        let labels = Vec::new();
+        let mut cycle = false;
+        for active in path {
+            labels.push(active.label);
+            if ptr_eq(active.identity, identity) {
+                cycle = true;
+            }
+        }
+        labels.push(label);
+        if cycle {
+            return Result::Err(
+                Error { kind: ErrorKind::Cycle, message: "incremental query cycle", path: labels },
+            )
+        }
+        if path.len() >= self.database.max_depth {
+            return Result::Err(
+                Error {
+                    kind: ErrorKind::Limit,
+                    message: "maximum query depth exceeded",
+                    path: labels,
+                },
+            )
+        }
+        path.push(Active { identity, label });
+        Result::Ok(
+            Evaluation {
+                database: self.database,
+                context_value: self.context_value,
+                path,
+                reads: Vec::new(),
+                access: gate(),
+                ended: Channel::new(0),
+            },
+        )
+    }
+}

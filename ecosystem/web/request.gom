@@ -1,0 +1,274 @@
+package web;
+
+use std::bytes::{Bytes};
+use std::ffi;
+use std::json;
+use std::serde::{Deserialize};
+use std::time::{Duration};
+
+pub struct Pairs {
+    values: Vec[(string, string)],
+}
+
+impl Pairs {
+    pub fn new() -> Pairs {
+        Pairs { values: Vec::new() }
+    }
+
+    pub fn entries(self: Pairs) -> Vec[(string, string)] {
+        self.values.copy()
+    }
+
+    pub fn len(self: Pairs) -> isize {
+        self.values.len()
+    }
+
+    pub fn get(self: Pairs, name: string) -> Option[string] {
+        for entry in self.values {
+            if entry.0 == name {
+                return Option::Some(entry.1)
+            }
+        }
+        Option::None
+    }
+
+    pub fn get_all(self: Pairs, name: string) -> Vec[string] {
+        let result = Vec::new();
+        for entry in self.values {
+            if entry.0 == name {
+                result.push(entry.1)
+            }
+        }
+        result
+    }
+
+    pub fn required(self: Pairs, name: string) -> Result[string, Error] {
+        self.get(name).ok_or(Error::new(ErrorKind::BadRequest, "missing parameter: " + name))
+    }
+}
+
+fn hex_digit(value: byte) -> Option[byte] {
+    if value >= b'0' && value <= b'9' {
+        Option::Some(value - b'0')
+    } else if value >= b'a' && value <= b'f' {
+        Option::Some(value - b'a' + 10)
+    } else if value >= b'A' && value <= b'F' {
+        Option::Some(value - b'A' + 10)
+    } else {
+        Option::None
+    }
+}
+
+fn decode_component(value: string, plus: bool) -> Result[string, Error] {
+    let input = value.to_bytes();
+    let output = Vec::new();
+    let mut index = 0;
+    while index < input.len() {
+        let c = input[index];
+        if c == b'%' {
+            if index + 2 >= input.len() {
+                return Result::Err(Error::new(ErrorKind::BadRequest, "truncated percent escape"))
+            }
+            let high = hex_digit(input[index + 1]).ok_or(
+                Error::new(ErrorKind::BadRequest, "invalid percent escape"),
+            )?;
+            let low = hex_digit(input[index + 2]).ok_or(
+                Error::new(ErrorKind::BadRequest, "invalid percent escape"),
+            )?;
+            output.push(high * 16 + low);
+            index += 3;
+        } else {
+            output.push(
+                if plus && c == b'+' {
+                    b' '
+                } else {
+                    c
+                },
+            );
+            index += 1;
+        }
+    }
+    let (valid, text) = string_from_utf8(output);
+    if valid {
+        Result::Ok(text)
+    } else {
+        Result::Err(Error::new(ErrorKind::BadRequest, "parameter is not UTF-8"))
+    }
+}
+
+pub fn parse_pairs(value: string, max_fields: isize) -> Result[Pairs, Error] {
+    if max_fields < 0 {
+        return Result::Err(Error::new(ErrorKind::Configuration, "negative field limit"))
+    }
+    let values = Vec::new();
+    if value.byte_len() == 0 {
+        return Result::Ok(Pairs { values })
+    }
+    for part in value.split("&") {
+        if part.byte_len() == 0 {
+            continue
+        }
+        if values.len() >= max_fields {
+            return Result::Err(Error::new(ErrorKind::BodyLimit, "too many URL-encoded fields"))
+        }
+        let (name, value) = part.split_once("=").unwrap_or((part, ""));
+        values.push((decode_component(name, true)?, decode_component(value, true)?));
+    }
+    Result::Ok(Pairs { values })
+}
+
+pub struct Body {
+    native: NativeRequest,
+}
+
+impl Body {
+    pub fn read(self: Body, maximum: isize) -> Result[Bytes, Error] {
+        let (data, error) = raw_read(self.native, maximum);
+        check(error)?;
+        Result::Ok(Bytes::from_vec(ffi::slice_to_vec_copy(data)))
+    }
+
+    pub fn collect(self: Body, limit: isize) -> Result[Bytes, Error] {
+        if limit < 0 {
+            return Result::Err(Error::new(ErrorKind::Configuration, "negative body limit"))
+        }
+        let output = Bytes::new();
+        loop {
+            let remaining = limit - output.len();
+            let size = if remaining >= 16384 {
+                16384
+            } else {
+                remaining + 1
+            };
+            let chunk = self.read(size)?;
+            if chunk.is_empty() {
+                return Result::Ok(output)
+            }
+            if chunk.len() > remaining {
+                return Result::Err(
+                    Error::new(ErrorKind::BodyLimit, "body exceeds extraction limit"),
+                )
+            }
+            output.extend_from_slice(chunk.as_slice());
+        }
+    }
+
+    pub fn close(self: Body) -> Result[(), Error] {
+        check(raw_close_body(self.native))
+    }
+}
+
+pub struct Request {
+    native: NativeRequest,
+    method_value: string,
+    path_value: string,
+    query_value: string,
+    headers_value: Headers,
+    params_value: Pairs,
+    attributes: Pairs,
+    extraction_limit: isize,
+    field_limit: isize,
+}
+
+impl Request {
+    pub fn method(self: Request) -> string {
+        self.method_value
+    }
+
+    pub fn path(self: Request) -> string {
+        self.path_value
+    }
+
+    pub fn raw_query(self: Request) -> string {
+        self.query_value
+    }
+
+    pub fn headers(self: Request) -> Headers {
+        self.headers_value
+    }
+
+    pub fn params(self: Request) -> Pairs {
+        self.params_value
+    }
+
+    pub fn remote_address(self: Request) -> Result[string, Error] {
+        native_text(raw_remote(self.native))
+    }
+
+    pub fn host(self: Request) -> Result[string, Error] {
+        native_text(raw_host(self.native))
+    }
+
+    pub fn body(self: Request) -> Body {
+        Body { native: self.native }
+    }
+
+    pub fn check(self: Request) -> Result[(), Error] {
+        check(raw_check(self.native))
+    }
+
+    pub fn wait(self: Request, duration: Duration) -> Result[(), Error] {
+        check(raw_wait(self.native, duration.as_nanoseconds()))
+    }
+
+    pub fn attribute(self: Request, name: string) -> Option[string] {
+        self.attributes.get(name)
+    }
+
+    pub fn with_attribute(self: Request, name: string, value: string) -> Request {
+        let values = Vec::new();
+        for entry in self.attributes.values {
+            if entry.0 != name {
+                values.push(entry)
+            }
+        }
+        values.push((name, value));
+        Request { attributes: Pairs { values }, ..self }
+    }
+
+    pub fn query(self: Request) -> Result[Pairs, Error] {
+        parse_pairs(self.query_value, self.field_limit)
+    }
+
+    pub fn query_as[T: Deserialize](self: Request) -> Result[T, Error] {
+        self.query()?.decode()
+    }
+
+    pub fn text(self: Request) -> Result[string, Error] {
+        let (valid, value) = string_from_utf8(
+            self.body().collect(self.extraction_limit)?.to_vec_copy(),
+        );
+        if valid {
+            Result::Ok(value)
+        } else {
+            Result::Err(Error::new(ErrorKind::BadRequest, "request body is not UTF-8"))
+        }
+    }
+
+    pub fn json[T: Deserialize](self: Request) -> Result[T, Error] {
+        let media = self.headers_value.get("content-type").unwrap_or("").split(";")[0].trim().to_ascii_lowercase();
+        if media != "application/json"
+            && !(media.starts_with("application/") && media.ends_with("+json")) {
+            return Result::Err(
+                Error::new(ErrorKind::UnsupportedMediaType, "expected application/json"),
+            )
+        }
+        json::from_string(self.text()?).map_err(|e| Error::new(ErrorKind::UnprocessableEntity, e))
+    }
+
+    pub fn form(self: Request) -> Result[Pairs, Error] {
+        if !content_type(self.headers_value, "application/x-www-form-urlencoded") {
+            return Result::Err(
+                Error::new(
+                    ErrorKind::UnsupportedMediaType,
+                    "expected application/x-www-form-urlencoded",
+                ),
+            )
+        }
+        parse_pairs(self.text()?, self.field_limit)
+    }
+
+    pub fn form_as[T: Deserialize](self: Request) -> Result[T, Error] {
+        self.form()?.decode()
+    }
+}

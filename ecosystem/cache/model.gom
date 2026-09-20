@@ -1,0 +1,275 @@
+package cache;
+
+use std::context;
+use std::time;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Error {
+    InvalidOptions(string),
+    InvalidWeight,
+    TooHeavy,
+    Closed,
+    Busy,
+    Invalidated,
+    Cancelled,
+    DeadlineExceeded,
+    Exhausted,
+    Loader(string),
+}
+
+impl ToString for Error {
+    fn to_string(self: Error) -> string {
+        match self {
+            InvalidOptions(message) => "invalid cache options: " + message,
+            InvalidWeight => "cache weight must not be negative",
+            TooHeavy => "cache value exceeds maximum weight",
+            Closed => "cache is closed",
+            Busy => "cache load admission limit reached",
+            Invalidated => "cache load invalidated",
+            Cancelled => "cache operation cancelled",
+            DeadlineExceeded => "cache deadline exceeded",
+            Exhausted => "cache load identifiers exhausted",
+            Loader(message) => "cache loader: " + message,
+        }
+    }
+}
+
+fn context_error(error: context::Error) -> Error {
+    match error {
+        Cancelled => Error::Cancelled,
+        DeadlineExceeded => Error::DeadlineExceeded,
+    }
+}
+
+pub struct Clock {
+    read: () -> i64,
+}
+
+impl Clock {
+    pub fn new(read: () -> i64) -> Clock {
+        Clock { read }
+    }
+
+    pub fn monotonic() -> Clock {
+        let started = time::Instant::now();
+        Clock::new(|| started.elapsed().as_milliseconds())
+    }
+}
+
+pub struct ManualClock {
+    value: Channel[i64],
+}
+
+impl ManualClock {
+    pub fn new() -> ManualClock {
+        let value = Channel::new(1);
+        value.send(0);
+        ManualClock { value }
+    }
+
+    pub fn now(self: ManualClock) -> i64 {
+        let value = self.value.recv().unwrap_or(0);
+        self.value.send(value);
+        value
+    }
+
+    pub fn advance(self: ManualClock, milliseconds: i64) -> Result[(), Error] {
+        let value = self.value.recv().unwrap_or(0);
+        if milliseconds < 0 || milliseconds > 9223372036854775807 - value {
+            self.value.send(value);
+            return Result::Err(Error::InvalidOptions("clock advance out of range"))
+        }
+        self.value.send(value + milliseconds);
+        Result::Ok(())
+    }
+
+    pub fn clock(self: ManualClock) -> Clock {
+        Clock::new(|| self.now())
+    }
+}
+
+#[derive(PartialEq, Eq)]
+pub struct Expiry {
+    pub ttl_ms: i64,
+    pub tti_ms: i64,
+    pub deadline_ms: Option[i64],
+}
+
+impl Expiry {
+    pub fn none() -> Expiry {
+        Expiry { ttl_ms: 0, tti_ms: 0, deadline_ms: Option::None }
+    }
+
+    pub fn ttl(milliseconds: i64) -> Expiry {
+        Expiry { ttl_ms: milliseconds, ..Expiry::none() }
+    }
+
+    pub fn idle(milliseconds: i64) -> Expiry {
+        Expiry { tti_ms: milliseconds, ..Expiry::none() }
+    }
+
+    pub fn until(deadline_ms: i64) -> Expiry {
+        Expiry { deadline_ms: Option::Some(deadline_ms), ..Expiry::none() }
+    }
+
+    fn validate(self: Expiry) -> Result[(), Error] {
+        if self.ttl_ms < 0 || self.tti_ms < 0 || self.deadline_ms.unwrap_or(0) < 0 {
+            Result::Err(Error::InvalidOptions("expiry must not be negative"))
+        } else {
+            Result::Ok(())
+        }
+    }
+
+    fn enabled(self: Expiry) -> bool {
+        self.ttl_ms > 0 || self.tti_ms > 0 || self.deadline_ms.is_some()
+    }
+
+    fn expired(self: Expiry, now: i64, created: i64, used: i64) -> bool {
+        self.ttl_ms > 0 && now - created >= self.ttl_ms
+            || self.tti_ms > 0 && now - used >= self.tti_ms
+            || match self.deadline_ms {
+                Some(deadline) => now >= deadline,
+                None => false,
+            }
+    }
+}
+
+pub struct Options {
+    pub max_entries: isize,
+    pub max_weight: i64,
+    pub max_inflight: isize,
+    pub max_waiters: isize,
+    pub expiry: Expiry,
+    pub clock: Clock,
+}
+
+impl Options {
+    pub fn new(max_entries: isize) -> Options {
+        Options {
+            max_entries,
+            max_weight: 9223372036854775807,
+            max_inflight: 64,
+            max_waiters: 1024,
+            expiry: Expiry::none(),
+            clock: Clock::monotonic(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RemovalCause {
+    Capacity,
+    Expired,
+    Replaced,
+    Removed,
+    Cleared,
+    Closed,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Stats {
+    pub entries: isize,
+    pub weight: i64,
+    pub inflight: isize,
+    pub waiters: isize,
+    pub closed: bool,
+    pub hits: u64,
+    pub misses: u64,
+    pub insertions: u64,
+    pub evictions: u64,
+    pub expirations: u64,
+    pub removals: u64,
+    pub loads: u64,
+    pub load_successes: u64,
+    pub load_failures: u64,
+    pub coalesced: u64,
+    pub rejected: u64,
+}
+
+fn increment(value: u64) -> u64 {
+    if value == 18446744073709551615 {
+        value
+    } else {
+        value + 1
+    }
+}
+
+fn empty_stats() -> Stats {
+    Stats {
+        entries: 0,
+        weight: 0,
+        inflight: 0,
+        waiters: 0,
+        closed: false,
+        hits: 0,
+        misses: 0,
+        insertions: 0,
+        evictions: 0,
+        expirations: 0,
+        removals: 0,
+        loads: 0,
+        load_successes: 0,
+        load_failures: 0,
+        coalesced: 0,
+        rejected: 0,
+    }
+}
+
+pub struct Loaded[V] {
+    pub value: V,
+    pub weight: i64,
+    pub expiry: Option[Expiry],
+}
+
+impl[V] Loaded[V] {
+    pub fn new(value: V, weight: i64) -> Loaded[V] {
+        Loaded { value, weight, expiry: Option::None }
+    }
+
+    pub fn with_expiry(self: Loaded[V], expiry: Expiry) -> Loaded[V] {
+        Loaded { expiry: Option::Some(expiry), ..self }
+    }
+}
+
+pub struct LoadContext {
+    context: context::Context,
+    closed: Receiver[()],
+    invalidated: Receiver[()],
+}
+
+impl LoadContext {
+    pub fn context(self: LoadContext) -> context::Context {
+        self.context
+    }
+
+    pub fn closed(self: LoadContext) -> Receiver[()] {
+        self.closed
+    }
+
+    pub fn invalidated(self: LoadContext) -> Receiver[()] {
+        self.invalidated
+    }
+
+    pub fn check(self: LoadContext) -> Result[(), Error] {
+        self.context.check().map_err(|error| context_error(error))?;
+        select priority {
+            recv(self.closed) as _ => Result::Err(Error::Closed),
+            recv(self.invalidated) as _ => Result::Err(Error::Invalidated),
+            default => Result::Ok(()),
+        }
+    }
+
+    pub fn sleep(self: LoadContext, duration: time::Duration) -> Result[(), Error] {
+        self.check()?;
+        let timer = time::Timer::new(duration);
+        defer {
+            let _ = timer.stop();
+        };
+        select {
+            recv(self.context.done()) as _ => self.check(),
+            recv(self.closed) as _ => self.check(),
+            recv(self.invalidated) as _ => self.check(),
+            recv(timer.done()) as _ => self.check(),
+        }
+    }
+}

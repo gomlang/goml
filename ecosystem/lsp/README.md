@@ -176,9 +176,12 @@ preempted. All server/session/token access must remain on the owning loop; worke
 tasks should receive immutable inputs and return results to that loop. This library does not
 provide a worker pool, timer scheduler or synchronization for concurrent mutation.
 
-Document changes currently rebuild strings and line indexes, so a batch of C
-changes on a document of size N can take O(CN) work and allocate intermediate
-snapshots. The library provides explicit size limits, but does not use a rope.
+Documents use `ecosystem::rope` persistent text storage. Edits share unchanged
+tree nodes with previous snapshots, and UTF-16 coordinates use cached subtree
+counts. `content()` and `apply_edits()` explicitly materialize their string
+results; incremental document changes retain the tree representation. Existing
+CRLF clamping, surrogate rejection, size limits and transactional updates remain
+part of the document API.
 Optional features such as completion/semantic-token generation, workspace-edit
 execution, URI file loading and capability-specific language semantics belong to
 the application. Raw JSON handlers support their protocol messages.

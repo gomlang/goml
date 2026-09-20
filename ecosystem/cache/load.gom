@@ -1,0 +1,154 @@
+package cache;
+
+use std::context;
+
+enum Acquisition[V] {
+    Hit(V),
+    Wait(Flight[V]),
+    Lead(Flight[V]),
+}
+
+impl[K: Eq + Hash, V] Cache[K, V] {
+    fn acquire(self: Cache[K, V], key: K) -> Result[Acquisition[V], Error] {
+        self.open()?;
+        if let Some(value) = self.lookup_locked(key, true, true) {
+            return Result::Ok(Acquisition::Hit(value))
+        }
+        let mut state = self.state.get();
+        if let Some(flight) = state.flights.get(key) {
+            if state.stats.waiters >= self.options.max_waiters {
+                state.stats.rejected = increment(state.stats.rejected);
+                self.state.set(state);
+                return Result::Err(Error::Busy)
+            }
+            state.stats.waiters += 1;
+            state.stats.coalesced = increment(state.stats.coalesced);
+            self.state.set(state);
+            return Result::Ok(Acquisition::Wait(flight))
+        }
+        if state.stats.inflight >= self.options.max_inflight {
+            state.stats.rejected = increment(state.stats.rejected);
+            self.state.set(state);
+            return Result::Err(Error::Busy)
+        }
+        if state.next_id == 18446744073709551615 {
+            return Result::Err(Error::Exhausted)
+        }
+        let flight = Flight {
+            id: state.next_id,
+            done: Channel::new(0),
+            result: Ref::new(Option::None),
+        };
+        state.next_id += 1;
+        state.stats.inflight += 1;
+        state.stats.loads = increment(state.stats.loads);
+        state.flights.set(key, flight);
+        self.state.set(state);
+        Result::Ok(Acquisition::Lead(flight))
+    }
+
+    fn wait(self: Cache[K, V], ctx: context::Context, flight: Flight[V]) -> Result[V, Error] {
+        let result = select {
+            recv(ctx.done()) as _ => Result::Err(
+                context_error(ctx.error().unwrap_or(context::Error::Cancelled)),
+            ),
+            recv(flight.done) as _ => {
+                ctx.check().map_err(|error| context_error(error)).and_then(
+                    |_| flight.result.get().unwrap_or(Result::Err(Error::Invalidated)),
+                )
+            },
+        };
+        self.lock();
+        let mut state = self.state.get();
+        state.stats.waiters -= 1;
+        self.state.set(state);
+        self.gate.send(());
+        result.map(|value| (self.copy)(value))
+    }
+
+    fn complete(
+        self: Cache[K, V],
+        key: K,
+        flight: Flight[V],
+        value: Result[Loaded[V], Error],
+        load_context: LoadContext,
+        now: i64,
+        removals: Vec[Removal[K, V]],
+    ) -> Result[V, Error] {
+        self.lock();
+        self.maintain(now, removals);
+        let mut state = self.state.get();
+        state.stats.inflight -= 1;
+        self.state.set(state);
+        let current = state.flights.get(key).map(|active| active.id == flight.id).unwrap_or(false);
+        if current {
+            state.flights.remove(key);
+            let result = match load_context.check().and_then(|_| value) {
+                Ok(value) => {
+                    let _ = self.insert_locked(key, value, removals);
+                    Result::Ok(value.value)
+                },
+                Err(error) => Result::Err(error),
+            };
+            flight.result.set(Option::Some(result));
+            flight.done.close();
+        }
+        let result = flight.result.get().unwrap_or(Result::Err(Error::Invalidated));
+        let mut state = self.state.get();
+        if result.is_ok() {
+            state.stats.load_successes = increment(state.stats.load_successes);
+        } else {
+            state.stats.load_failures = increment(state.stats.load_failures);
+        }
+        self.state.set(state);
+        self.gate.send(());
+        self.emit(removals);
+        result.map(|value| (self.copy)(value))
+    }
+
+    pub fn get_or_try_insert_with(
+        self: Cache[K, V],
+        ctx: context::Context,
+        key: K,
+        loader: (LoadContext) -> Result[Loaded[V], Error],
+    ) -> Result[V, Error] {
+        ctx.check().map_err(|error| context_error(error))?;
+        let now = self.clock();
+        let removals = Vec::new();
+        self.lock_with(ctx)?;
+        self.maintain(now, removals);
+        let acquisition = self.acquire(key);
+        self.gate.send(());
+        match acquisition {
+            Ok(Acquisition::Hit(value)) => {
+                self.emit(removals);
+                Result::Ok((self.copy)(value))
+            },
+            Ok(Acquisition::Wait(flight)) => {
+                self.emit(removals);
+                self.wait(ctx, flight)
+            },
+            Ok(Acquisition::Lead(flight)) => {
+                let load_context = LoadContext {
+                    context: ctx,
+                    closed: self.done.receiver(),
+                    invalidated: flight.done.receiver(),
+                };
+                let result = load_context.check().and_then(|_| loader(load_context)).and_then(
+                    |loaded| {
+                        load_context.check()?;
+                        self.validate_loaded(loaded)?;
+                        let value = (self.copy)(loaded.value);
+                        load_context.check()?;
+                        Result::Ok(Loaded { value, ..loaded })
+                    },
+                );
+                self.complete(key, flight, result, load_context, self.clock(), removals)
+            },
+            Err(error) => {
+                self.emit(removals);
+                Result::Err(error)
+            },
+        }
+    }
+}

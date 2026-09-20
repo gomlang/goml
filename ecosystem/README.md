@@ -22,7 +22,7 @@ tracks completed improvements and the remaining functional gaps.
 | [pipeline](pipeline/README.md) | Lazy streams, bounded parallel transforms, filtering, ordering, batching/windows, merge/zip, backpressure and cancellation | Implemented; 21 library tests and race checks, versioned consumer and 1,253 Python oracle cases pass |
 | [ndarray](ndarray/README.md) | Generic shared views, slicing, broadcasting, checked arithmetic, reductions, batched multiplication, LU/Cholesky/QR solves and SIMD | Implemented; 17 library tests, versioned consumer, 2,929 NumPy cases and native/SSE2/scalar builds pass |
 | [sqlite](sqlite/README.md) | Typed binding/rows, prepared statements, streaming queries, nested savepoints, rollback, cancellation and explicit resource management | Implemented; 13 GoML tests, 4 native tests, versioned consumer, 2,754 SQLite comparisons and race checks pass |
-| [lsp](lsp/README.md) | JSON-RPC framing, document synchronization, UTF-16 positions, synchronous/deferred dispatch, cancellation and deadlines | Implemented; module, consumer and subprocess interoperability tests pass |
+| [lsp](lsp/README.md) | JSON-RPC framing, persistent rope document snapshots, UTF-16 positions, synchronous/deferred dispatch, cancellation and deadlines | Implemented; module, consumer and subprocess interoperability tests pass |
 | [markdown](markdown/README.md) | Block and inline parsing, AST, HTML rendering, escaping, links, code, lists and reference conformance | Implemented; 652/652 CommonMark examples, entity, module and consumer checks pass |
 | [diff](diff/README.md) | Myers and linear-space Hirschberg differences, unified patches, checked application, context and newline preservation | Implemented; tests and GNU interoperability pass |
 | [bitflags](bitflags/README.md) | Typed integer flag sets, third-party derives, unknown-bit policies, set algebra, name iteration, text and numeric Serde | Implemented; 10 library tests, consumer, 16 derive diagnostics and 4,601 Rust reference comparisons pass |
@@ -30,6 +30,16 @@ tracks completed improvements and the remaining functional gaps.
 | [tempfile](tempfile/README.md) | Secure temporary files/directories, anonymous files, atomic persistence, ownership transfer, scoped cleanup and memory-to-disk spooling | Implemented; 24 library tests and race checks, consumer and 160 concurrent filesystem comparisons pass |
 | [reqwest](reqwest/README.md) | HTTP(S)/HTTP2 clients, request builders, JSON/form/multipart, redirects, cancellation, TLS policy and bounded responses | Implemented; 10 library tests and race checks, 4 native race tests, consumer and Python HTTP interoperability pass |
 | [llvm](llvm/README.md) | LLVM 18 typed handles, IR construction/parsing, verification, optimization, bitcode and native object/assembly output | Implemented; 7 library tests, 4 native tests and race checks, consumer and 9,624 linked-function comparisons pass |
+| [rope](rope/README.md) | Persistent balanced UTF-8 text, shared snapshots, checked edits/slices, UTF-16 and line indexing, chunk iterators and streaming I/O | Implemented; 11 library tests and race checks, versioned consumer and 3,266 Python reference edits pass |
+| [tracing](tracing/README.md) | Structured events, nested spans, explicit task contexts, filtering/sampling, composed sinks, bounded asynchronous output and coordinated cleanup | Implemented; 26 library tests and race checks, 3 consumer tests and 1,307 Python reference records pass |
+| [web](web/README.md) | HTTP/1.1 server routing, typed request extraction, middleware, streaming I/O/SSE, cancellation, bounds and graceful shutdown | Implemented; 15 library tests, 3 consumer tests, 10 native tests, live HTTP interoperability and race checks pass |
+| [bigint](bigint/README.md) | Immutable signed/unsigned arbitrary-precision integers, arithmetic/division, bitwise operations, radix/byte conversions, number theory and exact Serde | Implemented; 19 library tests, 2 consumer tests, race checks and 1,938 Python reference cases pass |
+| [decimal](decimal/README.md) | Exact base-10 arithmetic over bigint, precision contexts, seven rounding modes, quantization, checked conversions and representation-preserving Serde | Implemented; 18 library tests, versioned consumer, race checks and 3,072 Python Decimal value/error/status comparisons pass |
+| [incremental](incremental/README.md) | Typed heterogeneous inputs/queries, dynamic dependencies, revision validation, unchanged-result cutoff, atomic updates, cancellation and bounded memoization | Implemented; 13 library tests and race checks, versioned consumer and 15,847 from-scratch oracle queries pass |
+| [datetime](datetime/README.md) | Checked calendars and nanosecond instants, explicit arithmetic policies, RFC3339, TZif/POSIX timezones, DST ambiguity resolution and Serde | Implemented; 18 library tests and race checks, versioned consumer and 8,140 calendar/timezone reference cases pass |
+| [cache](cache/README.md) | Generic concurrent weighted LRU, TTL/TTI, injectable clocks, bounded singleflight loading, invalidation generations, copy policy and removal callbacks | Implemented; 22 library tests and race checks, versioned consumer and 42,240 Python reference operations pass |
+| [ignore](ignore/README.md) | Glob sets, hierarchical Git ignore rules, match explanations, worktree metadata, bounded traversal, cancellation and parallel callbacks | Implemented; 21 library tests and race checks, versioned consumer and 9,400 real Git reference queries pass |
+| [syntax](syntax/README.md) | Immutable lossless green trees, red navigation, typed AST views, bounded interning/builders, checked ranges and persistent subtree edits | Implemented; 18 library tests and race checks, versioned consumer, 3,840 model-checked edits and 240 lossless rewrites pass |
 
 Validation includes module-local public API tests, separate consuming modules,
 deterministic negative cases, reference interoperability where applicable, and
@@ -43,18 +53,21 @@ Current development command, from a module directory:
 ../../stage2/bin/goml test
 ```
 
+Modules with ecosystem dependencies need those versions in the selected registry.
+For this checkout, use the verification command below to create the isolated
+registry snapshot and check both the library and its consumer.
+
 ## Tools
 
 [`goml_stats`](goml_stats/README.md) is a standalone GoML project statistics tool
-with no third-party dependencies. It counts files, code/comment/blank lines,
-bytes, test files, modules and package directories, with exclusions, detailed
+using the `ignore` library for hierarchical Git ignore rules. It counts files,
+code/comment/blank lines, bytes, test files, modules and package directories, with exclusions, detailed
 tables and JSON output. Its lexer-aware counting handles raw and multiline
 strings without mistaking their contents for comments.
 
 ```sh
-(cd ecosystem/goml_stats && ../../stage2/bin/goml build)
-ecosystem/goml_stats/_artifact/bin/cmd/goml_stats/goml_stats .
 python3 ecosystem/goml_stats/verify.py
+ecosystem/goml_stats/_artifact/bin/cmd/goml_stats/goml_stats .
 ```
 
 ## Library verification

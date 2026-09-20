@@ -1,0 +1,458 @@
+package cache;
+
+use std::context;
+
+struct Entry[K, V] {
+    value: V,
+    weight: i64,
+    created: i64,
+    used: i64,
+    expiry: Expiry,
+    previous: Option[K],
+    next: Option[K],
+}
+
+struct Flight[V] {
+    id: u64,
+    done: Channel[()],
+    result: Ref[Option[Result[V, Error]]],
+}
+
+struct State[K, V] {
+    entries: HashMap[K, Entry[K, V]],
+    flights: HashMap[K, Flight[V]],
+    oldest: Option[K],
+    newest: Option[K],
+    expiring: isize,
+    now: i64,
+    next_id: u64,
+    stats: Stats,
+}
+
+struct Removal[K, V] {
+    key: K,
+    value: V,
+    cause: RemovalCause,
+}
+
+pub struct Cache[K, V] {
+    gate: Channel[()],
+    state: Ref[State[K, V]],
+    options: Options,
+    copy: (V) -> V,
+    removed: (K, V, RemovalCause) -> (),
+    done: Channel[()],
+}
+
+impl[K: Eq + Hash, V] Cache[K, V] {
+    pub fn new(options: Options) -> Result[Cache[K, V], Error] {
+        Cache::with_policy(options, |value| value, |_, _, _| ())
+    }
+
+    pub fn with_policy(options: Options, copy: (V) -> V, removed: (K, V, RemovalCause) -> ()) -> Result[
+        Cache[K, V],
+        Error,
+    ] {
+        if options.max_entries < 1 || options.max_weight < 1 || options.max_inflight < 1
+            || options.max_waiters < 0 {
+            return Result::Err(
+                Error::InvalidOptions("capacities must be positive; waiters may be zero"),
+            )
+        }
+        options.expiry.validate()?;
+        let gate = Channel::new(1);
+        gate.send(());
+        Result::Ok(
+            Cache {
+                gate,
+                state: Ref::new(
+                    State {
+                        entries: HashMap::new(),
+                        flights: HashMap::new(),
+                        oldest: Option::None,
+                        newest: Option::None,
+                        expiring: 0,
+                        now: 0,
+                        next_id: 1,
+                        stats: empty_stats(),
+                    },
+                ),
+                options,
+                copy,
+                removed,
+                done: Channel::new(0),
+            },
+        )
+    }
+
+    pub fn closed(self: Cache[K, V]) -> Receiver[()] {
+        self.done.receiver()
+    }
+
+    fn lock(self: Cache[K, V]) -> () {
+        let _ = self.gate.recv();
+    }
+
+    fn lock_with(self: Cache[K, V], ctx: context::Context) -> Result[(), Error] {
+        ctx.check().map_err(|error| context_error(error))?;
+        select {
+            recv(ctx.done()) as _ => Result::Err(
+                context_error(ctx.error().unwrap_or(context::Error::Cancelled)),
+            ),
+            recv(self.gate) as _ => {
+                if let Err(error) = ctx.check() {
+                    self.gate.send(());
+                    Result::Err(context_error(error))
+                } else {
+                    Result::Ok(())
+                }
+            },
+        }
+    }
+
+    fn emit(self: Cache[K, V], removals: Vec[Removal[K, V]]) -> () {
+        for removal in removals {
+            (self.removed)(removal.key, (self.copy)(removal.value), removal.cause);
+        }
+    }
+
+    fn clock(self: Cache[K, V]) -> i64 {
+        let now = (self.options.clock.read)();
+        if now < 0 {
+            0
+        } else {
+            now
+        }
+    }
+
+    fn open(self: Cache[K, V]) -> Result[(), Error] {
+        if self.state.get().stats.closed {
+            Result::Err(Error::Closed)
+        } else {
+            Result::Ok(())
+        }
+    }
+
+    fn unlink(self: Cache[K, V], key: K, entry: Entry[K, V]) -> () {
+        let mut state = self.state.get();
+        if let Some(previous) = entry.previous {
+            if let Some(value) = state.entries.get(previous) {
+                state.entries.set(previous, Entry { next: entry.next, ..value });
+            }
+        } else {
+            state.oldest = entry.next;
+        }
+        if let Some(next) = entry.next {
+            if let Some(value) = state.entries.get(next) {
+                state.entries.set(next, Entry { previous: entry.previous, ..value });
+            }
+        } else {
+            state.newest = entry.previous;
+        }
+        state.entries.remove(key);
+        self.state.set(state);
+    }
+
+    fn append(self: Cache[K, V], key: K, entry: Entry[K, V]) -> () {
+        let mut state = self.state.get();
+        let previous = state.newest;
+        if let Some(previous) = previous {
+            if let Some(value) = state.entries.get(previous) {
+                state.entries.set(previous, Entry { next: Option::Some(key), ..value });
+            }
+        } else {
+            state.oldest = Option::Some(key);
+        }
+        state.entries.set(key, Entry { previous, next: Option::None, ..entry });
+        state.newest = Option::Some(key);
+        self.state.set(state);
+    }
+
+    fn remove_locked(self: Cache[K, V], key: K, cause: RemovalCause, removals: Vec[Removal[K, V]]) -> Option[
+        V,
+    ] {
+        let entry = self.state.get().entries.get(key)?;
+        self.unlink(key, entry);
+        let mut state = self.state.get();
+        state.stats.entries -= 1;
+        state.stats.weight -= entry.weight;
+        state.stats.removals = increment(state.stats.removals);
+        if cause == RemovalCause::Capacity {
+            state.stats.evictions = increment(state.stats.evictions);
+        }
+        if cause == RemovalCause::Expired {
+            state.stats.expirations = increment(state.stats.expirations);
+        }
+        if entry.expiry.enabled() {
+            state.expiring -= 1;
+        }
+        self.state.set(state);
+        removals.push(Removal { key, value: entry.value, cause });
+        Option::Some(entry.value)
+    }
+
+    fn maintain(self: Cache[K, V], observed: i64, removals: Vec[Removal[K, V]]) -> () {
+        let mut state = self.state.get();
+        if observed > state.now {
+            state.now = observed;
+        }
+        self.state.set(state);
+        if state.expiring == 0 {
+            return
+        }
+        for (key, entry) in state.entries.entries() {
+            if entry.expiry.expired(state.now, entry.created, entry.used) {
+                let _ = self.remove_locked(key, RemovalCause::Expired, removals);
+            }
+        }
+    }
+
+    fn lookup_locked(self: Cache[K, V], key: K, touch: bool, count: bool) -> Option[V] {
+        let entry = self.state.get().entries.get(key);
+        if count {
+            let mut state = self.state.get();
+            if entry.is_some() {
+                state.stats.hits = increment(state.stats.hits);
+            } else {
+                state.stats.misses = increment(state.stats.misses);
+            }
+            self.state.set(state);
+        }
+        match entry {
+            Some(entry) => {
+                if touch {
+                    self.unlink(key, entry);
+                    self.append(key, Entry { used: self.state.get().now, ..entry });
+                }
+                Option::Some(entry.value)
+            },
+            None => Option::None,
+        }
+    }
+
+    fn read(self: Cache[K, V], key: K, touch: bool) -> Result[Option[V], Error] {
+        let now = self.clock();
+        let removals = Vec::new();
+        self.lock();
+        let result = if self.state.get().stats.closed {
+            Result::Err(Error::Closed)
+        } else {
+            self.maintain(now, removals);
+            Result::Ok(self.lookup_locked(key, touch, touch))
+        };
+        self.gate.send(());
+        self.emit(removals);
+        result.map(|value| value.map(|value| (self.copy)(value)))
+    }
+
+    pub fn get(self: Cache[K, V], key: K) -> Result[Option[V], Error] {
+        self.read(key, true)
+    }
+
+    pub fn peek(self: Cache[K, V], key: K) -> Result[Option[V], Error] {
+        self.read(key, false)
+    }
+
+    fn validate_loaded(self: Cache[K, V], value: Loaded[V]) -> Result[(), Error] {
+        if value.weight < 0 {
+            return Result::Err(Error::InvalidWeight)
+        }
+        if value.weight > self.options.max_weight {
+            return Result::Err(Error::TooHeavy)
+        }
+        value.expiry.unwrap_or(self.options.expiry).validate()
+    }
+
+    fn invalidate_locked(self: Cache[K, V], key: K, error: Error) -> () {
+        if let Some(flight) = self.state.get().flights.remove_value(key) {
+            flight.result.set(Option::Some(Result::Err(error)));
+            flight.done.close();
+        }
+    }
+
+    fn insert_locked(self: Cache[K, V], key: K, value: Loaded[V], removals: Vec[Removal[K, V]]) -> Option[
+        V,
+    ] {
+        let old = self.remove_locked(key, RemovalCause::Replaced, removals);
+        let expiry = value.expiry.unwrap_or(self.options.expiry);
+        let now = self.state.get().now;
+        if expiry.expired(now, now, now) {
+            let mut state = self.state.get();
+            state.stats.insertions = increment(state.stats.insertions);
+            state.stats.expirations = increment(state.stats.expirations);
+            state.stats.removals = increment(state.stats.removals);
+            self.state.set(state);
+            removals.push(Removal { key, value: value.value, cause: RemovalCause::Expired });
+            return old
+        }
+        loop {
+            let state = self.state.get();
+            if state.stats.entries < self.options.max_entries
+                && state.stats.weight <= self.options.max_weight - value.weight {
+                break
+            }
+            if let Some(oldest) = state.oldest {
+                let _ = self.remove_locked(oldest, RemovalCause::Capacity, removals);
+            } else {
+                break
+            }
+        }
+        self.append(
+            key,
+            Entry {
+                value: value.value,
+                weight: value.weight,
+                created: now,
+                used: now,
+                expiry,
+                previous: Option::None,
+                next: Option::None,
+            },
+        );
+        let mut state = self.state.get();
+        state.stats.entries += 1;
+        state.stats.weight += value.weight;
+        state.stats.insertions = increment(state.stats.insertions);
+        if expiry.enabled() {
+            state.expiring += 1;
+        }
+        self.state.set(state);
+        old
+    }
+
+    pub fn insert(self: Cache[K, V], key: K, value: V, weight: i64) -> Result[Option[V], Error] {
+        self.insert_with_expiry(key, value, weight, self.options.expiry)
+    }
+
+    pub fn insert_with_expiry(self: Cache[K, V], key: K, value: V, weight: i64, expiry: Expiry) -> Result[
+        Option[V],
+        Error,
+    ] {
+        let loaded = Loaded { value, weight, expiry: Option::Some(expiry) };
+        self.validate_loaded(loaded)?;
+        let loaded = Loaded { value: (self.copy)(value), ..loaded };
+        let now = self.clock();
+        let removals = Vec::new();
+        self.lock();
+        let result = if self.state.get().stats.closed {
+            Result::Err(Error::Closed)
+        } else {
+            self.maintain(now, removals);
+            self.invalidate_locked(key, Error::Invalidated);
+            Result::Ok(self.insert_locked(key, loaded, removals))
+        };
+        self.gate.send(());
+        self.emit(removals);
+        result.map(|value| value.map(|value| (self.copy)(value)))
+    }
+
+    pub fn remove(self: Cache[K, V], key: K) -> Result[Option[V], Error] {
+        let now = self.clock();
+        let removals = Vec::new();
+        self.lock();
+        let result = if self.state.get().stats.closed {
+            Result::Err(Error::Closed)
+        } else {
+            self.maintain(now, removals);
+            self.invalidate_locked(key, Error::Invalidated);
+            Result::Ok(self.remove_locked(key, RemovalCause::Removed, removals))
+        };
+        self.gate.send(());
+        self.emit(removals);
+        result.map(|value| value.map(|value| (self.copy)(value)))
+    }
+
+    pub fn invalidate(self: Cache[K, V], key: K) -> Result[(), Error] {
+        self.remove(key).map(|_| ())
+    }
+
+    fn clear_locked(self: Cache[K, V], cause: RemovalCause, removals: Vec[Removal[K, V]]) -> () {
+        let state = self.state.get();
+        for (key, _) in state.entries.entries() {
+            let _ = self.remove_locked(key, cause, removals);
+        }
+        for (key, _) in state.flights.entries() {
+            self.invalidate_locked(
+                key,
+                if cause == RemovalCause::Closed {
+                    Error::Closed
+                } else {
+                    Error::Invalidated
+                },
+            );
+        }
+    }
+
+    pub fn clear(self: Cache[K, V]) -> Result[(), Error] {
+        let removals = Vec::new();
+        self.lock();
+        let result = self.open();
+        if result.is_ok() {
+            self.clear_locked(RemovalCause::Cleared, removals);
+        }
+        self.gate.send(());
+        self.emit(removals);
+        result
+    }
+
+    pub fn close(self: Cache[K, V]) -> () {
+        let removals = Vec::new();
+        self.lock();
+        if !self.state.get().stats.closed {
+            let mut state = self.state.get();
+            state.stats.closed = true;
+            self.state.set(state);
+            self.clear_locked(RemovalCause::Closed, removals);
+            self.done.close();
+        }
+        self.gate.send(());
+        self.emit(removals);
+    }
+
+    pub fn prune(self: Cache[K, V]) -> Result[isize, Error] {
+        let now = self.clock();
+        let removals = Vec::new();
+        self.lock();
+        let result = self.open().map(
+            |_| {
+                self.maintain(now, removals);
+                removals.len()
+            },
+        );
+        self.gate.send(());
+        self.emit(removals);
+        result
+    }
+
+    pub fn stats(self: Cache[K, V]) -> Stats {
+        let now = self.clock();
+        let removals = Vec::new();
+        self.lock();
+        self.maintain(now, removals);
+        let stats = self.state.get().stats;
+        self.gate.send(());
+        self.emit(removals);
+        stats
+    }
+
+    pub fn keys_lru(self: Cache[K, V]) -> Result[Vec[K], Error] {
+        let now = self.clock();
+        let removals = Vec::new();
+        self.lock();
+        let result = self.open().map(
+            |_| {
+                self.maintain(now, removals);
+                let keys = Vec::new();
+                let mut next = self.state.get().oldest;
+                while let Some(key) = next {
+                    keys.push(key);
+                    next = self.state.get().entries.get(key).and_then(|entry| entry.next);
+                }
+                keys
+            },
+        );
+        self.gate.send(());
+        self.emit(removals);
+        result
+    }
+}

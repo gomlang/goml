@@ -111,7 +111,97 @@ They distinguish supported designs from current compiler or API boundaries.
   variants agree across 9,624 function results. This design requires ordinary
   native dependencies but no compiler or builtin changes.
 
+The rope library uses private GC-managed references to implement an immutable
+AVL tree with shared subtrees. UTF-8, UTF-16 and CRLF metadata survive edits,
+splits and concatenation across separately compiled consumers. LSP documents
+now use this storage without changing their clamping or transactional semantics.
+Logical sizes can grow through sharing without large allocations, so public
+operations check integer overflow before updating cached counts. Leaf copies
+prevent small slices from retaining unrelated large source strings.
+
+The incremental library composes heterogeneous input and query types through
+typed handles and closures that erase dependency validation only. Revision
+tracking, equal-result cutoff and atomic input batches work across versioned
+module boundaries. Channel gates serialize root operations and join in-flight
+callback reads before publishing memoized values. Thirteen tests pass under
+the race detector; 15,847 queries agree with independent from-scratch evaluation.
+Mutable values require an explicit copy policy, and callbacks use their scoped
+`Evaluation` rather than reentering a blocking database operation.
+
+The web framework passes lifted GoML callbacks through ordinary Go FFI into
+concurrent HTTP handlers and streaming producers. Typed form/query decoding
+implements the Serde deserializer protocol in GoML; body and response streams
+implement public I/O traits. Opaque native interfaces keep FFI metadata bounded.
+Cancellation callbacks must finish before connection deadlines are reset, so a
+completed request cannot poison a later keep-alive request. Native tests and a
+separate race-built consumer exercise network backpressure and SSE disconnects.
+
+Bigint implements signed and unsigned arbitrary-precision arithmetic using
+immutable `FrozenVec[u32]` limbs and `u64` intermediates, including normalized
+multi-limb division and negative two's-complement bitwise semantics. Public
+numeric and Serde traits specialize in independent consumers. Exact methods
+provide the arithmetic API without operator overloading or wide integer
+primitives; the decimal module can reuse this through an ordinary dependency.
+
+Tracing combines immutable structured fields, explicit task contexts and a
+bounded channel worker without a native adapter. Root sampling has a separate
+ordinal from span identity allocation, so nesting cannot bias the sample.
+Trace sampling remains separate from record filtering: a hidden parent can
+carry a visible error event. All 26 tests pass under the race detector, including
+queue saturation, concurrent closure and first-error propagation. Sink callbacks
+must cooperate with shutdown and cannot synchronously reenter their own tracer.
+
+Datetime implements checked calendar arithmetic, nanosecond normalization,
+bounded TZif decoding and POSIX timezone rules entirely in GoML. Shared immutable
+zone snapshots support concurrent conversions and explicit gap/fold resolution.
+Python and Go reference implementations disagree on some synthetic POSIX edge
+cases; the README records the specification, minimal cases and oracle selection.
+All 18 library tests pass under the race detector and 8,140 cases agree with
+their documented calendar, timezone or specification reference.
+
+Decimal consumes bigint through a versioned dependency and implements exact
+coefficient/scale arithmetic, numeric hashing and format-sensitive Serde without
+floating-point intermediates. Independent Python comparisons cover both values
+and `Rounded`/`Inexact` status: discarding zero positions can count as rounding
+without changing the value. Private bounded representations keep intermediate
+allocation predictable, while explicit context and quantum policies avoid global
+rounding state.
+
+Cache uses generic hash keys and private linked LRU entries behind a channel
+gate. Singleflight results are published through completion channels; generations
+prevent invalidated loads from restoring stale values, while active loader counts
+remain bounded until callbacks return. Clock, copy, loader and removal callbacks
+run outside the gate. A final context check at publication handles cancellation
+during callbacks. All 22 tests pass under the race detector; 42,240 operations
+agree with an independent weighted LRU/TTL/TTI model.
+
+Ignore implements byte-oriented glob dynamic programming and immutable
+hierarchical rule sets without a native matcher. Bounded descriptor iteration,
+canonical ancestor checks and scoped callback workers handle real filesystem
+traversal. Git reference queries distinguish an explicit trailing slash from a
+directory entry visited during traversal. Worktree Git metadata can live outside
+the scan root and requires `gitdir`/`commondir` resolution that preserves path
+spaces. All 21 tests pass under the race detector; 9,400 queries agree with Git.
+
+Syntax combines immutable green trees with parent-aware red views and
+consumer-defined typed AST traits. Frozen children, checked cached byte/element
+counts and iterative traversal support deep trees and persistent path-copy edits
+without ownership syntax. Bounded shared interning works across tasks; all 18
+tests pass under the race detector. Independent tree models check 3,840 edits,
+and a versioned configuration-language consumer preserves trivia through 240
+text rewrites.
+
+The statistics tool consumes ignore through a normal versioned dependency.
+Its public scan API composes a custom exclusion closure with hierarchical Git
+rules and bounded filesystem traversal, preserving explicit-root behavior and
+returning errors instead of partial totals when traversal fails.
+
 ## Fixed compiler regressions
+
+Ignore-file BOM handling exposed a Go output bug: a decoded `\uFEFF` string
+escape was emitted as a literal BOM inside generated Go, which Go rejects.
+The backend now emits `\ufeff`, preserving the UTF-8 value. Printer and real
+Go compilation/execution regressions cover embedded and repeated marks.
 
 The development compiler now passes all four retained reproducers in `repros/`:
 

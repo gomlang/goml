@@ -1,0 +1,330 @@
+package decimal;
+
+use ecosystem::bigint::{BigInt};
+
+fn division(numerator: BigInt, denominator: BigInt) -> Result[(BigInt, BigInt), Error] {
+    numerator.div_rem(denominator).map_err(|error| Error::Integer(error.to_string()))
+}
+
+fn increment(
+    quotient: BigInt,
+    remainder: BigInt,
+    denominator: BigInt,
+    negative: bool,
+    rounding: Rounding,
+) -> bool {
+    if remainder.is_zero() {
+        return false
+    }
+    let half = remainder.abs().mul(BigInt::from_u64(2).abs()).cmp(denominator.abs());
+    match rounding {
+        Rounding::Down => false,
+        Rounding::Up => true,
+        Rounding::Ceiling => !negative,
+        Rounding::Floor => negative,
+        Rounding::HalfUp => half != Ordering::Less,
+        Rounding::HalfDown => half == Ordering::Greater,
+        Rounding::HalfEven => half == Ordering::Greater
+            || (half == Ordering::Equal && quotient.is_odd()),
+    }
+}
+
+fn rounded_quotient(numerator: BigInt, denominator: BigInt, rounding: Rounding) -> Result[
+    (BigInt, bool),
+    Error,
+] {
+    let (quotient, remainder) = division(numerator, denominator)?;
+    let negative = numerator.is_negative() != denominator.is_negative();
+    let quotient = if increment(quotient, remainder, denominator, negative, rounding) {
+        if negative {
+            quotient.sub(BigInt::one())
+        } else {
+            quotient.add(BigInt::one())
+        }
+    } else {
+        quotient
+    };
+    Result::Ok((quotient, !remainder.is_zero()))
+}
+
+fn align(left: Decimal, right: Decimal) -> Result[(BigInt, BigInt, isize), Error] {
+    let scale = if left.scale > right.scale {
+        left.scale
+    } else {
+        right.scale
+    };
+    Result::Ok(
+        (
+            left.coefficient.mul(power10(scale - left.scale)?),
+            right.coefficient.mul(power10(scale - right.scale)?),
+            scale,
+        ),
+    )
+}
+
+fn round_coefficient(coefficient: BigInt, scale: isize, context: Context) -> Result[Outcome, Error] {
+    let length = digits(coefficient);
+    if length <= context.precision {
+        return Result::Ok(
+            Outcome { value: Decimal::new(coefficient, scale)?, rounded: false, inexact: false },
+        )
+    }
+    let removed = length - context.precision;
+    let (mut coefficient, inexact) = rounded_quotient(
+        coefficient,
+        power10(removed)?,
+        context.rounding,
+    )?;
+    let mut scale = scale - removed;
+    if digits(coefficient) > context.precision {
+        coefficient = division(coefficient, BigInt::from_u64(10))?.0;
+        scale -= 1;
+    }
+    Result::Ok(Outcome { value: Decimal::new(coefficient, scale)?, rounded: true, inexact })
+}
+
+impl Decimal {
+    pub fn add(self: Decimal, other: Decimal) -> Result[Decimal, Error] {
+        let (left, right, scale) = align(self, other)?;
+        Decimal::new(left.add(right), scale)
+    }
+
+    pub fn sub(self: Decimal, other: Decimal) -> Result[Decimal, Error] {
+        self.add(other.neg())
+    }
+
+    pub fn mul(self: Decimal, other: Decimal) -> Result[Decimal, Error] {
+        Decimal::new(self.coefficient.mul(other.coefficient), self.scale + other.scale)
+    }
+
+    pub fn rescale_status(self: Decimal, scale: isize, rounding: Rounding) -> Result[Outcome, Error] {
+        check_scale(scale)?;
+        if scale >= self.scale {
+            if !self.is_zero() && self.precision() + scale - self.scale > 4096 {
+                return Result::Err(Error::Overflow)
+            }
+            let coefficient = self.coefficient.mul(power10(scale - self.scale)?);
+            return Result::Ok(
+                Outcome { value: Decimal::new(coefficient, scale)?, rounded: false, inexact: false },
+            )
+        }
+        let (coefficient, inexact) = rounded_quotient(
+            self.coefficient,
+            power10(self.scale - scale)?,
+            rounding,
+        )?;
+        Result::Ok(
+            Outcome { value: Decimal::new(coefficient, scale)?, rounded: !self.is_zero(), inexact },
+        )
+    }
+
+    pub fn rescale(self: Decimal, scale: isize, rounding: Rounding) -> Result[Decimal, Error] {
+        Result::Ok(self.rescale_status(scale, rounding)?.value)
+    }
+
+    pub fn rescale_exact(self: Decimal, scale: isize) -> Result[Decimal, Error] {
+        let outcome = self.rescale_status(scale, Rounding::Down)?;
+        if outcome.inexact {
+            Result::Err(Error::Inexact)
+        } else {
+            Result::Ok(outcome.value)
+        }
+    }
+
+    pub fn normalize(self: Decimal) -> Decimal {
+        if self.is_zero() {
+            return Decimal::zero()
+        }
+        let text = self.coefficient.abs().to_string();
+        let mut end = text.byte_len();
+        let mut scale = self.scale;
+        while end > 1 && text.byte_get(end - 1) == 48 && scale > -4096 {
+            end -= 1;
+            scale -= 1;
+        }
+        let coefficient = BigInt::parse(text.byte_slice(0, end)).unwrap_or(self.coefficient);
+        Decimal {
+            coefficient: if self.is_negative() {
+                coefficient.neg()
+            } else {
+                coefficient
+            },
+            scale,
+        }
+    }
+
+    pub fn div_exact(self: Decimal, other: Decimal) -> Result[Decimal, Error] {
+        if other.is_zero() {
+            return Result::Err(Error::DivisionByZero)
+        }
+        if self.is_zero() {
+            return Result::Ok(Decimal::zero())
+        }
+        let common = BigInt::from_sign_magnitude(false, self.coefficient.gcd(other.coefficient));
+        let mut numerator = division(self.coefficient, common)?.0;
+        let mut denominator = division(other.coefficient, common)?.0;
+        if denominator.is_negative() {
+            numerator = numerator.neg();
+            denominator = denominator.neg();
+        }
+        let two = BigInt::from_u64(2);
+        let five = BigInt::from_u64(5);
+        let mut twos = 0;
+        let mut fives = 0;
+        while !denominator.is_odd() {
+            denominator = division(denominator, two)?.0;
+            twos += 1;
+            if twos > 8192 {
+                return Result::Err(Error::LimitExceeded("exact division factors"))
+            }
+        }
+        loop {
+            let (quotient, remainder) = division(denominator, five)?;
+            if !remainder.is_zero() {
+                break;
+            }
+            denominator = quotient;
+            fives += 1;
+            if fives > 8192 {
+                return Result::Err(Error::LimitExceeded("exact division factors"))
+            }
+        }
+        if !denominator.is_one() {
+            return Result::Err(Error::NonTerminating)
+        }
+        let places = if twos > fives {
+            twos
+        } else {
+            fives
+        };
+        let scale = self.scale - other.scale + places;
+        check_scale(scale)?;
+        let twos = two.pow((places - twos).to_u64()).map_err(
+            |error| Error::Integer(error.to_string()),
+        )?;
+        let fives = five.pow((places - fives).to_u64()).map_err(
+            |error| Error::Integer(error.to_string()),
+        )?;
+        Result::Ok(Decimal::new(numerator.mul(twos).mul(fives), scale)?.normalize())
+    }
+
+    pub fn to_i64(self: Decimal) -> Result[i64, Error] {
+        self.rescale_exact(0)?.coefficient.to_i64().ok_or(Error::Overflow)
+    }
+
+    pub fn to_u64(self: Decimal) -> Result[u64, Error] {
+        self.rescale_exact(0)?.coefficient.to_u64().ok_or(Error::Overflow)
+    }
+
+    pub fn to_bigint(self: Decimal) -> Result[BigInt, Error] {
+        Result::Ok(self.rescale_exact(0)?.coefficient)
+    }
+
+    pub fn trunc(self: Decimal) -> Result[Decimal, Error] {
+        self.rescale(0, Rounding::Down)
+    }
+
+    pub fn floor(self: Decimal) -> Result[Decimal, Error] {
+        self.rescale(0, Rounding::Floor)
+    }
+
+    pub fn ceil(self: Decimal) -> Result[Decimal, Error] {
+        self.rescale(0, Rounding::Ceiling)
+    }
+}
+
+impl Context {
+    pub fn round_status(self: Context, value: Decimal) -> Result[Outcome, Error] {
+        round_coefficient(value.coefficient, value.scale, self)
+    }
+
+    pub fn round(self: Context, value: Decimal) -> Result[Decimal, Error] {
+        Result::Ok(self.round_status(value)?.value)
+    }
+
+    pub fn add_status(self: Context, left: Decimal, right: Decimal) -> Result[Outcome, Error] {
+        let (left, right, scale) = align(left, right)?;
+        round_coefficient(left.add(right), scale, self)
+    }
+
+    pub fn add(self: Context, left: Decimal, right: Decimal) -> Result[Decimal, Error] {
+        Result::Ok(self.add_status(left, right)?.value)
+    }
+
+    pub fn sub(self: Context, left: Decimal, right: Decimal) -> Result[Decimal, Error] {
+        self.add(left, right.neg())
+    }
+
+    pub fn sub_status(self: Context, left: Decimal, right: Decimal) -> Result[Outcome, Error] {
+        self.add_status(left, right.neg())
+    }
+
+    pub fn mul_status(self: Context, left: Decimal, right: Decimal) -> Result[Outcome, Error] {
+        round_coefficient(left.coefficient.mul(right.coefficient), left.scale + right.scale, self)
+    }
+
+    pub fn mul(self: Context, left: Decimal, right: Decimal) -> Result[Decimal, Error] {
+        Result::Ok(self.mul_status(left, right)?.value)
+    }
+
+    pub fn quantize_status(self: Context, value: Decimal, scale: isize) -> Result[Outcome, Error] {
+        let outcome = value.rescale_status(scale, self.rounding)?;
+        if outcome.value.precision() > self.precision {
+            Result::Err(Error::Overflow)
+        } else {
+            Result::Ok(outcome)
+        }
+    }
+
+    pub fn quantize(self: Context, value: Decimal, scale: isize) -> Result[Decimal, Error] {
+        Result::Ok(self.quantize_status(value, scale)?.value)
+    }
+
+    pub fn div_status(self: Context, left: Decimal, right: Decimal) -> Result[Outcome, Error] {
+        if right.is_zero() {
+            return Result::Err(Error::DivisionByZero)
+        }
+        if left.is_zero() {
+            return Result::Ok(Outcome { value: Decimal::zero(), rounded: false, inexact: false })
+        }
+        let numerator = left.coefficient;
+        let denominator = right.coefficient;
+        let mut exponent = digits(numerator) - digits(denominator);
+        let order = if exponent >= 0 {
+            numerator.abs().cmp(denominator.abs().mul(power10(exponent)?.abs()))
+        } else {
+            numerator.abs().mul(power10(-exponent)?.abs()).cmp(denominator.abs())
+        };
+        if order == Ordering::Less {
+            exponent -= 1;
+        }
+        let shift = self.precision - 1 - exponent;
+        let numerator = if shift >= 0 {
+            numerator.mul(power10(shift)?)
+        } else {
+            numerator
+        };
+        let denominator = if shift < 0 {
+            denominator.mul(power10(-shift)?)
+        } else {
+            denominator
+        };
+        let (mut coefficient, inexact) = rounded_quotient(numerator, denominator, self.rounding)?;
+        let mut scale = shift + left.scale - right.scale;
+        if digits(coefficient) > self.precision {
+            coefficient = division(coefficient, BigInt::from_u64(10))?.0;
+            scale -= 1;
+        }
+        Result::Ok(
+            Outcome {
+                value: Decimal::new(coefficient, scale)?,
+                rounded: inexact || scale < left.scale - right.scale,
+                inexact,
+            },
+        )
+    }
+
+    pub fn div(self: Context, left: Decimal, right: Decimal) -> Result[Decimal, Error] {
+        Result::Ok(self.div_status(left, right)?.value)
+    }
+}

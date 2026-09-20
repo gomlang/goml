@@ -1,5 +1,6 @@
 package lsp;
 
+use ecosystem::rope;
 use std::json;
 use std::text;
 
@@ -116,8 +117,7 @@ pub struct Document {
     uri_value: string,
     language_value: string,
     version_value: isize,
-    text_value: string,
-    index: text::LineIndex,
+    text_value: rope::Rope,
 }
 
 impl Document {
@@ -134,8 +134,9 @@ impl Document {
                 uri_value: uri,
                 language_value: language_id,
                 version_value: version,
-                text_value: content,
-                index: text::LineIndex::new(content),
+                text_value: rope::Rope::from_string(content).map_err(
+                    |error| invalid(error.to_string()),
+                )?,
             },
         )
     }
@@ -153,39 +154,51 @@ impl Document {
     }
 
     pub fn content(self: Document) -> string {
-        self.text_value
+        self.text_value.to_string()
     }
 
     pub fn line_count(self: Document) -> isize {
-        self.index.line_count()
+        self.text_value.len_lines()
     }
 
     pub fn position(self: Document, offset: isize) -> Result[Position, RpcError] {
-        if offset < 0 || offset > self.text_value.byte_len()
+        if offset < 0 || offset > self.text_value.len_bytes()
             || !self.text_value.is_char_boundary(offset) {
             return Result::Err(invalid("byte offset is outside the document or splits UTF-8"))
         }
-        let value = self.index.offset_to_line_column(offset, text::PositionEncoding::Utf16);
-        Result::Ok(Position { line: value.line, character: value.column })
+        let line = self.text_value.byte_to_line(offset).map_err(|error| invalid(error.to_string()))?;
+        let (start, end) = self.text_value.line_bounds(line, false).map_err(
+            |error| invalid(error.to_string()),
+        )?;
+        let clamped = if offset > end {
+            end
+        } else {
+            offset
+        };
+        let first = self.text_value.byte_to_utf16(start).map_err(|error| invalid(error.to_string()))?;
+        let current = self.text_value.byte_to_utf16(clamped).map_err(
+            |error| invalid(error.to_string()),
+        )?;
+        Result::Ok(Position { line, character: current - first })
     }
 
     pub fn offset(self: Document, position: Position) -> Result[isize, RpcError] {
-        if position.line < 0 || position.line >= self.index.line_count() || position.character < 0
+        if position.line < 0 || position.line >= self.text_value.len_lines()
+            || position.character < 0
             || position.character > 2147483647 {
             return Result::Err(invalid("position outside document"))
         }
-        let end = self.index.line_column_to_offset(
-            text::LineColumn { line: position.line, column: 2147483647 },
-            text::PositionEncoding::Utf16,
-        );
-        let last = self.index.offset_to_line_column(end, text::PositionEncoding::Utf16);
-        if position.character >= last.column {
+        let (start, end) = self.text_value.line_bounds(position.line, false).map_err(
+            |error| invalid(error.to_string()),
+        )?;
+        let first = self.text_value.byte_to_utf16(start).map_err(|error| invalid(error.to_string()))?;
+        let last = self.text_value.byte_to_utf16(end).map_err(|error| invalid(error.to_string()))?;
+        if position.character >= last - first {
             return Result::Ok(end)
         }
-        self.index.line_column_to_offset_checked(
-            text::LineColumn { line: position.line, column: position.character },
-            text::PositionEncoding::Utf16,
-        ).ok_or(invalid("position splits a UTF-16 surrogate pair"))
+        self.text_value.utf16_to_byte(first + position.character).map_err(
+            |_| invalid("position splits a UTF-16 surrogate pair"),
+        )
     }
 
     pub fn offsets(self: Document, range: Range) -> Result[(isize, isize), RpcError] {
@@ -197,7 +210,9 @@ impl Document {
 
     pub fn text_in(self: Document, range: Range) -> Result[string, RpcError] {
         let (start, end) = self.offsets(range)?;
-        Result::Ok(self.text_value.byte_slice(start, end))
+        Result::Ok(
+            self.text_value.slice_bytes(start, end).map_err(|error| invalid(error.to_string()))?.to_string(),
+        )
     }
 
     pub fn changed(self: Document, version: isize, changes: Vec[Change], max_bytes: isize) -> Result[
@@ -215,27 +230,37 @@ impl Document {
         for change in changes {
             let (start, end) = match change.range {
                 Some(range) => result.offsets(range)?,
-                None => (0, result.text_value.byte_len()),
+                None => (0, result.text_value.len_bytes()),
             };
             if let Some(expected) = change.range_length {
                 if change.range.is_none()
-                    || expected != utf16_length(result.text_value.byte_slice(start, end)) {
+                    || expected
+                        != result.text_value.byte_to_utf16(end).map_err(
+                            |error| invalid(error.to_string()),
+                        )?
+                            - result.text_value.byte_to_utf16(start).map_err(
+                                |error| invalid(error.to_string()),
+                            )? {
                     return Result::Err(invalid("rangeLength does not match replaced UTF-16 length"))
                 }
             }
-            if max_bytes < 0 || result.text_value.byte_len() - (end - start) > max_bytes
+            if result.text_value.len_bytes() - (end - start) > max_bytes
                 || change.text.byte_len()
-                    > max_bytes - (result.text_value.byte_len() - (end - start)) {
+                    > max_bytes - (result.text_value.len_bytes() - (end - start)) {
                 return Result::Err(invalid("document size limit exceeded"))
             }
-            let content = result.text_value.byte_slice(0, start) + change.text
-                + result.text_value.byte_slice(end, result.text_value.byte_len());
-            result = Document::new(self.uri_value, self.language_value, version, content)?;
+            let replacement = rope::Rope::from_string(change.text).map_err(
+                |error| invalid(error.to_string()),
+            )?;
+            let content = result.text_value.replace_bytes(start, end, replacement).map_err(
+                |error| invalid(error.to_string()),
+            )?;
+            result = Document { text_value: content, version_value: version, ..result };
         }
-        if result.text_value.byte_len() > max_bytes {
+        if result.text_value.len_bytes() > max_bytes {
             return Result::Err(invalid("document size limit exceeded"))
         }
-        Document::new(self.uri_value, self.language_value, version, result.text_value)
+        Result::Ok(Document { version_value: version, ..result })
     }
 
     pub fn apply_edits(self: Document, edits: Vec[TextEdit]) -> Result[string, RpcError] {
@@ -258,11 +283,21 @@ impl Document {
             if start < cursor {
                 return Result::Err(invalid("overlapping text edits"))
             }
-            output.write_string(self.text_value.byte_slice(cursor, start));
+            let unchanged = self.text_value.slice_bytes(cursor, start).map_err(
+                |error| invalid(error.to_string()),
+            )?;
+            for chunk in unchanged.chunks() {
+                output.write_string(chunk);
+            }
             output.write_string(replacement);
             cursor = end;
         }
-        output.write_string(self.text_value.byte_slice(cursor, self.text_value.byte_len()));
+        let remaining = self.text_value.slice_bytes(cursor, self.text_value.len_bytes()).map_err(
+            |error| invalid(error.to_string()),
+        )?;
+        for chunk in remaining.chunks() {
+            output.write_string(chunk);
+        }
         Result::Ok(output.finish())
     }
 }

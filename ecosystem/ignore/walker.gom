@@ -1,0 +1,585 @@
+package ignore;
+
+use std::context;
+use std::cmp::{Ord};
+use std::fs;
+use std::io;
+use std::os::linux::fd;
+use std::path;
+use std::task;
+use std::utf8;
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum Symlinks {
+    Skip,
+    Follow,
+}
+
+pub struct WalkOptions {
+    pub gitignore: bool,
+    pub skip_git: bool,
+    pub symlinks: Symlinks,
+    pub max_depth: isize,
+    pub max_entries_per_directory: isize,
+    pub max_visited: isize,
+    pub limits: Limits,
+    pub initial: Gitignore,
+    pub exclude: Option[(string, bool) -> bool],
+}
+
+impl WalkOptions {
+    pub fn standard() -> WalkOptions {
+        WalkOptions {
+            gitignore: true,
+            skip_git: true,
+            symlinks: Symlinks::Skip,
+            max_depth: 256,
+            max_entries_per_directory: 100000,
+            max_visited: 1000000,
+            limits: Limits::standard(),
+            initial: Gitignore::new(),
+            exclude: Option::None,
+        }
+    }
+}
+
+pub struct Entry {
+    path_value: string,
+    relative: string,
+    name_value: string,
+    kind: fs::FileType,
+    depth_value: isize,
+    link: bool,
+}
+
+impl Entry {
+    pub fn path(self: Entry) -> string {
+        self.path_value
+    }
+
+    pub fn relative_path(self: Entry) -> string {
+        self.relative
+    }
+
+    pub fn name(self: Entry) -> string {
+        self.name_value
+    }
+
+    pub fn file_type(self: Entry) -> fs::FileType {
+        self.kind
+    }
+
+    pub fn depth(self: Entry) -> isize {
+        self.depth_value
+    }
+
+    pub fn is_symlink(self: Entry) -> bool {
+        self.link
+    }
+}
+
+struct Work {
+    path: string,
+    relative: string,
+    depth: isize,
+    rules: Gitignore,
+    ancestors: FrozenVec[string],
+}
+
+pub struct Walker {
+    options: WalkOptions,
+    pending: Ref[Option[Work]],
+    stack: Vec[Work],
+    done: Ref[bool],
+    visited: Ref[isize],
+}
+
+fn cancelled(ctx: context::Context) -> Error {
+    failure(
+        ErrorKind::Cancelled,
+        ctx.error().map(|error| error.to_string()).unwrap_or("walk cancelled"),
+    )
+}
+
+fn read_source(file_path: string, limits: Limits, ctx: context::Context) -> Result[
+    Option[string],
+    Error,
+] {
+    let metadata = match fs::symlink_metadata(file_path) {
+        Ok(value) => value,
+        Err(error) => if error.kind() == io::ErrorKind::NotFound {
+            return Result::Ok(Option::None)
+        } else {
+            return Result::Err(fs_failure(file_path, error))
+        },
+    };
+    if metadata.file_type().is_symlink() {
+        return Result::Ok(Option::None)
+    }
+    if !metadata.file_type().is_file() {
+        return Result::Err(failure(ErrorKind::Io, "ignore source is not a regular file"))
+    }
+    let file = fd::open(file_path, fd::O_RDONLY | fd::O_NOFOLLOW | fd::O_NONBLOCK, 0).map_err(
+        |error| io_failure(file_path, error),
+    )?;
+    defer {
+        let _ = file.close();
+    };
+    let data: Vec[byte] = Vec::new();
+    let buffer: Vec[byte] = Vec::new();
+    for _ in 0..8192 {
+        buffer.push(0);
+    }
+    loop {
+        if ctx.error().is_some() {
+            return Result::Err(cancelled(ctx))
+        }
+        let count = file.read(buffer.as_mut_slice()).map_err(|error| io_failure(file_path, error))?;
+        if count == 0 {
+            break;
+        }
+        if count > limits.max_source_bytes - data.len() {
+            return Result::Err(
+                Error {
+                    path: file_path,
+                    ..failure(ErrorKind::Limit, "ignore source byte limit exceeded"),
+                },
+            )
+        }
+        for index in 0..count {
+            data.push(buffer[index]);
+        }
+    }
+    utf8::decode(data).map(|text| Option::Some(text)).map_err(
+        |error| Error { path: file_path, ..failure(ErrorKind::InvalidPattern, error.to_string()) },
+    )
+}
+
+fn directory_names(directory: string, maximum: isize, ctx: context::Context) -> Result[
+    Vec[string],
+    Error,
+] {
+    let file = fd::open(directory, fd::O_RDONLY | fd::O_DIRECTORY, 0).map_err(
+        |error| io_failure(directory, error),
+    )?;
+    defer {
+        let _ = file.close();
+    };
+    let names: Vec[string] = Vec::new();
+    loop {
+        if ctx.error().is_some() {
+            return Result::Err(cancelled(ctx))
+        }
+        let batch = file.read_dir().map_err(|error| io_failure(directory, error))?;
+        if batch.is_empty() {
+            break;
+        }
+        for entry in batch {
+            let name = utf8::decode(entry.name).map_err(
+                |error| Error {
+                    path: directory,
+                    ..failure(ErrorKind::InvalidPath, error.to_string()),
+                },
+            )?;
+            if name == "." || name == ".." {
+                continue;
+            }
+            if names.len() == maximum {
+                return Result::Err(
+                    Error {
+                        path: directory,
+                        ..failure(ErrorKind::Limit, "directory entry limit exceeded"),
+                    },
+                )
+            }
+            names.push(name);
+        }
+    }
+    names.sort_by_ordering(|left, right| left.cmp(right));
+    Result::Ok(names)
+}
+
+fn metadata_line(text: string) -> string {
+    let text = if text.ends_with("\n") {
+        text.byte_slice(0, text.byte_len() - 1)
+    } else {
+        text
+    };
+    if text.ends_with("\r") {
+        text.byte_slice(0, text.byte_len() - 1)
+    } else {
+        text
+    }
+}
+
+fn git_exclude_path(root: string, limits: Limits, ctx: context::Context) -> Result[
+    Option[string],
+    Error,
+] {
+    let marker = path::join(root, ".git");
+    let metadata = match fs::symlink_metadata(marker) {
+        Ok(value) => value,
+        Err(error) => if error.kind() == io::ErrorKind::NotFound {
+            return Result::Ok(Option::None)
+        } else {
+            return Result::Err(fs_failure(marker, error))
+        },
+    };
+    let gitdir = if metadata.file_type().is_dir() {
+        marker
+    } else if metadata.file_type().is_file() {
+        let source = read_source(marker, limits, ctx)?.unwrap_or("");
+        if !source.starts_with("gitdir: ") {
+            return Result::Err(
+                Error {
+                    path: marker,
+                    ..failure(ErrorKind::InvalidPath, "invalid gitdir pointer file"),
+                },
+            )
+        }
+        let target = metadata_line(source.byte_slice(8, source.byte_len()));
+        if target == "" || target.contains("\u0000") || target.contains("\n")
+            || target.contains("\r")
+            || target.byte_len() > limits.max_path_bytes {
+            return Result::Err(
+                Error { path: marker, ..failure(ErrorKind::InvalidPath, "invalid gitdir path") },
+            )
+        }
+        if path::is_absolute(target) {
+            path::clean(target)
+        } else {
+            path::join(root, target)
+        }
+    } else {
+        return Result::Ok(Option::None)
+    };
+    let common = match read_source(path::join(gitdir, "commondir"), limits, ctx)? {
+        None => gitdir,
+        Some(text) => {
+            let target = metadata_line(text);
+            if target == "" || target.contains("\u0000") || target.contains("\n")
+                || target.contains("\r")
+                || target.byte_len() > limits.max_path_bytes {
+                return Result::Err(
+                    Error {
+                        path: path::join(gitdir, "commondir"),
+                        ..failure(ErrorKind::InvalidPath, "invalid common gitdir path"),
+                    },
+                )
+            }
+            if path::is_absolute(target) {
+                path::clean(target)
+            } else {
+                path::join(gitdir, target)
+            }
+        },
+    };
+    Result::Ok(Option::Some(path::join(common, "info/exclude")))
+}
+
+impl Walker {
+    pub fn new(root: string, options: WalkOptions) -> Result[Walker, Error] {
+        options.limits.validate()?;
+        let options = WalkOptions { initial: options.initial.bounded(options.limits)?, ..options };
+        if root == "" || root.contains("\u0000") {
+            return Result::Err(
+                failure(ErrorKind::InvalidPath, "root must be a nonempty path without NUL"),
+            )
+        }
+        if options.max_depth < 0 || options.max_entries_per_directory < 1 || options.max_visited < 1 {
+            return Result::Err(
+                failure(
+                    ErrorKind::InvalidOptions,
+                    "walk limits must be positive and depth must be nonnegative",
+                ),
+            )
+        }
+        let root = path::absolute_structured(root).map_err(
+            |error| failure(ErrorKind::InvalidPath, error.to_string()),
+        )?;
+        Result::Ok(
+            Walker {
+                options,
+                pending: Ref::new(Option::None),
+                stack: Vec::from_array(
+                    [
+                        Work {
+                            path: root,
+                            relative: "",
+                            depth: 0,
+                            rules: options.initial,
+                            ancestors: Vec::new().freeze(),
+                        },
+                    ],
+                ),
+                done: Ref::new(false),
+                visited: Ref::new(0),
+            },
+        )
+    }
+
+    pub fn close(self: Walker) -> () {
+        self.done.set(true);
+        self.pending.set(Option::None);
+        self.stack.clear();
+    }
+
+    pub fn skip_current_dir(self: Walker) -> () {
+        self.pending.set(Option::None);
+    }
+
+    pub fn visited_count(self: Walker) -> isize {
+        self.visited.get()
+    }
+
+    fn descend(self: Walker, work: Work, ctx: context::Context) -> Result[(), Error] {
+        let mut rules = work.rules;
+        if self.options.gitignore {
+            if work.depth == 0 {
+                if let Some(source) = git_exclude_path(work.path, self.options.limits, ctx)? {
+                    if let Some(text) = read_source(source, self.options.limits, ctx)? {
+                        rules = rules.with_excludes(source, text)?;
+                    }
+                }
+            }
+            let source = path::join(work.path, ".gitignore");
+            if let Some(text) = read_source(source, self.options.limits, ctx)? {
+                rules = rules.with_source(work.relative, source, text)?;
+            }
+        }
+        let canonical = fs::canonicalize(work.path).map_err(|error| fs_failure(work.path, error))?;
+        if work.ancestors.contains(canonical) {
+            return Result::Err(
+                Error {
+                    path: work.path,
+                    ..failure(ErrorKind::Cycle, "symbolic link reaches an ancestor directory"),
+                },
+            )
+        }
+        let ancestors = work.ancestors.to_vec();
+        ancestors.push(canonical);
+        let ancestors = ancestors.freeze();
+        let remaining = self.options.max_visited - self.visited.get() - self.stack.len();
+        let maximum = if remaining < self.options.max_entries_per_directory {
+            remaining
+        } else {
+            self.options.max_entries_per_directory
+        };
+        let names = directory_names(work.path, maximum, ctx)?;
+        let mut index = names.len();
+        while index > 0 {
+            index -= 1;
+            let name = names[index];
+            let relative = if work.relative == "" {
+                name
+            } else {
+                work.relative + "/" + name
+            };
+            self.stack.push(
+                Work {
+                    path: path::join(work.path, name),
+                    relative,
+                    depth: work.depth + 1,
+                    rules,
+                    ancestors,
+                },
+            );
+        }
+        Result::Ok(())
+    }
+
+    pub fn next(self: Walker, ctx: context::Context) -> Option[Result[Entry, Error]] {
+        if self.done.get() {
+            return Option::None
+        }
+        if ctx.error().is_some() {
+            self.close();
+            return Option::Some(Result::Err(cancelled(ctx)))
+        }
+        if let Some(work) = self.pending.get() {
+            self.pending.set(Option::None);
+            if let Err(error) = self.descend(work, ctx) {
+                if error.kind == ErrorKind::Cancelled {
+                    self.close();
+                }
+                return Option::Some(Result::Err(error))
+            }
+        }
+        loop {
+            let work = match self.stack.pop() {
+                Some(work) => work,
+                None => {
+                    self.close();
+                    return Option::None
+                },
+            };
+            if ctx.error().is_some() {
+                self.close();
+                return Option::Some(Result::Err(cancelled(ctx)))
+            }
+            if self.visited.get() == self.options.max_visited {
+                self.close();
+                return Option::Some(
+                    Result::Err(failure(ErrorKind::Limit, "visited entry limit exceeded")),
+                )
+            }
+            self.visited.set(self.visited.get() + 1);
+            if work.relative.byte_len() > self.options.limits.max_path_bytes {
+                return Option::Some(
+                    Result::Err(
+                        Error {
+                            path: work.path,
+                            ..failure(ErrorKind::Limit, "relative path byte limit exceeded"),
+                        },
+                    ),
+                )
+            }
+            let metadata = match fs::symlink_metadata(work.path) {
+                Ok(value) => value,
+                Err(error) => return Option::Some(Result::Err(fs_failure(work.path, error))),
+            };
+            let link = metadata.file_type().is_symlink();
+            let metadata = if link && self.options.symlinks == Symlinks::Follow {
+                match fs::metadata(work.path) {
+                    Ok(value) => value,
+                    Err(error) => return Option::Some(Result::Err(fs_failure(work.path, error))),
+                }
+            } else {
+                metadata
+            };
+            let name = path::file_name(work.path).unwrap_or(work.path);
+            let is_dir = metadata.file_type().is_dir();
+            if work.depth > 0 {
+                if self.options.skip_git && name == ".git" {
+                    continue;
+                }
+                if let Some(exclude) = self.options.exclude {
+                    if exclude(work.relative, is_dir) {
+                        continue;
+                    }
+                }
+                let matched = match work.rules.matched(work.relative, is_dir) {
+                    Ok(value) => value,
+                    Err(error) => return Option::Some(
+                        Result::Err(Error { path: work.path, ..error }),
+                    ),
+                };
+                if matched.is_ignored() {
+                    continue;
+                }
+            }
+            if is_dir && work.depth < self.options.max_depth {
+                self.pending.set(Option::Some(work));
+            }
+            return Option::Some(
+                Result::Ok(
+                    Entry {
+                        path_value: work.path,
+                        relative: work.relative,
+                        name_value: name,
+                        kind: metadata.file_type(),
+                        depth_value: work.depth,
+                        link,
+                    },
+                ),
+            )
+        }
+    }
+}
+
+pub fn walk_parallel(
+    root: string,
+    options: WalkOptions,
+    ctx: context::Context,
+    workers: isize,
+    callback: (Entry, context::Context) -> Result[(), Error],
+) -> Result[isize, Error] {
+    if workers < 1 || workers > 1024 {
+        return Result::Err(
+            failure(ErrorKind::InvalidOptions, "worker count must be between 1 and 1024"),
+        )
+    }
+    let walker = Walker::new(root, options)?;
+    context::with_cancel(
+        ctx,
+        |child, cancel| task::scope(
+            |scope| {
+                let jobs: Channel[Entry] = Channel::new(workers);
+                let failures: Channel[Error] = Channel::new(workers);
+                let tasks: Vec[task::Task[isize]] = Vec::new();
+                for _ in 0..workers {
+                    tasks.push(
+                        scope.spawn(
+                            |_| {
+                                let mut completed = 0;
+                                loop {
+                                    let job = select {
+                                        recv(child.done()) as _ => Option::None,
+                                        recv(jobs) as value => value,
+                                    };
+                                    let entry = match job {
+                                        Some(value) => value,
+                                        None => break,
+                                    };
+                                    if child.error().is_some() {
+                                        break;
+                                    }
+                                    match callback(entry, child) {
+                                        Ok(()) => {
+                                            completed += 1;
+                                        },
+                                        Err(error) => {
+                                            failures.send(error);
+                                            cancel.cancel();
+                                            break;
+                                        },
+                                    }
+                                }
+                                completed
+                            },
+                        ),
+                    );
+                }
+                let mut walk_error = Option::None;
+                while let Some(result) = walker.next(child) {
+                    match result {
+                        Ok(entry) => {
+                            let sent = select {
+                                recv(child.done()) as _ => false,
+                                send(jobs, entry) => true,
+                            };
+                            if !sent {
+                                break;
+                            }
+                        },
+                        Err(error) => {
+                            walk_error = Option::Some(error);
+                            cancel.cancel();
+                            break;
+                        },
+                    }
+                }
+                walker.close();
+                jobs.close();
+                let mut completed = 0;
+                for job in tasks {
+                    completed += job.join();
+                }
+                let callback_error = select {
+                    recv(failures) as value => value,
+                    default => Option::None,
+                };
+                if let Some(error) = callback_error {
+                    return Result::Err(error)
+                }
+                if let Some(error) = walk_error {
+                    return Result::Err(error)
+                }
+                if child.error().is_some() {
+                    return Result::Err(cancelled(child))
+                }
+                Result::Ok(completed)
+            },
+        ),
+    )
+}

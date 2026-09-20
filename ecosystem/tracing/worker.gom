@@ -1,0 +1,317 @@
+package tracing;
+
+use std::context;
+use std::task;
+use std::resource;
+
+struct State {
+    metrics: Metrics,
+    next_id: u64,
+    next_root: u64,
+    next_sequence: u64,
+    filter: Filter,
+    sampling: Sampling,
+}
+
+enum Command {
+    Record(Record),
+    Flush(Channel[Result[(), Error]]),
+    Close,
+}
+
+pub struct Tracer {
+    gate: Channel[()],
+    state: Ref[State],
+    queue: Channel[Command],
+    done: Channel[()],
+    failure: Channel[Option[Error]],
+    overflow: Overflow,
+}
+
+fn context_error(error: context::Error) -> Error {
+    match error {
+        Cancelled => Error { kind: ErrorKind::Cancelled, message: "tracing operation cancelled" },
+        DeadlineExceeded => Error {
+            kind: ErrorKind::DeadlineExceeded,
+            message: "tracing deadline exceeded",
+        },
+    }
+}
+
+fn cancelled(ctx: context::Context) -> Error {
+    context_error(ctx.error().unwrap_or(context::Error::Cancelled))
+}
+
+fn closed() -> Error {
+    Error { kind: ErrorKind::Closed, message: "tracer or span is closed" }
+}
+
+impl Tracer {
+    pub fn new(scope: task::Scope, sink: Sink, options: Options) -> Result[Tracer, Error] {
+        if scope.token().is_cancelled() {
+            return Result::Err(
+                Error { kind: ErrorKind::Cancelled, message: "worker scope already cancelled" },
+            )
+        }
+        if options.capacity < 1 || options.capacity > 1048576 {
+            return Result::Err(
+                Error {
+                    kind: ErrorKind::InvalidInput,
+                    message: "queue capacity must be between 1 and 1048576",
+                },
+            )
+        }
+        if options.sampling == Sampling::Every(0) {
+            return Result::Err(
+                Error { kind: ErrorKind::InvalidInput, message: "sampling period must be positive" },
+            )
+        }
+        let gate = Channel::new(1);
+        gate.send(());
+        let failure = Channel::new(1);
+        failure.send(Option::None);
+        let tracer = Tracer {
+            gate,
+            state: Ref::new(
+                State {
+                    metrics: Metrics {
+                        accepted: 0,
+                        dropped: 0,
+                        filtered: 0,
+                        live_spans: 0,
+                        closing: false,
+                    },
+                    next_id: 1,
+                    next_root: 1,
+                    next_sequence: 1,
+                    filter: options.filter,
+                    sampling: options.sampling,
+                },
+            ),
+            queue: Channel::new(options.capacity),
+            done: Channel::new(0),
+            failure,
+            overflow: options.overflow,
+        };
+        if scope.try_spawn(|token| worker(tracer, sink, token)).is_none() {
+            return Result::Err(
+                Error { kind: ErrorKind::Cancelled, message: "worker scope already cancelled" },
+            )
+        }
+        Result::Ok(tracer)
+    }
+
+    fn lock(self: Tracer, ctx: context::Context) -> Result[(), Error] {
+        ctx.check().map_err(|error| context_error(error))?;
+        select {
+            recv(ctx.done()) as _ => Result::Err(cancelled(ctx)),
+            recv(self.gate) as _ => {
+                if let Err(error) = ctx.check() {
+                    self.gate.send(());
+                    Result::Err(context_error(error))
+                } else {
+                    Result::Ok(())
+                }
+            },
+        }
+    }
+
+    pub fn error(self: Tracer) -> Option[Error] {
+        let error = self.failure.recv().unwrap_or(Option::None);
+        self.failure.send(error);
+        error
+    }
+
+    fn remember(self: Tracer, result: Result[(), Error]) -> () {
+        if let Err(error) = result {
+            let current = self.failure.recv().unwrap_or(Option::None);
+            self.failure.send(
+                if current.is_none() {
+                    Option::Some(error)
+                } else {
+                    current
+                },
+            );
+        }
+    }
+
+    fn outcome(self: Tracer) -> Result[(), Error] {
+        match self.error() {
+            Some(error) => Result::Err(error),
+            None => Result::Ok(()),
+        }
+    }
+
+    fn check_open(self: Tracer) -> Result[(), Error] {
+        self.outcome()?;
+        if self.state.get().metrics.closing {
+            return Result::Err(closed())
+        }
+        select {
+            recv(self.done) as _ => Result::Err(closed()),
+            default => Result::Ok(()),
+        }
+    }
+
+    fn enqueue(self: Tracer, ctx: context::Context, command: Command) -> Result[(), Error] {
+        ctx.check().map_err(|error| context_error(error))?;
+        select {
+            recv(ctx.done()) as _ => Result::Err(cancelled(ctx)),
+            recv(self.done) as _ => {
+                self.outcome()?;
+                Result::Err(closed())
+            },
+            send(self.queue, command) => Result::Ok(()),
+        }
+    }
+
+    fn publish(self: Tracer, ctx: context::Context, record: Record, reliable: bool) -> Result[
+        Delivery,
+        Error,
+    ] {
+        let mut state = self.state.get();
+        if state.next_sequence == 18446744073709551615 {
+            return Result::Err(
+                Error { kind: ErrorKind::Exhausted, message: "record sequence exhausted" },
+            )
+        }
+        let record = Record { sequence: state.next_sequence, ..record };
+        if !reliable && self.overflow == Overflow::DropNewest {
+            ctx.check().map_err(|error| context_error(error))?;
+            let accepted = select {
+                send(self.queue, Command::Record(record)) => true,
+                default => false,
+            };
+            if !accepted {
+                state.metrics.dropped += 1;
+                self.state.set(state);
+                return Result::Ok(Delivery::Dropped)
+            }
+        } else {
+            self.enqueue(ctx, Command::Record(record))?;
+        }
+        state.next_sequence += 1;
+        state.metrics.accepted += 1;
+        self.state.set(state);
+        Result::Ok(Delivery::Accepted)
+    }
+
+    fn filtered(self: Tracer) -> Delivery {
+        let mut state = self.state.get();
+        state.metrics.filtered += 1;
+        self.state.set(state);
+        Delivery::Filtered
+    }
+
+    pub fn metrics(self: Tracer, ctx: context::Context) -> Result[Metrics, Error] {
+        self.lock(ctx)?;
+        defer self.gate.send(());
+        Result::Ok(self.state.get().metrics)
+    }
+
+    pub fn reload_filter(self: Tracer, ctx: context::Context, filter: Filter) -> Result[(), Error] {
+        self.lock(ctx)?;
+        defer self.gate.send(());
+        self.check_open()?;
+        let mut state = self.state.get();
+        state.filter = filter;
+        self.state.set(state);
+        Result::Ok(())
+    }
+
+    pub fn enabled(self: Tracer, ctx: context::Context, metadata: Metadata) -> Result[bool, Error] {
+        self.lock(ctx)?;
+        defer self.gate.send(());
+        self.check_open()?;
+        Result::Ok(self.state.get().filter.enabled(metadata))
+    }
+
+    fn wait_closed(self: Tracer, ctx: context::Context) -> Result[(), Error] {
+        ctx.check().map_err(|error| context_error(error))?;
+        select {
+            recv(ctx.done()) as _ => Result::Err(cancelled(ctx)),
+            recv(self.done) as _ => self.outcome(),
+        }
+    }
+
+    pub fn flush(self: Tracer, ctx: context::Context) -> Result[(), Error] {
+        self.lock(ctx)?;
+        let reply = Channel::new(1);
+        let closing = self.state.get().metrics.closing;
+        let queued = if closing {
+            Result::Ok(())
+        } else {
+            self.enqueue(ctx, Command::Flush(reply))
+        };
+        self.gate.send(());
+        queued?;
+        if closing {
+            return self.wait_closed(ctx)
+        }
+        select {
+            recv(reply) as result => result.unwrap_or(Result::Err(closed())),
+            recv(self.done) as _ => self.outcome(),
+            recv(ctx.done()) as _ => Result::Err(cancelled(ctx)),
+        }
+    }
+
+    pub fn in_scope[T, E](self: Tracer, ctx: context::Context, body: (Tracer) -> Result[T, E]) -> Result[
+        T,
+        resource::ScopeError[E, Error],
+    ] {
+        resource::with_cleanup(|| body(self), || self.close(ctx))
+    }
+
+    pub fn close(self: Tracer, ctx: context::Context) -> Result[(), Error] {
+        self.lock(ctx)?;
+        let mut state = self.state.get();
+        let queued = if state.metrics.closing {
+            Result::Ok(())
+        } else {
+            let result = self.enqueue(ctx, Command::Close);
+            if result.is_ok() {
+                state.metrics.closing = true;
+                self.state.set(state);
+            }
+            result
+        };
+        self.gate.send(());
+        queued?;
+        self.wait_closed(ctx)
+    }
+}
+
+fn worker(tracer: Tracer, sink: Sink, token: task::CancelToken) -> () {
+    loop {
+        let command = select {
+            recv(token.done()) as _ => Option::None,
+            recv(tracer.queue) as command => command,
+        };
+        match command {
+            Some(Command::Record(record)) => {
+                if tracer.error().is_none() {
+                    tracer.remember((sink.write)(record));
+                }
+            },
+            Some(Command::Flush(reply)) => {
+                tracer.remember((sink.flush)());
+                reply.send(tracer.outcome());
+            },
+            Some(Command::Close) => break,
+            None => {
+                tracer.remember(
+                    Result::Err(
+                        Error {
+                            kind: ErrorKind::Cancelled,
+                            message: "tracing worker scope cancelled",
+                        },
+                    ),
+                );
+                break
+            },
+        }
+    }
+    tracer.remember((sink.flush)());
+    tracer.remember((sink.finish)());
+    tracer.done.close();
+}

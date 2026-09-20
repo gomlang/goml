@@ -10,7 +10,7 @@ of feature parity with every mature library in that category.
 | --- | --- |
 | proptest | Lazy shrinking with shared work limits, structured pass/fail/discard reports, classification and coverage, persistent regression seeds, unique collections, model-valid command sequences and full-width numeric edge cases |
 | redis | Injectable duplex transports and dialing with a shared setup/operation deadline, adapter validation and failure cleanup |
-| lsp | Deferred request acceptance/completion, cooperative cancellation, deadline polling and pending-request cleanup on exit |
+| lsp | Deferred request acceptance/completion, cooperative cancellation, deadline polling, pending-request cleanup on exit and persistent rope document snapshots |
 | cli | Argument/command aliases, inherited global options, cardinality-constrained argument groups and derive support for option aliases/globals |
 | diff | Explicit linear-space Hirschberg algorithm for sequences, text and patches, with work/workspace limits |
 | parser | Shared text/binary work and depth limits, contextual custom parsers, iterative alternatives and binary backtracking/lookahead primitives |
@@ -25,7 +25,7 @@ is intentionally deferred.
 | --- | --- |
 | proptest | Distribution histograms and richer report formatting, failure aggregation, application-oriented state-machine execution helpers; custom callbacks remain responsible for their own bounded work |
 | redis | Bundled DNS/TLS adapters, connection pools and health/reconnection policies, Cluster/Sentinel, typed Streams commands and sharded subscriptions; no automatic retry of ambiguous writes |
-| lsp | Position-encoding negotiation, broader typed feature models (completion, code actions, workspace edits and semantic tokens), outgoing deadline scheduling and more efficient document storage |
+| lsp | Position-encoding negotiation, broader typed feature models (completion, code actions, workspace edits and semantic tokens) and outgoing deadline scheduling |
 | cli | Nested/flattened argument derives, derived subcommands, shell completion, defaults/environment for flags and counters |
 | diff | Multi-file and Git metadata support, three-way merge, offset/fuzzy application; the linear-space algorithm is explicitly selected and has O(NM) worst-case time |
 | parser | Recovery with multiple diagnostics, token-stream and incremental text parsing, further binary/text combinator parity; grammar left recursion still requires rewriting |
@@ -36,12 +36,22 @@ is intentionally deferred.
 | ndarray | Masked selection/scatter, sorting/quantiles, NPY interchange, SVD/eigen and rank-deficient solve support |
 | msgpack | Reader/writer integration and incremental field processing, reduced copying and richer typed extension support |
 | graph | Flow/matching algorithms, serialization and configurable cost types |
-| goml_stats | Gitignore/glob semantics, manifest-based canonical identities, declaration counts and historical comparisons |
+| goml_stats | Manifest-based canonical identities, declaration counts and historical comparisons; hierarchical Git ignore rules are provided by the ignore dependency |
 | bitflags | Associated-constant or operator syntax depends on language support; Serde wrappers support explicit or format-sensitive representations; arbitrary declaration expressions and generic storage newtypes are not generated |
 | logos | Compile-time derive/DFA generation, streaming/byte input, named subpatterns and broader Unicode regex properties; current runtime NFA reports equal-priority ambiguity during matching |
 | tempfile | Platforms beyond Linux amd64, cancellation-aware file operations, crash-durable persistence helpers; cleanup assumes no hostile concurrent filesystem changes |
 | reqwest | Streaming requests/responses, HTTP/3, WebSocket, full domain-cookie policy, custom DNS, application retries and middleware; the synchronous API buffers within explicit limits |
 | llvm | JIT execution, cross-target configuration, debug metadata, atomics, exception handling and broader LLVM instruction/API coverage; the initial binding targets LLVM 18 and native object generation |
+| incremental | Parallel branch evaluation, immutable database snapshots, persistent caches, durability classes and cycle fixed-point recovery; current root operations serialize and callbacks use scoped Evaluation handles |
+| rope | Grapheme and reverse iterators, search, editing history, optional Unicode newline policies and memory-mapped backing; current storage is persistent UTF-8 with LF/CRLF/CR line semantics |
+| web | TLS listeners, HTTP/2 and HTTP/3, WebSocket, multipart extraction, static files, compression and bundled CORS middleware; current adapter serves HTTP/1.1 with streaming and SSE |
+| bigint | Faster multiplication/division for very large operands, primality and modular inverses, roots and rational arithmetic; ordinary arithmetic allocates proportionally to results while input/shift/power operations have explicit budgets |
+| tracing | Distributed trace propagation, OpenTelemetry exporters, richer sampling, byte-budget admission and instrumentation syntax; contexts are explicit and arbitrary sink callbacks must cooperate with shutdown |
+| datetime | Arbitrary-pattern parsing, localization, recurrence scheduling and automatic timezone-data updates; dates cover Gregorian years 1–9999 and timestamps use POSIX seconds without leap records |
+| decimal | Roots and transcendental functions, locale formatting, binary-float conversion and special-value/trap models; current finite arithmetic has explicit 4,096-digit coefficient/precision and scale bounds |
+| cache | Frequency-based admission, sharding and indexed/background expiry; current exact LRU uses O(n) expiry scans when timed entries exist, and synchronous loaders cooperate with cancellation |
+| ignore | Combined multi-pattern automata, tracked-file/index-aware selection, configurable file-type groups and additional platforms; current matching is byte-oriented with explicit work budgets and traversal targets Linux amd64 |
+| syntax | Incremental parsing/reparse orchestration, syntax pointers stable across revisions, multi-edit transactions and weak-reference interning; current library provides immutable lossless trees and checked persistent edits |
 
 Further work should preserve resource bounds, recoverable errors, normal
 versioned dependency consumption and the independent reference checks already
