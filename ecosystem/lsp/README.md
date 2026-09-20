@@ -251,8 +251,14 @@ A consumer test independently counts scalar byte/UTF-16/UTF-32 boundaries across
 positions. Deferred dispatch, outgoing deadlines, cancellation and duplicate
 suppression have direct native tests.
 
-A separate GoML test builds and starts the real stdio consumer with
-`std::process`, checks 102 correlated framed replies (decoding output one byte at
-a time), Unicode payloads and shutdown. Additional subprocesses verify premature
-exit, clean EOF, truncated bodies and invalid framing. Every subprocess has a
-deadline. This is targeted protocol coverage, not full LSP certification.
+Native GoML tests start the real stdio consumer and independently decode
+Content-Length/CRLF frames, JSON-RPC versions and response envelopes. They retain
+102 correlated bulk replies and four failure exits. Bidirectional pipe sessions
+exercise fragmented requests, protocol errors, initialization and shutdown,
+78 multilingual documents across the default and negotiated UTF-8/UTF-16/UTF-32
+encodings, invalid positions, clamping, sequential edits and transactional
+rollback. They also cover outgoing zero, early and late deadlines, explicit
+polling, cancellation, duplicate replies and cleanup with an outstanding request.
+Pipe reads, writes and process cleanup have deadlines; stderr must match the
+deliberately triggered diagnostics exactly, and successful exit permits no extra
+stdout. This is targeted protocol coverage, not full LSP certification.

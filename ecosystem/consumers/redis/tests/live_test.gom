@@ -1,0 +1,135 @@
+package tests;
+
+use consumer::redis as app;
+use std::bytes;
+use std::env;
+use std::fs;
+use std::net;
+use std::process;
+use std::task;
+use std::testing;
+use std::time;
+use std::utf8;
+use utf8::BytesUtf8;
+
+fn reference_command(program: string, arguments: Vec[string], timeout: i64) -> process::Output {
+    let result = testing::expect_ok(
+        process::Command::new(program).args(arguments).output_timeout_structured(
+            time::Duration::from_seconds(timeout),
+        ),
+        program,
+    );
+    if !result.status().success() {
+        testing::fail(
+            program + ": " + testing::expect_ok(result.stderr().to_string_utf8(), "stderr"),
+        );
+    }
+    result
+}
+
+#[test]
+fn authenticated_redis_725_command_families_resp2_and_resp3() -> () {
+    let directory = testing::expect_ok(fs::canonicalize("../.."), "ecosystem")
+        + "/_artifact/reference";
+    testing::assert_ok(fs::create_dir_all(directory));
+    let archive = directory + "/redis-7.2.5-github.tar.gz";
+    let checksum = "98a8502a2e902d2a9785ef46a69a5f8d5e24cbf9ea3ae4d845afcfc6778aa783";
+    if !fs::is_file(archive) {
+        let _ = reference_command(
+            "curl",
+            Vec::from_array(
+                [
+                    "--fail",
+                    "--location",
+                    "--max-time",
+                    "60",
+                    "--output",
+                    archive,
+                    "https://codeload.github.com/redis/redis/tar.gz/refs/tags/7.2.5",
+                ],
+            ),
+            70,
+        );
+    }
+    testing::assert_eq(testing::expect_ok(fs::sha256_file(archive), "Redis archive hash"), checksum);
+    let source = directory + "/redis-7.2.5";
+    let binary = source + "/src/redis-server";
+    if !fs::is_file(binary) {
+        let _ = reference_command("tar", Vec::from_array(["-xzf", archive, "-C", directory]), 30);
+        let _ = reference_command(
+            "make",
+            Vec::from_array(
+                [
+                    "-j2",
+                    "-C",
+                    source + "/src",
+                    "MALLOC=libc",
+                    "REDIS_CFLAGS=",
+                    "REDIS_LDFLAGS=",
+                    "redis-server",
+                ],
+            ),
+            240,
+        );
+    }
+    let version = reference_command(binary, Vec::from_array(["--version"]), 5);
+    testing::assert(
+        testing::expect_ok(version.stdout().to_string_utf8(), "version").contains("v=7.2.5 "),
+    );
+    let reservation = testing::expect_ok(
+        net::TcpListener::bind(testing::expect_ok(net::SocketAddr::parse("127.0.0.1:0"), "address")),
+        "reserve port",
+    );
+    let address = testing::expect_ok(reservation.local_addr(), "port");
+    testing::assert_ok(reservation.close());
+    let parts = address.to_string().split(":");
+    let password = "ecosystem-reference-only";
+    task::scope(
+        |scope| {
+            let server = scope.spawn(
+                |_| process::Command::new(binary).args(
+                    Vec::from_array(
+                        [
+                            "--bind",
+                            "127.0.0.1",
+                            "--port",
+                            parts[parts.len() - 1],
+                            "--save",
+                            "",
+                            "--appendonly",
+                            "no",
+                            "--protected-mode",
+                            "yes",
+                            "--daemonize",
+                            "no",
+                            "--dir",
+                            directory,
+                            "--requirepass",
+                            password,
+                        ],
+                    ),
+                ).output_cancel_structured(scope.token()),
+            );
+            defer scope.cancel();
+            let mut ready = false;
+            for _ in 0..200 {
+                if let Ok(stream) = net::TcpStream::connect_with(
+                    address,
+                    net::WaitOptions::new().with_timeout(time::Duration::from_milliseconds(50)),
+                ) {
+                    testing::assert_ok(stream.close());
+                    ready = true;
+                    break;
+                }
+                time::sleep(time::Duration::from_milliseconds(20));
+            }
+            testing::assert(ready);
+            for version in Vec::from_array(["2", "3"]) {
+                app::live(address.to_string(), version, password);
+            }
+            scope.cancel();
+            let result = server.join();
+            testing::assert_err(result);
+        },
+    );
+}

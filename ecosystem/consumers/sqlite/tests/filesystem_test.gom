@@ -1,0 +1,123 @@
+package tests;
+
+use ecosystem::sqlite::{Database, Executor, Params, Row, TransactionMode};
+use std::bytes;
+use std::fs;
+use std::process;
+use std::testing;
+use std::time;
+use std::utf8;
+use utf8::BytesUtf8;
+
+fn native_sqlite_command(program: string, arguments: Vec[string]) -> string {
+    let output = testing::expect_ok(
+        process::Command::new(program).args(arguments).output_timeout_structured(
+            time::Duration::from_seconds(30),
+        ),
+        "independent SQLite process",
+    );
+    if !output.status().success() {
+        testing::fail(testing::expect_ok(output.stderr().to_string_utf8(), "native SQLite error"));
+    }
+    testing::expect_ok(output.stdout().to_string_utf8(), "native SQLite output")
+}
+
+#[test]
+fn independent_database_file_read_write_rollback_and_readonly_reopen() -> () {
+    let directory = "_artifact/file-reference";
+    testing::assert_ok(fs::create_dir_all(directory));
+    defer {
+        testing::assert_ok(fs::remove_dir_all(directory));
+    };
+    let path = directory + "/shared.sqlite";
+    testing::assert_ok(fs::copy("tests/data/reference.sqlite", path));
+    let database = testing::expect_ok(Database::open(path), "open independent SQLite file");
+    defer {
+        testing::assert_ok(database.close());
+    };
+    let row: Row = testing::expect_ok(
+        database.query_one("SELECT id,value,name FROM shared", Params::empty()),
+        "independent row",
+    );
+    let id: i64 = testing::expect_ok(row.get(0), "id");
+    let value: bytes::Bytes = testing::expect_ok(row.get(1), "blob");
+    let name: string = testing::expect_ok(row.get(2), "name");
+    testing::assert_eq(id, 1);
+    let expected: Vec[u8] = Vec::from_array([0, 255, 128]);
+    testing::assert(value.to_vec() == expected);
+    testing::assert_eq(name, "Independent 中😀");
+    testing::assert_ok(
+        database.execute("INSERT INTO shared VALUES(2,x'0100ff','GoML é')", Params::empty()),
+    );
+    let transaction = testing::expect_ok(database.begin(TransactionMode::Immediate), "transaction");
+    testing::assert_ok(
+        transaction.execute(
+            "INSERT INTO shared VALUES(99,x'01','rolled back on close')",
+            Params::empty(),
+        ),
+    );
+    testing::assert_ok(database.close());
+    let absolute = testing::expect_ok(fs::canonicalize(path), "file path");
+    let reference = directory + "/sqlite-reference";
+    let _ = native_sqlite_command(
+        "cc",
+        Vec::from_array(
+            [
+                "-O2",
+                "-Wall",
+                "-Wextra",
+                "tests/data/sqlite_reference.c",
+                "-Wl,-l:libsqlite3.so.0",
+                "-o",
+                reference,
+            ],
+        ),
+    );
+    testing::assert_eq(
+        native_sqlite_command(
+            reference,
+            Vec::from_array([absolute, "SELECT id,hex(value),name FROM shared ORDER BY id"]),
+        ),
+        "1\t00FF80\tIndependent 中😀\n2\t0100FF\tGoML é\n",
+    );
+    testing::assert_eq(
+        native_sqlite_command(
+            reference,
+            Vec::from_array(
+                [absolute, "INSERT INTO shared VALUES(3,x'6e6174697665006279746573','SQLite é')"],
+            ),
+        ),
+        "",
+    );
+    let readonly = testing::expect_ok(
+        Database::open("file:" + absolute + "?mode=ro"),
+        "reopen read only",
+    );
+    defer {
+        testing::assert_ok(readonly.close());
+    };
+    let rows: Vec[Row] = testing::expect_ok(
+        readonly.query_all("SELECT id,hex(value),name FROM shared ORDER BY id", Params::empty(), 10),
+        "reopened rows",
+    );
+    testing::assert_eq(rows.len(), 3);
+    let id: i64 = testing::expect_ok(rows[1].get(0), "persisted id");
+    let value: string = testing::expect_ok(rows[1].get(1), "persisted bytes");
+    let name: string = testing::expect_ok(rows[1].get(2), "persisted text");
+    testing::assert_eq(id, 2);
+    testing::assert_eq(value, "0100FF");
+    testing::assert_eq(name, "GoML é");
+    let id: i64 = testing::expect_ok(rows[2].get(0), "independent writer id");
+    let value: string = testing::expect_ok(rows[2].get(1), "independent writer bytes");
+    let name: string = testing::expect_ok(rows[2].get(2), "independent writer text");
+    testing::assert_eq(id, 3);
+    testing::assert_eq(value, "6E6174697665006279746573");
+    testing::assert_eq(name, "SQLite é");
+    testing::assert_eq(
+        testing::expect_err(
+            readonly.execute("DELETE FROM shared", Params::empty()),
+            "readonly protection",
+        ).code,
+        8,
+    );
+}

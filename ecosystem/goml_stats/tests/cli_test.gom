@@ -1,0 +1,503 @@
+package tests;
+
+use ecosystem::verification::reference as ref;
+use std::bytes;
+use std::crypto::hash;
+use std::crypto::rand;
+use std::env;
+use std::fs;
+use std::json;
+use std::path;
+use std::process;
+use std::testing;
+use std::text;
+use std::time;
+use std::utf8;
+use utf8::BytesUtf8;
+
+fn cli_root() -> string {
+    let suffix = hash::sha256(testing::expect_ok(rand::bytes(24), "random fixture path"));
+    let root = testing::expect_ok(
+        path::absolute_structured("_artifact/cli-tests/" + suffix),
+        "absolute fixture path",
+    );
+    testing::assert_ok(fs::create_dir_all(root));
+    root
+}
+
+fn write(root: string, name: string, content: string) -> () {
+    let destination = path::join(root, name);
+    testing::assert_ok(fs::create_dir_all(path::parent(destination).unwrap_or(root)));
+    testing::assert_ok(fs::write_file_structured(destination, content));
+}
+
+fn invoke(root: string, arguments: Vec[string], expected: isize) -> string {
+    let binary = testing::expect_ok(
+        path::absolute_structured(
+            env::var_structured("GOML_VERIFY_BINARY").unwrap_or(
+                "_artifact/bin/cmd/goml_stats/goml_stats",
+            ),
+        ),
+        "CLI executable",
+    );
+    let result = testing::expect_ok(
+        process::Command::new(binary).args(arguments).current_dir(root).output_timeout_structured(
+            time::Duration::from_seconds(15),
+        ),
+        "execute goml_stats",
+    );
+    let stdout = testing::expect_ok(result.stdout().to_string_utf8(), "CLI stdout UTF-8");
+    let stderr = testing::expect_ok(result.stderr().to_string_utf8(), "CLI stderr UTF-8");
+    if result.status().code().unwrap_or(-1) != expected {
+        testing::fail("unexpected CLI status: " + stdout + stderr);
+    }
+    if expected == 0 {
+        assert_same(stderr, "");
+        stdout
+    } else {
+        assert_same(stdout, "");
+        testing::assert(stderr.contains("goml_stats:"));
+        stderr
+    }
+}
+
+fn report(root: string, flags: Vec[string], target: string) -> json::Value {
+    let args = Vec::from_array(["--json", "--files"]);
+    args.extend(flags);
+    args.push(target);
+    testing::expect_ok(json::parse(invoke(root, args, 0)), "CLI JSON")
+}
+
+fn counts(source: string, code: isize, comments: isize, blank: isize, test: bool) -> Vec[isize] {
+    Vec::from_array(
+        [
+            1,
+            if test {
+                1
+            } else {
+                0
+            },
+            code + comments + blank,
+            code,
+            comments,
+            blank,
+            source.byte_len(),
+        ],
+    )
+}
+
+fn count_values(value: json::Value) -> Vec[isize] {
+    let result = Vec::new();
+    for name in Vec::from_array(
+        ["files", "test_files", "lines", "code", "comments", "blank", "bytes"],
+    ) {
+        result.push(ref::integer(ref::field(value, name)));
+    }
+    result
+}
+
+fn assert_same[T: PartialEq](actual: T, expected: T) -> () {
+    testing::assert(actual == expected)
+}
+
+fn simple_sources(names: Vec[string]) -> Vec[(string, Vec[isize])] {
+    let result = Vec::new();
+    for name in names {
+        result.push((name, counts("code\n", 1, 0, 0, false)));
+    }
+    result
+}
+
+fn add_counts(total: Vec[isize], item: Vec[isize]) -> () {
+    for index in 0..total.len() {
+        total[index] += item[index];
+    }
+}
+
+fn empty_counts() -> Vec[isize] {
+    Vec::from_array([0, 0, 0, 0, 0, 0, 0])
+}
+
+fn check_report(value: json::Value, expected: Vec[(string, Vec[isize])]) -> () {
+    let wanted = expected.copy();
+    wanted.sort_by(
+        |left, right| if left.0 < right.0 {
+            -1
+        } else if left.0 > right.0 {
+            1
+        } else {
+            0
+        },
+    );
+    let actual = ref::array(ref::field(value, "files"));
+    assert_same(actual.len(), wanted.len());
+    let total = empty_counts();
+    let packages = HashMap::new();
+    for index in 0..wanted.len() {
+        let (name, numbers) = wanted[index];
+        assert_same(ref::text(ref::field(actual[index], "path")), name);
+        assert_same(count_values(ref::field(actual[index], "counts")), numbers);
+        add_counts(total, numbers);
+        let parent = path::parent(name).unwrap_or(".");
+        let parent = if parent == "" {
+            "."
+        } else {
+            parent
+        };
+        let group = packages.get(parent).unwrap_or_else(|| empty_counts());
+        add_counts(group, numbers);
+        packages.insert(parent, group);
+    }
+    assert_same(count_values(ref::field(value, "totals")), total);
+    assert_same(ref::integer(ref::field(value, "package_count")), packages.len());
+    for group in ref::array(ref::field(value, "packages")) {
+        assert_same(
+            count_values(ref::field(group, "counts")),
+            testing::expect_some(
+                packages.get(ref::text(ref::field(group, "path"))),
+                "package summary",
+            ),
+        );
+    }
+    let assigned = count_values(ref::field(value, "unassigned"));
+    for group in ref::array(ref::field(value, "modules")) {
+        add_counts(assigned, count_values(ref::field(group, "counts")));
+    }
+    assert_same(assigned, total);
+}
+
+fn select(expected: Vec[(string, Vec[isize])], removed: Vec[string]) -> Vec[(string, Vec[isize])] {
+    let result = Vec::new();
+    for entry in expected {
+        if !removed.contains(entry.0) {
+            result.push(entry);
+        }
+    }
+    result
+}
+
+#[test]
+fn project_cli_counts_grouping_exclusions_and_errors() -> () {
+    let root = cli_root();
+    let sources = Vec::from_array(
+        [
+            ("main.gom", "package main;\n\n// docs\nfn main() -> () {}\n", 2, 1, 1, false),
+            ("src/core.gom", "let url = \"https://example.invalid\"; // inline\n", 1, 0, 0, false),
+            ("src/core_test.gom", "// test\r\n\r\nfn check() -> () {}", 1, 1, 1, true),
+            ("tests/api.gom", "fn test() -> () {}\n", 1, 0, 0, true),
+            (
+                "vendor/nested/lib.gom",
+                "let s = br#\"first\n// literal\n\nlast\"#;\n// outside",
+                4,
+                1,
+                0,
+                false,
+            ),
+            ("empty.gom", "", 0, 0, 0, false),
+            ("unicode/中文 \"name\".gom", "let s = \"😀\";\r// 中文\r", 1, 1, 0, false),
+        ],
+    );
+    let expected = Vec::new();
+    for (name, source, code, comments, blank, test) in sources {
+        write(root, name, source);
+        expected.push((name, counts(source, code, comments, blank, test)));
+    }
+    for name in Vec::from_array(["goml.toml", "vendor/nested/goml.toml", "empty_module/goml.toml"]) {
+        write(root, name, "[module]\npath = \"fixture\"\n");
+    }
+    let defaults = Vec::from_array(
+        [
+            ".git",
+            ".hg",
+            ".svn",
+            ".goml",
+            "_artifact",
+            "_bootstrap",
+            "stage0",
+            "stage1",
+            "stage2",
+            "stage3",
+            "node_modules",
+            "__pycache__",
+            "src/_artifact",
+        ],
+    );
+    for name in defaults {
+        write(root, name + "/ignored.gom", "ignored\n");
+    }
+    write(root, "README.md", "ignored\n");
+    write(root, "generated.go", "ignored\n");
+    testing::assert_ok(
+        fs::symbolic_link(path::join(root, "main.gom"), path::join(root, "link.gom")),
+    );
+    testing::assert_ok(fs::symbolic_link(root, path::join(root, "loop")));
+    testing::assert_ok(
+        fs::symbolic_link(path::join(root, "missing"), path::join(root, "dangling.gom")),
+    );
+    let fifo = testing::expect_ok(
+        process::Command::new("mkfifo").arg(path::join(root, "pipe.gom")).output_timeout_structured(
+            time::Duration::from_seconds(5),
+        ),
+        "create FIFO",
+    );
+    testing::assert(fifo.status().success());
+    let original = report(root, Vec::new(), root);
+    check_report(original, expected);
+    assert_same(ref::integer(ref::field(original, "schema_version")), 1);
+    assert_same(ref::text(ref::field(original, "root")), root);
+    assert_same(ref::integer(ref::field(original, "module_count")), 3);
+    for group in ref::array(ref::field(original, "modules")) {
+        let name = ref::text(ref::field(group, "path"));
+        if name == "empty_module" {
+            assert_same(count_values(ref::field(group, "counts")), empty_counts());
+        }
+        if name == "vendor/nested" {
+            assert_same(count_values(ref::field(group, "counts")), expected[4].1);
+        }
+    }
+    for file in ref::array(ref::field(original, "files")) {
+        assert_same(
+            ref::text(ref::field(file, "module")),
+            if ref::text(ref::field(file, "path")).starts_with("vendor/nested/") {
+                "vendor/nested"
+            } else {
+                "."
+            },
+        );
+    }
+    ref::assert_equal(report(root, Vec::new(), root), original, "repeat scan");
+    ref::assert_equal(report(root, Vec::new(), "."), original, "relative root");
+    ref::assert_equal(
+        testing::expect_ok(
+            json::parse(invoke(root, Vec::from_array(["--json", "--files"]), 0)),
+            "default root",
+        ),
+        original,
+        "default root",
+    );
+    for (flags, removed) in Vec::from_array(
+        [
+            (
+                Vec::from_array(["--exclude", "src"]),
+                Vec::from_array(["src/core.gom", "src/core_test.gom"]),
+            ),
+            (Vec::from_array(["--exclude=core.gom"]), Vec::from_array(["src/core.gom"])),
+            (
+                Vec::from_array(["--exclude", "vendor/nested/"]),
+                Vec::from_array(["vendor/nested/lib.gom"]),
+            ),
+            (
+                Vec::from_array(["--exclude", "src/core.gom", "--exclude", "tests"]),
+                Vec::from_array(["src/core.gom", "tests/api.gom"]),
+            ),
+            (Vec::from_array(["--exclude", "missing"]), Vec::new()),
+        ],
+    ) {
+        check_report(report(root, flags, root), select(expected, removed));
+    }
+    assert_same(
+        ref::integer(
+            ref::field(
+                report(root, Vec::from_array(["--exclude", "vendor/nested"]), root),
+                "module_count",
+            ),
+        ),
+        2,
+    );
+    let unassigned = report(root, Vec::from_array(["--exclude", "goml.toml"]), root);
+    check_report(unassigned, expected);
+    assert_same(ref::integer(ref::field(unassigned, "module_count")), 0);
+    assert_same(
+        count_values(ref::field(unassigned, "unassigned")),
+        count_values(ref::field(original, "totals")),
+    );
+    for file in ref::array(ref::field(unassigned, "files")) {
+        assert_same(json::encode(ref::field(file, "module")), "null");
+    }
+    let all = expected.copy();
+    for name in defaults {
+        all.push((name + "/ignored.gom", counts("ignored\n", 1, 0, 0, false)));
+    }
+    check_report(report(root, Vec::from_array(["--no-default-excludes"]), root), all);
+    check_report(
+        report(root, Vec::from_array(["--no-default-excludes", "--exclude", "stage2"]), root),
+        select(all, Vec::from_array(["stage2/ignored.gom"])),
+    );
+    check_report(
+        report(root, Vec::new(), path::join(root, "_artifact")),
+        Vec::from_array([("ignored.gom", counts("ignored\n", 1, 0, 0, false))]),
+    );
+    for index in Vec::from_array([0, 5, 3]) {
+        let (name, numbers) = expected[index];
+        let single = report(root, Vec::new(), path::join(root, name));
+        check_report(single, Vec::from_array([(path::file_name(name).unwrap_or(name), numbers)]));
+        assert_same(ref::integer(ref::field(single, "module_count")), 0);
+    }
+    testing::assert_ok(fs::create_dir(path::join(root, "empty_directory")));
+    check_report(report(root, Vec::new(), path::join(root, "empty_directory")), Vec::new());
+    write(root, "-dash.gom", "x\n");
+    check_report(
+        report(root, Vec::from_array(["--"]), "-dash.gom"),
+        Vec::from_array([("-dash.gom", counts("x\n", 1, 0, 0, false))]),
+    );
+    testing::assert_ok(fs::remove_file(path::join(root, "-dash.gom")));
+    let no_files = testing::expect_ok(
+        json::parse(invoke(root, Vec::from_array(["--json", root]), 0)),
+        "JSON without files",
+    );
+    testing::assert_none(json::field(no_files, "files"));
+    for (flags, text) in Vec::from_array(
+        [
+            (Vec::new(), "Total"),
+            (Vec::from_array(["--files"]), "src/core.gom"),
+            (Vec::from_array(["--modules"]), "vendor/nested"),
+            (Vec::from_array(["--packages"]), "Package directory"),
+        ],
+    ) {
+        flags.push(root);
+        let output = invoke(root, flags, 0);
+        testing::assert(
+            output.contains(text) && output.contains("Modules: 3")
+                && output.contains("Test files: 2"),
+        );
+    }
+    for flag in Vec::from_array(["--help", "-h"]) {
+        testing::assert(invoke(root, Vec::from_array([flag]), 0).contains("Usage: goml_stats"));
+    }
+    for flags in Vec::from_array(
+        [
+            Vec::from_array(["--unknown"]),
+            Vec::from_array(["--exclude"]),
+            Vec::from_array(["--exclude="]),
+            Vec::from_array(["--exclude", "../outside"]),
+            Vec::from_array(["--exclude", "/absolute"]),
+            Vec::from_array(["--exclude", "."]),
+            Vec::from_array([root, root]),
+            Vec::from_array([""]),
+        ],
+    ) {
+        invoke(root, flags, 2);
+    }
+    for name in Vec::from_array(["missing", "README.md", "link.gom", "loop", "pipe.gom"]) {
+        invoke(root, Vec::from_array([path::join(root, name)]), 1);
+    }
+    testing::assert_ok(
+        fs::write_bytes_structured(
+            path::join(root, "invalid.gom"),
+            bytes::Bytes::from_vec(Vec::from_array([255.to_u8(), 254.to_u8()])),
+        ),
+    );
+    testing::assert(invoke(root, Vec::from_array(["--json", root]), 1).contains("invalid.gom"));
+    testing::assert_ok(fs::remove_dir_all(root));
+}
+
+#[test]
+fn cli_gitignore_worktrees_and_explicit_roots() -> () {
+    let root = cli_root();
+    let sources = Vec::from_array(
+        [
+            "main.gom",
+            "ignored.gom",
+            "generated/hidden.gom",
+            "generated/keep.gom",
+            "logs/a.gom",
+            "logs/keep.gom",
+            "src/private.gom",
+            "src/keep.gom",
+            "src/deep/kept.gom",
+            "info.gom",
+            "info_hidden.gom",
+            "#literal.gom",
+        ],
+    );
+    for name in sources {
+        write(root, name, "code\n");
+    }
+    write(
+        root,
+        ".gitignore",
+        "ignored.gom\ngenerated/\n!generated/keep.gom\nlogs/*\n!logs/keep.gom\n!info.gom\n\\#literal.gom\n",
+    );
+    write(root, "src/.gitignore", "/private.gom\n");
+    write(root, ".git/info/exclude", "info.gom\ninfo_hidden.gom\n");
+    let expected = simple_sources(sources);
+    let visible = simple_sources(
+        Vec::from_array(
+            ["main.gom", "logs/keep.gom", "src/keep.gom", "src/deep/kept.gom", "info.gom"],
+        ),
+    );
+    check_report(report(root, Vec::new(), root), visible);
+    check_report(report(root, Vec::from_array(["--no-ignore"]), root), expected);
+    check_report(report(root, Vec::from_array(["--no-default-excludes"]), root), visible);
+    check_report(
+        report(root, Vec::from_array(["--exclude", "src"]), root),
+        select(visible, Vec::from_array(["src/keep.gom", "src/deep/kept.gom"])),
+    );
+    check_report(
+        report(root, Vec::new(), path::join(root, "ignored.gom")),
+        Vec::from_array([("ignored.gom", counts("code\n", 1, 0, 0, false))]),
+    );
+    check_report(
+        report(root, Vec::new(), path::join(root, "generated")),
+        Vec::from_array(
+            [
+                ("hidden.gom", counts("code\n", 1, 0, 0, false)),
+                ("keep.gom", counts("code\n", 1, 0, 0, false)),
+            ],
+        ),
+    );
+    let tree = path::join(root, "worktree");
+    let metadata = path::join(root, "worktree metadata/common/worktrees/linked");
+    write(root, "worktree metadata/common/info/exclude", "ignored.gom\noverride.gom\n");
+    write(root, "worktree metadata/common/worktrees/linked/commondir", "../..\n");
+    write(tree, ".git", "gitdir: ../worktree metadata/common/worktrees/linked\n");
+    write(tree, ".gitignore", "!override.gom\n");
+    for name in Vec::from_array(["main.gom", "ignored.gom", "override.gom"]) {
+        write(tree, name, "code\n");
+    }
+    let visible_tree = simple_sources(Vec::from_array(["main.gom", "override.gom"]));
+    check_report(report(root, Vec::new(), tree), visible_tree);
+    write(tree, ".git", "gitdir: " + metadata + "\n");
+    check_report(report(root, Vec::new(), tree), visible_tree);
+    let all = visible_tree.copy();
+    all.push(("ignored.gom", counts("code\n", 1, 0, 0, false)));
+    check_report(report(root, Vec::from_array(["--no-ignore"]), tree), all);
+    testing::assert_ok(fs::remove_dir_all(root));
+}
+
+#[test]
+fn generated_sources_keep_independent_physical_line_totals() -> () {
+    let root = cli_root();
+    let blocks = Vec::from_array(
+        [
+            (Vec::from_array(["// comment"]), 0, 1, 0),
+            (Vec::from_array(["", " \t"]), 0, 0, 2),
+            (Vec::from_array(["let url = \"https://example.invalid\"; // inline"]), 1, 0, 0),
+            (Vec::from_array(["let s = r##\"first", "// literal", "", "\"#", "last\"##;"]), 5, 0, 0),
+            (Vec::from_array(["let s =", "  \\\\r#\"", "  \\\\// literal", ";"]), 4, 0, 0),
+        ],
+    );
+    let mut seed: u64 = 20260920;
+    let expected = Vec::new();
+    for index in 0..48 {
+        let lines = Vec::new();
+        let mut code = 0;
+        let mut comments = 0;
+        let mut blank = 0;
+        for _ in 0..(index % 24 + 1) {
+            seed = (seed * 1664525 + 1013904223) % 4294967296;
+            let (block, c, m, b) = blocks[(seed % 5).to_isize()];
+            lines.extend(block);
+            code += c;
+            comments += m;
+            blank += b;
+        }
+        let ending = Vec::from_array(["\n", "\r\n", "\r"])[index % 3];
+        let source = text::join(lines, ending) + ending;
+        let name = "case_" + index.to_string() + ".gom";
+        write(root, name, source);
+        expected.push((name, counts(source, code, comments, blank, false)));
+    }
+    check_report(report(root, Vec::new(), root), expected);
+    testing::assert_ok(fs::remove_dir_all(root));
+}

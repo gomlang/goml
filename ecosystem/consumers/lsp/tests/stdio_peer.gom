@@ -1,0 +1,283 @@
+package tests;
+
+use std::bytes;
+use std::io;
+use std::os::linux::fd;
+use std::os::linux::ipc;
+use std::os::linux::process as linux;
+use std::time;
+use std::utf8;
+
+struct StdioPeer {
+    input: fd::Fd,
+    output: fd::Fd,
+    errors: fd::Fd,
+    child: linux::Child,
+    received: Ref[Vec[byte]],
+    cursor: Ref[isize],
+    error_bytes: Vec[byte],
+    expected_errors: Ref[string],
+    output_eof: Ref[bool],
+    error_eof: Ref[bool],
+    closed: Ref[bool],
+    scratch: Vec[byte],
+}
+
+impl StdioPeer {
+    fn open(binary: string) -> Result[StdioPeer, string] {
+        let handles: Vec[fd::Fd] = Vec::new();
+        let mut opened = false;
+        defer {
+            if !opened {
+                for handle in handles {
+                    let _ = handle.close();
+                }
+            }
+        };
+        let input = ipc::pipe(0).map_err(|error| error.to_string())?;
+        handles.push(input.reader);
+        handles.push(input.writer);
+        let output = ipc::pipe(0).map_err(|error| error.to_string())?;
+        handles.push(output.reader);
+        handles.push(output.writer);
+        let errors = ipc::pipe(0).map_err(|error| error.to_string())?;
+        handles.push(errors.reader);
+        handles.push(errors.writer);
+        for handle in Vec::from_array([input.writer, output.reader, errors.reader]) {
+            let flags = handle.status_flags().map_err(|error| error.to_string())?;
+            handle.set_status_flags(flags | fd::O_NONBLOCK).map_err(|error| error.to_string())?;
+        }
+        let child = linux::Command::new(binary).arg("--stdio").stdin(input.reader).stdout(
+            output.writer,
+        ).stderr(errors.writer).spawn().map_err(|error| "spawn LSP consumer: " + error.to_string())?;
+        let _ = input.reader.close();
+        let _ = output.writer.close();
+        let _ = errors.writer.close();
+        let scratch = Vec::with_capacity(65536);
+        for _ in 0..65536 {
+            scratch.push(0);
+        }
+        opened = true;
+        Result::Ok(
+            StdioPeer {
+                input: input.writer,
+                output: output.reader,
+                errors: errors.reader,
+                child,
+                received: Ref::new(Vec::new()),
+                cursor: Ref::new(0),
+                error_bytes: Vec::new(),
+                expected_errors: Ref::new(""),
+                output_eof: Ref::new(false),
+                error_eof: Ref::new(false),
+                closed: Ref::new(false),
+                scratch,
+            },
+        )
+    }
+
+    fn close(self: StdioPeer) -> () {
+        if self.closed.get() {
+            return
+        }
+        self.closed.set(true);
+        let _ = self.input.close();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = self.output.close();
+        let _ = self.errors.close();
+    }
+
+    fn error(self: StdioPeer) -> string {
+        let value = utf8::decode(self.error_bytes).unwrap_or("<invalid UTF-8 stderr>");
+        "LSP child stderr: "
+            + if value.char_count() > 1024 {
+                value.slice_chars(0, 1024).unwrap_or(value) + "…"
+            } else {
+                value
+            }
+    }
+
+    fn expect_stderr(self: StdioPeer, text: string) -> () {
+        self.expected_errors.set(self.expected_errors.get() + text);
+    }
+
+    fn capture(self: StdioPeer, standard_error: bool) -> Result[(), string] {
+        let handle = if standard_error {
+            self.errors
+        } else {
+            self.output
+        };
+        for _ in 0..16 {
+            match handle.read(self.scratch.as_mut_slice()) {
+                Ok(count) => {
+                    if count == 0 {
+                        if standard_error {
+                            self.error_eof.set(true);
+                        } else {
+                            self.output_eof.set(true);
+                        }
+                        return Result::Ok(())
+                    }
+                    if standard_error {
+                        if self.error_bytes.len() + count > 1048576 {
+                            return Result::Err("LSP child stderr exceeds 1 MiB")
+                        }
+                        for byte in self.scratch.slice(0, count) {
+                            self.error_bytes.push(byte);
+                        }
+                    } else {
+                        let mut buffer = self.received.get();
+                        let start = self.cursor.get();
+                        if start >= 65536 || start == buffer.len() {
+                            buffer = buffer.slice(start, buffer.len()).to_vec();
+                            self.cursor.set(0);
+                            self.received.set(buffer);
+                        }
+                        if buffer.len() + count > 33554432 {
+                            return Result::Err("LSP buffered stdout exceeds 32 MiB")
+                        }
+                        for byte in self.scratch.slice(0, count) {
+                            buffer.push(byte);
+                        }
+                    }
+                },
+                Err(error) => {
+                    if error.kind() == io::ErrorKind::WouldBlock {
+                        return Result::Ok(())
+                    }
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Result::Err("read LSP pipe: " + error.to_string())
+                    }
+                },
+            }
+        }
+        Result::Ok(())
+    }
+
+    fn poll(self: StdioPeer, writing: bool) -> Result[(), string] {
+        let interests = Vec::new();
+        let kinds = Vec::new();
+        if !self.output_eof.get() {
+            interests.push(ipc::PollInterest { descriptor: self.output, events: ipc::POLLIN });
+            kinds.push(0);
+        }
+        if !self.error_eof.get() {
+            interests.push(ipc::PollInterest { descriptor: self.errors, events: ipc::POLLIN });
+            kinds.push(1);
+        }
+        if writing {
+            interests.push(ipc::PollInterest { descriptor: self.input, events: ipc::POLLOUT });
+            kinds.push(2);
+        }
+        let events = match ipc::poll(interests.as_slice(), 50) {
+            Ok(events) => events,
+            Err(error) => {
+                if error.kind() == io::ErrorKind::Interrupted {
+                    return Result::Ok(())
+                }
+                return Result::Err(error.to_string())
+            },
+        };
+        for event in events {
+            let kind = kinds[event.index];
+            if kind < 2 {
+                self.capture(kind == 1)?;
+            }
+        }
+        Result::Ok(())
+    }
+
+    fn send(self: StdioPeer, data: Slice[byte]) -> Result[(), string] {
+        if self.closed.get() || self.input.is_closed() {
+            return Result::Err("LSP stdin is closed")
+        }
+        let input = data.to_vec();
+        let started = time::Instant::now();
+        let mut sent = 0;
+        while sent < input.len() {
+            if started.elapsed().as_seconds() >= 10 {
+                return Result::Err("LSP write timed out")
+            }
+            match self.input.write(input.slice(sent, input.len())) {
+                Ok(count) => {
+                    if count == 0 {
+                        return Result::Err("LSP pipe write made no progress")
+                    }
+                    sent += count;
+                },
+                Err(error) => {
+                    if error.kind() == io::ErrorKind::WouldBlock {
+                        self.poll(true)?;
+                    } else if error.kind() != io::ErrorKind::Interrupted {
+                        return Result::Err("write LSP pipe: " + error.to_string())
+                    }
+                },
+            }
+        }
+        Result::Ok(())
+    }
+
+    fn read_exact(self: StdioPeer, count: isize) -> Result[bytes::Bytes, string] {
+        if self.closed.get() {
+            return Result::Err("LSP peer is closed")
+        }
+        if count < 0 || count > 16777216 {
+            return Result::Err("LSP read count is outside 0..16 MiB")
+        }
+        let started = time::Instant::now();
+        loop {
+            let buffer = self.received.get();
+            let start = self.cursor.get();
+            if buffer.len() - start >= count {
+                let result = bytes::Bytes::from_vec(buffer.slice(start, start + count).to_vec());
+                self.cursor.set(start + count);
+                return Result::Ok(result)
+            }
+            if self.output_eof.get() {
+                return Result::Err("LSP output ended before the complete reply")
+            }
+            if started.elapsed().as_seconds() >= 10 {
+                return Result::Err("LSP reply timed out")
+            }
+            self.poll(false)?;
+        }
+    }
+
+    fn finish(self: StdioPeer, expected_exit: isize) -> Result[(), string] {
+        if self.closed.get() {
+            return Result::Err("LSP peer is already closed")
+        }
+        defer self.close();
+        self.input.close().map_err(|error| error.to_string())?;
+        let started = time::Instant::now();
+        let mut status = Option::None;
+        while status.is_none() || !self.output_eof.get() || !self.error_eof.get() {
+            if started.elapsed().as_seconds() >= 10 {
+                return Result::Err("LSP shutdown timed out")
+            }
+            self.poll(false)?;
+            if let Some(outcome) = self.child.try_wait().map_err(|error| error.to_string())? {
+                status = Option::Some(outcome.status);
+            }
+        }
+        let status = status.ok_or("LSP child exit status unavailable")?;
+        if status.exit_code() != Option::Some(expected_exit) {
+            return Result::Err(
+                "LSP child exit code " + status.exit_code().unwrap_or(-1).to_string()
+                    + ", expected "
+                    + expected_exit.to_string(),
+            )
+        }
+        if self.received.get().len() != self.cursor.get() {
+            return Result::Err("LSP child produced unexpected trailing stdout")
+        }
+        let observed = utf8::decode(self.error_bytes).map_err(
+            |error| "invalid LSP stderr UTF-8: " + error.to_string(),
+        )?;
+        if observed != self.expected_errors.get() {
+            return Result::Err("LSP stderr does not match registered diagnostics; " + self.error())
+        }
+        Result::Ok(())
+    }
+}

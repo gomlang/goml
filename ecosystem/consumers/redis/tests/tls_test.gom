@@ -1,0 +1,253 @@
+package tests;
+
+use ecosystem::redis;
+use ecosystem::redis::commands;
+use std::context;
+use std::ffi;
+use std::net::tls;
+use std::task;
+use std::testing;
+use std::time;
+
+#[go_type("example.com/goml-ecosystem/redis-consumer/testserver", "Server")]
+extern type TlsPeer;
+
+#[go_ffi("example.com/goml-ecosystem/redis-consumer/testserver", "Start")]
+extern fn peer_start(mode: ffi::String) -> TlsPeer;
+
+#[go_ffi("example.com/goml-ecosystem/redis-consumer/testserver", "Port")]
+extern fn peer_port(peer: TlsPeer) -> isize;
+
+#[go_ffi("example.com/goml-ecosystem/redis-consumer/testserver", "Certificate")]
+extern fn peer_certificate(peer: TlsPeer) -> ffi::String;
+
+#[go_ffi("example.com/goml-ecosystem/redis-consumer/testserver", "Key")]
+extern fn peer_key(peer: TlsPeer) -> ffi::String;
+
+#[go_ffi("example.com/goml-ecosystem/redis-consumer/testserver", "Wait")]
+extern fn peer_wait(peer: TlsPeer) -> bool;
+
+#[go_ffi("example.com/goml-ecosystem/redis-consumer/testserver", "Count")]
+extern fn peer_count(peer: TlsPeer) -> isize;
+
+#[go_ffi("example.com/goml-ecosystem/redis-consumer/testserver", "Close")]
+extern fn peer_close(peer: TlsPeer) -> ffi::String;
+
+fn secure_stalled(
+    connection: redis::Connection,
+    operation: redis::Operation,
+    kind: redis::ErrorKind,
+) -> () {
+    let error = testing::expect_err(
+        connection.execute(testing::expect_ok(commands::echo("stall"), "echo"), operation),
+        "stalled request",
+    );
+    testing::assert_eq(error.kind, kind);
+    testing::assert(error.may_have_executed);
+    testing::assert(connection.is_closed());
+}
+
+fn secure_case(mode: string) -> () {
+    let peer = peer_start(ffi::string_from_text(mode));
+    defer {
+        testing::assert_eq(testing::expect_ok(ffi::string_text(peer_close(peer)), "close peer"), "");
+    };
+    let port = peer_port(peer).to_u16();
+    let certificate = testing::expect_ok(ffi::string_text(peer_certificate(peer)), "certificate");
+    let key = testing::expect_ok(ffi::string_text(peer_key(peer)), "key");
+    let mut config = tls::ClientConfig::new(
+        if mode == "name" {
+            "wrong.invalid"
+        } else {
+            "localhost"
+        },
+    );
+    if mode != "untrusted" {
+        config = config.with_ca_pem(certificate.to_bytes().as_slice());
+    }
+    if mode == "mutual" || mode == "pool_mutual" {
+        config = config.with_client_certificate(
+            certificate.to_bytes().as_slice(),
+            key.to_bytes().as_slice(),
+        );
+    }
+    let options = redis::ConnectionOptions::standard();
+    if mode.starts_with("pool_") {
+        let settings = redis::PoolOptions {
+            max_connections: 1,
+            max_idle: 1,
+            ..redis::PoolOptions::standard(),
+        };
+        let pool = testing::expect_ok(
+            if mode == "pool_plain" {
+                redis::Pool::connect_host("localhost", port, options, settings)
+            } else {
+                redis::Pool::connect_tls("localhost", port, config, options, settings)
+            },
+            "pool",
+        );
+        defer {
+            testing::assert_ok(pool.close());
+        };
+        for _ in 0..3 {
+            testing::assert_eq(
+                testing::expect_ok(
+                    pool.execute(
+                        testing::expect_ok(commands::ping(), "ping"),
+                        redis::Operation::new(),
+                    ),
+                    "pooled PING",
+                ),
+                "PONG",
+            );
+        }
+        if mode == "pool_timeout" {
+            let error = testing::expect_err(
+                pool.execute(
+                    testing::expect_ok(commands::echo("stall"), "echo"),
+                    redis::Operation::new().with_timeout(time::Duration::from_milliseconds(50)),
+                ),
+                "pooled timeout",
+            );
+            testing::assert_eq(error.kind, redis::ErrorKind::Timeout);
+            testing::assert(error.may_have_executed);
+            testing::assert_eq(pool.stats().idle, 0);
+            testing::assert_eq(pool.stats().leased, 0);
+        } else {
+            let value = testing::expect_ok(
+                pool.execute(
+                    testing::expect_ok(commands::echo("secure\u0000echo"), "echo"),
+                    redis::Operation::new(),
+                ),
+                "pooled echo",
+            );
+            testing::assert_eq(testing::expect_ok(value.text(), "binary text"), "secure\u0000echo");
+            testing::assert_eq(pool.stats().idle, 1);
+        }
+        testing::assert_eq(peer_count(peer), 8);
+        return
+    }
+    let operation = redis::Operation::new().with_timeout(
+        time::Duration::from_milliseconds(
+            if mode == "handshake_timeout" || mode == "hello_timeout" {
+                150
+            } else {
+                3000
+            },
+        ),
+    );
+    let connected = if mode == "plain" {
+        redis::Connection::connect_host("localhost", port, options, operation)
+    } else {
+        redis::Connection::connect_tls("localhost", port, config, options, operation)
+    };
+    if mode == "untrusted" || mode == "name" || mode == "handshake_timeout"
+        || mode == "hello_timeout" {
+        let error = testing::expect_err(connected, "rejected setup");
+        testing::assert_eq(
+            error.kind,
+            if mode == "untrusted" || mode == "name" {
+                redis::ErrorKind::Io
+            } else {
+                redis::ErrorKind::Timeout
+            },
+        );
+        if mode != "hello_timeout" {
+            testing::assert_eq(peer_count(peer), 0);
+        }
+        return
+    }
+    let connection = testing::expect_ok(connected, "connection");
+    defer {
+        testing::assert_ok(connection.close());
+    };
+    for _ in 0..3 {
+        testing::assert_eq(
+            testing::expect_ok(
+                connection.execute(
+                    testing::expect_ok(commands::ping(), "ping"),
+                    redis::Operation::new(),
+                ),
+                "PING",
+            ),
+            "PONG",
+        );
+    }
+    if mode == "io_timeout" {
+        secure_stalled(
+            connection,
+            redis::Operation::new().with_timeout(time::Duration::from_milliseconds(50)),
+            redis::ErrorKind::Timeout,
+        );
+    } else if mode == "context_timeout" {
+        context::with_timeout(
+            context::Context::background(),
+            time::Duration::from_milliseconds(50),
+            |ctx, _| secure_stalled(
+                connection,
+                redis::Operation::new().without_timeout().with_context(ctx),
+                redis::ErrorKind::Timeout,
+            ),
+        );
+    } else if mode == "cancel" || mode == "legacy" {
+        context::with_cancel(
+            context::Context::background(),
+            |ctx, cancel| task::scope(
+                |scope| {
+                    let operation = if mode == "legacy" {
+                        redis::Operation::new().without_timeout().with_context(ctx).with_cancel(
+                            scope.token(),
+                        )
+                    } else {
+                        redis::Operation::new().without_timeout().with_context(ctx)
+                    };
+                    let worker = scope.spawn(
+                        |_| secure_stalled(connection, operation, redis::ErrorKind::Cancelled),
+                    );
+                    testing::assert(peer_wait(peer));
+                    if mode == "legacy" {
+                        scope.cancel();
+                    } else {
+                        cancel.cancel();
+                    }
+                    worker.join();
+                },
+            ),
+        );
+    } else {
+        let value = testing::expect_ok(
+            connection.execute(
+                testing::expect_ok(commands::echo("secure\u0000echo"), "echo"),
+                redis::Operation::new(),
+            ),
+            "echo",
+        );
+        testing::assert_eq(testing::expect_ok(value.text(), "binary text"), "secure\u0000echo");
+    }
+    testing::assert_eq(peer_count(peer), 5);
+}
+
+#[test]
+fn dns_tls_mutual_authentication_deadlines_cancellation_and_pool_eviction() -> () {
+    for mode in Vec::from_array(
+        [
+            "plain",
+            "tls",
+            "mutual",
+            "untrusted",
+            "name",
+            "handshake_timeout",
+            "hello_timeout",
+            "io_timeout",
+            "context_timeout",
+            "cancel",
+            "legacy",
+            "pool_plain",
+            "pool_tls",
+            "pool_mutual",
+            "pool_timeout",
+        ],
+    ) {
+        secure_case(mode);
+    }
+}

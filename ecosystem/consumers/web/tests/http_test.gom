@@ -1,0 +1,255 @@
+package tests;
+
+use consumer::web as app;
+use ecosystem::reqwest;
+use std::bytes;
+use std::collections::{HashSet};
+use std::json;
+use std::process;
+use std::task;
+use std::testing;
+use std::time;
+use std::utf8;
+use utf8::BytesUtf8;
+
+fn http_value(response: reqwest::Response, name: string) -> json::Value {
+    let value: json::Value = testing::expect_ok(response.json(), "response JSON");
+    testing::expect_some(json::field(value, name), name)
+}
+
+#[test]
+fn actual_http_routing_forms_streaming_disconnect_and_concurrency() -> () {
+    let server = testing::expect_ok(app::app().serve("127.0.0.1:0"), "serve");
+    defer {
+        testing::assert_ok(server.shutdown(time::Duration::from_seconds(3)));
+    };
+    let base = "http://" + testing::expect_ok(server.address(), "address");
+    let client = testing::expect_ok(
+        reqwest::Client::builder().redirect(reqwest::RedirectPolicy::None).build(),
+        "client",
+    );
+    defer client.close();
+    let response = testing::expect_ok(
+        client.get(base + "/api/users/%E4%B8%AD%F0%9F%98%80").send(),
+        "Unicode path",
+    );
+    testing::assert_eq(response.status().as_isize(), 200);
+    testing::assert(response.headers().get("x-web") == Option::Some("goml"));
+    testing::assert(json::as_string(http_value(response, "name")) == Option::Some("中😀"));
+    testing::assert(json::as_int(http_value(response, "count")) == Option::Some(1));
+    for expected in Vec::from_array([("/files/a/b%20c", "a/b c"), ("/", "web consumer")]) {
+        testing::assert_eq(
+            testing::expect_ok(
+                testing::expect_ok(client.get(base + expected.0).send(), "HTTP route").text(),
+                "route body",
+            ),
+            expected.1,
+        );
+    }
+    let response = testing::expect_ok(
+        client.post(base + "/api/json").text("{\"name\":\"typed\",\"count\":41}").header(
+            "content-type",
+            "application/json",
+        ).send(),
+        "typed JSON request",
+    );
+    testing::assert_eq(response.status().as_isize(), 201);
+    testing::assert(json::as_int(http_value(response, "count")) == Option::Some(42));
+    for index in 0..60 {
+        let label = "0001 +&=%中😀" + index.to_string();
+        let count = index * 3197 - 100000;
+        let enabled = index % 2 == 0;
+        let fields = Vec::from_array(
+            [
+                ("label", label),
+                ("count", count.to_string()),
+                ("enabled", enabled.to_string()),
+                ("tag", "a1 +&中"),
+                ("tag", "b中😀"),
+            ],
+        );
+        for post in Vec::from_array([false, true]) {
+            let response = testing::expect_ok(
+                if post {
+                    client.post(base + "/api/form").form(fields).send()
+                } else {
+                    client.get(base + "/api/query").query(fields).send()
+                },
+                "typed query/form",
+            );
+            testing::assert_eq(response.status().as_isize(), 200);
+            let value: json::Value = testing::expect_ok(response.json(), "form JSON");
+            testing::assert(
+                json::field(value, "label").and_then(|v| json::as_string(v)) == Option::Some(label),
+            );
+            testing::assert(
+                json::field(value, "count").and_then(|v| json::as_int(v)) == Option::Some(count),
+            );
+            testing::assert(
+                json::field(value, "enabled").and_then(|v| json::as_bool(v))
+                    == Option::Some(enabled),
+            );
+            testing::assert_eq(
+                json::encode(testing::expect_some(json::field(value, "tag"), "tags")),
+                "[\"a1 +&中\",\"b中😀\"]",
+            );
+        }
+    }
+    for pair in Vec::from_array(
+        [
+            ("POST", "/api/users/1", 405),
+            ("OPTIONS", "/api/users/1", 204),
+            ("GET", "/missing", 404),
+            ("GET", "/redirect", 307),
+            ("GET", "/slow", 504),
+        ],
+    ) {
+        testing::assert_eq(
+            testing::expect_ok(client.request(pair.0, base + pair.1).send(), "HTTP status").status().as_isize(),
+            pair.2,
+        );
+    }
+    testing::assert_eq(
+        testing::expect_ok(
+            testing::expect_ok(client.head(base + "/api/users/1").send(), "HEAD").text(),
+            "HEAD body",
+        ),
+        "",
+    );
+    testing::assert_eq(
+        testing::expect_ok(
+            client.post(base + "/api/json").text("bad").header("content-type", "application/json").send(),
+            "invalid JSON",
+        ).status().as_isize(),
+        422,
+    );
+    testing::assert_eq(
+        testing::expect_ok(client.post(base + "/api/json").text("{}").send(), "media type").status().as_isize(),
+        415,
+    );
+    testing::assert_eq(
+        testing::expect_ok(
+            client.post(base + "/api/json").text("x".repeat(262145)).header(
+                "content-type",
+                "application/json",
+            ).send(),
+            "body limit",
+        ).status().as_isize(),
+        413,
+    );
+    testing::assert_eq(
+        testing::expect_ok(client.get(base + "/headers").send(), "duplicate headers").headers().get_all(
+            "set-cookie",
+        ).len(),
+        2,
+    );
+    let data = Vec::new();
+    for index in 0..204800 {
+        data.push((index % 256).to_u8());
+    }
+    let streamed = testing::expect_ok(
+        process::Command::new("curl").args(
+            Vec::from_array(
+                [
+                    "--silent",
+                    "--noproxy",
+                    "*",
+                    "--show-error",
+                    "--max-time",
+                    "5",
+                    "--http1.1",
+                    "--fail-with-body",
+                    "-H",
+                    "Transfer-Encoding: chunked",
+                    "--data-binary",
+                    "@-",
+                    base + "/stream",
+                ],
+            ),
+        ).input(bytes::Bytes::from_vec(data)).output_timeout_structured(
+            time::Duration::from_seconds(8),
+        ),
+        "independent chunked HTTP client",
+    );
+    if !streamed.status().success() {
+        testing::fail(
+            "chunked curl: " + testing::expect_ok(streamed.stderr().to_string_utf8(), "curl stderr"),
+        );
+    }
+    if streamed.stdout().to_vec() != data {
+        testing::fail("chunked output bytes: " + streamed.stdout().len().to_string());
+    }
+    let events = testing::expect_ok(client.get(base + "/events").send(), "SSE");
+    testing::assert_eq(events.headers().get("content-type").unwrap_or(""), "text/event-stream");
+    testing::assert_eq(
+        testing::expect_ok(events.text(), "events"),
+        "id: 0\ndata: value 0\n\nid: 1\ndata: value 1\n\nid: 2\ndata: value 2\n\n",
+    );
+    let disconnected = testing::expect_ok(
+        process::Command::new("curl").args(
+            Vec::from_array(
+                [
+                    "--silent",
+                    "--noproxy",
+                    "*",
+                    "--no-buffer",
+                    "--max-time",
+                    "0.2",
+                    base + "/forever",
+                ],
+            ),
+        ).output_timeout_structured(time::Duration::from_seconds(3)),
+        "SSE disconnect",
+    );
+    testing::assert_eq(disconnected.status().code().unwrap_or(-1), 28);
+    testing::assert(
+        testing::expect_ok(disconnected.stdout().to_string_utf8(), "SSE bytes").contains(
+            "data: tick\n\n",
+        ),
+    );
+    let mut cleaned = false;
+    for _ in 0..100 {
+        if json::as_int(
+            http_value(testing::expect_ok(client.get(base + "/active").send(), "active"), "count"),
+        )
+            == Option::Some(0) {
+            cleaned = true;
+            break;
+        }
+        time::sleep(time::Duration::from_milliseconds(10));
+    }
+    if !cleaned {
+        testing::fail("SSE producer remained active after disconnect");
+    }
+    task::scope(
+        |scope| {
+            let calls = Vec::new();
+            for _ in 0..48 {
+                calls.push(
+                    scope.spawn(
+                        |_| testing::expect_some(
+                            json::as_int(
+                                http_value(
+                                    testing::expect_ok(
+                                        client.get(base + "/counter").send(),
+                                        "concurrent request",
+                                    ),
+                                    "count",
+                                ),
+                            ),
+                            "counter",
+                        ),
+                    ),
+                );
+            }
+            let observed: HashSet[isize] = HashSet::new();
+            for call in calls {
+                observed.insert(call.join());
+            }
+            testing::assert_eq(observed.len(), 48);
+            for index in 1..49 {
+                testing::assert(observed.contains(index));
+            }
+        },
+    );
+}

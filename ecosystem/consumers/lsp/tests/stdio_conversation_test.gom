@@ -1,0 +1,512 @@
+package tests;
+
+use std::json;
+use std::testing;
+use std::time;
+
+fn initialize_wire(client: WireClient, encoding: string, fragmented: bool) -> () {
+    let capabilities = if encoding == "default" {
+        wire_empty()
+    } else {
+        wire_object(
+            Vec::from_array(
+                [
+                    (
+                        "general",
+                        wire_object(
+                            Vec::from_array(
+                                [
+                                    (
+                                        "positionEncodings",
+                                        json::Value::Array(
+                                            Vec::from_array(
+                                                [wire_text("future-encoding"), wire_text(encoding)],
+                                            ),
+                                        ),
+                                    ),
+                                ],
+                            ),
+                        ),
+                    ),
+                ],
+            ),
+        )
+    };
+    let reply = client.request(
+        "initialize",
+        wire_object(Vec::from_array([("capabilities", capabilities)])),
+        Option::None,
+        fragmented,
+    );
+    let capabilities = wire_field(reply, "capabilities");
+    testing::assert_eq(
+        wire_string(wire_field(capabilities, "positionEncoding")),
+        if encoding == "default" {
+            "utf-16"
+        } else {
+            encoding
+        },
+    );
+    testing::assert_eq(wire_integer(wire_field(capabilities, "textDocumentSync")), 2);
+    client.notify("initialized", wire_empty());
+}
+
+fn position(line: isize, character: isize) -> json::Value {
+    wire_object(
+        Vec::from_array([("line", wire_number(line)), ("character", wire_number(character))]),
+    )
+}
+
+fn document_id(uri: string) -> json::Value {
+    wire_object(Vec::from_array([("uri", wire_text(uri))]))
+}
+
+fn edit_span(
+    text: string,
+    start_line: isize,
+    start_character: isize,
+    end_line: isize,
+    end_character: isize,
+    length: Option[isize],
+) -> json::Value {
+    let fields = Vec::from_array(
+        [
+            ("text", wire_text(text)),
+            (
+                "range",
+                wire_object(
+                    Vec::from_array(
+                        [
+                            ("start", position(start_line, start_character)),
+                            ("end", position(end_line, end_character)),
+                        ],
+                    ),
+                ),
+            ),
+        ],
+    );
+    if let Some(length) = length {
+        fields.push(("rangeLength", wire_number(length)));
+    }
+    wire_object(fields)
+}
+
+fn send_changes(client: WireClient, uri: string, version: isize, changes: Vec[json::Value]) -> () {
+    client.notify(
+        "textDocument/didChange",
+        wire_object(
+            Vec::from_array(
+                [
+                    (
+                        "textDocument",
+                        wire_object(
+                            Vec::from_array(
+                                [("uri", wire_text(uri)), ("version", wire_number(version))],
+                            ),
+                        ),
+                    ),
+                    ("contentChanges", json::Value::Array(changes)),
+                ],
+            ),
+        ),
+    );
+}
+
+fn assert_document(client: WireClient, uri: string, text: string, version: isize) -> () {
+    let document = client.query("test/document", document_id(uri));
+    match document {
+        json::Value::Object(fields) => testing::assert_eq(fields.len(), 2),
+        _ => testing::fail("expected document object"),
+    }
+    testing::assert_eq(wire_string(wire_field(document, "text")), text);
+    testing::assert_eq(wire_integer(wire_field(document, "version")), version);
+}
+
+fn independent_lines(text: string) -> Vec[(isize, string)] {
+    let lines = Vec::new();
+    let mut start = 0;
+    let mut at = 0;
+    while at < text.byte_len() {
+        let byte = text.byte_get(at);
+        if byte == 10 || byte == 13 {
+            lines.push((start, text.byte_slice(start, at)));
+            at += 1;
+            if byte == 13 && at < text.byte_len() && text.byte_get(at) == 10 {
+                at += 1;
+            }
+            start = at;
+        } else {
+            at += 1;
+        }
+    }
+    lines.push((start, text.byte_slice(start, at)));
+    lines
+}
+
+fn encoded_units(text: string, encoding: string) -> isize {
+    if encoding == "utf-8" {
+        return text.byte_len();
+    }
+    let mut units = 0;
+    for scalar in text.chars() {
+        units += if encoding == "utf-16" && scalar.to_u32() > 65535 {
+            2
+        } else {
+            1
+        };
+    }
+    units
+}
+
+fn random_document(state: Ref[u64], length: isize) -> string {
+    let alphabet = Vec::from_array(["a", "中", "😀", "é", "é", "\r", "\n", "\r\n"]);
+    let mut text = "";
+    for _ in 0..length {
+        let mut seed = state.get();
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        state.set(seed);
+        text += alphabet[(seed % 8).to_isize()];
+    }
+    text
+}
+
+fn verify_wire_document(client: WireClient, uri: string, text: string, encoding: string) -> isize {
+    client.notify(
+        "textDocument/didOpen",
+        wire_object(
+            Vec::from_array(
+                [
+                    (
+                        "textDocument",
+                        wire_object(
+                            Vec::from_array(
+                                [
+                                    ("uri", wire_text(uri)),
+                                    ("languageId", wire_text("goml")),
+                                    ("version", wire_number(1)),
+                                    ("text", wire_text(text)),
+                                ],
+                            ),
+                        ),
+                    ),
+                ],
+            ),
+        ),
+    );
+    let lines = independent_lines(text);
+    let mut checked = 0;
+    for number in 0..lines.len() {
+        let (base, line) = lines[number];
+        let boundaries: HashMap[isize, isize] = HashMap::new();
+        boundaries.set(0, base);
+        let mut units = 0;
+        let mut offset = base;
+        for scalar in line.chars() {
+            let value = scalar.to_string();
+            units += encoded_units(value, encoding);
+            offset += value.byte_len();
+            boundaries.set(units, offset);
+        }
+        for character in 0..units + 1 {
+            let params = wire_object(
+                Vec::from_array(
+                    [("textDocument", document_id(uri)), ("position", position(number, character))],
+                ),
+            );
+            match boundaries.get(character) {
+                Some(expected) => testing::assert_eq(
+                    wire_integer(client.query("test/offset", params)),
+                    expected,
+                ),
+                None => client.reject("test/offset", params, -32602),
+            }
+            checked += 1;
+        }
+        let clamped = client.query(
+            "test/offset",
+            wire_object(
+                Vec::from_array(
+                    [("textDocument", document_id(uri)), ("position", position(number, 2147483647))],
+                ),
+            ),
+        );
+        testing::assert_eq(wire_integer(clamped), base + line.byte_len());
+    }
+    let emoji = encoded_units("😀", encoding);
+    let wide = encoded_units("中", encoding);
+    send_changes(
+        client,
+        uri,
+        2,
+        Vec::from_array(
+            [
+                wire_object(Vec::from_array([("text", wire_text("a😀b\r\n中\n"))])),
+                edit_span("中", 0, 1, 0, 1 + emoji, Option::Some(emoji)),
+                edit_span("done", 0, 1, 1, wide, Option::Some(wide * 2 + 3)),
+            ],
+        ),
+    );
+    assert_document(client, uri, "adone\n", 2);
+    client.peer.expect_stderr(
+        "-32602: rangeLength does not match replaced length in the negotiated encoding\n",
+    );
+    send_changes(
+        client,
+        uri,
+        3,
+        Vec::from_array(
+            [
+                wire_object(Vec::from_array([("text", wire_text("a😀"))])),
+                edit_span("invalid", 0, 1, 0, 1 + emoji, Option::Some(99)),
+            ],
+        ),
+    );
+    assert_document(client, uri, "adone\n", 2);
+    client.peer.expect_stderr("-32602: position outside document\n");
+    send_changes(
+        client,
+        uri,
+        4,
+        Vec::from_array(
+            [
+                wire_object(Vec::from_array([("text", wire_text("partial"))])),
+                edit_span("invalid", 99, 0, 99, 0, Option::None),
+            ],
+        ),
+    );
+    assert_document(client, uri, "adone\n", 2);
+    send_changes(
+        client,
+        uri,
+        5,
+        Vec::from_array(
+            [
+                wire_object(Vec::from_array([("text", wire_text("a😀b\r\n中\n"))])),
+                edit_span("XY", 0, 1, 0, 1 + emoji, Option::Some(emoji)),
+                edit_span("done", 0, 3, 1, wide, Option::None),
+            ],
+        ),
+    );
+    assert_document(client, uri, "aXYdone\n", 5);
+    let hover = client.query(
+        "textDocument/hover",
+        wire_object(
+            Vec::from_array([("textDocument", document_id(uri)), ("position", position(0, 0))]),
+        ),
+    );
+    testing::assert_eq(wire_string(wire_field(wire_field(hover, "contents"), "kind")), "markdown");
+    client.notify(
+        "textDocument/didClose",
+        wire_object(Vec::from_array([("textDocument", document_id(uri))])),
+    );
+    client.reject("test/document", document_id(uri), -32602);
+    checked
+}
+
+#[test]
+fn stdio_protocol_errors_fragmented_requests_and_transactional_document_lifecycle() -> () {
+    let client = WireClient::open(stdio_binary());
+    defer client.close();
+    client.send_body("{", false);
+    let reply = client.read(false);
+    testing::assert_eq(wire_integer(wire_field(wire_field(reply, "error"), "code")), -32700);
+    testing::assert_eq(json::encode(wire_field(reply, "id")), "null");
+    client.send_body("[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"x\"}]", false);
+    testing::assert_eq(
+        wire_integer(wire_field(wire_field(client.read(false), "error"), "code")),
+        -32600,
+    );
+    client.reject("test/echo", wire_empty(), -32002);
+    initialize_wire(client, "default", true);
+    testing::assert_eq(
+        json::encode(
+            client.query(
+                "test/add",
+                wire_object(
+                    Vec::from_array([("left", wire_number(20)), ("right", wire_number(22))]),
+                ),
+            ),
+        ),
+        "{\"value\":42}",
+    );
+    client.reject(
+        "test/add",
+        wire_object(Vec::from_array([("left", wire_text("bad")), ("right", wire_number(22))])),
+        -32602,
+    );
+    client.reject("missing", wire_empty(), -32601);
+    client.notify("$/cancelRequest", wire_object(Vec::from_array([("id", wire_number(9999))])));
+    let echo = client.request(
+        "test/echo",
+        wire_object(Vec::from_array([("text", wire_text("你好😀"))])),
+        Option::None,
+        true,
+    );
+    testing::assert_eq(json::encode(echo), "{\"text\":\"你好😀\"}");
+    let state = Ref::new(7331.to_u64());
+    let mut positions = 0;
+    for sample in 0..30 {
+        positions += verify_wire_document(
+            client,
+            "file:///sample-" + sample.to_string(),
+            random_document(state, 12),
+            "utf-16",
+        );
+    }
+    testing::assert(positions > 300);
+    client.shutdown();
+}
+
+#[test]
+fn stdio_negotiates_three_encodings_and_checks_every_valid_and_invalid_boundary() -> () {
+    let binary = stdio_binary();
+    let mut positions = 0;
+    for encoding in Vec::from_array(["utf-8", "utf-16", "utf-32"]) {
+        let client = WireClient::open(binary);
+        defer client.close();
+        let invalid = wire_object(
+            Vec::from_array(
+                [
+                    (
+                        "capabilities",
+                        wire_object(
+                            Vec::from_array(
+                                [
+                                    (
+                                        "general",
+                                        wire_object(
+                                            Vec::from_array(
+                                                [
+                                                    (
+                                                        "positionEncodings",
+                                                        json::Value::Array(
+                                                            Vec::from_array(
+                                                                [
+                                                                    wire_text(encoding),
+                                                                    wire_number(7),
+                                                                ],
+                                                            ),
+                                                        ),
+                                                    ),
+                                                ],
+                                            ),
+                                        ),
+                                    ),
+                                ],
+                            ),
+                        ),
+                    ),
+                ],
+            ),
+        );
+        client.reject("initialize", invalid, -32602);
+        initialize_wire(client, encoding, false);
+        let state = Ref::new(2407.to_u64());
+        for sample in 0..16 {
+            let text = if sample == 0 {
+                "x".repeat(1023) + "\r\n😀中é\r\né\n"
+            } else {
+                random_document(state, 24)
+            };
+            positions += verify_wire_document(
+                client,
+                "file:///" + encoding + "-" + sample.to_string(),
+                text,
+                encoding,
+            );
+        }
+        client.shutdown();
+    }
+    testing::assert(positions > 4000);
+}
+
+fn outgoing(client: WireClient, id: string, milliseconds: isize) -> () {
+    client.notify(
+        "test/outgoing",
+        wire_object(
+            Vec::from_array([("id", wire_text(id)), ("timeout", wire_number(milliseconds))]),
+        ),
+    );
+    let request = client.read(true);
+    testing::assert_eq(wire_string(wire_field(request, "id")), id);
+    testing::assert_eq(wire_string(wire_field(request, "method")), "client/echo");
+}
+
+fn expired(client: WireClient, id: string, cancellation: bool) -> () {
+    if cancellation {
+        let message = client.read(true);
+        testing::assert_eq(wire_string(wire_field(message, "method")), "$/cancelRequest");
+        testing::assert_eq(wire_string(wire_field(wire_field(message, "params"), "id")), id);
+    }
+    let message = client.read(true);
+    testing::assert_eq(wire_string(wire_field(message, "method")), "test/completed");
+    let result = wire_field(message, "params");
+    testing::assert_eq(wire_string(wire_field(result, "id")), id);
+    testing::assert_eq(wire_integer(wire_field(wire_field(result, "error"), "code")), -32803);
+}
+
+#[test]
+fn stdio_outgoing_deadlines_late_replies_duplicate_suppression_and_exit_cleanup() -> () {
+    let client = WireClient::open(stdio_binary());
+    defer client.close();
+    initialize_wire(client, "default", false);
+    outgoing(client, "zero", 0);
+    client.notify("test/poll", wire_empty());
+    expired(client, "zero", true);
+    client.peer.expect_stderr("-32602: unexpected or duplicate response\n");
+    client.send(
+        wire_object(
+            Vec::from_array(
+                [
+                    ("jsonrpc", wire_text("2.0")),
+                    ("id", wire_text("zero")),
+                    ("result", wire_text("late")),
+                ],
+            ),
+        ),
+    );
+    testing::assert_eq(json::encode(client.query("test/echo", wire_empty())), "{}");
+    outgoing(client, "early", 10000);
+    client.send(
+        wire_object(
+            Vec::from_array(
+                [
+                    ("jsonrpc", wire_text("2.0")),
+                    ("id", wire_text("early")),
+                    ("result", wire_object(Vec::from_array([("unicode", wire_text("😀"))]))),
+                ],
+            ),
+        ),
+    );
+    let completed = client.read(true);
+    testing::assert_eq(wire_string(wire_field(completed, "method")), "test/completed");
+    testing::assert_eq(wire_string(wire_field(wire_field(completed, "params"), "id")), "early");
+    testing::assert_eq(
+        json::encode(wire_field(wire_field(completed, "params"), "result")),
+        "{\"unicode\":\"😀\"}",
+    );
+    outgoing(client, "late", 20);
+    time::sleep(time::Duration::from_milliseconds(50));
+    client.send(
+        wire_object(
+            Vec::from_array(
+                [
+                    ("jsonrpc", wire_text("2.0")),
+                    ("id", wire_text("late")),
+                    ("result", wire_text("overdue")),
+                ],
+            ),
+        ),
+    );
+    expired(client, "late", false);
+    outgoing(client, "poll", 20);
+    time::sleep(time::Duration::from_milliseconds(50));
+    client.notify("test/poll", wire_empty());
+    expired(client, "poll", true);
+    client.notify("test/poll", wire_empty());
+    testing::assert_eq(json::encode(client.query("test/echo", wire_empty())), "{}");
+    outgoing(client, "exit", 10000);
+    client.shutdown();
+}

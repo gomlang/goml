@@ -1,0 +1,222 @@
+package tests;
+
+use std::bytes;
+use std::env;
+use std::fs;
+use std::json;
+use std::num;
+use std::process;
+use std::testing;
+use std::time;
+use std::utf8;
+use utf8::BytesUtf8;
+
+fn stdio_binary() -> string {
+    if let Ok(binary) = env::var_structured("GOML_VERIFY_BINARY") {
+        return binary;
+    }
+    let driver = env::var_structured("GOML_VERIFY_DRIVER").unwrap_or(
+        testing::expect_ok(fs::canonicalize("../../../stage2/bin/goml"), "driver"),
+    );
+    let built = testing::expect_ok(
+        process::Command::new(driver).args(
+            Vec::from_array(["build", "--target-dir", "_artifact/stdio-reference"]),
+        ).output_timeout_structured(time::Duration::from_seconds(90)),
+        "build stdio consumer",
+    );
+    if !built.status().success() {
+        testing::fail(testing::expect_ok(built.stderr().to_string_utf8(), "build stderr"));
+    }
+    "_artifact/stdio-reference/bin/lsp"
+}
+
+fn wire_field(value: json::Value, name: string) -> json::Value {
+    testing::expect_some(json::field(value, name), "LSP field " + name)
+}
+
+fn wire_string(value: json::Value) -> string {
+    testing::expect_some(json::as_string(value), "LSP string")
+}
+
+fn wire_integer(value: json::Value) -> isize {
+    testing::expect_some(json::as_int(value), "LSP integer: " + json::encode(value))
+}
+
+fn wire_text(value: string) -> json::Value {
+    json::Value::String(value)
+}
+
+fn wire_number(value: isize) -> json::Value {
+    json::Value::Number(value.to_string())
+}
+
+fn wire_object(fields: Vec[(string, json::Value)]) -> json::Value {
+    json::object(fields)
+}
+
+fn wire_empty() -> json::Value {
+    json::object(Vec::new())
+}
+
+fn decode_stdio_message(read: (isize) -> Result[bytes::Bytes, string], protocol: bool) -> Result[
+    json::Value,
+    string,
+] {
+    let header = bytes::Builder::new();
+    loop {
+        let byte = read(1)?;
+        if byte.len() != 1 {
+            return Result::Err("truncated LSP header");
+        }
+        header.extend(byte.as_slice());
+        let data = header.to_vec();
+        if data.len() > 8192 {
+            return Result::Err("LSP response header exceeds 8192 bytes");
+        }
+        if data.len() >= 4 && data[data.len() - 4] == 13 && data[data.len() - 3] == 10
+            && data[data.len() - 2] == 13
+            && data[data.len() - 1] == 10 {
+            break;
+        }
+    }
+    let header = header.finish().to_string_utf8().map_err(|error| error.to_string())?;
+    let mut length = Option::None;
+    for field in header.byte_slice(0, header.byte_len() - 4).split("\r\n") {
+        let colon = field.find(":").ok_or("LSP header missing colon")?;
+        let name = field.byte_slice(0, colon);
+        let value = field.byte_slice(colon + 1, field.byte_len()).trim();
+        if name == "Content-Length" {
+            if length.is_some() {
+                return Result::Err("duplicate LSP Content-Length");
+            }
+            if value == "" {
+                return Result::Err("empty LSP Content-Length");
+            }
+            for byte in value.to_bytes() {
+                if byte < 48 || byte > 57 {
+                    return Result::Err("nondecimal LSP Content-Length");
+                }
+            }
+            let count = num::parse_int_structured(value).map_err(|error| error.to_string())?;
+            if count > 16777216 {
+                return Result::Err("LSP body exceeds 16 MiB");
+            }
+            length = Option::Some(count);
+        }
+    }
+    let length = length.ok_or("LSP Content-Length missing")?;
+    let body = read(length)?;
+    if body.len() != length {
+        return Result::Err("truncated LSP response body");
+    }
+    let value = json::parse(body.to_string_utf8().map_err(|error| error.to_string())?)?;
+    if json::field(value, "jsonrpc").and_then(|value| json::as_string(value)) != Option::Some("2.0") {
+        return Result::Err("invalid JSON-RPC version");
+    }
+    if !protocol && json::field(value, "result").is_some() == json::field(value, "error").is_some() {
+        return Result::Err("JSON-RPC reply must contain exactly one of result or error");
+    }
+    Result::Ok(value)
+}
+
+struct WireClient {
+    peer: StdioPeer,
+    next_id: Ref[isize],
+}
+
+impl WireClient {
+    fn open(binary: string) -> WireClient {
+        WireClient {
+            peer: testing::expect_ok(StdioPeer::open(binary), "start stdio server"),
+            next_id: Ref::new(1),
+        }
+    }
+
+    fn close(self: WireClient) -> () {
+        self.peer.close();
+    }
+
+    fn send_body(self: WireClient, body: string, fragmented: bool) -> () {
+        let wire = stdio_frame(body).to_bytes();
+        if fragmented {
+            for byte in wire {
+                testing::assert_ok(self.peer.send(Vec::from_array([byte]).as_slice()));
+            }
+        } else {
+            testing::assert_ok(self.peer.send(wire.as_slice()));
+        }
+    }
+
+    fn send(self: WireClient, value: json::Value) -> () {
+        self.send_body(json::encode(value), false);
+    }
+
+    fn read(self: WireClient, protocol: bool) -> json::Value {
+        match decode_stdio_message(|count| self.peer.read_exact(count), protocol) {
+            Ok(value) => value,
+            Err(error) => {
+                testing::fail("independent LSP framing: " + error);
+                json::Value::Null
+            },
+        }
+    }
+
+    fn notify(self: WireClient, method: string, params: json::Value) -> () {
+        self.send(
+            wire_object(
+                Vec::from_array(
+                    [
+                        ("jsonrpc", wire_text("2.0")),
+                        ("method", wire_text(method)),
+                        ("params", params),
+                    ],
+                ),
+            ),
+        );
+    }
+
+    fn request(
+        self: WireClient,
+        method: string,
+        params: json::Value,
+        error: Option[isize],
+        fragmented: bool,
+    ) -> json::Value {
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        let fields = Vec::from_array(
+            [("jsonrpc", wire_text("2.0")), ("id", wire_number(id)), ("method", wire_text(method))],
+        );
+        match params {
+            json::Value::Null => (),
+            _ => fields.push(("params", params)),
+        }
+        self.send_body(json::encode(wire_object(fields)), fragmented);
+        let reply = self.read(false);
+        testing::assert_eq(wire_integer(wire_field(reply, "id")), id);
+        if let Some(code) = error {
+            let error = wire_field(reply, "error");
+            testing::assert_eq(wire_integer(wire_field(error, "code")), code);
+            error
+        } else {
+            wire_field(reply, "result")
+        }
+    }
+
+    fn query(self: WireClient, method: string, params: json::Value) -> json::Value {
+        self.request(method, params, Option::None, false)
+    }
+
+    fn reject(self: WireClient, method: string, params: json::Value, code: isize) -> () {
+        let _ = self.request(method, params, Option::Some(code), false);
+    }
+
+    fn shutdown(self: WireClient) -> () {
+        testing::assert_eq(json::encode(self.query("shutdown", json::Value::Null)), "null");
+        self.reject("test/echo", wire_empty(), -32600);
+        self.notify("exit", wire_empty());
+        if let Err(error) = self.peer.finish(0) {
+            testing::fail("LSP stdio shutdown: " + error);
+        }
+    }
+}
