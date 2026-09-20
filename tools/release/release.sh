@@ -92,7 +92,7 @@ set_stage0() {
     printf '%s\n' \
         "GOML_STAGE0_RELEASE_TAG=v$value" \
         "GOML_STAGE0_ASSET_NAME=$asset" \
-        "GOML_STAGE0_URL=https://github.com/lijunchen/goml/releases/download/v$value/$asset" \
+        "GOML_STAGE0_URL=https://github.com/gomlang/goml/releases/download/v$value/$asset" \
         "GOML_STAGE0_SHA256=$checksum" \
         > bootstrap/stage0.env
 }

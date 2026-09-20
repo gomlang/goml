@@ -35,9 +35,9 @@ just ci
     set -eu
     release_sha="$(git rev-parse HEAD)"
     git push origin main
-    ci_run_id="$(gh run list --repo lijunchen/goml --workflow CI --branch main --commit "$release_sha" --event push --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+    ci_run_id="$(gh run list --repo gomlang/goml --workflow CI --branch main --commit "$release_sha" --event push --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
     test -n "$ci_run_id"
-    gh run watch "$ci_run_id" --repo lijunchen/goml --exit-status
+    gh run watch "$ci_run_id" --repo gomlang/goml --exit-status
     git tag -a "v$release_version" -m "goml v$release_version"
     git push origin "v$release_version"
 )
