@@ -10,10 +10,18 @@ They distinguish supported designs from current compiler or API boundaries.
   errors, and parser operators preserve left/right associativity.
 - Associated-type strategies support custom downstream implementations. Lazy
   recursive shrink trees, dependent generators and higher-order transformations
-  compile and execute across module boundaries.
+  compile and execute across module boundaries. Bounded campaigns aggregate
+  counterexamples under shared shrink budgets and preserve typed initial/minimal
+  values alongside categorical distributions. A downstream state-machine helper
+  resets custom model/system types for every initial and shrink evaluation, with
+  explicit invariant and cleanup results.
 - Third-party derives export through dependency interfaces. CLI derives generate
   generic struct decoding, unit-enum conversion, definition-site runtime helper
-  calls and type predicates. Import aliases and caller-name collisions are tested.
+  calls and type predicates. Nested Args and typed subcommand enums compose
+  across dependencies, retaining generic payload predicates and positional/global
+  option semantics. Import aliases and caller-name collisions are tested.
+  Composition errors remain explicit schema diagnostics, including multiple
+  subcommand selectors introduced through nested flattening.
 - Generic sequence algorithms produce minimal edits over exhaustive short inputs;
   the text layer interoperates with GNU diff and GNU patch in both directions.
 - Generic graphs support downstream label types, captured weight callbacks,
@@ -22,7 +30,10 @@ They distinguish supported designs from current compiler or API boundaries.
 - A generic LSP router deserializes downstream parameter types and serializes
   downstream result types inside stored closures. Its separate consumer also
   validates public stateful APIs, standard I/O and UTF-16 document coordinates
-  against an independent Python client.
+  against an independent Python client. Negotiated UTF-8/UTF-16/UTF-32 positions
+  share rope-based conversion and transactional edit semantics; 4,768 additional
+  boundary checks and 48 edit sequences agree with Python. Incoming and outgoing
+  deadlines contribute to one explicit event-loop wakeup calculation.
 - The Markdown library combines mutually recursive block/inline trees, shared
   node arenas, captured visitors, Unicode case folding and ordinary Go FFI
   character classifiers. Its generated entity lookup table compiles as GoML;
@@ -46,9 +57,12 @@ They distinguish supported designs from current compiler or API boundaries.
   generic reply decoders and captured fallible transformations; consumer-defined
   `FromReply` implementations specialize across the versioned module boundary.
   Incremental recursive RESP values preserve binary data, attributes and streamed
-  aggregates. All 19 library tests also pass under Go's race detector, including
+  aggregates. All 29 library tests also pass under Go's race detector, including
   concurrent calls, close wakeups and cancellation during partial replies.
-  DNS/TLS connectors now use the released standard network APIs. Eleven Python
+  Bounded pools reserve slots before dialing, serialize shared lease aliases,
+  retire unhealthy connections and preserve ambiguous-write errors without
+  replaying commands. Real Redis checks cover concurrent INCR and replacement
+  after CLIENT KILL. DNS/TLS connectors use standard network APIs. Fifteen Python
   TLS-server cases, repeated under the race detector, verify trust, mTLS,
   setup/operation deadlines and both context and legacy cancellation.
 
@@ -202,6 +216,13 @@ Its public scan API composes a custom exclusion closure with hierarchical Git
 rules and bounded filesystem traversal, preserving explicit-root behavior and
 returning errors instead of partial totals when traversal fails.
 
+Notify and walkdir now compile as independent ecosystem modules using only
+public standard filesystem, byte, syscall, task and time APIs. Moving their
+implementations out of the compiler's standard-package catalog preserves their
+public API and Linux descriptor lifecycles. Their separate consumers retain
+the original compiler-module scenarios for recursive notifications, cancellation,
+subscriptions, symlink traversal and directory syscall behavior.
+
 ## Fixed compiler regressions
 
 Ignore-file BOM handling exposed a Go output bug: a decoded `\uFEFF` string
@@ -247,6 +268,10 @@ the transport workaround and uses standard I/O directly in its FFI package.
 - Integer `to_string` now works in CTFE; bitflags uses it when generating masks.
   Derives can generate public inherent methods. General CTFE collections,
   associated constants, and const generics remain future work.
+- Derive attribute metadata does not retain every token form: numeric and raw
+  string values can be omitted by attribute lowering. CLI validates the retained
+  raw attribute text, rejects invalid non-string values and decodes raw strings
+  itself; escaped ordinary strings continue to use decoded compiler metadata.
 - `std::resource` combines action and cleanup errors and provides concurrent,
   idempotent LIFO scopes. `Bytes::copy` and `freeze` make buffer isolation explicit.
   Serde formats can distinguish text from binary through `is_human_readable`.

@@ -2864,8 +2864,6 @@ use std::error;
 use std::env;
 use std::ffi;
 use std::fs;
-use std::fs::notify;
-use std::fs::walkdir;
 use std::io;
 use std::iter;
 use std::json;
@@ -2905,8 +2903,6 @@ Public APIs include:
 - `env::args`, current-directory and executable queries, and environment-variable reads
 - `ffi::String`, `Rune`, `Ptr`, `Error`, `Func`, `RawSlice`, `RawMap`, and explicit Go boundary adapters
 - `fs::read_file_structured`, `write_file_structured`, structured byte I/O, directory operations, path inspection, and `sha256_file`
-- `fs::notify` Linux amd64 file and recursive-directory notifications, event filters, ignore rules with subtree pruning, independent multi-path registrations, cancellable reads, bounded subscriptions, rename cookies, and rescan signals
-- `fs::walkdir::{walk, WalkDir, WalkIterator, DirEntry, Error}` for lazy directory traversal, depth bounds, pruning, link following, and contextual errors
 - `io::{Read, Write, BufRead, Close}`, `Cursor`, `Take`, `BufReader`, `BufWriter`, `copy`, `stdin`, `stdout`, `stderr`, and the existing standard-stream functions
 - `iter::empty`, `once`, `from_fn`, iterator adapters, and single-pass consumers
 - `json::Value`, `parse`, `encode`, serde `Serialize` and `Deserialize` re-exports, `to_value`, `from_value`, `try_to_string`, `from_string`, `field`, and typed `as_*` accessors
@@ -3454,153 +3450,39 @@ fn connect_example() -> Result[tls::TlsStream, io::Error] {
 }
 ```
 
-### Directory traversal
+### Filesystem ecosystem packages
 
-`std::fs::walkdir` implements lazy, iterative depth-first traversal in GoML using Linux amd64 syscalls: `openat`, `getdents64`, `newfstatat`, `fstat`, and `close`. Other targets are unsupported; it does not fall back to host directory-listing or metadata APIs. `walk(root: string) -> WalkIterator` uses the defaults from `WalkDir::new(root)`: include the root at depth zero, visit directories before their contents, sort siblings by file name, impose no depth limit, and do not follow symbolic links, including a root link. A file root yields one entry. Construction performs no filesystem I/O; the first iterator step checks the root.
+Recursive directory traversal and filesystem notifications are independent
+third-party modules: [`ecosystem::walkdir`](../ecosystem/walkdir/README.md) and
+[`ecosystem::notify`](../ecosystem/notify/README.md). They use public standard
+filesystem, syscall, task and time APIs. Their sources are no longer bundled
+with the toolchain as `std::fs::walkdir` or `std::fs::notify`.
 
-`WalkDir` is a reusable value builder. Each `iter()` or `IntoIterator::into_iter()` creates an independent `WalkIterator`, so it can also be used directly in `for`. Builder methods return a modified value:
+Add dependencies to the module-root manifest and import the new paths:
 
-| Method | Behavior |
-| --- | --- |
-| `min_depth(isize)` | Hide entries shallower than the bound while still traversing them. |
-| `max_depth(isize)` | Include this depth but never read directories below it. |
-| `follow_links(bool)` | Follow file and directory symbolic links, including the root. |
-| `contents_first(bool)` | Yield a directory after its descendants instead of before them. |
-| `filter_entry((DirEntry) -> bool)` | Reject an entry and prune its entire subtree. Repeated filters are combined with short-circuiting AND. |
-
-Negative bounds or `min_depth > max_depth` produce one `InvalidInput` error before filesystem access, followed by exhaustion. The predicate runs after metadata is obtained, before descending, and even for entries hidden by `min_depth`; it also prunes correctly with `contents_first(true)`. Use `std::iter::filter` when only output should be filtered without pruning.
-
-`WalkIterator` implements `Iterator` with `Item = Result[DirEntry, Error]` and composes with `std::iter`. In preorder, call `skip_current_dir()` immediately after receiving a directory to skip its descendants. The directory is not opened until the next `next()` call. Skipping before iteration, after a file or error, or in contents-first order does nothing. `close()` releases all retained directory descriptors, clears pending work, and permanently exhausts the iterator; it is idempotent. Complete exhaustion also releases all descriptors. When stopping early, including after an error, call `close()` or use `defer`; garbage collection does not close descriptors. Explicit `close()` attempts every descriptor and discards close errors; a close failure during normal iteration is returned as an error. On Linux, close is never retried, including after `EINTR`. Exhaustion is permanent. Copies of an iterator share progress and must be used by one consumer; copies of the builder can start independent walks.
-
-`DirEntry` exposes `path()`, `file_name() -> Option[string]`, `depth()`, `file_type()`, `metadata()`, and `path_is_symlink()`. Metadata is a snapshot taken before yielding the entry. When following a link, `file_type()` and `metadata()` describe the target while `path_is_symlink()` remains true. Paths retain the supplied root spelling and use `path::join` for children; they are not replaced with canonical target paths.
-
-`Error` exposes `path()`, `depth()`, `kind()`, `fs_error()`, and `loop_ancestor() -> Option[string]`, plus `ToString` and `Debug`. The underlying `fs::Error` retains its operation and available raw OS code. A failed entry or directory emits an error and traversal continues with remaining branches. Errors are not suppressed by `min_depth`. A directory-read error follows its entry in preorder and precedes its entry in contents-first order. Device and inode identities from opened directory descriptors detect ancestor loops, including directory links and bind-mount aliases; these return `InvalidData` with the offending path and the ancestor's traversal path, then skip that subtree. Sibling aliases to the same directory are each traversed. Dangling links are ordinary link entries by default and metadata errors when followed; a link chain rejected by the OS reports its filesystem error without a loop ancestor.
-
-```goml
-use std::fs::walkdir;
-use std::io;
-
-fn main() -> () {
-    let tree = walkdir::WalkDir::new(".")
-        .max_depth(8)
-        .filter_entry(|entry| entry.file_name() != Option::Some(".git"));
-    let iterator = tree.iter();
-    defer iterator.close();
-    for item in iterator {
-        match item {
-            Ok(entry) => println(entry.path()),
-            Err(error) => io::eprintln(error.to_string()),
-        }
-    }
-}
+```toml
+[dependencies]
+"ecosystem::walkdir" = "0.1.0"
+"ecosystem::notify" = "0.1.0"
 ```
 
-Directory entries are read in 32 KiB `getdents64` batches, decoded with record-length and filename validation, and sorted before traversal. Full metadata is still read for each yielded entry to preserve `metadata()` snapshot semantics; `d_type` is not used to omit these queries, so `DT_UNKNOWN` requires no special fallback. Invalid UTF-8 filenames report `InvalidData` for the directory. Paths remain UTF-8 strings, and embedded NUL bytes are rejected before calling the kernel.
-
-One descriptor per active ancestor is retained until its subtree finishes. Descriptors use `O_CLOEXEC`; child lookup uses the parent descriptor, so renaming an opened ancestor does not redirect traversal to a replacement at its old path. Returned paths still reflect the original traversal spelling. Opening a directory checks that its identity matches the earlier metadata; a changed directory produces an error and is skipped. Without link following, `O_NOFOLLOW` also rejects replacement of the final directory component by a symbolic link. Path prefixes and explicit links follow kernel resolution rules; this is not a confinement API or an atomic filesystem snapshot.
-
-Traversal uses an explicit stack rather than recursive calls; memory scales with pending names along the active branch. Very deep trees can reach the process descriptor limit, which produces an OS error for that branch; `max_depth` can bound this usage. Interrupted open, metadata, and directory-read calls retry. Entry failures leave other branches available, so callers must still close an iterator when abandoning it after an error. This API uses ordinary imports, closures, traits, and `for` syntax and adds no grammar or compile-time filesystem access. The native layouts and lifecycle rules follow [getdents64](https://man7.org/linux/man-pages/man2/getdents.2.html), [stat](https://man7.org/linux/man-pages/man2/stat.2.html), [openat](https://man7.org/linux/man-pages/man2/open.2.html), and [close](https://man7.org/linux/man-pages/man2/close.2.html).
-
-### Filesystem notifications
-
-`std::fs::notify` implements filesystem notifications in GoML using `std::os::linux::syscall` and Linux inotify. The supported target is Linux amd64. `watch(path: string)` watches one file or a directory and its immediate entries. `watch_recursive(path: string)` requires a directory, watches existing descendants, and adds watches when directories are created or moved into the tree. Both return `Result[Watcher, fs::Error]`. Descendant symbolic links are not traversed, and a symbolic link as the root is rejected. Directory aliases through bind mounts are unsupported.
-
-`watch_with(path, options: Options)` configures a single watcher. `Options::new()` uses `recursive = false` and `mask = CHANGES`; `with_recursive(bool)` and `with_mask(u32)` return adjusted options. Both fields are public. A requested mask must be a nonempty subset of `ALL_EVENTS`. The available request bits are `ACCESS`, `MODIFY`, `ATTRIB`, `CLOSE_WRITE`, `CLOSE_NOWRITE`, `OPEN`, `MOVED_FROM`, `MOVED_TO`, `CREATE`, `DELETE`, `DELETE_SELF`, and `MOVE_SELF`. `CHANGES` includes these except `ACCESS`, `CLOSE_NOWRITE`, and `OPEN`. Recursive directory topology events, root lifecycle events, and recovery notifications are always delivered even when excluded by the requested filter, so filtering cannot disable recursive maintenance.
-
-`Event` has public `path: string`, `mask: u32`, `cookie: u32`, and `rescan: bool` fields. Paths are absolute. `has(mask)` tests whether any requested mask bit is present, and `is_dir()` tests `IS_DIR`. In addition to requested event bits, masks may contain `UNMOUNT`, `Q_OVERFLOW`, `IGNORED`, or `IS_DIR`. Matching nonzero cookies connect `MOVED_FROM` and `MOVED_TO` events within a registration; cookies are not persistent object identities.
-
-Build ignore rules with `Options::new().with_ignored_names(Vec::from_array([".git", "node_modules"]))` or `with_ignore((absolute_path: string, is_directory: bool) -> bool)`. Repeated calls combine rules with OR. Name rules match literal basenames at every depth and snapshot the supplied vector; they are not glob patterns. An ignored directory prunes its entire subtree, avoiding recursive watches and scans there. Rules apply to initial discovery, new directories, renames, and overflow recovery, including registrations in `WatchSet` and subscriptions. Moving a visible directory into an ignored path removes its subtree watches; moving it back installs watches and requests a rescan. The root itself and recovery signals are never ignored. Construct options through `new()`; predicates must be stable, quick, and must not call back into their watcher because they run while its state is locked.
-
-`Watcher.try_read() -> Result[Vec[Event], fs::Error]` reads one available batch without waiting for new kernel events. `Watcher.read(timeout: time::Duration)` has the same return type and waits for a nonempty batch, returning an empty vector on timeout. A zero timeout checks immediately. `read_with(cancel: task::CancelToken, timeout)` returns `Result[task::WaitResult[Vec[Event]], fs::Error]`; cancellation returns `Cancelled` and leaves the watcher available. A read that wins a race with cancellation may return `Completed(events)`. Waits check cancellation and close in intervals of at most 50 ms. Timeouts and cancellation bound waiting for kernel events, not directory scans or time spent waiting for another operation to release shared state.
-
-Single-watcher copies share a synchronized handle. Concurrent reads divide the event stream. `close() -> Result[(), fs::Error]` releases the descriptor and all watches and is idempotent; `is_closed()` reports terminal state. Use explicit close or `defer`; garbage collection does not close watchers. A single-file watcher follows the watched inode until a terminal event. Editors commonly replace a file atomically, which ends that file watch; monitor its parent directory and filter event paths when replacement must be followed.
-
 ```goml
+use ecosystem::walkdir;
+use ecosystem::notify;
 use std::fs;
-use std::fs::notify;
 use std::time;
-
-fn monitor_once(directory: string) -> Result[(), fs::Error] {
-    let watcher = notify::watch_recursive(directory)?;
-    defer {
-        let _ = watcher.close();
-    };
-    for event in watcher.read(time::Duration::from_seconds(5))? {
-        if event.rescan {
-            println("rescan " + event.path);
-        }
-        if event.has(notify::CREATE | notify::MODIFY | notify::DELETE) {
-            println(event.path);
-        }
-    }
-    Result::Ok(())
-}
 ```
 
-`WatchSet::new()` creates an initially empty manager for multiple independent registrations. It does not open a kernel descriptor until a path is added.
-
-| Method | Result and behavior |
-| --- | --- |
-| `add(path)` | `Result[WatchId, fs::Error]`; add a file or nonrecursive directory |
-| `add_recursive(path)` | `Result[WatchId, fs::Error]`; add a directory tree |
-| `add_with(path, options)` | `Result[WatchId, fs::Error]`; add with explicit options |
-| `remove(id)` | `Result[bool, fs::Error]`; close that registration; `false` means it was absent |
-| `watches()` | `Result[Vec[WatchInfo], fs::Error]`; snapshot of public `id`, absolute `path`, and `options` |
-| `try_read()` | `Result[Vec[Notice], fs::Error]`; read at most one kernel batch per registration |
-| `read(timeout)` | Same result; wait for notices or return an empty vector on timeout |
-| `read_with(cancel, timeout)` | `Result[task::WaitResult[Vec[Notice]], fs::Error]`; cancellable waiting |
-| `close()` / `is_closed()` | Close every registration idempotently / query manager state |
-
-`WatchId` supports equality, hashing, debug output, and `value() -> u64`. IDs are local to one `WatchSet` and are not reused during its lifetime. Duplicate or overlapping paths receive independent IDs and may produce duplicate events, each tagged with its registration. Removing one ID leaves other registrations intact. Registration failure cleans up the attempted registration and leaves existing registrations unchanged. Each registered root uses a separate inotify instance, descriptor, and event queue; recursive roots additionally consume one kernel watch per directory. Kernel limits such as `max_user_instances`, `max_user_watches`, and the process descriptor limit are reported as structured errors with numeric errno.
-
-`Notice` is `Event(WatchId, Event)`, `Error(WatchId, fs::Error)`, or `Removed(WatchId)`. A terminal root event is followed by `Removed`; a decoding or maintenance failure produces `Error` followed by `Removed`. Such failures affect only that registration. The manager remains available, even after its last registration ends, and accepts new paths. Explicit `remove` reports its result directly and does not enqueue a `Removed` notice. Events are ordered within each registration; the set promises no total order across roots and collects from every root to prevent one busy root from starving another.
-
-Both `Watcher` and `WatchSet` provide `subscribe(scope: task::Scope, capacity: isize)`, returning `Result[Subscription[Event], fs::Error]` and `Result[Subscription[Notice], fs::Error]`, respectively. The subscription starts a task in the supplied scope and takes responsibility for closing the source on exit. Its `events()` returns a `Receiver[Result[Vec[T], fs::Error]]`; `done()` becomes ready after the worker has finished. A single-watcher error is delivered as `Err` before the channel closes. Per-registration errors in a set remain `Notice::Error` values, allowing other registrations to continue.
-
-The channel capacity counts batches, not individual events. Zero is an unbuffered channel; a negative capacity is rejected. A full channel applies backpressure and does not silently drop delivered batches. The kernel queue can still overflow while a consumer is slow, and recovery is reported through `rescan`. `Subscription.close()` signals shutdown, joins the worker, closes the source, and returns its close result; copies can call it repeatedly or concurrently. Scope cancellation and closing the underlying source also unblock a producer waiting to send. Shutdown may discard an undelivered batch, while already buffered batches can be drained. A rejected subscription, including one attempted in an already cancelled scope, leaves its source available. Consume through one subscription, or through explicit reads; mixing them divides events between consumers.
-
-```goml
-use std::fs;
-use std::fs::notify;
-use std::task;
-use std::io;
-
-fn monitor_pair(scope: task::Scope, first: string, second: string) -> Result[(), fs::Error] {
-    let watches = notify::WatchSet::new();
-    defer {
-        let _ = watches.close();
-    };
-    let _ = watches.add_recursive(first)?;
-    let _ = watches.add_recursive(second)?;
-    let stream = watches.subscribe(scope, 16)?;
-    defer {
-        let _ = stream.close();
-    };
-    while let Some(batch) = stream.events().recv() {
-        for notice in batch? {
-            match notice {
-                notify::Notice::Event(id, event) => {
-                    println(id.value().to_string() + ": " + event.path);
-                    if event.rescan {
-                        println("rescan " + event.path);
-                    }
-                },
-                notify::Notice::Error(_, error) => io::eprintln(error.to_string()),
-                notify::Notice::Removed(_) => (),
-            }
-        }
-    }
-    Result::Ok(())
-}
-```
-
-Without a subscription, call a reading method regularly: recursive registration and rename maintenance run while consuming kernel events. For an internal directory rename, the watcher matches cookies across read batches and updates descendant paths. While a move is unresolved, events inside that subtree are suppressed to avoid reporting paths outside the root. Unmatched moves expire after 100 ms when the input queue becomes empty. Reusing an old path creates a new subscription to that directory without retaining the moved-out tree. If a directory scan discovers a relocation before its queued rename records have been processed, the library reconciles descriptor paths and requests a root rescan rather than treating that ordinary race as a fatal alias error.
-
-When a single watcher's root moves, is deleted, or is unmounted, the terminal event is returned and the watcher closes; subsequent reads return `InvalidInput`. Errors during decoding or watch maintenance also close that watcher, so failures cannot leave a silently incomplete subscription. Errors retain the operation, path when applicable, and numeric errno; unsupported targets return `Unsupported` during registration. Permission failures and exhausted watch limits are not retried indefinitely.
-
-Inotify does not provide an atomic recursive subscription. Files may change before a newly discovered directory gets its own watch. A directory `CREATE` or `MOVED_TO` event therefore sets `rescan = true`, requesting that the caller refresh that subtree's contents. On `Q_OVERFLOW`, the library recreates the affected inotify descriptor and all its watches, discards the remaining stale batch, and returns a root event with `rescan = true`. A synthetic root event with `mask = 0` and `rescan = true` requests reconciliation after paths were discovered ahead of queued rename records. Applications maintaining a cache must rescan the indicated path, then continue processing queued events. If rebuilding fails, the registration closes and reports an error. Initial registration similarly requires the caller's own scan if an initial snapshot is needed.
-
-Notifications may be coalesced, and paths can change again before events are consumed; they are not an audit log. Non-UTF-8 event names produce `InvalidData` rather than replacement characters, consistent with the standard library's UTF-8 path API. Network-filesystem remote changes, mounts placed over watched paths, and memory-mapped writes have the underlying [inotify limitations](https://man7.org/linux/man-pages/man7/inotify.7.html). This API uses ordinary imports, structs, functions, and methods; no grammar changes are introduced.
+The public traversal and notification APIs keep their existing names and
+behavior. Walkers provide lazy iterative traversal, depth bounds, pruning,
+optional link following and contextual errors. Watchers provide recursive
+inotify maintenance, event filters, ignored-subtree pruning, multi-path watch
+sets, timed/cancellable reads and bounded subscriptions. Both currently target
+Linux amd64 and require explicit resource closure when stopping early.
+Their complete API examples, lifecycle rules and platform limits are documented
+in the module READMEs. Normal package/dependency syntax applies; this move adds
+no language grammar. For this checkout, the [ecosystem verifier](../ecosystem/README.md#library-verification)
+constructs an isolated registry for these development modules.
 
 ### Bincode typed binary data
 
@@ -3785,8 +3667,8 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | Go interface adapter | `#[go_interface(RawType, Wrapper, method = "GoMethod")]` generates a checked native-interface wrapper and trait implementation; `from_trait` explicitly creates a typed Go bridge retaining the supplied dyn object; nil/typed-nil and multiple results are preserved |
 | Go binding generator | `goml bind-go <CONFIG>` selects explicit package/symbol allowlists and finite Go-checked generic arguments; emits raw bindings with protected deterministic output |
 | Go-callable export | Annotate a supported public function with `#[go_export("Name")]` and generate a Go package with `goml export-go` |
-| Traverse a directory tree | `std::fs::walkdir` Linux amd64 syscall-backed depth-first iteration with depth bounds, pruning, optional link following, and per-path errors |
-| Watch a directory tree for changes | Use `fs::notify::watch_recursive` or `WatchSet` on Linux amd64, prune ignored paths through `Options`, consume timed reads or scoped subscriptions, handle `Event.rescan`, and close the handle |
+| Traverse a directory tree | `ecosystem::walkdir` dependency for Linux amd64 syscall-backed depth-first iteration with depth bounds, pruning, optional link following, and per-path errors |
+| Watch a directory tree for changes | Use the `ecosystem::notify` dependency and its `watch_recursive` or `WatchSet` on Linux amd64, prune ignored paths through `Options`, consume timed reads or scoped subscriptions, handle `Event.rescan`, and close the handle |
 | TCP and UDP networking | `std::net` sockets, DNS resolution, shared epoll readiness, explicit close, and context-aware waits; `std::net::tls` for verified TLS clients |
 | Keep byte snapshots independent | `Bytes::copy` for mutable copies; `Bytes::freeze` and `FrozenBytes` for immutable snapshots |
 | Preserve action and cleanup errors | `std::resource::{with_cleanup, scope, ScopeError}` or `io::with_resource` |

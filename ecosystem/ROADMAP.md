@@ -33,14 +33,23 @@ is intentionally deferred.
 | redis | Bundled DNS/TLS connectors, mTLS and standard Context cancellation/deadlines composed with existing operation controls |
 | bitflags | Optional `FlagValues` inherent derive for named flag constructors without trait imports |
 
+## Second improvement batch
+
+| Module | Added |
+| --- | --- |
+| proptest | Bounded multi-failure campaigns with shared shrink budgets, categorical histograms and text reports, atomic batch replay persistence, and state-machine execution with reset/invariant/cleanup handling |
+| redis | Bounded connection pools, shared-deadline checkout, idempotent leases, configurable PING health checks, idle/lifetime expiry and replacement of unusable connections without replaying user commands |
+| lsp | UTF-8/UTF-16/UTF-32 position-encoding negotiation, consistent document queries/edits, outgoing request deadlines and combined event-loop wakeup scheduling |
+| cli | Nested flattened Args, typed required/optional subcommand derives, generic payloads, multilevel aliases/help/globals and composition diagnostics |
+| notify / walkdir | Complete filesystem notification and traversal packages moved from `lib/std/fs` into normal versioned dependencies, with their original behavior suites retained as independent consumers |
+
 ## Remaining work
 
 | Module | Remaining capabilities |
 | --- | --- |
-| proptest | Distribution histograms and richer report formatting, failure aggregation, application-oriented state-machine execution helpers; custom callbacks remain responsible for their own bounded work |
-| redis | Connection pools and health/reconnection policies, Cluster/Sentinel, typed Streams commands and sharded subscriptions; no automatic retry of ambiguous writes; active standard TLS I/O interruption requires reconnection |
-| lsp | Position-encoding negotiation, broader typed feature models (completion, code actions, workspace edits and semantic tokens) and outgoing deadline scheduling |
-| cli | Nested/flattened argument derives, derived subcommands, shell completion, defaults/environment for flags and counters |
+| redis | Cluster/Sentinel, typed Streams commands and sharded subscriptions; no automatic retry of ambiguous writes; active standard TLS I/O interruption requires reconnection |
+| lsp | Broader typed feature models (completion, code actions, workspace edits and semantic tokens); the application event loop drives deadline polling |
+| cli | Shell completion and defaults/environment for flags and counters |
 | diff | Multi-file and Git metadata support, three-way merge, offset/fuzzy application; the linear-space algorithm is explicitly selected and has O(NM) worst-case time |
 | parser | Recovery with multiple diagnostics, token-stream and incremental text parsing, further binary/text combinator parity; grammar left recursion still requires rewriting |
 | template | Macros/imports/call blocks, keyword arguments, file-loader invalidation and incremental output writing |
