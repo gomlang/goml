@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 
 ROOT = Path(__file__).resolve().parent
@@ -19,6 +20,7 @@ def main():
     for name in tests:
         subprocess.run([str(BINARY), f'ecosystem::redis::tests::{name}'], cwd=ROOT, env=environment, check=True, timeout=30)
     print(f'Redis race detector: {len(tests)} tests passed')
+    subprocess.run([sys.executable, str(ROOT / 'network_check.py'), '--race'], check=True, timeout=180)
 
 
 if __name__ == '__main__':

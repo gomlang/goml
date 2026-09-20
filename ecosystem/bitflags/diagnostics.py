@@ -31,14 +31,19 @@ def main():
         ('#[flags(A=invalid)] struct Bad { value: u8 }', 'require NAME = "mask"'),
         ('#[flags("1")] struct Bad { value: u8 }', 'require NAME = "mask"'),
     ]
+    cases = [(declaration, expected, "Flags") for declaration, expected in cases] + [
+        ('#[flags(READ="1", read="2")] struct Bad { value: u8 }', 'accessor collision: flag_read', 'FlagValues'),
+        ('#[flags(READ="256")] struct Bad { value: u8 }', 'out-of-range flag mask', 'FlagValues'),
+        ('#[flags(READ="1")] struct Bad[T] { value: T }', 'non-generic struct', 'FlagValues'),
+    ]
     artifacts = ROOT / "bitflags/_artifact/diagnostics"
     artifacts.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=artifacts) as temporary:
-        for index, (declaration, expected) in enumerate(cases):
+        for index, (declaration, expected, derive) in enumerate(cases):
             directory = Path(temporary) / str(index)
             directory.mkdir()
             (directory / "goml.toml").write_text('[module]\npath="diagnostics::bitflags"\n[dependencies]\n"ecosystem::bitflags"="0.1.0"\n')
-            (directory / "main.gom").write_text('package main;\nuse ecosystem::bitflags;\n#[derive(bitflags::Flags)]\n' + declaration + '\nfn main() -> () {}\n')
+            (directory / "main.gom").write_text('package main;\nuse ecosystem::bitflags;\n#[derive(bitflags::' + derive + ')]\n' + declaration + '\nfn main() -> () {}\n')
             subprocess.run([goml, "fmt"], cwd=directory, env=environment, check=True, capture_output=True, text=True)
             result = subprocess.run([goml, "check"], cwd=directory, env=environment, capture_output=True, text=True, timeout=60)
             output = result.stdout + result.stderr

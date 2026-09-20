@@ -1,0 +1,168 @@
+package main;
+
+use ecosystem::redis;
+use ecosystem::redis::commands;
+use std::context;
+use std::fs;
+use std::io;
+use std::net::tls;
+use std::num;
+use std::task;
+use std::testing;
+use std::time;
+
+fn stalled(connection: redis::Connection, operation: redis::Operation) -> () {
+    let error = testing::expect_err(
+        connection.execute(testing::expect_ok(commands::echo("stall"), "command"), operation),
+        "stalled request",
+    );
+    testing::assert_eq(error.kind, redis::ErrorKind::Timeout);
+    testing::assert(error.may_have_executed);
+    testing::assert(connection.is_closed());
+}
+
+fn cancelled_request(connection: redis::Connection, operation: redis::Operation, cancel: () -> ()) -> () {
+    task::scope(
+        |scope| {
+            let worker = scope.spawn(
+                |_| connection.execute(
+                    testing::expect_ok(commands::echo("stall"), "command"),
+                    operation,
+                ),
+            );
+            let _ = testing::expect_ok(io::read_stdin_to_string(), "cancellation barrier");
+            cancel();
+            let error = testing::expect_err(worker.join(), "cancelled request");
+            testing::assert_eq(error.kind, redis::ErrorKind::Cancelled);
+            testing::assert(error.may_have_executed);
+            testing::assert(connection.is_closed());
+        },
+    );
+}
+
+fn secure_network(args: Vec[string]) -> Result[(), string] {
+    let scopes = task::active_scope_count();
+    defer {
+        testing::assert_eq(task::active_scope_count(), scopes);
+    };
+    if args.len() != 7 {
+        return Result::Err("--tls host port certificate key mode")
+    }
+    let host = args[2];
+    let port = num::parse_uint_structured(args[3]).map_err(|error| error.to_string())?;
+    if port > 65535 {
+        return Result::Err("invalid port")
+    }
+    let mode = args[6];
+    let pem = fs::read_file_structured(args[4]).map_err(|error| error.to_string())?;
+    let mut config = tls::ClientConfig::new(
+        if mode == "name" {
+            "wrong.invalid"
+        } else {
+            "localhost"
+        },
+    );
+    if mode != "untrusted" {
+        config = config.with_ca_pem(pem.to_bytes().as_slice());
+    }
+    if mode == "mutual" {
+        let key = fs::read_file_structured(args[5]).map_err(|error| error.to_string())?;
+        config = config.with_client_certificate(
+            pem.to_bytes().as_slice(),
+            key.to_bytes().as_slice(),
+        );
+    }
+    let operation = redis::Operation::new().with_timeout(
+        time::Duration::from_milliseconds(
+            if mode == "handshake_timeout" || mode == "hello_timeout" {
+                150
+            } else {
+                3000
+            },
+        ),
+    );
+    let result = if mode == "plain" {
+        redis::Connection::connect_host(
+            host,
+            port.to_u16(),
+            redis::ConnectionOptions::standard(),
+            operation,
+        )
+    } else {
+        redis::Connection::connect_tls(
+            host,
+            port.to_u16(),
+            config,
+            redis::ConnectionOptions::standard(),
+            operation,
+        )
+    };
+    if mode == "untrusted" || mode == "name" || mode == "handshake_timeout"
+        || mode == "hello_timeout" {
+        let error = testing::expect_err(result, "rejected connection");
+        testing::assert_eq(
+            error.kind,
+            if mode == "handshake_timeout" || mode == "hello_timeout" {
+                redis::ErrorKind::Timeout
+            } else {
+                redis::ErrorKind::Io
+            },
+        );
+        return Result::Ok(())
+    }
+    let connection = result.map_err(|error| error.to_string())?;
+    defer {
+        let _ = connection.close();
+    };
+    for _ in 0..3 {
+        let pong = connection.execute(
+            commands::ping().map_err(|error| error.to_string())?,
+            redis::Operation::new(),
+        ).map_err(|error| error.to_string())?;
+        testing::assert_eq(pong, "PONG");
+    }
+    if mode == "io_timeout" {
+        stalled(
+            connection,
+            redis::Operation::new().with_timeout(time::Duration::from_milliseconds(50)),
+        );
+    } else if mode == "context_timeout" {
+        context::with_timeout(
+            context::Context::background(),
+            time::Duration::from_milliseconds(50),
+            |ctx, _| stalled(
+                connection,
+                redis::Operation::new().without_timeout().with_context(ctx),
+            ),
+        );
+    } else if mode == "cancel" {
+        context::with_cancel(
+            context::Context::background(),
+            |ctx, cancel| cancelled_request(
+                connection,
+                redis::Operation::new().without_timeout().with_context(ctx),
+                || cancel.cancel(),
+            ),
+        );
+    } else if mode == "legacy" {
+        task::scope(
+            |scope| context::with_cancel(
+                context::Context::background(),
+                |ctx, _| cancelled_request(
+                    connection,
+                    redis::Operation::new().without_timeout().with_context(ctx).with_cancel(
+                        scope.token(),
+                    ),
+                    || scope.cancel(),
+                ),
+            ),
+        );
+    } else {
+        let echo = connection.execute(
+            commands::echo("secure\u0000echo").map_err(|error| error.to_string())?,
+            redis::Operation::new(),
+        ).map_err(|error| error.to_string())?;
+        testing::assert_eq(echo.text().map_err(|error| error.to_string())?, "secure\u0000echo");
+    }
+    Result::Ok(())
+}

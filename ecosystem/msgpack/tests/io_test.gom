@@ -1,0 +1,204 @@
+package tests;
+
+use ecosystem::msgpack;
+use ecosystem::msgpack::{StreamReader, StreamWriter, StreamError, Options, Limits, ErrorKind, Value};
+use std::bytes;
+use std::io;
+use io::{Read, Write};
+use std::testing;
+
+fn io_problem(kind: io::ErrorKind) -> io::Error {
+    io::Error::new(kind, "test stream", Option::None, Option::None, "injected")
+}
+
+struct Fragmented {
+    cursor: io::Cursor,
+    calls: Ref[isize],
+}
+
+impl Read for Fragmented {
+    fn read(self: Fragmented, buffer: MutSlice[byte]) -> Result[isize, io::Error] {
+        let call = self.calls.get();
+        self.calls.set(call + 1);
+        if call == 0 {
+            Result::Err(io_problem(io::ErrorKind::Interrupted))
+        } else {
+            self.cursor.read(
+                buffer.sub(
+                    0,
+                    if buffer.len() > 1 {
+                        1
+                    } else {
+                        buffer.len()
+                    },
+                ),
+            )
+        }
+    }
+}
+
+struct InvalidRead {
+    count: isize,
+    calls: Ref[isize],
+}
+
+impl Read for InvalidRead {
+    fn read(self: InvalidRead, _buffer: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        Result::Ok(self.count)
+    }
+}
+
+struct PartialWriter {
+    output: io::Cursor,
+    calls: Ref[isize],
+    fail: bool,
+    flushes: Ref[isize],
+}
+
+impl Write for PartialWriter {
+    fn write(self: PartialWriter, buffer: Slice[byte]) -> Result[isize, io::Error] {
+        let call = self.calls.get();
+        self.calls.set(call + 1);
+        if call == 0 {
+            return Result::Err(io_problem(io::ErrorKind::Interrupted))
+        }
+        if call == 2 && self.fail {
+            return Result::Err(io_problem(io::ErrorKind::BrokenPipe))
+        }
+        self.output.write(
+            buffer.sub(
+                0,
+                if buffer.len() > 2 {
+                    2
+                } else {
+                    buffer.len()
+                },
+            ),
+        )
+    }
+
+    fn flush(self: PartialWriter) -> Result[(), io::Error] {
+        self.flushes.set(self.flushes.get() + 1);
+        Result::Ok(())
+    }
+}
+
+#[test]
+fn standard_streams_handle_partial_transfers_and_multiple_bounded_frames() -> () {
+    let output = io::Cursor::new(bytes::Bytes::new());
+    let sink = PartialWriter { output, calls: Ref::new(0), fail: false, flushes: Ref::new(0) };
+    let options = Options {
+        limits: Limits { max_bytes: 12, ..Limits::standard() },
+        ..Options::standard(),
+    };
+    let writer = testing::expect_ok(StreamWriter::new(sink, options), "writer");
+    for index in 0..50 {
+        testing::assert_ok(writer.serialize(index));
+    }
+    testing::assert_ok(writer.write(Value::Extension(-4, Vec::from_array([1, 0, 255]))));
+    testing::assert_eq(sink.flushes.get(), 0);
+    testing::assert_ok(writer.flush());
+    testing::assert_eq(sink.flushes.get(), 1);
+    testing::assert(output.bytes().len() > options.limits.max_bytes);
+    let reader = testing::expect_ok(
+        StreamReader::with_capacity(
+            Fragmented { cursor: io::Cursor::new(output.bytes()), calls: Ref::new(0) },
+            5,
+            options,
+        ),
+        "reader",
+    );
+    for index in 0..50 {
+        let next: Option[isize] = testing::expect_ok(reader.decode_next(), "next number");
+        testing::assert(next == Option::Some(index));
+    }
+    match testing::expect_ok(reader.next(), "extension") {
+        Some(Value::Extension(tag, data)) => {
+            testing::assert_eq(tag, -4);
+            testing::assert(data == Vec::from_array([1, 0, 255]));
+        },
+        _ => testing::fail("expected extension"),
+    }
+    testing::assert(testing::expect_ok(reader.next(), "EOF").is_none());
+    testing::assert(testing::expect_ok(reader.next(), "fused EOF").is_none());
+}
+
+#[test]
+fn typed_stream_mismatch_retains_the_frame_for_another_decoder() -> () {
+    let encoded = testing::expect_ok(msgpack::to_vec("retained"), "encode");
+    let reader = testing::expect_ok(
+        StreamReader::new(io::Cursor::new(bytes::Bytes::from_vec(encoded)), Options::standard()),
+        "reader",
+    );
+    let wrong: Result[Option[bool], StreamError] = reader.decode_next();
+    testing::assert(wrong.is_err());
+    let right: Option[string] = testing::expect_ok(reader.decode_next(), "retry type");
+    testing::assert(right == Option::Some("retained"));
+    testing::assert(testing::expect_ok(reader.next(), "end").is_none());
+}
+
+#[test]
+fn stream_bounds_truncation_and_invalid_reader_counts_are_recoverable() -> () {
+    for count in Vec::from_array([-1, 4]) {
+        let calls = Ref::new(0);
+        let reader = testing::expect_ok(
+            StreamReader::with_capacity(InvalidRead { count, calls }, 3, Options::standard()),
+            "reader",
+        );
+        match testing::expect_err(reader.next(), "invalid count") {
+            StreamError::Io(error) => testing::assert_eq(error.kind(), io::ErrorKind::InvalidData),
+            _ => testing::fail("expected I/O error"),
+        }
+        testing::assert(reader.next().is_err());
+        testing::assert_eq(calls.get(), 1);
+    }
+    let cursor = io::Cursor::new(bytes::Bytes::from_vec(Vec::from_array([0xd9, 3, b'x'])));
+    let reader = testing::expect_ok(
+        StreamReader::new(cursor, Options::standard()),
+        "truncated reader",
+    );
+    match testing::expect_err(reader.next(), "truncated input") {
+        StreamError::Codec(error) => testing::assert_eq(error.kind, ErrorKind::UnexpectedEof),
+        _ => testing::fail("expected codec error"),
+    }
+    testing::assert(reader.next().is_err());
+    let options = Options {
+        limits: Limits { max_bytes: 0, ..Limits::standard() },
+        ..Options::standard(),
+    };
+    let empty = testing::expect_ok(
+        StreamReader::new(io::Cursor::new(bytes::Bytes::new()), options),
+        "empty limit",
+    );
+    testing::assert(testing::expect_ok(empty.next(), "empty EOF").is_none());
+    let limited = testing::expect_ok(
+        StreamReader::new(io::Cursor::new(bytes::Bytes::from_vec(Vec::from_array([0xc0]))), options),
+        "zero limit",
+    );
+    testing::assert(limited.next().is_err());
+    testing::assert(
+        StreamReader::with_capacity(io::Cursor::new(bytes::Bytes::new()), 0, options).is_err(),
+    );
+}
+
+#[test]
+fn writer_validation_is_atomic_and_partial_io_failure_is_terminal() -> () {
+    let output = io::Cursor::new(bytes::Bytes::new());
+    let calls = Ref::new(0);
+    let sink = PartialWriter { output, calls, fail: true, flushes: Ref::new(0) };
+    let options = Options {
+        limits: Limits { max_bytes: 16, ..Limits::standard() },
+        ..Options::standard(),
+    };
+    let writer = testing::expect_ok(StreamWriter::new(sink, options), "writer");
+    testing::assert(writer.serialize("this value exceeds the configured byte limit").is_err());
+    testing::assert_eq(calls.get(), 0);
+    testing::assert(writer.serialize("truncated").is_err());
+    testing::assert_eq(output.bytes().len(), 2);
+    testing::assert_eq(calls.get(), 3);
+    testing::assert(writer.serialize(1).is_err());
+    testing::assert(writer.flush().is_err());
+    testing::assert_eq(calls.get(), 3);
+    testing::assert_eq(sink.flushes.get(), 0);
+}

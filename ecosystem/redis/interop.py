@@ -4,6 +4,7 @@ from pathlib import Path
 import random
 import socket
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
@@ -152,6 +153,7 @@ def main():
         raise RuntimeError('Build the Redis consumer with ecosystem/verify.py first')
     protocol_cases()
     live_cases()
+    subprocess.run([sys.executable, str(ROOT / 'redis' / 'network_check.py')], check=True, timeout=120)
 
 
 if __name__ == '__main__':
