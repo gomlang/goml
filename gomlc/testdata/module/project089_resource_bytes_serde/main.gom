@@ -1,0 +1,204 @@
+package main;
+
+use std::bytes;
+use std::io;
+use std::json;
+use std::bincode;
+use std::serde;
+use serde::{Serialize, Deserialize, Serializer, Deserializer};
+use std::resource;
+use std::task;
+use std::testing;
+
+fn check_bytes() -> () {
+    let source = Vec::from_array([1.to_u8(), 2.to_u8(), 3.to_u8()]);
+    let shared = bytes::Bytes::from_vec(source);
+    let copy = shared.copy();
+    let copied_vec = shared.to_vec_copy();
+    let frozen = shared.freeze();
+    let view = testing::expect_some(frozen.slice_checked(1, 3), "frozen view");
+    source[1] = 9.to_u8();
+    copied_vec[0] = 8.to_u8();
+    testing::assert_eq(shared.get(1), 9.to_u8());
+    testing::assert_eq(copy.get(1), 2.to_u8());
+    testing::assert_eq(testing::expect_some(frozen.get_checked(0), "frozen byte"), 1.to_u8());
+    let thawed = view.thaw();
+    thawed.set(0, 7.to_u8());
+    testing::assert(view.to_vec_copy() == Vec::from_array([2.to_u8(), 3.to_u8()]));
+    testing::assert(frozen.get_checked(-1).is_none());
+    testing::assert(frozen.get_checked(3).is_none());
+    testing::assert(frozen.slice_checked(0, 4).is_none());
+    testing::assert(frozen.slice_checked(2, 1).is_none());
+    testing::assert(testing::expect_some(view.slice_checked(2, 2), "empty").is_empty());
+    let builder = bytes::Builder::new();
+    builder.push(4.to_u8());
+    let snapshot = builder.finish_copy();
+    builder.push(5.to_u8());
+    testing::assert_eq(snapshot.len(), 1);
+    let slice_copy = bytes::Bytes::from_slice_copy(shared.as_slice());
+    shared.clear();
+    testing::assert_eq(slice_copy.len(), 3);
+    testing::assert(
+        bytes::FrozenBytes::from_string("abc")
+            == bytes::FrozenBytes::from_vec_copy("abc".to_bytes()),
+    );
+}
+
+struct FakeFile {
+    calls: Ref[isize],
+}
+
+impl io::Close for FakeFile {
+    fn close(self: FakeFile) -> Result[(), io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        Result::Err(
+            io::Error::new(io::ErrorKind::Other, "close", Option::None, Option::None, "cleanup"),
+        )
+    }
+}
+
+fn check_cleanup_errors() -> () {
+    let calls = Ref::new(0);
+    let result: Result[isize, resource::ScopeError[string, io::Error]] = io::with_resource(
+        FakeFile { calls },
+        |_| Result::Err("operation"),
+    );
+    match result {
+        Err(error) => {
+            testing::assert_eq(error.action.unwrap_or(""), "operation");
+            testing::assert_eq(error.cleanup.len(), 1);
+            testing::assert_eq(error.cleanup[0].message(), "cleanup");
+        },
+        Ok(_) => testing::fail("expected both errors"),
+    }
+    testing::assert_eq(calls.get(), 1);
+    let result: Result[isize, resource::ScopeError[string, string]] = resource::with_cleanup(
+        || Result::Ok(12),
+        || Result::Err("cleanup only"),
+    );
+    testing::assert_eq(testing::expect_err(result, "cleanup failure").cleanup[0], "cleanup only");
+    let result: Result[isize, resource::ScopeError[string, string]] = resource::with_cleanup(
+        || Result::Ok(12),
+        || Result::Ok(()),
+    );
+    testing::assert_eq(testing::expect_ok(result, "success"), 12);
+}
+
+fn check_scope() -> () {
+    let order = Vec::new();
+    let escaped: Ref[Option[resource::Scope[string]]] = Ref::new(Option::None);
+    let result: Result[(), resource::ScopeError[string, string]] = resource::scope(
+        |scope| {
+            escaped.set(Option::Some(scope));
+            for index in 0..3 {
+                testing::assert(
+                    scope.register(
+                        || {
+                            testing::assert(scope.is_closed());
+                            testing::assert(!scope.register(|| Result::Ok(())));
+                            order.push(index);
+                            Result::Err(index.to_string())
+                        },
+                    ),
+                );
+            }
+            Result::Err("action")
+        },
+    );
+    let error = testing::expect_err(result, "scope errors");
+    testing::assert(order == Vec::from_array([2, 1, 0]));
+    testing::assert(error.cleanup == Vec::from_array(["2", "1", "0"]));
+    let scope = testing::expect_some(escaped.get(), "escaped scope");
+    testing::assert(scope.is_closed());
+    testing::assert(!scope.register(|| Result::Ok(())));
+    let previous = scope.close();
+    previous.clear();
+    testing::assert_eq(scope.close().len(), 3);
+    testing::assert_eq(order.len(), 3);
+    let concurrent: resource::Scope[string] = resource::Scope::new();
+    let cleaned: Channel[isize] = Channel::new(32);
+    task::scope(
+        |tasks| {
+            for index in 0..32 {
+                let _ = tasks.spawn(
+                    |_| {
+                        testing::assert(
+                            concurrent.register(
+                                || {
+                                    cleaned.send(index);
+                                    Result::Ok(())
+                                },
+                            ),
+                        );
+                    },
+                );
+            }
+        },
+    );
+    task::scope(
+        |tasks| {
+            for _ in 0..8 {
+                let _ = tasks.spawn(|_| testing::assert(concurrent.close().is_empty()));
+            }
+        },
+    );
+    cleaned.close();
+    let mut count = 0;
+    while let Some(_) = cleaned.recv() {
+        count += 1;
+    }
+    testing::assert_eq(count, 32);
+}
+
+struct Adaptive {
+    value: u64,
+}
+
+impl Serialize for Adaptive {
+    fn serialize[S: Serializer](self: Adaptive, serializer: S) -> Result[(), string] {
+        if serializer.is_human_readable() {
+            serializer.serialize_string(self.value.to_string())
+        } else {
+            serializer.serialize_uint64(self.value)
+        }
+    }
+}
+
+impl Deserialize for Adaptive {
+    fn deserialize[D: Deserializer](deserializer: D) -> Result[Adaptive, string] {
+        if deserializer.is_human_readable() {
+            let text = deserializer.deserialize_string()?;
+            if text != "42" {
+                return Result::Err("expected 42")
+            }
+            Result::Ok(Adaptive { value: 42 })
+        } else {
+            Result::Ok(Adaptive { value: deserializer.deserialize_uint64()? })
+        }
+    }
+}
+
+fn check_serde() -> () {
+    let encoded = testing::expect_ok(json::try_to_string(Adaptive { value: 42 }), "json");
+    testing::assert_eq(encoded, "\"42\"");
+    let decoded: Adaptive = testing::expect_ok(json::from_string(encoded), "json decode");
+    testing::assert_eq(decoded.value, 42.to_u64());
+    let binary = testing::expect_ok(
+        bincode::encode_to_vec(Adaptive { value: 42 }, bincode::standard()),
+        "binary",
+    );
+    testing::assert(binary == Vec::from_array([42.to_u8()]));
+    let decoded: (Adaptive, isize) = testing::expect_ok(
+        bincode::decode_from_slice(binary.as_slice(), bincode::standard()),
+        "binary decode",
+    );
+    testing::assert_eq(decoded.0.value, 42.to_u64());
+}
+
+fn main() -> () {
+    check_bytes();
+    check_cleanup_errors();
+    check_scope();
+    check_serde();
+    println("resource, byte snapshots and format-sensitive serde: ok");
+}

@@ -1,0 +1,119 @@
+package project;
+
+use module::test_support;
+use std::fs;
+use std::path;
+use std::process;
+use std::testing;
+
+fn native_test_context(name: string) -> Context {
+    let root = test_support::workspace(name) + "/space and ' quote";
+    let dependency = root + "/dependency";
+    test_support::write_file(root + "/goml.toml", "[module]\npath = \"app\"\n");
+    test_support::write_file(root + "/go.mod", "module example.com/app\n\ngo 1.25.0\n");
+    test_support::write_file(
+        root + "/main.go",
+        "package main\nimport (\"fmt\"; \"example.com/native\")\nfunc main() { fmt.Println(native.Value()) }\n",
+    );
+    test_support::write_file(
+        dependency + "/goml.toml",
+        "[module]\npath = \"demo::native\"\n[native]\ngo-module = \"example.com/native\"\n",
+    );
+    test_support::write_file(dependency + "/go.mod", "module example.com/native\n\ngo 1.25.0\n");
+    test_support::write_file(
+        dependency + "/native.go",
+        "package native\nfunc Value() int { return 42 }\n",
+    );
+    Context {
+        graph: Graph {
+            module_dir: root,
+            module_path: "app",
+            entry_package: "app",
+            packages: Vec::new(),
+            sources: Vec::from_array(
+                [
+                    ModuleSource {
+                        name: "app",
+                        directory: root,
+                        artifact_prefix: "",
+                        dependencies: Vec::from_array(["demo::native"]),
+                    },
+                    ModuleSource {
+                        name: "demo::native",
+                        directory: dependency,
+                        artifact_prefix: "",
+                        dependencies: Vec::new(),
+                    },
+                ],
+            ),
+            order: Vec::new(),
+        },
+        compiler: "",
+        compiler_world: CompilerWorld::Source,
+        artifact_root: root + "/_artifact",
+        foreign: Option::None,
+    }
+}
+
+#[test]
+fn native_modules_are_resolved_without_editing_sources() -> () {
+    let context = native_test_context("native_resolution");
+    let root = context.graph.module_dir;
+    let original = test_support::read_file(root + "/go.mod");
+    let dry = testing::expect_ok(prepare_native_environment(context, true), "native dry run");
+    testing::assert_eq(dry.len(), 1);
+    testing::assert(!fs::exists(context.artifact_root));
+    let environment = testing::expect_ok(
+        prepare_native_environment(context, false),
+        "native preparation",
+    );
+    let again = testing::expect_ok(
+        prepare_native_environment(context, false),
+        "native cached preparation",
+    );
+    testing::assert(environment == again);
+    let command = process::Command::new("go").args(
+        Vec::from_array(["run", "-mod=readonly", "main.go"]),
+    ).current_dir(root).env("GOWORK", "off").env("GOPROXY", "off").env("GOTOOLCHAIN", "local");
+    for (key, value) in environment {
+        let _ = command.env(key, value);
+    }
+    let result = testing::expect_ok(command.output_structured(), "native Go execution");
+    test_support::assert_success(result);
+    testing::assert_eq(test_support::stdout(result), "42\n");
+    testing::assert_eq(test_support::read_file(root + "/go.mod"), original);
+    testing::assert(!fs::exists(root + "/go.sum"));
+    test_support::write_file(
+        root + "/dependency/go.mod",
+        "module example.com/native\n\ngo 1.25.0\n\nretract v0.1.0\n",
+    );
+    let changed = testing::expect_ok(
+        prepare_native_environment(context, false),
+        "changed native metadata",
+    );
+    testing::assert(environment != changed);
+    test_support::write_file(root + "/dependency/go.mod", "module example.com/wrong\n\ngo 1.25.0\n");
+    test_support::assert_contains(
+        testing::expect_err(prepare_native_environment(context, false), "module mismatch"),
+        "disagrees with go.mod",
+    );
+}
+
+#[test]
+fn native_modules_reject_missing_roots_and_ambiguous_providers() -> () {
+    let context = native_test_context("native_invalid_sources");
+    let _ = testing::expect_ok(
+        fs::remove_file(path::join(context.graph.module_dir, "go.mod")),
+        "remove root manifest",
+    );
+    test_support::assert_contains(
+        testing::expect_err(prepare_native_environment(context, false), "missing root Go module"),
+        "module-root go.mod",
+    );
+    context.graph.sources.push(context.graph.sources[1]);
+    test_support::assert_contains(
+        testing::expect_err(prepare_native_environment(context, false), "duplicate native provider"),
+        "multiple GoML modules",
+    );
+    testing::assert(native_flag("a'\"b").is_err());
+}
