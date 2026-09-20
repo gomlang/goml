@@ -1,0 +1,235 @@
+package pipeline;
+
+use std::task;
+use std::time;
+
+#[derive(Debug, PartialEq)]
+pub enum ErrorKind {
+    Stage,
+    InvalidConfig,
+    Cancelled,
+    Timeout,
+    Limit,
+}
+
+pub struct Error[E] {
+    pub kind: ErrorKind,
+    pub message: string,
+    pub stage: string,
+    pub index: Option[isize],
+    pub cause: Option[E],
+}
+
+impl[E] Error[E] {
+    fn new(kind: ErrorKind, message: string) -> Error[E] {
+        Error { kind, message, stage: "", index: Option::None, cause: Option::None }
+    }
+
+    fn stage(cause: E, stage: string, index: Option[isize]) -> Error[E] {
+        Error {
+            kind: ErrorKind::Stage,
+            message: "pipeline callback failed",
+            stage,
+            index,
+            cause: Option::Some(cause),
+        }
+    }
+
+    fn cancelled() -> Error[E] {
+        Error::new(ErrorKind::Cancelled, "pipeline cancelled")
+    }
+}
+
+impl[E] ToString for Error[E] {
+    fn to_string(self: Error[E]) -> string {
+        let location = if self.stage == "" {
+            ""
+        } else {
+            " in " + self.stage
+        };
+        let index = self.index.map(|value| " at item " + value.to_string()).unwrap_or("");
+        self.message + location + index
+    }
+}
+
+impl[E] Debug for Error[E] {
+    fn debug(self: Error[E]) -> string {
+        self.to_string()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Control {
+    Continue,
+    Stop,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Order {
+    Input,
+    Completion,
+}
+
+pub struct ParallelOptions {
+    pub workers: isize,
+    pub capacity: isize,
+    pub max_in_flight: isize,
+    pub order: Order,
+}
+
+impl ParallelOptions {
+    pub fn new(workers: isize, capacity: isize, order: Order) -> ParallelOptions {
+        ParallelOptions {
+            workers,
+            capacity,
+            max_in_flight: if workers >= 1 && workers <= 1024 && capacity >= 0
+                && capacity <= 1048576 {
+                workers + capacity
+            } else {
+                0
+            },
+            order,
+        }
+    }
+
+    fn validate(self: ParallelOptions) -> Result[(), string] {
+        if self.workers < 1 || self.workers > 1024 {
+            return Result::Err("worker count must be between 1 and 1024")
+        }
+        if self.capacity < 0 || self.capacity > 1048576 {
+            return Result::Err("channel capacity must be between 0 and 1048576")
+        }
+        if self.max_in_flight < 1 || self.max_in_flight > 2097152 {
+            return Result::Err("in-flight bound must be between 1 and 2097152")
+        }
+        Result::Ok(())
+    }
+}
+
+pub struct RunOptions {
+    pub cancel: Option[task::CancelToken],
+    pub timeout: Option[time::Duration],
+    pub max_items: Option[isize],
+}
+
+impl RunOptions {
+    pub fn standard() -> RunOptions {
+        RunOptions { cancel: Option::None, timeout: Option::None, max_items: Option::Some(1000000) }
+    }
+
+    pub fn with_cancel(self: RunOptions, cancel: task::CancelToken) -> RunOptions {
+        RunOptions { cancel: Option::Some(cancel), ..self }
+    }
+
+    pub fn with_timeout(self: RunOptions, timeout: time::Duration) -> RunOptions {
+        RunOptions { timeout: Option::Some(timeout), ..self }
+    }
+
+    pub fn without_limit(self: RunOptions) -> RunOptions {
+        RunOptions { max_items: Option::None, ..self }
+    }
+}
+
+pub struct Report {
+    pub emitted: isize,
+    pub stopped: bool,
+}
+
+pub struct Stream[T, E] {
+    produce: (task::CancelToken, RunControl[E], (T) -> bool) -> Result[(), Error[E]],
+}
+
+fn receive[T](cancel: task::CancelToken, input: Receiver[T]) -> task::WaitResult[Option[T]] {
+    if cancel.is_cancelled() {
+        return task::WaitResult::Cancelled
+    }
+    select {
+        recv(cancel.done()) as _ => task::WaitResult::Cancelled,
+        recv(input) as value => task::WaitResult::Completed(value),
+    }
+}
+
+fn send[T](cancel: task::CancelToken, output: Channel[T], value: T) -> bool {
+    if cancel.is_cancelled() {
+        return false
+    }
+    match task::send_with(cancel, output, value) {
+        task::WaitResult::Completed(()) => true,
+        task::WaitResult::Cancelled => false,
+    }
+}
+
+struct RunControl[E] {
+    scope: task::Scope,
+    errors: Channel[Error[E]],
+    path: string,
+}
+
+impl[E] RunControl[E] {
+    fn with_name(self: RunControl[E], name: string) -> RunControl[E] {
+        RunControl {
+            path: if self.path == "" {
+                name
+            } else {
+                self.path + "/" + name
+            },
+            ..self,
+        }
+    }
+
+    fn record(self: RunControl[E], problem: Error[E]) -> () {
+        if problem.kind == ErrorKind::Cancelled {
+            return
+        }
+        let problem = if self.path == "" {
+            problem
+        } else {
+            Error {
+                stage: if problem.stage == "" {
+                    self.path
+                } else {
+                    self.path + "/" + problem.stage
+                },
+                ..problem,
+            }
+        };
+        select {
+            send(self.errors, problem) => (),
+            default => (),
+        }
+        self.scope.cancel();
+    }
+
+    fn first_error(self: RunControl[E]) -> Option[Error[E]] {
+        select {
+            recv(self.errors) as value => value,
+            default => Option::None,
+        }
+    }
+
+    fn failed(self: RunControl[E], scope: task::Scope, errors: Channel[Error[E]], problem: Error[E]) -> () {
+        if problem.kind != ErrorKind::Cancelled {
+            select {
+                send(errors, problem) => (),
+                default => (),
+            }
+            self.record(problem);
+        }
+        scope.cancel();
+    }
+}
+
+fn outcome[E](parent: task::CancelToken, errors: Channel[Error[E]]) -> Result[(), Error[E]] {
+    let problem = select {
+        recv(errors) as value => value,
+        default => Option::None,
+    };
+    if let Some(problem) = problem {
+        return Result::Err(problem)
+    }
+    if parent.is_cancelled() {
+        Result::Err(Error::cancelled())
+    } else {
+        Result::Ok(())
+    }
+}

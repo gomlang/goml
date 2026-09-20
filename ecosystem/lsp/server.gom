@@ -1,0 +1,259 @@
+package lsp;
+
+use std::json;
+use std::serde;
+use std::serde::{Deserialize, Serialize};
+
+pub struct RequestContext {
+    pub token: RequestToken,
+    pub documents: Documents,
+}
+
+pub struct Router {
+    requests: HashMap[
+        string,
+        (RequestContext, Option[json::Value]) -> Result[json::Value, RpcError],
+    ],
+    notifications: HashMap[string, (Documents, Option[json::Value]) -> Result[(), RpcError]],
+}
+
+impl Router {
+    pub fn new() -> Router {
+        Router { requests: HashMap::new(), notifications: HashMap::new() }
+    }
+
+    pub fn on_raw_request(
+        self: Router,
+        method: string,
+        handler: (RequestContext, Option[json::Value]) -> Result[json::Value, RpcError],
+    ) -> Result[(), RpcError] {
+        if self.requests.contains(method) {
+            return Result::Err(invalid("request handler already registered"))
+        }
+        self.requests.set(method, handler);
+        Result::Ok(())
+    }
+
+    pub fn on_request[P: Deserialize, R: Serialize](
+        self: Router,
+        method: string,
+        handler: (RequestContext, P) -> Result[R, RpcError],
+    ) -> Result[(), RpcError] {
+        self.on_raw_request(
+            method,
+            |context, params| {
+                let value: P = json::from_value(params.unwrap_or(json::object(Vec::new()))).map_err(
+                    |message| invalid(message),
+                )?;
+                json::to_value(handler(context, value)?).map_err(
+                    |message| RpcError::new(-32603, message),
+                )
+            },
+        )
+    }
+
+    pub fn on_notification(
+        self: Router,
+        method: string,
+        handler: (Documents, Option[json::Value]) -> Result[(), RpcError],
+    ) -> Result[(), RpcError] {
+        if self.notifications.contains(method) {
+            return Result::Err(invalid("notification handler already registered"))
+        }
+        self.notifications.set(method, handler);
+        Result::Ok(())
+    }
+
+    pub fn dispatch(self: Router, context: RequestContext, params: Option[json::Value]) -> Result[
+        json::Value,
+        RpcError,
+    ] {
+        context.token.check()?;
+        let method = context.token.method();
+        let handler = self.requests.get(method).ok_or(
+            RpcError::new(-32601, f"method not found: {method}"),
+        )?;
+        handler(context, params)
+    }
+
+    pub fn notify(self: Router, documents: Documents, method: string, params: Option[json::Value]) -> Result[
+        (),
+        RpcError,
+    ] {
+        match self.notifications.get(method) {
+            Some(handler) => handler(documents, params),
+            None => Result::Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Phase {
+    New,
+    AwaitInitialized,
+    Running,
+    Shutdown,
+    Exited,
+}
+
+pub struct Event {
+    pub reply: Option[Message],
+    pub completed: Option[Completed],
+    pub exit_code: Option[isize],
+}
+
+fn empty_event() -> Event {
+    Event { reply: Option::None, completed: Option::None, exit_code: Option::None }
+}
+
+pub struct Server {
+    router_value: Router,
+    documents_value: Documents,
+    session_value: Session,
+    capabilities: json::Value,
+    phase_value: Ref[Phase],
+}
+
+impl Server {
+    pub fn new(router: Router, documents: Documents, max_pending: isize, capabilities: json::Value) -> Result[
+        Server,
+        RpcError,
+    ] {
+        let fields = members(capabilities)?.copy();
+        if json::field(capabilities, "positionEncoding").is_some()
+            || json::field(capabilities, "textDocumentSync").is_some() {
+            return Result::Err(
+                invalid("server owns positionEncoding and textDocumentSync capabilities"),
+            )
+        }
+        fields.push(("positionEncoding", json::Value::String("utf-16")));
+        fields.push(("textDocumentSync", json::Value::Number("2")));
+        Result::Ok(
+            Server {
+                router_value: router,
+                documents_value: documents,
+                session_value: Session::new(max_pending)?,
+                capabilities: json::object(fields),
+                phase_value: Ref::new(Phase::New),
+            },
+        )
+    }
+
+    pub fn phase(self: Server) -> Phase {
+        self.phase_value.get()
+    }
+
+    pub fn documents(self: Server) -> Documents {
+        self.documents_value
+    }
+
+    pub fn session(self: Server) -> Session {
+        self.session_value
+    }
+
+    fn invoke(self: Server, token: RequestToken, params: Option[json::Value]) -> Result[
+        json::Value,
+        RpcError,
+    ] {
+        let method = token.method();
+        if method == "initialize" {
+            if self.phase() != Phase::New {
+                return Result::Err(RpcError::new(-32600, "server already initialized"))
+            }
+            let params = params.ok_or(invalid("initialize params required"))?;
+            let _ = members(params)?;
+            let _ = members(required(params, "capabilities")?)?;
+            self.phase_value.set(Phase::AwaitInitialized);
+            return Result::Ok(json::object(Vec::from_array([("capabilities", self.capabilities)])))
+        }
+        if self.phase() == Phase::New || self.phase() == Phase::AwaitInitialized {
+            return Result::Err(RpcError::new(-32002, "server is not initialized"))
+        }
+        if self.phase() != Phase::Running {
+            return Result::Err(RpcError::new(-32600, "server has shut down"))
+        }
+        if method == "shutdown" {
+            if params.is_some() {
+                return Result::Err(invalid("shutdown takes no parameters"))
+            }
+            self.phase_value.set(Phase::Shutdown);
+            return Result::Ok(json::Value::Null)
+        }
+        if method.starts_with("$/") {
+            return Result::Err(RpcError::new(-32601, "unsupported protocol request"))
+        }
+        self.router_value.dispatch(
+            RequestContext { token, documents: self.documents_value },
+            params,
+        )
+    }
+
+    pub fn handle(self: Server, message: Message) -> Result[Event, RpcError] {
+        let _ = decode_value(encode_value(message))?;
+        if self.phase() == Phase::Exited {
+            return Result::Err(invalid("server has exited"))
+        }
+        match message {
+            Message::Request(id, method, params) => {
+                let reply = match self.session_value.begin(id, method) {
+                    Ok(token) => self.session_value.complete(token, self.invoke(token, params))?,
+                    Err(problem) => Message::Response(Option::Some(id), Result::Err(problem)),
+                };
+                Result::Ok(
+                    Event {
+                        reply: Option::Some(reply),
+                        completed: Option::None,
+                        exit_code: Option::None,
+                    },
+                )
+            },
+            Message::Response(_, _) => Result::Ok(
+                Event {
+                    reply: Option::None,
+                    completed: Option::Some(self.session_value.receive(message)?),
+                    exit_code: Option::None,
+                },
+            ),
+            Message::Notification(method, params) => {
+                if method == "exit" {
+                    let code = if self.phase() == Phase::Shutdown {
+                        0
+                    } else {
+                        1
+                    };
+                    self.phase_value.set(Phase::Exited);
+                    return Result::Ok(
+                        Event {
+                            reply: Option::None,
+                            completed: Option::None,
+                            exit_code: Option::Some(code),
+                        },
+                    )
+                }
+                if method == "$/cancelRequest" {
+                    let params = params.ok_or(invalid("cancel params required"))?;
+                    let _ = members(params)?;
+                    let _ = self.session_value.cancel(Id::from_json(required(params, "id")?)?);
+                    return Result::Ok(empty_event())
+                }
+                if method == "initialized" {
+                    if self.phase() != Phase::AwaitInitialized {
+                        return Result::Err(invalid("unexpected initialized notification"))
+                    }
+                    if let Some(params) = params {
+                        let _ = members(params)?;
+                    }
+                    self.phase_value.set(Phase::Running);
+                    return Result::Ok(empty_event())
+                }
+                if self.phase() != Phase::Running {
+                    return Result::Ok(empty_event())
+                }
+                if !self.documents_value.synchronize(method, params.unwrap_or(json::Value::Null))? {
+                    self.router_value.notify(self.documents_value, method, params)?;
+                }
+                Result::Ok(empty_event())
+            },
+        }
+    }
+}

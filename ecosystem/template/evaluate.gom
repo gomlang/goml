@@ -1,0 +1,670 @@
+package template;
+
+use std::num;
+use std::math;
+
+fn bounded_index(value: i64, length: isize, reverse: bool) -> isize {
+    let size = length.to_i64();
+    if value < 0 {
+        if value < -size {
+            if reverse {
+                -1
+            } else {
+                0
+            }
+        } else {
+            (value + size).to_isize()
+        }
+    } else if value >= size {
+        if reverse {
+            length - 1
+        } else {
+            length
+        }
+    } else {
+        value.to_isize()
+    }
+}
+
+impl Runtime {
+    fn eval(
+        self: Runtime,
+        expression: Expr,
+        source: Source,
+        world: World,
+        autoescape: bool,
+        depth: isize,
+    ) -> Result[Value, Error] {
+        let offset = expression.offset;
+        self.tick(source, offset, depth)?;
+        match expression.kind {
+            ExprKind::Literal(value) => Result::Ok(value),
+            ExprKind::Name(name) => Result::Ok(self.lookup(name)),
+            ExprKind::List(expressions) => {
+                if expressions.len() > self.engine.options.limits.max_collection {
+                    return Result::Err(
+                        problem(
+                            source,
+                            offset,
+                            ErrorKind::Limit,
+                            "list literal exceeds collection limit",
+                        ),
+                    )
+                }
+                let result = Vec::new();
+                for item in expressions {
+                    result.push(self.eval(item, source, world, autoescape, depth + 1)?);
+                }
+                Result::Ok(Value::List(result))
+            },
+            ExprKind::Object(fields) => {
+                if fields.len() > self.engine.options.limits.max_collection {
+                    return Result::Err(
+                        problem(
+                            source,
+                            offset,
+                            ErrorKind::Limit,
+                            "object literal exceeds collection limit",
+                        ),
+                    )
+                }
+                let result = Vec::new();
+                let names = HashMap::new();
+                for (key, value) in fields {
+                    let name = self.eval(key, source, world, autoescape, depth + 1)?.as_text().or_error(
+                        || problem(
+                            source,
+                            key.offset,
+                            ErrorKind::Type,
+                            "object keys must be strings",
+                        ),
+                    )?;
+                    if names.contains(name) {
+                        return Result::Err(
+                            problem(source, key.offset, ErrorKind::Type, "duplicate object key"),
+                        )
+                    }
+                    names.set(name, true);
+                    result.push((name, self.eval(value, source, world, autoescape, depth + 1)?));
+                }
+                Result::Ok(Value::Object(result))
+            },
+            ExprKind::Unary(operator, operand) => {
+                let value = self.eval(operand, source, world, autoescape, depth + 1)?;
+                if operator == "not" {
+                    return Result::Ok(Value::Bool(!self.truth(value, source, offset)?))
+                }
+                if let Value::Int(value) = value {
+                    if operator == "+" {
+                        Result::Ok(Value::Int(value))
+                    } else {
+                        Result::Ok(
+                            Value::Int(
+                                num::checked_subtract_int64(0, value).or_error(
+                                    || problem(
+                                        source,
+                                        offset,
+                                        ErrorKind::Arithmetic,
+                                        "integer negation overflow",
+                                    ),
+                                )?,
+                            ),
+                        )
+                    }
+                } else if let Value::Float(value) = value {
+                    Result::Ok(
+                        Value::Float(
+                            if operator == "+" {
+                                value
+                            } else {
+                                -value
+                            },
+                        ),
+                    )
+                } else {
+                    Result::Err(
+                        problem(
+                            source,
+                            offset,
+                            ErrorKind::Type,
+                            "numeric unary operator requires a number",
+                        ),
+                    )
+                }
+            },
+            ExprKind::Binary(operator, left, right) => {
+                let left = self.eval(left, source, world, autoescape, depth + 1)?;
+                if operator == "and" && !self.truth(left, source, offset)? {
+                    return Result::Ok(left)
+                }
+                if operator == "or" && self.truth(left, source, offset)? {
+                    return Result::Ok(left)
+                }
+                let right = self.eval(right, source, world, autoescape, depth + 1)?;
+                if operator == "and" || operator == "or" {
+                    Result::Ok(right)
+                } else if operator == "~" {
+                    self.concatenate(left, right, source, offset, autoescape)
+                } else {
+                    self.binary(operator, left, right, source, offset)
+                }
+            },
+            ExprKind::Compare(first, comparisons) => {
+                let mut left = self.eval(first, source, world, autoescape, depth + 1)?;
+                for (operator, expression) in comparisons {
+                    let right = self.eval(expression, source, world, autoescape, depth + 1)?;
+                    let result = if operator == "==" {
+                        self.equal(left, right, source, offset, depth + 1)?
+                    } else if operator == "!=" {
+                        !self.equal(left, right, source, offset, depth + 1)?
+                    } else if operator == "in" || operator == "not in" {
+                        let contained = self.contains_value(right, left, source, offset, depth + 1)?;
+                        if operator == "in" {
+                            contained
+                        } else {
+                            !contained
+                        }
+                    } else {
+                        let order = self.order(left, right, source, offset)?;
+                        match operator {
+                            "<" => order < 0,
+                            "<=" => order <= 0,
+                            ">" => order > 0,
+                            _ => order >= 0,
+                        }
+                    };
+                    if !result {
+                        return Result::Ok(Value::Bool(false))
+                    }
+                    left = right;
+                }
+                Result::Ok(Value::Bool(true))
+            },
+            ExprKind::Test(expression, name, negate) => {
+                let value = self.eval(expression, source, world, autoescape, depth + 1)?;
+                let result = match name {
+                    "defined" => !is_missing(value),
+                    "undefined" => is_missing(value),
+                    "none" | "null" => match value {
+                        Value::Null => true,
+                        _ => false,
+                    },
+                    "number" => numeric(value),
+                    "integer" => value.as_int().is_some(),
+                    "string" => value.as_text().is_some(),
+                    "boolean" => match value {
+                        Value::Bool(_) => true,
+                        _ => false,
+                    },
+                    "sequence" => match value {
+                        Value::List(_) | Value::Text(_) | Value::Safe(_) => true,
+                        _ => false,
+                    },
+                    "mapping" => match value {
+                        Value::Object(_) => true,
+                        _ => false,
+                    },
+                    "odd" | "even" => {
+                        let number = value.as_int().or_error(
+                            || problem(
+                                source,
+                                offset,
+                                ErrorKind::Type,
+                                "odd/even test requires integer",
+                            ),
+                        )?;
+                        if name == "odd" {
+                            number % 2 != 0
+                        } else {
+                            number % 2 == 0
+                        }
+                    },
+                    _ => return Result::Err(
+                        problem(source, offset, ErrorKind::Type, f"unknown test {name}"),
+                    ),
+                };
+                Result::Ok(
+                    Value::Bool(
+                        if negate {
+                            !result
+                        } else {
+                            result
+                        },
+                    ),
+                )
+            },
+            ExprKind::Index(expression, key) => {
+                let value = self.eval(expression, source, world, autoescape, depth + 1)?;
+                let key = self.eval(key, source, world, autoescape, depth + 1)?;
+                self.index(value, key, source, offset)
+            },
+            ExprKind::Slice(expression, start, end, step) => {
+                let value = self.eval(expression, source, world, autoescape, depth + 1)?;
+                let start = self.slice_argument(start, source, world, autoescape, depth + 1)?;
+                let end = self.slice_argument(end, source, world, autoescape, depth + 1)?;
+                let step = self.slice_argument(step, source, world, autoescape, depth + 1)?.unwrap_or(
+                    1,
+                );
+                self.slice_value(value, start, end, step, source, offset)
+            },
+            ExprKind::Call(name, arguments) => {
+                let values = Vec::new();
+                for argument in arguments {
+                    values.push(self.eval(argument, source, world, autoescape, depth + 1)?);
+                }
+                if name == "super" {
+                    if !values.is_empty() || world.active.is_empty() {
+                        return Result::Err(
+                            problem(
+                                source,
+                                offset,
+                                ErrorKind::Type,
+                                "super() requires an active inherited block and no arguments",
+                            ),
+                        )
+                    }
+                    let (name, index) = world.active[world.active.len() - 1];
+                    let output = Output::new(self.engine.options.limits.max_output_bytes);
+                    self.block(
+                        name,
+                        index + 1,
+                        world,
+                        output,
+                        autoescape,
+                        depth + 1,
+                        source,
+                        offset,
+                    )?;
+                    Result::Ok(
+                        if autoescape {
+                            Value::Safe(output.finish())
+                        } else {
+                            Value::Text(output.finish())
+                        },
+                    )
+                } else if let Some(function) = self.engine.functions.get(name) {
+                    let result = function(values).map_err(
+                        |message| problem(source, offset, ErrorKind::Extension, message),
+                    )?;
+                    self.snapshot(result, source, offset, depth + 1)
+                } else {
+                    self.call_builtin(name, values, source, offset, autoescape)
+                }
+            },
+            ExprKind::Filter(expression, name, arguments) => {
+                let value = self.eval(expression, source, world, autoescape, depth + 1)?;
+                let values = Vec::new();
+                for argument in arguments {
+                    values.push(self.eval(argument, source, world, autoescape, depth + 1)?);
+                }
+                if let Some(filter) = self.engine.filters.get(name) {
+                    let result = filter(value, values).map_err(
+                        |message| problem(source, offset, ErrorKind::Extension, message),
+                    )?;
+                    self.snapshot(result, source, offset, depth + 1)
+                } else {
+                    self.filter_builtin(name, value, values, source, offset, autoescape)
+                }
+            },
+            ExprKind::Choose(condition, success, failure) => {
+                let chosen = if self.truth(
+                    self.eval(condition, source, world, autoescape, depth + 1)?,
+                    source,
+                    offset,
+                )? {
+                    success
+                } else {
+                    failure
+                };
+                self.eval(chosen, source, world, autoescape, depth + 1)
+            },
+        }
+    }
+
+    fn contains_value(
+        self: Runtime,
+        haystack: Value,
+        needle: Value,
+        source: Source,
+        offset: isize,
+        depth: isize,
+    ) -> Result[bool, Error] {
+        if let Some(text) = haystack.as_text() {
+            let part = needle.as_text().or_error(
+                || problem(source, offset, ErrorKind::Type, "string membership requires a string"),
+            )?;
+            return Result::Ok(text.contains(part))
+        }
+        let values = self.sequence(haystack, source, offset)?;
+        for value in values {
+            if self.equal(value, needle, source, offset, depth + 1)? {
+                return Result::Ok(true)
+            }
+        }
+        Result::Ok(false)
+    }
+
+    fn index(self: Runtime, value: Value, key: Value, source: Source, offset: isize) -> Result[
+        Value,
+        Error,
+    ] {
+        if let Value::Undefined(path) = value {
+            return Result::Ok(Value::Undefined(path + "." + self.display(key, source, offset)?))
+        }
+        if let Value::Object(fields) = value {
+            let name = key.as_text().or_error(
+                || problem(source, offset, ErrorKind::Type, "object index must be a string"),
+            )?;
+            return Result::Ok(Value::Object(fields).get(name))
+        }
+        let index = key.as_int().or_error(
+            || problem(source, offset, ErrorKind::Type, "sequence index must be an integer"),
+        )?;
+        let values = self.sequence(value, source, offset)?;
+        let length = values.len().to_i64();
+        let position = if index < 0 {
+            num::checked_add_int64(index, length).unwrap_or(-1)
+        } else {
+            index
+        };
+        if position < 0 || position >= length {
+            Result::Ok(Value::Undefined(f"index {index}"))
+        } else {
+            Result::Ok(values[position.to_isize()])
+        }
+    }
+
+    fn slice_argument(
+        self: Runtime,
+        expression: Option[Expr],
+        source: Source,
+        world: World,
+        autoescape: bool,
+        depth: isize,
+    ) -> Result[Option[i64], Error] {
+        if let Some(expression) = expression {
+            let value = self.eval(expression, source, world, autoescape, depth + 1)?;
+            Result::Ok(
+                Option::Some(
+                    value.as_int().or_error(
+                        || problem(
+                            source,
+                            expression.offset,
+                            ErrorKind::Type,
+                            "slice indices must be integers",
+                        ),
+                    )?,
+                ),
+            )
+        } else {
+            Result::Ok(Option::None)
+        }
+    }
+
+    fn slice_value(
+        self: Runtime,
+        value: Value,
+        start: Option[i64],
+        end: Option[i64],
+        step: i64,
+        source: Source,
+        offset: isize,
+    ) -> Result[Value, Error] {
+        if step == 0 {
+            return Result::Err(
+                problem(source, offset, ErrorKind::Type, "slice step cannot be zero"),
+            )
+        }
+        let items = self.sequence(value, source, offset)?;
+        let reverse = step < 0;
+        let first = match start {
+            Some(value) => bounded_index(value, items.len(), reverse),
+            None => if reverse {
+                items.len() - 1
+            } else {
+                0
+            },
+        };
+        let last = match end {
+            Some(value) => bounded_index(value, items.len(), reverse),
+            None => if reverse {
+                -1
+            } else {
+                items.len()
+            },
+        };
+        let result = Vec::new();
+        let mut index = first.to_i64();
+        while if reverse {
+            index > last.to_i64()
+        } else {
+            index < last.to_i64()
+        } {
+            self.tick(source, offset, 0)?;
+            result.push(items[index.to_isize()]);
+            if let Some(next) = num::checked_add_int64(index, step) {
+                index = next;
+            } else {
+                break;
+            }
+        }
+        if value.as_text().is_some() {
+            let output = Output::new(self.engine.options.limits.max_output_bytes);
+            for item in result {
+                output.append(item.as_text().unwrap_or(""), source, offset)?;
+            }
+            Result::Ok(Value::Text(output.finish()))
+        } else {
+            Result::Ok(Value::List(result))
+        }
+    }
+
+    fn concatenate(
+        self: Runtime,
+        left: Value,
+        right: Value,
+        source: Source,
+        offset: isize,
+        escape: bool,
+    ) -> Result[Value, Error] {
+        let safe = escape && (is_safe(left) || is_safe(right));
+        let output = Output::new(self.engine.options.limits.max_output_bytes);
+        for value in Vec::from_array([left, right]) {
+            let text = self.display(value, source, offset)?;
+            output.append(
+                if safe && !is_safe(value) {
+                    escaped(text, output.limit, source, offset)?
+                } else {
+                    text
+                },
+                source,
+                offset,
+            )?;
+        }
+        Result::Ok(
+            if safe {
+                Value::Safe(output.finish())
+            } else {
+                Value::Text(output.finish())
+            },
+        )
+    }
+
+    fn binary(
+        self: Runtime,
+        operator: string,
+        left: Value,
+        right: Value,
+        source: Source,
+        offset: isize,
+    ) -> Result[Value, Error] {
+        if operator == "~"
+            || (operator == "+" && left.as_text().is_some() && right.as_text().is_some()) {
+            return self.concatenate(left, right, source, offset, true)
+        }
+        if operator == "+" {
+            if let Value::List(a) = left {
+                if let Value::List(b) = right {
+                    if a.len() > self.engine.options.limits.max_collection - b.len() {
+                        return Result::Err(
+                            problem(
+                                source,
+                                offset,
+                                ErrorKind::Limit,
+                                "concatenated collection exceeds limit",
+                            ),
+                        )
+                    }
+                    let result = a.copy();
+                    result.extend(b);
+                    return Result::Ok(Value::List(result))
+                }
+            }
+        }
+        if operator == "*" {
+            let (sequence, count) = if let Some(count) = right.as_int() {
+                (left, count)
+            } else if let Some(count) = left.as_int() {
+                (right, count)
+            } else {
+                (Value::Null, 0)
+            };
+            if sequence.as_text().is_some() {
+                let text = sequence.as_text().unwrap_or("");
+                let length = text.byte_len();
+                if count > 0 && length > 0
+                    && count > (self.engine.options.limits.max_output_bytes / length).to_i64() {
+                    return Result::Err(
+                        problem(source, offset, ErrorKind::Limit, "repeated string exceeds limit"),
+                    )
+                }
+                let output = Output::new(self.engine.options.limits.max_output_bytes);
+                if length > 0 {
+                    let mut index: i64 = 0;
+                    while index < count {
+                        self.tick(source, offset, 0)?;
+                        output.append(text, source, offset)?;
+                        index += 1;
+                    }
+                }
+                return Result::Ok(
+                    if is_safe(sequence) {
+                        Value::Safe(output.finish())
+                    } else {
+                        Value::Text(output.finish())
+                    },
+                )
+            }
+            if let Value::List(items) = sequence {
+                if count > 0 && !items.is_empty()
+                    && count > (self.engine.options.limits.max_collection / items.len()).to_i64() {
+                    return Result::Err(
+                        problem(
+                            source,
+                            offset,
+                            ErrorKind::Limit,
+                            "repeated collection exceeds limit",
+                        ),
+                    )
+                }
+                let result = Vec::new();
+                if !items.is_empty() {
+                    let mut index: i64 = 0;
+                    while index < count {
+                        self.tick(source, offset, 0)?;
+                        result.extend(items);
+                        index += 1;
+                    }
+                }
+                return Result::Ok(Value::List(result))
+            }
+        }
+        if let Value::Int(a) = left {
+            if let Value::Int(b) = right {
+                if operator != "/" && !(operator == "**" && b < 0) {
+                    let overflow = || problem(
+                        source,
+                        offset,
+                        ErrorKind::Arithmetic,
+                        "integer arithmetic overflow or zero divisor",
+                    );
+                    let result = match operator {
+                        "+" => num::checked_add_int64(a, b).or_error(overflow)?,
+                        "-" => num::checked_subtract_int64(a, b).or_error(overflow)?,
+                        "*" => num::checked_multiply_int64(a, b).or_error(overflow)?,
+                        "//" | "%" => {
+                            if b == 0 || (a == -9223372036854775808 && b == -1) {
+                                return Result::Err(overflow())
+                            }
+                            let remainder = a % b;
+                            if operator == "%" {
+                                if remainder != 0 && (remainder < 0) != (b < 0) {
+                                    remainder + b
+                                } else {
+                                    remainder
+                                }
+                            } else {
+                                let quotient = a / b;
+                                if remainder != 0 && (a < 0) != (b < 0) {
+                                    quotient - 1
+                                } else {
+                                    quotient
+                                }
+                            }
+                        },
+                        "**" => {
+                            let mut base = a;
+                            let mut exponent = b;
+                            let mut value: i64 = 1;
+                            while exponent > 0 {
+                                self.tick(source, offset, 0)?;
+                                if exponent % 2 == 1 {
+                                    value = num::checked_multiply_int64(value, base).or_error(
+                                        overflow,
+                                    )?;
+                                }
+                                exponent /= 2;
+                                if exponent > 0 {
+                                    base = num::checked_multiply_int64(base, base).or_error(
+                                        overflow,
+                                    )?;
+                                }
+                            }
+                            value
+                        },
+                        _ => return Result::Err(
+                            problem(source, offset, ErrorKind::Type, "unknown numeric operator"),
+                        ),
+                    };
+                    return Result::Ok(Value::Int(result))
+                }
+            }
+        }
+        let a = to_float(left).or_error(
+            || problem(source, offset, ErrorKind::Type, "arithmetic requires numeric operands"),
+        )?;
+        let b = to_float(right).or_error(
+            || problem(source, offset, ErrorKind::Type, "arithmetic requires numeric operands"),
+        )?;
+        if (operator == "/" || operator == "//" || operator == "%") && b == 0.0 {
+            return Result::Err(problem(source, offset, ErrorKind::Arithmetic, "division by zero"))
+        }
+        let result = match operator {
+            "+" => a + b,
+            "-" => a - b,
+            "*" => a * b,
+            "/" => a / b,
+            "//" => math::floor(a / b),
+            "%" => a - math::floor(a / b) * b,
+            "**" => math::pow(a, b),
+            _ => return Result::Err(problem(source, offset, ErrorKind::Type, "unknown operator")),
+        };
+        if !math::is_finite(result) {
+            Result::Err(
+                problem(source, offset, ErrorKind::Arithmetic, "nonfinite arithmetic result"),
+            )
+        } else {
+            Result::Ok(Value::Float(result))
+        }
+    }
+}

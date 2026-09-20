@@ -1,0 +1,254 @@
+package proptest;
+
+use std::rand;
+use std::math;
+
+pub fn booleans() -> Generator[bool] {
+    Generator::new(
+        |seed, _| {
+            let value = rand::next_u64(seed) % 2 == 1;
+            Result::Ok(
+                Sample::new(
+                    value,
+                    || {
+                        if value {
+                            Vec::from_array([Sample::leaf(false)])
+                        } else {
+                            Vec::new()
+                        }
+                    },
+                ),
+            )
+        },
+    )
+}
+
+pub fn select[T](values: Vec[T]) -> Result[Generator[T], string] {
+    if values.is_empty() {
+        return Result::Err("selection requires at least one value")
+    }
+    let snapshot = values.freeze();
+    Result::Ok(
+        Generator::new(
+            |seed, _| {
+                let index = (rand::next_u64(seed) % snapshot.len().to_u64()).to_isize();
+                Result::Ok(map_sample(integer_sample(index, 0), |position| snapshot.get(position)))
+            },
+        ),
+    )
+}
+
+pub fn weighted[T](choices: Vec[(u64, Generator[T])]) -> Result[Generator[T], string] {
+    if choices.is_empty() {
+        return Result::Err("weighted choice requires generators")
+    }
+    let snapshot = choices.freeze();
+    let mut total: u64 = 0;
+    for choice in choices {
+        if choice.0 == 0 || choice.0 > 0xffffffffffffffff - total {
+            return Result::Err("weights must be positive and their sum must fit u64")
+        }
+        total += choice.0;
+    }
+    let bound = total;
+    Result::Ok(
+        Generator::new(
+            |seed, size| {
+                let mut selected = rand::next_u64(seed) % bound;
+                for index in 0..snapshot.len() {
+                    let entry = snapshot.get(index);
+                    if selected < entry.0 {
+                        return entry.1.generate(rand::next_u64(seed), size)
+                    }
+                    selected -= entry.0;
+                }
+                Result::Err("invalid generator selection")
+            },
+        ),
+    )
+}
+
+pub fn one_of[T](choices: Vec[Generator[T]]) -> Result[Generator[T], string] {
+    let entries: Vec[(u64, Generator[T])] = Vec::new();
+    for generator in choices {
+        entries.push((1, generator));
+    }
+    weighted(entries)
+}
+
+pub fn optional[T](generator: Generator[T]) -> Generator[Option[T]] {
+    Generator::new(
+        |seed, size| {
+            if rand::next_u64(seed) % 4 == 0 {
+                return Result::Ok(Sample::leaf(Option::None))
+            }
+            let sample = generator.generate(rand::next_u64(seed), size)?;
+            Result::Ok(optional_sample(sample))
+        },
+    )
+}
+
+fn optional_sample[T](sample: Sample[T]) -> Sample[Option[T]] {
+    Sample::new(
+        Option::Some(sample.value),
+        || {
+            let result = Vec::from_array([Sample::leaf(Option::None)]);
+            for child in sample.children() {
+                result.push(optional_sample(child));
+            }
+            result
+        },
+    )
+}
+
+pub fn characters() -> Generator[char] {
+    Generator::new(
+        |seed, _| {
+            let index = (rand::next_u64(seed) % 0x10f800).to_isize();
+            Result::Ok(
+                map_sample(
+                    integer_sample(index, 0),
+                    |value| {
+                        let scalar: isize = if value >= 0xd800 {
+                            value + 0x800
+                        } else {
+                            value
+                        };
+                        char_from_u32(scalar.to_u32()).unwrap_or('\u0000')
+                    },
+                ),
+            )
+        },
+    )
+}
+
+pub fn strings(characters: Generator[char], minimum: isize, maximum: isize) -> Result[
+    Generator[string],
+    string,
+] {
+    Result::Ok(
+        vectors(characters, minimum, maximum)?.map(
+            |values| {
+                let parts: Vec[string] = Vec::new();
+                for value in values {
+                    parts.push(value.to_string());
+                }
+                parts.join("")
+            },
+        ),
+    )
+}
+
+pub fn bytes(minimum: isize, maximum: isize) -> Result[Generator[Vec[byte]], string] {
+    vectors(integers(0, 256)?.map(|value| value.to_u8()), minimum, maximum)
+}
+
+pub fn finite_floats(minimum: f64, maximum: f64) -> Result[Generator[f64], string] {
+    if !math::is_finite(minimum) || !math::is_finite(maximum) || minimum > maximum {
+        return Result::Err("float bounds must be finite and ordered")
+    }
+    let target = if minimum > 0.0 {
+        minimum
+    } else if maximum < 0.0 {
+        maximum
+    } else {
+        0.0
+    };
+    Result::Ok(
+        Generator::new(
+            |seed, _| {
+                let ratio = float64_from_bits(0x3ff0000000000000 | (rand::next_u64(seed) >> 12))
+                    - 1.0;
+                let value = minimum * (1.0 - ratio) + maximum * ratio;
+                Result::Ok(float_sample(value, target, 64))
+            },
+        ),
+    )
+}
+
+fn float_sample(value: f64, target: f64, depth: isize) -> Sample[f64] {
+    Sample::new(
+        value,
+        || {
+            let result: Vec[Sample[f64]] = Vec::new();
+            if value != target && depth > 0 {
+                result.push(Sample::leaf(target));
+                let middle = value / 2.0 + target / 2.0;
+                if middle != value && middle != target {
+                    result.push(float_sample(middle, target, depth - 1));
+                }
+            }
+            result
+        },
+    )
+}
+
+fn dependent_sample[T, U](
+    outer: Sample[T],
+    inner: Sample[U],
+    build: (T) -> Generator[U],
+    seed: u64,
+    size: isize,
+) -> Sample[U] {
+    Sample::new(
+        inner.value,
+        || {
+            let result: Vec[Sample[U]] = Vec::new();
+            for child in inner.children() {
+                result.push(dependent_sample(outer, child, build, seed, size));
+            }
+            for child in outer.children() {
+                if let Ok(next) = build(child.value).generate(seed, size) {
+                    result.push(dependent_sample(child, next, build, seed, size));
+                }
+            }
+            result
+        },
+    )
+}
+
+impl[T] Generator[T] {
+    pub fn flat_map[U](self: Generator[T], build: (T) -> Generator[U]) -> Generator[U] {
+        Generator::new(
+            |seed, size| {
+                let outer = self.generate(seed, size)?;
+                let inner_seed = rand::next_u64(seed);
+                let inner = build(outer.value).generate(inner_seed, size)?;
+                Result::Ok(dependent_sample(outer, inner, build, inner_seed, size))
+            },
+        )
+    }
+}
+
+pub fn recursive[T](leaf: Generator[T], branch: (Generator[T]) -> Generator[T], depth: isize) -> Result[
+    Generator[T],
+    string,
+] {
+    if depth < 0 || depth > 64 {
+        return Result::Err("recursive depth must be between 0 and 64")
+    }
+    let mut result = leaf;
+    for _ in 0..depth {
+        result = one_of(Vec::from_array([leaf, branch(result)]))?;
+    }
+    Result::Ok(result)
+}
+
+impl Config {
+    pub fn new(seed: u64) -> Config {
+        Config { seed, cases: 100, size: 64, max_shrinks: 10000 }
+    }
+}
+
+impl[T: ToString] Failure[T] {
+    pub fn report(self: Failure[T]) -> string {
+        f"property failed at case {self.case_index}; replay seed={self.seed}\ninitial: {self.initial}\nminimal: {self.minimal}\nshrink attempts: {self.attempts}"
+    }
+}
+
+pub fn replay[S: Strategy](strategy: S, seed: u64, size: isize) -> Result[S::Item, string] {
+    if size < 0 {
+        return Result::Err("replay size must be nonnegative")
+    }
+    Result::Ok(strategy.generate(seed, size)?.value)
+}

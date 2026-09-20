@@ -1,0 +1,308 @@
+package proptest;
+
+use std::rand;
+
+pub struct Sample[T] {
+    pub value: T,
+    shrink: () -> Vec[Sample[T]],
+}
+
+impl[T] Sample[T] {
+    pub fn new(value: T, shrink: () -> Vec[Sample[T]]) -> Sample[T] {
+        Sample { value, shrink }
+    }
+
+    pub fn leaf(value: T) -> Sample[T] {
+        Sample { value, shrink: || Vec::new() }
+    }
+
+    pub fn children(self: Sample[T]) -> Vec[Sample[T]] {
+        (self.shrink)()
+    }
+}
+
+pub trait Strategy {
+    type Item;
+    fn generate(self: Self, seed: u64, size: isize) -> Result[Sample[Self::Item], string];
+}
+
+pub struct Generator[T] {
+    draw: (u64, isize) -> Result[Sample[T], string],
+}
+
+impl[T] Strategy for Generator[T] {
+    type Item = T;
+
+    fn generate(self: Generator[T], seed: u64, size: isize) -> Result[Sample[T], string] {
+        (self.draw)(seed, size)
+    }
+}
+
+fn map_sample[T, U](sample: Sample[T], transform: (T) -> U) -> Sample[U] {
+    Sample::new(
+        transform(sample.value),
+        || {
+            let result: Vec[Sample[U]] = Vec::new();
+            for child in sample.children() {
+                result.push(map_sample(child, transform));
+            }
+            result
+        },
+    )
+}
+
+fn filter_sample[T](sample: Sample[T], accept: (T) -> bool) -> Sample[T] {
+    Sample::new(
+        sample.value,
+        || {
+            let result: Vec[Sample[T]] = Vec::new();
+            let pending = sample.children();
+            let mut visited = 0;
+            while visited < pending.len() && visited < 1024 {
+                let child = pending[visited];
+                visited += 1;
+                if accept(child.value) {
+                    result.push(filter_sample(child, accept));
+                } else {
+                    pending.extend(child.children());
+                }
+            }
+            result
+        },
+    )
+}
+
+impl[T] Generator[T] {
+    pub fn new(draw: (u64, isize) -> Result[Sample[T], string]) -> Generator[T] {
+        Generator { draw }
+    }
+
+    pub fn map[U](self: Generator[T], transform: (T) -> U) -> Generator[U] {
+        Generator::new(
+            |seed: u64, size: isize| Result::Ok(map_sample(self.generate(seed, size)?, transform)),
+        )
+    }
+
+    pub fn filter(self: Generator[T], accept: (T) -> bool, attempts: isize) -> Generator[T] {
+        Generator::new(
+            |seed: u64, size: isize| {
+                let mut state = seed;
+                for _ in 0..attempts {
+                    let sample = self.generate(state, size)?;
+                    if accept(sample.value) {
+                        return Result::Ok(filter_sample(sample, accept))
+                    }
+                    state = rand::next_u64(state);
+                }
+                Result::Err("generator exhausted its rejection budget")
+            },
+        )
+    }
+
+    pub fn zip[U](self: Generator[T], other: Generator[U]) -> Generator[(T, U)] {
+        Generator::new(
+            |seed: u64, size: isize| {
+                Result::Ok(
+                    pair_sample(
+                        self.generate(seed, size)?,
+                        other.generate(rand::next_u64(seed), size)?,
+                    ),
+                )
+            },
+        )
+    }
+}
+
+fn pair_sample[T, U](left: Sample[T], right: Sample[U]) -> Sample[(T, U)] {
+    Sample::new(
+        (left.value, right.value),
+        || {
+            let result: Vec[Sample[(T, U)]] = Vec::new();
+            for child in left.children() {
+                result.push(pair_sample(child, right));
+            }
+            for child in right.children() {
+                result.push(pair_sample(left, child));
+            }
+            result
+        },
+    )
+}
+
+fn integer_sample(value: isize, target: isize) -> Sample[isize] {
+    Sample::new(
+        value,
+        || {
+            let result: Vec[Sample[isize]] = Vec::new();
+            if value != target {
+                result.push(integer_sample(target, target));
+                let descending = value > target;
+                let distance: u64 = if descending {
+                    value.to_u64() - target.to_u64()
+                } else {
+                    target.to_u64() - value.to_u64()
+                };
+                let mut step = distance / 2;
+                while step > 0 {
+                    let candidate = if descending {
+                        (value.to_u64() - step).to_isize()
+                    } else {
+                        (value.to_u64() + step).to_isize()
+                    };
+                    if candidate != target {
+                        result.push(integer_sample(candidate, target));
+                    }
+                    step /= 2;
+                }
+            }
+            result
+        },
+    )
+}
+
+pub fn integers(minimum: isize, maximum: isize) -> Result[Generator[isize], string] {
+    if minimum >= maximum {
+        return Result::Err("integer range must be nonempty")
+    }
+    let target = if minimum > 0 {
+        minimum
+    } else if maximum <= 0 {
+        maximum - 1
+    } else {
+        0
+    };
+    Result::Ok(
+        Generator::new(
+            |seed, _| {
+                let width = maximum.to_u64() - minimum.to_u64();
+                let value = (minimum.to_u64() + rand::next_u64(seed) % width).to_isize();
+                Result::Ok(integer_sample(value, target))
+            },
+        ),
+    )
+}
+
+pub fn just[T](value: T) -> Generator[T] {
+    Generator::new(|_, _| Result::Ok(Sample::leaf(value)))
+}
+
+fn vector_sample[T](samples: Vec[Sample[T]], minimum: isize) -> Sample[Vec[T]] {
+    let values: Vec[T] = Vec::new();
+    for sample in samples {
+        values.push(sample.value);
+    }
+    Sample::new(
+        values,
+        || {
+            let result: Vec[Sample[Vec[T]]] = Vec::new();
+            if samples.len() > minimum {
+                let short = samples.slice(0, minimum).to_vec();
+                result.push(vector_sample(short, minimum));
+                for index in 0..samples.len() {
+                    let shorter = samples.copy();
+                    let _ = shorter.remove(index);
+                    result.push(vector_sample(shorter, minimum));
+                }
+            }
+            for index in 0..samples.len() {
+                for child in samples[index].children() {
+                    let changed = samples.copy();
+                    changed[index] = child;
+                    result.push(vector_sample(changed, minimum));
+                }
+            }
+            result
+        },
+    )
+}
+
+pub fn vectors[T](item: Generator[T], minimum: isize, maximum: isize) -> Result[
+    Generator[Vec[T]],
+    string,
+] {
+    if minimum < 0 || minimum > maximum || maximum > 1000000 {
+        return Result::Err("vector bounds must satisfy 0 <= minimum <= maximum <= 1000000")
+    }
+    Result::Ok(
+        Generator::new(
+            |seed: u64, size: isize| {
+                let upper: isize = if size < minimum {
+                    minimum
+                } else if size > maximum {
+                    maximum
+                } else {
+                    size
+                };
+                let count = minimum
+                    + (rand::next_u64(seed) % (upper - minimum + 1).to_u64()).to_isize();
+                let samples: Vec[Sample[T]] = Vec::new();
+                let mut state = seed;
+                for _ in 0..count {
+                    state = rand::next_u64(state);
+                    samples.push(item.generate(state, size)?);
+                }
+                Result::Ok(vector_sample(samples, minimum))
+            },
+        ),
+    )
+}
+
+pub struct Config {
+    pub seed: u64,
+    pub cases: isize,
+    pub size: isize,
+    pub max_shrinks: isize,
+}
+
+pub struct Failure[T] {
+    pub seed: u64,
+    pub case_index: isize,
+    pub initial: T,
+    pub minimal: T,
+    pub attempts: isize,
+}
+
+pub fn check[S: Strategy](strategy: S, config: Config, property: (S::Item) -> bool) -> Result[
+    Option[Failure[S::Item]],
+    string,
+] {
+    if config.cases < 0 || config.size < 0 || config.max_shrinks < 0 {
+        return Result::Err("test budgets must be nonnegative")
+    }
+    let mut seed = config.seed;
+    for index in 0..config.cases {
+        let initial = strategy.generate(seed, config.size)?;
+        if !property(initial.value) {
+            let mut current = initial;
+            let mut attempts = 0;
+            let mut changed = true;
+            while changed && attempts < config.max_shrinks {
+                changed = false;
+                for candidate in current.children() {
+                    if attempts >= config.max_shrinks {
+                        break;
+                    }
+                    attempts += 1;
+                    if !property(candidate.value) {
+                        current = candidate;
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+            return Result::Ok(
+                Option::Some(
+                    Failure {
+                        seed,
+                        case_index: index,
+                        initial: initial.value,
+                        minimal: current.value,
+                        attempts,
+                    },
+                ),
+            )
+        }
+        seed = rand::next_u64(seed);
+    }
+    Result::Ok(Option::None)
+}

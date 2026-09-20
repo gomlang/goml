@@ -1,0 +1,219 @@
+# Redis
+
+`ecosystem::redis` is a standalone GoML RESP2/RESP3 client. It includes an
+incremental binary codec, typed requests, heterogeneous pipelines, transactions,
+optimistic updates, subscriptions, bounded push handling, cancellation and TCP
+connection management. It uses `std::net`, `std::task` and `std::time`; it does not
+wrap a Go Redis client.
+
+## Connection and typed commands
+
+```gom
+use ecosystem::redis::{Connection, ConnectionOptions, Operation, Error, ErrorKind};
+use ecosystem::redis::commands;
+use std::net;
+
+fn example() -> Result[(), Error] {
+    let address = net::SocketAddr::parse("127.0.0.1:6379").map_err(
+        |problem| Error::new(ErrorKind::Io, problem.to_string()),
+    )?;
+    let connection = Connection::connect(address, ConnectionOptions::standard(), Operation::new())?;
+    defer { let _ = connection.close(); };
+    let stored = connection.execute(
+        commands::set("greeting", "hello", commands::SetOptions::standard())?,
+        Operation::new(),
+    )?;
+    let value = connection.execute(commands::get("greeting")?, Operation::new())?;
+    if stored {
+        if let Some(blob) = value {
+            println(blob.text()?);
+        }
+    }
+    Result::Ok(())
+}
+```
+
+`ConnectionOptions` selects `Protocol::Resp2` or `Resp3` (default), optional
+`Credentials`, database, client name, resource limits and read buffer size.
+Connection setup issues `HELLO`, optionally authenticates and names the client,
+validates the returned protocol version, then selects the database. It therefore
+requires Redis 6 or newer even in RESP2 mode. Failed setup closes the socket.
+`close()` is idempotent and wakes active/queued operations; `quit()` exchanges
+QUIT and then closes. Applications should explicitly close connections.
+
+The `commands` package provides typed factories for:
+
+| Family | Commands |
+| --- | --- |
+| Connection | PING, ECHO, CLIENT ID, SELECT |
+| Strings | GET, GETDEL, SET, SET GET, MGET, MSET, APPEND, STRLEN, INCRBY, DECRBY |
+| Keys | DEL, UNLINK, EXISTS, RENAME, TYPE, EXPIRE, PEXPIRE, TTL, PTTL, PERSIST |
+| Lists | LPUSH, RPUSH, LPOP, RPOP, LLEN, LRANGE, BLPOP |
+| Hashes | HGET, HMGET, HSET, HDEL, HLEN, HGETALL, HINCRBY, HSCAN |
+| Sets | SADD, SREM, SCARD, SISMEMBER, SMEMBERS, SSCAN |
+| Sorted sets | ZADD, ZREM, ZCARD, ZSCORE, ZRANGE WITHSCORES, ZINCRBY |
+| Iteration and scripts | SCAN, SCRIPT LOAD, EVAL, EVALSHA |
+| Publishing | PUBLISH |
+
+Factories return `Result[Request[T], Error]`, validate empty lists and invalid
+options, and copy binary arguments. `SetOptions` combines an exclusive condition
+with an exclusive expiration policy, including KEEPTTL and absolute expiration.
+`set` returns whether the condition allowed storage; `set_get` returns the prior
+value according to Redis's SET GET semantics. SCAN methods expose each cursor
+and page; callers iterate until the cursor is zero and handle Redis's documented
+possible duplicates. BLPOP's server-side zero timeout means indefinite waiting;
+the client's default operation timeout still applies.
+
+`Blob` carries arbitrary bytes; `Blob.text()` checks UTF-8. `ToArg` supports
+strings, blobs, byte vectors/slices, booleans and numeric scalars, and applications
+may implement it. `FromReply` supports blobs, UTF-8 strings, checked integer
+widths, floats, booleans, OK unit status, options, vectors, pairs,
+`Entries[K, V]`, `ScoredMembers` and raw `Value`. Vectors decode arrays/sets;
+use `Blob` for a binary string. Signed integers require integer replies;
+unsigned integers also accept decimal strings, needed by SCAN's unsigned cursor.
+RESP2 flat pairs and RESP3 maps/nested scored members share typed results.
+
+Use `request[T: FromReply](name, arguments)` for additional Redis commands,
+`raw_request(Command)` for dynamic replies, or `Request::new(command, decoder)`
+for custom decoding. `Request.map` composes fallible result conversions. A
+consumer-defined `FromReply` implementation specializes through the dependency
+interface. Protocol-changing commands, replication/monitoring modes and CLIENT
+REPLY are rejected by ordinary execution; use the dedicated transaction,
+subscription and close APIs. Raw commands that alter server state otherwise have
+the semantics of those commands; there is no automatic retry or reconnection.
+
+## Pipelines and transactions
+
+Create `Pipeline::new()`, enqueue typed requests with `queue`, retain each
+`Ticket[T]`, call `connection.pipeline(plan, operation)`, then decode with
+`Responses.get(ticket)`. The plan can mix unrelated result types. All command
+replies are drained even when some contain server errors. Each ticket checks
+pipeline identity, including independently constructed pipelines; `at` and
+`raw` provide indexed access. A server/type error identifies the response index.
+A pipeline can be reused; its builder and mutable argument/reply buffers must
+not be mutated concurrently with use.
+
+`connection.transaction(plan, operation)` holds the connection for MULTI,
+queued commands and EXEC. It verifies MULTI before sending the plan. Queue-time
+errors trigger DISCARD and return `TransactionOutcome::Rejected` with indexed
+server errors. A successful EXEC returns `Committed(Responses)`; execution-time
+errors remain individual results and **do not roll back** successful commands.
+A WATCH conflict returns `Aborted`. Unexpected protocol/transport failure after
+MULTI closes the connection so queued transaction state cannot escape.
+
+`compare_and_set(keys, reads, build, operation)` performs WATCH, executes the
+read pipeline, invokes `build(responses)` to create the transaction and runs
+MULTI/EXEC under one connection gate. It clears watch state on application
+errors and on completion; failed cleanup closes the socket. The callback must
+not reenter this connection, wait on a task using it, or perform unbounded work.
+Use another connection when an independent operation is required. Callers own
+conflict retry policy. The callback is ordinary synchronous code and cannot be
+preempted by the operation timeout.
+
+## Deadlines, concurrency and pushes
+
+`Operation::new()` has a five-second total timeout. `with_timeout`,
+`without_timeout` and `with_cancel` configure each operation. The deadline covers
+waiting for the connection, writing requests and reading every reply, including
+interleaved push traffic. Continued network progress does not reset it.
+Concurrent requests share a channel gate and cannot exchange each other's
+replies. No background reader or connection-owned task is created.
+
+Cancellation/timeout before transmission leaves the connection usable. Failed
+transmission or interrupted reply collection closes it; `Error.may_have_executed`
+marks this transport ambiguity and `partial` retains complete pipeline replies
+already received. It does not prove whether the server committed a write, and
+it is not a transaction rollback indicator. Server errors and typed decoding
+errors after a complete ordinary reply leave framing synchronized.
+
+RESP3 pushes encountered while collecting command replies are retained in a
+bounded queue. `drain_pushes` removes currently queued values; `next_push` waits
+for a queued or newly arriving push. Push limits count both frames and wire
+bytes; overflow during a request closes the connection. `next_push` timeout or
+cancellation preserves an incomplete decoder frame for the next call because
+no request was sent. Reading an unexpected ordinary reply this way is a
+protocol failure.
+
+`subscribe(channels, SubscriptionKind, operation)` enters dedicated channel or
+pattern subscription mode. `Subscription.change` adds/removes explicit nonempty
+lists, consumes and validates all acknowledgements, and queues messages arriving
+between them. `next` returns `Event::Message(channel, payload, pattern)`,
+subscription changes, pong or an unknown event. Binary channel names and payloads
+are preserved. A read-only subscription timeout can resume a partial frame;
+an interrupted subscription change closes the connection. Ordinary command
+execution is rejected while subscribed, in both RESP versions. Removing the last
+subscription restores ordinary mode. `count` reads the server's acknowledged
+subscription count; `close` closes the underlying connection. Publishers use a
+separate connection. Sharded subscriptions are not implemented.
+
+## Codec and limits
+
+`Value` preserves every RESP2/RESP3 type, including the three null encodings,
+attributes, arbitrary map keys, duplicate pairs, big-number decimal text,
+verbatim format prefixes, binary errors and push frames. `checked()` turns a
+server error into structured `Error.server`; `without_attributes()` exposes the
+attributed payload without changing the original value. Floats support NaN,
+infinities and negative zero. Big numbers remain decimal text without narrowing.
+
+`encode`/`decode` operate on one complete value; decode rejects trailing bytes.
+`decode_prefix` returns the value and its consumed wire length. Their
+`*_with_limits` variants use explicit `Limits`.
+`Decoder::new(limits)`, `feed`, `next_frame`/`next`, `finish`, and `reset` implement
+incremental parsing without reparsing previously consumed payloads or headers.
+`next_frame` reports each root frame's wire byte count. `finish` requires drained,
+complete input. A malformed/over-limit feed or decode poisons the decoder until
+reset. `buffered` counts unconsumed input bytes; `is_partial` also detects bytes
+already materialized into an incomplete frame.
+
+Streamed bulk strings, arrays, maps and sets are accepted. The writer emits
+fixed-size equivalents; it preserves values rather than original header spelling
+or chunk boundaries. Redis 7.2 does not emit streamed aggregates itself, so
+independent specification fixtures cover those forms. Simple string/error
+payloads preserve binary bytes but exclude CR/LF. Numeric/control headers and
+three-character verbatim format labels are checked.
+
+Default limits are 16 MiB per frame, input buffer and blob; 64 KiB per header;
+1,000,000 aggregate elements; 2,000,000 values; depth 128; 1,024 commands and
+16 MiB encoded bytes per pipeline; 64 MiB received bytes per batch; and 128 pushes
+with 16 MiB queued wire bytes. Root depth is zero. Attribute pairs and their
+payload consume the value/depth budgets. Incremental input buffers can be smaller
+than a frame because consumed payload bytes move into the decoded value. Limits
+bound wire data and counts, not an exact process heap size. Cyclic caller-created
+values terminate at the encoder's depth limit. Decoder/builders are mutable and
+require external serialization if shared; `Connection` provides its own gate.
+
+Transport currently follows `std::net`: Linux amd64 numeric IPv4/IPv6 TCP
+addresses. DNS, TLS, Unix sockets, connection pools, Cluster redirection and
+Sentinel discovery are outside this implementation. Command availability depends
+on the selected server version; unsupported commands return normal server errors.
+
+## Validation
+
+From the repository root:
+
+```sh
+python3 ecosystem/verify.py redis
+python3 ecosystem/redis/race.py
+```
+
+The verifier runs 15 library tests, an independent versioned consumer test,
+fresh/cached builds, a consumer smoke check and `interop.py`. Coverage includes
+all RESP tags, every fixture fragment boundary and truncation, binary payloads,
+100,000 one-byte feeds, numeric bounds, malformed/limited frames, concurrent
+requests, queued versus in-flight cancellation, total deadlines, partial pipeline
+errors, close wakeups, push overflow and resumable subscription reads.
+
+The interoperability script checks 2,391 independently constructed RESP cases
+and exercises command families, authentication failures, binary values, Lua,
+pipelines, queue/execution transaction errors, WATCH conflicts/cleanup and Pub/Sub
+against Redis 7.2.5 in both RESP versions. It downloads the official GitHub tag
+archive with a pinned SHA-256, builds under `ecosystem/_artifact/reference`, and
+starts a fresh authenticated loopback server on an ephemeral port with persistence
+disabled. It terminates/reaps the process in `finally`. It never connects to an
+existing Redis instance. A C compiler, make and network access for the first
+reference download are needed. `race.py` compiles the generated library test
+runner with Go's race detector and invokes every test separately.
+
+Protocol references: [Redis RESP specification](https://redis.io/docs/latest/develop/reference/protocol-spec/),
+[RESP3 streamed types](https://github.com/antirez/RESP3/blob/master/spec.md),
+and [Redis transactions](https://redis.io/docs/latest/develop/using-commands/transactions/).

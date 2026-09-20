@@ -1,0 +1,583 @@
+package template;
+
+use std::num;
+use std::math;
+use std::unicode;
+
+fn arity(name: string, count: isize, minimum: isize, maximum: isize, source: Source, offset: isize) -> Result[
+    (),
+    Error,
+] {
+    if count < minimum || count > maximum {
+        Result::Err(
+            problem(
+                source,
+                offset,
+                ErrorKind::Type,
+                f"{name} expects {minimum}..{maximum} arguments",
+            ),
+        )
+    } else {
+        Result::Ok(())
+    }
+}
+
+fn text_argument(value: Value, source: Source, offset: isize) -> Result[string, Error] {
+    value.as_text().or_error(
+        || problem(source, offset, ErrorKind::Type, "expected string argument"),
+    )
+}
+
+fn int_argument(value: Value, source: Source, offset: isize) -> Result[i64, Error] {
+    value.as_int().or_error(
+        || problem(source, offset, ErrorKind::Type, "expected integer argument"),
+    )
+}
+
+impl Runtime {
+    fn sorted(self: Runtime, values: Vec[Value], reverse: bool, source: Source, offset: isize) -> Result[
+        Vec[Value],
+        Error,
+    ] {
+        let mut items = values.copy();
+        let mut width = 1;
+        while width < items.len() {
+            let result: Vec[Value] = Vec::with_capacity(items.len());
+            let mut start = 0;
+            while start < items.len() {
+                let middle = if width > items.len() - start {
+                    items.len()
+                } else {
+                    start + width
+                };
+                let end = if width > items.len() - middle {
+                    items.len()
+                } else {
+                    middle + width
+                };
+                let mut left = start;
+                let mut right = middle;
+                while left < middle || right < end {
+                    let choose_left = if right == end {
+                        true
+                    } else if left == middle {
+                        false
+                    } else {
+                        let order = self.order(items[left], items[right], source, offset)?;
+                        if reverse {
+                            order >= 0
+                        } else {
+                            order <= 0
+                        }
+                    };
+                    if choose_left {
+                        result.push(items[left]);
+                        left += 1;
+                    } else {
+                        result.push(items[right]);
+                        right += 1;
+                    }
+                }
+                start = end;
+            }
+            items = result;
+            width *= 2;
+        }
+        Result::Ok(items)
+    }
+
+    fn call_builtin(
+        self: Runtime,
+        name: string,
+        arguments: Vec[Value],
+        source: Source,
+        offset: isize,
+        autoescape: bool,
+    ) -> Result[Value, Error] {
+        if name == "range" {
+            arity(name, arguments.len(), 1, 3, source, offset)?;
+            let start = if arguments.len() > 1 {
+                int_argument(arguments[0], source, offset)?
+            } else {
+                0
+            };
+            let end = int_argument(
+                arguments[if arguments.len() > 1 {
+                    1
+                } else {
+                    0
+                }],
+                source,
+                offset,
+            )?;
+            let step = if arguments.len() > 2 {
+                int_argument(arguments[2], source, offset)?
+            } else {
+                1
+            };
+            if step == 0 {
+                return Result::Err(
+                    problem(source, offset, ErrorKind::Type, "range step cannot be zero"),
+                )
+            }
+            let values = Vec::new();
+            let mut current = start;
+            while if step > 0 {
+                current < end
+            } else {
+                current > end
+            } {
+                self.tick(source, offset, 0)?;
+                if values.len() >= self.engine.options.limits.max_collection {
+                    return Result::Err(
+                        problem(source, offset, ErrorKind::Limit, "range exceeds collection limit"),
+                    )
+                }
+                values.push(Value::Int(current));
+                if let Some(next) = num::checked_add_int64(current, step) {
+                    current = next;
+                } else {
+                    break;
+                }
+            }
+            return Result::Ok(Value::List(values))
+        }
+        arity(name, arguments.len(), 1, 1, source, offset)?;
+        if name == "str" {
+            return Result::Ok(Value::Text(self.display(arguments[0], source, offset)?))
+        }
+        if name == "bool" {
+            return Result::Ok(Value::Bool(self.truth(arguments[0], source, offset)?))
+        }
+        if name == "len" {
+            return self.filter_builtin(
+                "length",
+                arguments[0],
+                Vec::new(),
+                source,
+                offset,
+                autoescape,
+            )
+        }
+        if name == "int" || name == "float" || name == "list" || name == "min" || name == "max" {
+            return self.filter_builtin(name, arguments[0], Vec::new(), source, offset, autoescape)
+        }
+        Result::Err(problem(source, offset, ErrorKind::Extension, f"unknown function {name}"))
+    }
+
+    fn filter_builtin(
+        self: Runtime,
+        name: string,
+        value: Value,
+        arguments: Vec[Value],
+        source: Source,
+        offset: isize,
+        autoescape: bool,
+    ) -> Result[Value, Error] {
+        if name == "default" || name == "d" {
+            arity(name, arguments.len(), 0, 2, source, offset)?;
+            let fallback = if arguments.is_empty() {
+                Value::Text("")
+            } else {
+                arguments[0]
+            };
+            let boolean = if arguments.len() > 1 {
+                self.truth(arguments[1], source, offset)?
+            } else {
+                false
+            };
+            return Result::Ok(
+                if is_missing(value) || (boolean && !self.truth(value, source, offset)?) {
+                    fallback
+                } else {
+                    value
+                },
+            )
+        }
+        if name == "escape" || name == "e" || name == "safe" || name == "forceescape" {
+            arity(name, arguments.len(), 0, 0, source, offset)?;
+            let text = self.display(value, source, offset)?;
+            return Result::Ok(
+                Value::Safe(
+                    if name == "safe" || (is_safe(value) && name != "forceescape") {
+                        text
+                    } else {
+                        escaped(text, self.engine.options.limits.max_output_bytes, source, offset)?
+                    },
+                ),
+            )
+        }
+        if name == "upper" || name == "lower" || name == "trim" || name == "capitalize" {
+            arity(name, arguments.len(), 0, 0, source, offset)?;
+            let text = text_argument(value, source, offset)?;
+            let result = match name {
+                "upper" => unicode::uppercase(text),
+                "lower" => unicode::lowercase(text),
+                "trim" => trim_space(text, true, true),
+                _ => {
+                    let lower = unicode::lowercase(text);
+                    if let Some((first, width)) = lower.decode_at(0) {
+                        unicode::to_uppercase(first).to_string()
+                            + lower.byte_slice(width, lower.byte_len())
+                    } else {
+                        ""
+                    }
+                },
+            };
+            if result.byte_len() > self.engine.options.limits.max_output_bytes {
+                return Result::Err(
+                    problem(
+                        source,
+                        offset,
+                        ErrorKind::Limit,
+                        "case conversion exceeds string limit",
+                    ),
+                )
+            }
+            return Result::Ok(
+                if is_safe(value) {
+                    Value::Safe(result)
+                } else {
+                    Value::Text(result)
+                },
+            )
+        }
+        if name == "length" || name == "count" {
+            arity(name, arguments.len(), 0, 0, source, offset)?;
+            let length = if let Some(text) = value.as_text() {
+                text.char_count()
+            } else {
+                self.sequence(value, source, offset)?.len()
+            };
+            return Result::Ok(Value::Int(length.to_i64()))
+        }
+        if name == "join" {
+            arity(name, arguments.len(), 0, 1, source, offset)?;
+            let separator = if arguments.is_empty() {
+                Value::Text("")
+            } else {
+                arguments[0]
+            };
+            let separator_text = text_argument(separator, source, offset)?;
+            let items = self.sequence(value, source, offset)?;
+            let mut safe = is_safe(separator);
+            if autoescape {
+                for item in items {
+                    safe = safe || is_safe(item);
+                }
+            }
+            let output = Output::new(self.engine.options.limits.max_output_bytes);
+            let delimiter = if safe && !is_safe(separator) {
+                escaped(separator_text, output.limit, source, offset)?
+            } else {
+                separator_text
+            };
+            for index in 0..items.len() {
+                self.tick(source, offset, 0)?;
+                if index > 0 {
+                    output.append(delimiter, source, offset)?;
+                }
+                let item = items[index];
+                let text = self.display(item, source, offset)?;
+                output.append(
+                    if safe && !is_safe(item) {
+                        escaped(text, output.limit, source, offset)?
+                    } else {
+                        text
+                    },
+                    source,
+                    offset,
+                )?;
+            }
+            return Result::Ok(
+                if safe {
+                    Value::Safe(output.finish())
+                } else {
+                    Value::Text(output.finish())
+                },
+            )
+        }
+        if name == "replace" {
+            arity(name, arguments.len(), 2, 3, source, offset)?;
+            let text = text_argument(value, source, offset)?;
+            let old = text_argument(arguments[0], source, offset)?;
+            let replacement = text_argument(arguments[1], source, offset)?;
+            let count = if arguments.len() > 2 {
+                int_argument(arguments[2], source, offset)?
+            } else {
+                -1
+            };
+            let output = Output::new(self.engine.options.limits.max_output_bytes);
+            let mut replaced: i64 = 0;
+            let mut start = 0;
+            let mut index = 0;
+            loop {
+                if (count < 0 || replaced < count) && text.starts_with_at(index, old) {
+                    output.append(text.byte_slice(start, index), source, offset)?;
+                    output.append(replacement, source, offset)?;
+                    replaced += 1;
+                    self.tick(source, offset, 0)?;
+                    if old.byte_len() > 0 {
+                        index += old.byte_len();
+                        start = index;
+                        continue;
+                    }
+                    start = index;
+                }
+                if index >= text.byte_len() {
+                    break;
+                }
+                let (_, width) = text.decode_at(index).or_error(
+                    || problem(source, offset, ErrorKind::Type, "invalid UTF-8 string"),
+                )?;
+                index += width;
+            }
+            output.append(text.byte_slice(start, text.byte_len()), source, offset)?;
+            return Result::Ok(Value::Text(output.finish()))
+        }
+        if name == "items" || name == "keys" || name == "values" {
+            arity(name, arguments.len(), 0, 0, source, offset)?;
+            let Value::Object(fields) = value else {
+                return Result::Err(
+                    problem(source, offset, ErrorKind::Type, "mapping filter requires an object"),
+                )
+            };
+            let result: Vec[Value] = Vec::new();
+            for (key, value) in fields {
+                result.push(
+                    if name == "keys" {
+                        Value::Text(key)
+                    } else if name == "values" {
+                        value
+                    } else {
+                        Value::List(Vec::from_array([Value::Text(key), value]))
+                    },
+                );
+            }
+            return Result::Ok(Value::List(result))
+        }
+        if name == "map" || name == "selectattr" || name == "rejectattr" {
+            arity(name, arguments.len(), 1, 1, source, offset)?;
+            let path = text_argument(arguments[0], source, offset)?.split(".");
+            let result: Vec[Value] = Vec::new();
+            for item in self.sequence(value, source, offset)? {
+                self.tick(source, offset, 0)?;
+                let mut field = item;
+                for part in path {
+                    field = field.get(part);
+                }
+                if name == "map" {
+                    result.push(field);
+                } else if self.truth(field, source, offset)? == (name == "selectattr") {
+                    result.push(item);
+                }
+            }
+            return Result::Ok(Value::List(result))
+        }
+        if name == "batch" {
+            arity(name, arguments.len(), 1, 2, source, offset)?;
+            let size = int_argument(arguments[0], source, offset)?;
+            if size <= 0 || size > self.engine.options.limits.max_collection.to_i64() {
+                return Result::Err(
+                    problem(source, offset, ErrorKind::Limit, "batch size outside collection limit"),
+                )
+            }
+            let items = self.sequence(value, source, offset)?;
+            let result: Vec[Value] = Vec::new();
+            let mut index = 0;
+            while index < items.len() {
+                let batch = Vec::new();
+                for _ in 0..size.to_isize() {
+                    self.tick(source, offset, 0)?;
+                    if index < items.len() {
+                        batch.push(items[index]);
+                        index += 1;
+                    } else if arguments.len() == 2 {
+                        batch.push(arguments[1]);
+                    } else {
+                        break;
+                    }
+                }
+                result.push(Value::List(batch));
+            }
+            return Result::Ok(Value::List(result))
+        }
+        if name == "int" || name == "float" {
+            arity(name, arguments.len(), 0, 0, source, offset)?;
+            let text = self.display(value, source, offset)?;
+            if name == "int" {
+                return Result::Ok(
+                    Value::Int(
+                        num::parse_int_structured(text).map_err(
+                            |error| problem(source, offset, ErrorKind::Type, error.to_string()),
+                        )?.to_i64(),
+                    ),
+                )
+            }
+            let number = num::parse_float64_structured(text).map_err(
+                |error| problem(source, offset, ErrorKind::Type, error.to_string()),
+            )?;
+            if !math::is_finite(number) {
+                return Result::Err(
+                    problem(source, offset, ErrorKind::Arithmetic, "float conversion is not finite"),
+                )
+            }
+            return Result::Ok(Value::Float(number))
+        }
+        if name == "abs" || name == "round" {
+            arity(name, arguments.len(), 0, 0, source, offset)?;
+            if let Value::Int(number) = value {
+                return Result::Ok(
+                    if name == "abs" && number < 0 {
+                        self.binary("-", Value::Int(0), value, source, offset)?
+                    } else {
+                        value
+                    },
+                )
+            }
+            let number = to_float(value).or_error(
+                || problem(source, offset, ErrorKind::Type, "numeric filter requires a number"),
+            )?;
+            return Result::Ok(
+                Value::Float(
+                    if name == "round" {
+                        math::round(number)
+                    } else if number < 0.0 {
+                        -number
+                    } else {
+                        number
+                    },
+                ),
+            )
+        }
+        if name == "tojson" {
+            arity(name, arguments.len(), 0, 0, source, offset)?;
+            let text = json_text(value, self, source, offset)?;
+            let output = Output::new(self.engine.options.limits.max_output_bytes);
+            for scalar in text.chars() {
+                output.append(
+                    match scalar {
+                        '<' => "\\u003c",
+                        '>' => "\\u003e",
+                        '&' => "\\u0026",
+                        '\'' => "\\u0027",
+                        _ => scalar.to_string(),
+                    },
+                    source,
+                    offset,
+                )?;
+            }
+            return Result::Ok(Value::Safe(output.finish()))
+        }
+        if name == "urlencode" {
+            arity(name, arguments.len(), 0, 0, source, offset)?;
+            let text = text_argument(value, source, offset)?;
+            let digits = "0123456789ABCDEF".to_bytes();
+            let output = Output::new(self.engine.options.limits.max_output_bytes);
+            for byte in text.to_bytes() {
+                if (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || digit(byte)
+                    || byte == 45
+                    || byte == 46
+                    || byte == 95
+                    || byte == 126
+                    || byte == 47 {
+                    output.append(string_from_utf8(Vec::from_array([byte])).1, source, offset)?;
+                } else {
+                    output.append(
+                        string_from_utf8(
+                            Vec::from_array(
+                                [37, digits[(byte / 16).to_isize()], digits[(byte % 16).to_isize()]],
+                            ),
+                        ).1,
+                        source,
+                        offset,
+                    )?;
+                }
+            }
+            return Result::Ok(Value::Text(output.finish()))
+        }
+        if name == "sort" {
+            arity(name, arguments.len(), 0, 1, source, offset)?;
+            let reverse = if arguments.is_empty() {
+                false
+            } else {
+                self.truth(arguments[0], source, offset)?
+            };
+            return Result::Ok(
+                Value::List(
+                    self.sorted(self.sequence(value, source, offset)?, reverse, source, offset)?,
+                ),
+            )
+        }
+        if name == "first" || name == "last" || name == "reverse" || name == "list"
+            || name == "unique"
+            || name == "sum"
+            || name == "min"
+            || name == "max"
+            || name == "select"
+            || name == "reject" {
+            arity(name, arguments.len(), 0, 0, source, offset)?;
+            let items = self.sequence(value, source, offset)?;
+            if name == "list" {
+                return Result::Ok(Value::List(items.copy()))
+            }
+            if name == "reverse" {
+                return self.slice_value(value, Option::None, Option::None, -1, source, offset)
+            }
+            if name == "first" || name == "last" {
+                return Result::Ok(
+                    if items.is_empty() {
+                        Value::Undefined("empty collection")
+                    } else {
+                        items[if name == "first" {
+                            0
+                        } else {
+                            items.len() - 1
+                        }]
+                    },
+                )
+            }
+            if name == "sum" {
+                let mut total = Value::Int(0);
+                for item in items {
+                    self.tick(source, offset, 0)?;
+                    total = self.binary("+", total, item, source, offset)?;
+                }
+                return Result::Ok(total)
+            }
+            if name == "min" || name == "max" {
+                if items.is_empty() {
+                    return Result::Ok(Value::Undefined("empty collection"))
+                }
+                let mut selected = items[0];
+                for item in items {
+                    let order = self.order(item, selected, source, offset)?;
+                    if (name == "min" && order < 0) || (name == "max" && order > 0) {
+                        selected = item;
+                    }
+                }
+                return Result::Ok(selected)
+            }
+            let result: Vec[Value] = Vec::new();
+            for item in items {
+                self.tick(source, offset, 0)?;
+                if name == "unique" {
+                    let mut found = false;
+                    for previous in result {
+                        if self.equal(previous, item, source, offset, 0)? {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        result.push(item);
+                    }
+                } else if self.truth(item, source, offset)? == (name == "select") {
+                    result.push(item);
+                }
+            }
+            return Result::Ok(Value::List(result))
+        }
+        Result::Err(problem(source, offset, ErrorKind::Extension, f"unknown filter {name}"))
+    }
+}

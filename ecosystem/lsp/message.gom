@@ -1,0 +1,224 @@
+package lsp;
+
+use std::json;
+use std::num;
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub enum Id {
+    Number(isize),
+    Text(string),
+}
+
+pub struct RpcError {
+    pub code: isize,
+    pub message: string,
+    pub data: Option[json::Value],
+}
+
+impl RpcError {
+    pub fn new(code: isize, message: string) -> RpcError {
+        RpcError { code, message, data: Option::None }
+    }
+}
+
+impl ToString for RpcError {
+    fn to_string(self: RpcError) -> string {
+        f"{self.code}: {self.message}"
+    }
+}
+
+pub enum Message {
+    Request(Id, string, Option[json::Value]),
+    Notification(string, Option[json::Value]),
+    Response(Option[Id], Result[json::Value, RpcError]),
+}
+
+fn invalid(message: string) -> RpcError {
+    RpcError::new(-32602, message)
+}
+
+fn members(value: json::Value) -> Result[Vec[(string, json::Value)], RpcError] {
+    let json::Value::Object(fields) = value else {
+        return Result::Err(invalid("expected object"))
+    };
+    let seen: HashMap[string, bool] = HashMap::new();
+    for (key, _) in fields {
+        if seen.contains(key) {
+            return Result::Err(invalid(f"duplicate field {key}"))
+        }
+        seen.set(key, true);
+    }
+    Result::Ok(fields)
+}
+
+fn required(value: json::Value, key: string) -> Result[json::Value, RpcError] {
+    json::field(value, key).ok_or(invalid(f"missing {key}"))
+}
+
+fn string_field(value: json::Value, key: string) -> Result[string, RpcError] {
+    json::as_string(required(value, key)?).ok_or(invalid(f"{key} must be a string"))
+}
+
+fn integer(value: json::Value) -> Result[isize, RpcError] {
+    let json::Value::Number(raw) = value else {
+        return Result::Err(invalid("expected integer"))
+    };
+    let result = num::parse_int_structured(raw).map_err(|_| invalid("expected in-range integer"))?;
+    if result < -2147483648 || result > 2147483647 {
+        Result::Err(invalid("integer exceeds LSP range"))
+    } else {
+        Result::Ok(result)
+    }
+}
+
+fn unsigned(value: json::Value) -> Result[isize, RpcError] {
+    let result = integer(value)?;
+    if result < 0 {
+        Result::Err(invalid("expected nonnegative integer"))
+    } else {
+        Result::Ok(result)
+    }
+}
+
+impl Id {
+    pub fn from_json(value: json::Value) -> Result[Id, RpcError] {
+        match value {
+            json::Value::String(value) => Result::Ok(Id::Text(value)),
+            json::Value::Number(_) => Result::Ok(Id::Number(integer(value)?)),
+            _ => Result::Err(invalid("request id must be an integer or string")),
+        }
+    }
+
+    pub fn to_json(self: Id) -> json::Value {
+        match self {
+            Id::Number(value) => json::Value::Number(value.to_string()),
+            Id::Text(value) => json::Value::String(value),
+        }
+    }
+}
+
+fn read_message(value: json::Value) -> Result[Message, RpcError] {
+    let _ = members(value)?;
+    if string_field(value, "jsonrpc")? != "2.0" {
+        return Result::Err(invalid("jsonrpc must be 2.0"))
+    }
+    if json::field(value, "method").is_some() {
+        if json::field(value, "result").is_some() || json::field(value, "error").is_some() {
+            return Result::Err(invalid("method and response fields cannot be combined"))
+        }
+        let method = string_field(value, "method")?;
+        let params = json::field(value, "params");
+        if let Some(params) = params {
+            match params {
+                json::Value::Array(_) => (),
+                json::Value::Object(_) => {
+                    let _ = members(params)?;
+                },
+                _ => return Result::Err(invalid("params must be an object or array")),
+            }
+        }
+        match json::field(value, "id") {
+            Some(id) => Result::Ok(Message::Request(Id::from_json(id)?, method, params)),
+            None => Result::Ok(Message::Notification(method, params)),
+        }
+    } else {
+        let id = match required(value, "id")? {
+            json::Value::Null => Option::None,
+            value => Option::Some(Id::from_json(value)?),
+        };
+        match (json::field(value, "result"), json::field(value, "error")) {
+            (Some(result), None) => Result::Ok(Message::Response(id, Result::Ok(result))),
+            (None, Some(problem)) => {
+                let _ = members(problem)?;
+                Result::Ok(
+                    Message::Response(
+                        id,
+                        Result::Err(
+                            RpcError {
+                                code: integer(required(problem, "code")?)?,
+                                message: string_field(problem, "message")?,
+                                data: json::field(problem, "data"),
+                            },
+                        ),
+                    ),
+                )
+            },
+            _ => Result::Err(invalid("response requires exactly one of result or error")),
+        }
+    }
+}
+
+pub fn decode_value(value: json::Value) -> Result[Message, RpcError] {
+    read_message(value).map_err(|problem| RpcError::new(-32600, problem.message))
+}
+
+pub fn decode(body: string) -> Result[Message, RpcError] {
+    let mut depth: isize = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for ch in body.chars() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                quoted = false;
+            }
+        } else if ch == '"' {
+            quoted = true;
+        } else if ch == '{' || ch == '[' {
+            depth += 1;
+            if depth > 128 {
+                return Result::Err(RpcError::new(-32700, "JSON nesting limit exceeded"))
+            }
+        } else if ch == '}' || ch == ']' {
+            depth -= 1;
+        }
+    }
+    decode_value(json::parse(body).map_err(|message| RpcError::new(-32700, message))?)
+}
+
+pub fn encode_value(message: Message) -> json::Value {
+    let fields = Vec::from_array([("jsonrpc", json::Value::String("2.0"))]);
+    match message {
+        Message::Request(id, method, params) => {
+            fields.push(("id", id.to_json()));
+            fields.push(("method", json::Value::String(method)));
+            if let Some(params) = params {
+                fields.push(("params", params));
+            }
+        },
+        Message::Notification(method, params) => {
+            fields.push(("method", json::Value::String(method)));
+            if let Some(params) = params {
+                fields.push(("params", params));
+            }
+        },
+        Message::Response(id, result) => {
+            fields.push(("id", id.map(|id| id.to_json()).unwrap_or(json::Value::Null)));
+            match result {
+                Ok(value) => fields.push(("result", value)),
+                Err(problem) => {
+                    let error_fields = Vec::from_array(
+                        [
+                            ("code", json::Value::Number(problem.code.to_string())),
+                            ("message", json::Value::String(problem.message)),
+                        ],
+                    );
+                    if let Some(data) = problem.data {
+                        error_fields.push(("data", data));
+                    }
+                    fields.push(("error", json::object(error_fields)));
+                },
+            }
+        },
+    }
+    json::object(fields)
+}
+
+pub fn encode(message: Message) -> Result[string, RpcError] {
+    let value = encode_value(message);
+    let _ = decode_value(value)?;
+    Result::Ok(json::encode(value))
+}

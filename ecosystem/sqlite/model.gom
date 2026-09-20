@@ -1,0 +1,417 @@
+package sqlite;
+
+use std::bytes::{Bytes};
+use std::ffi;
+
+#[derive(Debug, PartialEq)]
+pub enum ErrorKind {
+    Closed,
+    Busy,
+    Argument,
+    Conversion,
+    Timeout,
+    Cancelled,
+    Sqlite,
+    Constraint,
+    NoRows,
+    MultipleRows,
+    Limit,
+}
+
+pub struct DbError {
+    pub kind: ErrorKind,
+    pub message: string,
+    pub code: isize,
+    pub cleanup: Option[string],
+    native: Option[Cause],
+}
+
+impl DbError {
+    pub fn new(kind: ErrorKind, message: string) -> DbError {
+        DbError { kind, message, code: 0, cleanup: Option::None, native: Option::None }
+    }
+
+    pub fn primary_code(self: DbError) -> isize {
+        self.code & 255
+    }
+
+    pub fn native_cause(self: DbError) -> Option[Cause] {
+        self.native
+    }
+
+    fn with_cleanup(self: DbError, cleanup: DbError) -> DbError {
+        DbError { cleanup: Option::Some(cleanup.to_string()), ..self }
+    }
+}
+
+impl ToString for DbError {
+    fn to_string(self: DbError) -> string {
+        if let Some(cleanup) = self.cleanup {
+            self.message + "; cleanup: " + cleanup
+        } else {
+            self.message
+        }
+    }
+}
+
+impl Debug for DbError {
+    fn debug(self: DbError) -> string {
+        self.to_string()
+    }
+}
+
+fn check(error: NativeFailure) -> Result[(), DbError] {
+    if raw_error_is_nil(error) {
+        return Result::Ok(())
+    }
+    let native = Cause { raw: error };
+    let code = raw_error_code(error);
+    let kind = match raw_error_class(error) {
+        1 => ErrorKind::Closed,
+        2 => ErrorKind::Busy,
+        3 => ErrorKind::Argument,
+        4 => ErrorKind::Conversion,
+        5 => ErrorKind::Timeout,
+        6 => ErrorKind::Cancelled,
+        _ => if code & 255 == 19 {
+            ErrorKind::Constraint
+        } else if code & 255 == 5 || code & 255 == 6 {
+            ErrorKind::Busy
+        } else {
+            ErrorKind::Sqlite
+        },
+    };
+    Result::Err(
+        DbError {
+            kind,
+            code,
+            message: native.message(),
+            cleanup: Option::None,
+            native: Option::Some(native),
+        },
+    )
+}
+
+pub enum Value {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(string),
+    TextBytes(Bytes),
+    Blob(Bytes),
+}
+
+impl Value {
+    pub fn is_null(self: Value) -> bool {
+        match self {
+            Value::Null => true,
+            _ => false,
+        }
+    }
+
+    fn encode(self: Value) -> NativeValue {
+        match self {
+            Value::Null => raw_null(),
+            Value::Integer(value) => raw_integer(value),
+            Value::Real(value) => raw_real(value),
+            Value::Text(value) => raw_text(ffi::string_from_text(value)),
+            Value::TextBytes(value) => raw_text(ffi::string_from_bytes(value)),
+            Value::Blob(value) => raw_blob(ffi::slice_from_vec_copy(value.to_vec())),
+        }
+    }
+}
+
+fn decode(value: NativeValue) -> Result[Value, DbError] {
+    match raw_value_kind(value) {
+        0 => Result::Ok(Value::Null),
+        1 => Result::Ok(Value::Integer(raw_value_integer(value))),
+        2 => Result::Ok(Value::Real(raw_value_real(value))),
+        3 => {
+            let text = raw_value_text(value);
+            Result::Ok(
+                match ffi::string_text(text) {
+                    Ok(text) => Value::Text(text),
+                    Err(_) => Value::TextBytes(ffi::string_bytes(text)),
+                },
+            )
+        },
+        4 => Result::Ok(Value::Blob(Bytes::from_vec(ffi::slice_to_vec_copy(raw_value_blob(value))))),
+        _ => Result::Err(DbError::new(ErrorKind::Conversion, "unknown native SQLite value")),
+    }
+}
+
+pub trait ToValue {
+    fn to_value(self: Self) -> Value;
+}
+
+pub trait FromValue {
+    fn from_value(value: Value) -> Result[Self, DbError];
+}
+
+impl ToValue for Value {
+    fn to_value(self: Value) -> Value {
+        self
+    }
+}
+
+impl FromValue for Value {
+    fn from_value(value: Value) -> Result[Value, DbError] {
+        Result::Ok(value)
+    }
+}
+
+impl ToValue for i64 {
+    fn to_value(self: i64) -> Value {
+        Value::Integer(self)
+    }
+}
+
+impl FromValue for i64 {
+    fn from_value(value: Value) -> Result[i64, DbError] {
+        match value {
+            Value::Integer(value) => Result::Ok(value),
+            _ => Result::Err(DbError::new(ErrorKind::Conversion, "expected INTEGER")),
+        }
+    }
+}
+
+impl ToValue for f64 {
+    fn to_value(self: f64) -> Value {
+        Value::Real(self)
+    }
+}
+
+impl FromValue for f64 {
+    fn from_value(value: Value) -> Result[f64, DbError] {
+        match value {
+            Value::Real(value) => Result::Ok(value),
+            _ => Result::Err(DbError::new(ErrorKind::Conversion, "expected REAL")),
+        }
+    }
+}
+
+impl ToValue for bool {
+    fn to_value(self: bool) -> Value {
+        Value::Integer(
+            if self {
+                1
+            } else {
+                0
+            },
+        )
+    }
+}
+
+impl FromValue for bool {
+    fn from_value(value: Value) -> Result[bool, DbError] {
+        match value {
+            Value::Integer(0) => Result::Ok(false),
+            Value::Integer(1) => Result::Ok(true),
+            _ => Result::Err(DbError::new(ErrorKind::Conversion, "expected INTEGER 0 or 1")),
+        }
+    }
+}
+
+impl ToValue for string {
+    fn to_value(self: string) -> Value {
+        Value::Text(self)
+    }
+}
+
+impl FromValue for string {
+    fn from_value(value: Value) -> Result[string, DbError] {
+        match value {
+            Value::Text(value) => Result::Ok(value),
+            _ => Result::Err(DbError::new(ErrorKind::Conversion, "expected UTF-8 TEXT")),
+        }
+    }
+}
+
+impl ToValue for Bytes {
+    fn to_value(self: Bytes) -> Value {
+        Value::Blob(self)
+    }
+}
+
+impl FromValue for Bytes {
+    fn from_value(value: Value) -> Result[Bytes, DbError] {
+        match value {
+            Value::Blob(value) => Result::Ok(value),
+            _ => Result::Err(DbError::new(ErrorKind::Conversion, "expected BLOB")),
+        }
+    }
+}
+
+impl[T: ToValue] ToValue for Option[T] {
+    fn to_value(self: Option[T]) -> Value {
+        match self {
+            Some(value) => value.to_value(),
+            None => Value::Null,
+        }
+    }
+}
+
+impl[T: FromValue] FromValue for Option[T] {
+    fn from_value(value: Value) -> Result[Option[T], DbError] {
+        if value.is_null() {
+            Result::Ok(Option::None)
+        } else {
+            let decoded: T = FromValue::from_value(value)?;
+            Result::Ok(Option::Some(decoded))
+        }
+    }
+}
+
+pub struct Params {
+    values: Vec[Value],
+    names: Vec[string],
+}
+
+impl Params {
+    pub fn empty() -> Params {
+        Params { values: Vec::new(), names: Vec::new() }
+    }
+
+    pub fn positional(values: Vec[Value]) -> Params {
+        Params { values: values.copy(), names: Vec::new() }
+    }
+
+    pub fn named(values: Vec[(string, Value)]) -> Params {
+        let names = Vec::new();
+        let items = Vec::new();
+        for (name, value) in values {
+            names.push(name);
+            items.push(value);
+        }
+        Params { values: items, names }
+    }
+
+    pub fn len(self: Params) -> isize {
+        self.values.len()
+    }
+
+    fn encode(self: Params) -> (ffi::RawSlice[NativeValue], ffi::RawSlice[ffi::String]) {
+        let values = Vec::new();
+        let names = Vec::new();
+        for value in self.values {
+            values.push(value.encode());
+        }
+        for name in self.names {
+            names.push(ffi::string_from_text(name));
+        }
+        let result = (ffi::slice_shared(values), ffi::slice_shared(names));
+        result
+    }
+}
+
+pub struct Column {
+    pub name: string,
+    pub declared_type: string,
+}
+
+pub struct Row {
+    values: Vec[Value],
+    columns: Vec[Column],
+}
+
+impl Row {
+    pub fn len(self: Row) -> isize {
+        self.values.len()
+    }
+
+    pub fn columns(self: Row) -> Vec[Column] {
+        self.columns.copy()
+    }
+
+    pub fn values(self: Row) -> Vec[Value] {
+        self.values.copy()
+    }
+
+    pub fn value(self: Row, index: isize) -> Result[Value, DbError] {
+        if index < 0 || index >= self.values.len() {
+            Result::Err(DbError::new(ErrorKind::Argument, "column index out of range"))
+        } else {
+            Result::Ok(self.values[index])
+        }
+    }
+
+    pub fn index(self: Row, name: string) -> Result[isize, DbError] {
+        let mut found = Option::None;
+        for index in 0..self.columns.len() {
+            if self.columns[index].name == name {
+                if found.is_some() {
+                    return Result::Err(
+                        DbError::new(ErrorKind::Argument, "ambiguous column name: " + name),
+                    )
+                }
+                found = Option::Some(index);
+            }
+        }
+        found.ok_or(DbError::new(ErrorKind::Argument, "unknown column name: " + name))
+    }
+
+    pub fn get[T: FromValue](self: Row, index: isize) -> Result[T, DbError] {
+        FromValue::from_value(self.value(index)?)
+    }
+
+    pub fn get_named[T: FromValue](self: Row, name: string) -> Result[T, DbError] {
+        self.get(self.index(name)?)
+    }
+
+    pub fn decode[T: FromRow](self: Row) -> Result[T, DbError] {
+        FromRow::from_row(self)
+    }
+}
+
+pub trait FromRow {
+    fn from_row(row: Row) -> Result[Self, DbError];
+}
+
+impl FromRow for Row {
+    fn from_row(row: Row) -> Result[Row, DbError] {
+        Result::Ok(row)
+    }
+}
+
+fn decode_columns(raw: ffi::RawSlice[NativeColumn]) -> Result[Vec[Column], DbError] {
+    let values = Vec::new();
+    for column in raw {
+        values.push(
+            Column {
+                name: ffi::string_text(raw_column_name(column)).map_err(
+                    |_| DbError::new(ErrorKind::Conversion, "column name is not UTF-8"),
+                )?,
+                declared_type: ffi::string_text(raw_column_type(column)).map_err(
+                    |_| DbError::new(ErrorKind::Conversion, "column type is not UTF-8"),
+                )?,
+            },
+        );
+    }
+    Result::Ok(values)
+}
+
+fn decode_row(raw: NativeRow) -> Result[Row, DbError] {
+    let values = Vec::new();
+    for value in raw_row_values(raw) {
+        values.push(decode(value)?);
+    }
+    Result::Ok(Row { values, columns: decode_columns(raw_row_columns(raw))? })
+}
+
+pub struct Cause {
+    raw: NativeFailure,
+}
+
+impl Cause {
+    pub fn message(self: Cause) -> string {
+        ffi::string_text(raw_error_message(self.raw)).unwrap_or("SQLite returned a non-UTF-8 error")
+    }
+
+    pub fn message_bytes(self: Cause) -> Bytes {
+        ffi::string_bytes(raw_error_message(self.raw))
+    }
+
+    pub fn code(self: Cause) -> isize {
+        raw_error_code(self.raw)
+    }
+}

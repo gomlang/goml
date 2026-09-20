@@ -1,0 +1,655 @@
+package redis;
+
+use std::num;
+use std::utf8;
+use std::math;
+
+struct Aggregate {
+    tag: u8,
+    expected: Option[isize],
+    values: Vec[Value],
+}
+
+enum Pending {
+    Tag,
+    Line(u8, Vec[u8], bool, Option[Vec[u8]]),
+    Payload(u8, isize, Vec[u8], isize, bool),
+    Chunk(Vec[u8]),
+}
+
+pub struct Decoder {
+    limits: Limits,
+    buffer: Vec[u8],
+    cursor: Ref[isize],
+    used: Ref[isize],
+    values: Ref[isize],
+    pending: Ref[Pending],
+    stack: Vec[Aggregate],
+    failure: Ref[Option[Error]],
+}
+
+fn decimal(value: string, signed: bool) -> bool {
+    let mut index = 0;
+    if signed && value.byte_len() > 0 && (value.byte_get(0) == 43 || value.byte_get(0) == 45) {
+        index = 1;
+    }
+    if index == value.byte_len() {
+        return false
+    }
+    while index < value.byte_len() {
+        let byte = value.byte_get(index);
+        if byte < 48 || byte > 57 {
+            return false
+        }
+        index += 1;
+    }
+    true
+}
+
+fn integer_line(value: string, offset: isize) -> Result[i64, Error] {
+    if !decimal(value, true) {
+        return Result::Err(error(ErrorKind::Protocol, offset, "invalid decimal integer"))
+    }
+    num::parse_int_structured(value).map(|value| value.to_i64()).map_err(
+        |_| error(ErrorKind::Protocol, offset, "integer exceeds signed 64-bit range"),
+    )
+}
+
+fn length_line(value: string, offset: isize) -> Result[isize, Error] {
+    if !decimal(value, false) {
+        return Result::Err(error(ErrorKind::Protocol, offset, "length must be unsigned decimal"))
+    }
+    num::parse_int_structured(value).map_err(
+        |_| error(ErrorKind::Limit, offset, "length exceeds platform range"),
+    )
+}
+
+fn double_line(value: string, offset: isize) -> Result[f64, Error] {
+    if value == "inf" {
+        return Result::Ok(float64_from_bits(9218868437227405312))
+    }
+    if value == "-inf" {
+        return Result::Ok(float64_from_bits(18442240474082181120))
+    }
+    if value == "nan" {
+        return Result::Ok(float64_from_bits(9221120237041090560))
+    }
+    let mut index = 0;
+    if value.starts_with("-") || value.starts_with("+") {
+        index += 1;
+    }
+    let mut digits = 0;
+    while index < value.byte_len() && value.byte_get(index) >= 48 && value.byte_get(index) <= 57 {
+        index += 1;
+        digits += 1;
+    }
+    if index < value.byte_len() && value.byte_get(index) == 46 {
+        index += 1;
+        while index < value.byte_len() && value.byte_get(index) >= 48 && value.byte_get(index) <= 57 {
+            index += 1;
+            digits += 1;
+        }
+    }
+    if digits == 0 {
+        return Result::Err(error(ErrorKind::Protocol, offset, "invalid double"))
+    }
+    if index < value.byte_len() && (value.byte_get(index) == 101 || value.byte_get(index) == 69) {
+        index += 1;
+        if index < value.byte_len() && (value.byte_get(index) == 43 || value.byte_get(index) == 45) {
+            index += 1;
+        }
+        let start = index;
+        while index < value.byte_len() && value.byte_get(index) >= 48 && value.byte_get(index) <= 57 {
+            index += 1;
+        }
+        if index == start {
+            return Result::Err(
+                error(ErrorKind::Protocol, offset, "double exponent requires digits"),
+            )
+        }
+    }
+    if index != value.byte_len() {
+        return Result::Err(error(ErrorKind::Protocol, offset, "invalid double characters"))
+    }
+    let parsed = num::parse_float64_structured(value).map_err(
+        |_| error(ErrorKind::Protocol, offset, "double outside supported range"),
+    )?;
+    if !math::is_finite(parsed) {
+        Result::Err(
+            error(ErrorKind::Protocol, offset, "nonfinite double must use inf, -inf or nan"),
+        )
+    } else {
+        Result::Ok(parsed)
+    }
+}
+
+fn pairs(values: Vec[Value], length: isize) -> Vec[(Value, Value)] {
+    let result = Vec::with_capacity(length);
+    for index in 0..length {
+        result.push((values[index * 2], values[index * 2 + 1]));
+    }
+    result
+}
+
+fn aggregate_value(frame: Aggregate, offset: isize) -> Result[Value, Error] {
+    let values = frame.values;
+    match frame.tag {
+        42 => Result::Ok(Value::Array(values)),
+        126 => Result::Ok(Value::Set(values)),
+        37 => if values.len() % 2 != 0 {
+            Result::Err(error(ErrorKind::Protocol, offset, "map requires key/value pairs"))
+        } else {
+            Result::Ok(Value::Map(pairs(values, values.len() / 2)))
+        },
+        124 => {
+            if values.len() % 2 != 1 {
+                return Result::Err(
+                    error(
+                        ErrorKind::Protocol,
+                        offset,
+                        "attributes require pairs and a following value",
+                    ),
+                )
+            }
+            Result::Ok(Value::Attribute(pairs(values, values.len() / 2), values[values.len() - 1]))
+        },
+        62 => {
+            if values.is_empty() {
+                return Result::Err(error(ErrorKind::Protocol, offset, "push requires a type name"))
+            }
+            match values[0].without_attributes() {
+                Value::Simple(_) | Value::Bulk(_) => Result::Ok(Value::Push(values)),
+                _ => Result::Err(error(ErrorKind::Protocol, offset, "push type must be a string")),
+            }
+        },
+        _ => Result::Err(error(ErrorKind::Protocol, offset, "invalid aggregate")),
+    }
+}
+
+impl Decoder {
+    pub fn new(limits: Limits) -> Result[Decoder, Error] {
+        limits.validate()?;
+        Result::Ok(
+            Decoder {
+                limits,
+                buffer: Vec::new(),
+                cursor: Ref::new(0),
+                used: Ref::new(0),
+                values: Ref::new(0),
+                pending: Ref::new(Pending::Tag),
+                stack: Vec::new(),
+                failure: Ref::new(Option::None),
+            },
+        )
+    }
+
+    pub fn buffered(self: Decoder) -> isize {
+        self.buffer.len() - self.cursor.get()
+    }
+
+    pub fn capacity_remaining(self: Decoder) -> isize {
+        self.limits.max_buffer_bytes - self.buffered()
+    }
+
+    pub fn is_partial(self: Decoder) -> bool {
+        self.used.get() != 0
+    }
+
+    pub fn feed(self: Decoder, data: Slice[u8]) -> Result[(), Error] {
+        if let Some(error) = self.failure.get() {
+            return Result::Err(error)
+        }
+        if data.len() > self.capacity_remaining() {
+            let problem = error(
+                ErrorKind::Limit,
+                self.used.get(),
+                "decoder input buffer limit exceeded",
+            );
+            self.failure.set(Option::Some(problem));
+            return Result::Err(problem)
+        }
+        if self.cursor.get() > 0
+            && (self.cursor.get() >= self.buffer.len() / 2
+                || data.len() > self.limits.max_buffer_bytes - self.buffer.len()) {
+            let rest = self.buffer.slice(self.cursor.get(), self.buffer.len()).to_vec();
+            self.buffer.clear();
+            self.buffer.extend(rest);
+            self.cursor.set(0);
+        }
+        for byte in data {
+            self.buffer.push(byte);
+        }
+        Result::Ok(())
+    }
+
+    fn consume(self: Decoder, count: isize) -> Result[(), Error] {
+        if count > self.limits.max_frame_bytes - self.used.get() {
+            return Result::Err(
+                error(ErrorKind::Limit, self.used.get(), "RESP frame byte limit exceeded"),
+            )
+        }
+        self.cursor.set(self.cursor.get() + count);
+        self.used.set(self.used.get() + count);
+        Result::Ok(())
+    }
+
+    fn byte(self: Decoder) -> Result[u8, Error] {
+        let byte = self.buffer[self.cursor.get()];
+        self.consume(1)?;
+        Result::Ok(byte)
+    }
+
+    fn emit(self: Decoder, initial: Value) -> Result[Option[Decoded], Error] {
+        let mut value = initial;
+        loop {
+            if self.stack.is_empty() {
+                let frame = Decoded { value, wire_bytes: self.used.get() };
+                self.used.set(0);
+                self.values.set(0);
+                self.pending.set(Pending::Tag);
+                return Result::Ok(Option::Some(frame))
+            }
+            let top = self.stack[self.stack.len() - 1];
+            let allowed = if top.tag == 37 {
+                self.limits.max_elements * 2
+            } else if top.tag == 124 {
+                self.limits.max_elements * 2 + 1
+            } else {
+                self.limits.max_elements
+            };
+            if top.values.len() >= allowed {
+                return Result::Err(
+                    error(ErrorKind::Limit, self.used.get(), "aggregate element limit exceeded"),
+                )
+            }
+            top.values.push(value);
+            if let Some(expected) = top.expected {
+                if top.values.len() == expected {
+                    let _ = self.stack.pop();
+                    value = aggregate_value(top, self.used.get())?;
+                    continue;
+                }
+            }
+            return Result::Ok(Option::None)
+        }
+    }
+
+    fn header(self: Decoder, tag: u8, data: Vec[u8], chunks: Option[Vec[u8]]) -> Result[
+        Option[Decoded],
+        Error,
+    ] {
+        self.pending.set(Pending::Tag);
+        if tag == 43 {
+            return self.emit(Value::Simple(data))
+        }
+        if tag == 45 {
+            return self.emit(Value::SimpleError(data))
+        }
+        let text = utf8::decode_slice(data.as_slice()).map_err(
+            |_| error(ErrorKind::Protocol, self.used.get(), "numeric/control header is not ASCII"),
+        )?;
+        match tag {
+            58 => return self.emit(Value::Integer(integer_line(text, self.used.get())?)),
+            95 => {
+                if text != "" {
+                    return Result::Err(
+                        error(ErrorKind::Protocol, self.used.get(), "null header must be empty"),
+                    )
+                }
+                return self.emit(Value::Null)
+            },
+            35 => {
+                if text != "t" && text != "f" {
+                    return Result::Err(
+                        error(ErrorKind::Protocol, self.used.get(), "boolean must be t or f"),
+                    )
+                }
+                return self.emit(Value::Boolean(text == "t"))
+            },
+            44 => return self.emit(Value::Double(double_line(text, self.used.get())?)),
+            40 => {
+                if !decimal(text, true) {
+                    return Result::Err(
+                        error(ErrorKind::Protocol, self.used.get(), "invalid big number"),
+                    )
+                }
+                return self.emit(Value::BigNumber(text))
+            },
+            46 => {
+                if text != "" || self.stack.is_empty() {
+                    return Result::Err(
+                        error(
+                            ErrorKind::Protocol,
+                            self.used.get(),
+                            "unexpected aggregate terminator",
+                        ),
+                    )
+                }
+                let frame = self.stack[self.stack.len() - 1];
+                if frame.expected.is_some() {
+                    return Result::Err(
+                        error(
+                            ErrorKind::Protocol,
+                            self.used.get(),
+                            "terminator inside fixed aggregate",
+                        ),
+                    )
+                }
+                let _ = self.stack.pop();
+                return self.emit(aggregate_value(frame, self.used.get())?)
+            },
+            _ => (),
+        }
+        if tag == 36 && text == "-1" {
+            return self.emit(Value::NullBulk)
+        }
+        if tag == 42 && text == "-1" {
+            return self.emit(Value::NullArray)
+        }
+        if tag == 36 && text == "?" {
+            self.pending.set(Pending::Chunk(Vec::new()));
+            return Result::Ok(Option::None)
+        }
+        if tag == 36 || tag == 33 || tag == 61 || tag == 59 {
+            let length = length_line(text, self.used.get())?;
+            let bytes = chunks.unwrap_or(Vec::new());
+            if length > self.limits.max_blob_bytes - bytes.len() {
+                return Result::Err(
+                    error(ErrorKind::Limit, self.used.get(), "bulk payload limit exceeded"),
+                )
+            }
+            if tag == 59 && length == 0 {
+                return self.emit(Value::Bulk(bytes))
+            }
+            if tag == 61 && length < 4 {
+                return Result::Err(
+                    error(
+                        ErrorKind::Protocol,
+                        self.used.get(),
+                        "verbatim payload requires a format prefix",
+                    ),
+                )
+            }
+            if length > self.limits.max_frame_bytes - self.used.get() {
+                return Result::Err(
+                    error(ErrorKind::Limit, self.used.get(), "declared payload exceeds frame limit"),
+                )
+            }
+            self.pending.set(Pending::Payload(tag, length, bytes, 0, tag == 59));
+            return Result::Ok(Option::None)
+        }
+        let expected = if text == "?" {
+            if tag != 42 && tag != 37 && tag != 126 {
+                return Result::Err(
+                    error(ErrorKind::Protocol, self.used.get(), "this aggregate cannot be streamed"),
+                )
+            }
+            Option::None
+        } else {
+            let length = length_line(text, self.used.get())?;
+            if length > self.limits.max_elements || length > (9223372036854775807 - 1) / 2 {
+                return Result::Err(
+                    error(ErrorKind::Limit, self.used.get(), "aggregate length limit exceeded"),
+                )
+            }
+            let count = if tag == 37 {
+                length * 2
+            } else if tag == 124 {
+                length * 2 + 1
+            } else {
+                length
+            };
+            if count > self.limits.max_values - self.values.get() {
+                return Result::Err(
+                    error(
+                        ErrorKind::Limit,
+                        self.used.get(),
+                        "aggregate exceeds remaining value budget",
+                    ),
+                )
+            }
+            Option::Some(count)
+        };
+        let frame = Aggregate { tag, expected, values: Vec::new() };
+        if expected == Option::Some(0) {
+            self.emit(aggregate_value(frame, self.used.get())?)
+        } else {
+            self.stack.push(frame);
+            Result::Ok(Option::None)
+        }
+    }
+
+    fn scan(self: Decoder) -> Result[Option[Decoded], Error] {
+        while self.buffered() > 0 {
+            match self.pending.get() {
+                Pending::Tag => {
+                    let tag = self.byte()?;
+                    if tag != 46 {
+                        if self.stack.len() > self.limits.max_depth
+                            || self.values.get() >= self.limits.max_values {
+                            return Result::Err(
+                                error(
+                                    ErrorKind::Limit,
+                                    self.used.get(),
+                                    "RESP nesting or value count limit exceeded",
+                                ),
+                            )
+                        }
+                        self.values.set(self.values.get() + 1);
+                    }
+                    match tag {
+                        43 | 45 | 58 | 36 | 42 | 95 | 35 | 44 | 40 | 33 | 61 | 37 | 124 | 126 | 62 | 46 => self.pending.set(
+                            Pending::Line(tag, Vec::new(), false, Option::None),
+                        ),
+                        _ => return Result::Err(
+                            error(ErrorKind::Protocol, self.used.get() - 1, "unknown RESP prefix"),
+                        ),
+                    }
+                },
+                Pending::Chunk(bytes) => {
+                    if self.byte()? != 59 {
+                        return Result::Err(
+                            error(
+                                ErrorKind::Protocol,
+                                self.used.get() - 1,
+                                "streamed bulk requires a chunk header",
+                            ),
+                        )
+                    }
+                    self.pending.set(Pending::Line(59, Vec::new(), false, Option::Some(bytes)));
+                },
+                Pending::Line(tag, line, seen_cr, chunks) => {
+                    let mut cr = seen_cr;
+                    let mut complete = false;
+                    while self.buffered() > 0 {
+                        let byte = self.byte()?;
+                        if cr {
+                            if byte != 10 {
+                                return Result::Err(
+                                    error(
+                                        ErrorKind::Protocol,
+                                        self.used.get() - 1,
+                                        "CR must be followed by LF",
+                                    ),
+                                )
+                            }
+                            complete = true;
+                            break;
+                        }
+                        if byte == 10 {
+                            return Result::Err(
+                                error(
+                                    ErrorKind::Protocol,
+                                    self.used.get() - 1,
+                                    "bare LF in RESP header",
+                                ),
+                            )
+                        }
+                        if byte == 13 {
+                            cr = true;
+                        } else {
+                            if line.len() >= self.limits.max_line_bytes {
+                                return Result::Err(
+                                    error(
+                                        ErrorKind::Limit,
+                                        self.used.get(),
+                                        "RESP line limit exceeded",
+                                    ),
+                                )
+                            }
+                            line.push(byte);
+                        }
+                    }
+                    if complete {
+                        if let Some(value) = self.header(tag, line, chunks)? {
+                            return Result::Ok(Option::Some(value))
+                        }
+                    } else {
+                        self.pending.set(Pending::Line(tag, line, cr, chunks));
+                    }
+                },
+                Pending::Payload(tag, remaining, bytes, trailer, streamed) => {
+                    let mut left = remaining;
+                    let mut ending = trailer;
+                    if left > 0 {
+                        let count = if left < self.buffered() {
+                            left
+                        } else {
+                            self.buffered()
+                        };
+                        let start = self.cursor.get();
+                        self.consume(count)?;
+                        for byte in self.buffer.slice(start, start + count) {
+                            bytes.push(byte);
+                        }
+                        left -= count;
+                    }
+                    if left == 0 {
+                        while ending < 2 && self.buffered() > 0 {
+                            let expected = if ending == 0 {
+                                13
+                            } else {
+                                10
+                            };
+                            if self.byte()? != expected {
+                                return Result::Err(
+                                    error(
+                                        ErrorKind::Protocol,
+                                        self.used.get() - 1,
+                                        "invalid bulk terminator",
+                                    ),
+                                )
+                            }
+                            ending += 1;
+                        }
+                    }
+                    if left == 0 && ending == 2 {
+                        if streamed {
+                            self.pending.set(Pending::Chunk(bytes));
+                        } else {
+                            self.pending.set(Pending::Tag);
+                            let value = if tag == 36 {
+                                Value::Bulk(bytes)
+                            } else if tag == 33 {
+                                Value::BlobError(bytes)
+                            } else {
+                                if bytes[3] != 58 || bytes[0] < 32 || bytes[0] > 126
+                                    || bytes[1] < 32
+                                    || bytes[1] > 126
+                                    || bytes[2] < 32
+                                    || bytes[2] > 126 {
+                                    return Result::Err(
+                                        error(
+                                            ErrorKind::Protocol,
+                                            self.used.get(),
+                                            "invalid verbatim format prefix",
+                                        ),
+                                    )
+                                }
+                                Value::Verbatim(
+                                    string_from_utf8(bytes.slice(0, 3).to_vec()).1,
+                                    bytes.slice(4, bytes.len()).to_vec(),
+                                )
+                            };
+                            if let Some(value) = self.emit(value)? {
+                                return Result::Ok(Option::Some(value))
+                            }
+                        }
+                    } else {
+                        self.pending.set(Pending::Payload(tag, left, bytes, ending, streamed));
+                    }
+                },
+            }
+        }
+        if self.used.get() >= self.limits.max_frame_bytes && self.used.get() > 0 {
+            return Result::Err(
+                error(ErrorKind::Limit, self.used.get(), "incomplete frame exhausted byte limit"),
+            )
+        }
+        Result::Ok(Option::None)
+    }
+
+    pub fn next_frame(self: Decoder) -> Result[Option[Decoded], Error] {
+        if let Some(error) = self.failure.get() {
+            return Result::Err(error)
+        }
+        match self.scan() {
+            Ok(value) => Result::Ok(value),
+            Err(error) => {
+                self.failure.set(Option::Some(error));
+                Result::Err(error)
+            },
+        }
+    }
+
+    pub fn next(self: Decoder) -> Result[Option[Value], Error] {
+        Result::Ok(self.next_frame()?.map(|frame| frame.value))
+    }
+
+    pub fn finish(self: Decoder) -> Result[(), Error] {
+        if let Some(error) = self.failure.get() {
+            return Result::Err(error)
+        }
+        if self.buffered() != 0 || self.is_partial() {
+            Result::Err(
+                error(
+                    ErrorKind::UnexpectedEof,
+                    self.used.get(),
+                    "undrained or truncated RESP input",
+                ),
+            )
+        } else {
+            Result::Ok(())
+        }
+    }
+
+    pub fn reset(self: Decoder) -> () {
+        self.buffer.clear();
+        self.cursor.set(0);
+        self.used.set(0);
+        self.values.set(0);
+        self.pending.set(Pending::Tag);
+        self.stack.clear();
+        self.failure.set(Option::None);
+    }
+}
+
+pub fn decode_prefix(input: Slice[u8], limits: Limits) -> Result[Decoded, Error] {
+    let decoder = Decoder::new(limits)?;
+    decoder.feed(input)?;
+    decoder.next_frame()?.ok_or(
+        error(ErrorKind::UnexpectedEof, decoder.used.get(), "truncated RESP value"),
+    )
+}
+
+pub fn decode(input: Slice[u8]) -> Result[Value, Error] {
+    decode_with_limits(input, Limits::standard())
+}
+
+pub fn decode_with_limits(input: Slice[u8], limits: Limits) -> Result[Value, Error] {
+    let decoded = decode_prefix(input, limits)?;
+    if decoded.wire_bytes != input.len() {
+        return Result::Err(error(ErrorKind::TrailingData, decoded.wire_bytes, "trailing RESP data"))
+    }
+    Result::Ok(decoded.value)
+}

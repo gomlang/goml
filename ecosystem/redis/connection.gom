@@ -1,0 +1,377 @@
+package redis;
+
+use std::net;
+
+pub struct Connection {
+    stream: net::TcpStream,
+    options: ConnectionOptions,
+    decoder: Decoder,
+    gate: Channel[()],
+    close_gate: Channel[()],
+    closed: Channel[()],
+    close_error: Ref[Option[Error]],
+    pushes: Vec[Decoded],
+    push_bytes: Ref[isize],
+    subscribed: Ref[bool],
+    subscription_count: Ref[i64],
+}
+
+fn single(name: string, arguments: Vec[Vec[u8]]) -> Command {
+    Command { name, arguments }
+}
+
+impl Connection {
+    pub fn connect(address: net::SocketAddr, options: ConnectionOptions, operation: Operation) -> Result[
+        Connection,
+        Error,
+    ] {
+        let deadline = Deadline::new(operation);
+        defer deadline.stop();
+        options.limits.validate()?;
+        if options.read_chunk_bytes < 1
+            || options.read_chunk_bytes > options.limits.max_buffer_bytes {
+            return Result::Err(error(ErrorKind::Limit, 0, "read chunk must fit the decoder buffer"))
+        }
+        let stream = net::TcpStream::connect_with(address, deadline.options()?).map_err(io_error)?;
+        let gate = Channel::new(1);
+        gate.send(());
+        let close_gate = Channel::new(1);
+        close_gate.send(());
+        let connection = Connection {
+            stream,
+            options,
+            decoder: Decoder::new(options.limits)?,
+            gate,
+            close_gate,
+            closed: Channel::new(0),
+            close_error: Ref::new(Option::None),
+            pushes: Vec::new(),
+            push_bytes: Ref::new(0),
+            subscribed: Ref::new(false),
+            subscription_count: Ref::new(0),
+        };
+        if let Err(problem) = connection.initialize(deadline) {
+            let _ = connection.close();
+            return Result::Err(problem)
+        }
+        Result::Ok(connection)
+    }
+
+    fn initialize(self: Connection, deadline: Deadline) -> Result[(), Error] {
+        self.stream.set_nodelay(true).map_err(io_error)?;
+        let version = if self.options.protocol == Protocol::Resp3 {
+            "3"
+        } else {
+            "2"
+        };
+        let args = Vec::from_array([version.to_bytes()]);
+        if let Some(credentials) = self.options.credentials {
+            args.push("AUTH".to_bytes());
+            args.push(credentials.username.to_bytes());
+            args.push(credentials.password.bytes.copy());
+        }
+        if let Some(name) = self.options.client_name {
+            args.push("SETNAME".to_bytes());
+            args.push(name.to_bytes());
+        }
+        let value = self.one(single("HELLO", args), deadline)?.checked()?;
+        let info: Entries[string, Value] = FromReply::from_reply(value)?;
+        let mut matched = false;
+        for (key, value) in info.entries {
+            if key == "proto" {
+                if let Value::Integer(actual) = value.without_attributes() {
+                    matched = actual
+                        == if self.options.protocol == Protocol::Resp3 {
+                            3
+                        } else {
+                            2
+                        };
+                }
+            }
+        }
+        if !matched {
+            return Result::Err(
+                error(ErrorKind::Protocol, 0, "HELLO did not confirm requested protocol"),
+            )
+        }
+        if self.options.database != 0 {
+            let value = self.one(
+                single("SELECT", Vec::from_array([self.options.database.to_string().to_bytes()])),
+                deadline,
+            )?;
+            let _: () = FromReply::from_reply(value)?;
+        }
+        Result::Ok(())
+    }
+
+    pub fn is_closed(self: Connection) -> bool {
+        select {
+            recv(self.closed) as _ => true,
+            default => self.stream.is_closed(),
+        }
+    }
+
+    pub fn close(self: Connection) -> Result[(), Error] {
+        let _ = self.close_gate.recv();
+        defer self.close_gate.send(());
+        let already = select {
+            recv(self.closed) as _ => true,
+            default => false,
+        };
+        if already {
+            return match self.close_error.get() {
+                Some(error) => Result::Err(error),
+                None => Result::Ok(()),
+            }
+        }
+        self.closed.close();
+        if let Err(problem) = self.stream.close() {
+            let error = io_error(problem);
+            self.close_error.set(Option::Some(error));
+            return Result::Err(error)
+        }
+        Result::Ok(())
+    }
+
+    fn open(self: Connection) -> Result[(), Error] {
+        if self.is_closed() {
+            Result::Err(error(ErrorKind::Closed, 0, "Redis connection is closed"))
+        } else {
+            Result::Ok(())
+        }
+    }
+
+    fn ordinary(self: Connection) -> Result[(), Error] {
+        self.open()?;
+        if self.subscribed.get() {
+            Result::Err(
+                error(
+                    ErrorKind::InvalidCommand,
+                    0,
+                    "connection is subscribed; use its Subscription handle",
+                ),
+            )
+        } else {
+            Result::Ok(())
+        }
+    }
+
+    fn fatal(self: Connection, problem: Error, sent: bool, partial: Vec[Value]) -> Error {
+        let problem = if self.is_closed()
+            && (problem.kind == ErrorKind::Io || problem.kind == ErrorKind::UnexpectedEof) {
+            Error {
+                kind: ErrorKind::Closed,
+                message: "Redis connection closed during operation",
+                ..problem,
+            }
+        } else {
+            problem
+        };
+        let _ = self.close();
+        Error { may_have_executed: sent, partial, ..problem }
+    }
+
+    fn write(self: Connection, bytes: Slice[u8], deadline: Deadline) -> Result[(), Error] {
+        self.open()?;
+        let options = deadline.options()?;
+        if let Err(problem) = self.stream.write_all_with(bytes, options) {
+            return Result::Err(self.fatal(io_error(problem), true, Vec::new()))
+        }
+        Result::Ok(())
+    }
+
+    fn frame(self: Connection, deadline: Deadline) -> Result[Decoded, Error] {
+        let buffer: Vec[u8] = Vec::with_capacity(self.options.read_chunk_bytes);
+        for _ in 0..self.options.read_chunk_bytes {
+            buffer.push(0);
+        }
+        loop {
+            self.open()?;
+            deadline.check()?;
+            if let Some(frame) = self.decoder.next_frame()? {
+                return Result::Ok(frame)
+            }
+            let available = self.decoder.capacity_remaining();
+            if available <= 0 {
+                return Result::Err(error(ErrorKind::Limit, 0, "decoder buffer has no room"))
+            }
+            let length = if available < buffer.len() {
+                available
+            } else {
+                buffer.len()
+            };
+            let count = self.stream.read_with(
+                buffer.as_mut_slice().sub(0, length),
+                deadline.options()?,
+            ).map_err(io_error)?;
+            if count == 0 {
+                return Result::Err(
+                    error(ErrorKind::UnexpectedEof, 0, "Redis server closed the connection"),
+                )
+            }
+            self.decoder.feed(buffer.slice(0, count))?;
+        }
+    }
+
+    fn stash(self: Connection, frame: Decoded) -> Result[(), Error] {
+        if self.pushes.len() >= self.options.limits.max_pushes
+            || frame.wire_bytes > self.options.limits.max_push_bytes - self.push_bytes.get() {
+            return Result::Err(error(ErrorKind::Limit, 0, "Redis push queue limit exceeded"))
+        }
+        self.pushes.push(frame);
+        self.push_bytes.set(self.push_bytes.get() + frame.wire_bytes);
+        Result::Ok(())
+    }
+
+    fn response(self: Connection, deadline: Deadline, received: Ref[isize]) -> Result[Value, Error] {
+        loop {
+            let frame = self.frame(deadline)?;
+            if frame.wire_bytes > self.options.limits.max_batch_reply_bytes - received.get() {
+                return Result::Err(error(ErrorKind::Limit, 0, "batch reply byte limit exceeded"))
+            }
+            received.set(received.get() + frame.wire_bytes);
+            if frame.value.is_push() {
+                self.stash(frame)?;
+            } else {
+                return Result::Ok(frame.value)
+            }
+        }
+    }
+
+    fn wire(self: Connection, commands: Vec[Command], regular: bool) -> Result[Vec[u8], Error] {
+        if commands.len() > self.options.limits.max_batch {
+            return Result::Err(error(ErrorKind::Limit, 0, "pipeline command limit exceeded"))
+        }
+        let bytes = Vec::new();
+        for command in commands {
+            if regular {
+                command.validate_regular()?;
+            }
+            let encoded = command.encode(self.options.limits)?;
+            if encoded.len() > self.options.limits.max_frame_bytes - bytes.len() {
+                return Result::Err(error(ErrorKind::Limit, 0, "batch request byte limit exceeded"))
+            }
+            bytes.extend(encoded);
+        }
+        Result::Ok(bytes)
+    }
+
+    fn exchange(self: Connection, commands: Vec[Command], regular: bool, deadline: Deadline) -> Result[
+        Vec[Value],
+        Error,
+    ] {
+        let bytes = self.wire(commands, regular)?;
+        if commands.is_empty() {
+            deadline.check()?;
+            return Result::Ok(Vec::new())
+        }
+        self.write(bytes.as_slice(), deadline)?;
+        let values = Vec::with_capacity(commands.len());
+        let received = Ref::new(0);
+        for _ in commands {
+            match self.response(deadline, received) {
+                Ok(value) => values.push(value),
+                Err(problem) => return Result::Err(self.fatal(problem, true, values)),
+            }
+        }
+        Result::Ok(values)
+    }
+
+    fn one(self: Connection, command: Command, deadline: Deadline) -> Result[Value, Error] {
+        let values = self.exchange(Vec::from_array([command]), false, deadline)?;
+        Result::Ok(values[0])
+    }
+
+    pub fn execute[T](self: Connection, request: Request[T], operation: Operation) -> Result[
+        T,
+        Error,
+    ] {
+        let deadline = Deadline::new(operation);
+        defer deadline.stop();
+        request.command.validate_regular()?;
+        deadline.acquire(self.gate, self.closed)?;
+        defer self.gate.send(());
+        self.ordinary()?;
+        let value = self.one(request.command, deadline)?.checked()?;
+        (request.decode)(value)
+    }
+
+    pub fn pipeline(self: Connection, pipeline: Pipeline, operation: Operation) -> Result[
+        Responses,
+        Error,
+    ] {
+        let deadline = Deadline::new(operation);
+        defer deadline.stop();
+        let commands = pipeline.commands.copy();
+        let _ = self.wire(commands, true)?;
+        deadline.acquire(self.gate, self.closed)?;
+        defer self.gate.send(());
+        self.ordinary()?;
+        Result::Ok(
+            Responses { values: self.exchange(commands, true, deadline)?, owner: pipeline.owner },
+        )
+    }
+
+    pub fn drain_pushes(self: Connection, operation: Operation) -> Result[Vec[Value], Error] {
+        let deadline = Deadline::new(operation);
+        defer deadline.stop();
+        deadline.acquire(self.gate, self.closed)?;
+        defer self.gate.send(());
+        self.open()?;
+        let values = Vec::with_capacity(self.pushes.len());
+        for frame in self.pushes {
+            values.push(frame.value);
+        }
+        self.pushes.clear();
+        self.push_bytes.set(0);
+        Result::Ok(values)
+    }
+
+    pub fn next_push(self: Connection, operation: Operation) -> Result[Value, Error] {
+        let deadline = Deadline::new(operation);
+        defer deadline.stop();
+        deadline.acquire(self.gate, self.closed)?;
+        defer self.gate.send(());
+        self.ordinary()?;
+        if !self.pushes.is_empty() {
+            let frame = self.pushes.remove(0);
+            self.push_bytes.set(self.push_bytes.get() - frame.wire_bytes);
+            return Result::Ok(frame.value)
+        }
+        match self.frame(deadline) {
+            Ok(frame) => if frame.value.is_push() {
+                Result::Ok(frame.value)
+            } else {
+                Result::Err(
+                    self.fatal(
+                        error(
+                            ErrorKind::Protocol,
+                            0,
+                            "unexpected ordinary reply while waiting for push",
+                        ),
+                        false,
+                        Vec::new(),
+                    ),
+                )
+            },
+            Err(problem) => if problem.kind == ErrorKind::Timeout
+                || problem.kind == ErrorKind::Cancelled {
+                Result::Err(problem)
+            } else {
+                Result::Err(self.fatal(problem, false, Vec::new()))
+            },
+        }
+    }
+
+    pub fn quit(self: Connection, operation: Operation) -> Result[(), Error] {
+        let deadline = Deadline::new(operation);
+        defer deadline.stop();
+        deadline.acquire(self.gate, self.closed)?;
+        defer self.gate.send(());
+        self.ordinary()?;
+        let result = self.one(single("QUIT", Vec::new()), deadline);
+        let _ = self.close();
+        let _: () = FromReply::from_reply(result?)?;
+        Result::Ok(())
+    }
+}

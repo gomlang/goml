@@ -1,0 +1,376 @@
+package msgpack;
+
+use std::utf8;
+
+struct Writer {
+    output: Vec[u8],
+    options: Options,
+    values: Ref[isize],
+}
+
+impl Writer {
+    fn new(options: Options) -> Result[Writer, Error] {
+        options.limits.validate()?;
+        Result::Ok(Writer { output: Vec::new(), options, values: Ref::new(0) })
+    }
+
+    fn bytes(self: Writer, data: Slice[u8]) -> Result[(), Error] {
+        if data.len() > self.options.limits.max_bytes - self.output.len() {
+            return Result::Err(
+                error(ErrorKind::Limit, self.output.len(), "encoded output exceeds byte limit"),
+            )
+        }
+        for byte in data {
+            self.output.push(byte);
+        }
+        Result::Ok(())
+    }
+
+    fn byte(self: Writer, value: u8) -> Result[(), Error] {
+        if self.output.len() >= self.options.limits.max_bytes {
+            return Result::Err(
+                error(ErrorKind::Limit, self.output.len(), "encoded output exceeds byte limit"),
+            )
+        }
+        self.output.push(value);
+        Result::Ok(())
+    }
+
+    fn raw_uint(self: Writer, value: u64, width: isize) -> Result[(), Error] {
+        let mut divisor: u64 = 1;
+        for _ in 1..width {
+            divisor *= 256;
+        }
+        for _ in 0..width {
+            self.byte((value / divisor % 256).to_u8())?;
+            divisor /= 256;
+        }
+        Result::Ok(())
+    }
+
+    fn count(self: Writer) -> Result[(), Error] {
+        if self.values.get() >= self.options.limits.max_values {
+            return Result::Err(
+                error(ErrorKind::Limit, self.output.len(), "value count limit exceeded"),
+            )
+        }
+        self.values.set(self.values.get() + 1);
+        Result::Ok(())
+    }
+
+    fn uint(self: Writer, value: u64) -> Result[(), Error] {
+        self.count()?;
+        if value < 128 {
+            self.byte(value.to_u8())
+        } else if value <= 255 {
+            self.byte(204)?;
+            self.raw_uint(value, 1)
+        } else if value <= 65535 {
+            self.byte(205)?;
+            self.raw_uint(value, 2)
+        } else if value <= 4294967295 {
+            self.byte(206)?;
+            self.raw_uint(value, 4)
+        } else {
+            self.byte(207)?;
+            self.raw_uint(value, 8)
+        }
+    }
+
+    fn int(self: Writer, value: i64) -> Result[(), Error] {
+        if value >= 0 {
+            return self.uint(value.to_u64())
+        }
+        self.count()?;
+        if value >= -32 {
+            self.byte(value.to_u8())
+        } else if value >= -128 {
+            self.byte(208)?;
+            self.raw_uint(value.to_u64(), 1)
+        } else if value >= -32768 {
+            self.byte(209)?;
+            self.raw_uint(value.to_u64(), 2)
+        } else if value >= -2147483648 {
+            self.byte(210)?;
+            self.raw_uint(value.to_u64(), 4)
+        } else {
+            self.byte(211)?;
+            self.raw_uint(value.to_u64(), 8)
+        }
+    }
+
+    fn scalar(self: Writer, tag: u8) -> Result[(), Error] {
+        self.count()?;
+        self.byte(tag)
+    }
+
+    fn float32(self: Writer, value: f32) -> Result[(), Error] {
+        self.count()?;
+        self.byte(202)?;
+        self.raw_uint(value.to_bits().to_u64(), 4)
+    }
+
+    fn float64(self: Writer, value: f64) -> Result[(), Error] {
+        self.count()?;
+        self.byte(203)?;
+        self.raw_uint(value.to_bits(), 8)
+    }
+
+    fn length(self: Writer, length: isize, limit: isize) -> Result[(), Error] {
+        if length < 0 || length > limit || length.to_u64() > 4294967295 {
+            Result::Err(
+                error(
+                    ErrorKind::Limit,
+                    self.output.len(),
+                    "length exceeds configured or wire limit",
+                ),
+            )
+        } else {
+            Result::Ok(())
+        }
+    }
+
+    fn blob(self: Writer, tag: u8, data: Slice[u8]) -> Result[(), Error] {
+        self.length(data.len(), self.options.limits.max_blob)?;
+        self.count()?;
+        let length = data.len();
+        if tag == 217 && length <= 31 {
+            self.byte((160 + length).to_u8())?;
+        } else if length <= 255 {
+            self.byte(tag)?;
+            self.raw_uint(length.to_u64(), 1)?;
+        } else if length <= 65535 {
+            self.byte(tag + 1)?;
+            self.raw_uint(length.to_u64(), 2)?;
+        } else {
+            self.byte(tag + 2)?;
+            self.raw_uint(length.to_u64(), 4)?;
+        }
+        self.bytes(data)
+    }
+
+    fn text(self: Writer, value: string) -> Result[(), Error] {
+        self.blob(217, value.to_bytes().as_slice())
+    }
+
+    fn container(self: Writer, length: isize, map: bool) -> Result[(), Error] {
+        self.length(length, self.options.limits.max_container)?;
+        self.count()?;
+        if length <= 15 {
+            self.byte(
+                ((if map {
+                    128
+                } else {
+                    144
+                })
+                    + length).to_u8(),
+            )
+        } else if length <= 65535 {
+            self.byte(
+                if map {
+                    222
+                } else {
+                    220
+                },
+            )?;
+            self.raw_uint(length.to_u64(), 2)
+        } else {
+            self.byte(
+                if map {
+                    223
+                } else {
+                    221
+                },
+            )?;
+            self.raw_uint(length.to_u64(), 4)
+        }
+    }
+
+    fn extension(self: Writer, kind: i8, data: Slice[u8]) -> Result[(), Error] {
+        self.length(data.len(), self.options.limits.max_blob)?;
+        self.count()?;
+        match data.len() {
+            1 => self.byte(212)?,
+            2 => self.byte(213)?,
+            4 => self.byte(214)?,
+            8 => self.byte(215)?,
+            16 => self.byte(216)?,
+            length => if length <= 255 {
+                self.byte(199)?;
+                self.raw_uint(length.to_u64(), 1)?;
+            } else if length <= 65535 {
+                self.byte(200)?;
+                self.raw_uint(length.to_u64(), 2)?;
+            } else {
+                self.byte(201)?;
+                self.raw_uint(length.to_u64(), 4)?;
+            },
+        }
+        self.byte(kind.to_u8())?;
+        self.bytes(data)
+    }
+}
+
+struct Reader {
+    input: Slice[u8],
+    options: Options,
+    cursor: Ref[isize],
+    values: Ref[isize],
+}
+
+impl Reader {
+    fn new(input: Slice[u8], options: Options) -> Result[Reader, Error] {
+        options.limits.validate()?;
+        if input.len() > options.limits.max_bytes {
+            return Result::Err(error(ErrorKind::Limit, 0, "input exceeds byte limit"))
+        }
+        Result::Ok(Reader { input, options, cursor: Ref::new(0), values: Ref::new(0) })
+    }
+
+    fn take(self: Reader, length: isize) -> Result[Slice[u8], Error] {
+        let start = self.cursor.get();
+        if length < 0 || length > self.input.len() - start {
+            return Result::Err(error(ErrorKind::UnexpectedEof, start, "truncated value"))
+        }
+        self.cursor.set(start + length);
+        Result::Ok(self.input.sub(start, start + length))
+    }
+
+    fn byte(self: Reader) -> Result[u8, Error] {
+        Result::Ok(self.take(1)?[0])
+    }
+
+    fn uint(self: Reader, width: isize) -> Result[u64, Error] {
+        let mut value: u64 = 0;
+        for byte in self.take(width)? {
+            value = value * 256 + byte.to_u64();
+        }
+        Result::Ok(value)
+    }
+
+    fn blob(self: Reader, length: isize, is_text: bool) -> Result[Token, Error] {
+        if length > self.options.limits.max_blob {
+            return Result::Err(
+                error(ErrorKind::Limit, self.cursor.get(), "blob length exceeds limit"),
+            )
+        }
+        let start = self.cursor.get();
+        let data = self.take(length)?;
+        if is_text && !self.options.allow_invalid_utf8 {
+            utf8::validate(data).map_err(
+                |problem| error(
+                    ErrorKind::InvalidUtf8,
+                    start + problem.valid_up_to(),
+                    "invalid UTF-8 string",
+                ),
+            )?;
+        }
+        Result::Ok(
+            if is_text {
+                Token::String(data)
+            } else {
+                Token::Binary(data)
+            },
+        )
+    }
+
+    fn container(self: Reader, length: isize, map: bool) -> Result[Token, Error] {
+        if length > self.options.limits.max_container {
+            return Result::Err(
+                error(ErrorKind::Limit, self.cursor.get(), "container length exceeds limit"),
+            )
+        }
+        let minimum = if map {
+            length * 2
+        } else {
+            length
+        };
+        if minimum > self.input.len() - self.cursor.get() {
+            return Result::Err(
+                error(
+                    ErrorKind::UnexpectedEof,
+                    self.cursor.get(),
+                    "container cannot fit in remaining input",
+                ),
+            )
+        }
+        Result::Ok(
+            if map {
+                Token::Map(length)
+            } else {
+                Token::Array(length)
+            },
+        )
+    }
+
+    fn extension(self: Reader, length: isize) -> Result[Token, Error] {
+        if length > self.options.limits.max_blob {
+            return Result::Err(
+                error(ErrorKind::Limit, self.cursor.get(), "extension length exceeds limit"),
+            )
+        }
+        let kind = self.byte()?.to_i8();
+        Result::Ok(Token::Extension(kind, self.take(length)?))
+    }
+
+    fn token(self: Reader) -> Result[Token, Error] {
+        if self.values.get() >= self.options.limits.max_values {
+            return Result::Err(
+                error(ErrorKind::Limit, self.cursor.get(), "value count limit exceeded"),
+            )
+        }
+        self.values.set(self.values.get() + 1);
+        let offset = self.cursor.get();
+        let tag = self.byte()?;
+        if tag <= 127 {
+            return Result::Ok(Token::Uint(tag.to_u64()))
+        }
+        if tag >= 224 {
+            return Result::Ok(Token::Int(tag.to_i8().to_i64()))
+        }
+        if tag >= 128 && tag <= 143 {
+            return self.container((tag - 128).to_isize(), true)
+        }
+        if tag >= 144 && tag <= 159 {
+            return self.container((tag - 144).to_isize(), false)
+        }
+        if tag >= 160 && tag <= 191 {
+            return self.blob((tag - 160).to_isize(), true)
+        }
+        match tag {
+            192 => Result::Ok(Token::Nil),
+            193 => Result::Err(error(ErrorKind::InvalidTag, offset, "reserved tag 0xc1")),
+            194 => Result::Ok(Token::Bool(false)),
+            195 => Result::Ok(Token::Bool(true)),
+            196 => self.blob(self.uint(1)?.to_isize(), false),
+            197 => self.blob(self.uint(2)?.to_isize(), false),
+            198 => self.blob(self.uint(4)?.to_isize(), false),
+            199 => self.extension(self.uint(1)?.to_isize()),
+            200 => self.extension(self.uint(2)?.to_isize()),
+            201 => self.extension(self.uint(4)?.to_isize()),
+            202 => Result::Ok(Token::Float32(float32_from_bits(self.uint(4)?.to_u32()))),
+            203 => Result::Ok(Token::Float64(float64_from_bits(self.uint(8)?))),
+            204 => Result::Ok(Token::Uint(self.uint(1)?)),
+            205 => Result::Ok(Token::Uint(self.uint(2)?)),
+            206 => Result::Ok(Token::Uint(self.uint(4)?)),
+            207 => Result::Ok(Token::Uint(self.uint(8)?)),
+            208 => Result::Ok(Token::Int(self.uint(1)?.to_i8().to_i64())),
+            209 => Result::Ok(Token::Int(self.uint(2)?.to_i16().to_i64())),
+            210 => Result::Ok(Token::Int(self.uint(4)?.to_i32().to_i64())),
+            211 => Result::Ok(Token::Int(self.uint(8)?.to_i64())),
+            212 => self.extension(1),
+            213 => self.extension(2),
+            214 => self.extension(4),
+            215 => self.extension(8),
+            216 => self.extension(16),
+            217 => self.blob(self.uint(1)?.to_isize(), true),
+            218 => self.blob(self.uint(2)?.to_isize(), true),
+            219 => self.blob(self.uint(4)?.to_isize(), true),
+            220 => self.container(self.uint(2)?.to_isize(), false),
+            221 => self.container(self.uint(4)?.to_isize(), false),
+            222 => self.container(self.uint(2)?.to_isize(), true),
+            223 => self.container(self.uint(4)?.to_isize(), true),
+            _ => Result::Err(error(ErrorKind::InvalidTag, offset, "unknown tag")),
+        }
+    }
+}

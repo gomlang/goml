@@ -1,0 +1,190 @@
+package pipeline;
+
+use std::task;
+use std::time;
+
+impl[T, E] Stream[T, E] {
+    fn run_scoped(
+        self: Stream[T, E],
+        scope: task::Scope,
+        options: RunOptions,
+        body: (task::CancelToken, T) -> Result[Control, E],
+    ) -> Result[Report, Error[E]] {
+        defer scope.cancel();
+        let cancel = scope.token();
+        if cancel.is_cancelled() {
+            return Result::Err(Error::cancelled())
+        }
+        let control = RunControl { scope, errors: Channel::new(1), path: "" };
+        let started = time::Instant::now();
+        let timer = options.timeout.map(|duration| time::Timer::new(duration));
+        if let Some(timer) = timer {
+            let _ = scope.try_spawn(
+                |_| {
+                    select {
+                        recv(timer.done()) as _ => scope.cancel(),
+                        recv(cancel.done()) as _ => (),
+                    }
+                },
+            );
+        }
+        defer if let Some(timer) = timer {
+            let _ = timer.stop();
+        };
+        if let Some(timeout) = options.timeout {
+            if timeout.is_zero() {
+                return Result::Err(Error::new(ErrorKind::Timeout, "pipeline timed out"))
+            }
+        }
+        let count = Ref::new(0);
+        let stopped = Ref::new(false);
+        let error: Ref[Option[Error[E]]] = Ref::new(Option::None);
+        let result = (self.produce)(
+            cancel,
+            control,
+            |value| {
+                if stopped.get() || error.get().is_some() || cancel.is_cancelled() {
+                    return false
+                }
+                if let Some(limit) = options.max_items {
+                    if count.get() >= limit {
+                        let problem = Error::new(ErrorKind::Limit, "terminal item limit exceeded");
+                        control.record(problem);
+                        error.set(Option::Some(problem));
+                        return false
+                    }
+                }
+                let index = count.get();
+                if index == 9223372036854775807 {
+                    let problem = Error::new(ErrorKind::Limit, "terminal item count overflow");
+                    control.record(problem);
+                    error.set(Option::Some(problem));
+                    return false
+                }
+                count.set(index + 1);
+                match body(cancel, value) {
+                    Ok(Control::Continue) => !cancel.is_cancelled(),
+                    Ok(Control::Stop) => {
+                        stopped.set(true);
+                        false
+                    },
+                    Err(cause) => {
+                        let problem = Error::stage(cause, "sink", Option::Some(index));
+                        control.record(problem);
+                        error.set(Option::Some(problem));
+                        false
+                    },
+                }
+            },
+        );
+        if let Some(problem) = control.first_error() {
+            return Result::Err(problem)
+        }
+        if let Some(problem) = error.get() {
+            return Result::Err(problem)
+        }
+        if let Err(problem) = result {
+            if problem.kind != ErrorKind::Cancelled {
+                return Result::Err(problem)
+            }
+        }
+        if let Some(timeout) = options.timeout {
+            if started.elapsed().compare(timeout) >= 0 {
+                return Result::Err(Error::new(ErrorKind::Timeout, "pipeline timed out"))
+            }
+        }
+        if cancel.is_cancelled() {
+            return Result::Err(Error::cancelled())
+        }
+        result?;
+        Result::Ok(Report { emitted: count.get(), stopped: stopped.get() })
+    }
+
+    pub fn for_each(
+        self: Stream[T, E],
+        options: RunOptions,
+        body: (task::CancelToken, T) -> Result[Control, E],
+    ) -> Result[Report, Error[E]] {
+        if let Some(limit) = options.max_items {
+            if limit < 0 {
+                return Result::Err(
+                    Error::new(ErrorKind::InvalidConfig, "terminal item limit must be nonnegative"),
+                )
+            }
+        }
+        match options.cancel {
+            Some(cancel) => task::scope_with(cancel, |scope| self.run_scoped(scope, options, body)),
+            None => task::scope(|scope| self.run_scoped(scope, options, body)),
+        }
+    }
+
+    pub fn collect(self: Stream[T, E], options: RunOptions) -> Result[Vec[T], Error[E]] {
+        let values = Vec::new();
+        self.for_each(
+            options,
+            |_, value| {
+                values.push(value);
+                Result::Ok(Control::Continue)
+            },
+        )?;
+        Result::Ok(values)
+    }
+
+    pub fn fold[A](
+        self: Stream[T, E],
+        initial: A,
+        options: RunOptions,
+        body: (task::CancelToken, A, T) -> Result[A, E],
+    ) -> Result[A, Error[E]] {
+        let state = Ref::new(initial);
+        self.for_each(
+            options,
+            |cancel, value| {
+                state.set(body(cancel, state.get(), value)?);
+                Result::Ok(Control::Continue)
+            },
+        )?;
+        Result::Ok(state.get())
+    }
+
+    pub fn count(self: Stream[T, E], options: RunOptions) -> Result[isize, Error[E]] {
+        Result::Ok(self.for_each(options, |_, _| Result::Ok(Control::Continue))?.emitted)
+    }
+
+    pub fn find(self: Stream[T, E], options: RunOptions, predicate: (T) -> bool) -> Result[
+        Option[T],
+        Error[E],
+    ] {
+        let found = Ref::new(Option::None);
+        self.for_each(
+            options,
+            |_, value| {
+                if predicate(value) {
+                    found.set(Option::Some(value));
+                    Result::Ok(Control::Stop)
+                } else {
+                    Result::Ok(Control::Continue)
+                }
+            },
+        )?;
+        Result::Ok(found.get())
+    }
+
+    pub fn first(self: Stream[T, E], options: RunOptions) -> Result[Option[T], Error[E]] {
+        self.find(options, |_| true)
+    }
+
+    pub fn any(self: Stream[T, E], options: RunOptions, predicate: (T) -> bool) -> Result[
+        bool,
+        Error[E],
+    ] {
+        Result::Ok(self.find(options, predicate)?.is_some())
+    }
+
+    pub fn all(self: Stream[T, E], options: RunOptions, predicate: (T) -> bool) -> Result[
+        bool,
+        Error[E],
+    ] {
+        Result::Ok(self.find(options, |value| !predicate(value))?.is_none())
+    }
+}

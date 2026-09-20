@@ -1,0 +1,213 @@
+package msgpack;
+
+use std::utf8;
+
+fn write_value(writer: Writer, value: Value, depth: isize) -> Result[(), Error] {
+    if depth > writer.options.limits.max_depth {
+        return Result::Err(error(ErrorKind::Limit, writer.output.len(), "nesting limit exceeded"))
+    }
+    match value {
+        Value::Nil => writer.scalar(192),
+        Value::Bool(value) => writer.scalar(
+            if value {
+                195
+            } else {
+                194
+            },
+        ),
+        Value::Int(value) => writer.int(value),
+        Value::Uint(value) => writer.uint(value),
+        Value::Float32(value) => writer.float32(value),
+        Value::Float64(value) => writer.float64(value),
+        Value::String(value) => writer.text(value),
+        Value::RawString(value) => {
+            if !writer.options.allow_invalid_utf8 {
+                utf8::validate(value.as_slice()).map_err(
+                    |problem| error(
+                        ErrorKind::InvalidUtf8,
+                        writer.output.len() + problem.valid_up_to(),
+                        "invalid raw string",
+                    ),
+                )?;
+            }
+            writer.blob(217, value.as_slice())
+        },
+        Value::Binary(value) => writer.blob(196, value.as_slice()),
+        Value::Extension(kind, value) => writer.extension(kind, value.as_slice()),
+        Value::Array(values) => {
+            writer.container(values.len(), false)?;
+            for value in values {
+                write_value(writer, value, depth + 1)?;
+            }
+            Result::Ok(())
+        },
+        Value::Map(entries) => {
+            writer.container(entries.len(), true)?;
+            for (key, value) in entries {
+                write_value(writer, key, depth + 1)?;
+                write_value(writer, value, depth + 1)?;
+            }
+            Result::Ok(())
+        },
+    }
+}
+
+fn read_value(reader: Reader, depth: isize) -> Result[Value, Error] {
+    if depth > reader.options.limits.max_depth {
+        return Result::Err(error(ErrorKind::Limit, reader.cursor.get(), "nesting limit exceeded"))
+    }
+    match reader.token()? {
+        Token::Nil => Result::Ok(Value::Nil),
+        Token::Bool(value) => Result::Ok(Value::Bool(value)),
+        Token::Int(value) => Result::Ok(Value::Int(value)),
+        Token::Uint(value) => Result::Ok(Value::Uint(value)),
+        Token::Float32(value) => Result::Ok(Value::Float32(value)),
+        Token::Float64(value) => Result::Ok(Value::Float64(value)),
+        Token::String(value) => {
+            let (valid, decoded) = string_from_utf8(value.to_vec());
+            if valid {
+                Result::Ok(Value::String(decoded))
+            } else {
+                Result::Ok(Value::RawString(value.to_vec()))
+            }
+        },
+        Token::Binary(value) => Result::Ok(Value::Binary(value.to_vec())),
+        Token::Extension(kind, value) => Result::Ok(Value::Extension(kind, value.to_vec())),
+        Token::Array(length) => {
+            let values: Vec[Value] = Vec::new();
+            for _ in 0..length {
+                values.push(read_value(reader, depth + 1)?);
+            }
+            Result::Ok(Value::Array(values))
+        },
+        Token::Map(length) => {
+            let entries: Vec[(Value, Value)] = Vec::new();
+            for _ in 0..length {
+                let key = read_value(reader, depth + 1)?;
+                let value = read_value(reader, depth + 1)?;
+                entries.push((key, value));
+            }
+            Result::Ok(Value::Map(entries))
+        },
+    }
+}
+
+fn skip(reader: Reader, initial_depth: isize) -> Result[(), Error] {
+    let remaining = Vec::from_array([1]);
+    while !remaining.is_empty() {
+        let last = remaining.len() - 1;
+        if remaining[last] == 0 {
+            let _ = remaining.pop();
+            continue;
+        }
+        if initial_depth + last > reader.options.limits.max_depth {
+            return Result::Err(
+                error(ErrorKind::Limit, reader.cursor.get(), "nesting limit exceeded"),
+            )
+        }
+        let token = reader.token()?;
+        remaining[last] -= 1;
+        match token {
+            Token::Array(length) => remaining.push(length),
+            Token::Map(length) => remaining.push(length * 2),
+            _ => (),
+        }
+    }
+    Result::Ok(())
+}
+
+pub fn pack_with_options(value: Value, options: Options) -> Result[Vec[u8], Error] {
+    let writer = Writer::new(options)?;
+    write_value(writer, value, 0)?;
+    Result::Ok(writer.output)
+}
+
+pub fn pack(value: Value) -> Result[Vec[u8], Error] {
+    pack_with_options(value, Options::standard())
+}
+
+pub fn unpack_prefix(input: Slice[u8], options: Options) -> Result[(Value, isize), Error] {
+    let reader = Reader::new(input, options)?;
+    let value = read_value(reader, 0)?;
+    Result::Ok((value, reader.cursor.get()))
+}
+
+pub fn unpack_with_options(input: Slice[u8], options: Options) -> Result[Value, Error] {
+    let (value, end) = unpack_prefix(input, options)?;
+    if end != input.len() {
+        Result::Err(error(ErrorKind::TrailingData, end, "trailing bytes after root value"))
+    } else {
+        Result::Ok(value)
+    }
+}
+
+pub fn unpack(input: Slice[u8]) -> Result[Value, Error] {
+    unpack_with_options(input, Options::standard())
+}
+
+pub fn skip_prefix(input: Slice[u8], options: Options) -> Result[isize, Error] {
+    let reader = Reader::new(input, options)?;
+    skip(reader, 0)?;
+    Result::Ok(reader.cursor.get())
+}
+
+impl Timestamp {
+    pub fn to_value(self: Timestamp) -> Result[Value, Error] {
+        if self.nanoseconds > 999999999 {
+            return Result::Err(
+                error(ErrorKind::InvalidTimestamp, 0, "nanoseconds must be below one billion"),
+            )
+        }
+        let writer = Writer::new(Options::standard())?;
+        if self.seconds >= 0 && self.seconds <= 4294967295 && self.nanoseconds == 0 {
+            writer.raw_uint(self.seconds.to_u64(), 4)?;
+        } else if self.seconds >= 0 && self.seconds < 17179869184 {
+            writer.raw_uint(self.nanoseconds.to_u64() * 17179869184 + self.seconds.to_u64(), 8)?;
+        } else {
+            writer.raw_uint(self.nanoseconds.to_u64(), 4)?;
+            writer.raw_uint(self.seconds.to_u64(), 8)?;
+        }
+        Result::Ok(Value::Extension(-1, writer.output))
+    }
+
+    pub fn from_value(value: Value) -> Result[Timestamp, Error] {
+        let Value::Extension(kind, data) = value else {
+            return Result::Err(
+                error(ErrorKind::InvalidTimestamp, 0, "timestamp must be an extension"),
+            )
+        };
+        if kind != -1 {
+            return Result::Err(
+                error(ErrorKind::InvalidTimestamp, 0, "timestamp extension type must be -1"),
+            )
+        }
+        let reader = Reader::new(data.as_slice(), Options::standard())?;
+        let timestamp = match data.len() {
+            4 => Timestamp { seconds: reader.uint(4)?.to_i64(), nanoseconds: 0 },
+            8 => {
+                let bits = reader.uint(8)?;
+                Timestamp {
+                    seconds: (bits % 17179869184).to_i64(),
+                    nanoseconds: (bits / 17179869184).to_u32(),
+                }
+            },
+            12 => {
+                let nanoseconds = reader.uint(4)?.to_u32();
+                let seconds = reader.uint(8)?.to_i64();
+                Timestamp { seconds, nanoseconds }
+            },
+            _ => return Result::Err(
+                error(
+                    ErrorKind::InvalidTimestamp,
+                    0,
+                    "timestamp payload must contain 4, 8 or 12 bytes",
+                ),
+            ),
+        };
+        if timestamp.nanoseconds > 999999999 {
+            Result::Err(error(ErrorKind::InvalidTimestamp, 0, "invalid timestamp nanoseconds"))
+        } else {
+            Result::Ok(timestamp)
+        }
+    }
+}

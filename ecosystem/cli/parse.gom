@@ -1,0 +1,362 @@
+package cli;
+
+use std::env;
+
+fn valid_name(name: string) -> bool {
+    if name == "" {
+        return false
+    }
+    for index in 0..name.byte_len() {
+        let value = name.byte_get(index);
+        if !((value >= b'a' && value <= b'z') || (value >= b'A' && value <= b'Z')
+            || (value >= b'0' && value <= b'9')
+            || value == b'-'
+            || value == b'_') {
+            return false
+        }
+    }
+    !name.starts_with("-")
+}
+
+fn validate_command(command: Command, depth: isize) -> Result[(), Error] {
+    if depth > 64 {
+        return Result::Err(problem(ErrorKind::InvalidSchema, "subcommand nesting exceeds 64"))
+    }
+    if !valid_name(command.name) {
+        return Result::Err(problem(ErrorKind::InvalidSchema, "invalid command name"))
+    }
+    let names: HashMap[string, bool] = HashMap::new();
+    let shorts: HashMap[char, bool] = HashMap::new();
+    let positions: HashMap[isize, Argument] = HashMap::new();
+    for argument in command.arguments {
+        if !valid_name(argument.name) || argument.name == "help" || argument.name == "version"
+            || names.contains(argument.name) {
+            return Result::Err(
+                problem(ErrorKind::InvalidSchema, f"invalid or duplicate argument: {argument.name}"),
+            )
+        }
+        names.set(argument.name, true);
+        if let Some(short) = argument.short_name {
+            if shorts.contains(short) || short == 'h' || short == 'V' || short.to_u32() < 33
+                || short.to_u32() > 126
+                || short == '-'
+                || short == '=' {
+                return Result::Err(
+                    problem(ErrorKind::InvalidSchema, "invalid or duplicate short option"),
+                )
+            }
+            shorts.set(short, true);
+        }
+        if let Some(index) = argument.position {
+            if index < 0 || positions.contains(index) || argument.short_name.is_some()
+                || argument.action != Action::Value {
+                return Result::Err(problem(ErrorKind::InvalidSchema, "invalid positional argument"))
+            }
+            positions.set(index, argument);
+        }
+        if !argument.repeated && argument.defaults.len() > 1 {
+            return Result::Err(
+                problem(ErrorKind::InvalidSchema, "multiple defaults for a scalar argument"),
+            )
+        }
+        if argument.action != Action::Value
+            && (!argument.defaults.is_empty() || argument.environment.is_some()
+                || !argument.choices.is_empty()) {
+            return Result::Err(
+                problem(
+                    ErrorKind::InvalidSchema,
+                    "flags and counters cannot have defaults, environment values or choices",
+                ),
+            )
+        }
+    }
+    let mut optional_seen = false;
+    for index in 0..positions.len() {
+        let Some(argument) = positions.get(index) else {
+            return Result::Err(
+                problem(ErrorKind::InvalidSchema, "positional indices must be contiguous from zero"),
+            )
+        };
+        if optional_seen && argument.required_value {
+            return Result::Err(
+                problem(
+                    ErrorKind::InvalidSchema,
+                    "required positional follows an optional positional",
+                ),
+            )
+        }
+        if !argument.required_value {
+            optional_seen = true;
+        }
+        if argument.repeated && index != positions.len() - 1 {
+            return Result::Err(
+                problem(ErrorKind::InvalidSchema, "variadic positional must be last"),
+            )
+        }
+    }
+    for argument in command.arguments {
+        for name in argument.conflicts {
+            if name == argument.name || !names.contains(name) {
+                return Result::Err(problem(ErrorKind::InvalidSchema, "unknown or self conflict"))
+            }
+        }
+        for name in argument.dependencies {
+            if name == argument.name || !names.contains(name) {
+                return Result::Err(problem(ErrorKind::InvalidSchema, "unknown or self dependency"))
+            }
+        }
+    }
+    let commands: HashMap[string, bool] = HashMap::new();
+    for child in command.commands {
+        if commands.contains(child.name) {
+            return Result::Err(problem(ErrorKind::InvalidSchema, "duplicate subcommand"))
+        }
+        commands.set(child.name, true);
+        validate_command(child, depth + 1)?;
+    }
+    Result::Ok(())
+}
+
+fn long_argument(command: Command, name: string) -> Result[Argument, Error] {
+    for argument in command.arguments {
+        if argument.position.is_none() && argument.name == name {
+            return Result::Ok(argument)
+        }
+    }
+    Result::Err(problem(ErrorKind::Usage, f"unknown option --{name}"))
+}
+
+fn short_argument(command: Command, name: char) -> Result[Argument, Error] {
+    for argument in command.arguments {
+        if argument.short_name == Option::Some(name) {
+            return Result::Ok(argument)
+        }
+    }
+    Result::Err(problem(ErrorKind::Usage, f"unknown option -{name}"))
+}
+
+fn store(matches: Matches, argument: Argument, value: string, explicit: bool) -> Result[(), Error] {
+    if !argument.choices.is_empty() && !argument.choices.contains(value) {
+        return Result::Err(
+            problem(
+                ErrorKind::InvalidValue,
+                f"{argument.name}: expected one of " + argument.choices.join(", "),
+            ),
+        )
+    }
+    let values = matches.values_by_name.get(argument.name).unwrap_or(Vec::new());
+    if !argument.repeated && !values.is_empty() {
+        return Result::Err(problem(ErrorKind::Usage, f"duplicate argument: {argument.name}"))
+    }
+    values.push(value);
+    matches.values_by_name.set(argument.name, values);
+    if explicit {
+        matches.explicit_names.set(argument.name, true);
+    }
+    Result::Ok(())
+}
+
+fn option_value(arguments: Vec[string], index: isize, name: string) -> Result[string, Error] {
+    if index >= arguments.len() || arguments[index].starts_with("--") {
+        Result::Err(problem(ErrorKind::Usage, f"missing value for {name}"))
+    } else {
+        Result::Ok(arguments[index])
+    }
+}
+
+fn parse_command(command: Command, arguments: Vec[string], environment: (string) -> Option[string]) -> Result[
+    Matches,
+    Error,
+] {
+    let matches = Matches {
+        command: command.name,
+        values_by_name: HashMap::new(),
+        explicit_names: HashMap::new(),
+        children: Vec::new(),
+    };
+    let mut index = 0;
+    let mut positional = 0;
+    let mut options = true;
+    while index < arguments.len() {
+        let token = arguments[index];
+        index += 1;
+        if options && (token == "--help" || token == "-h") {
+            return Result::Err(problem(ErrorKind::Help, command.help_text()))
+        }
+        if options && command.version_value != "" && (token == "--version" || token == "-V") {
+            return Result::Err(
+                problem(ErrorKind::Version, command.name + " " + command.version_value),
+            )
+        }
+        if options && token == "--" {
+            options = false;
+            continue;
+        }
+        if options && token.starts_with("--") {
+            let text = token.byte_slice(2, token.byte_len());
+            let (name, inline) = match text.split_once("=") {
+                Some((name, value)) => (name, Option::Some(value)),
+                None => (text, Option::None),
+            };
+            let argument = long_argument(command, name)?;
+            if argument.action == Action::Value {
+                let value = match inline {
+                    Some(value) => value,
+                    None => {
+                        let value = option_value(arguments, index, name)?;
+                        index += 1;
+                        value
+                    },
+                };
+                store(matches, argument, value, true)?;
+            } else {
+                if inline.is_some() {
+                    return Result::Err(problem(ErrorKind::Usage, f"--{name} takes no value"))
+                }
+                store(matches, argument, "true", true)?;
+            }
+            continue;
+        }
+        if options && token.starts_with("-") && token.byte_len() > 1 {
+            let mut position = 1;
+            while position < token.byte_len() {
+                let value = token.byte_get(position);
+                if value > 127 {
+                    return Result::Err(problem(ErrorKind::Usage, "short options must be ASCII"))
+                }
+                let name = char_from_u32(value.to_u32()).unwrap_or('?');
+                position += 1;
+                if name == 'h' {
+                    return Result::Err(problem(ErrorKind::Help, command.help_text()))
+                }
+                if name == 'V' && command.version_value != "" {
+                    return Result::Err(
+                        problem(ErrorKind::Version, command.name + " " + command.version_value),
+                    )
+                }
+                let argument = short_argument(command, name)?;
+                if argument.action == Action::Value {
+                    let value = if position < token.byte_len() {
+                        token.byte_slice(position, token.byte_len())
+                    } else {
+                        let value = option_value(arguments, index, argument.name)?;
+                        index += 1;
+                        value
+                    };
+                    store(matches, argument, value, true)?;
+                    break;
+                } else {
+                    store(matches, argument, "true", true)?;
+                }
+            }
+            continue;
+        }
+        let mut child_command: Option[Command] = Option::None;
+        if options {
+            for child in command.commands {
+                if child.name == token {
+                    child_command = Option::Some(child);
+                    break;
+                }
+            }
+        }
+        if let Some(child) = child_command {
+            matches.children.push(
+                parse_command(child, arguments.slice(index, arguments.len()).to_vec(), environment)?,
+            );
+            break;
+        }
+        let mut target: Option[Argument] = Option::None;
+        for argument in command.arguments {
+            if argument.position == Option::Some(positional) {
+                target = Option::Some(argument);
+                break;
+            }
+        }
+        let Some(argument) = target else {
+            return Result::Err(problem(ErrorKind::Usage, f"unexpected argument: {token}"))
+        };
+        store(matches, argument, token, true)?;
+        if !argument.repeated {
+            positional += 1;
+        }
+    }
+    for argument in command.arguments {
+        if !matches.contains(argument.name) {
+            let fallback = match argument.environment {
+                Some(name) => environment(name),
+                None => Option::None,
+            };
+            if let Some(value) = fallback {
+                store(matches, argument, value, true)?;
+            } else {
+                for value in argument.defaults {
+                    store(matches, argument, value, false)?;
+                }
+            }
+        }
+        if argument.required_value && !matches.contains(argument.name) {
+            return Result::Err(
+                problem(ErrorKind::Usage, f"missing required argument: {argument.name}"),
+            )
+        }
+    }
+    for argument in command.arguments {
+        if !matches.was_provided(argument.name) {
+            continue;
+        }
+        for conflict in argument.conflicts {
+            if matches.was_provided(conflict) {
+                return Result::Err(
+                    problem(ErrorKind::Usage, f"{argument.name} conflicts with {conflict}"),
+                )
+            }
+        }
+        for dependency in argument.dependencies {
+            if !matches.contains(dependency) {
+                return Result::Err(
+                    problem(ErrorKind::Usage, f"{argument.name} requires {dependency}"),
+                )
+            }
+        }
+    }
+    if command.subcommand_required && matches.children.is_empty() {
+        return Result::Err(problem(ErrorKind::Usage, "a subcommand is required"))
+    }
+    Result::Ok(matches)
+}
+
+impl Command {
+    pub fn validate(self: Command) -> Result[(), Error] {
+        validate_command(self, 0)
+    }
+
+    pub fn parse(self: Command, arguments: Vec[string]) -> Result[Matches, Error] {
+        self.parse_with_env(arguments, |_| Option::None)
+    }
+
+    pub fn parse_with_env(
+        self: Command,
+        arguments: Vec[string],
+        environment: (string) -> Option[string],
+    ) -> Result[Matches, Error] {
+        self.validate()?;
+        parse_command(self, arguments, environment)
+    }
+
+    pub fn parse_env(self: Command) -> Result[Matches, Error] {
+        let arguments = env::args();
+        let values = if arguments.is_empty() {
+            Vec::new()
+        } else {
+            arguments.slice(1, arguments.len()).to_vec()
+        };
+        self.parse_with_env(
+            values,
+            |name| match env::var_structured(name) {
+                Ok(value) => Option::Some(value),
+                Err(_) => Option::None,
+            },
+        )
+    }
+}

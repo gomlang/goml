@@ -1,0 +1,170 @@
+package lsp;
+
+use std::json;
+
+pub struct RequestToken {
+    id_value: Id,
+    method_value: string,
+    owner: Ref[bool],
+    active: Ref[bool],
+    cancelled: Ref[bool],
+}
+
+impl RequestToken {
+    pub fn id(self: RequestToken) -> Id {
+        self.id_value
+    }
+
+    pub fn method(self: RequestToken) -> string {
+        self.method_value
+    }
+
+    pub fn is_cancelled(self: RequestToken) -> bool {
+        self.cancelled.get()
+    }
+
+    pub fn is_active(self: RequestToken) -> bool {
+        self.active.get()
+    }
+
+    pub fn check(self: RequestToken) -> Result[(), RpcError] {
+        if !self.active.get() {
+            Result::Err(invalid("request already completed"))
+        } else if self.cancelled.get() {
+            Result::Err(RpcError::new(-32800, "request cancelled"))
+        } else {
+            Result::Ok(())
+        }
+    }
+}
+
+pub struct Completed {
+    pub id: Id,
+    pub method: string,
+    pub result: Result[json::Value, RpcError],
+}
+
+pub struct Session {
+    identity: Ref[bool],
+    incoming: HashMap[Id, RequestToken],
+    outgoing: HashMap[Id, RequestToken],
+    limit: isize,
+}
+
+impl Session {
+    pub fn new(max_pending: isize) -> Result[Session, RpcError] {
+        if max_pending < 0 {
+            return Result::Err(invalid("invalid pending request limit"))
+        }
+        Result::Ok(
+            Session {
+                identity: Ref::new(false),
+                incoming: HashMap::new(),
+                outgoing: HashMap::new(),
+                limit: max_pending,
+            },
+        )
+    }
+
+    pub fn incoming_count(self: Session) -> isize {
+        self.incoming.len()
+    }
+
+    pub fn outgoing_count(self: Session) -> isize {
+        self.outgoing.len()
+    }
+
+    fn register(self: Session, table: HashMap[Id, RequestToken], id: Id, method: string) -> Result[
+        RequestToken,
+        RpcError,
+    ] {
+        let _ = Id::from_json(id.to_json())?;
+        if table.contains(id) {
+            return Result::Err(RpcError::new(-32600, "duplicate pending request id"))
+        }
+        if table.len() >= self.limit {
+            return Result::Err(RpcError::new(-32000, "pending request limit exceeded"))
+        }
+        let token = RequestToken {
+            id_value: id,
+            method_value: method,
+            owner: self.identity,
+            active: Ref::new(true),
+            cancelled: Ref::new(false),
+        };
+        table.set(id, token);
+        Result::Ok(token)
+    }
+
+    pub fn begin(self: Session, id: Id, method: string) -> Result[RequestToken, RpcError] {
+        self.register(self.incoming, id, method)
+    }
+
+    pub fn cancel(self: Session, id: Id) -> bool {
+        match self.incoming.get(id) {
+            Some(token) => {
+                token.cancelled.set(true);
+                true
+            },
+            None => false,
+        }
+    }
+
+    pub fn complete(self: Session, token: RequestToken, result: Result[json::Value, RpcError]) -> Result[
+        Message,
+        RpcError,
+    ] {
+        if !ptr_eq(token.owner, self.identity) || !token.active.get() {
+            return Result::Err(invalid("foreign or completed request token"))
+        }
+        let current = self.incoming.get(token.id_value).ok_or(invalid("request is not pending"))?;
+        if !ptr_eq(current.active, token.active) {
+            return Result::Err(invalid("stale request token"))
+        }
+        let response = Message::Response(Option::Some(token.id_value), result);
+        let _ = decode_value(encode_value(response))?;
+        let _ = self.incoming.remove(token.id_value);
+        token.active.set(false);
+        Result::Ok(response)
+    }
+
+    pub fn request(self: Session, id: Id, method: string, params: Option[json::Value]) -> Result[
+        Message,
+        RpcError,
+    ] {
+        let message = Message::Request(id, method, params);
+        let _ = decode_value(encode_value(message))?;
+        let _ = self.register(self.outgoing, id, method)?;
+        Result::Ok(message)
+    }
+
+    pub fn cancel_outgoing(self: Session, id: Id) -> Result[Message, RpcError] {
+        let token = self.outgoing.get(id).ok_or(invalid("unknown outgoing request"))?;
+        token.cancelled.set(true);
+        Result::Ok(
+            Message::Notification(
+                "$/cancelRequest",
+                Option::Some(json::object(Vec::from_array([("id", id.to_json())]))),
+            ),
+        )
+    }
+
+    pub fn expire(self: Session, id: Id) -> Result[Message, RpcError] {
+        let notification = self.cancel_outgoing(id)?;
+        let token = self.outgoing.remove_value(id).ok_or(invalid("unknown outgoing request"))?;
+        token.active.set(false);
+        Result::Ok(notification)
+    }
+
+    pub fn receive(self: Session, message: Message) -> Result[Completed, RpcError] {
+        let _ = decode_value(encode_value(message))?;
+        let Message::Response(Some(id), result) = message else {
+            return Result::Err(invalid("expected response with a known id"))
+        };
+        let token = self.outgoing.remove_value(id).ok_or(
+            invalid("unexpected or duplicate response"),
+        )?;
+        token.active.set(false);
+        Result::Ok(Completed { id, method: token.method_value, result })
+    }
+}

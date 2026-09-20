@@ -1,0 +1,553 @@
+package msgpack;
+
+use std::serde;
+use std::serde::{Deserialize, Deserializer};
+use std::utf8;
+
+pub struct Decoder {
+    reader: Reader,
+    frames: Vec[Frame],
+    root: Ref[bool],
+}
+
+impl Decoder {
+    pub fn new(input: Slice[u8], options: Options) -> Result[Decoder, Error] {
+        let _ = skip_prefix(input, options)?;
+        Result::Ok(
+            Decoder {
+                reader: Reader::new(input, options)?,
+                frames: Vec::new(),
+                root: Ref::new(false),
+            },
+        )
+    }
+
+    pub fn position(self: Decoder) -> isize {
+        self.reader.cursor.get()
+    }
+
+    pub fn finish(self: Decoder) -> Result[(), Error] {
+        if !self.root.get() || !self.frames.is_empty() {
+            return Result::Err(
+                error(
+                    ErrorKind::Serde,
+                    self.position(),
+                    "deserialization did not finish exactly one root",
+                ),
+            )
+        }
+        if self.position() != self.reader.input.len() {
+            return Result::Err(
+                error(ErrorKind::TrailingData, self.position(), "trailing data after root"),
+            )
+        }
+        Result::Ok(())
+    }
+
+    fn token(self: Decoder) -> Result[Token, string] {
+        self.reader.token().map_err(|problem| problem.to_string())
+    }
+
+    fn value(self: Decoder) -> Result[Token, string] {
+        claim(self.frames, self.root)?;
+        self.token()
+    }
+
+    fn push(self: Decoder, current: Frame) -> Result[(), string] {
+        if self.frames.len() > self.reader.options.limits.max_depth {
+            return Result::Err(self.error("deserialization nesting limit exceeded"))
+        }
+        self.frames.push(current);
+        Result::Ok(())
+    }
+
+    fn signed(self: Decoder, minimum: i64, maximum: i64) -> Result[i64, string] {
+        let value = match self.value()? {
+            Token::Int(value) => value,
+            Token::Uint(value) => if value <= maximum.to_u64() {
+                value.to_i64()
+            } else {
+                return Result::Err(self.error("integer outside signed range"))
+            },
+            _ => return Result::Err(self.error("expected integer")),
+        };
+        if value < minimum || value > maximum {
+            Result::Err(self.error("integer outside signed range"))
+        } else {
+            Result::Ok(value)
+        }
+    }
+
+    fn unsigned(self: Decoder, maximum: u64) -> Result[u64, string] {
+        let value = match self.value()? {
+            Token::Uint(value) => value,
+            Token::Int(value) => if value >= 0 {
+                value.to_u64()
+            } else {
+                return Result::Err(self.error("negative integer for unsigned type"))
+            },
+            _ => return Result::Err(self.error("expected integer")),
+        };
+        if value > maximum {
+            Result::Err(self.error("integer outside unsigned range"))
+        } else {
+            Result::Ok(value)
+        }
+    }
+
+    fn field(self: Decoder, kind: FrameKind) -> Result[Option[serde::FieldKey], string] {
+        let current = top(self.frames, kind)?;
+        if current.ready.get() {
+            return Result::Err(self.error("previous field has no value"))
+        }
+        let index = current.consumed.get();
+        if index == current.length.get() {
+            return Result::Ok(Option::None)
+        }
+        let key = if current.mapped.get() {
+            let Token::String(bytes) = self.token()? else {
+                return Result::Err(self.error("struct field key must be a string"))
+            };
+            let name = utf8::decode_slice(bytes).map_err(|problem| problem.to_string())?;
+            unique_name(current, name)?;
+            serde::FieldKey::Name(name)
+        } else {
+            serde::FieldKey::Position(index)
+        };
+        prepare(current, index)?;
+        Result::Ok(Option::Some(key))
+    }
+
+    fn variant_key(self: Decoder, token: Token, variants: isize) -> Result[
+        serde::VariantKey,
+        string,
+    ] {
+        let index = match token {
+            Token::String(bytes) => return Result::Ok(
+                serde::VariantKey::Name(
+                    utf8::decode_slice(bytes).map_err(|problem| problem.to_string())?,
+                ),
+            ),
+            Token::Uint(value) => if value <= 9223372036854775807 {
+                value.to_isize()
+            } else {
+                -1
+            },
+            Token::Int(value) => value.to_isize(),
+            _ => return Result::Err(self.error("variant tag must be a string or integer")),
+        };
+        if index < 0 || index >= variants {
+            Result::Err(self.error("variant index outside enum range"))
+        } else {
+            Result::Ok(serde::VariantKey::Index(index))
+        }
+    }
+}
+
+fn read_serde_value(reader: Reader, depth: isize) -> Result[serde::Value, string] {
+    if depth > reader.options.limits.max_depth {
+        return Result::Err("dynamic Serde value nesting limit exceeded")
+    }
+    match reader.token().map_err(|problem| problem.to_string())? {
+        Token::Nil => Result::Ok(serde::Value::Unit),
+        Token::Bool(value) => Result::Ok(serde::Value::Bool(value)),
+        Token::Int(value) => Result::Ok(serde::Value::Int64(value)),
+        Token::Uint(value) => Result::Ok(serde::Value::Uint64(value)),
+        Token::Float32(value) => Result::Ok(serde::Value::Float32(value)),
+        Token::Float64(value) => Result::Ok(serde::Value::Float64(value)),
+        Token::String(bytes) => Result::Ok(
+            serde::Value::String(utf8::decode_slice(bytes).map_err(|problem| problem.to_string())?),
+        ),
+        Token::Binary(_) => Result::Err(
+            "std::serde::Value has no binary representation; use msgpack::Binary or msgpack::Value",
+        ),
+        Token::Array(length) => {
+            let values = Vec::with_capacity(length);
+            for _ in 0..length {
+                values.push(read_serde_value(reader, depth + 1)?);
+            }
+            Result::Ok(serde::Value::Sequence(values))
+        },
+        Token::Map(length) => {
+            let fields = Vec::with_capacity(length);
+            for _ in 0..length {
+                let Token::String(bytes) = reader.token().map_err(|problem| problem.to_string())? else {
+                    return Result::Err(
+                        "std::serde::Value requires string map keys; use msgpack::Value for arbitrary maps",
+                    )
+                };
+                let name = utf8::decode_slice(bytes).map_err(|problem| problem.to_string())?;
+                fields.push((name, read_serde_value(reader, depth + 1)?));
+            }
+            Result::Ok(serde::Value::Struct(fields))
+        },
+        Token::Extension(_, _) => Result::Err(
+            "std::serde::Value has no extension representation; use msgpack::Value",
+        ),
+    }
+}
+
+impl serde::Deserializer for Decoder {
+    fn error(self: Decoder, message: string) -> string {
+        f"byte {self.position()}: {message}"
+    }
+
+    fn deserialize_any(self: Decoder) -> Result[serde::Value, string] {
+        claim(self.frames, self.root)?;
+        read_serde_value(self.reader, 0)
+    }
+
+    fn deserialize_unit(self: Decoder) -> Result[(), string] {
+        match self.value()? {
+            Token::Nil => Result::Ok(()),
+            _ => Result::Err(self.error("expected nil")),
+        }
+    }
+
+    fn deserialize_bool(self: Decoder) -> Result[bool, string] {
+        match self.value()? {
+            Token::Bool(value) => Result::Ok(value),
+            _ => Result::Err(self.error("expected boolean")),
+        }
+    }
+
+    fn deserialize_int(self: Decoder) -> Result[isize, string] {
+        Result::Ok(self.signed(-9223372036854775808, 9223372036854775807)?.to_isize())
+    }
+
+    fn deserialize_int8(self: Decoder) -> Result[i8, string] {
+        Result::Ok(self.signed(-128, 127)?.to_i8())
+    }
+
+    fn deserialize_int16(self: Decoder) -> Result[i16, string] {
+        Result::Ok(self.signed(-32768, 32767)?.to_i16())
+    }
+
+    fn deserialize_int32(self: Decoder) -> Result[i32, string] {
+        Result::Ok(self.signed(-2147483648, 2147483647)?.to_i32())
+    }
+
+    fn deserialize_int64(self: Decoder) -> Result[i64, string] {
+        self.signed(-9223372036854775808, 9223372036854775807)
+    }
+
+    fn deserialize_uint(self: Decoder) -> Result[usize, string] {
+        Result::Ok(self.unsigned(18446744073709551615)?.to_usize())
+    }
+
+    fn deserialize_uint8(self: Decoder) -> Result[u8, string] {
+        Result::Ok(self.unsigned(255)?.to_u8())
+    }
+
+    fn deserialize_uint16(self: Decoder) -> Result[u16, string] {
+        Result::Ok(self.unsigned(65535)?.to_u16())
+    }
+
+    fn deserialize_uint32(self: Decoder) -> Result[u32, string] {
+        Result::Ok(self.unsigned(4294967295)?.to_u32())
+    }
+
+    fn deserialize_uint64(self: Decoder) -> Result[u64, string] {
+        self.unsigned(18446744073709551615)
+    }
+
+    fn deserialize_float32(self: Decoder) -> Result[f32, string] {
+        match self.value()? {
+            Token::Float32(value) => Result::Ok(value),
+            Token::Float64(value) => Result::Ok(float64_to_float32(value)),
+            _ => Result::Err(self.error("expected floating point value")),
+        }
+    }
+
+    fn deserialize_float64(self: Decoder) -> Result[f64, string] {
+        match self.value()? {
+            Token::Float32(value) => Result::Ok(float32_to_float64(value)),
+            Token::Float64(value) => Result::Ok(value),
+            _ => Result::Err(self.error("expected floating point value")),
+        }
+    }
+
+    fn deserialize_number(self: Decoder) -> Result[string, string] {
+        match self.value()? {
+            Token::Int(value) => Result::Ok(value.to_string()),
+            Token::Uint(value) => Result::Ok(value.to_string()),
+            Token::Float32(value) => Result::Ok(value.to_string()),
+            Token::Float64(value) => Result::Ok(value.to_string()),
+            _ => Result::Err(self.error("expected number")),
+        }
+    }
+
+    fn deserialize_string(self: Decoder) -> Result[string, string] {
+        match self.value()? {
+            Token::String(bytes) => utf8::decode_slice(bytes).map_err(|problem| problem.to_string()),
+            _ => Result::Err(self.error("expected string")),
+        }
+    }
+
+    fn deserialize_char(self: Decoder) -> Result[char, string] {
+        let value = self.deserialize_string()?;
+        let (scalar, end) = value.decode_at(0).ok_or(self.error("expected one Unicode scalar"))?;
+        if end == value.byte_len() && end > 0 {
+            Result::Ok(scalar)
+        } else {
+            Result::Err(self.error("expected one Unicode scalar"))
+        }
+    }
+
+    fn deserialize_bytes(self: Decoder) -> Result[Vec[u8], string] {
+        match self.value()? {
+            Token::Binary(bytes) => Result::Ok(bytes.to_vec()),
+            _ => Result::Err(self.error("expected binary")),
+        }
+    }
+
+    fn begin_optional(self: Decoder) -> Result[bool, string] {
+        claim(self.frames, self.root)?;
+        let present = if self.reader.options.tagged_options {
+            let Token::Array(length) = self.token()? else {
+                return Result::Err(self.error("expected tagged option array"))
+            };
+            match self.token()? {
+                Token::Uint(0) => if length == 1 {
+                    false
+                } else {
+                    return Result::Err(self.error("None tag requires one element"))
+                },
+                Token::Uint(1) => if length == 2 {
+                    true
+                } else {
+                    return Result::Err(self.error("Some tag requires two elements"))
+                },
+                _ => return Result::Err(self.error("invalid option tag")),
+            }
+        } else {
+            if self.position() >= self.reader.input.len() {
+                return Result::Err(self.error("missing optional value"))
+            }
+            if self.reader.input[self.position()] == 192 {
+                let _ = self.token()?;
+                false
+            } else {
+                true
+            }
+        };
+        let current = frame(
+            FrameKind::Optional,
+            if present {
+                1
+            } else {
+                0
+            },
+            false,
+        );
+        current.ready.set(present);
+        self.push(current)?;
+        Result::Ok(present)
+    }
+
+    fn end_optional(self: Decoder) -> Result[(), string] {
+        finish_frame(self.frames, FrameKind::Optional)
+    }
+
+    fn begin_sequence(self: Decoder) -> Result[Option[isize], string] {
+        let Token::Array(length) = self.value()? else {
+            return Result::Err(self.error("expected array"))
+        };
+        self.push(frame(FrameKind::Sequence, length, false))?;
+        Result::Ok(Option::Some(length))
+    }
+
+    fn next_sequence_element(self: Decoder) -> Result[bool, string] {
+        let current = top(self.frames, FrameKind::Sequence)?;
+        if current.ready.get() {
+            return Result::Err(self.error("previous sequence element has no value"))
+        }
+        if current.consumed.get() == current.length.get() {
+            return Result::Ok(false)
+        }
+        prepare(current, current.consumed.get())?;
+        Result::Ok(true)
+    }
+
+    fn end_sequence(self: Decoder) -> Result[(), string] {
+        finish_frame(self.frames, FrameKind::Sequence)
+    }
+
+    fn begin_tuple(self: Decoder, length: isize) -> Result[(), string] {
+        let Token::Array(actual) = self.value()? else {
+            return Result::Err(self.error("expected tuple array"))
+        };
+        if actual != length {
+            return Result::Err(self.error("tuple length mismatch"))
+        }
+        self.push(frame(FrameKind::Tuple, length, false))
+    }
+
+    fn begin_tuple_element(self: Decoder, index: isize) -> Result[(), string] {
+        prepare(top(self.frames, FrameKind::Tuple)?, index)
+    }
+
+    fn end_tuple(self: Decoder) -> Result[(), string] {
+        finish_frame(self.frames, FrameKind::Tuple)
+    }
+
+    fn begin_map(self: Decoder) -> Result[Option[isize], string] {
+        let Token::Map(length) = self.value()? else {
+            return Result::Err(self.error("expected map"))
+        };
+        self.push(frame(FrameKind::Map, length * 2, true))?;
+        Result::Ok(Option::Some(length))
+    }
+
+    fn next_map_entry(self: Decoder) -> Result[bool, string] {
+        let current = top(self.frames, FrameKind::Map)?;
+        if current.ready.get() || current.state.get() != 0 || current.consumed.get() % 2 != 0 {
+            return Result::Err(self.error("previous map entry is incomplete"))
+        }
+        if current.consumed.get() == current.length.get() {
+            return Result::Ok(false)
+        }
+        current.state.set(1);
+        Result::Ok(true)
+    }
+
+    fn begin_map_key(self: Decoder) -> Result[(), string] {
+        let current = top(self.frames, FrameKind::Map)?;
+        if current.state.get() != 1 {
+            return Result::Err(self.error("map key out of order"))
+        }
+        prepare(current, current.consumed.get())?;
+        current.state.set(2);
+        Result::Ok(())
+    }
+
+    fn begin_map_value(self: Decoder) -> Result[(), string] {
+        let current = top(self.frames, FrameKind::Map)?;
+        if current.state.get() != 2 || current.consumed.get() % 2 != 1 {
+            return Result::Err(self.error("map value out of order"))
+        }
+        prepare(current, current.consumed.get())?;
+        current.state.set(0);
+        Result::Ok(())
+    }
+
+    fn end_map(self: Decoder) -> Result[(), string] {
+        if top(self.frames, FrameKind::Map)?.state.get() != 0 {
+            return Result::Err(self.error("map entry is incomplete"))
+        }
+        finish_frame(self.frames, FrameKind::Map)
+    }
+
+    fn begin_struct(self: Decoder, name: string, fields: isize) -> Result[(), string] {
+        let _ = name;
+        if fields < 0 {
+            return Result::Err(self.error("negative field count"))
+        }
+        let current = match self.value()? {
+            Token::Map(length) => frame(FrameKind::Struct, length, true),
+            Token::Array(length) => frame(FrameKind::Struct, length, false),
+            _ => return Result::Err(self.error("expected struct map or array")),
+        };
+        self.push(current)
+    }
+
+    fn next_struct_field(self: Decoder) -> Result[Option[serde::FieldKey], string] {
+        self.field(FrameKind::Struct)
+    }
+
+    fn skip_value(self: Decoder) -> Result[(), string] {
+        claim(self.frames, self.root)?;
+        skip(self.reader, 0).map_err(|problem| problem.to_string())
+    }
+
+    fn end_struct(self: Decoder) -> Result[(), string] {
+        finish_frame(self.frames, FrameKind::Struct)
+    }
+
+    fn begin_variant(self: Decoder, enum_name: string, variants: isize) -> Result[
+        serde::VariantKey,
+        string,
+    ] {
+        let _ = enum_name;
+        if variants < 1 {
+            return Result::Err(self.error("empty enum"))
+        }
+        let first = self.value()?;
+        let current = frame(FrameKind::Variant, 0, false);
+        let key = match first {
+            Token::Map(1) => {
+                current.state.set(-1);
+                self.variant_key(self.token()?, variants)?
+            },
+            token => {
+                current.state.set(-2);
+                self.variant_key(token, variants)?
+            },
+        };
+        self.push(current)?;
+        Result::Ok(key)
+    }
+
+    fn begin_variant_fields(self: Decoder, kind: isize, fields: isize) -> Result[(), string] {
+        let current = top(self.frames, FrameKind::Variant)?;
+        if kind < 0 || kind > 2 || fields < 0 || current.state.get() >= 0 {
+            return Result::Err(self.error("invalid variant fields event"))
+        }
+        if current.state.get() == -2 {
+            if kind != 0 || fields != 0 {
+                return Result::Err(self.error("unit tag used for data variant"))
+            }
+        } else {
+            if kind == 0 {
+                return Result::Err(self.error("data map used for unit variant"))
+            }
+            match self.token()? {
+                Token::Array(length) => {
+                    if kind == 1 && length != fields {
+                        return Result::Err(self.error("tuple variant length mismatch"))
+                    }
+                    current.length.set(length);
+                },
+                Token::Map(length) => {
+                    if kind != 2 {
+                        return Result::Err(self.error("tuple variant requires array"))
+                    }
+                    current.length.set(length);
+                    current.mapped.set(true);
+                },
+                _ => return Result::Err(self.error("variant payload must be an array or map")),
+            }
+        }
+        current.state.set(kind);
+        Result::Ok(())
+    }
+
+    fn next_variant_field(self: Decoder) -> Result[Option[serde::FieldKey], string] {
+        if top(self.frames, FrameKind::Variant)?.state.get() < 0 {
+            return Result::Err(self.error("variant fields have not begun"))
+        }
+        self.field(FrameKind::Variant)
+    }
+
+    fn end_variant(self: Decoder) -> Result[(), string] {
+        if top(self.frames, FrameKind::Variant)?.state.get() < 0 {
+            return Result::Err(self.error("variant fields have not begun"))
+        }
+        finish_frame(self.frames, FrameKind::Variant)
+    }
+}
+
+pub fn from_slice_with_options[T: Deserialize](input: Slice[u8], options: Options) -> Result[
+    T,
+    Error,
+] {
+    let decoder = Decoder::new(input, options)?;
+    let decoded: Result[T, string] = Deserialize::deserialize(decoder);
+    let value = decoded.map_err(|message| serde_error(decoder.position(), message))?;
+    decoder.finish()?;
+    Result::Ok(value)
+}
+
+pub fn from_slice[T: Deserialize](input: Slice[u8]) -> Result[T, Error] {
+    from_slice_with_options(input, Options::standard())
+}

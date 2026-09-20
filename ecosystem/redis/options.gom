@@ -1,0 +1,143 @@
+package redis;
+
+use std::net;
+use std::task;
+use std::time;
+use std::io;
+
+#[derive(Debug, PartialEq)]
+pub enum Protocol {
+    Resp2,
+    Resp3,
+}
+
+pub struct Credentials {
+    pub username: string,
+    pub password: Blob,
+}
+
+pub struct ConnectionOptions {
+    pub protocol: Protocol,
+    pub credentials: Option[Credentials],
+    pub database: u32,
+    pub client_name: Option[string],
+    pub limits: Limits,
+    pub read_chunk_bytes: isize,
+}
+
+impl ConnectionOptions {
+    pub fn standard() -> ConnectionOptions {
+        ConnectionOptions {
+            protocol: Protocol::Resp3,
+            credentials: Option::None,
+            database: 0,
+            client_name: Option::None,
+            limits: Limits::standard(),
+            read_chunk_bytes: 8192,
+        }
+    }
+}
+
+pub struct Operation {
+    timeout: Option[time::Duration],
+    cancel: Option[task::CancelToken],
+}
+
+impl Operation {
+    pub fn new() -> Operation {
+        Operation { timeout: Option::Some(time::Duration::from_seconds(5)), cancel: Option::None }
+    }
+
+    pub fn with_timeout(self: Operation, timeout: time::Duration) -> Operation {
+        Operation { timeout: Option::Some(timeout), ..self }
+    }
+
+    pub fn without_timeout(self: Operation) -> Operation {
+        Operation { timeout: Option::None, ..self }
+    }
+
+    pub fn with_cancel(self: Operation, cancel: task::CancelToken) -> Operation {
+        Operation { cancel: Option::Some(cancel), ..self }
+    }
+}
+
+struct Deadline {
+    operation: Operation,
+    start: time::Instant,
+    timer: Option[time::Timer],
+    expired: Receiver[()],
+    cancelled: Receiver[()],
+}
+
+impl Deadline {
+    fn new(operation: Operation) -> Deadline {
+        let never: Channel[()] = Channel::new(0);
+        let start = time::Instant::now();
+        let timer = operation.timeout.map(|value| time::Timer::new(value));
+        Deadline {
+            operation,
+            start,
+            timer,
+            expired: timer.map(|value| value.done()).unwrap_or(never.receiver()),
+            cancelled: operation.cancel.map(|value| value.done()).unwrap_or(never.receiver()),
+        }
+    }
+
+    fn stop(self: Deadline) -> () {
+        if let Some(timer) = self.timer {
+            let _ = timer.stop();
+        }
+    }
+
+    fn check(self: Deadline) -> Result[(), Error] {
+        if let Some(cancel) = self.operation.cancel {
+            if cancel.is_cancelled() {
+                return Result::Err(error(ErrorKind::Cancelled, 0, "Redis operation cancelled"))
+            }
+        }
+        if let Some(timeout) = self.operation.timeout {
+            if self.start.elapsed().compare(timeout) >= 0 {
+                return Result::Err(error(ErrorKind::Timeout, 0, "Redis operation timed out"))
+            }
+        }
+        Result::Ok(())
+    }
+
+    fn options(self: Deadline) -> Result[net::WaitOptions, Error] {
+        self.check()?;
+        let mut options = net::WaitOptions::new();
+        if let Some(timeout) = self.operation.timeout {
+            options = options.with_timeout(timeout.saturating_subtract(self.start.elapsed()));
+        }
+        if let Some(cancel) = self.operation.cancel {
+            options = options.with_cancel(cancel);
+        }
+        Result::Ok(options)
+    }
+
+    fn acquire(self: Deadline, gate: Channel[()], closed: Channel[()]) -> Result[(), Error] {
+        self.check()?;
+        select {
+            recv(closed) as _ => Result::Err(
+                error(ErrorKind::Closed, 0, "Redis connection is closed"),
+            ),
+            recv(self.cancelled) as _ => Result::Err(
+                error(ErrorKind::Cancelled, 0, "Redis operation cancelled while queued"),
+            ),
+            recv(self.expired) as _ => Result::Err(
+                error(ErrorKind::Timeout, 0, "Redis operation timed out while queued"),
+            ),
+            recv(gate) as _ => Result::Ok(()),
+        }
+    }
+}
+
+fn io_error(problem: io::Error) -> Error {
+    let kind = match problem.kind() {
+        io::ErrorKind::TimedOut => ErrorKind::Timeout,
+        io::ErrorKind::Interrupted => ErrorKind::Cancelled,
+        io::ErrorKind::UnexpectedEof => ErrorKind::UnexpectedEof,
+        _ => ErrorKind::Io,
+    };
+    Error { io_kind: Option::Some(problem.kind()), ..error(kind, 0, problem.to_string()) }
+}
