@@ -1,0 +1,270 @@
+package tests;
+
+use ecosystem::progress;
+use ecosystem::terminal;
+use ecosystem::ansi;
+use ecosystem::unicode_text;
+use std::context;
+use std::io;
+use std::os::linux::ipc;
+use std::task;
+use std::testing;
+
+struct Harness {
+    input: ipc::Pipe,
+    output: ipc::Pipe,
+    session: terminal::Session,
+    manager: progress::Manager,
+    clock: Channel[i64],
+}
+
+fn harness(options: progress::Options) -> Harness {
+    let input = testing::expect_ok(ipc::pipe(0), "input pipe");
+    let output = testing::expect_ok(ipc::pipe(0), "output pipe");
+    let session = testing::expect_ok(
+        terminal::Session::from_fds(input.reader, output.writer, terminal::Options::defaults()),
+        "session",
+    );
+    let clock = Channel::new(1);
+    clock.send(0);
+    let manager = testing::expect_ok(
+        progress::Manager::new(
+            session,
+            progress::Options {
+                clock: progress::Clock::new(
+                    || {
+                        let value = clock.recv().unwrap_or(0);
+                        clock.send(value);
+                        value
+                    },
+                ),
+                ..options,
+            },
+        ),
+        "manager",
+    );
+    Harness { input, output, session, manager, clock }
+}
+
+fn simple() -> Harness {
+    harness(
+        progress::Options {
+            mode: progress::Mode::Lines,
+            width: 200,
+            ..progress::Options::defaults(),
+        },
+    )
+}
+
+impl Harness {
+    fn time(self: Harness, value: i64) -> () {
+        let _ = self.clock.recv();
+        self.clock.send(value);
+    }
+
+    fn close(self: Harness) -> () {
+        let _ = self.manager.shutdown();
+        testing::assert_ok(self.session.close());
+        let _ = self.input.reader.close();
+        let _ = self.input.writer.close();
+        let _ = self.output.reader.close();
+        let _ = self.output.writer.close();
+    }
+
+    fn snapshot(self: Harness) -> progress::Snapshot {
+        testing::expect_ok(self.manager.snapshot(), "snapshot")
+    }
+}
+
+#[test]
+fn positions_totals_and_failures_are_atomic_and_monotonic() -> () {
+    let h = simple();
+    defer h.close();
+    let job = testing::expect_ok(h.manager.add("download", Option::Some(100)), "job");
+    testing::assert_ok(job.advance(20));
+    testing::assert_err(job.advance(-1));
+    testing::assert_err(job.set_position(19));
+    testing::assert_err(job.set_total(90));
+    testing::assert_err(job.set_position(101));
+    testing::assert_err(job.advance(progress::MAX_POSITION));
+    testing::assert_eq(h.snapshot().jobs[0].position, 20);
+    testing::assert_eq(h.snapshot().jobs[0].total.unwrap_or(-1), 100);
+    testing::assert_ok(job.set_total(200));
+    testing::assert_ok(job.set_position(200));
+    testing::assert_err(job.advance(1));
+    testing::assert_ok(job.finish("ready"));
+    testing::assert_err(job.advance(0));
+    testing::assert_err(job.fail("late"));
+    testing::assert(h.snapshot().jobs[0].status == progress::Status::Finished);
+}
+
+#[test]
+fn rate_eta_clock_regression_and_reset_have_defined_semantics() -> () {
+    let h = simple();
+    defer h.close();
+    let job = testing::expect_ok(h.manager.add("copy", Option::Some(100)), "job");
+    testing::assert_none(h.snapshot().jobs[0].per_second);
+    h.time(2000);
+    testing::assert_ok(job.advance(20));
+    let snapshot = h.snapshot().jobs[0];
+    testing::assert_eq(snapshot.elapsed_ms, 2000);
+    testing::assert_eq(snapshot.per_second.unwrap_or(-1.0), 10.0);
+    testing::assert_eq(snapshot.eta_ms.unwrap_or(-1), 8000);
+    h.time(1000);
+    testing::assert_eq(h.snapshot().jobs[0].elapsed_ms, 2000);
+    h.time(4000);
+    testing::assert_ok(job.fail("network"));
+    h.time(8000);
+    testing::assert_eq(h.snapshot().jobs[0].elapsed_ms, 4000);
+    testing::assert_none(h.snapshot().jobs[0].eta_ms);
+    testing::assert_ok(job.reset(Option::Some(10)));
+    testing::assert_eq(h.snapshot().jobs[0].elapsed_ms, 0);
+    testing::assert_eq(h.snapshot().jobs[0].position, 0);
+    testing::assert_none(h.snapshot().jobs[0].per_second);
+    testing::assert_eq(h.snapshot().jobs[0].message, "");
+    h.time(9000);
+    testing::assert_ok(job.advance(5));
+    testing::assert_eq(h.snapshot().jobs[0].eta_ms.unwrap_or(-1), 1000);
+}
+
+#[test]
+fn bounded_storage_removed_handles_and_detached_snapshots() -> () {
+    let h = harness(
+        progress::Options { max_jobs: 2, max_message_bytes: 8, ..progress::Options::defaults() },
+    );
+    defer h.close();
+    let one = testing::expect_ok(h.manager.add("one", Option::None), "one");
+    let two = testing::expect_ok(h.manager.add("two", Option::Some(0)), "two");
+    testing::assert_err(h.manager.add("three", Option::None));
+    testing::assert_err(one.set_message("123456789"));
+    testing::assert_err(one.set_message("bad\u001b[2J"));
+    testing::assert_err(h.manager.add("line\nbreak", Option::None));
+    let before = h.snapshot();
+    before.jobs.clear();
+    testing::assert_eq(h.snapshot().jobs.len(), 2);
+    testing::assert_ok(one.remove(context::Context::background()));
+    testing::assert_err(one.advance(1));
+    testing::assert_err(one.remove(context::Context::background()));
+    let three = testing::expect_ok(h.manager.add("three", Option::None), "replacement");
+    testing::assert(three.id() > two.id());
+    testing::assert_ok(two.finish("empty"));
+    testing::assert_eq(h.snapshot().jobs[0].position, 0);
+}
+
+#[test]
+fn aliases_allow_atomic_concurrent_updates_and_explicit_finish() -> () {
+    let h = simple();
+    defer h.close();
+    let job = testing::expect_ok(h.manager.add("parallel", Option::Some(800)), "job");
+    task::scope(
+        |scope| {
+            let workers = Vec::new();
+            for _ in 0..8 {
+                workers.push(
+                    scope.spawn(
+                        |_| {
+                            for _ in 0..100 {
+                                testing::assert_ok(job.advance(1));
+                            }
+                        },
+                    ),
+                );
+            }
+            for worker in workers {
+                worker.join();
+            }
+        },
+    );
+    testing::assert_eq(h.snapshot().jobs[0].position, 800);
+    testing::assert(h.snapshot().jobs[0].status == progress::Status::Running);
+    testing::assert_ok(job.finish("done"));
+    testing::assert(h.snapshot().jobs[0].status == progress::Status::Finished);
+}
+
+#[test]
+fn bounds_control_characters_and_style_aliases_are_checked() -> () {
+    let h = simple();
+    defer h.close();
+    for options in Vec::from_array(
+        [
+            progress::Options { max_jobs: 0, ..progress::Options::defaults() },
+            progress::Options { spinner_ms: 0, ..progress::Options::defaults() },
+            progress::Options { refresh_ms: -1, ..progress::Options::defaults() },
+            progress::Options { width: 4097, ..progress::Options::defaults() },
+            progress::Options {
+                style: progress::Style { frames: Vec::new(), ..progress::Style::defaults() },
+                ..progress::Options::defaults(),
+            },
+            progress::Options {
+                style: progress::Style { fill: "中", ..progress::Style::defaults() },
+                ..progress::Options::defaults(),
+            },
+        ],
+    ) {
+        testing::assert_err(progress::Manager::new(h.session, options));
+    }
+    for value in Vec::from_array(["\n", "\r", "\t", "\u009b", "\u2028"]) {
+        testing::assert_err(h.manager.add(value, Option::None));
+        testing::assert_err(h.manager.log(context::Context::background(), value));
+    }
+    testing::assert_err(h.manager.add("bad", Option::Some(-1)));
+    testing::assert_err(h.manager.add("big", Option::Some(progress::MAX_POSITION + 1)));
+    let frames = Vec::from_array(["a", "b"]);
+    let manager = testing::expect_ok(
+        progress::Manager::new(
+            h.session,
+            progress::Options {
+                style: progress::Style { frames, ..progress::Style::defaults() },
+                ..progress::Options::defaults(),
+            },
+        ),
+        "copied style",
+    );
+    frames.clear();
+    let _ = testing::expect_ok(manager.add("still valid", Option::None), "job");
+    testing::assert_ok(manager.flush(context::Context::background()));
+    testing::assert_ok(manager.shutdown());
+}
+
+#[test]
+fn pure_rendering_clips_graphemes_limits_rows_and_preserves_styles() -> () {
+    let h = simple();
+    defer h.close();
+    let one = testing::expect_ok(h.manager.add("中e\u0301👩‍💻", Option::Some(10)), "job");
+    let _ = testing::expect_ok(h.manager.add("two", Option::None), "two");
+    let _ = testing::expect_ok(h.manager.add("three", Option::None), "three");
+    testing::assert_ok(one.set_position(5));
+    let snapshot = h.snapshot();
+    let style = progress::Style {
+        bar_columns: 4,
+        show_rate: false,
+        show_eta: false,
+        ..progress::Style::defaults(),
+    };
+    let full = testing::expect_ok(
+        progress::render_job(snapshot.jobs[0], 100, style, ansi::Profile::Plain),
+        "plain",
+    );
+    testing::assert_eq(full, "| 中e\u0301👩‍💻 [==--] 5/10");
+    for width in 0..30 {
+        let text = testing::expect_ok(
+            progress::render_job(snapshot.jobs[0], width, style, ansi::Profile::Plain),
+            "clip",
+        );
+        testing::assert(unicode_text::width(text) <= width);
+        testing::assert_eq(text, unicode_text::truncate(full, width));
+    }
+    let lines = testing::expect_ok(
+        progress::render(snapshot, 40, 2, style, ansi::Profile::Plain),
+        "rows",
+    );
+    testing::assert_eq(lines.len(), 2);
+    testing::assert_eq(lines[1], "... 2 more jobs");
+    let colored = testing::expect_ok(
+        progress::render_job(snapshot.jobs[0], 40, style, ansi::Profile::Ansi16),
+        "color",
+    );
+    testing::assert(colored.find("\u001b[").is_some());
+    testing::assert_eq(progress::duration_text(3661000), "1h1m");
+    testing::assert_eq(progress::duration_text(-1), "0s");
+}

@@ -1,0 +1,224 @@
+package tests;
+
+use example::explorer;
+use ecosystem::tempfile;
+use ecosystem::terminal;
+use std::bytes;
+use std::fs;
+use std::task;
+use std::testing;
+use std::time;
+
+fn key(code: terminal::KeyCode) -> terminal::Event {
+    terminal::Event::Key(terminal::KeyEvent { code, modifiers: terminal::Modifiers::none() })
+}
+
+#[test]
+fn builtin_snapshot_is_deterministic_and_combines_tree_markdown_and_progress() -> () {
+    let state = testing::expect_ok(explorer::demo(), "demo");
+    let first = testing::expect_ok(explorer::snapshot(state, 100, 28), "snapshot");
+    testing::assert_eq(first, testing::expect_ok(explorer::snapshot(state, 100, 28), "second"));
+    testing::assert(first.contains("GoML Explorer"));
+    testing::assert(first.contains("README.md"));
+    testing::assert(first.contains("GoML terminal ecosystem"));
+    testing::assert(first.contains("6/6"));
+    testing::assert(first.contains("中文"));
+    testing::assert(!first.contains("\u001b"));
+    testing::assert_eq(state.selected_path(), "demo/README.md");
+    let moved = testing::expect_ok(state.update(key(terminal::KeyCode::Down), 20), "next");
+    testing::assert_eq(moved.selected_path(), "demo/src");
+    let preview = testing::expect_ok(moved.update(key(terminal::KeyCode::Tab), 20), "focus");
+    testing::assert(
+        testing::expect_ok(explorer::snapshot(preview, 100, 28), "preview pane").contains(
+            "Markdown [focus]",
+        ),
+    );
+    testing::assert(
+        testing::expect_ok(explorer::snapshot(state, 20, 4), "small frame").contains("Explorer"),
+    );
+}
+
+#[test]
+fn scan_prunes_build_trees_and_symlinks_with_entry_and_depth_limits() -> () {
+    let directory = testing::expect_ok(tempfile::tempdir(), "directory");
+    defer {
+        let _ = directory.close();
+    };
+    let root = directory.path();
+    testing::assert_ok(fs::create_dir(root + "/docs"));
+    testing::assert_ok(fs::create_dir(root + "/.git"));
+    testing::assert_ok(fs::create_dir(root + "/_artifact"));
+    testing::assert_ok(fs::write_file_structured(root + "/README.md", "# root\n"));
+    testing::assert_ok(fs::write_file_structured(root + "/docs/guide.md", "# guide\n"));
+    testing::assert_ok(fs::write_file_structured(root + "/.git/config", "hidden"));
+    testing::assert_ok(fs::symbolic_link(root + "/docs", root + "/link"));
+    let result = testing::expect_ok(explorer::scan_now(root, explorer::Limits::defaults()), "scan");
+    testing::assert_eq(result.entries.len(), 5);
+    testing::assert_eq(result.summary.errors.len(), 0);
+    testing::assert(!result.summary.truncated);
+    testing::assert(!result.summary.cancelled);
+    let mut links = 0;
+    for entry in result.entries {
+        testing::assert(entry.name != ".git" && entry.name != "_artifact");
+        if entry.kind == explorer::Kind::Symlink {
+            links += 1;
+        }
+    }
+    testing::assert_eq(links, 1);
+    let shallow = testing::expect_ok(
+        explorer::scan_now(root, explorer::Limits { max_depth: 1, ..explorer::Limits::defaults() }),
+        "shallow",
+    );
+    testing::assert_eq(shallow.entries.len(), 4);
+    let bounded = testing::expect_ok(
+        explorer::scan_now(
+            root,
+            explorer::Limits { max_entries: 2, ..explorer::Limits::defaults() },
+        ),
+        "bounded",
+    );
+    testing::assert_eq(bounded.entries.len(), 2);
+    testing::assert(bounded.summary.truncated);
+    testing::assert(
+        explorer::scan_now(
+            root,
+            explorer::Limits { max_entries: 0, ..explorer::Limits::defaults() },
+        ).is_err(),
+    );
+}
+
+#[test]
+fn regular_file_preview_is_bounded_utf8_checked_and_rejects_replaced_links() -> () {
+    let directory = testing::expect_ok(tempfile::tempdir(), "directory");
+    defer {
+        let _ = directory.close();
+    };
+    let root = directory.path();
+    let path = root + "/README.md";
+    testing::assert_ok(fs::write_file_structured(path, "# 中文\n"));
+    let entry = explorer::Entry {
+        path,
+        name: "README.md",
+        depth: 1,
+        kind: explorer::Kind::File,
+        bytes: 0,
+    };
+    testing::assert_eq(
+        testing::expect_ok(explorer::read_preview(entry, explorer::Limits::defaults()), "preview"),
+        "# 中文\n",
+    );
+    testing::assert(
+        explorer::read_preview(
+            entry,
+            explorer::Limits { max_file_bytes: 2, ..explorer::Limits::defaults() },
+        ).is_err(),
+    );
+    testing::assert_ok(
+        fs::write_bytes_structured(path, bytes::Bytes::from_vec(Vec::from_array([255, 0]))),
+    );
+    testing::assert(explorer::read_preview(entry, explorer::Limits::defaults()).is_err());
+    testing::assert_ok(fs::remove_file(path));
+    testing::assert_ok(fs::write_file_structured(root + "/target.md", "# target"));
+    testing::assert_ok(fs::symbolic_link(root + "/target.md", path));
+    testing::assert(explorer::read_preview(entry, explorer::Limits::defaults()).is_err());
+    testing::assert(
+        explorer::read_preview(
+            explorer::Entry { kind: explorer::Kind::Directory, ..entry },
+            explorer::Limits::defaults(),
+        ).is_err(),
+    );
+}
+
+#[test]
+fn background_worker_delivers_complete_batches_and_cancels_under_backpressure() -> () {
+    let directory = testing::expect_ok(tempfile::tempdir(), "directory");
+    defer {
+        let _ = directory.close();
+    };
+    let root = directory.path();
+    for index in 0..80 {
+        testing::assert_ok(
+            fs::write_file_structured(root + "/file" + index.to_string() + ".md", "# file"),
+        );
+    }
+    task::scope(
+        |scope| {
+            let requests = Channel::new(1);
+            let events = Channel::new(1);
+            let worker = scope.spawn(
+                |cancel| explorer::scan_worker(
+                    root,
+                    explorer::Limits::defaults(),
+                    cancel,
+                    requests,
+                    events,
+                ),
+            );
+            defer scope.cancel();
+            requests.send(());
+            let mut count = 0;
+            loop {
+                match testing::expect_some(events.recv(), "event") {
+                    explorer::ScanEvent::Batch(batch) => {
+                        count += batch.len();
+                    },
+                    explorer::ScanEvent::Done(summary) => {
+                        testing::assert_eq(summary.entries, 81);
+                        break;
+                    },
+                }
+            }
+            testing::assert_eq(count, 81);
+            requests.send(());
+            time::sleep(time::Duration::from_milliseconds(30));
+            let started = time::Instant::now();
+            scope.cancel();
+            worker.join();
+            testing::assert(started.elapsed().as_milliseconds() < 1000);
+        },
+    );
+}
+
+#[test]
+fn refresh_preserves_selected_path_and_missing_roots_report_errors() -> () {
+    let directory = testing::expect_ok(tempfile::tempdir(), "directory");
+    defer {
+        let _ = directory.close();
+    };
+    let root = directory.path();
+    testing::assert_ok(fs::write_file_structured(root + "/README.md", "# First"));
+    let result = testing::expect_ok(explorer::scan_now(root, explorer::Limits::defaults()), "scan");
+    let state = testing::expect_ok(
+        explorer::Explorer::new(root, explorer::Limits::defaults()),
+        "state",
+    ).begin_scan();
+    let state = testing::expect_ok(
+        testing::expect_ok(state.accept(explorer::ScanEvent::Batch(result.entries)), "batch").accept(
+            explorer::ScanEvent::Done(result.summary),
+        ),
+        "done",
+    );
+    testing::assert_eq(state.selected_path(), root + "/README.md");
+    testing::assert_ok(fs::write_file_structured(root + "/README.md", "# Updated"));
+    let result = testing::expect_ok(
+        explorer::scan_now(root, explorer::Limits::defaults()),
+        "rescan",
+    );
+    let state = state.request_refresh(true).begin_scan();
+    let state = testing::expect_ok(
+        testing::expect_ok(state.accept(explorer::ScanEvent::Batch(result.entries)), "batch").accept(
+            explorer::ScanEvent::Done(result.summary),
+        ),
+        "done",
+    );
+    testing::assert_eq(state.selected_path(), root + "/README.md");
+    testing::assert(
+        testing::expect_ok(explorer::snapshot(state, 100, 20), "frame").contains("Updated"),
+    );
+    let missing = testing::expect_ok(
+        explorer::scan_now(root + "/missing", explorer::Limits::defaults()),
+        "missing",
+    );
+    testing::assert_eq(missing.entries.len(), 0);
+    testing::assert(!missing.summary.errors.is_empty());
+}

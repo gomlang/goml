@@ -1,0 +1,179 @@
+package tests;
+
+use ecosystem::tui;
+use ecosystem::ansi;
+use ecosystem::unicode_text;
+use std::testing;
+
+fn buffer(width: isize, height: isize) -> tui::Buffer {
+    testing::expect_ok(tui::Buffer::new(width, height), "buffer")
+}
+
+fn rect(x: isize, y: isize, width: isize, height: isize) -> tui::Rect {
+    testing::expect_ok(tui::Rect::new(x, y, width, height), "rectangle")
+}
+
+fn cell(value: tui::Buffer, x: isize, y: isize) -> tui::Cell {
+    testing::expect_some(value.get(x, y), "cell")
+}
+
+#[test]
+fn wide_cells_repair_overlap_in_both_directions() -> () {
+    let value = buffer(8, 1);
+    let style = ansi::Style::new();
+    testing::assert_eq(testing::expect_ok(value.put(1, 0, "界", style), "wide"), 2);
+    testing::assert(cell(value, 2, 0).continuation);
+    testing::expect_ok(value.put(2, 0, "x", style), "overwrite continuation");
+    testing::assert_eq(value.lines()[0], "  x     ");
+    testing::expect_ok(value.put(3, 0, "👩‍💻", style), "emoji");
+    testing::expect_ok(value.put(2, 0, "中", style), "overlap head");
+    testing::assert_eq(value.lines()[0], "  中    ");
+    testing::expect_ok(value.validate(), "coherent cells");
+    testing::assert_eq(testing::expect_ok(value.put(7, 0, "界", style), "right edge"), 0);
+    testing::expect_ok(value.fill(rect(3, 0, 1, 1), style), "clipped fill repairs pair");
+    testing::assert_eq(value.lines()[0], "        ");
+}
+
+#[test]
+fn text_clips_graphemes_preserves_lines_and_sanitizes_controls() -> () {
+    let value = buffer(8, 3);
+    let style = ansi::Style::new().foreground(ansi::Color::Indexed(2));
+    let text = ansi::StyledText::from_spans(
+        Vec::from_array([ansi::Span::new("e", style), ansi::Span::plain("́界\n👩‍💻x\tY")]),
+    );
+    testing::expect_ok(value.draw_text(rect(1, 0, 3, 3), text), "styled graphemes");
+    testing::assert_eq(value.lines()[0], " é界    ");
+    testing::assert_eq(cell(value, 1, 0).style, style);
+    testing::assert_eq(value.lines()[1], " 👩‍💻x    ");
+    testing::expect_ok(
+        value.draw_text(rect(6, 2, 1, 1), ansi::StyledText::plain("界x")),
+        "partial wide clipping",
+    );
+    testing::assert_eq(value.lines()[2], "        ");
+    testing::expect_ok(value.put(0, 2, "\u001b", style), "escape sanitized");
+    testing::assert_eq(cell(value, 0, 2).text, "�");
+    testing::expect_ok(value.put(1, 2, "́", style), "standalone combining mark");
+    testing::assert_eq(cell(value, 1, 2).text, "◌́");
+    testing::assert_err(value.put(1, 2, "abc", style));
+    testing::expect_ok(value.validate(), "validate");
+}
+
+#[test]
+fn snapshots_are_independent_and_invalid_limits_recover() -> () {
+    let value = buffer(2, 2);
+    let snapshot = value.snapshot();
+    testing::expect_ok(value.put(0, 0, "x", ansi::Style::new()), "put");
+    testing::assert_eq(snapshot.lines()[0], "  ");
+    testing::assert(tui::Buffer::new(-1, 10).is_err());
+    testing::assert(tui::Buffer::new(4096, 4096).is_err());
+    testing::assert(
+        value.fill(tui::Rect { x: 0, y: 0, width: -1, height: 1 }, ansi::Style::new()).is_err(),
+    );
+    testing::assert_eq(buffer(0, 0).lines().len(), 0);
+}
+
+#[test]
+fn exhaustive_wide_overwrite_and_fill_keep_valid_column_widths() -> () {
+    let style = ansi::Style::new();
+    for first in 0..7 {
+        for second in 0..7 {
+            for third in 0..8 {
+                let value = buffer(8, 1);
+                testing::expect_ok(value.put(first, 0, "界", style), "first");
+                testing::expect_ok(value.put(second, 0, "👩‍💻", style), "second");
+                testing::expect_ok(value.fill(rect(third, 0, 1, 1), style), "fill");
+                testing::expect_ok(value.validate(), "no orphan continuation");
+                testing::assert_eq(unicode_text::width(value.lines()[0]), 8);
+            }
+        }
+    }
+}
+
+#[test]
+fn renderer_commits_only_successful_frames_and_repaints_after_resize() -> () {
+    let value = buffer(4, 2);
+    let backend = tui::MemoryBackend::new();
+    let renderer = testing::expect_ok(
+        tui::Renderer::new(4, 2, ansi::Profile::TrueColor),
+        "renderer",
+    );
+    let first = testing::expect_ok(renderer.render(value, |text| backend.write(text)), "first");
+    testing::assert(first.full_redraw);
+    testing::assert_eq(first.changed_cells, 8);
+    testing::assert(backend.output()[0].starts_with("\u001b[0m"));
+    testing::assert(backend.output()[0].ends_with("\u001b[0m"));
+    testing::assert_eq(
+        testing::expect_ok(renderer.render(value, |text| backend.write(text)), "unchanged").bytes,
+        0,
+    );
+    testing::expect_ok(
+        value.put(1, 0, "界", ansi::Style::new().with_attribute(ansi::BOLD, true)),
+        "change",
+    );
+    backend.fail_once();
+    testing::assert_err(renderer.render(value, |text| backend.write(text)));
+    testing::assert(
+        testing::expect_ok(renderer.render(value, |text| backend.write(text)), "recovery").full_redraw,
+    );
+    testing::expect_ok(value.put(2, 0, "x", ansi::Style::new()), "erase wide");
+    testing::assert_eq(
+        testing::expect_ok(renderer.render(value, |text| backend.write(text)), "head and tail").changed_cells,
+        2,
+    );
+    testing::expect_ok(renderer.resize(2, 1), "resize");
+    testing::assert_err(renderer.render(value, |text| backend.write(text)));
+    testing::assert(
+        testing::expect_ok(
+            renderer.render(buffer(2, 1), |text| backend.write(text)),
+            "resized frame",
+        ).full_redraw,
+    );
+}
+
+#[test]
+fn render_snapshot_isolation_invalidation_and_reentry_are_explicit() -> () {
+    let value = buffer(2, 1);
+    let renderer = testing::expect_ok(tui::Renderer::new(2, 1, ansi::Profile::Plain), "renderer");
+    testing::expect_ok(
+        renderer.render(
+            value,
+            |_| {
+                testing::assert(renderer.render(value, |_| Result::Ok(())).is_err());
+                testing::expect_ok(value.put(0, 0, "x", ansi::Style::new()), "mutate original");
+                Result::Ok(())
+            },
+        ),
+        "snapshot",
+    );
+    testing::assert_eq(
+        testing::expect_ok(
+            renderer.render(
+                value,
+                |_| {
+                    renderer.invalidate();
+                    Result::Ok(())
+                },
+            ),
+            "changed after snapshot",
+        ).changed_cells,
+        1,
+    );
+    testing::assert(
+        testing::expect_ok(renderer.render(value, |_| Result::Ok(())), "invalidate during writer").full_redraw,
+    );
+}
+
+#[test]
+fn buffer_text_budget_accounts_for_replaced_cells() -> () {
+    let value = buffer(1024, 1);
+    let grapheme = "a" + "́".repeat(2046);
+    for column in 0..1024 {
+        testing::expect_ok(value.put(column, 0, grapheme, ansi::Style::new()), "near budget");
+    }
+    testing::expect_ok(value.put(0, 0, grapheme, ansi::Style::new()), "equal replacement");
+    testing::expect_ok(
+        value.put(1, 0, "b" + "́".repeat(2045), ansi::Style::new()),
+        "smaller replacement",
+    );
+    testing::expect_ok(value.validate(), "budget invariant");
+}

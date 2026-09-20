@@ -1,0 +1,507 @@
+package tests;
+
+use ecosystem::terminal;
+use std::io;
+use std::testing;
+
+fn decoder() -> terminal::Decoder {
+    testing::expect_ok(terminal::Decoder::new(terminal::DecoderOptions::defaults()), "decoder")
+}
+
+fn decoded(text: string) -> Vec[terminal::Event] {
+    testing::expect_ok(decoder().feed(text.to_bytes().as_slice()), "decode")
+}
+
+fn key(code: terminal::KeyCode) -> terminal::Event {
+    terminal::Event::Key(terminal::KeyEvent { code, modifiers: terminal::Modifiers::none() })
+}
+
+#[test]
+fn fragmented_utf8_and_escape_input_is_partition_independent() -> () {
+    let text = "a中🙂\u001b[A\u001b[1;5D\u001bOP\u001b[24~\u001b[I\u001b[O\u001b[<0;12;8M\u001b[<0;12;8m\u001b[200~one\n二\u001b[A\u001b[201~\u001bz";
+    let expected = decoded(text);
+    equal(expected.len(), 13);
+    let bytes = text.to_bytes();
+    for split in 0..bytes.len() + 1 {
+        let parser = decoder();
+        let actual = testing::expect_ok(parser.feed(bytes.slice(0, split)), "first fragment");
+        for event in testing::expect_ok(
+            parser.feed(bytes.slice(split, bytes.len())),
+            "second fragment",
+        ) {
+            actual.push(event);
+        }
+        equal(actual, expected);
+    }
+    let parser = decoder();
+    let actual = Vec::new();
+    for index in 0..bytes.len() {
+        for event in testing::expect_ok(parser.feed(bytes.slice(index, index + 1)), "single byte") {
+            actual.push(event);
+        }
+    }
+    equal(actual, expected);
+}
+
+#[test]
+fn keys_modifiers_functions_and_control_characters_are_typed() -> () {
+    let events = decoded("\u0000\u0003\t\r\n\u007f\u001b[Z\u001b[1;8A\u001b中");
+    equal(events.len(), 9);
+    equal(
+        events[1],
+        terminal::Event::Key(
+            terminal::KeyEvent {
+                code: terminal::KeyCode::Char('c'),
+                modifiers: terminal::Modifiers { control: true, ..terminal::Modifiers::none() },
+            },
+        ),
+    );
+    equal(events[2], key(terminal::KeyCode::Tab));
+    equal(events[3], key(terminal::KeyCode::Enter));
+    equal(events[5], key(terminal::KeyCode::Backspace));
+    equal(
+        events[6],
+        terminal::Event::Key(
+            terminal::KeyEvent {
+                code: terminal::KeyCode::BackTab,
+                modifiers: terminal::Modifiers { shift: true, ..terminal::Modifiers::none() },
+            },
+        ),
+    );
+    equal(
+        events[7],
+        terminal::Event::Key(
+            terminal::KeyEvent {
+                code: terminal::KeyCode::Up,
+                modifiers: terminal::Modifiers { shift: true, alt: true, control: true },
+            },
+        ),
+    );
+    equal(
+        events[8],
+        terminal::Event::Key(
+            terminal::KeyEvent {
+                code: terminal::KeyCode::Char('中'),
+                modifiers: terminal::Modifiers { alt: true, ..terminal::Modifiers::none() },
+            },
+        ),
+    );
+    let navigation = decoded("\u001b[H\u001b[F\u001b[2~\u001b[3~\u001b[5~\u001b[6~");
+    equal(
+        navigation,
+        Vec::from_array(
+            [
+                key(terminal::KeyCode::Home),
+                key(terminal::KeyCode::End),
+                key(terminal::KeyCode::Insert),
+                key(terminal::KeyCode::Delete),
+                key(terminal::KeyCode::PageUp),
+                key(terminal::KeyCode::PageDown),
+            ],
+        ),
+    );
+}
+
+#[test]
+fn sgr_mouse_drag_motion_wheel_and_modifiers_use_zero_based_coordinates() -> () {
+    let events = decoded(
+        "\u001b[<52;1;2M\u001b[<35;7;9M\u001b[<64;3;4M\u001b[<65;3;4M\u001b[<66;3;4M\u001b[<67;3;4M",
+    );
+    equal(events.len(), 6);
+    equal(
+        events[0],
+        terminal::Event::Mouse(
+            terminal::MouseEvent {
+                kind: terminal::MouseKind::Drag,
+                button: terminal::MouseButton::Left,
+                column: 0,
+                row: 1,
+                modifiers: terminal::Modifiers { control: true, shift: true, alt: false },
+            },
+        ),
+    );
+    if let terminal::Event::Mouse(event) = events[1] {
+        equal(event.kind, terminal::MouseKind::Move);
+    } else {
+        testing::fail("mouse move");
+    }
+    for index in 0..4 {
+        if let terminal::Event::Mouse(event) = events[index + 2] {
+            equal(
+                event.kind,
+                Vec::from_array(
+                    [
+                        terminal::MouseKind::ScrollUp,
+                        terminal::MouseKind::ScrollDown,
+                        terminal::MouseKind::ScrollLeft,
+                        terminal::MouseKind::ScrollRight,
+                    ],
+                )[index],
+            );
+        } else {
+            testing::fail("wheel");
+        }
+    }
+    for value in Vec::from_array(
+        [
+            "\u001b[<0;0;1M",
+            "\u001b[<999;1;1M",
+            "\u001b[1;99A",
+            "\u001b[9999999999999~",
+            "\u001b[?25h",
+        ],
+    ) {
+        equal(decoded(value), Vec::from_array([terminal::Event::Unknown(value)]));
+    }
+}
+
+#[test]
+fn bracketed_paste_preserves_escape_sequences_and_enforces_exact_byte_limits() -> () {
+    let parser = testing::expect_ok(
+        terminal::Decoder::new(
+            terminal::DecoderOptions { max_paste_bytes: 3, ..terminal::DecoderOptions::defaults() },
+        ),
+        "bounded decoder",
+    );
+    equal(
+        testing::expect_ok(parser.feed("\u001b[200~中\u001b[201~".to_bytes().as_slice()), "paste"),
+        Vec::from_array([terminal::Event::Paste("中")]),
+    );
+    testing::assert_err(parser.feed("\u001b[200~four\u001b[201~".to_bytes().as_slice()));
+    testing::assert_err(parser.feed("x".to_bytes().as_slice()));
+    let zero = testing::expect_ok(
+        terminal::Decoder::new(
+            terminal::DecoderOptions { max_paste_bytes: 0, ..terminal::DecoderOptions::defaults() },
+        ),
+        "zero paste limit",
+    );
+    equal(
+        testing::expect_ok(zero.feed("\u001b[200~\u001b[201~".to_bytes().as_slice()), "empty paste"),
+        Vec::from_array([terminal::Event::Paste("")]),
+    );
+}
+
+#[test]
+fn escape_ambiguity_and_eof_are_explicit() -> () {
+    let parser = decoder();
+    equal(testing::expect_ok(parser.feed("\u001b".to_bytes().as_slice()), "escape prefix").len(), 0);
+    testing::assert(parser.pending_escape());
+    equal(parser.flush_escape(), Vec::from_array([key(terminal::KeyCode::Escape)]));
+    equal(testing::expect_ok(parser.finish(), "eof"), Vec::from_array([terminal::Event::End]));
+    equal(testing::expect_ok(parser.finish(), "repeated eof").len(), 0);
+    testing::assert_err(parser.feed("a".to_bytes().as_slice()));
+    let partial = decoder();
+    testing::assert_ok(partial.feed("\u001b[12;".to_bytes().as_slice()));
+    equal(partial.flush_escape(), Vec::from_array([terminal::Event::Unknown("\u001b[12;")]));
+}
+
+#[test]
+fn malformed_utf8_incomplete_paste_and_long_sequences_fail_recoverably() -> () {
+    for value in Vec::from_array(
+        [
+            Vec::from_array([255]),
+            Vec::from_array([0xc0, 0x80]),
+            Vec::from_array([0xed, 0xa0, 0x80]),
+            Vec::from_array([0xf4, 0x90, 0x80, 0x80]),
+        ],
+    ) {
+        testing::assert_err(decoder().feed(value.as_slice()));
+    }
+    let partial = decoder();
+    testing::assert_ok(partial.feed(Vec::from_array([0xe4]).as_slice()));
+    testing::assert_err(partial.finish());
+    let paste = decoder();
+    testing::assert_ok(paste.feed("\u001b[200~text".to_bytes().as_slice()));
+    testing::assert_err(paste.finish());
+    let bounded = testing::expect_ok(
+        terminal::Decoder::new(
+            terminal::DecoderOptions {
+                max_sequence_bytes: 8,
+                ..terminal::DecoderOptions::defaults(),
+            },
+        ),
+        "sequence bound",
+    );
+    equal(
+        testing::expect_err(bounded.feed("\u001b[1111111".to_bytes().as_slice()), "long sequence").kind(),
+        io::ErrorKind::InvalidData,
+    );
+    testing::assert_err(
+        terminal::Decoder::new(
+            terminal::DecoderOptions { max_paste_bytes: -1, ..terminal::DecoderOptions::defaults() },
+        ),
+    );
+}
+
+#[test]
+fn capabilities_obey_tty_dumb_no_color_and_explicit_policy() -> () {
+    equal(
+        terminal::detect_capabilities(
+            true,
+            true,
+            "xterm-256color",
+            "",
+            false,
+            terminal::ColorPolicy::Auto,
+        ).color,
+        terminal::ColorDepth::Ansi256,
+    );
+    equal(
+        terminal::detect_capabilities(
+            true,
+            true,
+            "xterm",
+            "truecolor",
+            false,
+            terminal::ColorPolicy::Auto,
+        ).color,
+        terminal::ColorDepth::TrueColor,
+    );
+    for result in Vec::from_array(
+        [
+            terminal::detect_capabilities(
+                true,
+                false,
+                "xterm",
+                "truecolor",
+                false,
+                terminal::ColorPolicy::Auto,
+            ),
+            terminal::detect_capabilities(
+                true,
+                true,
+                "dumb",
+                "truecolor",
+                false,
+                terminal::ColorPolicy::Auto,
+            ),
+            terminal::detect_capabilities(
+                true,
+                true,
+                "xterm",
+                "truecolor",
+                true,
+                terminal::ColorPolicy::Auto,
+            ),
+            terminal::detect_capabilities(
+                true,
+                true,
+                "xterm",
+                "truecolor",
+                false,
+                terminal::ColorPolicy::Never,
+            ),
+        ],
+    ) {
+        equal(result.color, terminal::ColorDepth::None);
+    }
+    equal(
+        terminal::detect_capabilities(false, false, "", "", true, terminal::ColorPolicy::Always).color,
+        terminal::ColorDepth::Ansi16,
+    );
+    equal(testing::expect_ok(terminal::cursor_to(0, 2), "cursor"), "\u001b[3;1H");
+    testing::assert_err(terminal::cursor_to(-1, 0));
+}
+
+fn equal[T: PartialEq](actual: T, expected: T) -> () {
+    testing::assert(actual == expected);
+}
+
+#[test]
+fn unknown_control_strings_remain_one_event_across_fragments() -> () {
+    for sequence in Vec::from_array(
+        [
+            "\u001b]10;rgb:ffff/0000/0000\u0007",
+            "\u001b]text\u001b\\",
+            "\u001bPdata\u001b\\",
+            "\u001b_kitty\u001b\\",
+        ],
+    ) {
+        let parser = decoder();
+        let bytes = sequence.to_bytes();
+        for index in 0..bytes.len() - 1 {
+            equal(
+                testing::expect_ok(parser.feed(bytes.slice(index, index + 1)), "control fragment").len(),
+                0,
+            );
+        }
+        equal(
+            testing::expect_ok(
+                parser.feed(bytes.slice(bytes.len() - 1, bytes.len())),
+                "control end",
+            ),
+            Vec::from_array([terminal::Event::Unknown(sequence)]),
+        );
+    }
+}
+
+#[test]
+fn control_punctuation_and_wheel_button_are_not_misidentified() -> () {
+    let events = decoded("\u001c\u001d\u001e\u001f");
+    let codes = Vec::from_array(['\\', ']', '^', '_']);
+    for index in 0..4 {
+        equal(
+            events[index],
+            terminal::Event::Key(
+                terminal::KeyEvent {
+                    code: terminal::KeyCode::Char(codes[index]),
+                    modifiers: terminal::Modifiers { control: true, ..terminal::Modifiers::none() },
+                },
+            ),
+        );
+    }
+    if let terminal::Event::Mouse(event) = decoded("\u001b[<64;1;1M")[0] {
+        equal(event.button, terminal::MouseButton::None);
+    } else {
+        testing::fail("wheel event");
+    }
+}
+
+#[test]
+fn unsupported_parameter_shapes_are_not_interpreted_as_keypresses() -> () {
+    for value in Vec::from_array(
+        [
+            "\u001b[2;3R",
+            "\u001b[24;8R",
+            "\u001b[999A",
+            "\u001b[2;5A",
+            "\u001b[0A",
+            "\u001b[;5A",
+            "\u001b[2H",
+            "\u001b[2;3H",
+            "\u001b[5Z",
+            "\u001b[1;0P",
+            "\u001b[1;9P",
+            "\u001b[1;2;3R",
+            "\u001bO2P",
+            "\u001bO1;5A",
+            "\u001bO11~",
+            "\u001bOZ",
+        ],
+    ) {
+        let expected = Vec::from_array([terminal::Event::Unknown(value)]);
+        equal(decoded(value), expected);
+        let bytes = value.to_bytes();
+        for split in 0..bytes.len() + 1 {
+            let parser = decoder();
+            let actual = testing::expect_ok(parser.feed(bytes.slice(0, split)), "first part");
+            for event in testing::expect_ok(
+                parser.feed(bytes.slice(split, bytes.len())),
+                "second part",
+            ) {
+                actual.push(event);
+            }
+            equal(actual, expected);
+        }
+    }
+}
+
+#[test]
+fn standard_csi_ss3_and_legacy_tilde_key_tables_keep_their_modifiers() -> () {
+    let alphabetic = Vec::from_array(
+        [
+            ("A", terminal::KeyCode::Up),
+            ("B", terminal::KeyCode::Down),
+            ("C", terminal::KeyCode::Right),
+            ("D", terminal::KeyCode::Left),
+            ("H", terminal::KeyCode::Home),
+            ("F", terminal::KeyCode::End),
+            ("P", terminal::KeyCode::Function(1)),
+            ("Q", terminal::KeyCode::Function(2)),
+            ("R", terminal::KeyCode::Function(3)),
+            ("S", terminal::KeyCode::Function(4)),
+        ],
+    );
+    for entry in alphabetic {
+        equal(decoded("\u001b[" + entry.0), Vec::from_array([key(entry.1)]));
+        equal(decoded("\u001bO" + entry.0), Vec::from_array([key(entry.1)]));
+        equal(decoded("\u001b[1" + entry.0), Vec::from_array([key(entry.1)]));
+        for modifier in 1..9 {
+            let bits = modifier - 1;
+            equal(
+                decoded("\u001b[1;" + modifier.to_string() + entry.0),
+                Vec::from_array(
+                    [
+                        terminal::Event::Key(
+                            terminal::KeyEvent {
+                                code: entry.1,
+                                modifiers: terminal::Modifiers {
+                                    shift: bits & 1 != 0,
+                                    alt: bits & 2 != 0,
+                                    control: bits & 4 != 0,
+                                },
+                            },
+                        ),
+                    ],
+                ),
+            );
+        }
+    }
+    let tilde = Vec::from_array(
+        [
+            (1, terminal::KeyCode::Home),
+            (2, terminal::KeyCode::Insert),
+            (3, terminal::KeyCode::Delete),
+            (4, terminal::KeyCode::End),
+            (5, terminal::KeyCode::PageUp),
+            (6, terminal::KeyCode::PageDown),
+            (7, terminal::KeyCode::Home),
+            (8, terminal::KeyCode::End),
+            (11, terminal::KeyCode::Function(1)),
+            (12, terminal::KeyCode::Function(2)),
+            (13, terminal::KeyCode::Function(3)),
+            (14, terminal::KeyCode::Function(4)),
+            (15, terminal::KeyCode::Function(5)),
+            (17, terminal::KeyCode::Function(6)),
+            (18, terminal::KeyCode::Function(7)),
+            (19, terminal::KeyCode::Function(8)),
+            (20, terminal::KeyCode::Function(9)),
+            (21, terminal::KeyCode::Function(10)),
+            (23, terminal::KeyCode::Function(11)),
+            (24, terminal::KeyCode::Function(12)),
+        ],
+    );
+    for entry in tilde {
+        equal(decoded("\u001b[" + entry.0.to_string() + "~"), Vec::from_array([key(entry.1)]));
+        for modifier in 1..9 {
+            let bits = modifier - 1;
+            equal(
+                decoded("\u001b[" + entry.0.to_string() + ";" + modifier.to_string() + "~"),
+                Vec::from_array(
+                    [
+                        terminal::Event::Key(
+                            terminal::KeyEvent {
+                                code: entry.1,
+                                modifiers: terminal::Modifiers {
+                                    shift: bits & 1 != 0,
+                                    alt: bits & 2 != 0,
+                                    control: bits & 4 != 0,
+                                },
+                            },
+                        ),
+                    ],
+                ),
+            );
+        }
+    }
+    for modifier in 1..9 {
+        let bits = modifier - 1;
+        equal(
+            decoded("\u001b[1;" + modifier.to_string() + "Z"),
+            Vec::from_array(
+                [
+                    terminal::Event::Key(
+                        terminal::KeyEvent {
+                            code: terminal::KeyCode::BackTab,
+                            modifiers: terminal::Modifiers {
+                                shift: true,
+                                alt: bits & 2 != 0,
+                                control: bits & 4 != 0,
+                            },
+                        },
+                    ),
+                ],
+            ),
+        );
+    }
+}

@@ -1,0 +1,243 @@
+package tests;
+
+use ecosystem::progress;
+use std::context;
+use std::io;
+use std::os::linux::fd;
+use std::task;
+use std::testing;
+use std::time;
+use std::utf8;
+
+fn drain(h: Harness) -> string {
+    testing::assert_ok(h.output.reader.set_status_flags(fd::O_NONBLOCK));
+    let result = Vec::new();
+    let buffer = Vec::new();
+    for _ in 0..4096 {
+        buffer.push(0);
+    }
+    loop {
+        match h.output.reader.read(buffer.as_mut_slice()) {
+            Ok(0) => break,
+            Ok(count) => {
+                for index in 0..count {
+                    result.push(buffer[index]);
+                }
+            },
+            Err(error) => {
+                testing::assert(error.kind() == io::ErrorKind::WouldBlock);
+                break
+            },
+        }
+    }
+    testing::expect_ok(utf8::decode(result), "utf8 output")
+}
+
+#[test]
+fn tick_coalesces_updates_and_lines_never_contain_terminal_controls() -> () {
+    let h = simple();
+    defer h.close();
+    let ctx = context::Context::background();
+    let one = testing::expect_ok(h.manager.add("copy", Option::Some(100)), "job");
+    testing::assert(testing::expect_ok(h.manager.tick(ctx), "initial tick"));
+    testing::assert(drain(h).find("0/100").is_some());
+    for _ in 0..10 {
+        testing::assert_ok(one.advance(1));
+    }
+    h.time(99);
+    testing::assert(!testing::expect_ok(h.manager.tick(ctx), "throttle"));
+    testing::assert_eq(drain(h), "");
+    h.time(100);
+    testing::assert(testing::expect_ok(h.manager.tick(ctx), "coalesced"));
+    let text = drain(h);
+    testing::assert(text.find("10/100").is_some());
+    testing::assert(text.find("\u001b").is_none());
+    testing::assert_eq(text.split("\n").len(), 2);
+    h.time(200);
+    testing::assert(!testing::expect_ok(h.manager.tick(ctx), "unchanged"));
+    testing::assert_ok(h.manager.log(ctx, "scanned files"));
+    testing::assert_eq(drain(h), "scanned files\n");
+    testing::assert_ok(one.finish("done"));
+    testing::assert_ok(h.manager.shutdown());
+    let text = drain(h);
+    testing::assert(text.starts_with("+ copy"));
+    testing::assert(text.find("100/100").is_some());
+    testing::assert_ok(h.manager.shutdown());
+    testing::assert_eq(drain(h), "");
+    testing::assert_err(one.advance(1));
+    testing::assert_err(h.manager.snapshot());
+    testing::assert_ok(h.session.write("session still open"));
+    testing::assert_eq(drain(h), "session still open");
+}
+
+#[test]
+fn interactive_logs_erase_redraw_and_resize_without_extra_input_reader() -> () {
+    let h = harness(
+        progress::Options {
+            mode: progress::Mode::Interactive,
+            width: 24,
+            follow_terminal_size: false,
+            ..progress::Options::defaults(),
+        },
+    );
+    defer h.close();
+    let ctx = context::Context::background();
+    let one = testing::expect_ok(h.manager.add("one", Option::Some(20)), "one");
+    let two = testing::expect_ok(h.manager.add("two", Option::None), "two");
+    testing::assert_ok(h.manager.flush(ctx));
+    let initial = drain(h);
+    testing::assert_eq(initial.split("\r\n").len(), 3);
+    testing::assert_ok(h.manager.log(ctx, "hello"));
+    let logged = drain(h);
+    testing::assert(logged.starts_with("\r\u001b[1A\u001b[2K\u001b[1A\u001b[2Khello\r\n"));
+    testing::assert_ok(h.manager.set_width(Option::Some(7)));
+    h.time(100);
+    testing::assert_ok(h.manager.tick(ctx));
+    let resized = drain(h);
+    testing::assert(resized.find("/ one ").is_some());
+    testing::assert(resized.find("[---").is_none());
+    testing::assert_ok(two.remove(ctx));
+    testing::assert_ok(h.manager.flush(ctx));
+    let removed = drain(h);
+    testing::assert(removed.starts_with("\r\u001b[1A\u001b[2K\u001b[1A\u001b[2K"));
+    testing::assert_ok(one.cancel("stop"));
+    testing::assert_ok(h.manager.shutdown());
+    testing::assert(drain(h).find("x one").is_some());
+}
+
+#[test]
+fn context_cancellation_preserves_updates_and_output_until_a_write_starts() -> () {
+    let h = simple();
+    defer h.close();
+    let job = testing::expect_ok(h.manager.add("job", Option::None), "job");
+    context::with_cancel(
+        context::Context::background(),
+        |ctx, cancel| {
+            cancel.cancel();
+            testing::assert(
+                testing::expect_err(
+                    job.apply_with(ctx, progress::Update::Advance(1)),
+                    "cancel update",
+                ).kind()
+                    == io::ErrorKind::Interrupted,
+            );
+            testing::assert_err(h.manager.add_with(ctx, "another", Option::None));
+            testing::assert_err(h.manager.tick(ctx));
+        },
+    );
+    testing::assert_eq(h.snapshot().jobs[0].position, 0);
+    testing::assert_eq(drain(h), "");
+    testing::assert_ok(job.advance(1));
+    testing::assert_ok(h.manager.flush(context::Context::background()));
+    testing::assert(drain(h).find("job 1").is_some());
+}
+
+fn fill_output(h: Harness) -> () {
+    let data = "x".repeat(4096).to_bytes();
+    loop {
+        match h.output.writer.write(data.as_slice()) {
+            Ok(_) => (),
+            Err(error) => {
+                testing::assert(error.kind() == io::ErrorKind::WouldBlock);
+                break
+            },
+        }
+    }
+}
+
+#[test]
+fn blocked_output_deadline_is_sticky_and_shutdown_is_bounded() -> () {
+    let h = simple();
+    defer h.close();
+    let _ = testing::expect_ok(h.manager.add("blocked", Option::None), "job");
+    fill_output(h);
+    context::with_timeout(
+        context::Context::background(),
+        time::Duration::from_milliseconds(30),
+        |ctx, _| {
+            testing::assert(
+                testing::expect_err(h.manager.flush(ctx), "write deadline").kind()
+                    == io::ErrorKind::TimedOut,
+            );
+        },
+    );
+    let _ = drain(h);
+    testing::assert(
+        testing::expect_err(h.manager.flush(context::Context::background()), "sticky error").kind()
+            == io::ErrorKind::TimedOut,
+    );
+    let started = time::Instant::now();
+    testing::assert_err(h.manager.shutdown());
+    testing::assert(started.elapsed().as_milliseconds() < 1500);
+    testing::assert_err(h.manager.shutdown());
+}
+
+#[test]
+fn shutdown_cancels_active_output_and_queued_updates_without_closing_session() -> () {
+    let h = simple();
+    defer h.close();
+    let job = testing::expect_ok(h.manager.add("blocked", Option::None), "job");
+    fill_output(h);
+    task::scope(
+        |scope| {
+            let writing = scope.spawn(|_| h.manager.flush(context::Context::background()));
+            time::sleep(time::Duration::from_milliseconds(30));
+            context::with_timeout(
+                context::Context::background(),
+                time::Duration::from_milliseconds(25),
+                |ctx, _| {
+                    testing::assert(
+                        testing::expect_err(
+                            job.apply_with(ctx, progress::Update::Advance(1)),
+                            "queued deadline",
+                        ).kind()
+                            == io::ErrorKind::TimedOut,
+                    );
+                },
+            );
+            let queued = scope.spawn(|_| job.advance(1));
+            let started = time::Instant::now();
+            testing::assert_err(h.manager.shutdown());
+            testing::assert(started.elapsed().as_milliseconds() < 1500);
+            testing::assert_err(writing.join());
+            testing::assert_err(queued.join());
+        },
+    );
+    let _ = drain(h);
+    testing::assert_ok(h.session.write("reusable"));
+    testing::assert_eq(drain(h), "reusable");
+}
+
+#[test]
+fn competing_logs_remain_complete_and_spinner_ticks_advance_only_interactively() -> () {
+    let h = harness(
+        progress::Options {
+            mode: progress::Mode::Interactive,
+            width: 40,
+            follow_terminal_size: false,
+            ..progress::Options::defaults(),
+        },
+    );
+    defer h.close();
+    let _ = testing::expect_ok(h.manager.add("spinner", Option::None), "job");
+    testing::assert_ok(h.manager.tick(context::Context::background()));
+    testing::assert(drain(h).find("| spinner").is_some());
+    h.time(100);
+    testing::assert_ok(h.manager.tick(context::Context::background()));
+    testing::assert(drain(h).find("/ spinner").is_some());
+    task::scope(
+        |scope| {
+            let one = scope.spawn(
+                |_| h.manager.log(context::Context::background(), "first message"),
+            );
+            let two = scope.spawn(
+                |_| h.manager.log(context::Context::background(), "second message"),
+            );
+            testing::assert_ok(one.join());
+            testing::assert_ok(two.join());
+        },
+    );
+    let text = drain(h);
+    testing::assert_eq(text.split("first message").len(), 2);
+    testing::assert_eq(text.split("second message").len(), 2);
+}

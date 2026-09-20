@@ -1,0 +1,277 @@
+package tests;
+
+use ecosystem::ansi;
+use ecosystem::diagnostics;
+use ecosystem::unicode_text;
+use std::testing;
+use std::text;
+
+fn span(cache: diagnostics::SourceCache, file: diagnostics::FileId, start: isize, end: isize) -> diagnostics::Span {
+    testing::expect_ok(cache.span(file, start, end), "span")
+}
+
+fn rendered(
+    cache: diagnostics::SourceCache,
+    report: diagnostics::Diagnostic,
+    options: diagnostics::RenderOptions,
+) -> string {
+    testing::expect_ok(diagnostics::render(cache, report, options), "render")
+}
+
+#[test]
+fn simple_diagnostic_has_exact_plain_layout() -> () {
+    let cache = diagnostics::SourceCache::new();
+    let file = testing::expect_ok(cache.add("main.gom", "let value = old;\n"), "file");
+    let report = diagnostics::Diagnostic::new(diagnostics::Severity::Error, "unknown name").with_code(
+        "E001",
+    ).with_label(diagnostics::Label::primary(span(cache, file, 12, 15), "not in scope")).with_note(
+        "names are case sensitive",
+    ).with_help("declare old first");
+    let options = diagnostics::RenderOptions {
+        context_lines: 0,
+        ..diagnostics::RenderOptions::new(),
+    };
+    testing::assert_eq(
+        rendered(cache, report, options),
+        "error[E001]: unknown name\n --> main.gom:1:13\n1 |   let value = old;\n  |               ^^^ not in scope\n = note: names are case sensitive\n = help: declare old first\n",
+    );
+}
+
+#[test]
+fn overlapping_labels_have_independent_rows_with_stable_priority() -> () {
+    let cache = diagnostics::SourceCache::new();
+    let file = testing::expect_ok(cache.add("overlap", "abcdef"), "file");
+    let base = diagnostics::Diagnostic::new(diagnostics::Severity::Warning, "overlap");
+    let report = base.with_label(diagnostics::Label::secondary(span(cache, file, 1, 5), "outer")).with_label(
+        diagnostics::Label::primary(span(cache, file, 1, 3), "inner"),
+    ).with_label(diagnostics::Label::secondary(span(cache, file, 2, 4), "another"));
+    testing::assert_eq(base.labels.len(), 0);
+    let output = rendered(cache, report, diagnostics::RenderOptions::new());
+    testing::assert_eq(
+        output,
+        "warning: overlap\n --> overlap:1:2\n1 |   abcdef\n  |    ^^ inner\n  |    ---- outer\n  |     -- another\n",
+    );
+    testing::assert_eq(rendered(cache, report, diagnostics::RenderOptions::new()), output);
+}
+
+#[test]
+fn multiline_spans_and_context_are_merged_without_duplicate_source_lines() -> () {
+    let cache = diagnostics::SourceCache::new();
+    let file = testing::expect_ok(cache.add("multi", "aa\r\nbb\r\ncc\r\ndd"), "file");
+    let report = diagnostics::Diagnostic::new(diagnostics::Severity::Advice, "crosses lines").with_label(
+        diagnostics::Label::primary(span(cache, file, 1, 10), "range"),
+    ).with_label(diagnostics::Label::secondary(span(cache, file, 4, 6), "middle"));
+    let output = rendered(cache, report, diagnostics::RenderOptions::new());
+    testing::assert(output.contains("^ [begins] range"));
+    testing::assert(output.contains("^^ [continues] range"));
+    testing::assert(output.contains("^^ [ends] range"));
+    testing::assert_eq(text::split(output, "2 |   bb").len(), 2);
+    testing::assert(!output.contains("\r"));
+}
+
+#[test]
+fn unicode_tabs_and_partial_grapheme_spans_keep_caret_alignment() -> () {
+    let cache = diagnostics::SourceCache::new();
+    let file = testing::expect_ok(cache.add("unicode", "\t中é👩‍💻"), "file");
+    let report = diagnostics::Diagnostic::new(diagnostics::Severity::Error, "unicode").with_label(
+        diagnostics::Label::primary(span(cache, file, 5, 7), "mark"),
+    ).with_label(diagnostics::Label::secondary(span(cache, file, 11, 14), "joiner"));
+    let output = rendered(cache, report, diagnostics::RenderOptions::new());
+    testing::assert(output.contains(" --> unicode:1:7\n"));
+    testing::assert(output.contains("1 |       中é👩‍💻\n"));
+    testing::assert(output.contains("  |         ^ mark\n"));
+    testing::assert(output.contains("  |          -- joiner\n"));
+}
+
+#[test]
+fn empty_eof_and_newline_only_spans_get_visible_carets() -> () {
+    let cache = diagnostics::SourceCache::new();
+    let empty = testing::expect_ok(cache.add("empty", ""), "empty");
+    let lines = testing::expect_ok(cache.add("lines", "a\r\n"), "lines");
+    let report = diagnostics::Diagnostic::new(diagnostics::Severity::Error, "positions").with_label(
+        diagnostics::Label::primary(span(cache, empty, 0, 0), "empty"),
+    ).with_label(diagnostics::Label::primary(span(cache, lines, 1, 3), "newline")).with_label(
+        diagnostics::Label::secondary(span(cache, lines, 3, 3), "EOF"),
+    );
+    let output = rendered(cache, report, diagnostics::RenderOptions::new());
+    testing::assert(output.contains(" --> empty:1:1\n1 |   \n  |   ^ empty\n"));
+    testing::assert(output.contains("  |    ^ newline\n"));
+    testing::assert(output.contains("2 |   \n  |   - EOF\n"));
+}
+
+#[test]
+fn files_follow_cache_registration_order_and_primary_anchor() -> () {
+    let cache = diagnostics::SourceCache::new();
+    let a = testing::expect_ok(cache.add("z.gom", "abc"), "a");
+    let b = testing::expect_ok(cache.add("a.gom", "xyz"), "b");
+    let report = diagnostics::Diagnostic::new(diagnostics::Severity::Note, "related sources").with_label(
+        diagnostics::Label::primary(span(cache, b, 0, 1), "second file"),
+    ).with_label(diagnostics::Label::secondary(span(cache, a, 0, 1), "earlier source")).with_label(
+        diagnostics::Label::primary(span(cache, a, 2, 3), "anchor"),
+    );
+    let output = rendered(cache, report, diagnostics::RenderOptions::new());
+    let first = testing::expect_some(text::find(output, " --> z.gom:1:3"), "first");
+    let second = testing::expect_some(text::find(output, " --> a.gom:1:1"), "second");
+    testing::assert(first < second);
+}
+
+#[test]
+fn horizontal_clipping_keeps_focus_wide_cells_and_far_labels_visible() -> () {
+    let cache = diagnostics::SourceCache::new();
+    let source = text::repeat("中", 60) + "target" + text::repeat("x", 100);
+    let file = testing::expect_ok(cache.add("long", source), "source");
+    let report = diagnostics::Diagnostic::new(diagnostics::Severity::Error, "long").with_label(
+        diagnostics::Label::primary(span(cache, file, 180, 186), "target"),
+    ).with_label(diagnostics::Label::secondary(span(cache, file, 250, 252), "far right"));
+    let options = diagnostics::RenderOptions { columns: 40, ..diagnostics::RenderOptions::new() };
+    let output = rendered(cache, report, options);
+    testing::assert(output.contains("1 | < "));
+    testing::assert(output.contains("target"));
+    testing::assert(output.contains(" >\n"));
+    testing::assert(output.contains("far right"));
+    for line in text::split(output, "\n") {
+        testing::assert(unicode_text::width(line) <= options.columns);
+    }
+}
+
+#[test]
+fn vertical_budget_retains_endpoints_and_names_omitted_labels() -> () {
+    let cache = diagnostics::SourceCache::new();
+    let file = testing::expect_ok(cache.add("many", text::repeat("abc\n", 100)), "source");
+    let report = diagnostics::Diagnostic::new(diagnostics::Severity::Error, "long range").with_label(
+        diagnostics::Label::primary(span(cache, file, 1, 399), "both ends"),
+    ).with_label(diagnostics::Label::secondary(span(cache, file, 200, 201), "middle location"));
+    let options = diagnostics::RenderOptions {
+        context_lines: 0,
+        max_source_lines: 2,
+        ..diagnostics::RenderOptions::new(),
+    };
+    let output = rendered(cache, report, options);
+    testing::assert(output.contains("98 source lines omitted"));
+    testing::assert(output.contains("[begins] both ends"));
+    testing::assert(output.contains("[ends] both ends"));
+    testing::assert(output.contains("secondary at lines 51..51: middle location"));
+}
+
+#[test]
+fn ansi_profiles_preserve_plain_layout_and_neutralize_input_sequences() -> () {
+    let cache = diagnostics::SourceCache::new();
+    let file = testing::expect_ok(cache.add("evil\u001b[31m\nname", "\u001b[2Jx\u202e"), "source");
+    let report = diagnostics::Diagnostic::new(
+        diagnostics::Severity::Error,
+        "message\n\u001b[2J\u202e",
+    ).with_code("X\tY").with_label(
+        diagnostics::Label::primary(span(cache, file, 0, 1), "unsafe\rlabel"),
+    );
+    let plain = rendered(cache, report, diagnostics::RenderOptions::new());
+    testing::assert(!plain.contains("\u001b"));
+    testing::assert(!plain.contains("\u202e"));
+    testing::assert(plain.contains("message\\n�[2J�"));
+    for profile in[ansi::Profile::Ansi16, ansi::Profile::Ansi256, ansi::Profile::TrueColor] {
+        let options = diagnostics::RenderOptions {
+            profile,
+            theme: diagnostics::Theme {
+                error: ansi::Style::new().foreground(ansi::Color::Rgb(123, 45, 67)),
+                ..diagnostics::Theme::new(),
+            },
+            ..diagnostics::RenderOptions::new(),
+        };
+        let styled = rendered(cache, report, options);
+        testing::assert(styled.contains("\u001b["));
+        testing::assert_eq(
+            testing::expect_ok(ansi::parse(styled), "parse generated ansi").plain_text(),
+            plain,
+        );
+    }
+}
+
+#[test]
+fn rendered_suggestions_include_applicability_and_checked_replacements() -> () {
+    let cache = diagnostics::SourceCache::new();
+    let file = testing::expect_ok(cache.add("fix", "old"), "file");
+    let suggestion = diagnostics::Suggestion::new(
+        "rename",
+        diagnostics::Applicability::HasPlaceholders,
+    ).with_edit(diagnostics::Edit::new(span(cache, file, 0, 3), "<new>\n"));
+    let report = diagnostics::Diagnostic::new(diagnostics::Severity::Warning, "rename required").with_suggestion(
+        suggestion,
+    );
+    let output = rendered(cache, report, diagnostics::RenderOptions::new());
+    testing::assert(output.contains("help: rename (contains placeholders)"));
+    testing::assert(output.contains("fix:1:1: replace bytes 0..3"));
+    testing::assert(output.contains("   + <new>\\n\n"));
+    let invalid = suggestion.with_edit(diagnostics::Edit::new(span(cache, file, 1, 2), "x"));
+    testing::assert(
+        diagnostics::render(
+            cache,
+            diagnostics::Diagnostic::new(diagnostics::Severity::Error, "bad").with_suggestion(
+                invalid,
+            ),
+            diagnostics::RenderOptions::new(),
+        ).is_err(),
+    );
+}
+
+#[test]
+fn rendering_bounds_fail_recoverably_without_partial_output() -> () {
+    let cache = diagnostics::SourceCache::new();
+    let file = testing::expect_ok(cache.add("file", "abcdef"), "file");
+    let report = diagnostics::Diagnostic::new(diagnostics::Severity::Error, "message").with_label(
+        diagnostics::Label::primary(span(cache, file, 0, 1), "label"),
+    ).with_note("note").with_suggestion(
+        diagnostics::Suggestion::new("edit", diagnostics::Applicability::Unspecified).with_edit(
+            diagnostics::Edit::new(span(cache, file, 1, 2), "z"),
+        ),
+    );
+    let defaults = diagnostics::RenderOptions::new();
+    for options in[
+        diagnostics::RenderOptions { columns: 23, ..defaults },
+        diagnostics::RenderOptions { tab_stop: 0, ..defaults },
+        diagnostics::RenderOptions { max_source_lines: 0, ..defaults },
+        diagnostics::RenderOptions { max_labels: 0, ..defaults },
+        diagnostics::RenderOptions { max_notes: 0, ..defaults },
+        diagnostics::RenderOptions { max_suggestions: 0, ..defaults },
+        diagnostics::RenderOptions { max_edits: 0, ..defaults },
+        diagnostics::RenderOptions { max_text_bytes: 3, ..defaults },
+        diagnostics::RenderOptions { max_line_bytes: 3, ..defaults },
+        diagnostics::RenderOptions { max_output_bytes: 10, ..defaults },
+    ] {
+        testing::assert(diagnostics::render(cache, report, options).is_err());
+    }
+    testing::assert(diagnostics::render(diagnostics::SourceCache::new(), report, defaults).is_err());
+    testing::assert(rendered(cache, report, defaults).contains("message"));
+}
+
+#[test]
+fn a_single_line_budget_marks_trailing_and_missing_file_excerpts() -> () {
+    let cache = diagnostics::SourceCache::new();
+    let first = testing::expect_ok(cache.add("first", "a\nb\nc"), "first");
+    let second = testing::expect_ok(cache.add("second", "x"), "second");
+    let report = diagnostics::Diagnostic::new(diagnostics::Severity::Error, "budget").with_label(
+        diagnostics::Label::primary(span(cache, first, 0, 5), "range"),
+    ).with_label(diagnostics::Label::secondary(span(cache, second, 0, 1), "related"));
+    let options = diagnostics::RenderOptions {
+        max_source_lines: 1,
+        context_lines: 0,
+        ..diagnostics::RenderOptions::new(),
+    };
+    let output = rendered(cache, report, options);
+    testing::assert(output.contains("2 source lines omitted"));
+    testing::assert(output.contains("source excerpt omitted by line budget"));
+    testing::assert(output.contains("secondary at lines 1..1: related"));
+}
+
+#[test]
+fn long_marker_rows_move_messages_to_a_separate_visible_row() -> () {
+    let cache = diagnostics::SourceCache::new();
+    let file = testing::expect_ok(cache.add("long", text::repeat("x", 200)), "source");
+    let report = diagnostics::Diagnostic::new(diagnostics::Severity::Error, "wide").with_label(
+        diagnostics::Label::primary(span(cache, file, 0, 200), "entire expression"),
+    );
+    let options = diagnostics::RenderOptions { columns: 32, ..diagnostics::RenderOptions::new() };
+    let output = rendered(cache, report, options);
+    testing::assert(output.contains("  |   = entire expression\n"));
+    for line in text::split(output, "\n") {
+        testing::assert(unicode_text::width(line) <= options.columns);
+    }
+}

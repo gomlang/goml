@@ -1,0 +1,239 @@
+package tests;
+
+use ecosystem::terminal;
+use std::context;
+use std::io;
+use std::os::linux::fd;
+use std::os::linux::ipc;
+use std::task;
+use std::testing;
+use std::time;
+
+fn pipes() -> (ipc::Pipe, ipc::Pipe, terminal::Session) {
+    let input = testing::expect_ok(ipc::pipe(0), "input pipe");
+    let output = testing::expect_ok(ipc::pipe(0), "output pipe");
+    let session = testing::expect_ok(
+        terminal::Session::from_fds(input.reader, output.writer, terminal::Options::defaults()),
+        "session",
+    );
+    (input, output, session)
+}
+
+fn cleanup(input: ipc::Pipe, output: ipc::Pipe, session: terminal::Session) -> () {
+    testing::assert_ok(session.close());
+    testing::assert_ok(input.reader.close());
+    testing::assert_ok(input.writer.close());
+    testing::assert_ok(output.reader.close());
+    testing::assert_ok(output.writer.close());
+}
+
+#[test]
+fn pipe_sessions_decode_partial_reads_report_eof_once_and_restore_flags() -> () {
+    let (input, output, session) = pipes();
+    defer cleanup(input, output, session);
+    testing::assert(!session.capabilities().input_tty);
+    testing::assert_ok(input.writer.write_all("a中\u001b[A".to_bytes().as_slice()));
+    let context = context::Context::background();
+    for code in Vec::from_array(
+        [terminal::KeyCode::Char('a'), terminal::KeyCode::Char('中'), terminal::KeyCode::Up],
+    ) {
+        equal(
+            testing::expect_ok(session.next_event(context, 200), "key"),
+            Option::Some(
+                terminal::Event::Key(
+                    terminal::KeyEvent { code, modifiers: terminal::Modifiers::none() },
+                ),
+            ),
+        );
+    }
+    testing::assert_none(testing::expect_ok(session.next_event(context, 0), "no input"));
+    testing::assert_ok(input.writer.close());
+    equal(
+        testing::expect_ok(session.next_event(context, 200), "eof"),
+        Option::Some(terminal::Event::End),
+    );
+    testing::assert_none(
+        testing::expect_ok(session.next_event(context, 0), "eof already delivered"),
+    );
+    testing::assert_ok(session.write("written"));
+    let bytes = Vec::from_array([0, 0, 0, 0, 0, 0, 0]);
+    equal(testing::expect_ok(output.reader.read(bytes.as_mut_slice()), "read output"), 7);
+    equal(bytes, "written".to_bytes());
+    testing::assert_ok(session.close());
+    testing::assert_ok(session.close());
+    equal(testing::expect_ok(input.reader.status_flags(), "input flags") & fd::O_NONBLOCK, 0);
+    equal(testing::expect_ok(output.writer.status_flags(), "output flags") & fd::O_NONBLOCK, 0);
+    testing::assert_err(session.write("after close"));
+    testing::assert_err(session.next_event(context, 0));
+}
+
+#[test]
+fn delayed_escape_and_utf8_fragments_survive_poll_timeouts() -> () {
+    let (input, output, session) = pipes();
+    defer cleanup(input, output, session);
+    let context = context::Context::background();
+    testing::assert_ok(input.writer.write_all("\u001b".to_bytes().as_slice()));
+    testing::assert_none(testing::expect_ok(session.next_event(context, 0), "partial escape"));
+    equal(
+        testing::expect_ok(session.next_event(context, 200), "escape timeout"),
+        Option::Some(
+            terminal::Event::Key(
+                terminal::KeyEvent {
+                    code: terminal::KeyCode::Escape,
+                    modifiers: terminal::Modifiers::none(),
+                },
+            ),
+        ),
+    );
+    let chinese = "中".to_bytes();
+    testing::assert_ok(input.writer.write_all(chinese.slice(0, 1)));
+    testing::assert_none(testing::expect_ok(session.next_event(context, 0), "partial utf8"));
+    testing::assert_ok(input.writer.write_all(chinese.slice(1, 3)));
+    equal(
+        testing::expect_ok(session.next_event(context, 100), "utf8 completed"),
+        Option::Some(
+            terminal::Event::Key(
+                terminal::KeyEvent {
+                    code: terminal::KeyCode::Char('中'),
+                    modifiers: terminal::Modifiers::none(),
+                },
+            ),
+        ),
+    );
+}
+
+#[test]
+fn waiting_reader_deadline_and_cancel_return_without_consuming_input() -> () {
+    let (input, output, session) = pipes();
+    defer cleanup(input, output, session);
+    context::with_timeout(
+        context::Context::background(),
+        time::Duration::from_milliseconds(25),
+        |context, _| {
+            equal(
+                testing::expect_err(session.next_event(context, -1), "deadline").kind(),
+                io::ErrorKind::TimedOut,
+            );
+        },
+    );
+    context::with_cancel(
+        context::Context::background(),
+        |context, cancel| {
+            cancel.cancel();
+            equal(
+                testing::expect_err(session.next_event(context, -1), "cancel").kind(),
+                io::ErrorKind::Interrupted,
+            );
+        },
+    );
+    testing::assert_ok(input.writer.write_all("q".to_bytes().as_slice()));
+    testing::assert_some(
+        testing::expect_ok(
+            session.next_event(context::Context::background(), 200),
+            "session remains usable",
+        ),
+    );
+}
+
+#[test]
+fn close_wakes_active_and_queued_readers_and_is_shared_and_idempotent() -> () {
+    let (input, output, session) = pipes();
+    defer cleanup(input, output, session);
+    task::scope(
+        |scope| {
+            let ready: Channel[()] = Channel::new(2);
+            let one = scope.spawn(
+                |_| {
+                    ready.send(());
+                    session.next_event(context::Context::background(), -1)
+                },
+            );
+            let two = scope.spawn(
+                |_| {
+                    ready.send(());
+                    session.next_event(context::Context::background(), -1)
+                },
+            );
+            let _ = ready.recv();
+            let _ = ready.recv();
+            time::sleep(time::Duration::from_milliseconds(25));
+            testing::assert_ok(session.close());
+            testing::assert_err(one.join());
+            testing::assert_err(two.join());
+            testing::assert_ok(session.close());
+        },
+    );
+}
+
+#[test]
+fn blocked_output_can_be_cancelled_and_close_wakes_both_writer_gates() -> () {
+    let (input, output, session) = pipes();
+    defer cleanup(input, output, session);
+    let chunk = "x".repeat(1048576);
+    context::with_timeout(
+        context::Context::background(),
+        time::Duration::from_milliseconds(25),
+        |context, _| {
+            equal(
+                testing::expect_err(session.write_with(context, chunk), "blocked write deadline").kind(),
+                io::ErrorKind::TimedOut,
+            );
+        },
+    );
+    task::scope(
+        |scope| {
+            let one = scope.spawn(|_| session.write(chunk));
+            let two = scope.spawn(|_| session.write(chunk));
+            time::sleep(time::Duration::from_milliseconds(25));
+            testing::assert_ok(session.close());
+            testing::assert_err(one.join());
+            testing::assert_err(two.join());
+        },
+    );
+}
+
+#[test]
+fn invalid_setup_preserves_descriptors_and_raw_requires_tty() -> () {
+    let input = testing::expect_ok(ipc::pipe(0), "input");
+    let output = testing::expect_ok(ipc::pipe(0), "output");
+    defer {
+        let _ = input.reader.close();
+        let _ = input.writer.close();
+        let _ = output.reader.close();
+        let _ = output.writer.close();
+    };
+    for options in Vec::from_array(
+        [
+            terminal::Options::interactive(),
+            terminal::Options { alternate_screen: true, ..terminal::Options::defaults() },
+            terminal::Options { escape_timeout_ms: -1, ..terminal::Options::defaults() },
+        ],
+    ) {
+        testing::assert_err(terminal::Session::from_fds(input.reader, output.writer, options));
+        equal(testing::expect_ok(input.reader.status_flags(), "input flags") & fd::O_NONBLOCK, 0);
+        equal(testing::expect_ok(output.writer.status_flags(), "output flags") & fd::O_NONBLOCK, 0);
+    }
+}
+
+#[test]
+fn concurrent_complete_writes_do_not_interleave_under_backpressure() -> () {
+    let (input, output, session) = pipes();
+    defer cleanup(input, output, session);
+    let first = "a".repeat(131072);
+    let second = "b".repeat(131072);
+    let data: Vec[byte] = Vec::with_capacity(262144);
+    for _ in 0..262144 {
+        data.push(0);
+    }
+    task::scope(
+        |scope| {
+            let reader = scope.spawn(|_| output.reader.read_exact(data.as_mut_slice()));
+            let writer_one = scope.spawn(|_| session.write(first));
+            let writer_two = scope.spawn(|_| session.write(second));
+            testing::assert_ok(writer_one.join());
+            testing::assert_ok(writer_two.join());
+            testing::assert_ok(reader.join());
+        },
+    );
+    testing::assert(data == (first + second).to_bytes() || data == (second + first).to_bytes());
+}
