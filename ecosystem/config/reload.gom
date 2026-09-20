@@ -1,0 +1,191 @@
+package config;
+
+use ecosystem::notify;
+use std::path;
+use std::task;
+use std::time;
+
+#[derive(Debug)]
+pub struct Reload {
+    pub revision: u64,
+    pub changed: bool,
+}
+
+struct LiveState {
+    snapshot: Snapshot,
+    last_error: Option[Error],
+}
+
+fn live_state(state: Channel[LiveState]) -> LiveState {
+    loop {
+        if let Some(value) = state.recv() {
+            break value
+        }
+    }
+}
+
+pub struct Live {
+    builder: Builder,
+    state: Channel[LiveState],
+    reload_gate: Channel[()],
+}
+
+impl Live {
+    pub fn new(builder: Builder) -> Result[Live, Error] {
+        let snapshot = Snapshot { revision: 1, ..builder.build()? };
+        let state = Channel::new(1);
+        state.send(LiveState { snapshot, last_error: Option::None });
+        let reload_gate = Channel::new(1);
+        reload_gate.send(());
+        Result::Ok(Live { builder, state, reload_gate })
+    }
+
+    pub fn snapshot(self: Live) -> Snapshot {
+        let state = live_state(self.state);
+        let result = state.snapshot;
+        self.state.send(state);
+        result
+    }
+
+    pub fn last_error(self: Live) -> Option[Error] {
+        let state = live_state(self.state);
+        let result = state.last_error;
+        self.state.send(state);
+        result
+    }
+
+    pub fn reload(self: Live) -> Result[Reload, Error] {
+        let _ = self.reload_gate.recv();
+        defer self.reload_gate.send(());
+        let candidate = self.builder.build();
+        let old = live_state(self.state);
+        match candidate {
+            Err(error) => {
+                self.state.send(LiveState { last_error: Option::Some(error), ..old });
+                Result::Err(error)
+            },
+            Ok(snapshot) => {
+                if old.snapshot.revision == 18446744073709551615 {
+                    let error = failure(ErrorKind::Limit, "configuration revisions exhausted");
+                    self.state.send(LiveState { last_error: Option::Some(error), ..old });
+                    return Result::Err(error)
+                }
+                let snapshot = Snapshot { revision: old.snapshot.revision + 1, ..snapshot };
+                let result = Reload {
+                    revision: snapshot.revision,
+                    changed: snapshot.json() != old.snapshot.json(),
+                };
+                self.state.send(LiveState { snapshot, last_error: Option::None });
+                Result::Ok(result)
+            },
+        }
+    }
+
+    pub fn watch(self: Live) -> Result[HotReload, Error] {
+        let files = self.builder.files();
+        if files.is_empty() {
+            return Result::Err(
+                failure(ErrorKind::InvalidOptions, "hot reload requires at least one file source"),
+            )
+        }
+        let watches = notify::WatchSet::new();
+        let parents = Vec::new();
+        for file in files {
+            let parent = path::parent(file).unwrap_or(".");
+            if !parents.contains(parent) {
+                if let Err(error) = watches.add(parent) {
+                    let _ = watches.close();
+                    return Result::Err(
+                        Error::new(
+                            ErrorKind::Watch,
+                            "",
+                            Origin { source: "notify", detail: parent },
+                            error.to_string(),
+                        ),
+                    )
+                }
+                parents.push(parent);
+            }
+        }
+        let watch = HotReload { live: self, watches, files, parents };
+        if let Err(error) = self.reload() {
+            let _ = watch.close();
+            return Result::Err(error)
+        }
+        Result::Ok(watch)
+    }
+}
+
+pub struct HotReload {
+    live: Live,
+    watches: notify::WatchSet,
+    files: Vec[string],
+    parents: Vec[string],
+}
+
+impl HotReload {
+    pub fn snapshot(self: HotReload) -> Snapshot {
+        self.live.snapshot()
+    }
+
+    pub fn poll(self: HotReload, timeout: time::Duration) -> Result[Option[Reload], Error] {
+        let events = self.watches.read(timeout).map_err(
+            |error| failure(ErrorKind::Watch, error.to_string()),
+        )?;
+        self.process(events)
+    }
+
+    pub fn poll_with(self: HotReload, cancel: task::CancelToken, timeout: time::Duration) -> Result[
+        task::WaitResult[Option[Reload]],
+        Error,
+    ] {
+        match self.watches.read_with(cancel, timeout).map_err(
+            |error| failure(ErrorKind::Watch, error.to_string()),
+        )? {
+            task::WaitResult::Cancelled => Result::Ok(task::WaitResult::Cancelled),
+            task::WaitResult::Completed(events) => self.process(events).map(
+                |value| task::WaitResult::Completed(value),
+            ),
+        }
+    }
+
+    fn process(self: HotReload, events: Vec[notify::Notice]) -> Result[Option[Reload], Error] {
+        let mut changed = false;
+        for event in events {
+            match event {
+                notify::Notice::Event(_, event) => {
+                    if event.rescan || self.files.contains(event.path) {
+                        changed = true;
+                    }
+                    if self.parents.contains(event.path)
+                        && event.has(
+                            notify::DELETE_SELF | notify::MOVE_SELF | notify::UNMOUNT
+                                | notify::IGNORED,
+                        ) {
+                        return Result::Err(
+                            failure(
+                                ErrorKind::Watch,
+                                "configuration parent directory watch was invalidated",
+                            ),
+                        )
+                    }
+                },
+                notify::Notice::Error(_, error) => return Result::Err(
+                    failure(ErrorKind::Watch, error.to_string()),
+                ),
+                notify::Notice::Removed(_) => return Result::Err(
+                    failure(ErrorKind::Watch, "configuration directory watch was removed"),
+                ),
+            }
+        }
+        if changed {
+            self.live.reload().map(|value| Option::Some(value))
+        } else {
+            Result::Ok(Option::None)
+        }
+    }
+
+    pub fn close(self: HotReload) -> Result[(), Error] {
+        self.watches.close().map_err(|error| failure(ErrorKind::Watch, error.to_string()))
+    }
+}

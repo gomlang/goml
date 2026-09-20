@@ -1,0 +1,389 @@
+package websocket;
+
+use std::bytes;
+use std::context;
+use std::io;
+use std::io::{Read, Write, Close};
+use std::net;
+use std::net::tls;
+
+fn context_error(problem: context::Error) -> Error {
+    error(
+        match problem {
+            Cancelled => ErrorKind::Cancelled,
+            DeadlineExceeded => ErrorKind::Timeout,
+        },
+        problem.to_string(),
+    )
+}
+
+fn io_error(problem: io::Error) -> Error {
+    error(
+        if problem.kind() == io::ErrorKind::TimedOut {
+            ErrorKind::Timeout
+        } else if problem.kind() == io::ErrorKind::Interrupted {
+            ErrorKind::Cancelled
+        } else {
+            ErrorKind::Io
+        },
+        problem.to_string(),
+    )
+}
+
+pub struct Transport {
+    reader: (MutSlice[u8], context::Context) -> Result[isize, io::Error],
+    writer: (Slice[u8], context::Context) -> Result[isize, io::Error],
+    closer: () -> Result[(), io::Error],
+}
+
+impl Transport {
+    pub fn new(
+        reader: (MutSlice[u8], context::Context) -> Result[isize, io::Error],
+        writer: (Slice[u8], context::Context) -> Result[isize, io::Error],
+        closer: () -> Result[(), io::Error],
+    ) -> Transport {
+        Transport { reader, writer, closer }
+    }
+
+    pub fn from_io[S: Read + Write + Close](stream: S) -> Transport {
+        Transport::new(|data, _| stream.read(data), |data, _| stream.write(data), || stream.close())
+    }
+
+    pub fn tcp(stream: net::TcpStream) -> Transport {
+        Transport::new(
+            |data, ctx| stream.read_with(data, net::WaitOptions::new().with_context(ctx)),
+            |data, ctx| stream.write_with(data, net::WaitOptions::new().with_context(ctx)),
+            || stream.close(),
+        )
+    }
+
+    pub fn tls(stream: tls::TlsStream) -> Transport {
+        Transport::new(
+            |data, ctx| stream.read_with(data, ctx),
+            |data, ctx| stream.write_with(data, ctx),
+            || stream.close(),
+        )
+    }
+
+    pub fn close(self: Transport) -> Result[(), Error] {
+        (self.closer)().map_err(io_error)
+    }
+
+    fn read(self: Transport, data: MutSlice[u8], ctx: context::Context) -> Result[isize, Error] {
+        ctx.check().map_err(context_error)?;
+        let count = (self.reader)(data, ctx).map_err(io_error)?;
+        if count < 0 || count > data.len() {
+            return Result::Err(error(ErrorKind::Io, "transport returned invalid read count"))
+        }
+        Result::Ok(count)
+    }
+
+    fn write(self: Transport, data: Slice[u8], ctx: context::Context) -> Result[isize, Error] {
+        ctx.check().map_err(context_error)?;
+        let count = (self.writer)(data, ctx).map_err(io_error)?;
+        if count < 0 || count > data.len() || (count == 0 && data.len() > 0) {
+            return Result::Err(
+                error(ErrorKind::Io, "transport returned invalid or zero write count"),
+            )
+        }
+        Result::Ok(count)
+    }
+
+    fn write_all(self: Transport, data: Slice[u8], ctx: context::Context) -> Result[(), Error] {
+        let mut offset = 0;
+        while offset < data.len() {
+            offset += self.write(data.sub(offset, data.len()), ctx)?;
+        }
+        Result::Ok(())
+    }
+}
+
+fn buffer(size: isize) -> bytes::Bytes {
+    let output = bytes::Bytes::with_capacity(size);
+    for _ in 0..size {
+        output.push(0);
+    }
+    output
+}
+
+fn read_head(stream: Transport, limits: Limits, ctx: context::Context) -> Result[
+    (bytes::Bytes, bytes::Bytes),
+    Error,
+] {
+    let decoder = HandshakeDecoder::new(limits.handshake_bytes)?;
+    let scratch = buffer(
+        if limits.buffered_bytes < 4096 {
+            limits.buffered_bytes
+        } else {
+            4096
+        },
+    );
+    loop {
+        let count = stream.read(scratch.as_mut_slice(), ctx)?;
+        if count == 0 {
+            return Result::Err(error(ErrorKind::UnexpectedEof, "EOF during opening handshake"))
+        }
+        let consumed = decoder.push(scratch.slice(0, count))?;
+        if let Some(head) = decoder.head() {
+            return Result::Ok((head, bytes::Bytes::from_slice_copy(scratch.slice(consumed, count))))
+        }
+    }
+}
+
+pub fn client(stream: Transport, request: ClientRequest, limits: Limits, ctx: context::Context) -> Result[
+    (Connection, Option[string]),
+    Error,
+] {
+    let result = client_inner(stream, request, limits, ctx);
+    if result.is_err() {
+        let _ = stream.close();
+    }
+    result
+}
+
+fn client_inner(stream: Transport, request: ClientRequest, limits: Limits, ctx: context::Context) -> Result[
+    (Connection, Option[string]),
+    Error,
+] {
+    limits.validate()?;
+    let encoded = request.encode();
+    if encoded.len() > limits.handshake_bytes {
+        return Result::Err(error(ErrorKind::Limit, "request handshake exceeds byte limit"))
+    }
+    stream.write_all(encoded.as_slice(), ctx)?;
+    let (head, remainder) = read_head(stream, limits, ctx)?;
+    let selected = request.validate_response(head, limits.handshake_bytes)?;
+    let connection = Connection::upgraded(stream, Role::Client, limits, remainder)?;
+    Result::Ok((connection, selected))
+}
+
+pub fn server(
+    stream: Transport,
+    limits: Limits,
+    ctx: context::Context,
+    select_protocol: (ServerRequest) -> Result[Option[string], Error],
+) -> Result[Connection, Error] {
+    let result = server_inner(stream, limits, ctx, select_protocol);
+    if result.is_err() {
+        let _ = stream.close();
+    }
+    result
+}
+
+fn server_inner(
+    stream: Transport,
+    limits: Limits,
+    ctx: context::Context,
+    select_protocol: (ServerRequest) -> Result[Option[string], Error],
+) -> Result[Connection, Error] {
+    limits.validate()?;
+    let (head, remainder) = read_head(stream, limits, ctx)?;
+    let request = ServerRequest::parse(head, limits.handshake_bytes)?;
+    let response = request.response(select_protocol(request)?)?;
+    if response.len() > limits.handshake_bytes {
+        return Result::Err(error(ErrorKind::Limit, "response handshake exceeds byte limit"))
+    }
+    stream.write_all(response.as_slice(), ctx)?;
+    Connection::upgraded(stream, Role::Server, limits, remainder)
+}
+
+pub struct Connection {
+    stream: Transport,
+    session: Session,
+    gate: Channel[()],
+    reader: Channel[()],
+    writer: Channel[()],
+    closed: Channel[()],
+    close_gate: Channel[()],
+    limits: Limits,
+}
+
+fn gate() -> Channel[()] {
+    let value = Channel::new(1);
+    value.send(());
+    value
+}
+
+impl Connection {
+    pub fn upgraded(stream: Transport, role: Role, limits: Limits, remainder: bytes::Bytes) -> Result[
+        Connection,
+        Error,
+    ] {
+        let session = match Session::new(role, limits) {
+            Ok(value) => value,
+            Err(problem) => {
+                let _ = stream.close();
+                return Result::Err(problem)
+            },
+        };
+        if let Err(problem) = session.feed(remainder.as_slice()) {
+            let _ = stream.close();
+            return Result::Err(problem)
+        }
+        Result::Ok(
+            Connection {
+                stream,
+                session,
+                gate: gate(),
+                reader: gate(),
+                writer: gate(),
+                closed: Channel::new(0),
+                close_gate: gate(),
+                limits,
+            },
+        )
+    }
+
+    fn acquire(self: Connection, selected: Channel[()], ctx: context::Context) -> Result[(), Error] {
+        ctx.check().map_err(context_error)?;
+        if self.is_closed() {
+            return Result::Err(error(ErrorKind::Closed, "transport closed"))
+        }
+        select {
+            recv(selected) as _ => {
+                if self.is_closed() {
+                    selected.send(());
+                    return Result::Err(error(ErrorKind::Closed, "transport closed"))
+                }
+                if let Err(problem) = ctx.check() {
+                    selected.send(());
+                    return Result::Err(context_error(problem))
+                }
+                Result::Ok(())
+            },
+            recv(self.closed) as _ => Result::Err(error(ErrorKind::Closed, "transport closed")),
+            recv(ctx.done()) as _ => Result::Err(
+                context_error(ctx.error().unwrap_or(context::Error::Cancelled)),
+            ),
+        }
+    }
+
+    pub fn is_closed(self: Connection) -> bool {
+        select {
+            recv(self.closed) as _ => true,
+            default => false,
+        }
+    }
+
+    pub fn abort(self: Connection) -> Result[(), Error] {
+        let _ = self.close_gate.recv();
+        defer self.close_gate.send(());
+        if self.is_closed() {
+            return Result::Ok(())
+        }
+        self.closed.close();
+        self.stream.close()
+    }
+
+    pub fn send(self: Connection, message: Message, ctx: context::Context) -> Result[(), Error] {
+        self.acquire(self.gate, ctx)?;
+        let result = self.session.send(message);
+        self.gate.send(());
+        result?;
+        self.flush(ctx)
+    }
+
+    pub fn close(self: Connection, close: Option[CloseFrame], ctx: context::Context) -> Result[
+        (),
+        Error,
+    ] {
+        self.send(Message::Close(close), ctx)
+    }
+
+    pub fn flush(self: Connection, ctx: context::Context) -> Result[(), Error] {
+        self.acquire(self.writer, ctx)?;
+        defer self.writer.send(());
+        loop {
+            self.acquire(self.gate, ctx)?;
+            let next = self.session.output();
+            let closed = self.session.state() == State::Closed;
+            self.gate.send(());
+            let Some(data) = next else {
+                if closed {
+                    let _ = self.abort();
+                }
+                return Result::Ok(())
+            };
+            let count = match self.stream.write(data.as_slice(), ctx) {
+                Ok(value) => value,
+                Err(problem) => {
+                    let _ = self.abort();
+                    return Result::Err(problem)
+                },
+            };
+            let _ = self.gate.recv();
+            let result = self.session.consume_output(count);
+            self.gate.send(());
+            result?;
+        }
+    }
+
+    pub fn receive(self: Connection, ctx: context::Context) -> Result[Message, Error] {
+        self.acquire(self.reader, ctx)?;
+        defer self.reader.send(());
+        let scratch = buffer(
+            if self.limits.buffered_bytes < 8192 {
+                self.limits.buffered_bytes
+            } else {
+                8192
+            },
+        );
+        loop {
+            self.acquire(self.gate, ctx)?;
+            let event = self.session.next();
+            let capacity = self.limits.buffered_bytes - self.session.buffered_bytes();
+            self.gate.send(());
+            match event {
+                Ok(Some(message)) => {
+                    self.flush(ctx)?;
+                    return Result::Ok(message)
+                },
+                Ok(None) => {},
+                Err(problem) if problem.kind == ErrorKind::Backpressure => {
+                    self.flush(ctx)?;
+                    continue
+                },
+                Err(problem) => {
+                    let _ = self.abort();
+                    return Result::Err(problem)
+                },
+            }
+            self.flush(ctx)?;
+            if self.is_closed() {
+                return Result::Err(error(ErrorKind::Closed, "closing handshake complete"))
+            }
+            let count = match self.stream.read(
+                scratch.slice_mut(
+                    0,
+                    if capacity < scratch.len() {
+                        capacity
+                    } else {
+                        scratch.len()
+                    },
+                ),
+                ctx,
+            ) {
+                Ok(value) => value,
+                Err(problem) => {
+                    if problem.kind != ErrorKind::Timeout && problem.kind != ErrorKind::Cancelled {
+                        let _ = self.abort();
+                    }
+                    return Result::Err(problem)
+                },
+            };
+            if count == 0 {
+                let _ = self.abort();
+                return Result::Err(
+                    error(ErrorKind::UnexpectedEof, "peer disconnected without closing handshake"),
+                )
+            }
+            let _ = self.gate.recv();
+            let result = self.session.feed(scratch.slice(0, count));
+            self.gate.send(());
+            if let Err(problem) = result {
+                let _ = self.abort();
+                return Result::Err(problem)
+            }
+        }
+    }
+}

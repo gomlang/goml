@@ -1,0 +1,158 @@
+package main;
+
+use ecosystem::csv;
+use ecosystem::tempfile;
+use std::bytes;
+use std::fs;
+use std::io;
+use io::{Read, Write};
+use std::serde::{Serialize, Deserialize};
+use std::testing;
+
+#[derive(Serialize, Deserialize)]
+pub struct Inventory {
+    pub sku: string,
+    pub name: string,
+    pub on_hand: u32,
+    pub unit_cents: u64,
+    pub active: bool,
+    pub note: Option[string],
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Summary {
+    pub rows: isize,
+    pub active_items: isize,
+    pub units: u64,
+    pub value_cents: u64,
+}
+
+pub struct RoundTrip {
+    pub summary: Summary,
+    pub exported: string,
+    pub temporary_directory: string,
+}
+
+pub fn schema() -> Result[csv::Schema, csv::Error] {
+    csv::Schema::new(
+        Vec::from_array(
+            [
+                csv::Column::new("sku", csv::ScalarType::Text),
+                csv::Column::new("name", csv::ScalarType::Text),
+                csv::Column::new("on_hand", csv::ScalarType::Unsigned(32)),
+                csv::Column::new("unit_cents", csv::ScalarType::Unsigned(64)),
+                csv::Column::new("active", csv::ScalarType::Bool),
+                csv::Column::new("note", csv::ScalarType::Text).optional(),
+            ],
+        ),
+    )
+}
+
+pub fn import_inventory[R: Read](input: R) -> Result[Vec[Inventory], string] {
+    let reader = csv::Reader::new(
+        input,
+        csv::ReadOptions { headers: true, buffer_size: 3, ..csv::ReadOptions::new() },
+    ).map_err(|error| error.to_string())?;
+    let schema = schema().map_err(|error| error.to_string())?;
+    let rows = Vec::new();
+    loop {
+        let next: Option[Inventory] = reader.decode_next(schema).map_err(|error| error.to_string())?;
+        match next {
+            Some(row) => rows.push(row),
+            None => break,
+        }
+    }
+    Result::Ok(rows)
+}
+
+pub fn export_inventory[W: Write](output: W, rows: Vec[Inventory]) -> Result[(), string] {
+    let writer = csv::Writer::new(
+        output,
+        csv::WriteOptions { headers: true, emit_bom: true, ..csv::WriteOptions::new() },
+    ).map_err(|error| error.to_string())?;
+    let schema = schema().map_err(|error| error.to_string())?;
+    if rows.is_empty() {
+        writer.write(schema.headers()).map_err(|error| error.to_string())?;
+    }
+    for row in rows {
+        writer.serialize(row, schema).map_err(|error| error.to_string())?;
+    }
+    writer.flush().map_err(|error| error.to_string())
+}
+
+pub fn summarize(rows: Vec[Inventory]) -> Result[Summary, string] {
+    let mut summary = Summary { rows: rows.len(), active_items: 0, units: 0, value_cents: 0 };
+    for row in rows {
+        if !row.active {
+            continue
+        }
+        let units = row.on_hand.to_u64();
+        if units > 18446744073709551615 - summary.units
+            || (units > 0 && row.unit_cents > 18446744073709551615 / units) {
+            return Result::Err("inventory total exceeds unsigned 64-bit range")
+        }
+        let value = units * row.unit_cents;
+        if value > 18446744073709551615 - summary.value_cents {
+            return Result::Err("inventory total exceeds unsigned 64-bit range")
+        }
+        summary = Summary {
+            rows: summary.rows,
+            active_items: summary.active_items + 1,
+            units: summary.units + units,
+            value_cents: summary.value_cents + value,
+        };
+    }
+    Result::Ok(summary)
+}
+
+pub fn sample_source() -> string {
+    "\ufeff\"sku\",\"note\",\"active\",\"name\",\"unit_cents\",\"on_hand\"\r\n0042,\"批次一\n冷藏\",true,\"Tea, \"\"green\"\"\",1250,4\r\nB-2,,true,咖啡,980,2\r\nC3,保留,false,退役样品,1,99\r\n"
+}
+
+pub fn exercise() -> Result[RoundTrip, string] {
+    let directory = tempfile::tempdir().map_err(|error| error.to_string())?;
+    defer {
+        let _ = directory.close();
+    };
+    let input = tempfile::Builder::new().parent(directory.path()).prefix("incoming-").suffix(".csv").tempfile().map_err(
+        |error| error.to_string(),
+    )?;
+    defer {
+        let _ = input.close();
+    };
+    input.write_all(bytes::Bytes::from_string(sample_source()).as_slice()).map_err(
+        |error| error.to_string(),
+    )?;
+    input.rewind().map_err(|error| error.to_string())?;
+    let rows = import_inventory(input)?;
+    let summary = summarize(rows)?;
+    testing::assert_eq(summary, Summary { rows: 3, active_items: 2, units: 6, value_cents: 6960 });
+    testing::assert_eq(rows[0].sku, "0042");
+    testing::assert_eq(rows[0].name, "Tea, \"green\"");
+    testing::assert(rows[0].note == Option::Some("批次一\n冷藏"));
+    testing::assert(rows[1].note.is_none());
+    let output = tempfile::Builder::new().parent(directory.path()).prefix("exported-").suffix(
+        ".csv",
+    ).tempfile().map_err(|error| error.to_string())?;
+    defer {
+        let _ = output.close();
+    };
+    export_inventory(output, rows)?;
+    let exported = fs::read_file_structured(output.path()).map_err(|error| error.to_string())?;
+    testing::assert(exported.starts_with("\ufeffsku,name,on_hand,unit_cents,active,note\r\n"));
+    output.rewind().map_err(|error| error.to_string())?;
+    let reloaded = import_inventory(output)?;
+    testing::assert_eq(summarize(reloaded)?, summary);
+    testing::assert_eq(reloaded[0].name, rows[0].name);
+    testing::assert(reloaded[0].note == rows[0].note);
+    testing::assert_eq(reloaded[1].name, "咖啡");
+    Result::Ok(RoundTrip { summary, exported, temporary_directory: directory.path() })
+}
+
+fn main() -> () {
+    let result = testing::expect_ok(exercise(), "inventory CSV round trip");
+    println(
+        f"CSV inventory: {result.summary.rows} rows, {result.summary.active_items} active products, {result.summary.units} units, {result.summary.value_cents} cents",
+    );
+    println(result.exported);
+}

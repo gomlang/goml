@@ -1,0 +1,220 @@
+package archive;
+
+use std::bytes;
+
+struct ZipDirectory {
+    count: isize,
+    start: isize,
+    comment: string,
+}
+
+fn zip_directory(data: bytes::Bytes, end: isize, limits: Limits) -> Result[ZipDirectory, Error] {
+    let disk = le(data, end + 4, 2)?;
+    let start_disk = le(data, end + 6, 2)?;
+    let disk_count = le(data, end + 8, 2)?;
+    let count = le(data, end + 10, 2)?.to_isize();
+    if disk != 0 || start_disk != 0 || disk_count != count.to_u64() {
+        return Result::Err(
+            failure(ErrorKind::Unsupported, end, "split ZIP archives are unsupported"),
+        )
+    }
+    let size = le(data, end + 12, 4)?.to_isize();
+    let start = le(data, end + 16, 4)?.to_isize();
+    if count == 65535 || size.to_u64() == 4294967295 || start.to_u64() == 4294967295 {
+        return Result::Err(failure(ErrorKind::Unsupported, end, "ZIP64 is unsupported"))
+    }
+    if count > limits.max_entries || size > limits.max_metadata_bytes {
+        return Result::Err(failure(ErrorKind::Limit, end, "ZIP directory limit"))
+    }
+    if start > end || size != end - start {
+        return Result::Err(failure(ErrorKind::Invalid, end, "ZIP directory bounds mismatch"))
+    }
+    Result::Ok(
+        ZipDirectory { count, start, comment: text(part(data, end + 22, data.len() - end - 22)?)? },
+    )
+}
+
+struct ParsedZip {
+    record: ZipRecord,
+    version: u64,
+    flags: u64,
+    method: u64,
+    local: isize,
+    next: isize,
+}
+
+fn zip_name(data: bytes::Bytes, flags: u64) -> Result[string, Error] {
+    if flags & 0x800 == 0 {
+        for value in data.as_slice() {
+            if value >= 128 {
+                return Result::Err(
+                    failure(ErrorKind::Unsupported, 0, "legacy non-ASCII ZIP filename"),
+                )
+            }
+        }
+    }
+    let name = text(data)?;
+    if name == "" || name.contains("\u0000") {
+        return Result::Err(failure(ErrorKind::Path, 0, "invalid ZIP filename"))
+    }
+    Result::Ok(name)
+}
+
+fn zip_kind(name: string, mode: u32) -> Result[EntryKind, Error] {
+    let kind = mode & 0o170000;
+    if kind == 0o120000 {
+        return Result::Ok(EntryKind::Symlink)
+    }
+    if name.ends_with("/") || kind == 0o040000 {
+        return Result::Ok(EntryKind::Directory)
+    }
+    if kind == 0 || kind == 0o100000 {
+        return Result::Ok(EntryKind::File)
+    }
+    Result::Err(failure(ErrorKind::Unsupported, 0, "unsupported ZIP Unix file type"))
+}
+
+fn zip_central(data: bytes::Bytes, offset: isize, end: isize, limits: Limits) -> Result[
+    ParsedZip,
+    Error,
+] {
+    if offset > end || end - offset < 46 {
+        return Result::Err(failure(ErrorKind::Truncated, offset, "truncated ZIP directory entry"))
+    }
+    let signature = le(data, offset, 4)?;
+    if signature != 0x02014b50 {
+        return Result::Err(failure(ErrorKind::Invalid, offset, "invalid ZIP directory entry"))
+    }
+    let version = le(data, offset + 6, 2)?;
+    let flags = le(data, offset + 8, 2)?;
+    if version > 20 || flags & 0xf7f1 != 0 {
+        return Result::Err(
+            failure(ErrorKind::Unsupported, offset, "unsupported ZIP version, encryption or flags"),
+        )
+    }
+    let method = le(data, offset + 10, 2)?;
+    let compression = match method {
+        0 => Compression::Stored,
+        8 => Compression::Deflate,
+        _ => return Result::Err(
+            failure(ErrorKind::Unsupported, offset, "unsupported ZIP compression"),
+        ),
+    };
+    let checksum = le(data, offset + 16, 4)?.to_u32();
+    let compressed_size = le(data, offset + 20, 4)?.to_isize();
+    let size = le(data, offset + 24, 4)?.to_isize();
+    if compressed_size.to_u64() == 4294967295 || size.to_u64() == 4294967295 {
+        return Result::Err(failure(ErrorKind::Unsupported, offset, "ZIP64 is unsupported"))
+    }
+    if size > limits.max_entry_bytes {
+        return Result::Err(failure(ErrorKind::Limit, offset, "ZIP expanded entry size limit"))
+    }
+    let name_len = le(data, offset + 28, 2)?.to_isize();
+    let extra_len = le(data, offset + 30, 2)?.to_isize();
+    let comment_len = le(data, offset + 32, 2)?.to_isize();
+    let disk = le(data, offset + 34, 2)?;
+    if disk != 0 {
+        return Result::Err(failure(ErrorKind::Unsupported, offset, "split ZIP entry"))
+    }
+    let next = offset + 46 + name_len + extra_len + comment_len;
+    if name_len > limits.max_path_bytes || next > end {
+        return Result::Err(failure(ErrorKind::Invalid, offset, "ZIP entry metadata bounds"))
+    }
+    let path = zip_name(part(data, offset + 46, name_len)?, flags)?;
+    let modified = zip_extra(part(data, offset + 46 + name_len, extra_len)?, 0)?;
+    let comment = text(part(data, offset + 46 + name_len + extra_len, comment_len)?)?;
+    let mode = (le(data, offset + 38, 4)? >> 16).to_u32();
+    let kind = zip_kind(path, mode)?;
+    if kind == EntryKind::Directory && size != 0 {
+        return Result::Err(failure(ErrorKind::Invalid, offset, "ZIP directory has payload"))
+    }
+    let local = le(data, offset + 42, 4)?.to_isize();
+    let header = Header { path, kind, mode: mode & 0o7777, modified, comment, ..Header::file("") };
+    Result::Ok(
+        ParsedZip {
+            record: ZipRecord {
+                header,
+                compression,
+                compressed_size,
+                size,
+                checksum,
+                data_offset: 0,
+            },
+            version,
+            flags,
+            method,
+            local,
+            next,
+        },
+    )
+}
+
+fn zip_descriptor(data: bytes::Bytes, offset: isize, limit: isize, record: ZipRecord) -> Result[
+    isize,
+    Error,
+] {
+    let signature = le(data, offset, 4)?;
+    let position = if signature == 0x08074b50 {
+        offset + 4
+    } else {
+        offset
+    };
+    if position + 12 > limit {
+        return Result::Err(failure(ErrorKind::Truncated, position, "truncated ZIP descriptor"))
+    }
+    let checksum = le(data, position, 4)?;
+    let packed = le(data, position + 4, 4)?;
+    let size = le(data, position + 8, 4)?;
+    if checksum != record.checksum.to_u64() || packed != record.compressed_size.to_u64()
+        || size != record.size.to_u64() {
+        return Result::Err(failure(ErrorKind::Invalid, position, "ZIP data descriptor mismatch"))
+    }
+    Result::Ok(position + 12)
+}
+
+fn zip_local(data: bytes::Bytes, parsed: ParsedZip, directory_start: isize) -> Result[
+    (isize, isize),
+    Error,
+] {
+    let local = parsed.local;
+    if local > directory_start || directory_start - local < 30 {
+        return Result::Err(failure(ErrorKind::Invalid, local, "invalid ZIP local header bounds"))
+    }
+    let signature = le(data, local, 4)?;
+    let version = le(data, local + 4, 2)?;
+    let flags = le(data, local + 6, 2)?;
+    let method = le(data, local + 8, 2)?;
+    if signature != 0x04034b50 || version != parsed.version || flags != parsed.flags
+        || method != parsed.method {
+        return Result::Err(
+            failure(ErrorKind::Invalid, local, "ZIP local and central headers disagree"),
+        )
+    }
+    let name_len = le(data, local + 26, 2)?.to_isize();
+    let extra_len = le(data, local + 28, 2)?.to_isize();
+    let data_offset = local + 30 + name_len + extra_len;
+    if data_offset > directory_start
+        || parsed.record.compressed_size > directory_start - data_offset {
+        return Result::Err(failure(ErrorKind::Invalid, local, "ZIP entry overlaps directory"))
+    }
+    let name = text(part(data, local + 30, name_len)?)?;
+    if name != parsed.record.header.path {
+        return Result::Err(failure(ErrorKind::Invalid, local, "ZIP local filename mismatch"))
+    }
+    let _ = zip_extra(part(data, local + 30 + name_len, extra_len)?, parsed.record.header.modified)?;
+    let range_end = data_offset + parsed.record.compressed_size;
+    if flags & 8 != 0 {
+        return Result::Ok(
+            (data_offset, zip_descriptor(data, range_end, directory_start, parsed.record)?),
+        )
+    }
+    let checksum = le(data, local + 14, 4)?;
+    let packed = le(data, local + 18, 4)?;
+    let size = le(data, local + 22, 4)?;
+    if checksum != parsed.record.checksum.to_u64()
+        || packed != parsed.record.compressed_size.to_u64()
+        || size != parsed.record.size.to_u64() {
+        return Result::Err(failure(ErrorKind::Invalid, local, "ZIP local sizes or CRC mismatch"))
+    }
+    Result::Ok((data_offset, range_end))
+}

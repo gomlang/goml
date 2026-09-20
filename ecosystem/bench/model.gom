@@ -1,0 +1,220 @@
+package bench;
+
+use std::time;
+use std::math;
+use std::num::{ToFloat};
+use std::context;
+use std::serde::{Serialize, Deserialize};
+
+#[derive(Debug, PartialEq)]
+pub enum ErrorKind {
+    Options,
+    Clock,
+    Limit,
+    Cancelled,
+    Workload,
+    Data,
+    Baseline,
+    Io,
+}
+
+pub struct Error {
+    pub kind: ErrorKind,
+    pub message: string,
+}
+
+impl ToString for Error {
+    fn to_string(self: Error) -> string {
+        self.message
+    }
+}
+
+impl Debug for Error {
+    fn debug(self: Error) -> string {
+        self.to_string()
+    }
+}
+
+fn error(kind: ErrorKind, message: string) -> Error {
+    Error { kind, message }
+}
+
+pub struct Clock {
+    read: () -> i64,
+    last: Ref[Option[i64]],
+}
+
+impl Clock {
+    pub fn monotonic() -> Clock {
+        let origin = time::Instant::now();
+        Clock::new(|| origin.elapsed().as_nanoseconds())
+    }
+
+    pub fn new(read: () -> i64) -> Clock {
+        Clock { read, last: Ref::new(Option::None) }
+    }
+
+    pub fn now(self: Clock) -> Result[i64, Error] {
+        let value = (self.read)();
+        if value < 0 {
+            return Result::Err(error(ErrorKind::Clock, "clock returned negative nanoseconds"))
+        }
+        if let Some(last) = self.last.get() {
+            if value < last {
+                return Result::Err(error(ErrorKind::Clock, "clock moved backwards"))
+            }
+        }
+        self.last.set(Option::Some(value));
+        Result::Ok(value)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Options {
+    pub warmup_ns: i64,
+    pub measurement_ns: i64,
+    pub samples: isize,
+    pub min_iterations: u64,
+    pub max_iterations: u64,
+    pub max_total_iterations: u64,
+    pub max_wall_ns: i64,
+    pub bootstrap_resamples: isize,
+    pub confidence: f64,
+    pub noise_threshold: f64,
+    pub seed: u64,
+}
+
+impl Options {
+    pub fn standard() -> Options {
+        Options {
+            warmup_ns: 100000000,
+            measurement_ns: 500000000,
+            samples: 30,
+            min_iterations: 1,
+            max_iterations: 1000000,
+            max_total_iterations: 100000000,
+            max_wall_ns: 30000000000,
+            bootstrap_resamples: 1000,
+            confidence: 0.95,
+            noise_threshold: 0.05,
+            seed: 0x9e3779b97f4a7c15,
+        }
+    }
+
+    pub fn validate(self: Options) -> Result[(), Error] {
+        if self.warmup_ns < 0 || self.measurement_ns <= 0 || self.max_wall_ns <= 0
+            || self.samples < 2
+            || self.samples > 10000
+            || self.min_iterations == 0
+            || self.max_iterations < self.min_iterations
+            || self.max_iterations > 1000000000
+            || self.max_total_iterations < self.min_iterations
+            || self.max_total_iterations > 1000000000000 {
+            return Result::Err(error(ErrorKind::Options, "invalid measurement bounds"))
+        }
+        if self.bootstrap_resamples < 20 || self.bootstrap_resamples > 100000
+            || self.bootstrap_resamples.to_u64() * self.samples.to_u64() > 20000000 {
+            return Result::Err(error(ErrorKind::Options, "invalid bootstrap work budget"))
+        }
+        if !math::is_finite(self.confidence) || self.confidence <= 0.5 || self.confidence >= 1.0
+            || !math::is_finite(self.noise_threshold)
+            || self.noise_threshold < 0.0
+            || self.noise_threshold >= 1.0 {
+            return Result::Err(error(ErrorKind::Options, "invalid confidence or noise threshold"))
+        }
+        Result::Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub enum Throughput {
+    None,
+    Bytes(u64),
+    Elements(u64),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub enum Timing {
+    Batch,
+    PerIteration,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Sample {
+    pub iterations: u64,
+    pub elapsed_ns: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Interval {
+    pub lower: f64,
+    pub estimate: f64,
+    pub upper: f64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Statistics {
+    pub mean: Interval,
+    pub median: f64,
+    pub min: f64,
+    pub max: f64,
+    pub standard_deviation: f64,
+    pub median_absolute_deviation: f64,
+    pub mild_outliers: isize,
+    pub severe_outliers: isize,
+    pub slope_ns: f64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Report {
+    pub group: string,
+    pub name: string,
+    pub parameter: string,
+    pub throughput: Throughput,
+    pub timing: Timing,
+    pub samples: Vec[Sample],
+    pub statistics: Statistics,
+    pub warmup_iterations: u64,
+    pub total_iterations: u64,
+    pub elapsed_wall_ns: i64,
+    pub checksum: u64,
+    pub options: Options,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SuiteReport {
+    pub schema: isize,
+    pub reports: Vec[Report],
+}
+
+pub struct Batch {
+    pub elapsed_ns: i64,
+    pub checksum: u64,
+}
+
+pub struct Case {
+    pub group: string,
+    pub name: string,
+    pub parameter: string,
+    pub throughput: Throughput,
+    pub timing: Timing,
+    measure: (u64, Clock, context::Context) -> Result[Batch, Error],
+}
+
+pub fn throughput_per_second(throughput: Throughput, nanoseconds: f64) -> Result[f64, Error] {
+    if !math::is_finite(nanoseconds) || nanoseconds <= 0.0 {
+        return Result::Err(error(ErrorKind::Data, "throughput requires positive finite duration"))
+    }
+    let amount = match throughput {
+        None => return Result::Err(error(ErrorKind::Data, "throughput is not configured")),
+        Bytes(value) | Elements(value) => value,
+    };
+    if amount == 0 {
+        return Result::Err(error(ErrorKind::Data, "throughput amount must be positive"))
+    }
+    let rate = amount.to_f64() * 1000000000.0 / nanoseconds;
+    if !math::is_finite(rate) {
+        return Result::Err(error(ErrorKind::Data, "throughput overflow"))
+    }
+    Result::Ok(rate)
+}

@@ -1,0 +1,182 @@
+package bench;
+
+use std::context;
+use std::num::{ToFloat, TryToInt};
+
+struct RunState {
+    clock: Clock,
+    control: context::Context,
+    started: i64,
+    total: Ref[u64],
+    checksum: Ref[u64],
+    options: Options,
+}
+
+impl RunState {
+    fn checkpoint(self: RunState) -> Result[i64, Error] {
+        check_context(self.control)?;
+        let now = self.clock.now()?;
+        if now - self.started > self.options.max_wall_ns {
+            return Result::Err(error(ErrorKind::Limit, "benchmark wall-clock budget exhausted"))
+        }
+        Result::Ok(now)
+    }
+
+    fn measure(self: RunState, case: Case, count: u64) -> Result[Batch, Error] {
+        let _ = self.checkpoint()?;
+        if count == 0 || count > self.options.max_iterations
+            || count > self.options.max_total_iterations - self.total.get() {
+            return Result::Err(error(ErrorKind::Limit, "benchmark iteration budget exhausted"))
+        }
+        self.total.set(self.total.get() + count);
+        let batch = (case.measure)(count, self.clock, self.control)?;
+        let _ = self.checkpoint()?;
+        self.checksum.set(self.checksum.get() ^ batch.checksum);
+        Result::Ok(batch)
+    }
+}
+
+fn next_iterations(current: u64, elapsed: i64, target: i64, options: Options) -> u64 {
+    if elapsed <= 0 {
+        if current > options.max_iterations / 2 {
+            return options.max_iterations
+        }
+        return current * 2
+    }
+    let desired = current.to_f64() * target.to_f64() / elapsed.to_f64();
+    if desired >= options.max_iterations.to_f64() {
+        return options.max_iterations
+    }
+    if desired <= options.min_iterations.to_f64() {
+        return options.min_iterations
+    }
+    let result = desired.try_to_u64().unwrap_or(options.max_iterations);
+    if result == 0 {
+        1
+    } else {
+        result
+    }
+}
+
+pub fn run(case: Case, options: Options) -> Result[Report, Error] {
+    run_with(case, options, Clock::monotonic(), context::Context::background())
+}
+
+pub fn run_with(case: Case, options: Options, clock: Clock, control: context::Context) -> Result[
+    Report,
+    Error,
+] {
+    options.validate()?;
+    if case.name == "" || case.group == "" || case.name.to_bytes().len() > 4096
+        || case.group.to_bytes().len() > 4096
+        || case.parameter.to_bytes().len() > 4096 {
+        return Result::Err(error(ErrorKind::Options, "invalid benchmark identity"))
+    }
+    match case.throughput {
+        Bytes(0) | Elements(0) => return Result::Err(
+            error(ErrorKind::Options, "zero throughput amount"),
+        ),
+        _ => (),
+    }
+    check_context(control)?;
+    let started = clock.now()?;
+    let state = RunState {
+        clock,
+        control,
+        started,
+        total: Ref::new(0),
+        checksum: Ref::new(0),
+        options,
+    };
+    let mut count = options.min_iterations;
+    let mut warmup_ns: i64 = 0;
+    let mut last = Batch { elapsed_ns: 0, checksum: 0 };
+    let mut rounds = 0;
+    loop {
+        last = state.measure(case, count)?;
+        if last.elapsed_ns > 9223372036854775807 - warmup_ns {
+            return Result::Err(error(ErrorKind::Limit, "warmup elapsed overflow"))
+        }
+        warmup_ns += last.elapsed_ns;
+        rounds += 1;
+        if last.elapsed_ns > 0 && warmup_ns >= options.warmup_ns {
+            break
+        }
+        if rounds >= 64 || (last.elapsed_ns == 0 && count == options.max_iterations) {
+            return Result::Err(
+                error(ErrorKind::Clock, "clock resolution cannot measure bounded workload"),
+            )
+        }
+        count = if count > options.max_iterations / 2 {
+            options.max_iterations
+        } else {
+            count * 2
+        };
+    }
+    let warmup_iterations = state.total.get();
+    let target = if options.measurement_ns / options.samples.to_i64() == 0 {
+        1
+    } else {
+        options.measurement_ns / options.samples.to_i64()
+    };
+    count = next_iterations(count, last.elapsed_ns, target, options);
+    let samples = Vec::with_capacity(options.samples);
+    for _ in 0..options.samples {
+        let batch = state.measure(case, count)?;
+        if batch.elapsed_ns <= 0 {
+            return Result::Err(error(ErrorKind::Clock, "measured sample has zero duration"))
+        }
+        samples.push(Sample { iterations: count, elapsed_ns: batch.elapsed_ns });
+        count = next_iterations(count, batch.elapsed_ns, target, options);
+    }
+    let statistics = analyze_with(samples, options, control)?;
+    let elapsed_wall_ns = state.checkpoint()? - started;
+    check_context(control)?;
+    Result::Ok(
+        Report {
+            group: case.group,
+            name: case.name,
+            parameter: case.parameter,
+            throughput: case.throughput,
+            timing: case.timing,
+            samples,
+            statistics,
+            warmup_iterations,
+            total_iterations: state.total.get(),
+            elapsed_wall_ns,
+            checksum: state.checksum.get(),
+            options,
+        },
+    )
+}
+
+pub fn run_suite(cases: Vec[Case], options: Options) -> Result[SuiteReport, Error] {
+    run_suite_with(cases, options, Clock::monotonic(), context::Context::background())
+}
+
+pub fn run_suite_with(cases: Vec[Case], options: Options, clock: Clock, control: context::Context) -> Result[
+    SuiteReport,
+    Error,
+] {
+    options.validate()?;
+    check_context(control)?;
+    if cases.len() > 1000 || cases.len().to_u64() * options.samples.to_u64() > 100000 {
+        return Result::Err(error(ErrorKind::Limit, "too many benchmark cases"))
+    }
+    let identities: HashMap[string, bool] = HashMap::new();
+    for case in cases {
+        let identity = case.group.len().to_string() + ":" + case.group + case.name.len().to_string()
+            + ":"
+            + case.name
+            + case.parameter;
+        if identities.get(identity).is_some() {
+            return Result::Err(error(ErrorKind::Options, "duplicate benchmark identity"))
+        }
+        identities.insert(identity, true);
+    }
+    let reports = Vec::new();
+    for case in cases {
+        reports.push(run_with(case, options, clock, control)?);
+    }
+    Result::Ok(SuiteReport { schema: 1, reports })
+}

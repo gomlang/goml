@@ -1,0 +1,202 @@
+package fuzzy;
+
+use std::context;
+use std::task;
+
+fn rank(left: Hit, right: Hit) -> isize {
+    if left.matched.score > right.matched.score {
+        -1
+    } else if left.matched.score < right.matched.score {
+        1
+    } else if left.index < right.index {
+        -1
+    } else if left.index > right.index {
+        1
+    } else {
+        0
+    }
+}
+
+fn retain(hits: Vec[Hit], hit: Hit, limit: isize) -> () {
+    if limit == 0 {
+        return;
+    }
+    if hits.len() == limit && rank(hit, hits[limit - 1]) >= 0 {
+        return;
+    }
+    let mut low = 0;
+    let mut high = hits.len();
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if rank(hit, hits[mid]) < 0 {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    hits.insert(low, hit);
+    if hits.len() > limit {
+        hits.truncate(limit);
+    }
+}
+
+impl Matcher {
+    pub fn search(
+        self: Matcher,
+        query: string,
+        values: Vec[string],
+        limit: isize,
+        ctx: context::Context,
+    ) -> Result[Report, Error] {
+        if limit < 0 || limit > self.options.max_results {
+            return Result::Err(Error::InvalidLimit);
+        }
+        check_context(ctx)?;
+        let session = Session::new_with(self, values, ctx)?;
+        let (_, report) = session.update(query, limit, ctx)?;
+        Result::Ok(report)
+    }
+
+    pub fn search_parallel(
+        self: Matcher,
+        query: string,
+        values: Vec[string],
+        limit: isize,
+        workers: isize,
+        ctx: context::Context,
+    ) -> Result[Report, Error] {
+        if limit < 0 || limit > self.options.max_results || workers < 1 || workers > 256 {
+            return Result::Err(Error::InvalidLimit);
+        }
+        check_context(ctx)?;
+        let pattern = self.pattern(query, MatchKind::Fuzzy)?;
+        let inputs = values.copy();
+        task::scope(
+            |scope| {
+                let tasks: Vec[task::Task[Result[Report, Error]]] = Vec::new();
+                for worker in 0..workers {
+                    tasks.push(
+                        scope.spawn(
+                            |_| {
+                                let hits = Vec::new();
+                                let mut index = worker;
+                                let mut total = 0;
+                                let mut scanned = 0;
+                                while index < inputs.len() {
+                                    check_context(ctx)?;
+                                    let candidate = self.prepare(inputs[index])?;
+                                    if let Some(matched) = self.match_prepared(
+                                        pattern,
+                                        candidate,
+                                        ctx,
+                                    )? {
+                                        total += 1;
+                                        retain(
+                                            hits,
+                                            Hit { index, text: candidate.value, matched },
+                                            limit,
+                                        );
+                                    }
+                                    scanned += 1;
+                                    index += workers;
+                                }
+                                Result::Ok(Report { hits, total, scanned })
+                            },
+                        ),
+                    );
+                }
+                let hits = Vec::new();
+                let mut total = 0;
+                let mut scanned = 0;
+                for job in tasks {
+                    let report = job.join()?;
+                    total += report.total;
+                    scanned += report.scanned;
+                    for hit in report.hits {
+                        retain(hits, hit, limit);
+                    }
+                }
+                check_context(ctx)?;
+                Result::Ok(Report { hits, total, scanned })
+            },
+        )
+    }
+}
+
+pub struct Session {
+    matcher: Matcher,
+    candidates: Vec[Candidate],
+    query: Option[Pattern],
+    eligible: Vec[isize],
+}
+
+impl Session {
+    pub fn new(matcher: Matcher, values: Vec[string]) -> Result[Session, Error] {
+        Session::new_with(matcher, values, context::Context::background())
+    }
+
+    pub fn new_with(matcher: Matcher, values: Vec[string], ctx: context::Context) -> Result[
+        Session,
+        Error,
+    ] {
+        check_context(ctx)?;
+        let candidates = Vec::new();
+        let eligible = Vec::new();
+        for value in values {
+            check_context(ctx)?;
+            eligible.push(candidates.len());
+            candidates.push(matcher.prepare(value)?);
+        }
+        Result::Ok(Session { matcher, candidates, query: Option::None, eligible })
+    }
+
+    pub fn len(self: Session) -> isize {
+        self.candidates.len()
+    }
+
+    pub fn update(self: Session, query: string, limit: isize, ctx: context::Context) -> Result[
+        (Session, Report),
+        Error,
+    ] {
+        if limit < 0 || limit > self.matcher.options.max_results {
+            return Result::Err(Error::InvalidLimit);
+        }
+        check_context(ctx)?;
+        let pattern = self.matcher.pattern(query, MatchKind::Fuzzy)?;
+        let narrow = match self.query {
+            Some(old) => pattern.sensitive == old.sensitive && query.starts_with(old.value),
+            None => false,
+        };
+        let indices = if narrow {
+            self.eligible
+        } else {
+            let all = Vec::new();
+            for index in 0..self.candidates.len() {
+                all.push(index);
+            }
+            all
+        };
+        let eligible = Vec::new();
+        let hits = Vec::new();
+        for index in indices {
+            let candidate = self.candidates[index];
+            if let Some(matched) = self.matcher.match_prepared(pattern, candidate, ctx)? {
+                eligible.push(index);
+                retain(hits, Hit { index, text: candidate.value, matched }, limit);
+            }
+        }
+        check_context(ctx)?;
+        let report = Report { hits, total: eligible.len(), scanned: indices.len() };
+        Result::Ok(
+            (
+                Session {
+                    matcher: self.matcher,
+                    candidates: self.candidates,
+                    query: Option::Some(pattern),
+                    eligible,
+                },
+                report,
+            ),
+        )
+    }
+}

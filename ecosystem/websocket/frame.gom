@@ -1,0 +1,197 @@
+package websocket;
+
+use std::bytes;
+
+pub fn encode_frame(frame: Frame, mask: Option[bytes::Bytes]) -> Result[bytes::Bytes, Error] {
+    if control(frame.opcode) && (!frame.final || frame.payload.len() > 125) {
+        return Result::Err(
+            error(ErrorKind::Protocol, "control frame must be final and at most 125 bytes"),
+        )
+    }
+    if let Some(key) = mask {
+        if key.len() != 4 {
+            return Result::Err(error(ErrorKind::InvalidInput, "mask must contain four bytes"))
+        }
+    }
+    let output = bytes::Bytes::new();
+    output.push(
+        opcode_byte(frame.opcode)
+            | if frame.final {
+                128
+            } else {
+                0
+            },
+    );
+    let flag: u8 = if mask.is_some() {
+        128
+    } else {
+        0
+    };
+    let length = frame.payload.len();
+    if length < 126 {
+        output.push(flag | length.to_u8());
+    } else if length <= 65535 {
+        output.push(flag | 126);
+        output.push((length >> 8).to_u8());
+        output.push(length.to_u8());
+    } else {
+        output.push(flag | 127);
+        for index in 0..8 {
+            output.push((length.to_u64() >> ((7 - index) * 8)).to_u8());
+        }
+    }
+    if let Some(key) = mask {
+        output.extend_from_slice(key.as_slice());
+    }
+    for index in 0..length {
+        output.push(frame.payload.get(index) ^ mask.map(|key| key.get(index % 4)).unwrap_or(0));
+    }
+    Result::Ok(output)
+}
+
+pub struct Decoder {
+    role: Role,
+    limits: Limits,
+    buffer: Ref[bytes::Bytes],
+    offset: Ref[isize],
+    failed: Ref[bool],
+}
+
+impl Decoder {
+    pub fn new(role: Role, limits: Limits) -> Result[Decoder, Error] {
+        limits.validate()?;
+        Result::Ok(
+            Decoder {
+                role,
+                limits,
+                buffer: Ref::new(bytes::Bytes::new()),
+                offset: Ref::new(0),
+                failed: Ref::new(false),
+            },
+        )
+    }
+
+    pub fn buffered(self: Decoder) -> isize {
+        self.buffer.get().len() - self.offset.get()
+    }
+
+    pub fn push(self: Decoder, input: Slice[u8]) -> Result[(), Error] {
+        if self.failed.get() {
+            return Result::Err(error(ErrorKind::Closed, "decoder failed"))
+        }
+        if input.len() > self.limits.buffered_bytes - self.buffered() {
+            return Result::Err(
+                error(
+                    ErrorKind::Backpressure,
+                    "input buffer limit; drain decoded frames before feeding more",
+                ),
+            )
+        }
+        if self.offset.get() > 0 {
+            let current = self.buffer.get();
+            self.buffer.set(
+                bytes::Bytes::from_slice_copy(current.slice(self.offset.get(), current.len())),
+            );
+            self.offset.set(0);
+        }
+        self.buffer.get().extend_from_slice(input);
+        Result::Ok(())
+    }
+
+    pub fn next(self: Decoder) -> Result[Option[Frame], Error] {
+        if self.failed.get() {
+            return Result::Err(error(ErrorKind::Closed, "decoder failed"))
+        }
+        match self.decode() {
+            Ok(value) => Result::Ok(value),
+            Err(problem) => {
+                self.failed.set(true);
+                Result::Err(problem)
+            },
+        }
+    }
+
+    fn decode(self: Decoder) -> Result[Option[Frame], Error] {
+        let data = self.buffer.get();
+        let start = self.offset.get();
+        if self.buffered() < 2 {
+            return Result::Ok(Option::None)
+        }
+        let first = data.get(start);
+        if (first & 112) != 0 {
+            return Result::Err(
+                error(ErrorKind::Protocol, "RSV bits require a negotiated extension"),
+            )
+        }
+        let kind = opcode(first & 15)?;
+        let final = (first & 128) != 0;
+        let masked = (data.get(start + 1) & 128) != 0;
+        if masked != (self.role == Role::Server) {
+            return Result::Err(error(ErrorKind::Protocol, "incorrect masking direction"))
+        }
+        let short = data.get(start + 1) & 127;
+        if control(kind) && (!final || short > 125) {
+            return Result::Err(error(ErrorKind::Protocol, "invalid control frame"))
+        }
+        let extended = if short == 126 {
+            2
+        } else if short == 127 {
+            8
+        } else {
+            0
+        };
+        if self.buffered() < 2 + extended {
+            return Result::Ok(Option::None)
+        }
+        let mut length = short.to_u64();
+        if extended != 0 {
+            length = 0;
+            for index in 0..extended {
+                length = (length << 8) | data.get(start + 2 + index).to_u64();
+            }
+            if (extended == 8 && (data.get(start + 2) & 128) != 0) || length < 126
+                || (extended == 8 && length <= 65535) {
+                return Result::Err(
+                    error(ErrorKind::Protocol, "noncanonical or signed frame length"),
+                )
+            }
+        }
+        if length > self.limits.frame_bytes.to_u64() {
+            return Result::Err(error(ErrorKind::Limit, "frame exceeds byte limit"))
+        }
+        let header = 2 + extended
+            + if masked {
+                4
+            } else {
+                0
+            };
+        if self.buffered() < header + length.to_isize() {
+            return Result::Ok(Option::None)
+        }
+        let payload = bytes::Bytes::with_capacity(length.to_isize());
+        for index in 0..length.to_isize() {
+            let mask = if masked {
+                data.get(start + 2 + extended + index % 4)
+            } else {
+                0
+            };
+            payload.push(data.get(start + header + index) ^ mask);
+        }
+        self.offset.set(start + header + length.to_isize());
+        if self.offset.get() == data.len() {
+            self.buffer.set(bytes::Bytes::new());
+            self.offset.set(0);
+        }
+        Result::Ok(Option::Some(Frame { final, opcode: kind, payload }))
+    }
+
+    pub fn finish(self: Decoder) -> Result[(), Error] {
+        if self.failed.get() {
+            Result::Err(error(ErrorKind::Closed, "decoder failed"))
+        } else if self.buffered() != 0 {
+            Result::Err(error(ErrorKind::UnexpectedEof, "incomplete WebSocket frame"))
+        } else {
+            Result::Ok(())
+        }
+    }
+}

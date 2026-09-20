@@ -1,0 +1,206 @@
+package archive;
+
+use std::bytes;
+use std::ffi;
+use std::io;
+use io::{Read, Write, Close};
+use std::os::linux::fd;
+
+#[derive(Debug, PartialEq)]
+pub enum LinkPolicy {
+    Reject,
+    Skip,
+}
+
+pub struct ExtractOptions {
+    pub limits: Limits,
+    pub links: LinkPolicy,
+    pub preserve_permissions: bool,
+}
+
+impl ExtractOptions {
+    pub fn standard() -> ExtractOptions {
+        ExtractOptions {
+            limits: Limits::standard(),
+            links: LinkPolicy::Reject,
+            preserve_permissions: false,
+        }
+    }
+}
+
+#[go_type("example.com/goml-ecosystem/archive/adapter", "Root")]
+extern type NativeRoot;
+
+#[go_ffi("example.com/goml-ecosystem/archive/adapter", "OpenRoot")]
+extern fn open_root(path: ffi::String) -> (NativeRoot, ffi::String);
+
+#[go_ffi("example.com/goml-ecosystem/archive/adapter", "CloseRoot")]
+extern fn close_root(root: NativeRoot) -> ();
+
+#[go_ffi("example.com/goml-ecosystem/archive/adapter", "Mkdir")]
+extern fn root_mkdir(root: NativeRoot, path: ffi::String) -> ffi::String;
+
+#[go_ffi("example.com/goml-ecosystem/archive/adapter", "WriteFile")]
+extern fn root_write(root: NativeRoot, path: ffi::String, data: ffi::RawSlice[byte], mode: u32) -> ffi::String;
+
+fn filesystem_result(value: ffi::String) -> Result[(), Error] {
+    let message = ffi::string_text(value).unwrap_or("invalid filesystem error");
+    if message != "" {
+        Result::Err(failure(ErrorKind::Io, 0, message))
+    } else {
+        Result::Ok(())
+    }
+}
+
+pub fn safe_path(path: string, limit: isize) -> Result[string, Error] {
+    if path == "" || path.to_bytes().len() > limit || path.starts_with("/") || path.contains("\\")
+        || path.contains(":")
+        || path.contains("\u0000") {
+        return Result::Err(failure(ErrorKind::Path, 0, "unsafe extraction path"))
+    }
+    let parts = path.split("/");
+    let mut result = "";
+    for index in 0..parts.len() {
+        let component = parts[index];
+        if component == "" && index == parts.len() - 1 {
+            continue
+        }
+        if component == "" || component == "." || component == ".." {
+            return Result::Err(failure(ErrorKind::Path, 0, "unsafe extraction path component"))
+        }
+        if result != "" {
+            result += "/";
+        }
+        result += component;
+    }
+    if result == "" {
+        return Result::Err(failure(ErrorKind::Path, 0, "empty extraction path"))
+    }
+    Result::Ok(result)
+}
+
+pub fn extract(entries: Vec[Entry], destination: string, options: ExtractOptions) -> Result[
+    isize,
+    Error,
+] {
+    options.limits.validate()?;
+    if entries.len() > options.limits.max_entries {
+        return Result::Err(failure(ErrorKind::Limit, 0, "extraction entry limit"))
+    }
+    let names: HashMap[string, EntryKind] = HashMap::new();
+    let paths = Vec::new();
+    let mut total = 0;
+    for entry in entries {
+        validate_entry(entry, options.limits)?;
+        let name = safe_path(entry.header.path, options.limits.max_path_bytes)?;
+        if names.get(name).is_some() {
+            return Result::Err(failure(ErrorKind::Path, 0, "duplicate extraction path"))
+        }
+        names.insert(name, entry.header.kind);
+        paths.push(name);
+        if entry.data.len() > options.limits.max_total_bytes - total {
+            return Result::Err(failure(ErrorKind::Limit, 0, "extraction size limit"))
+        }
+        total += entry.data.len();
+        if options.links == LinkPolicy::Reject
+            && (entry.header.kind == EntryKind::Symlink || entry.header.kind == EntryKind::Hardlink) {
+            return Result::Err(
+                failure(ErrorKind::Path, 0, "archive links rejected by extraction policy"),
+            )
+        }
+    }
+    for name in paths {
+        let components = name.split("/");
+        let mut prefix = "";
+        for index in 0..components.len() - 1 {
+            if prefix != "" {
+                prefix += "/";
+            }
+            prefix += components[index];
+            if let Some(kind) = names.get(prefix) {
+                if kind != EntryKind::Directory {
+                    return Result::Err(
+                        failure(ErrorKind::Path, 0, "non-directory archive entry is a parent path"),
+                    )
+                }
+            }
+        }
+    }
+    let (root, error) = open_root(ffi::string_from_text(destination));
+    filesystem_result(error)?;
+    defer close_root(root);
+    let mut written = 0;
+    for index in 0..entries.len() {
+        let entry = entries[index];
+        if entry.header.kind == EntryKind::Symlink || entry.header.kind == EntryKind::Hardlink {
+            continue
+        }
+        let name = paths[index];
+        let components = name.split("/");
+        let mut prefix = "";
+        let directory_count = if entry.header.kind == EntryKind::Directory {
+            components.len()
+        } else {
+            components.len() - 1
+        };
+        for component_index in 0..directory_count {
+            if prefix != "" {
+                prefix += "/";
+            }
+            prefix += components[component_index];
+            filesystem_result(root_mkdir(root, ffi::string_from_text(prefix)))?;
+        }
+        if entry.header.kind == EntryKind::File {
+            let mode = if options.preserve_permissions {
+                entry.header.mode & 0o777
+            } else {
+                0o644
+            };
+            filesystem_result(
+                root_write(
+                    root,
+                    ffi::string_from_text(name),
+                    ffi::slice_shared(entry.data.to_vec()),
+                    mode,
+                ),
+            )?;
+        }
+        written += 1;
+    }
+    Result::Ok(written)
+}
+
+pub fn read_file(path: string, limit: isize) -> Result[bytes::Bytes, Error] {
+    if limit < 0 {
+        return Result::Err(failure(ErrorKind::Limit, 0, "negative file limit"))
+    }
+    let file = fd::open(path, fd::O_RDONLY, 0).map_err(
+        |error| failure(ErrorKind::Io, 0, error.to_string()),
+    )?;
+    defer {
+        let _ = file.close();
+    };
+    file.read_to_end(limit).map_err(|error| failure(ErrorKind::Io, 0, error.to_string()))
+}
+
+pub fn write_file(path: string, data: bytes::Bytes) -> Result[(), Error] {
+    let file = fd::open(path, fd::O_WRONLY | fd::O_CREAT | fd::O_EXCL, 0o644).map_err(
+        |error| failure(ErrorKind::Io, 0, error.to_string()),
+    )?;
+    defer {
+        let _ = file.close();
+    };
+    file.write_all(data.as_slice()).map_err(|error| failure(ErrorKind::Io, 0, error.to_string()))
+}
+
+pub fn open_zip(path: string, limits: Limits) -> Result[ZipArchive, Error] {
+    ZipArchive::open(read_file(path, limits.max_archive_bytes)?, limits)
+}
+
+pub fn open_tar(path: string, limits: Limits) -> Result[Vec[Entry], Error] {
+    decode_tar(read_file(path, limits.max_archive_bytes)?, limits)
+}
+
+pub fn open_tar_gz(path: string, limits: Limits) -> Result[Vec[Entry], Error] {
+    decode_tar_gz(read_file(path, limits.max_archive_bytes)?, limits)
+}

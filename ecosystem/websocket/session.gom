@@ -1,0 +1,379 @@
+package websocket;
+
+use std::bytes;
+use std::crypto::rand;
+use std::utf8;
+
+pub fn valid_close_code(code: u16) -> bool {
+    (code >= 1000 && code <= 1014 && code != 1004 && code != 1005 && code != 1006)
+        || (code >= 3000 && code <= 4999)
+}
+
+fn close_payload(value: Option[CloseFrame]) -> Result[bytes::Bytes, Error] {
+    let output = bytes::Bytes::new();
+    if let Some(close) = value {
+        if !valid_close_code(close.code) {
+            return Result::Err(error(ErrorKind::Protocol, "invalid close status code"))
+        }
+        let reason = close.reason.to_bytes();
+        if reason.len() > 123 {
+            return Result::Err(error(ErrorKind::Limit, "close reason exceeds 123 bytes"))
+        }
+        output.push((close.code >> 8).to_u8());
+        output.push(close.code.to_u8());
+        output.extend_from_slice(reason.as_slice());
+    }
+    Result::Ok(output)
+}
+
+fn decode_close(payload: bytes::Bytes) -> Result[Option[CloseFrame], Error] {
+    if payload.len() == 0 {
+        return Result::Ok(Option::None)
+    }
+    if payload.len() == 1 {
+        return Result::Err(
+            error(ErrorKind::Protocol, "close payload must be empty or include a status code"),
+        )
+    }
+    let code = (payload.get(0).to_u16() << 8) | payload.get(1).to_u16();
+    if !valid_close_code(code) {
+        return Result::Err(error(ErrorKind::Protocol, "invalid close status code"))
+    }
+    let reason = utf8::decode_slice(payload.slice(2, payload.len())).map_err(
+        |_| error(ErrorKind::Utf8, "invalid close reason UTF-8"),
+    )?;
+    Result::Ok(Option::Some(CloseFrame { code, reason }))
+}
+
+pub struct Session {
+    role: Role,
+    limits: Limits,
+    decoder: Decoder,
+    state_value: Ref[State],
+    fragments: Ref[bytes::Bytes],
+    fragment_kind: Ref[Option[Opcode]],
+    pending: Ref[Option[Frame]],
+    output: Ref[Vec[bytes::Bytes]],
+    output_offset: Ref[isize],
+    output_bytes: Ref[isize],
+}
+
+impl Session {
+    pub fn new(role: Role, limits: Limits) -> Result[Session, Error] {
+        Result::Ok(
+            Session {
+                role,
+                limits,
+                decoder: Decoder::new(role, limits)?,
+                state_value: Ref::new(State::Open),
+                fragments: Ref::new(bytes::Bytes::new()),
+                fragment_kind: Ref::new(Option::None),
+                pending: Ref::new(Option::None),
+                output: Ref::new(Vec::new()),
+                output_offset: Ref::new(0),
+                output_bytes: Ref::new(0),
+            },
+        )
+    }
+
+    pub fn state(self: Session) -> State {
+        self.state_value.get()
+    }
+
+    pub fn queued_bytes(self: Session) -> isize {
+        self.output_bytes.get()
+    }
+
+    pub fn queued_frames(self: Session) -> isize {
+        self.output.get().len()
+    }
+
+    pub fn buffered_bytes(self: Session) -> isize {
+        self.decoder.buffered()
+    }
+
+    pub fn feed(self: Session, data: Slice[u8]) -> Result[(), Error] {
+        if self.state() == State::Closed || self.state() == State::Failed
+            || self.state() == State::CloseReceived {
+            return Result::Err(error(ErrorKind::Closed, "connection no longer accepts input"))
+        }
+        self.decoder.push(data)
+    }
+
+    fn encode(self: Session, frame: Frame) -> Result[bytes::Bytes, Error] {
+        let mask = if self.role == Role::Client {
+            Option::Some(rand::bytes(4).map_err(|message| error(ErrorKind::Io, message))?)
+        } else {
+            Option::None
+        };
+        encode_frame(frame, mask)
+    }
+
+    fn queue(self: Session, frames: Vec[bytes::Bytes]) -> Result[(), Error] {
+        let mut length = 0;
+        for frame in frames {
+            if frame.len() > self.limits.queued_bytes - length {
+                return Result::Err(
+                    error(ErrorKind::Backpressure, "message exceeds output queue capacity"),
+                )
+            }
+            length += frame.len();
+        }
+        if frames.len() > self.limits.queued_frames - self.queued_frames()
+            || length > self.limits.queued_bytes - self.queued_bytes() {
+            return Result::Err(
+                error(ErrorKind::Backpressure, "output queue full; flush before retrying"),
+            )
+        }
+        for frame in frames {
+            self.output.get().push(frame);
+        }
+        self.output_bytes.set(self.queued_bytes() + length);
+        Result::Ok(())
+    }
+
+    pub fn send(self: Session, message: Message) -> Result[(), Error] {
+        self.send_fragmented(message, self.limits.frame_bytes)
+    }
+
+    pub fn send_fragmented(self: Session, message: Message, fragment_bytes: isize) -> Result[
+        (),
+        Error,
+    ] {
+        if self.state() != State::Open {
+            return Result::Err(error(ErrorKind::Closed, "cannot send after starting close"))
+        }
+        if fragment_bytes < 1 || fragment_bytes > self.limits.frame_bytes {
+            return Result::Err(error(ErrorKind::InvalidInput, "invalid fragment size"))
+        }
+        let (kind, payload) = match message {
+            Text(value) => (Opcode::Text, bytes::Bytes::from_string(value)),
+            Binary(value) => (Opcode::Binary, value),
+            Ping(value) => (Opcode::Ping, value),
+            Pong(value) => (Opcode::Pong, value),
+            Close(value) => (Opcode::Close, close_payload(value)?),
+        };
+        if payload.len() > self.limits.message_bytes {
+            return Result::Err(error(ErrorKind::Limit, "message exceeds byte limit"))
+        }
+        if control(kind) && payload.len() > 125 {
+            return Result::Err(error(ErrorKind::Protocol, "control payload exceeds 125 bytes"))
+        }
+        let size = if control(kind) {
+            125
+        } else {
+            fragment_bytes
+        };
+        let count = if payload.len() == 0 {
+            1
+        } else {
+            (payload.len() - 1) / size + 1
+        };
+        let overhead = if self.role == Role::Client {
+            6
+        } else {
+            2
+        };
+        if count > self.limits.queued_frames - self.queued_frames()
+            || payload.len() > self.limits.queued_bytes - self.queued_bytes()
+            || count > (self.limits.queued_bytes - self.queued_bytes() - payload.len()) / overhead {
+            return Result::Err(
+                error(ErrorKind::Backpressure, "message exceeds available output queue"),
+            )
+        }
+        let frames = Vec::new();
+        for index in 0..count {
+            let start = index * size;
+            let end = if payload.len() - start > size {
+                start + size
+            } else {
+                payload.len()
+            };
+            frames.push(
+                self.encode(
+                    Frame {
+                        final: index == count - 1,
+                        opcode: if index == 0 {
+                            kind
+                        } else {
+                            Opcode::Continuation
+                        },
+                        payload: bytes::Bytes::from_slice_copy(payload.slice(start, end)),
+                    },
+                )?,
+            );
+        }
+        self.queue(frames)?;
+        if kind == Opcode::Close {
+            self.state_value.set(State::CloseSent);
+        }
+        Result::Ok(())
+    }
+
+    pub fn output(self: Session) -> Option[bytes::Bytes] {
+        if self.output.get().len() == 0 {
+            Option::None
+        } else {
+            let frame = self.output.get()[0];
+            Option::Some(
+                bytes::Bytes::from_slice_copy(frame.slice(self.output_offset.get(), frame.len())),
+            )
+        }
+    }
+
+    pub fn consume_output(self: Session, count: isize) -> Result[(), Error] {
+        if self.output.get().len() == 0 {
+            if count == 0 {
+                return Result::Ok(())
+            }
+            return Result::Err(error(ErrorKind::InvalidInput, "no output to consume"))
+        }
+        let first = self.output.get()[0];
+        if count < 0 || count > first.len() - self.output_offset.get() {
+            return Result::Err(error(ErrorKind::InvalidInput, "invalid output consumption"))
+        }
+        self.output_offset.set(self.output_offset.get() + count);
+        self.output_bytes.set(self.queued_bytes() - count);
+        if self.output_offset.get() == first.len() {
+            let next = Vec::new();
+            let old = self.output.get();
+            for index in 1..old.len() {
+                next.push(old[index]);
+            }
+            self.output.set(next);
+            self.output_offset.set(0);
+        }
+        if self.queued_frames() == 0 && self.state() == State::CloseReceived {
+            self.state_value.set(State::Closed);
+        }
+        Result::Ok(())
+    }
+
+    pub fn next(self: Session) -> Result[Option[Message], Error] {
+        if self.state() == State::Failed {
+            return Result::Err(error(ErrorKind::Closed, "session failed"))
+        }
+        if self.state() == State::Closed || self.state() == State::CloseReceived {
+            return Result::Ok(Option::None)
+        }
+        loop {
+            let frame = match self.pending.get() {
+                Some(frame) => frame,
+                None => match self.decoder.next() {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => return Result::Ok(Option::None),
+                    Err(problem) => {
+                        self.state_value.set(State::Failed);
+                        return Result::Err(problem)
+                    },
+                },
+            };
+            match self.process(frame) {
+                Ok(value) => {
+                    self.pending.set(Option::None);
+                    if value.is_some() {
+                        return Result::Ok(value)
+                    }
+                },
+                Err(problem) => {
+                    if problem.kind == ErrorKind::Backpressure {
+                        self.pending.set(Option::Some(frame));
+                    } else {
+                        self.state_value.set(State::Failed);
+                    }
+                    return Result::Err(problem)
+                },
+            }
+        }
+    }
+
+    fn process(self: Session, frame: Frame) -> Result[Option[Message], Error] {
+        if frame.opcode == Opcode::Ping {
+            self.queue(
+                Vec::from_array(
+                    [
+                        self.encode(
+                            Frame { final: true, opcode: Opcode::Pong, payload: frame.payload },
+                        )?,
+                    ],
+                ),
+            )?;
+            return Result::Ok(Option::Some(Message::Ping(frame.payload)))
+        }
+        if frame.opcode == Opcode::Pong {
+            return Result::Ok(Option::Some(Message::Pong(frame.payload)))
+        }
+        if frame.opcode == Opcode::Close {
+            let value = decode_close(frame.payload)?;
+            if self.state() == State::Open {
+                self.queue(
+                    Vec::from_array(
+                        [
+                            self.encode(
+                                Frame { final: true, opcode: Opcode::Close, payload: frame.payload },
+                            )?,
+                        ],
+                    ),
+                )?;
+            }
+            self.state_value.set(
+                if self.queued_frames() == 0 {
+                    State::Closed
+                } else {
+                    State::CloseReceived
+                },
+            );
+            self.fragments.set(bytes::Bytes::new());
+            self.fragment_kind.set(Option::None);
+            return Result::Ok(Option::Some(Message::Close(value)))
+        }
+        let kind = if frame.opcode == Opcode::Continuation {
+            self.fragment_kind.get().ok_or(
+                error(ErrorKind::Protocol, "continuation without an unfinished message"),
+            )?
+        } else {
+            if self.fragment_kind.get().is_some() {
+                return Result::Err(
+                    error(ErrorKind::Protocol, "new data frame interrupts a fragmented message"),
+                )
+            }
+            frame.opcode
+        };
+        if frame.payload.len() > self.limits.message_bytes - self.fragments.get().len() {
+            return Result::Err(error(ErrorKind::Limit, "fragmented message exceeds byte limit"))
+        }
+        self.fragments.get().extend_from_slice(frame.payload.as_slice());
+        if !frame.final {
+            self.fragment_kind.set(Option::Some(kind));
+            return Result::Ok(Option::None)
+        }
+        let data = self.fragments.get();
+        self.fragments.set(bytes::Bytes::new());
+        self.fragment_kind.set(Option::None);
+        let message = if kind == Opcode::Text {
+            Message::Text(
+                utf8::decode(data.to_vec()).map_err(
+                    |_| error(ErrorKind::Utf8, "invalid text message UTF-8"),
+                )?,
+            )
+        } else {
+            Message::Binary(data)
+        };
+        Result::Ok(Option::Some(message))
+    }
+
+    pub fn finish(self: Session) -> Result[(), Error] {
+        self.decoder.finish()?;
+        if self.state() != State::Closed {
+            self.state_value.set(State::Failed);
+            Result::Err(
+                error(
+                    ErrorKind::UnexpectedEof,
+                    "transport ended without a complete closing handshake",
+                ),
+            )
+        } else {
+            Result::Ok(())
+        }
+    }
+}

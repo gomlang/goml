@@ -1,0 +1,378 @@
+package csv;
+
+use std::bytes;
+use std::io;
+use std::utf8;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Position {
+    pub byte: isize,
+    pub record: isize,
+    pub line: isize,
+    pub column: isize,
+}
+
+impl Position {
+    pub fn start() -> Position {
+        Position { byte: 0, record: 1, line: 1, column: 1 }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ErrorKind {
+    Options,
+    Syntax,
+    Limit,
+    Width,
+    Header,
+    Utf8,
+    Type,
+    Io,
+}
+
+pub struct Error {
+    pub kind: ErrorKind,
+    pub position: Position,
+    pub field: Option[isize],
+    pub message: string,
+    pub cause: Option[io::Error],
+}
+
+impl ToString for Error {
+    fn to_string(self: Error) -> string {
+        self.kind.debug() + " at byte " + self.position.byte.to_string() + ", record "
+            + self.position.record.to_string()
+            + ", line "
+            + self.position.line.to_string()
+            + ", column "
+            + self.position.column.to_string()
+            + ": "
+            + self.message
+    }
+}
+
+impl Debug for Error {
+    fn debug(self: Error) -> string {
+        self.to_string()
+    }
+}
+
+fn error(kind: ErrorKind, position: Position, field: Option[isize], message: string) -> Error {
+    Error { kind, position, field, message, cause: Option::None }
+}
+
+fn io_error(position: Position, cause: io::Error) -> Error {
+    Error {
+        kind: ErrorKind::Io,
+        position,
+        field: Option::None,
+        message: cause.to_string(),
+        cause: Option::Some(cause),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Terminator {
+    Any,
+    CrLf,
+    Byte(byte),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum HeaderPolicy {
+    Reject,
+    First,
+    Last,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum QuoteStyle {
+    Necessary,
+    Always,
+    Never,
+}
+
+#[derive(Debug)]
+pub struct Limits {
+    pub max_field_bytes: isize,
+    pub max_record_bytes: isize,
+    pub max_columns: isize,
+    pub max_records: isize,
+    pub max_total_bytes: isize,
+}
+
+impl Limits {
+    pub fn new() -> Limits {
+        Limits {
+            max_field_bytes: 1048576,
+            max_record_bytes: 8388608,
+            max_columns: 4096,
+            max_records: 1000000,
+            max_total_bytes: 1073741824,
+        }
+    }
+
+    fn validate(self: Limits) -> Result[(), Error] {
+        if self.max_field_bytes < 0 || self.max_record_bytes < 1 || self.max_columns < 1
+            || self.max_records < 0
+            || self.max_total_bytes < 0 {
+            Result::Err(
+                error(ErrorKind::Options, Position::start(), Option::None, "invalid CSV limits"),
+            )
+        } else {
+            Result::Ok(())
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ReadOptions {
+    pub delimiter: byte,
+    pub quote: byte,
+    pub terminator: Terminator,
+    pub strict: bool,
+    pub flexible: bool,
+    pub headers: bool,
+    pub duplicate_headers: HeaderPolicy,
+    pub strip_bom: bool,
+    pub skip_blank: bool,
+    pub trim: bool,
+    pub buffer_size: isize,
+    pub limits: Limits,
+}
+
+impl ReadOptions {
+    pub fn new() -> ReadOptions {
+        ReadOptions {
+            delimiter: 44,
+            quote: 34,
+            terminator: Terminator::Any,
+            strict: true,
+            flexible: false,
+            headers: false,
+            duplicate_headers: HeaderPolicy::Reject,
+            strip_bom: true,
+            skip_blank: false,
+            trim: false,
+            buffer_size: 8192,
+            limits: Limits::new(),
+        }
+    }
+
+    fn validate(self: ReadOptions) -> Result[(), Error] {
+        self.limits.validate()?;
+        validate_dialect(self.delimiter, self.quote, self.terminator)?;
+        if self.buffer_size < 1 || self.buffer_size > 1048576 {
+            return Result::Err(
+                error(
+                    ErrorKind::Options,
+                    Position::start(),
+                    Option::None,
+                    "buffer size must be between 1 and 1048576",
+                ),
+            )
+        }
+        Result::Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct WriteOptions {
+    pub delimiter: byte,
+    pub quote: byte,
+    pub terminator: Terminator,
+    pub quoting: QuoteStyle,
+    pub flexible: bool,
+    pub headers: bool,
+    pub emit_bom: bool,
+    pub limits: Limits,
+}
+
+impl WriteOptions {
+    pub fn new() -> WriteOptions {
+        WriteOptions {
+            delimiter: 44,
+            quote: 34,
+            terminator: Terminator::CrLf,
+            quoting: QuoteStyle::Necessary,
+            flexible: false,
+            headers: false,
+            emit_bom: false,
+            limits: Limits::new(),
+        }
+    }
+
+    fn validate(self: WriteOptions) -> Result[(), Error] {
+        self.limits.validate()?;
+        validate_dialect(self.delimiter, self.quote, self.terminator)
+    }
+}
+
+fn validate_dialect(delimiter: byte, quote: byte, terminator: Terminator) -> Result[(), Error] {
+    let invalid = delimiter == quote || delimiter > 127 || quote > 127 || delimiter == 10
+        || delimiter == 13
+        || quote == 10
+        || quote == 13;
+    let conflict = match terminator {
+        Terminator::Byte(value) => value == delimiter || value == quote || value > 127,
+        _ => false,
+    };
+    if invalid || conflict {
+        Result::Err(
+            error(
+                ErrorKind::Options,
+                Position::start(),
+                Option::None,
+                "delimiter, quote and terminator must be distinct ASCII bytes; delimiter and quote cannot be newlines",
+            ),
+        )
+    } else {
+        Result::Ok(())
+    }
+}
+
+struct Field {
+    data: Vec[byte],
+    raw: Vec[byte],
+    position: Position,
+}
+
+pub struct ByteRecord {
+    fields: Vec[Field],
+    position: Position,
+}
+
+impl ByteRecord {
+    pub fn new(values: Vec[bytes::Bytes]) -> ByteRecord {
+        let fields = Vec::new();
+        for value in values {
+            let data = value.to_vec().copy();
+            fields.push(Field { data, raw: data, position: Position::start() });
+        }
+        ByteRecord { fields, position: Position::start() }
+    }
+
+    pub fn len(self: ByteRecord) -> isize {
+        self.fields.len()
+    }
+
+    pub fn get(self: ByteRecord, index: isize) -> Option[bytes::Bytes] {
+        if index < 0 || index >= self.fields.len() {
+            Option::None
+        } else {
+            Option::Some(bytes::Bytes::from_vec(self.fields[index].data.copy()))
+        }
+    }
+
+    pub fn position(self: ByteRecord) -> Position {
+        self.position
+    }
+
+    pub fn field_position(self: ByteRecord, index: isize) -> Option[Position] {
+        if index < 0 || index >= self.fields.len() {
+            Option::None
+        } else {
+            Option::Some(self.fields[index].position)
+        }
+    }
+
+    pub fn strings(self: ByteRecord) -> Result[StringRecord, Error] {
+        let values = Vec::new();
+        let positions = Vec::new();
+        for index in 0..self.fields.len() {
+            let field = self.fields[index];
+            if let Err(invalid) = utf8::validate(field.raw.as_slice()) {
+                let position = advance(field.position, field.raw, invalid.valid_up_to());
+                return Result::Err(
+                    error(ErrorKind::Utf8, position, Option::Some(index), invalid.to_string()),
+                )
+            }
+            let value = utf8::decode(field.data.copy()).map_err(
+                |invalid| error(
+                    ErrorKind::Utf8,
+                    field.position,
+                    Option::Some(index),
+                    invalid.to_string(),
+                ),
+            )?;
+            values.push(value);
+            positions.push(field.position);
+        }
+        Result::Ok(StringRecord { values, positions, position: self.position })
+    }
+}
+
+pub struct StringRecord {
+    values: Vec[string],
+    positions: Vec[Position],
+    position: Position,
+}
+
+impl StringRecord {
+    pub fn new(values: Vec[string]) -> StringRecord {
+        let positions = Vec::new();
+        for _ in 0..values.len() {
+            positions.push(Position::start());
+        }
+        StringRecord { values: values.copy(), positions, position: Position::start() }
+    }
+
+    pub fn len(self: StringRecord) -> isize {
+        self.values.len()
+    }
+
+    pub fn get(self: StringRecord, index: isize) -> Option[string] {
+        if index < 0 || index >= self.values.len() {
+            Option::None
+        } else {
+            Option::Some(self.values[index])
+        }
+    }
+
+    pub fn values(self: StringRecord) -> Vec[string] {
+        self.values.copy()
+    }
+
+    pub fn position(self: StringRecord) -> Position {
+        self.position
+    }
+
+    pub fn field_position(self: StringRecord, index: isize) -> Option[Position] {
+        if index < 0 || index >= self.positions.len() {
+            Option::None
+        } else {
+            Option::Some(self.positions[index])
+        }
+    }
+
+    pub fn bytes(self: StringRecord) -> ByteRecord {
+        let fields = Vec::new();
+        for index in 0..self.values.len() {
+            let data = utf8::encode(self.values[index]);
+            fields.push(Field { data, raw: data, position: self.positions[index] });
+        }
+        ByteRecord { fields, position: self.position }
+    }
+}
+
+fn advance(position: Position, data: Vec[byte], length: isize) -> Position {
+    let mut result = position;
+    let mut cr = false;
+    for index in 0..length {
+        let value = data[index];
+        result.byte += 1;
+        if value == 13 {
+            result.line += 1;
+            result.column = 1;
+        } else if value == 10 {
+            if !cr {
+                result.line += 1;
+            }
+            result.column = 1;
+        } else {
+            result.column += 1;
+        }
+        cr = value == 13;
+    }
+    result
+}

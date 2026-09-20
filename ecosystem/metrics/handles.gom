@@ -1,0 +1,243 @@
+package metrics;
+
+use std::context;
+use std::math;
+use std::num::{ToFloat};
+use std::time;
+
+pub struct Counter {
+    registry: Registry,
+    cell: Cell,
+}
+
+impl Counter {
+    pub fn get(self: Counter) -> Result[u64, Error] {
+        self.registry.lock();
+        defer self.registry.unlock();
+        attached(self.cell)?;
+        match self.cell.value.get() {
+            Counter(value) => Result::Ok(value),
+            _ => Result::Err(error(ErrorKind::Conflict, "counter handle mismatch")),
+        }
+    }
+
+    pub fn increment(self: Counter) -> Result[(), Error] {
+        self.add(1)
+    }
+
+    pub fn add(self: Counter, amount: u64) -> Result[(), Error] {
+        self.registry.lock();
+        defer self.registry.unlock();
+        self.add_locked(amount)
+    }
+
+    pub fn add_with(self: Counter, amount: u64, ctx: context::Context) -> Result[(), Error] {
+        self.registry.acquire(ctx)?;
+        defer self.registry.unlock();
+        self.add_locked(amount)
+    }
+
+    fn add_locked(self: Counter, amount: u64) -> Result[(), Error] {
+        attached(self.cell)?;
+        let Value::Counter(value) = self.cell.value.get() else {
+            return Result::Err(error(ErrorKind::Conflict, "counter handle mismatch"))
+        };
+        if amount > 18446744073709551615 - value {
+            return Result::Err(error(ErrorKind::Overflow, "counter overflow"))
+        }
+        self.cell.value.set(Value::Counter(value + amount));
+        Result::Ok(())
+    }
+
+    pub fn absolute(self: Counter, amount: u64) -> Result[(), Error] {
+        self.registry.lock();
+        defer self.registry.unlock();
+        attached(self.cell)?;
+        let Value::Counter(value) = self.cell.value.get() else {
+            return Result::Err(error(ErrorKind::Conflict, "counter handle mismatch"))
+        };
+        if amount > value {
+            self.cell.value.set(Value::Counter(amount));
+        }
+        Result::Ok(())
+    }
+}
+
+pub struct Gauge {
+    registry: Registry,
+    cell: Cell,
+}
+
+impl Gauge {
+    pub fn get(self: Gauge) -> Result[f64, Error] {
+        self.registry.lock();
+        defer self.registry.unlock();
+        attached(self.cell)?;
+        match self.cell.value.get() {
+            Gauge(value) => Result::Ok(value),
+            _ => Result::Err(error(ErrorKind::Conflict, "gauge handle mismatch")),
+        }
+    }
+
+    pub fn set(self: Gauge, value: f64) -> Result[(), Error] {
+        self.registry.lock();
+        defer self.registry.unlock();
+        self.update_locked(value, false)
+    }
+
+    pub fn set_with(self: Gauge, value: f64, ctx: context::Context) -> Result[(), Error] {
+        self.registry.acquire(ctx)?;
+        defer self.registry.unlock();
+        self.update_locked(value, false)
+    }
+
+    pub fn add(self: Gauge, amount: f64) -> Result[(), Error] {
+        self.registry.lock();
+        defer self.registry.unlock();
+        self.update_locked(amount, true)
+    }
+
+    pub fn increment(self: Gauge, amount: f64) -> Result[(), Error] {
+        if !math::is_finite(amount) || amount < 0.0 {
+            return Result::Err(
+                error(ErrorKind::InvalidValue, "increment must be finite and nonnegative"),
+            )
+        }
+        self.add(amount)
+    }
+
+    pub fn decrement(self: Gauge, amount: f64) -> Result[(), Error] {
+        if !math::is_finite(amount) || amount < 0.0 {
+            return Result::Err(
+                error(ErrorKind::InvalidValue, "decrement must be finite and nonnegative"),
+            )
+        }
+        self.add(-amount)
+    }
+
+    fn update_locked(self: Gauge, value: f64, relative: bool) -> Result[(), Error] {
+        attached(self.cell)?;
+        if !math::is_finite(value) {
+            return Result::Err(error(ErrorKind::InvalidValue, "gauge values must be finite"))
+        }
+        let Value::Gauge(previous) = self.cell.value.get() else {
+            return Result::Err(error(ErrorKind::Conflict, "gauge handle mismatch"))
+        };
+        let next = if relative {
+            previous + value
+        } else {
+            value
+        };
+        if !math::is_finite(next) {
+            return Result::Err(error(ErrorKind::Overflow, "gauge arithmetic overflow"))
+        }
+        self.cell.value.set(Value::Gauge(next));
+        Result::Ok(())
+    }
+}
+
+pub struct Histogram {
+    registry: Registry,
+    cell: Cell,
+}
+
+impl Histogram {
+    pub fn get(self: Histogram) -> Result[HistogramValue, Error] {
+        self.registry.lock();
+        defer self.registry.unlock();
+        attached(self.cell)?;
+        match self.cell.value.get() {
+            Histogram(value) => Result::Ok(value.copy()),
+            _ => Result::Err(error(ErrorKind::Conflict, "histogram handle mismatch")),
+        }
+    }
+
+    pub fn observe(self: Histogram, value: f64) -> Result[(), Error] {
+        self.observe_many(value, 1)
+    }
+
+    pub fn observe_many(self: Histogram, value: f64, count: u64) -> Result[(), Error] {
+        self.registry.lock();
+        defer self.registry.unlock();
+        self.observe_locked(value, count)
+    }
+
+    pub fn observe_with(self: Histogram, value: f64, ctx: context::Context) -> Result[(), Error] {
+        self.registry.acquire(ctx)?;
+        defer self.registry.unlock();
+        self.observe_locked(value, 1)
+    }
+
+    fn observe_locked(self: Histogram, value: f64, count: u64) -> Result[(), Error] {
+        attached(self.cell)?;
+        if !math::is_finite(value) {
+            return Result::Err(
+                error(ErrorKind::InvalidValue, "histogram observations must be finite"),
+            )
+        }
+        let Value::Histogram(previous) = self.cell.value.get() else {
+            return Result::Err(error(ErrorKind::Conflict, "histogram handle mismatch"))
+        };
+        if count > 18446744073709551615 - previous.count {
+            return Result::Err(error(ErrorKind::Overflow, "histogram count overflow"))
+        }
+        let sum = previous.sum + value * count.to_f64();
+        if !math::is_finite(sum) {
+            return Result::Err(error(ErrorKind::Overflow, "histogram sum overflow"))
+        }
+        for index in 0..previous.boundaries.len() {
+            if value <= previous.boundaries[index] {
+                previous.cumulative[index] = previous.cumulative[index] + count;
+            }
+        }
+        self.cell.value.set(
+            Value::Histogram(HistogramValue { count: previous.count + count, sum, ..previous }),
+        );
+        Result::Ok(())
+    }
+
+    pub fn observe_duration(self: Histogram, duration: time::Duration) -> Result[(), Error] {
+        self.observe(duration.as_nanoseconds().to_f64() / 1000000000.0)
+    }
+
+    pub fn start_timer(self: Histogram) -> Timer {
+        Timer { histogram: self, started: time::Instant::now(), state: Channel::new(1) }.initialize()
+    }
+
+    pub fn time[T](self: Histogram, body: () -> T) -> Result[T, Error] {
+        let timer = self.start_timer();
+        let result = body();
+        let _ = timer.stop()?;
+        Result::Ok(result)
+    }
+}
+
+pub struct Timer {
+    histogram: Histogram,
+    started: time::Instant,
+    state: Channel[bool],
+}
+
+impl Timer {
+    fn initialize(self: Timer) -> Timer {
+        self.state.send(false);
+        self
+    }
+
+    pub fn stop(self: Timer) -> Result[time::Duration, Error] {
+        let done = self.state.recv().unwrap_or(true);
+        defer self.state.send(true);
+        if done {
+            return Result::Err(error(ErrorKind::Finished, "timer already stopped or cancelled"))
+        }
+        let elapsed = self.started.elapsed();
+        self.histogram.observe_duration(elapsed)?;
+        Result::Ok(elapsed)
+    }
+
+    pub fn cancel(self: Timer) -> bool {
+        let done = self.state.recv().unwrap_or(true);
+        self.state.send(true);
+        !done
+    }
+}

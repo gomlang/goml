@@ -1,0 +1,325 @@
+package csv;
+
+use std::io;
+use io::Write;
+use std::serde;
+
+pub struct Writer[W] {
+    writer: W,
+    options: WriteOptions,
+    gate: Channel[()],
+    position: Ref[Position],
+    previous_cr: Ref[bool],
+    width: Ref[Option[isize]],
+    header: Ref[Option[Vec[string]]],
+    failure: Ref[Option[Error]],
+}
+
+impl[W: Write] Writer[W] {
+    pub fn new(writer: W, options: WriteOptions) -> Result[Writer[W], Error] {
+        options.validate()?;
+        let gate = Channel::new(1);
+        gate.send(());
+        Result::Ok(
+            Writer {
+                writer,
+                options,
+                gate,
+                position: Ref::new(Position::start()),
+                previous_cr: Ref::new(false),
+                width: Ref::new(Option::None),
+                header: Ref::new(Option::None),
+                failure: Ref::new(Option::None),
+            },
+        )
+    }
+
+    fn ready(self: Writer[W]) -> Result[(), Error] {
+        if let Some(failure) = self.failure.get() {
+            Result::Err(failure)
+        } else {
+            Result::Ok(())
+        }
+    }
+
+    fn prepare(self: Writer[W], record: ByteRecord) -> Result[Vec[byte], Error] {
+        if let Some(width) = self.width.get() {
+            if !self.options.flexible && width != record.len() {
+                return Result::Err(
+                    error(
+                        ErrorKind::Width,
+                        self.position.get(),
+                        Option::None,
+                        "record width differs from previous output",
+                    ),
+                )
+            }
+        }
+        encode_record(record, self.options).map_err(
+            |failure| Error { position: self.position.get(), ..failure },
+        )
+    }
+
+    fn allowance(self: Writer[W], length: isize, records: isize) -> Result[(), Error] {
+        let position = self.position.get();
+        let bom = if position.byte == 0 && self.options.emit_bom {
+            3
+        } else {
+            0
+        };
+        if records > self.options.limits.max_records - position.record + 1
+            || length > self.options.limits.max_total_bytes - position.byte
+            || bom > self.options.limits.max_total_bytes - position.byte - length {
+            return Result::Err(
+                error(
+                    ErrorKind::Limit,
+                    position,
+                    Option::None,
+                    "output record count or total byte limit exceeded",
+                ),
+            )
+        }
+        Result::Ok(())
+    }
+
+    fn emit(self: Writer[W], value: Vec[byte], columns: isize) -> Result[(), Error] {
+        let output = Vec::new();
+        if self.position.get().byte == 0 && self.options.emit_bom {
+            output.push(239.to_u8());
+            output.push(187.to_u8());
+            output.push(191.to_u8());
+        }
+        for item in value {
+            output.push(item);
+        }
+        let mut offset = 0;
+        while offset < output.len() {
+            let count = match self.writer.write(output.as_slice().sub(offset, output.len())) {
+                Ok(count) => count,
+                Err(cause) if cause.kind() == io::ErrorKind::Interrupted => continue,
+                Err(cause) => {
+                    let failure = io_error(self.position.get(), cause);
+                    self.failure.set(Option::Some(failure));
+                    return Result::Err(failure)
+                },
+            };
+            if count <= 0 || count > output.len() - offset {
+                let failure = error(
+                    ErrorKind::Io,
+                    self.position.get(),
+                    Option::None,
+                    "writer made no progress or returned an invalid byte count",
+                );
+                self.failure.set(Option::Some(failure));
+                return Result::Err(failure)
+            }
+            let mut position = self.position.get();
+            let mut cr = self.previous_cr.get();
+            for index in offset..offset + count {
+                let value = output[index];
+                position.byte += 1;
+                if value == 13 {
+                    position.line += 1;
+                    position.column = 1;
+                } else if value == 10 {
+                    if !cr {
+                        position.line += 1;
+                    }
+                    position.column = 1;
+                } else {
+                    position.column += 1;
+                }
+                cr = value == 13;
+            }
+            self.position.set(position);
+            self.previous_cr.set(cr);
+            offset += count;
+        }
+        self.position.set(
+            Position { record: self.position.get().record + 1, ..self.position.get() },
+        );
+        self.width.set(Option::Some(columns));
+        Result::Ok(())
+    }
+
+    pub fn write_bytes(self: Writer[W], record: ByteRecord) -> Result[(), Error] {
+        let _ = self.gate.recv();
+        defer self.gate.send(());
+        self.ready()?;
+        let value = self.prepare(record)?;
+        self.allowance(value.len(), 1)?;
+        self.emit(value, record.len())
+    }
+
+    pub fn write(self: Writer[W], record: StringRecord) -> Result[(), Error] {
+        self.write_bytes(record.bytes())
+    }
+
+    pub fn serialize[T: serde::Serialize](self: Writer[W], value: T, schema: Schema) -> Result[
+        (),
+        Error,
+    ] {
+        let _ = self.gate.recv();
+        let readiness = self.ready();
+        self.gate.send(());
+        readiness?;
+        let record = schema.encode(value)?;
+        let _ = self.gate.recv();
+        defer self.gate.send(());
+        self.ready()?;
+        let encoded = self.prepare(record.bytes())?;
+        let names = schema.headers();
+        let mut prefix = Vec::new();
+        let mut records = 1;
+        if self.options.headers {
+            if let Some(previous) = self.header.get() {
+                if previous != names.values {
+                    return Result::Err(
+                        error(
+                            ErrorKind::Header,
+                            self.position.get(),
+                            Option::None,
+                            "serialized schema differs from written header",
+                        ),
+                    )
+                }
+            } else {
+                if self.position.get().record != 1 {
+                    return Result::Err(
+                        error(
+                            ErrorKind::Header,
+                            self.position.get(),
+                            Option::None,
+                            "cannot insert automatic header after raw records",
+                        ),
+                    )
+                }
+                prefix = self.prepare(names.bytes())?;
+                records = 2;
+            }
+        }
+        self.allowance(encoded.len() + prefix.len(), records)?;
+        if !prefix.is_empty() {
+            self.emit(prefix, names.len())?;
+            self.header.set(Option::Some(names.values));
+        }
+        self.emit(encoded, record.len())
+    }
+
+    pub fn flush(self: Writer[W]) -> Result[(), Error] {
+        let _ = self.gate.recv();
+        defer self.gate.send(());
+        self.ready()?;
+        match self.writer.flush() {
+            Ok(()) => Result::Ok(()),
+            Err(cause) => {
+                let failure = io_error(self.position.get(), cause);
+                self.failure.set(Option::Some(failure));
+                Result::Err(failure)
+            },
+        }
+    }
+
+    pub fn position(self: Writer[W]) -> Position {
+        let _ = self.gate.recv();
+        defer self.gate.send(());
+        self.position.get()
+    }
+}
+
+fn encoded_push(output: Vec[byte], value: byte, limits: Limits) -> Result[(), Error] {
+    if output.len() >= limits.max_record_bytes {
+        return Result::Err(
+            error(
+                ErrorKind::Limit,
+                Position::start(),
+                Option::None,
+                "encoded record byte limit exceeded",
+            ),
+        )
+    }
+    output.push(value);
+    Result::Ok(())
+}
+
+fn needs_quotes(value: Vec[byte], options: WriteOptions, single: bool, first: bool) -> bool {
+    if single && value.is_empty() {
+        return true
+    }
+    if first && value.len() >= 3 && value[0] == 239 && value[1] == 187 && value[2] == 191 {
+        return true
+    }
+    for item in value {
+        let custom = match options.terminator {
+            Terminator::Byte(expected) => item == expected,
+            _ => false,
+        };
+        if item == options.delimiter || item == options.quote || item == 10 || item == 13 || custom {
+            return true
+        }
+    }
+    false
+}
+
+fn encode_record(record: ByteRecord, options: WriteOptions) -> Result[Vec[byte], Error] {
+    if record.len() == 0 || record.len() > options.limits.max_columns {
+        return Result::Err(
+            error(
+                ErrorKind::Limit,
+                record.position,
+                Option::None,
+                "record must have between one and max_columns fields",
+            ),
+        )
+    }
+    let output = Vec::new();
+    for index in 0..record.len() {
+        let field = record.fields[index];
+        if field.data.len() > options.limits.max_field_bytes {
+            return Result::Err(
+                error(
+                    ErrorKind::Limit,
+                    field.position,
+                    Option::Some(index),
+                    "field byte limit exceeded",
+                ),
+            )
+        }
+        if index > 0 {
+            encoded_push(output, options.delimiter, options.limits)?;
+        }
+        let necessary = needs_quotes(field.data, options, record.len() == 1, index == 0);
+        if necessary && options.quoting == QuoteStyle::Never {
+            return Result::Err(
+                error(
+                    ErrorKind::Syntax,
+                    field.position,
+                    Option::Some(index),
+                    "field requires quoting but quoting is disabled",
+                ),
+            )
+        }
+        let quoted = options.quoting == QuoteStyle::Always || necessary;
+        if quoted {
+            encoded_push(output, options.quote, options.limits)?;
+        }
+        for value in field.data {
+            encoded_push(output, value, options.limits)?;
+            if quoted && value == options.quote {
+                encoded_push(output, value, options.limits)?;
+            }
+        }
+        if quoted {
+            encoded_push(output, options.quote, options.limits)?;
+        }
+    }
+    match options.terminator {
+        Terminator::Any => encoded_push(output, 10, options.limits)?,
+        Terminator::CrLf => {
+            encoded_push(output, 13, options.limits)?;
+            encoded_push(output, 10, options.limits)?;
+        },
+        Terminator::Byte(value) => encoded_push(output, value, options.limits)?,
+    }
+    Result::Ok(output)
+}

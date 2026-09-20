@@ -1,0 +1,235 @@
+package config;
+
+use std::num;
+
+fn merge(base: Node, incoming: Node, arrays: ArrayMerge) -> Node {
+    match (base.kind, incoming.kind) {
+        (Kind::Object(old), Kind::Object(new)) => {
+            let updates = HashMap::new();
+            for (key, value) in new {
+                updates.set(key, value);
+            }
+            let fields = Vec::new();
+            let handled = HashMap::new();
+            for (key, value) in old {
+                let updated = match updates.get(key) {
+                    Some(next) => merge(value, next, arrays),
+                    None => value,
+                };
+                fields.push((key, updated));
+                handled.set(key, true);
+            }
+            for (key, value) in new {
+                if handled.get(key).is_none() {
+                    fields.push((key, value));
+                }
+            }
+            Node { kind: Kind::Object(fields), origin: incoming.origin }
+        },
+        (Kind::Array(old), Kind::Array(new)) if arrays == ArrayMerge::Append => {
+            let values = old.as_slice().to_vec();
+            for value in new {
+                values.push(value);
+            }
+            Node { kind: Kind::Array(values), origin: incoming.origin }
+        },
+        _ => incoming,
+    }
+}
+
+fn array_index(part: string, length: isize, append: bool, path: string, origin: Origin) -> Result[
+    isize,
+    Error,
+] {
+    if part == "-" && append {
+        return Result::Ok(length)
+    }
+    if part == "" || part.byte_len() > 1 && part.starts_with("0") {
+        return Result::Err(Error::new(ErrorKind::Path, path, origin, "invalid array index"))
+    }
+    for character in part.chars() {
+        if character < '0' || character > '9' {
+            return Result::Err(Error::new(ErrorKind::Path, path, origin, "invalid array index"))
+        }
+    }
+    let index = num::parse_int_structured(part).map_err(
+        |_| Error::new(ErrorKind::Path, path, origin, "array index out of range"),
+    )?;
+    if index >= length {
+        return Result::Err(
+            Error::new(ErrorKind::Missing, path, origin, "array index out of bounds"),
+        )
+    }
+    Result::Ok(index)
+}
+
+fn update(
+    node: Node,
+    parts: Vec[string],
+    position: isize,
+    value: Option[Node],
+    arrays: ArrayMerge,
+    current: string,
+    origin: Origin,
+) -> Result[Node, Error] {
+    if position == parts.len() {
+        return match value {
+            Some(value) => Result::Ok(merge(node, value, arrays)),
+            None => Result::Err(
+                Error::new(ErrorKind::Path, current, origin, "cannot remove configuration root"),
+            ),
+        }
+    }
+    let part = parts[position];
+    let child_path = path_join(current, part);
+    let terminal = position + 1 == parts.len();
+    match node.kind {
+        Kind::Object(fields) => {
+            let result = Vec::new();
+            let mut found = false;
+            for (key, child) in fields {
+                if key == part {
+                    found = true;
+                    if !(terminal && value.is_none()) {
+                        result.push(
+                            (
+                                key,
+                                update(
+                                    child,
+                                    parts,
+                                    position + 1,
+                                    value,
+                                    arrays,
+                                    child_path,
+                                    origin,
+                                )?,
+                            ),
+                        );
+                    }
+                } else {
+                    result.push((key, child));
+                }
+            }
+            if !found && value.is_some() {
+                let child = update(
+                    empty_node(origin),
+                    parts,
+                    position + 1,
+                    value,
+                    arrays,
+                    child_path,
+                    origin,
+                )?;
+                result.push((part, child));
+            }
+            Result::Ok(Node { kind: Kind::Object(result), origin })
+        },
+        Kind::Array(values) => {
+            let index = array_index(
+                part,
+                values.len(),
+                terminal && value.is_some(),
+                child_path,
+                origin,
+            )?;
+            let result = Vec::new();
+            for offset in 0..values.len() {
+                if offset == index {
+                    if !(terminal && value.is_none()) {
+                        result.push(
+                            update(
+                                values[offset],
+                                parts,
+                                position + 1,
+                                value,
+                                arrays,
+                                child_path,
+                                origin,
+                            )?,
+                        );
+                    }
+                } else {
+                    result.push(values[offset]);
+                }
+            }
+            if index == values.len() {
+                if let Some(value) = value {
+                    result.push(value);
+                }
+            }
+            Result::Ok(Node { kind: Kind::Array(result), origin })
+        },
+        _ => Result::Err(
+            Error::new(ErrorKind::Type, current, node.origin, "path traverses a scalar value"),
+        ),
+    }
+}
+
+fn lookup(node: Node, parts: Vec[string], position: isize, current: string) -> Result[Node, Error] {
+    if position == parts.len() {
+        return Result::Ok(node)
+    }
+    let part = parts[position];
+    let child_path = path_join(current, part);
+    match node.kind {
+        Kind::Object(fields) => {
+            for (key, child) in fields {
+                if key == part {
+                    return lookup(child, parts, position + 1, child_path)
+                }
+            }
+            Result::Err(
+                Error::new(
+                    ErrorKind::Missing,
+                    child_path,
+                    node.origin,
+                    "configuration key is missing",
+                ),
+            )
+        },
+        Kind::Array(values) => {
+            let index = array_index(part, values.len(), false, child_path, node.origin)?;
+            lookup(values[index], parts, position + 1, child_path)
+        },
+        _ => Result::Err(
+            Error::new(ErrorKind::Type, current, node.origin, "path traverses a scalar value"),
+        ),
+    }
+}
+
+fn node_origins(node: Node, path: string, result: Vec[(string, Origin)]) -> () {
+    result.push((path, node.origin));
+    match node.kind {
+        Kind::Object(fields) => for (key, child) in fields {
+            node_origins(child, path_join(path, key), result);
+        },
+        Kind::Array(values) => for index in 0..values.len() {
+            node_origins(values[index], path_join(path, index.to_string()), result);
+        },
+        _ => (),
+    }
+}
+
+fn validate_tree(node: Node, depth: isize, limits: Limits, count: Ref[isize]) -> Result[(), Error] {
+    if depth > limits.max_depth || count.get() >= limits.max_nodes {
+        return Result::Err(
+            Error::new(
+                ErrorKind::Limit,
+                "",
+                node.origin,
+                "merged configuration exceeds node or depth limit",
+            ),
+        )
+    }
+    count.set(count.get() + 1);
+    match node.kind {
+        Kind::Object(fields) => for (_, child) in fields {
+            validate_tree(child, depth + 1, limits, count)?;
+        },
+        Kind::Array(values) => for child in values {
+            validate_tree(child, depth + 1, limits, count)?;
+        },
+        _ => (),
+    }
+    Result::Ok(())
+}

@@ -1,0 +1,628 @@
+package archive;
+
+use std::bytes;
+use std::io;
+use io::{Read, Write};
+
+fn tar_string(block: bytes::Bytes, offset: isize, length: isize) -> Result[string, Error] {
+    let field = part(block, offset, length)?;
+    let mut end = 0;
+    while end < field.len() && field.get(end) != 0 {
+        end += 1;
+    }
+    text(part(field, 0, end)?)
+}
+
+fn tar_octal(block: bytes::Bytes, offset: isize, length: isize) -> Result[u64, Error] {
+    let field = part(block, offset, length)?;
+    let mut result: u64 = 0;
+    let mut ended = false;
+    let mut started = false;
+    for value in field.as_slice() {
+        if value == 0 || value == b' ' {
+            if started {
+                ended = true;
+            }
+        } else {
+            if ended || value < b'0' || value > b'7' || result > 2305843009213693951 {
+                return Result::Err(failure(ErrorKind::Invalid, offset, "invalid tar octal field"))
+            }
+            result = result * 8 + (value - b'0').to_u64();
+            started = true;
+        }
+    }
+    Result::Ok(result)
+}
+
+fn tar_set_string(block: bytes::Bytes, offset: isize, width: isize, value: string) -> Result[
+    (),
+    Error,
+] {
+    let data = value.to_bytes();
+    if data.len() > width || value.contains("\u0000") {
+        return Result::Err(
+            failure(ErrorKind::Invalid, offset, "tar field too long or contains NUL"),
+        )
+    }
+    for index in 0..data.len() {
+        block.set(offset + index, data[index])
+    }
+    Result::Ok(())
+}
+
+fn tar_set_octal(block: bytes::Bytes, offset: isize, width: isize, value: u64) -> Result[(), Error] {
+    let mut remaining = value;
+    for index in 0..width - 1 {
+        block.set(offset + width - 2 - index, b'0' + (remaining & 7).to_u8());
+        remaining >>= 3;
+    }
+    if remaining != 0 {
+        return Result::Err(
+            failure(ErrorKind::Unsupported, offset, "tar numeric field requires PAX"),
+        )
+    }
+    Result::Ok(())
+}
+
+fn pax_record(key: string, value: string) -> Result[string, Error] {
+    if key == "" || key.contains("=") || key.contains("\n") || key.contains("\u0000")
+        || value.contains("\u0000") {
+        return Result::Err(failure(ErrorKind::Invalid, 0, "invalid PAX record"))
+    }
+    let body = " " + key + "=" + value + "\n";
+    let mut length = body.to_bytes().len() + 1;
+    loop {
+        let next = body.to_bytes().len() + length.to_string().len();
+        if next == length {
+            break
+        }
+        length = next;
+    }
+    Result::Ok(length.to_string() + body)
+}
+
+fn parse_pax(data: bytes::Bytes) -> Result[Vec[(string, string)], Error] {
+    let result = Vec::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        let mut space = offset;
+        while space < data.len() && data.get(space) != b' ' {
+            space += 1;
+        }
+        if space == data.len() {
+            return Result::Err(failure(ErrorKind::Invalid, offset, "missing PAX record length"))
+        }
+        let length = decimal(text(part(data, offset, space - offset)?)?)?;
+        if length > (data.len() - offset).to_u64() || length <= (space - offset + 2).to_u64() {
+            return Result::Err(failure(ErrorKind::Invalid, offset, "invalid PAX record length"))
+        }
+        let end = offset + length.to_isize();
+        if data.get(end - 1) != b'\n' {
+            return Result::Err(failure(ErrorKind::Invalid, offset, "PAX record missing newline"))
+        }
+        let mut equals = space + 1;
+        while equals < end - 1 && data.get(equals) != b'=' {
+            equals += 1;
+        }
+        if equals == space + 1 || equals == end - 1 {
+            return Result::Err(failure(ErrorKind::Invalid, offset, "invalid PAX key"))
+        }
+        let key = text(part(data, space + 1, equals - space - 1)?)?;
+        if key.starts_with("GNU.sparse") {
+            return Result::Err(failure(ErrorKind::Unsupported, offset, "sparse tar not supported"))
+        }
+        result.push((key, text(part(data, equals + 1, end - equals - 2)?)?));
+        offset = end;
+    }
+    Result::Ok(result)
+}
+
+fn tar_header(header: Header, size: isize, flag: byte) -> Result[bytes::Bytes, Error] {
+    let block = zeros(512);
+    tar_set_string(block, 0, 100, header.path)?;
+    tar_set_octal(block, 100, 8, header.mode.to_u64())?;
+    tar_set_octal(block, 108, 8, header.uid)?;
+    tar_set_octal(block, 116, 8, header.gid)?;
+    tar_set_octal(block, 124, 12, size.to_u64())?;
+    tar_set_octal(block, 136, 12, header.modified.to_u64())?;
+    for index in 148..156 {
+        block.set(index, b' ')
+    }
+    block.set(156, flag);
+    tar_set_string(block, 157, 100, header.link)?;
+    tar_set_string(block, 257, 6, "ustar")?;
+    tar_set_string(block, 263, 2, "00")?;
+    tar_set_string(block, 265, 32, header.user)?;
+    tar_set_string(block, 297, 32, header.group)?;
+    let mut checksum: u64 = 0;
+    for value in block.as_slice() {
+        checksum += value.to_u64();
+    }
+    tar_set_octal(block, 148, 7, checksum)?;
+    block.set(155, b' ');
+    Result::Ok(block)
+}
+
+fn tar_prepare_pax(header: Header, limits: Limits) -> Result[(Header, bytes::Bytes), Error] {
+    if header.modified < 0 {
+        return Result::Err(failure(ErrorKind::Unsupported, 0, "negative tar timestamp"))
+    }
+    let mut records = "";
+    for (key, value) in header.pax {
+        if key == "path" || key == "linkpath" || key == "size" || key == "uid" || key == "gid"
+            || key == "mtime"
+            || key == "uname"
+            || key == "gname"
+            || key.starts_with("GNU.sparse") {
+            return Result::Err(
+                failure(ErrorKind::Invalid, 0, "reserved PAX key must use header field"),
+            )
+        }
+        records += pax_record(key, value)?;
+    }
+    let mut stored = header;
+    if header.path.to_bytes().len() > 100 {
+        records += pax_record("path", header.path)?;
+        stored = Header { path: "PaxEntry", ..stored };
+    }
+    if header.link.to_bytes().len() > 100 {
+        records += pax_record("linkpath", header.link)?;
+        stored = Header { link: "", ..stored };
+    }
+    if header.user.to_bytes().len() > 32 {
+        records += pax_record("uname", header.user)?;
+        stored = Header { user: "", ..stored };
+    }
+    if header.group.to_bytes().len() > 32 {
+        records += pax_record("gname", header.group)?;
+        stored = Header { group: "", ..stored };
+    }
+    if header.uid > 2097151 {
+        records += pax_record("uid", header.uid.to_string())?;
+        stored = Header { uid: 0, ..stored };
+    }
+    if header.gid > 2097151 {
+        records += pax_record("gid", header.gid.to_string())?;
+        stored = Header { gid: 0, ..stored };
+    }
+    if header.modified > 8589934591 {
+        records += pax_record("mtime", header.modified.to_string())?;
+        stored = Header { modified: 0, ..stored };
+    }
+    if records.to_bytes().len() > limits.max_metadata_bytes {
+        return Result::Err(failure(ErrorKind::Limit, 0, "PAX metadata exceeds limit"))
+    }
+    Result::Ok((stored, bytes::Bytes::from_string(records)))
+}
+
+pub struct TarWriter[W] {
+    writer: W,
+    limits: Limits,
+    count: Ref[isize],
+    total: Ref[isize],
+    written: Ref[isize],
+    closed: Ref[bool],
+    broken: Ref[bool],
+}
+
+impl[W: Write] TarWriter[W] {
+    pub fn new(writer: W, limits: Limits) -> Result[TarWriter[W], Error] {
+        limits.validate()?;
+        Result::Ok(
+            TarWriter {
+                writer,
+                limits,
+                count: Ref::new(0),
+                total: Ref::new(0),
+                written: Ref::new(0),
+                closed: Ref::new(false),
+                broken: Ref::new(false),
+            },
+        )
+    }
+
+    fn write_bytes(self: TarWriter[W], data: bytes::Bytes) -> Result[(), Error] {
+        if data.len() > self.limits.max_archive_bytes - self.written.get() {
+            return Result::Err(
+                failure(ErrorKind::Limit, self.written.get(), "archive size exceeds limit"),
+            )
+        }
+        match self.writer.write_all(data.as_slice()) {
+            Err(error) => {
+                self.broken.set(true);
+                Result::Err(failure(ErrorKind::Io, self.written.get(), error.to_string()))
+            },
+            Ok(_) => {
+                self.written.set(self.written.get() + data.len());
+                Result::Ok(())
+            },
+        }
+    }
+
+    pub fn append(self: TarWriter[W], entry: Entry) -> Result[(), Error] {
+        self.append_reader(entry.header, entry.data.len(), io::Cursor::new(entry.data))
+    }
+
+    pub fn append_reader[R: Read](self: TarWriter[W], header: Header, size: isize, reader: R) -> Result[
+        (),
+        Error,
+    ] {
+        if self.closed.get() || self.broken.get() {
+            return Result::Err(failure(ErrorKind::Closed, 0, "tar writer is closed or failed"))
+        }
+        validate_entry(Entry { header, data: bytes::Bytes::new() }, self.limits)?;
+        if size < 0 || size > self.limits.max_entry_bytes
+            || size > self.limits.max_total_bytes - self.total.get()
+            || self.count.get() >= self.limits.max_entries {
+            return Result::Err(failure(ErrorKind::Limit, 0, "tar entry exceeds limit"))
+        }
+        if header.kind != EntryKind::File && size != 0 {
+            return Result::Err(failure(ErrorKind::Invalid, 0, "non-file payload"))
+        }
+        let (stored, record_bytes) = tar_prepare_pax(header, self.limits)?;
+        let flag = match header.kind {
+            File => b'0',
+            Directory => b'5',
+            Symlink => b'2',
+            Hardlink => b'1',
+        };
+        let block = tar_header(stored, size, flag)?;
+        let extra = if record_bytes.is_empty() {
+            0
+        } else {
+            512 + record_bytes.len() + ((512 - record_bytes.len() % 512) % 512)
+        };
+        let padding = (512 - size % 512) % 512;
+        if size.to_u64() + padding.to_u64() + extra.to_u64() + 512
+            > (self.limits.max_archive_bytes - self.written.get()).to_u64() {
+            return Result::Err(failure(ErrorKind::Limit, 0, "tar archive exceeds limit"))
+        }
+        if !record_bytes.is_empty() {
+            self.write_bytes(
+                tar_header(Header::file("PaxHeaders/entry"), record_bytes.len(), b'x')?,
+            )?;
+            self.write_bytes(record_bytes)?;
+            self.write_bytes(zeros((512 - record_bytes.len() % 512) % 512))?;
+        }
+        self.write_bytes(block)?;
+        let scratch = zeros(8192);
+        let mut remaining = size;
+        while remaining > 0 {
+            let amount = if remaining < scratch.len() {
+                remaining
+            } else {
+                scratch.len()
+            };
+            if let Err(error) = reader.read_exact(scratch.slice_mut(0, amount)) {
+                self.broken.set(true);
+                return Result::Err(failure(ErrorKind::Io, self.written.get(), error.to_string()))
+            }
+            self.write_bytes(part(scratch, 0, amount)?)?;
+            remaining -= amount;
+        }
+        self.write_bytes(zeros(padding))?;
+        self.count.set(self.count.get() + 1);
+        self.total.set(self.total.get() + size);
+        Result::Ok(())
+    }
+
+    pub fn finish(self: TarWriter[W]) -> Result[(), Error] {
+        if self.broken.get() {
+            return Result::Err(failure(ErrorKind::Closed, 0, "tar writer failed"))
+        }
+        if self.closed.get() {
+            return Result::Ok(())
+        }
+        self.write_bytes(zeros(1024))?;
+        self.closed.set(true);
+        self.writer.flush().map_err(
+            |error| failure(ErrorKind::Io, self.written.get(), error.to_string()),
+        )
+    }
+}
+
+pub struct TarReader[R] {
+    reader: R,
+    limits: Limits,
+    offset: Ref[isize],
+    count: Ref[isize],
+    total: Ref[isize],
+    done: Ref[bool],
+    broken: Ref[bool],
+    globals: Ref[Vec[(string, string)]],
+}
+
+impl[R: Read] TarReader[R] {
+    pub fn new(reader: R, limits: Limits) -> Result[TarReader[R], Error] {
+        limits.validate()?;
+        Result::Ok(
+            TarReader {
+                reader,
+                limits,
+                offset: Ref::new(0),
+                count: Ref::new(0),
+                total: Ref::new(0),
+                done: Ref::new(false),
+                broken: Ref::new(false),
+                globals: Ref::new(Vec::new()),
+            },
+        )
+    }
+
+    fn read_bytes(self: TarReader[R], count: isize) -> Result[bytes::Bytes, Error] {
+        if count < 0 || count > self.limits.max_archive_bytes - self.offset.get() {
+            return Result::Err(
+                failure(ErrorKind::Limit, self.offset.get(), "archive exceeds limit"),
+            )
+        }
+        let data = zeros(count);
+        self.reader.read_exact(data.as_mut_slice()).map_err(
+            |error| failure(
+                if error.kind() == io::ErrorKind::UnexpectedEof {
+                    ErrorKind::Truncated
+                } else {
+                    ErrorKind::Io
+                },
+                self.offset.get(),
+                error.to_string(),
+            ),
+        )?;
+        self.offset.set(self.offset.get() + count);
+        Result::Ok(data)
+    }
+
+    pub fn next(self: TarReader[R]) -> Result[Option[Entry], Error] {
+        if self.broken.get() {
+            return Result::Err(failure(ErrorKind::Closed, self.offset.get(), "tar reader failed"))
+        }
+        match self.next_inner() {
+            Err(error) => {
+                self.broken.set(true);
+                Result::Err(error)
+            },
+            Ok(value) => Result::Ok(value),
+        }
+    }
+
+    fn next_inner(self: TarReader[R]) -> Result[Option[Entry], Error] {
+        if self.done.get() {
+            return Result::Ok(Option::None)
+        }
+        let mut local: Vec[(string, string)] = Vec::new();
+        let mut metadata_bytes = 0;
+        loop {
+            let block = self.read_bytes(512)?;
+            let mut sum: u64 = 0;
+            for value in block.as_slice() {
+                sum += value.to_u64();
+            }
+            if sum == 0 {
+                let end = self.read_bytes(512)?;
+                for value in end.as_slice() {
+                    if value != 0 {
+                        return Result::Err(
+                            failure(
+                                ErrorKind::Invalid,
+                                self.offset.get(),
+                                "tar end marker must contain two zero blocks",
+                            ),
+                        )
+                    }
+                }
+                if !local.is_empty() {
+                    return Result::Err(
+                        failure(ErrorKind::Invalid, self.offset.get(), "orphan PAX header"),
+                    )
+                }
+                self.done.set(true);
+                return Result::Ok(Option::None)
+            }
+            let expected = tar_octal(block, 148, 8)?;
+            let mut checksum: u64 = 0;
+            for index in 0..512 {
+                checksum += if index >= 148 && index < 156 {
+                    32
+                } else {
+                    block.get(index).to_u64()
+                };
+            }
+            if expected != checksum {
+                return Result::Err(
+                    failure(
+                        ErrorKind::Checksum,
+                        self.offset.get() - 512,
+                        "tar header checksum mismatch",
+                    ),
+                )
+            }
+            let magic = tar_string(block, 257, 6)?;
+            if magic != "ustar" {
+                return Result::Err(
+                    failure(
+                        ErrorKind::Unsupported,
+                        self.offset.get(),
+                        "only USTAR and PAX tar are supported",
+                    ),
+                )
+            }
+            let size_raw = tar_octal(block, 124, 12)?;
+            let flag = block.get(156);
+            if flag == b'x' || flag == b'g' {
+                if size_raw > (self.limits.max_metadata_bytes - metadata_bytes).to_u64() {
+                    return Result::Err(
+                        failure(ErrorKind::Limit, self.offset.get(), "PAX metadata exceeds limit"),
+                    )
+                }
+                let size = size_raw.to_isize();
+                metadata_bytes += size;
+                let records = parse_pax(self.read_bytes(size)?)?;
+                let _ = self.read_bytes((512 - size % 512) % 512)?;
+                if flag == b'g' {
+                    let existing = self.globals.get();
+                    let combined = Vec::new();
+                    for (key, value) in existing {
+                        let mut replaced = false;
+                        for (new_key, _) in records {
+                            if key == new_key {
+                                replaced = true;
+                            }
+                        }
+                        if !replaced {
+                            combined.push((key, value))
+                        }
+                    }
+                    for (key, value) in records {
+                        if value != "" {
+                            combined.push((key, value))
+                        }
+                    }
+                    let mut global_size = 0;
+                    for (key, value) in combined {
+                        global_size += key.to_bytes().len() + value.to_bytes().len();
+                    }
+                    if global_size > self.limits.max_metadata_bytes {
+                        return Result::Err(
+                            failure(
+                                ErrorKind::Limit,
+                                self.offset.get(),
+                                "global PAX metadata exceeds limit",
+                            ),
+                        )
+                    }
+                    self.globals.set(combined);
+                } else {
+                    local.extend(records)
+                }
+                continue
+            }
+            let kind = match flag {
+                0 | b'0' => EntryKind::File,
+                b'5' => EntryKind::Directory,
+                b'2' => EntryKind::Symlink,
+                b'1' => EntryKind::Hardlink,
+                _ => return Result::Err(
+                    failure(ErrorKind::Unsupported, self.offset.get(), "unsupported tar entry type"),
+                ),
+            };
+            let prefix = tar_string(block, 345, 155)?;
+            let name = tar_string(block, 0, 100)?;
+            let path = if prefix == "" {
+                name
+            } else {
+                prefix + "/" + name
+            };
+            let timestamp = tar_octal(block, 136, 12)?;
+            if timestamp > 9223372036854775807 {
+                return Result::Err(
+                    failure(ErrorKind::Invalid, self.offset.get(), "timestamp overflow"),
+                )
+            }
+            let mut header = Header {
+                path,
+                kind,
+                mode: tar_octal(block, 100, 8)?.to_u32(),
+                uid: tar_octal(block, 108, 8)?,
+                gid: tar_octal(block, 116, 8)?,
+                modified: timestamp.to_i64(),
+                user: tar_string(block, 265, 32)?,
+                group: tar_string(block, 297, 32)?,
+                link: tar_string(block, 157, 100)?,
+                comment: "",
+                pax: Vec::new(),
+            };
+            let mut size = size_raw;
+            let records = self.globals.get().copy();
+            records.extend(local);
+            for (key, value) in records {
+                match key {
+                    "path" => {
+                        header = Header { path: value, ..header };
+                    },
+                    "linkpath" => {
+                        header = Header { link: value, ..header };
+                    },
+                    "uname" => {
+                        header = Header { user: value, ..header };
+                    },
+                    "gname" => {
+                        header = Header { group: value, ..header };
+                    },
+                    "uid" => {
+                        header = Header { uid: decimal(value)?, ..header };
+                    },
+                    "gid" => {
+                        header = Header { gid: decimal(value)?, ..header };
+                    },
+                    "size" => {
+                        size = decimal(value)?;
+                    },
+                    "mtime" => {
+                        let pieces = value.split(".");
+                        let whole = decimal(pieces[0])?;
+                        if whole > 9223372036854775807 {
+                            return Result::Err(
+                                failure(ErrorKind::Invalid, self.offset.get(), "timestamp overflow"),
+                            )
+                        }
+                        header = Header { modified: whole.to_i64(), ..header };
+                    },
+                    _ => header.pax.push((key, value)),
+                }
+            }
+            if size > self.limits.max_entry_bytes.to_u64()
+                || size > (self.limits.max_total_bytes - self.total.get()).to_u64()
+                || self.count.get() >= self.limits.max_entries {
+                return Result::Err(
+                    failure(ErrorKind::Limit, self.offset.get(), "tar entry exceeds limit"),
+                )
+            }
+            let data = self.read_bytes(size.to_isize())?;
+            let _ = self.read_bytes((512 - size.to_isize() % 512) % 512)?;
+            let entry = Entry { header, data };
+            validate_entry(entry, self.limits)?;
+            self.count.set(self.count.get() + 1);
+            self.total.set(self.total.get() + data.len());
+            return Result::Ok(Option::Some(entry))
+        }
+    }
+}
+
+pub fn encode_tar(entries: Vec[Entry], limits: Limits) -> Result[bytes::Bytes, Error] {
+    let output = io::Cursor::new(bytes::Bytes::new());
+    let writer = TarWriter::new(output, limits)?;
+    for entry in entries {
+        writer.append(entry)?
+    }
+    writer.finish()?;
+    Result::Ok(output.bytes())
+}
+
+pub fn decode_tar(data: bytes::Bytes, limits: Limits) -> Result[Vec[Entry], Error] {
+    if data.len() > limits.max_archive_bytes {
+        return Result::Err(failure(ErrorKind::Limit, 0, "archive exceeds limit"))
+    }
+    let cursor = io::Cursor::new(data);
+    let reader = TarReader::new(cursor, limits)?;
+    let entries = Vec::new();
+    while let Some(entry) = reader.next()? {
+        entries.push(entry)
+    }
+    for index in cursor.position()..data.len() {
+        if data.get(index) != 0 {
+            return Result::Err(failure(ErrorKind::Invalid, index, "trailing tar data"))
+        }
+    }
+    Result::Ok(entries)
+}
+
+pub fn encode_tar_gz(entries: Vec[Entry], limits: Limits) -> Result[bytes::Bytes, Error] {
+    gzip(encode_tar(entries, limits)?)
+}
+
+pub fn decode_tar_gz(data: bytes::Bytes, limits: Limits) -> Result[Vec[Entry], Error] {
+    limits.validate()?;
+    if data.len() > limits.max_archive_bytes {
+        return Result::Err(failure(ErrorKind::Limit, 0, "gzip exceeds archive limit"))
+    }
+    decode_tar(gunzip(data, limits.max_archive_bytes)?, limits)
+}

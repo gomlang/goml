@@ -1,0 +1,273 @@
+package config;
+
+use std::json;
+use std::text;
+use std::collections;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ErrorKind {
+    InvalidOptions,
+    Parse,
+    Io,
+    Path,
+    Missing,
+    Type,
+    Duplicate,
+    Limit,
+    Validation,
+    Watch,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Origin {
+    pub source: string,
+    pub detail: string,
+}
+
+#[derive(Debug)]
+pub struct Error {
+    pub kind: ErrorKind,
+    pub path: string,
+    pub origin: Origin,
+    pub message: string,
+}
+
+impl Error {
+    pub fn new(kind: ErrorKind, path: string, origin: Origin, message: string) -> Error {
+        Error { kind, path, origin, message }
+    }
+}
+
+impl ToString for Error {
+    fn to_string(self: Error) -> string {
+        self.kind.debug() + " at " + self.path + " (" + self.origin.source + ": "
+            + self.origin.detail
+            + "): "
+            + self.message
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ArrayMerge {
+    Replace,
+    Append,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Format {
+    Json,
+    Toml,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ValueMode {
+    String,
+    Json,
+    Auto,
+}
+
+#[derive(Debug)]
+pub struct Limits {
+    pub max_source_bytes: isize,
+    pub max_total_bytes: isize,
+    pub max_nodes: isize,
+    pub max_depth: isize,
+    pub max_sources: isize,
+}
+
+impl Limits {
+    pub fn new() -> Limits {
+        Limits {
+            max_source_bytes: 1048576,
+            max_total_bytes: 4194304,
+            max_nodes: 100000,
+            max_depth: 64,
+            max_sources: 128,
+        }
+    }
+
+    fn validate(self: Limits) -> Result[(), Error] {
+        if self.max_source_bytes < 1 || self.max_total_bytes < 1 || self.max_nodes < 1
+            || self.max_depth < 1
+            || self.max_depth > 128
+            || self.max_sources < 1 {
+            Result::Err(
+                failure(ErrorKind::InvalidOptions, "limits must be positive and depth <= 128"),
+            )
+        } else {
+            Result::Ok(())
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct EnvOptions {
+    pub prefix: string,
+    pub separator: string,
+    pub lowercase: bool,
+    pub mode: ValueMode,
+}
+
+impl EnvOptions {
+    pub fn new(prefix: string) -> EnvOptions {
+        EnvOptions { prefix, separator: "__", lowercase: true, mode: ValueMode::Auto }
+    }
+}
+
+enum Kind {
+    Null,
+    Bool(bool),
+    Number(string),
+    String(string),
+    Array(Vec[Node]),
+    Object(Vec[(string, Node)]),
+}
+
+struct Node {
+    kind: Kind,
+    origin: Origin,
+}
+
+fn anonymous() -> Origin {
+    Origin { source: "config", detail: "" }
+}
+
+fn failure(kind: ErrorKind, message: string) -> Error {
+    Error::new(kind, "", anonymous(), message)
+}
+
+fn path_join(parent: string, part: string) -> string {
+    parent + "/" + text::replace(text::replace(part, "~", "~0"), "/", "~1")
+}
+
+fn pointer(path: string) -> Result[Vec[string], Error] {
+    let result = Vec::new();
+    if path == "" {
+        return Result::Ok(result)
+    }
+    if !path.starts_with("/") {
+        return Result::Err(
+            Error::new(ErrorKind::Path, path, anonymous(), "expected JSON Pointer beginning with /"),
+        )
+    }
+    for part in text::split(path.byte_slice(1, path.byte_len()), "/") {
+        let mut offset = 0;
+        while offset < part.byte_len() {
+            if part.byte_get(offset) == 126 {
+                if offset + 1 >= part.byte_len()
+                    || (part.byte_get(offset + 1) != 48 && part.byte_get(offset + 1) != 49) {
+                    return Result::Err(
+                        Error::new(
+                            ErrorKind::Path,
+                            path,
+                            anonymous(),
+                            "invalid JSON Pointer escape",
+                        ),
+                    )
+                }
+                offset += 1;
+            }
+            offset += 1;
+        }
+        result.push(text::replace(text::replace(part, "~1", "/"), "~0", "~"));
+    }
+    Result::Ok(result)
+}
+
+fn json_node(
+    value: json::Value,
+    origin: Origin,
+    path: string,
+    depth: isize,
+    limits: Limits,
+    count: Ref[isize],
+) -> Result[Node, Error] {
+    if depth > limits.max_depth || count.get() >= limits.max_nodes {
+        return Result::Err(
+            Error::new(ErrorKind::Limit, path, origin, "configuration node or depth limit exceeded"),
+        )
+    }
+    count.set(count.get() + 1);
+    let kind = match value {
+        json::Value::Null => Kind::Null,
+        json::Value::Bool(value) => Kind::Bool(value),
+        json::Value::Number(value) => Kind::Number(value),
+        json::Value::String(value) => Kind::String(value),
+        json::Value::Array(values) => {
+            let result = Vec::new();
+            for index in 0..values.len() {
+                result.push(
+                    json_node(
+                        values[index],
+                        origin,
+                        path_join(path, index.to_string()),
+                        depth + 1,
+                        limits,
+                        count,
+                    )?,
+                );
+            }
+            Kind::Array(result)
+        },
+        json::Value::Object(fields) => {
+            let result = Vec::new();
+            let seen = HashMap::new();
+            for (name, value) in fields {
+                let child_path = path_join(path, name);
+                if seen.get(name).is_some() {
+                    return Result::Err(
+                        Error::new(ErrorKind::Duplicate, child_path, origin, "duplicate object key"),
+                    )
+                }
+                seen.set(name, true);
+                result.push((name, json_node(value, origin, child_path, depth + 1, limits, count)?));
+            }
+            Kind::Object(result)
+        },
+    };
+    Result::Ok(Node { kind, origin })
+}
+
+fn node_json(node: Node) -> json::Value {
+    match node.kind {
+        Kind::Null => json::Value::Null,
+        Kind::Bool(value) => json::Value::Bool(value),
+        Kind::Number(value) => json::Value::Number(value),
+        Kind::String(value) => json::Value::String(value),
+        Kind::Array(values) => {
+            let result = Vec::new();
+            for value in values {
+                result.push(node_json(value));
+            }
+            json::Value::Array(result)
+        },
+        Kind::Object(fields) => {
+            let result = Vec::new();
+            for (key, value) in fields {
+                result.push((key, node_json(value)));
+            }
+            collections::stable_sort_by(
+                result,
+                |left, right| if left.0 < right.0 {
+                    -1
+                } else if left.0 == right.0 {
+                    0
+                } else {
+                    1
+                },
+            );
+            json::Value::Object(result)
+        },
+    }
+}
+
+fn empty_node(origin: Origin) -> Node {
+    Node { kind: Kind::Object(Vec::new()), origin }
+}
+
+fn object_fields(node: Node, path: string) -> Result[Vec[(string, Node)], Error] {
+    match node.kind {
+        Kind::Object(fields) => Result::Ok(fields),
+        _ => Result::Err(Error::new(ErrorKind::Type, path, node.origin, "expected an object")),
+    }
+}

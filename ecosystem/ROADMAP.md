@@ -61,6 +61,22 @@ The Explorer example composes the libraries with `walkdir` and `notify`.
 Verification uses independent registry consumers, official/reference data,
 pseudo-terminals and race checks where relevant. CI integration remains deferred.
 
+## Application libraries batch
+
+| Module | Added |
+| --- | --- |
+| fuzzy | Unicode case-folded matching, original grapheme ranges, explicit anchored modes, bounded maximum-score DP, stable Top-K, immutable incremental search sessions and parallel cancellation |
+| config | Layered sources, typed Serde, JSON Pointer overrides, array policies, provenance, validators, immutable concurrent snapshots and caller-driven inotify reloads |
+| websocket | Shared RFC 6455 protocol core, client/server handshakes, strict frames, fragmented UTF-8, control/close states, queue bounds and concurrent cancellable TCP/TLS I/O |
+| highlight | Extensible logos grammars, built-in language scopes, nested/multiline state, embedded Markdown code, immutable incremental documents and bounded ANSI/HTML renderers |
+| archive | USTAR/PAX and classic ZIP read/write, CRC32, bounded standard I/O, Deflate/GZIP adapters, metadata, rooted extraction and GNU/Info-ZIP interoperability |
+| metrics | Concurrent metric handles, checked counters/gauges/histograms, consistent snapshots, registration/cardinality policies, atomic gauge collection, timers and Prometheus text output |
+| csv | Standard reader/writer streaming, configurable dialects and quoting, multiline fields, BOM and header policies, byte/UTF-8 records, positions, resource bounds and typed Serde schemas |
+| bench | Adaptive warmup/sampling, setup exclusion, checked monotonic clocks, bootstrap intervals, outlier statistics, baseline comparisons, throughput and standalone JSON/HTML reports |
+
+The batch uses native GoML tests and independent versioned consumers. Local
+verification includes race checks; no CI workflow was added.
+
 ## Remaining work
 
 | Module | Remaining capabilities |
@@ -81,11 +97,11 @@ pseudo-terminals and race checks where relevant. CI integration remains deferred
 | bitflags | Associated-constant or operator syntax depends on language support; Serde wrappers support explicit or format-sensitive representations; arbitrary declaration expressions and generic storage newtypes are not generated |
 | logos | Compile-time derive/DFA generation, streaming/byte input, named subpatterns and broader Unicode regex properties; current runtime NFA reports equal-priority ambiguity during matching |
 | tempfile | Platforms beyond Linux amd64, cancellation-aware file operations, crash-durable persistence helpers; cleanup assumes no hostile concurrent filesystem changes |
-| reqwest | Streaming requests/responses, HTTP/3, WebSocket, full domain-cookie policy, custom DNS, application retries and middleware; the synchronous API buffers within explicit limits |
+| reqwest | Streaming requests/responses, HTTP/3, an adapter to the separate websocket library, full domain-cookie policy, custom DNS, application retries and middleware; the synchronous API buffers within explicit limits |
 | llvm | JIT execution, cross-target configuration, debug metadata, atomics, exception handling and broader LLVM instruction/API coverage; the initial binding targets LLVM 18 and native object generation |
 | incremental | Parallel branch evaluation, immutable database snapshots, persistent caches, durability classes and cycle fixed-point recovery; current root operations serialize and callbacks use scoped Evaluation handles |
 | rope | Grapheme and reverse iterators, search, editing history, optional Unicode newline policies and memory-mapped backing; current storage is persistent UTF-8 with LF/CRLF/CR line semantics |
-| web | TLS listeners, HTTP/2 and HTTP/3, WebSocket, multipart extraction, static files, compression and bundled CORS middleware; current adapter serves HTTP/1.1 with streaming and SSE |
+| web | TLS listeners, HTTP/2 and HTTP/3, an upgrade adapter to the separate websocket library, multipart extraction, static files, compression and bundled CORS middleware; current adapter serves HTTP/1.1 with streaming and SSE |
 | bigint | Faster multiplication/division for very large operands, primality and modular inverses, roots and rational arithmetic; ordinary arithmetic allocates proportionally to results while input/shift/power operations have explicit budgets |
 | tracing | Distributed trace propagation, OpenTelemetry exporters, richer sampling, byte-budget admission and instrumentation syntax; contexts are explicit and arbitrary sink callbacks must cooperate with shutdown |
 | datetime | Arbitrary-pattern parsing, localization, recurrence scheduling and automatic timezone-data updates; dates cover Gregorian years 1–9999 and timestamps use POSIX seconds without leap records |
@@ -98,10 +114,18 @@ pseudo-terminals and race checks where relevant. CI integration remains deferred
 | ansi | Screen emulation, single-byte C1 mode, extended underline styles/colors and terminal-specific palette discovery |
 | terminal | Additional operating systems, portable signal subscriptions and suspend/resume, Kitty keyboard/modifyOtherKeys, broader terminfo negotiation; current resize detection uses bounded polling |
 | tui | Configurable font/terminal width policies, soft-wrapped persistent editing, system clipboard, widget mouse-hit routing and graphics protocols |
-| prompt | Fuzzy/ranked completion menus, date/file pickers and batch-mode policies; current callbacks are synchronous and password values are ordinary GC strings |
+| prompt | Ranked completion-menu integration with the separate fuzzy library, date/file pickers and batch-mode policies; current callbacks are synchronous and password values are ordinary GC strings |
 | progress | Byte-stream adapters, recursive job trees, pause/resume accounting and arbitrary format templates; applications explicitly drive ticks |
 | diagnostics | Bidi/font shaping, richer graphical label routing and persistent source revisions; edit application returns checked new text without writing files |
-| tui_markdown | Full GFM extensions and syntax highlighting integrations; terminal rendering and optional pipe tables do not change the CommonMark parser's scope |
+| tui_markdown | Full GFM extensions and integration with the separate highlight library; terminal rendering and optional pipe tables do not change the CommonMark parser's scope |
+| fuzzy | Canonical normalization, accent/transliteration policies, richer query expressions and faster very-large Top-K; scores are library-specific and DP matrix limits are explicit |
+| config | Interpolation, additional format/secret providers, debounce/background scheduling and line/column provenance; file reload targets Linux and TOML inherits the standard parser's scope |
+| websocket | Compression extensions, HTTP/2 CONNECT, proxy/redirect integrations and Autobahn certification; the core currently implements RFC 6455 without extensions |
+| highlight | Semantic scopes, full Markdown inline/block semantics, interpolated-expression scopes and TextMate/Sublime grammar compatibility; source copying remains linear despite lexical suffix reuse |
+| archive | ZIP64, additional compression/encryption, GNU sparse/base-256/longname extensions and fully streaming decompression; ZIP indexing and GZIP convenience APIs are bounded in-memory operations |
+| metrics | OpenMetrics/native histograms, distributed exporters, automatic runtime instrumentation and sharded update paths; registry operations currently serialize for consistent snapshots |
+| csv | Asynchronous I/O, indexing/seeking, additional escape dialects and nested Serde structures; typed flat rows use an explicit scalar schema and stream operations are synchronous |
+| bench | Allocation/CPU counters, plotting dashboards, process isolation and automated baseline selection; timings include Go runtime effects, cancellation is cooperative and input barriers support scalar values |
 
 Further work should preserve resource bounds, recoverable errors, normal
 versioned dependency consumption and the independent reference checks already

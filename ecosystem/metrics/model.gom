@@ -1,0 +1,361 @@
+package metrics;
+
+use std::math;
+use std::num::{ToFloat};
+
+#[derive(Debug, PartialEq)]
+pub enum ErrorKind {
+    InvalidName,
+    InvalidLabels,
+    InvalidValue,
+    InvalidBuckets,
+    Conflict,
+    Limit,
+    Overflow,
+    Detached,
+    Cancelled,
+    Timeout,
+    Finished,
+}
+
+#[derive(Debug)]
+pub struct Error {
+    pub kind: ErrorKind,
+    pub message: string,
+}
+
+impl ToString for Error {
+    fn to_string(self: Error) -> string {
+        self.message
+    }
+}
+
+fn error(kind: ErrorKind, message: string) -> Error {
+    Error { kind, message }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Kind {
+    Counter,
+    Gauge,
+    Histogram,
+}
+
+pub struct Options {
+    pub max_families: isize,
+    pub max_series: isize,
+    pub max_series_per_family: isize,
+    pub max_labels: isize,
+    pub max_label_value_bytes: isize,
+    pub max_name_bytes: isize,
+    pub max_help_bytes: isize,
+    pub max_buckets: isize,
+}
+
+impl Options {
+    pub fn standard() -> Options {
+        Options {
+            max_families: 1024,
+            max_series: 10000,
+            max_series_per_family: 1024,
+            max_labels: 16,
+            max_label_value_bytes: 1024,
+            max_name_bytes: 256,
+            max_help_bytes: 4096,
+            max_buckets: 256,
+        }
+    }
+
+    fn validate(self: Options) -> Result[(), Error] {
+        if self.max_families < 1 || self.max_series < 1 || self.max_series_per_family < 1
+            || self.max_labels < 0
+            || self.max_label_value_bytes < 0
+            || self.max_name_bytes < 1
+            || self.max_help_bytes < 0
+            || self.max_buckets < 1 {
+            Result::Err(error(ErrorKind::Limit, "invalid registry limits"))
+        } else {
+            Result::Ok(())
+        }
+    }
+}
+
+fn name_valid(value: string, metric: bool) -> bool {
+    if value.byte_len() == 0 || value.starts_with_at(0, "__") {
+        return false
+    }
+    let bytes = value.to_bytes();
+    for index in 0..bytes.len() {
+        let value = bytes[index];
+        if !((value >= b'a' && value <= b'z') || (value >= b'A' && value <= b'Z') || value == b'_'
+            || (metric && value == b':')
+            || (index > 0 && value >= b'0' && value <= b'9')) {
+            return false
+        }
+    }
+    true
+}
+
+fn sorted_names(names: Vec[string]) -> Result[Vec[string], Error] {
+    let result = names.copy();
+    for index in 0..result.len() {
+        if !name_valid(result[index], false) {
+            return Result::Err(error(ErrorKind::InvalidLabels, "invalid or reserved label name"))
+        }
+        let mut at = index;
+        while at > 0 && result[at] < result[at - 1] {
+            let value = result[at];
+            result[at] = result[at - 1];
+            result[at - 1] = value;
+            at -= 1;
+        }
+    }
+    for index in 1..result.len() {
+        if result[index] == result[index - 1] {
+            return Result::Err(error(ErrorKind::InvalidLabels, "duplicate label name"))
+        }
+    }
+    Result::Ok(result)
+}
+
+#[derive(PartialEq)]
+pub struct Label {
+    pub name: string,
+    pub value: string,
+}
+
+pub struct Labels {
+    values: Vec[Label],
+}
+
+impl Labels {
+    pub fn empty() -> Labels {
+        Labels { values: Vec::new() }
+    }
+
+    pub fn new(values: Vec[(string, string)]) -> Result[Labels, Error] {
+        let keys = Vec::new();
+        for (name, _) in values {
+            keys.push(name);
+        }
+        let keys = sorted_names(keys)?;
+        let result = Vec::new();
+        for key in keys {
+            for (name, value) in values {
+                if key == name {
+                    result.push(Label { name, value });
+                }
+            }
+        }
+        Result::Ok(Labels { values: result })
+    }
+
+    pub fn entries(self: Labels) -> Vec[Label] {
+        self.values.copy()
+    }
+
+    pub fn get(self: Labels, name: string) -> Option[string] {
+        for entry in self.values {
+            if entry.name == name {
+                return Option::Some(entry.value)
+            }
+        }
+        Option::None
+    }
+}
+
+pub struct Descriptor {
+    pub name: string,
+    pub help: string,
+    pub unit: string,
+    pub kind: Kind,
+    pub label_names: Vec[string],
+    pub buckets: Vec[f64],
+}
+
+impl Descriptor {
+    pub fn counter(name: string, help: string) -> Descriptor {
+        Descriptor {
+            name,
+            help,
+            unit: "",
+            kind: Kind::Counter,
+            label_names: Vec::new(),
+            buckets: Vec::new(),
+        }
+    }
+
+    pub fn gauge(name: string, help: string) -> Descriptor {
+        Descriptor { kind: Kind::Gauge, ..Descriptor::counter(name, help) }
+    }
+
+    pub fn histogram(name: string, help: string, buckets: Vec[f64]) -> Descriptor {
+        Descriptor {
+            kind: Kind::Histogram,
+            buckets: buckets.copy(),
+            ..Descriptor::counter(name, help),
+        }
+    }
+
+    pub fn with_labels(self: Descriptor, names: Vec[string]) -> Descriptor {
+        Descriptor { label_names: names.copy(), ..self }
+    }
+
+    pub fn with_unit(self: Descriptor, unit: string) -> Descriptor {
+        Descriptor { unit, ..self }
+    }
+
+    fn validate(self: Descriptor, options: Options) -> Result[Descriptor, Error] {
+        if !name_valid(self.name, true) || self.name.byte_len() > options.max_name_bytes
+            || (self.unit != "" && !name_valid(self.unit, false))
+            || self.unit.byte_len() > options.max_name_bytes {
+            return Result::Err(error(ErrorKind::InvalidName, "invalid metric name or unit"))
+        }
+        if self.help.byte_len() > options.max_help_bytes
+            || self.label_names.len() > options.max_labels
+            || self.buckets.len() > options.max_buckets {
+            return Result::Err(
+                error(ErrorKind::Limit, "metric descriptor exceeds configured limits"),
+            )
+        }
+        let names = sorted_names(self.label_names)?;
+        for name in names {
+            if name.byte_len() > options.max_name_bytes {
+                return Result::Err(error(ErrorKind::Limit, "label name exceeds byte limit"))
+            }
+            if self.kind == Kind::Histogram && name == "le" {
+                return Result::Err(
+                    error(ErrorKind::InvalidLabels, "histogram reserves the le label"),
+                )
+            }
+        }
+        if self.kind != Kind::Histogram && self.buckets.len() > 0 {
+            return Result::Err(error(ErrorKind::InvalidBuckets, "only histograms define buckets"))
+        }
+        for index in 0..self.buckets.len() {
+            if !math::is_finite(self.buckets[index])
+                || (index > 0 && self.buckets[index] <= self.buckets[index - 1]) {
+                return Result::Err(
+                    error(
+                        ErrorKind::InvalidBuckets,
+                        "histogram boundaries must be finite and strictly increasing",
+                    ),
+                )
+            }
+        }
+        Result::Ok(Descriptor { label_names: names, buckets: self.buckets.copy(), ..self })
+    }
+
+    fn copy(self: Descriptor) -> Descriptor {
+        Descriptor { label_names: self.label_names.copy(), buckets: self.buckets.copy(), ..self }
+    }
+}
+
+fn compatible(left: Descriptor, right: Descriptor) -> bool {
+    left.name == right.name && left.help == right.help && left.unit == right.unit
+        && left.kind == right.kind
+        && left.label_names == right.label_names
+        && left.buckets == right.buckets
+}
+
+fn sample_names(descriptor: Descriptor) -> Vec[string] {
+    if descriptor.kind == Kind::Histogram {
+        Vec::from_array(
+            [
+                descriptor.name,
+                descriptor.name + "_bucket",
+                descriptor.name + "_sum",
+                descriptor.name + "_count",
+            ],
+        )
+    } else {
+        Vec::from_array([descriptor.name])
+    }
+}
+
+pub struct HistogramValue {
+    pub boundaries: Vec[f64],
+    pub cumulative: Vec[u64],
+    pub count: u64,
+    pub sum: f64,
+}
+
+impl HistogramValue {
+    fn copy(self: HistogramValue) -> HistogramValue {
+        HistogramValue {
+            boundaries: self.boundaries.copy(),
+            cumulative: self.cumulative.copy(),
+            ..self,
+        }
+    }
+}
+
+pub enum Value {
+    Counter(u64),
+    Gauge(f64),
+    Histogram(HistogramValue),
+}
+
+impl Value {
+    fn copy(self: Value) -> Value {
+        match self {
+            Counter(value) => Value::Counter(value),
+            Gauge(value) => Value::Gauge(value),
+            Histogram(value) => Value::Histogram(value.copy()),
+        }
+    }
+}
+
+pub struct Sample {
+    pub labels: Vec[Label],
+    pub value: Value,
+}
+
+pub struct FamilySnapshot {
+    pub descriptor: Descriptor,
+    pub samples: Vec[Sample],
+}
+
+pub struct Snapshot {
+    families_value: Vec[FamilySnapshot],
+}
+
+pub fn linear_buckets(start: f64, width: f64, count: isize) -> Result[Vec[f64], Error] {
+    if !math::is_finite(start) || !math::is_finite(width) || width <= 0.0 || count < 1
+        || count > 10000 {
+        return Result::Err(error(ErrorKind::InvalidBuckets, "invalid linear bucket parameters"))
+    }
+    let values = Vec::new();
+    for index in 0..count {
+        let next = start + width * index.to_f64();
+        if !math::is_finite(next) || (index > 0 && next <= values[index - 1]) {
+            return Result::Err(
+                error(ErrorKind::InvalidBuckets, "linear buckets overflow or lose precision"),
+            )
+        }
+        values.push(next);
+    }
+    Result::Ok(values)
+}
+
+pub fn exponential_buckets(start: f64, factor: f64, count: isize) -> Result[Vec[f64], Error] {
+    if !math::is_finite(start) || !math::is_finite(factor) || start <= 0.0 || factor <= 1.0
+        || count < 1
+        || count > 10000 {
+        return Result::Err(
+            error(ErrorKind::InvalidBuckets, "invalid exponential bucket parameters"),
+        )
+    }
+    let values = Vec::new();
+    let mut next = start;
+    for index in 0..count {
+        if !math::is_finite(next) || (index > 0 && next <= values[index - 1]) {
+            return Result::Err(
+                error(ErrorKind::InvalidBuckets, "exponential buckets overflow or lose precision"),
+            )
+        }
+        values.push(next);
+        next *= factor;
+    }
+    Result::Ok(values)
+}

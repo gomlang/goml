@@ -1,0 +1,503 @@
+package csv;
+
+use std::bytes;
+use std::io;
+use io::Read;
+use std::serde;
+
+pub struct Reader[R] {
+    reader: R,
+    options: ReadOptions,
+    gate: Channel[()],
+    buffer: bytes::Bytes,
+    offset: Ref[isize],
+    length: Ref[isize],
+    position: Ref[Position],
+    previous_cr: Ref[bool],
+    eof: Ref[bool],
+    initialized: Ref[bool],
+    pending: Ref[Vec[(byte, Position)]],
+    pending_offset: Ref[isize],
+    failure: Ref[Option[Error]],
+    headers_ready: Ref[bool],
+    header: Ref[Option[StringRecord]],
+    width: Ref[Option[isize]],
+}
+
+impl[R: Read] Reader[R] {
+    pub fn new(reader: R, options: ReadOptions) -> Result[Reader[R], Error] {
+        options.validate()?;
+        let buffer = bytes::Bytes::new();
+        for _ in 0..options.buffer_size {
+            buffer.push(0);
+        }
+        let gate = Channel::new(1);
+        gate.send(());
+        Result::Ok(
+            Reader {
+                reader,
+                options,
+                gate,
+                buffer,
+                offset: Ref::new(0),
+                length: Ref::new(0),
+                position: Ref::new(Position::start()),
+                previous_cr: Ref::new(false),
+                eof: Ref::new(false),
+                initialized: Ref::new(false),
+                pending: Ref::new(Vec::new()),
+                pending_offset: Ref::new(0),
+                failure: Ref::new(Option::None),
+                headers_ready: Ref::new(false),
+                header: Ref::new(Option::None),
+                width: Ref::new(Option::None),
+            },
+        )
+    }
+
+    fn raw_byte(self: Reader[R]) -> Result[Option[(byte, Position)], Error] {
+        if self.offset.get() == self.length.get() {
+            if self.eof.get() {
+                return Result::Ok(Option::None)
+            }
+            let remaining = self.options.limits.max_total_bytes - self.position.get().byte;
+            let capacity = if remaining < self.buffer.len() {
+                remaining + 1
+            } else {
+                self.buffer.len()
+            };
+            let count = loop {
+                match self.reader.read(self.buffer.slice_mut(0, capacity)) {
+                    Ok(count) => break count,
+                    Err(cause) if cause.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(cause) => return Result::Err(io_error(self.position.get(), cause)),
+                }
+            };
+            if count < 0 || count > capacity {
+                return Result::Err(
+                    error(
+                        ErrorKind::Io,
+                        self.position.get(),
+                        Option::None,
+                        "reader returned an invalid byte count",
+                    ),
+                )
+            }
+            self.offset.set(0);
+            self.length.set(count);
+            if count == 0 {
+                self.eof.set(true);
+                return Result::Ok(Option::None)
+            }
+        }
+        let position = self.position.get();
+        if position.byte >= self.options.limits.max_total_bytes {
+            return Result::Err(
+                error(ErrorKind::Limit, position, Option::None, "total input byte limit exceeded"),
+            )
+        }
+        let value = self.buffer.get(self.offset.get());
+        self.offset.set(self.offset.get() + 1);
+        let mut next = Position { byte: position.byte + 1, ..position };
+        if value == 13 {
+            next.line += 1;
+            next.column = 1;
+        } else if value == 10 {
+            if !self.previous_cr.get() {
+                next.line += 1;
+            }
+            next.column = 1;
+        } else {
+            next.column += 1;
+        }
+        self.previous_cr.set(value == 13);
+        self.position.set(next);
+        Result::Ok(Option::Some((value, position)))
+    }
+
+    fn initialize(self: Reader[R]) -> Result[(), Error] {
+        if self.initialized.get() {
+            return Result::Ok(())
+        }
+        self.initialized.set(true);
+        if !self.options.strip_bom {
+            return Result::Ok(())
+        }
+        let prefix = Vec::new();
+        for expected in Vec::from_array([239.to_u8(), 187.to_u8(), 191.to_u8()]) {
+            match self.raw_byte()? {
+                Some(item) => {
+                    prefix.push(item);
+                    if item.0 != expected {
+                        self.pending.set(prefix);
+                        return Result::Ok(())
+                    }
+                },
+                None => {
+                    self.pending.set(prefix);
+                    return Result::Ok(())
+                },
+            }
+        }
+        Result::Ok(())
+    }
+
+    fn next_byte(self: Reader[R]) -> Result[Option[(byte, Position)], Error] {
+        let pending = self.pending.get();
+        let index = self.pending_offset.get();
+        if index < pending.len() {
+            self.pending_offset.set(index + 1);
+            let item = pending[index];
+            Result::Ok(
+                Option::Some((item.0, Position { record: self.position.get().record, ..item.1 })),
+            )
+        } else {
+            self.raw_byte()
+        }
+    }
+
+    fn unget(self: Reader[R], item: (byte, Position)) -> () {
+        self.pending.set(Vec::from_array([item]));
+        self.pending_offset.set(0);
+    }
+
+    fn current(self: Reader[R]) -> Position {
+        let pending = self.pending.get();
+        let index = self.pending_offset.get();
+        if index < pending.len() {
+            Position { record: self.position.get().record, ..pending[index].1 }
+        } else {
+            self.position.get()
+        }
+    }
+
+    fn finish_record(
+        self: Reader[R],
+        fields: Vec[Field],
+        data: Vec[byte],
+        raw: Vec[byte],
+        field_position: Position,
+        start: Position,
+    ) -> Result[ByteRecord, Error] {
+        push_field(fields, data, raw, field_position, self.options)?;
+        self.position.set(Position { record: start.record + 1, ..self.position.get() });
+        Result::Ok(ByteRecord { fields, position: start })
+    }
+
+    fn record(self: Reader[R]) -> Result[Option[(ByteRecord, bool)], Error] {
+        if let Some(failure) = self.failure.get() {
+            return Result::Err(failure)
+        }
+        self.initialize()?;
+        let start = self.current();
+        let fields = Vec::new();
+        let mut data = Vec::new();
+        let mut raw = Vec::new();
+        let mut field_position = start;
+        let mut state = 0;
+        let mut consumed = 0;
+        loop {
+            let item = self.next_byte()?;
+            let (value, position) = match item {
+                Some(item) => item,
+                None => {
+                    if consumed == 0 {
+                        return Result::Ok(Option::None)
+                    }
+                    if state == 2 && self.options.strict {
+                        return Result::Err(
+                            error(
+                                ErrorKind::Syntax,
+                                self.current(),
+                                Option::Some(fields.len()),
+                                "unterminated quoted field",
+                            ),
+                        )
+                    }
+                    return self.finish_record(fields, data, raw, field_position, start).map(
+                        |record| Option::Some((record, false)),
+                    )
+                },
+            };
+            consumed += 1;
+            if start.record > self.options.limits.max_records
+                || consumed > self.options.limits.max_record_bytes {
+                return Result::Err(
+                    error(
+                        ErrorKind::Limit,
+                        position,
+                        Option::Some(fields.len()),
+                        "record count or byte limit exceeded",
+                    ),
+                )
+            }
+            if state != 2 {
+                let terminates = match self.options.terminator {
+                    Terminator::Any => value == 10 || value == 13,
+                    Terminator::CrLf => value == 13,
+                    Terminator::Byte(expected) => value == expected,
+                };
+                if terminates {
+                    if value == 13 && self.options.terminator != Terminator::Byte(13) {
+                        match self.next_byte() {
+                            Ok(Some((10, _))) => {
+                                consumed += 1;
+                                if consumed > self.options.limits.max_record_bytes {
+                                    return Result::Err(
+                                        error(
+                                            ErrorKind::Limit,
+                                            self.current(),
+                                            Option::Some(fields.len()),
+                                            "record byte limit exceeded",
+                                        ),
+                                    )
+                                }
+                            },
+                            Ok(Some(item)) if self.options.terminator == Terminator::Any => self.unget(
+                                item,
+                            ),
+                            Ok(None) if self.options.terminator == Terminator::Any => (),
+                            Err(failure) if self.options.terminator == Terminator::Any => self.failure.set(
+                                Option::Some(
+                                    Error {
+                                        position: Position {
+                                            record: start.record + 1,
+                                            ..failure.position,
+                                        },
+                                        ..failure,
+                                    },
+                                ),
+                            ),
+                            Err(failure) => return Result::Err(failure),
+                            _ => return Result::Err(
+                                error(
+                                    ErrorKind::Syntax,
+                                    position,
+                                    Option::Some(fields.len()),
+                                    "expected LF after record CR",
+                                ),
+                            ),
+                        }
+                    }
+                    let blank = fields.is_empty() && raw.is_empty();
+                    return self.finish_record(fields, data, raw, field_position, start).map(
+                        |record| Option::Some((record, blank)),
+                    )
+                }
+                if self.options.terminator == Terminator::CrLf && value == 10 {
+                    return Result::Err(
+                        error(
+                            ErrorKind::Syntax,
+                            position,
+                            Option::Some(fields.len()),
+                            "expected CRLF record terminator",
+                        ),
+                    )
+                }
+                if value == self.options.delimiter {
+                    push_field(fields, data, raw, field_position, self.options)?;
+                    data = Vec::new();
+                    raw = Vec::new();
+                    field_position = self.current();
+                    state = 0;
+                    continue
+                }
+            }
+            raw.push(value);
+            if state == 0 {
+                if value == self.options.quote {
+                    state = 2;
+                } else {
+                    data.push(value);
+                    state = 1;
+                }
+            } else if state == 1 {
+                if value == self.options.quote && self.options.strict {
+                    return Result::Err(
+                        error(
+                            ErrorKind::Syntax,
+                            position,
+                            Option::Some(fields.len()),
+                            "quote in an unquoted field",
+                        ),
+                    )
+                }
+                data.push(value);
+            } else if state == 2 {
+                if value == self.options.quote {
+                    state = 3;
+                } else {
+                    data.push(value);
+                }
+            } else if value == self.options.quote {
+                data.push(value);
+                state = 2;
+            } else if self.options.strict {
+                return Result::Err(
+                    error(
+                        ErrorKind::Syntax,
+                        position,
+                        Option::Some(fields.len()),
+                        "unexpected byte after closing quote",
+                    ),
+                )
+            } else {
+                data.push(value);
+                state = 1;
+            }
+            if data.len() > self.options.limits.max_field_bytes {
+                return Result::Err(
+                    error(
+                        ErrorKind::Limit,
+                        position,
+                        Option::Some(fields.len()),
+                        "field byte limit exceeded",
+                    ),
+                )
+            }
+        }
+    }
+
+    fn logical_record(self: Reader[R]) -> Result[Option[ByteRecord], Error] {
+        loop {
+            match self.record()? {
+                Some((record, blank)) => {
+                    if blank && self.options.skip_blank {
+                        continue
+                    }
+                    if let Some(width) = self.width.get() {
+                        if !self.options.flexible && record.len() != width {
+                            return Result::Err(
+                                error(
+                                    ErrorKind::Width,
+                                    record.position,
+                                    Option::None,
+                                    "record has " + record.len().to_string() + " fields; expected "
+                                        + width.to_string(),
+                                ),
+                            )
+                        }
+                    } else {
+                        self.width.set(Option::Some(record.len()));
+                    }
+                    return Result::Ok(Option::Some(record))
+                },
+                None => return Result::Ok(Option::None),
+            }
+        }
+    }
+
+    fn prepare_headers(self: Reader[R]) -> Result[(), Error] {
+        if self.headers_ready.get() {
+            return Result::Ok(())
+        }
+        self.headers_ready.set(true);
+        if self.options.headers {
+            if let Some(record) = self.logical_record()? {
+                let header = record.strings()?;
+                check_headers(header, self.options.duplicate_headers)?;
+                self.header.set(Option::Some(header));
+            }
+        }
+        Result::Ok(())
+    }
+
+    pub fn headers(self: Reader[R]) -> Result[Option[StringRecord], Error] {
+        let _ = self.gate.recv();
+        defer self.gate.send(());
+        if let Some(failure) = self.failure.get() {
+            return Result::Err(failure)
+        }
+        if let Err(failure) = self.prepare_headers() {
+            self.failure.set(Option::Some(failure));
+            return Result::Err(failure)
+        }
+        Result::Ok(self.header.get())
+    }
+
+    pub fn next_bytes(self: Reader[R]) -> Result[Option[ByteRecord], Error] {
+        let _ = self.gate.recv();
+        defer self.gate.send(());
+        if let Some(failure) = self.failure.get() {
+            return Result::Err(failure)
+        }
+        let result = self.prepare_headers().and_then(|_| self.logical_record());
+        if let Err(failure) = result {
+            self.failure.set(Option::Some(failure));
+        }
+        result
+    }
+
+    pub fn next(self: Reader[R]) -> Result[Option[StringRecord], Error] {
+        match self.next_bytes()? {
+            Some(record) => record.strings().map(|value| Option::Some(value)),
+            None => Result::Ok(Option::None),
+        }
+    }
+
+    pub fn decode_next[T: serde::Deserialize](self: Reader[R], schema: Schema) -> Result[
+        Option[T],
+        Error,
+    ] {
+        let header = self.headers()?;
+        match self.next()? {
+            Some(record) => schema.decode(record, header, self.options.duplicate_headers).map(
+                |value| Option::Some(value),
+            ),
+            None => Result::Ok(Option::None),
+        }
+    }
+}
+
+fn push_field(
+    fields: Vec[Field],
+    data: Vec[byte],
+    raw: Vec[byte],
+    position: Position,
+    options: ReadOptions,
+) -> Result[(), Error] {
+    if fields.len() >= options.limits.max_columns {
+        return Result::Err(
+            error(
+                ErrorKind::Limit,
+                position,
+                Option::Some(fields.len()),
+                "column count limit exceeded",
+            ),
+        )
+    }
+    let value = if options.trim {
+        let mut start = 0;
+        let mut end = data.len();
+        while start < end && (data[start] == 32 || data[start] == 9) {
+            start += 1;
+        }
+        while end > start && (data[end - 1] == 32 || data[end - 1] == 9) {
+            end -= 1;
+        }
+        data.as_slice().sub(start, end).to_vec()
+    } else {
+        data
+    };
+    fields.push(Field { data: value, raw, position });
+    Result::Ok(())
+}
+
+fn check_headers(header: StringRecord, policy: HeaderPolicy) -> Result[(), Error] {
+    let seen = HashMap::new();
+    for index in 0..header.len() {
+        let name = header.values[index];
+        if name == "" || policy == HeaderPolicy::Reject && seen.get(name).is_some() {
+            return Result::Err(
+                error(
+                    ErrorKind::Header,
+                    header.positions[index],
+                    Option::Some(index),
+                    "empty or duplicate header: " + name,
+                ),
+            )
+        }
+        seen.set(name, true);
+    }
+    Result::Ok(())
+}

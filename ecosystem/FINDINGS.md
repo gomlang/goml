@@ -420,3 +420,56 @@ visibility rule. The ecosystem batch does not alter compiler lowering;
 `TreeState::with_selection` performs the update inside its defining package,
 and the Explorer uses that public builder. The API's independent consumer and
 Explorer normal/race/PTY tests verify the working path.
+
+## Application libraries and composition
+
+The fuzzy, config, csv, websocket, highlight, archive, metrics and bench libraries use ordinary
+versioned modules. Unicode matching composes the standard full case fold with
+ecosystem grapheme segmentation; the normalized scalar positions must retain
+their original grapheme spans because folding can expand one character into
+several. Highlighting uses logos grammars and persistent line-state snapshots.
+Two hundred edit sequences compare incremental spans with complete re-highlighting.
+Public byte slicing requires both endpoints to be UTF-8 boundaries, including
+when testing a short ASCII delimiter against a multibyte character. Comparing
+delimiter bytes avoids constructing an invalid intermediate string slice.
+
+Standard I/O/context/TCP/TLS APIs are sufficient for a GoML RFC 6455 engine,
+including SHA-1 handshakes, separate read/write gates and recoverable queue
+backpressure. The archive format parsers, CRC32 and extraction planning are
+GoML; a narrow ordinary Go adapter supplies compression and the `os.Root`
+filesystem boundary. These adapters introduce no compiler runtime hooks.
+
+Concurrent metric handles use channels to serialize mutation and produce
+consistent detached snapshots; user collection callbacks execute outside the
+registry gate, then commit a validated batch atomically. CSV composes generic
+standard readers/writers with explicit scalar Serde schemas. Benchmark scheduling
+and statistics remain GoML, with a small atomic scalar adapter to prevent constant
+propagation through benchmark inputs and retain output values. Timing semantics
+include the Go runtime and must account for barrier and timer overhead.
+
+CSV character columns construct `serde::Value::Char` explicitly. The current
+standard `ValueDeserializer::deserialize_char` string path checks `value.len() == 1`,
+which counts UTF-8 bytes and rejects non-ASCII scalars such as `é` or `界`.
+The explicit character value preserves Unicode typed roundtrips without changing
+the standard library in this batch. Format-specific schemas also preserve numeric
+looking text such as `0042` rather than guessing its type from cell contents.
+
+Two existing compiler boundaries surfaced during this batch:
+
+- A generic configuration validation method whose type parameter occurs only
+  inside its implementation can pass checking but fail consumer specialization.
+  `Builder::validate_type[T: serde::Deserialize](self) -> Builder` forwarding
+  `snapshot.decode::[T]()` through a closure or generic helper failed test linking
+  with `cannot specialize ... validate_type: T does not satisfy
+  std::serde::Deserialize`. The public working API is `validate_with`, supplied
+  a concrete typed decoding callback by the consumer. Typed `Snapshot::decode`
+  itself works and is covered by external tests.
+- Large format-parser functions with many fallible operations and branches can
+  cause severe generated-Go growth. The initial archive test program reached
+  roughly 1.45 million generated lines; separating ZIP directory fields,
+  individual-entry validation and layout checks, and splitting TAR writing
+  stages reduced it to roughly 37,000. The library uses those smaller functions.
+  This is a compiler lowering/code-size pressure point, not a format limitation.
+
+These implementations do not change the compiler or stage0 contract. Container
+snapshots, recoverable errors, real I/O and race tests exercise the working APIs.

@@ -1,0 +1,224 @@
+package bench;
+
+use std::json;
+use std::math;
+use std::fs;
+use std::os::linux::fd;
+use std::io::{Read, Close};
+
+fn valid_identity(report: Report) -> bool {
+    report.group != "" && report.name != "" && report.group.to_bytes().len() <= 4096
+        && report.name.to_bytes().len() <= 4096
+        && report.parameter.to_bytes().len() <= 4096
+}
+
+fn validate_statistics(value: Statistics) -> Result[(), Error] {
+    for number in Vec::from_array(
+        [
+            value.mean.lower,
+            value.mean.estimate,
+            value.mean.upper,
+            value.median,
+            value.min,
+            value.max,
+            value.slope_ns,
+        ],
+    ) {
+        if !math::is_finite(number) || number <= 0.0 {
+            return Result::Err(error(ErrorKind::Data, "nonpositive or nonfinite report statistic"))
+        }
+    }
+    if !math::is_finite(value.standard_deviation)
+        || !math::is_finite(value.median_absolute_deviation)
+        || value.standard_deviation < 0.0
+        || value.median_absolute_deviation < 0.0
+        || value.mild_outliers < 0
+        || value.severe_outliers < 0
+        || value.mean.lower > value.mean.upper
+        || value.min > value.median
+        || value.median > value.max {
+        return Result::Err(error(ErrorKind::Data, "invalid report statistic bounds"))
+    }
+    Result::Ok(())
+}
+
+pub fn validate_report(report: SuiteReport) -> Result[(), Error] {
+    if report.schema != 1 || report.reports.len() > 1000 {
+        return Result::Err(error(ErrorKind::Data, "unsupported report schema or report count"))
+    }
+    let names: HashMap[string, bool] = HashMap::new();
+    let mut samples = 0;
+    for value in report.reports {
+        value.options.validate()?;
+        if !valid_identity(value) || value.elapsed_wall_ns < 0
+            || value.samples.len() != value.options.samples
+            || value.samples.len() < 2
+            || value.samples.len() > 10000 {
+            return Result::Err(error(ErrorKind::Data, "invalid benchmark report"))
+        }
+        samples += value.samples.len();
+        if samples > 100000 {
+            return Result::Err(error(ErrorKind::Limit, "report sample count exceeds limit"))
+        }
+        let name = value.group.len().to_string() + ":" + value.group + value.name.len().to_string()
+            + ":"
+            + value.name
+            + value.parameter;
+        if names.get(name).is_some() {
+            return Result::Err(error(ErrorKind::Data, "duplicate report identity"))
+        }
+        names.insert(name, true);
+        let mut iterations = value.warmup_iterations;
+        for sample in value.samples {
+            if sample.elapsed_ns <= 0 || sample.iterations < value.options.min_iterations
+                || sample.iterations > value.options.max_iterations
+                || iterations > value.options.max_total_iterations
+                || sample.iterations > value.options.max_total_iterations - iterations {
+                return Result::Err(
+                    error(ErrorKind::Data, "invalid report sample or iteration count"),
+                )
+            }
+            iterations += sample.iterations;
+        }
+        if iterations != value.total_iterations {
+            return Result::Err(error(ErrorKind::Data, "report iteration totals disagree"))
+        }
+        validate_statistics(value.statistics)?;
+        match value.throughput {
+            Bytes(0) | Elements(0) => return Result::Err(
+                error(ErrorKind::Data, "zero report throughput"),
+            ),
+            _ => (),
+        }
+    }
+    Result::Ok(())
+}
+
+pub fn to_json(report: SuiteReport) -> Result[string, Error] {
+    validate_report(report)?;
+    let encoded = json::try_to_string(report).map_err(|message| error(ErrorKind::Data, message))?;
+    if encoded.to_bytes().len() > 16777216 {
+        return Result::Err(error(ErrorKind::Limit, "report JSON exceeds 16 MiB"))
+    }
+    Result::Ok(encoded)
+}
+
+pub fn from_json(source: string) -> Result[SuiteReport, Error] {
+    if source.to_bytes().len() > 16777216 {
+        return Result::Err(error(ErrorKind::Limit, "report JSON exceeds 16 MiB"))
+    }
+    json_preflight(source)?;
+    let report: SuiteReport = json::from_string(source).map_err(
+        |message| error(ErrorKind::Data, message),
+    )?;
+    validate_report(report)?;
+    Result::Ok(report)
+}
+
+fn escape_html(value: string) -> string {
+    value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;").replace(
+        "'",
+        "&#39;",
+    )
+}
+
+pub fn to_html(report: SuiteReport) -> Result[string, Error] {
+    validate_report(report)?;
+    let mut result = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>GoML benchmark report</title><style>body{font:16px system-ui;margin:2rem;color:#1d2733}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:.6rem;border-bottom:1px solid #ddd}code{white-space:pre-wrap}details{margin:1rem 0}</style><h1>GoML benchmark report</h1><p>Times are nanoseconds per iteration. Intervals are seeded percentile bootstrap estimates. Outliers remain in the analysis.</p><table><thead><tr><th>Group / case</th><th>Parameter</th><th>Mean and interval</th><th>Median</th><th>Throughput / second</th><th>Outliers</th></tr></thead><tbody>";
+    for value in report.reports {
+        let statistics = value.statistics;
+        let throughput = match value.throughput {
+            None => "—",
+            Bytes(_) => throughput_per_second(value.throughput, statistics.mean.estimate)?.to_string()
+                + " bytes",
+            Elements(_) => throughput_per_second(value.throughput, statistics.mean.estimate)?.to_string()
+                + " elements",
+        };
+        result += "<tr><td>" + escape_html(value.group + " / " + value.name) + "</td><td>"
+            + escape_html(value.parameter)
+            + "</td><td>"
+            + statistics.mean.estimate.to_string()
+            + " ["
+            + statistics.mean.lower.to_string()
+            + ", "
+            + statistics.mean.upper.to_string()
+            + "]</td><td>"
+            + statistics.median.to_string()
+            + "</td><td>"
+            + throughput
+            + "</td><td>"
+            + statistics.mild_outliers.to_string()
+            + " mild, "
+            + statistics.severe_outliers.to_string()
+            + " severe</td></tr>";
+    }
+    result += "</tbody></table><details><summary>Raw samples and configuration</summary><pre><code>"
+        + escape_html(to_json(report)?)
+        + "</code></pre></details></html>";
+    Result::Ok(result)
+}
+
+pub fn write_json(path: string, report: SuiteReport) -> Result[(), Error] {
+    fs::atomic_write(path, to_json(report)?).map_err(
+        |failure| error(ErrorKind::Io, failure.to_string()),
+    )
+}
+
+pub fn write_html(path: string, report: SuiteReport) -> Result[(), Error] {
+    fs::atomic_write(path, to_html(report)?).map_err(
+        |failure| error(ErrorKind::Io, failure.to_string()),
+    )
+}
+
+pub fn read_json(path: string) -> Result[SuiteReport, Error] {
+    let file = fd::open(path, fd::O_RDONLY, 0).map_err(
+        |failure| error(ErrorKind::Io, failure.to_string()),
+    )?;
+    defer {
+        let _ = file.close();
+    };
+    let source = file.read_to_string(16777216).map_err(
+        |failure| error(ErrorKind::Io, failure.to_string()),
+    )?;
+    from_json(source)
+}
+
+fn json_preflight(source: string) -> Result[(), Error] {
+    let mut depth = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut structural = 0;
+    for value in source.to_bytes() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if value == b'\\' {
+                escaped = true;
+            } else if value == b'"' {
+                quoted = false;
+            }
+        } else if value == b'"' {
+            quoted = true;
+        } else if value == b'[' || value == b'{' {
+            depth += 1;
+            structural += 1;
+            if depth > 64 {
+                return Result::Err(error(ErrorKind::Limit, "report JSON nesting exceeds 64"))
+            }
+        } else if value == b']' || value == b'}' {
+            depth -= 1;
+            if depth < 0 {
+                return Result::Err(error(ErrorKind::Data, "unbalanced report JSON"))
+            }
+        } else if value == b',' || value == b':' {
+            structural += 1;
+        }
+        if structural > 1000000 {
+            return Result::Err(error(ErrorKind::Limit, "report JSON structure exceeds limit"))
+        }
+    }
+    if depth != 0 || quoted {
+        return Result::Err(error(ErrorKind::Data, "unterminated report JSON"))
+    }
+    Result::Ok(())
+}

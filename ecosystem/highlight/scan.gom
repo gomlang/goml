@@ -1,0 +1,270 @@
+package highlight;
+
+use std::context;
+
+fn starts_at(text: string, offset: isize, prefix: string) -> bool {
+    if prefix.byte_len() > text.byte_len() - offset {
+        return false;
+    }
+    for index in 0..prefix.byte_len() {
+        if text.byte_get(offset + index) != prefix.byte_get(index) {
+            return false;
+        }
+    }
+    true
+}
+
+fn append_span(spans: Vec[Span], start: isize, end: isize, kind: Scope) -> () {
+    if start == end {
+        return;
+    }
+    match spans.last() {
+        Some(last) => if last.end == start && last.scope == kind {
+            spans[spans.len() - 1] = Span { end, ..last };
+        } else {
+            spans.push(Span { start, end, scope: kind });
+        },
+        None => spans.push(Span { start, end, scope: kind }),
+    }
+}
+
+fn scalar_width(text: string, offset: isize) -> isize {
+    match text.decode_at(offset) {
+        Some((_, width)) => width,
+        None => 1,
+    }
+}
+
+fn fence_marker(text: string) -> Option[(string, string)] {
+    let mut start = 0;
+    while start < text.byte_len() && text.byte_get(start) == 32 {
+        start += 1;
+    }
+    if start > 3 || start == text.byte_len() {
+        return Option::None;
+    }
+    let ch = text.byte_get(start);
+    if ch != 96 && ch != 126 {
+        return Option::None;
+    }
+    let mut end = start;
+    while end < text.byte_len() && text.byte_get(end) == ch {
+        end += 1;
+    }
+    if end - start < 3 {
+        return Option::None;
+    }
+    let info = text.byte_slice(end, text.byte_len()).trim();
+    if ch == 96 && info.contains("`") {
+        return Option::None;
+    }
+    Option::Some((text.byte_slice(start, end), info))
+}
+
+fn info_language(info: string) -> string {
+    for (offset, ch) in info.char_indices() {
+        if ch == ' ' || ch == '\t' {
+            return info.byte_slice(0, offset);
+        }
+    }
+    info
+}
+
+impl Highlighter {
+    pub fn line(
+        self: Highlighter,
+        language: string,
+        text: string,
+        before: State,
+        ctx: context::Context,
+    ) -> Result[Line, Error] {
+        checked_context(ctx)?;
+        if text.byte_len() > self.options.max_line_bytes {
+            return Result::Err(failure("line byte limit exceeded"));
+        }
+        let mut next_check = 0;
+        for (offset, ch) in text.char_indices() {
+            if offset >= next_check {
+                checked_context(ctx)?;
+                next_check = offset + 1024;
+            }
+            if ch == '\n' && offset + 1 != text.byte_len() {
+                return Result::Err(failure("line API accepts at most one final newline"));
+            }
+        }
+        checked_context(ctx)?;
+        let language = self.language(language)?;
+        if language.markdown {
+            if let Some((marker, info)) = fence_marker(text) {
+                if before.fence != "" {
+                    if marker.byte_get(0) == before.fence.byte_get(0)
+                        && marker.byte_len() >= before.fence.byte_len()
+                        && info == "" {
+                        return Result::Ok(
+                            Line {
+                                text,
+                                spans: Vec::from_array(
+                                    [Span { start: 0, end: text.byte_len(), scope: Scope::Code }],
+                                ),
+                                before,
+                                after: State::new(),
+                            },
+                        );
+                    }
+                } else if before.region.is_none() {
+                    let requested = info_language(info);
+                    let embedded = match self.language(requested) {
+                        Result::Ok(value) => if value.markdown {
+                            "text"
+                        } else {
+                            value.name
+                        },
+                        Result::Err(_) => "text",
+                    };
+                    return Result::Ok(
+                        Line {
+                            text,
+                            spans: Vec::from_array(
+                                [Span { start: 0, end: text.byte_len(), scope: Scope::Code }],
+                            ),
+                            before,
+                            after: State { fence: marker, embedded, ..State::new() },
+                        },
+                    );
+                }
+            }
+            if before.fence != "" {
+                let embedded = self.language(before.embedded)?;
+                return self.scan(embedded, text, before, ctx);
+            }
+            if before.region.is_none() {
+                let trimmed = text.trim_start();
+                let indentation = text.byte_len() - trimmed.byte_len();
+                let mut count = 0;
+                while count < trimmed.byte_len() && trimmed.byte_get(count) == 35 {
+                    count += 1;
+                }
+                if indentation <= 3 && count > 0 && count <= 6
+                    && (count == trimmed.byte_len() || trimmed.byte_get(count) == 32
+                        || trimmed.byte_get(count) == 9
+                        || trimmed.byte_get(count) == 10
+                        || trimmed.byte_get(count) == 13) {
+                    return Result::Ok(
+                        Line {
+                            text,
+                            spans: Vec::from_array(
+                                [Span { start: 0, end: text.byte_len(), scope: Scope::Heading }],
+                            ),
+                            before,
+                            after: before,
+                        },
+                    );
+                }
+            }
+        }
+        self.scan(language, text, before, ctx)
+    }
+
+    fn scan(
+        self: Highlighter,
+        language: Language,
+        text: string,
+        before: State,
+        ctx: context::Context,
+    ) -> Result[Line, Error] {
+        let spans = Vec::new();
+        let mut state = before;
+        let mut offset = 0;
+        while offset < text.byte_len() {
+            checked_context(ctx)?;
+            if let Some(region) = state.region {
+                let start = offset;
+                let mut depth = state.depth;
+                let mut next_check = offset;
+                while offset < text.byte_len() {
+                    if offset >= next_check {
+                        checked_context(ctx)?;
+                        next_check = offset + 1024;
+                    }
+                    let escaped = match region.escape {
+                        Some(ch) => starts_at(text, offset, ch.to_string()),
+                        None => false,
+                    };
+                    if escaped {
+                        offset += scalar_width(text, offset);
+                        if offset < text.byte_len() {
+                            offset += scalar_width(text, offset);
+                        }
+                    } else if starts_at(text, offset, region.end) {
+                        offset += region.end.byte_len();
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else if region.nested && starts_at(text, offset, region.begin) {
+                        depth += 1;
+                        if depth > self.options.max_depth {
+                            return Result::Err(failure("nested region depth limit exceeded"));
+                        }
+                        offset += region.begin.byte_len();
+                    } else {
+                        offset += scalar_width(text, offset);
+                    }
+                }
+                append_span(spans, start, offset, region.scope);
+                state = State {
+                    depth,
+                    region: if depth == 0 {
+                        Option::None
+                    } else {
+                        Option::Some(region)
+                    },
+                    ..state,
+                };
+            } else {
+                let lexer = language.grammar.lexer_at(text, offset, ()).map_err(failure)?;
+                let next = lexer.next().ok_or(failure("lexer failed to advance"))?.map_err(
+                    |error| failure(error.debug()),
+                )?;
+                let span = lexer.span();
+                if span.end <= offset {
+                    return Result::Err(failure("lexer failed to advance"));
+                }
+                match next {
+                    Token::Plain(scope) => append_span(spans, span.start, span.end, scope),
+                    Token::Enter(region) => {
+                        append_span(spans, span.start, span.end, region.scope);
+                        state = State { region: Option::Some(region), depth: 1, ..state };
+                    },
+                    Token::Raw => {
+                        let delimiter = lexer.slice();
+                        let mut hashes = 0;
+                        for ch in delimiter.chars() {
+                            if ch == '#' {
+                                hashes += 1;
+                            }
+                        }
+                        let region = Region::new(
+                            delimiter,
+                            "\"" + "#".repeat(hashes),
+                            Scope::String,
+                        );
+                        append_span(spans, span.start, span.end, Scope::String);
+                        state = State { region: Option::Some(region), depth: 1, ..state };
+                    },
+                }
+                offset = span.end;
+            }
+            if spans.len() > self.options.max_spans {
+                return Result::Err(failure("span limit exceeded"));
+            }
+        }
+        if let Some(region) = state.region {
+            if !region.multiline {
+                state = State { region: Option::None, depth: 0, ..state };
+            }
+        }
+        checked_context(ctx)?;
+        Result::Ok(Line { text, spans, before, after: state })
+    }
+}

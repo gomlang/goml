@@ -1,0 +1,127 @@
+# archive
+
+A GoML implementation of USTAR/PAX TAR and classic ZIP archives. Format parsing,
+writing, CRC32, metadata validation, resource budgets, and extraction planning are
+implemented in GoML. The small Go adapter supplies raw DEFLATE/GZIP compression
+and rooted filesystem operations; it does not import `archive/tar` or
+`archive/zip`.
+
+## API
+
+```goml
+use ecosystem::archive;
+use std::bytes;
+
+let entries = Vec::from_array([
+    archive::Entry::directory("project/"),
+    archive::Entry::file("project/main.gom", bytes::Bytes::from_string("hello")),
+]);
+let limits = archive::Limits::standard();
+let packed = archive::encode_zip(entries, archive::Compression::Deflate, limits)?;
+let indexed = archive::ZipArchive::open(packed, limits)?;
+let first_file = indexed.entry(1)?;
+```
+
+- `encode_tar`, `decode_tar`, `encode_zip`, `decode_zip`, `encode_tar_gz`, and
+  `decode_tar_gz` provide bounded in-memory APIs.
+- `TarWriter[W: Write]` writes entries immediately. `append_reader` copies an
+  explicitly sized payload using an 8 KiB buffer; `finish` writes the two-block
+  end marker. It does not retain entry bodies.
+- `TarReader[R: Read]::next` reads one entry at a time, materializing at most one
+  bounded entry body. The next call releases that body's storage when the caller
+  no longer retains it. Global/local PAX headers are applied during iteration.
+- `ZipWriter[W: Write]` writes local headers and compressed bodies immediately,
+  retaining the central directory and one bounded compression buffer. Both
+  `append` and `append_reader` are available; `finish(comment)` emits the central
+  directory and archive comment.
+- `ZipArchive::open` owns a snapshot of its input and validates the directory,
+  local headers, descriptors and entry ranges. `read[R: Read]` reads a bounded
+  archive into memory. `records` exposes metadata without decompression;
+  `entry`, `entries`, and `copy_entry[W: Write]` validate expanded sizes and CRC32.
+- `open_tar`, `open_tar_gz`, `open_zip`, `read_file`, and `write_file` supply file
+  APIs. `write_file` creates a new file exclusively and never overwrites one.
+- `crc32` and incremental `crc32_update` implement IEEE CRC32 in GoML.
+
+Writers handle short writes and interrupted I/O through standard traits. Partial
+I/O failures poison writers, and TAR parsing failures poison readers. `finish`
+and terminal TAR EOF are idempotent. Callers own and close the underlying stream.
+Instances are intended for one sequential owner; independent instances can run
+concurrently.
+
+## Metadata and limits
+
+`Header` contains path, type, permissions, UID/GID, Unix modification seconds,
+user/group names, link target, ZIP comment and unknown PAX key/value extensions.
+USTAR prefixes are decoded; writing uses PAX when strings or IDs do not fit
+USTAR. TAR supports files, directories, symbolic links and hard links. ZIP
+supports files, directories and Unix symbolic-link entries, Stored and Deflate,
+UTF-8 names, extended Unix timestamps, archive/file comments, and both signed and
+unsigned classic data descriptors. ZIP directory ranges are checked in sorted
+order to reject overlapping entries without quadratic pairwise validation.
+
+`Limits` bounds entries, individual expanded bytes, total expanded bytes,
+archive bytes, path bytes, and metadata bytes. Decompression is bounded before
+returning a payload, and declared ZIP sizes are checked before decompression.
+Default limits are 100,000 entries, 64 MiB per entry, 256 MiB expanded total,
+512 MiB archive, 4 KiB paths and 1 MiB metadata. Classic ZIP additionally limits
+entry counts and offsets to its non-ZIP64 ranges. In TAR streaming APIs the
+archive limit counts consumed/emitted bytes; `decode_tar` additionally verifies
+that trailing bytes after the end marker are zero.
+
+## Extraction policy
+
+`extract(entries, existing_destination, ExtractOptions::standard())` validates
+all archive paths and parent relationships before creating entries. It rejects
+absolute paths, Windows drive/colon paths, backslashes, NUL, empty/`.`/`..`
+components, duplicate normalized paths, and file/link parents. Symbolic and hard
+links are rejected by default; `LinkPolicy::Skip` explicitly ignores them.
+Existing files and symlinks are never overwritten. Directory components must be
+real directories, and the Go 1.25 `os.Root` boundary prevents writes escaping the
+opened destination, including through concurrent filesystem changes. The caller
+chooses and creates the trusted destination. Extraction is not transactional:
+a filesystem error can leave earlier completed files behind.
+
+Permissions default to `0644` for files and `0755` for directories, subject to
+umask. `preserve_permissions` restores only ordinary file permission bits;
+setuid/setgid/sticky bits, ownership and timestamps are never applied. Directory
+permissions are kept traversable while extracting.
+
+## Deliberate format boundaries
+
+- ZIP64, split/encrypted archives, non-Deflate compression, legacy non-ASCII
+  codepage names, TAR devices/FIFOs, GNU base-256/sparse extensions and GNU longname
+  records produce recoverable errors.
+- PAX numeric fields support nonnegative values; modification fractions are
+  reduced to whole seconds. ZIP writing supports unsigned 32-bit Unix seconds;
+  decoding ZIP entries without extended timestamps currently yields zero.
+- The TAR reader materializes each body; ZIP indexing and GZIP convenience APIs
+  materialize the bounded archive. They are not constant-memory streaming
+  decompressors. `ZipWriter::append_reader` buffers one bounded entry.
+- File convenience APIs currently use the Linux standard file-descriptor API.
+  Format and standard `Read`/`Write` APIs do not assume seekable streams.
+
+## Validation
+
+Run from this module:
+
+```sh
+../../stage2/bin/goml fmt --check
+../../stage2/bin/goml check
+../../stage2/bin/goml test
+GOFLAGS=-race ../../stage2/bin/goml test --target-dir _artifact/race
+```
+
+Native GoML tests cover Unicode/PAX metadata, CRC vectors, GZIP corruption,
+truncation boundaries, invalid ZIP directory/local records, data descriptors,
+short/interrupted I/O, resource limits, input snapshot isolation, path/link
+attacks and real extraction. Interoperability tests create archives with GNU
+`tar` and Info-ZIP `zip`, read them in GoML, and have `tar`/`unzip` verify GoML
+output. These three programs must be installed. There are no Python helpers.
+The independent `../consumers/archive` module imports version `0.1.0` through the
+isolated verification registry.
+
+Format references: [PKWARE ZIP APPNOTE](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT),
+[GNU TAR USTAR description](https://www.gnu.org/software/tar/manual/html_node/Standard.html),
+[POSIX pax](https://pubs.opengroup.org/onlinepubs/9699919799/utilities/pax.html),
+[Go compression primitives](https://pkg.go.dev/compress/flate), and
+[Go rooted filesystem operations](https://pkg.go.dev/os#Root).

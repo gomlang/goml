@@ -1,0 +1,400 @@
+package websocket;
+
+use std::bytes;
+use std::crypto::rand;
+use std::encoding::base64;
+use std::text;
+use std::utf8;
+
+pub fn accept_key(key: string) -> Result[string, Error] {
+    let decoded = base64::decode(key).map_err(
+        |_| error(ErrorKind::Handshake, "invalid WebSocket key encoding"),
+    )?;
+    if decoded.len() != 16 {
+        return Result::Err(error(ErrorKind::Handshake, "WebSocket key must decode to 16 bytes"))
+    }
+    Result::Ok(
+        base64::encode(
+            sha1(bytes::Bytes::from_string(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")),
+        ),
+    )
+}
+
+fn token(value: string) -> bool {
+    if value.len() == 0 {
+        return false
+    }
+    for byte in value.to_bytes() {
+        if !((byte >= b'a' && byte <= b'z') || (byte >= b'A' && byte <= b'Z')
+            || (byte >= b'0' && byte <= b'9')
+            || byte == b'!'
+            || byte == b'#'
+            || byte == b'$'
+            || byte == b'%'
+            || byte == b'&'
+            || byte == b'\''
+            || byte == b'*'
+            || byte == b'+'
+            || byte == b'-'
+            || byte == b'.'
+            || byte == b'^'
+            || byte == b'_'
+            || byte == b'`'
+            || byte == b'|'
+            || byte == b'~') {
+            return false
+        }
+    }
+    true
+}
+
+fn clean(value: string, spaces: bool) -> bool {
+    for byte in value.to_bytes() {
+        if byte
+            < (if spaces {
+                32
+            } else {
+                33
+            })
+            || byte > 126 {
+            return false
+        }
+    }
+    true
+}
+
+fn protocols(value: string) -> Result[Vec[string], Error] {
+    let result: Vec[string] = Vec::new();
+    for item in text::split(value, ",") {
+        let item = text::trim(item);
+        if !token(item) {
+            return Result::Err(error(ErrorKind::Handshake, "invalid subprotocol token"))
+        }
+        for previous in result {
+            if previous == item {
+                return Result::Err(error(ErrorKind::Handshake, "duplicate subprotocol"))
+            }
+        }
+        result.push(item);
+    }
+    Result::Ok(result)
+}
+
+fn joined(values: Vec[string]) -> string {
+    let mut output = "";
+    for index in 0..values.len() {
+        if index != 0 {
+            output = output + ", ";
+        }
+        output = output + values[index];
+    }
+    output
+}
+
+pub struct ClientRequest {
+    host_value: string,
+    target_value: string,
+    key_value: string,
+    protocols_value: Vec[string],
+    origin_value: Option[string],
+}
+
+impl ClientRequest {
+    pub fn new(host: string, target: string, requested_protocols: Vec[string]) -> Result[
+        ClientRequest,
+        Error,
+    ] {
+        let key = base64::encode(rand::bytes(16).map_err(|message| error(ErrorKind::Io, message))?);
+        ClientRequest::with_key(host, target, requested_protocols, key)
+    }
+
+    pub fn with_key(host: string, target: string, requested_protocols: Vec[string], key: string) -> Result[
+        ClientRequest,
+        Error,
+    ] {
+        if host.len() == 0 || !clean(host, false) || !clean(target, false)
+            || !text::starts_with_at(target, 0, "/")
+            || text::find(target, "#").is_some() {
+            return Result::Err(
+                error(ErrorKind::InvalidInput, "invalid host or origin-form request target"),
+            )
+        }
+        let _ = accept_key(key)?;
+        if requested_protocols.len() > 0 {
+            let _ = protocols(joined(requested_protocols))?;
+        }
+        Result::Ok(
+            ClientRequest {
+                host_value: host,
+                target_value: target,
+                key_value: key,
+                protocols_value: requested_protocols.copy(),
+                origin_value: Option::None,
+            },
+        )
+    }
+
+    pub fn with_origin(self: ClientRequest, origin: string) -> Result[ClientRequest, Error] {
+        if !clean(origin, true) || origin.len() == 0 {
+            return Result::Err(error(ErrorKind::InvalidInput, "invalid Origin header"))
+        }
+        Result::Ok(ClientRequest { origin_value: Option::Some(origin), ..self })
+    }
+
+    pub fn key(self: ClientRequest) -> string {
+        self.key_value
+    }
+
+    pub fn encode(self: ClientRequest) -> bytes::Bytes {
+        let mut output = "GET " + self.target_value + " HTTP/1.1\r\nHost: " + self.host_value
+            + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: "
+            + self.key_value
+            + "\r\nSec-WebSocket-Version: 13\r\n";
+        if self.protocols_value.len() > 0 {
+            output = output + "Sec-WebSocket-Protocol: " + joined(self.protocols_value) + "\r\n";
+        }
+        if let Some(origin) = self.origin_value {
+            output = output + "Origin: " + origin + "\r\n";
+        }
+        bytes::Bytes::from_string(output + "\r\n")
+    }
+
+    pub fn validate_response(self: ClientRequest, response: bytes::Bytes, limit: isize) -> Result[
+        Option[string],
+        Error,
+    ] {
+        let (first, headers) = parse_head(response, limit)?;
+        let parts = text::split(first, " ");
+        if parts.len() < 3 || parts[0] != "HTTP/1.1" || parts[1] != "101" {
+            return Result::Err(error(ErrorKind::Handshake, "expected HTTP/1.1 101 response"))
+        }
+        validate_upgrade(headers)?;
+        if one(headers, "sec-websocket-accept", true)? != accept_key(self.key_value)? {
+            return Result::Err(error(ErrorKind::Handshake, "incorrect WebSocket accept digest"))
+        }
+        if has(headers, "sec-websocket-extensions") {
+            return Result::Err(error(ErrorKind::Handshake, "extensions are not supported"))
+        }
+        if has(headers, "sec-websocket-protocol") {
+            let protocol = one(headers, "sec-websocket-protocol", true)?;
+            if !token(protocol) {
+                return Result::Err(
+                    error(ErrorKind::Handshake, "server must select exactly one subprotocol"),
+                )
+            }
+            for requested in self.protocols_value {
+                if requested == protocol {
+                    return Result::Ok(Option::Some(protocol))
+                }
+            }
+            return Result::Err(
+                error(ErrorKind::Handshake, "server selected an unoffered subprotocol"),
+            )
+        }
+        Result::Ok(Option::None)
+    }
+}
+
+pub struct ServerRequest {
+    pub target: string,
+    pub host: string,
+    pub origin: Option[string],
+    pub protocols: Vec[string],
+    key: string,
+}
+
+impl ServerRequest {
+    pub fn parse(request: bytes::Bytes, limit: isize) -> Result[ServerRequest, Error] {
+        let (first, headers) = parse_head(request, limit)?;
+        let parts = text::split(first, " ");
+        if parts.len() != 3 || parts[0] != "GET" || parts[2] != "HTTP/1.1"
+            || !text::starts_with_at(parts[1], 0, "/")
+            || text::find(parts[1], "#").is_some() {
+            return Result::Err(
+                error(ErrorKind::Handshake, "expected GET origin-form HTTP/1.1 request"),
+            )
+        }
+        validate_upgrade(headers)?;
+        let host = one(headers, "host", true)?;
+        if !clean(host, false) {
+            return Result::Err(error(ErrorKind::Handshake, "invalid host"))
+        }
+        if one(headers, "sec-websocket-version", true)? != "13" {
+            return Result::Err(
+                error(ErrorKind::Handshake, "only WebSocket version 13 is supported"),
+            )
+        }
+        let key = one(headers, "sec-websocket-key", true)?;
+        let _ = accept_key(key)?;
+        let requested = if has(headers, "sec-websocket-protocol") {
+            protocols(all(headers, "sec-websocket-protocol"))?
+        } else {
+            Vec::new()
+        };
+        let origin = if has(headers, "origin") {
+            Option::Some(one(headers, "origin", true)?)
+        } else {
+            Option::None
+        };
+        Result::Ok(ServerRequest { target: parts[1], host, origin, protocols: requested, key })
+    }
+
+    pub fn response(self: ServerRequest, selected: Option[string]) -> Result[bytes::Bytes, Error] {
+        if let Some(protocol) = selected {
+            if !token(protocol) {
+                return Result::Err(error(ErrorKind::Handshake, "invalid selected subprotocol"))
+            }
+            let mut found = false;
+            for offered in self.protocols {
+                if offered == protocol {
+                    found = true;
+                }
+            }
+            if !found {
+                return Result::Err(
+                    error(ErrorKind::Handshake, "selected subprotocol was not offered"),
+                )
+            }
+        }
+        let mut output = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "
+            + accept_key(self.key)?
+            + "\r\n";
+        if let Some(protocol) = selected {
+            output = output + "Sec-WebSocket-Protocol: " + protocol + "\r\n";
+        }
+        Result::Ok(bytes::Bytes::from_string(output + "\r\n"))
+    }
+}
+
+fn has(headers: Vec[(string, string)], key: string) -> bool {
+    for (name, _) in headers {
+        if name == key {
+            return true
+        }
+    }
+    false
+}
+
+fn one(headers: Vec[(string, string)], key: string, required: bool) -> Result[string, Error] {
+    let mut value = "";
+    let mut count = 0;
+    for (name, current) in headers {
+        if name == key {
+            value = current;
+            count += 1;
+        }
+    }
+    if count > 1 || (required && (count == 0 || value.len() == 0)) {
+        return Result::Err(error(ErrorKind::Handshake, "missing or duplicate " + key))
+    }
+    Result::Ok(value)
+}
+
+fn all(headers: Vec[(string, string)], key: string) -> string {
+    let values = Vec::new();
+    for (name, value) in headers {
+        if name == key {
+            values.push(value);
+        }
+    }
+    joined(values)
+}
+
+fn contains_token(value: string, expected: string) -> bool {
+    for value in text::split(value, ",") {
+        if text::to_ascii_lowercase(text::trim(value)) == expected {
+            return true
+        }
+    }
+    false
+}
+
+fn validate_upgrade(headers: Vec[(string, string)]) -> Result[(), Error] {
+    if !contains_token(all(headers, "upgrade"), "websocket")
+        || !contains_token(all(headers, "connection"), "upgrade") {
+        return Result::Err(error(ErrorKind::Handshake, "missing WebSocket upgrade headers"))
+    }
+    if has(headers, "transfer-encoding")
+        || (has(headers, "content-length") && one(headers, "content-length", false)? != "0") {
+        return Result::Err(error(ErrorKind::Handshake, "upgrade handshake must not contain a body"))
+    }
+    Result::Ok(())
+}
+
+fn parse_head(input: bytes::Bytes, limit: isize) -> Result[(string, Vec[(string, string)]), Error] {
+    if limit < 1 || input.len() > limit {
+        return Result::Err(error(ErrorKind::Limit, "HTTP handshake exceeds byte limit"))
+    }
+    let value = utf8::decode(input.to_vec()).map_err(
+        |_| error(ErrorKind::Handshake, "invalid HTTP header bytes"),
+    )?;
+    let lines = text::split(value, "\r\n");
+    if lines.len() < 3 || lines[lines.len() - 1] != "" || lines[lines.len() - 2] != ""
+        || !clean(lines[0], true) {
+        return Result::Err(error(ErrorKind::Handshake, "handshake must end in CRLF CRLF"))
+    }
+    let headers = Vec::new();
+    for index in 1..(lines.len() - 2) {
+        let line = lines[index];
+        let (name, value) = text::split_once(line, ":").ok_or(
+            error(ErrorKind::Handshake, "invalid HTTP header"),
+        )?;
+        if !token(name) {
+            return Result::Err(
+                error(ErrorKind::Handshake, "invalid HTTP header name or folded line"),
+            )
+        }
+        for byte in value.to_bytes() {
+            if (byte < 32 && byte != 9) || byte > 126 {
+                return Result::Err(error(ErrorKind::Handshake, "invalid HTTP header value"))
+            }
+        }
+        headers.push((text::to_ascii_lowercase(name), text::trim(value)));
+    }
+    Result::Ok((lines[0], headers))
+}
+
+pub struct HandshakeDecoder {
+    limit: isize,
+    data: bytes::Bytes,
+    complete: Ref[bool],
+}
+
+impl HandshakeDecoder {
+    pub fn new(limit: isize) -> Result[HandshakeDecoder, Error] {
+        if limit < 1 {
+            return Result::Err(error(ErrorKind::InvalidInput, "handshake limit must be positive"))
+        }
+        Result::Ok(HandshakeDecoder { limit, data: bytes::Bytes::new(), complete: Ref::new(false) })
+    }
+
+    pub fn push(self: HandshakeDecoder, input: Slice[u8]) -> Result[isize, Error] {
+        if self.complete.get() {
+            return Result::Ok(0)
+        }
+        let mut consumed = 0;
+        for value in input {
+            if self.data.len() == self.limit {
+                return Result::Err(error(ErrorKind::Limit, "HTTP handshake exceeds byte limit"))
+            }
+            self.data.push(value);
+            consumed += 1;
+            let count = self.data.len();
+            if count >= 4 && self.data.get(count - 4) == 13 && self.data.get(count - 3) == 10
+                && self.data.get(count - 2) == 13
+                && self.data.get(count - 1) == 10 {
+                self.complete.set(true);
+                break
+            }
+        }
+        Result::Ok(consumed)
+    }
+
+    pub fn head(self: HandshakeDecoder) -> Option[bytes::Bytes] {
+        if self.complete.get() {
+            Option::Some(self.data.copy())
+        } else {
+            Option::None
+        }
+    }
+}

@@ -1,0 +1,460 @@
+package config;
+
+use std::collections;
+use std::env;
+use std::io;
+use io::Read;
+use std::json;
+use std::os::linux::fd;
+use std::path;
+use std::serde;
+use std::text;
+use std::toml;
+use std::unicode;
+
+enum SourceKind {
+    Document(Format, string),
+    File(Format, string, bool),
+    Environment(EnvOptions, Option[Vec[(string, string)]]),
+    Overrides(Vec[Override]),
+}
+
+pub struct Source {
+    name: string,
+    kind: SourceKind,
+}
+
+pub struct Override {
+    pointer: string,
+    value: Option[(string, ValueMode)],
+}
+
+impl Override {
+    pub fn text(pointer: string, value: string, mode: ValueMode) -> Override {
+        Override { pointer, value: Option::Some((value, mode)) }
+    }
+
+    pub fn value[T: serde::Serialize](pointer: string, value: T) -> Result[Override, Error] {
+        json::try_to_string(value).map(|encoded| Override::text(pointer, encoded, ValueMode::Json)).map_err(
+            |message| Error::new(ErrorKind::Type, pointer, anonymous(), message),
+        )
+    }
+
+    pub fn unset(pointer: string) -> Override {
+        Override { pointer, value: Option::None }
+    }
+}
+
+impl Source {
+    pub fn json(name: string, input: string) -> Source {
+        Source { name, kind: SourceKind::Document(Format::Json, input) }
+    }
+
+    pub fn toml(name: string, input: string) -> Source {
+        Source { name, kind: SourceKind::Document(Format::Toml, input) }
+    }
+
+    pub fn defaults[T: serde::Serialize](value: T) -> Result[Source, Error] {
+        json::try_to_string(value).map(|encoded| Source::json("defaults", encoded)).map_err(
+            |message| failure(ErrorKind::Type, message),
+        )
+    }
+
+    pub fn file(name: string, file: string, format: Format, required: bool) -> Result[Source, Error] {
+        let absolute = path::absolute_structured(file).map_err(
+            |error| failure(ErrorKind::Io, error.to_string()),
+        )?;
+        Result::Ok(Source { name, kind: SourceKind::File(format, absolute, required) })
+    }
+
+    pub fn environment(name: string, options: EnvOptions) -> Source {
+        Source { name, kind: SourceKind::Environment(options, Option::None) }
+    }
+
+    pub fn environment_values(name: string, options: EnvOptions, values: Vec[(string, string)]) -> Source {
+        Source {
+            name,
+            kind: SourceKind::Environment(options, Option::Some(values.as_slice().to_vec())),
+        }
+    }
+
+    pub fn overrides(name: string, values: Vec[Override]) -> Source {
+        Source { name, kind: SourceKind::Overrides(values.as_slice().to_vec()) }
+    }
+
+    pub fn name(self: Source) -> string {
+        self.name
+    }
+}
+
+fn charge(length: isize, limits: Limits, used: Ref[isize], origin: Origin) -> Result[(), Error] {
+    if length > limits.max_source_bytes || length > limits.max_total_bytes - used.get() {
+        Result::Err(
+            Error::new(ErrorKind::Limit, "", origin, "configuration source byte limit exceeded"),
+        )
+    } else {
+        used.set(used.get() + length);
+        Result::Ok(())
+    }
+}
+
+fn preflight(input: string, format: Format, limits: Limits, origin: Origin) -> Result[(), Error] {
+    let mut index = 0;
+    let mut quote: byte = 0;
+    let mut triple = false;
+    let mut nesting = 0;
+    let mut dots = 0;
+    while index < input.byte_len() {
+        let current = input.byte_get(index);
+        if quote != 0 {
+            if quote == 34 && current == 92 {
+                index += 2;
+                continue
+            }
+            if current == quote {
+                if !triple {
+                    quote = 0;
+                } else if index + 2 < input.byte_len() && input.byte_get(index + 1) == quote
+                    && input.byte_get(index + 2) == quote {
+                    quote = 0;
+                    index += 2;
+                }
+            }
+        } else if current == 34 || format == Format::Toml && current == 39 {
+            quote = current;
+            triple = format == Format::Toml && index + 2 < input.byte_len()
+                && input.byte_get(index + 1) == quote
+                && input.byte_get(index + 2) == quote;
+            if triple {
+                index += 2;
+            }
+        } else if format == Format::Toml && current == 35 {
+            while index < input.byte_len() && input.byte_get(index) != 10 {
+                index += 1;
+            }
+            dots = 0;
+        } else {
+            if current == 91 || current == 123 {
+                nesting += 1;
+                if nesting > limits.max_depth {
+                    return Result::Err(
+                        Error::new(ErrorKind::Limit, "", origin, "source nesting limit exceeded"),
+                    )
+                }
+            } else if current == 93 || current == 125 {
+                nesting -= 1;
+            }
+            if format == Format::Toml {
+                if current == 46 {
+                    dots += 1;
+                    if dots > limits.max_depth {
+                        return Result::Err(
+                            Error::new(
+                                ErrorKind::Limit,
+                                "",
+                                origin,
+                                "TOML dotted-key limit exceeded",
+                            ),
+                        )
+                    }
+                } else if current == 10 || current == 61 || current == 44 {
+                    dots = 0;
+                }
+            }
+        }
+        index += 1;
+    }
+    Result::Ok(())
+}
+
+fn parse_document(input: string, format: Format, limits: Limits, origin: Origin) -> Result[
+    json::Value,
+    Error,
+] {
+    preflight(input, format, limits, origin)?;
+    match format {
+        Format::Json => json::parse(input),
+        Format::Toml => toml::parse(input).and_then(
+            |value| json::try_from_serde_value(toml::into_serde_value(value)),
+        ),
+    }.map_err(|message| Error::new(ErrorKind::Parse, "", origin, message))
+}
+
+fn parse_override(input: string, mode: ValueMode, limits: Limits, origin: Origin) -> Result[
+    json::Value,
+    Error,
+] {
+    match mode {
+        ValueMode::String => Result::Ok(json::Value::String(input)),
+        ValueMode::Json => parse_document(input, Format::Json, limits, origin),
+        ValueMode::Auto => {
+            preflight(input, Format::Json, limits, origin)?;
+            Result::Ok(json::parse(input).unwrap_or(json::Value::String(input)))
+        },
+    }
+}
+
+fn load_file(file: string, required: bool, limits: Limits, origin: Origin) -> Result[
+    Option[string],
+    Error,
+] {
+    let handle = match fd::open(file, fd::O_RDONLY | fd::O_NONBLOCK, 0) {
+        Ok(value) => value,
+        Err(error) if !required && error.kind() == io::ErrorKind::NotFound => return Result::Ok(
+            Option::None,
+        ),
+        Err(error) => return Result::Err(Error::new(ErrorKind::Io, "", origin, error.to_string())),
+    };
+    let input = handle.read_to_string(limits.max_source_bytes);
+    let close = handle.close();
+    let input = input.map_err(|error| Error::new(ErrorKind::Io, "", origin, error.to_string()))?;
+    close.map_err(|error| Error::new(ErrorKind::Io, "", origin, error.to_string()))?;
+    Result::Ok(Option::Some(input))
+}
+
+fn apply_document(
+    root: Node,
+    input: string,
+    format: Format,
+    origin: Origin,
+    limits: Limits,
+    arrays: ArrayMerge,
+    bytes: Ref[isize],
+    nodes: Ref[isize],
+) -> Result[Node, Error] {
+    charge(input.byte_len(), limits, bytes, origin)?;
+    let value = parse_document(input, format, limits, origin)?;
+    let node = json_node(value, origin, "", 0, limits, nodes)?;
+    let _ = object_fields(node, "")?;
+    Result::Ok(merge(root, node, arrays))
+}
+
+fn apply_overrides(
+    root: Node,
+    values: Vec[Override],
+    origin: Origin,
+    limits: Limits,
+    arrays: ArrayMerge,
+    bytes: Ref[isize],
+    nodes: Ref[isize],
+) -> Result[Node, Error] {
+    let mut result = root;
+    let start = bytes.get();
+    for item in values {
+        let parts = pointer(item.pointer).map_err(|error| Error { origin, ..error })?;
+        if parts.len() > limits.max_depth {
+            return Result::Err(
+                Error::new(ErrorKind::Limit, item.pointer, origin, "path depth limit exceeded"),
+            )
+        }
+        let value = match item.value {
+            Some((value, mode)) => {
+                charge(value.byte_len() + item.pointer.byte_len(), limits, bytes, origin)?;
+                let parsed = parse_override(value, mode, limits, origin).map_err(
+                    |error| Error { path: item.pointer, ..error },
+                )?;
+                Option::Some(json_node(parsed, origin, item.pointer, parts.len(), limits, nodes)?)
+            },
+            None => {
+                charge(item.pointer.byte_len(), limits, bytes, origin)?;
+                Option::None
+            },
+        };
+        if bytes.get() - start > limits.max_source_bytes {
+            return Result::Err(
+                Error::new(
+                    ErrorKind::Limit,
+                    item.pointer,
+                    origin,
+                    "override source byte limit exceeded",
+                ),
+            )
+        }
+        result = update(result, parts, 0, value, arrays, "", origin)?;
+        let _ = object_fields(result, "")?;
+    }
+    Result::Ok(result)
+}
+
+fn environment_overrides(
+    options: EnvOptions,
+    entries: Vec[(string, string)],
+    origin: Origin,
+    limits: Limits,
+) -> Result[Vec[(Override, Origin)], Error] {
+    if options.separator == "" {
+        return Result::Err(
+            Error::new(
+                ErrorKind::InvalidOptions,
+                "",
+                origin,
+                "environment separator must not be empty",
+            ),
+        )
+    }
+    let result = Vec::new();
+    let names = HashMap::new();
+    let ancestors = HashMap::new();
+    let mut byte_count = 0;
+    for (name, value) in entries {
+        if !name.starts_with(options.prefix) {
+            continue
+        }
+        if name.byte_len() > limits.max_source_bytes - byte_count {
+            return Result::Err(
+                Error::new(ErrorKind::Limit, "", origin, "environment source byte limit exceeded"),
+            )
+        }
+        byte_count += name.byte_len();
+        if value.byte_len() > limits.max_source_bytes - byte_count {
+            return Result::Err(
+                Error::new(ErrorKind::Limit, "", origin, "environment source byte limit exceeded"),
+            )
+        }
+        byte_count += value.byte_len();
+        let tail = name.byte_slice(options.prefix.byte_len(), name.byte_len());
+        let parts = text::split(tail, options.separator);
+        if parts.len() > limits.max_depth || result.len() >= limits.max_nodes {
+            return Result::Err(
+                Error::new(ErrorKind::Limit, "", origin, "environment path or entry limit exceeded"),
+            )
+        }
+        let mut target = "";
+        let prefixes = Vec::new();
+        for part in parts {
+            if part == "" {
+                return Result::Err(
+                    Error::new(
+                        ErrorKind::Path,
+                        target,
+                        Origin { detail: name, ..origin },
+                        "empty environment key segment",
+                    ),
+                )
+            }
+            target = path_join(
+                target,
+                if options.lowercase {
+                    unicode::lowercase(part)
+                } else {
+                    part
+                },
+            );
+            if names.get(target).is_some() {
+                return Result::Err(
+                    Error::new(
+                        ErrorKind::Duplicate,
+                        target,
+                        Origin { detail: name, ..origin },
+                        "environment keys collide after mapping",
+                    ),
+                )
+            }
+            prefixes.push(target);
+        }
+        if ancestors.get(target).is_some() {
+            return Result::Err(
+                Error::new(
+                    ErrorKind::Duplicate,
+                    target,
+                    Origin { detail: name, ..origin },
+                    "environment keys collide after mapping",
+                ),
+            )
+        }
+        for prefix in prefixes {
+            ancestors.set(prefix, true);
+        }
+        names.set(target, true);
+        result.push(
+            (Override::text(target, value, options.mode), Origin { detail: name, ..origin }),
+        );
+    }
+    collections::stable_sort_by(
+        result,
+        |a, b| if a.0.pointer < b.0.pointer {
+            -1
+        } else if a.0.pointer == b.0.pointer {
+            0
+        } else {
+            1
+        },
+    );
+    Result::Ok(result)
+}
+
+fn apply_source(
+    root: Node,
+    source: Source,
+    limits: Limits,
+    arrays: ArrayMerge,
+    bytes: Ref[isize],
+    nodes: Ref[isize],
+) -> Result[Node, Error] {
+    let origin = Origin { source: source.name, detail: "" };
+    match source.kind {
+        SourceKind::Document(format, input) => apply_document(
+            root,
+            input,
+            format,
+            origin,
+            limits,
+            arrays,
+            bytes,
+            nodes,
+        ),
+        SourceKind::File(format, file, required) => {
+            let origin = Origin { detail: file, ..origin };
+            match load_file(file, required, limits, origin)? {
+                Some(input) => apply_document(
+                    root,
+                    input,
+                    format,
+                    origin,
+                    limits,
+                    arrays,
+                    bytes,
+                    nodes,
+                ),
+                None => Result::Ok(root),
+            }
+        },
+        SourceKind::Overrides(values) => apply_overrides(
+            root,
+            values,
+            origin,
+            limits,
+            arrays,
+            bytes,
+            nodes,
+        ),
+        SourceKind::Environment(options, values) => {
+            let entries = values.unwrap_or_else(|| env::vars());
+            let mapped = environment_overrides(options, entries, origin, limits)?;
+            let mut result = root;
+            let start = bytes.get();
+            for (item, origin) in mapped {
+                result = apply_overrides(
+                    result,
+                    Vec::from_array([item]),
+                    origin,
+                    limits,
+                    arrays,
+                    bytes,
+                    nodes,
+                )?;
+                if bytes.get() - start > limits.max_source_bytes {
+                    return Result::Err(
+                        Error::new(
+                            ErrorKind::Limit,
+                            "",
+                            origin,
+                            "environment source byte limit exceeded",
+                        ),
+                    )
+                }
+            }
+            Result::Ok(result)
+        },
+    }
+}

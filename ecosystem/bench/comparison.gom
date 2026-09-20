@@ -1,0 +1,108 @@
+package bench;
+
+use std::rand;
+use std::context;
+use std::num::{ToFloat};
+use std::serde::{Serialize, Deserialize};
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub enum Change {
+    Improved,
+    Regressed,
+    WithinNoise,
+    Inconclusive,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Comparison {
+    pub change: Change,
+    pub relative_change: Interval,
+    pub confidence: f64,
+    pub noise_threshold: f64,
+}
+
+fn sample_values(samples: Vec[Sample]) -> Result[Vec[f64], Error] {
+    if samples.len() < 2 || samples.len() > 10000 {
+        return Result::Err(error(ErrorKind::Baseline, "baseline requires 2 to 10000 samples"))
+    }
+    let result = Vec::with_capacity(samples.len());
+    for sample in samples {
+        if sample.iterations == 0 || sample.elapsed_ns <= 0 {
+            return Result::Err(error(ErrorKind::Baseline, "invalid baseline sample"))
+        }
+        result.push(sample.elapsed_ns.to_f64() / sample.iterations.to_f64());
+    }
+    Result::Ok(result)
+}
+
+fn resampled_mean(values: Vec[f64], state: Ref[u64]) -> f64 {
+    let mut result = 0.0;
+    for index in 0..values.len() {
+        state.set(rand::next_u64(state.get()));
+        let value = values[(state.get() % values.len().to_u64()).to_isize()];
+        result += (value - result) / (index + 1).to_f64();
+    }
+    result
+}
+
+pub fn compare_with(baseline: Report, current: Report, control: context::Context) -> Result[
+    Comparison,
+    Error,
+] {
+    check_context(control)?;
+    if baseline.group != current.group || baseline.name != current.name
+        || baseline.parameter != current.parameter
+        || baseline.throughput != current.throughput
+        || baseline.timing != current.timing {
+        return Result::Err(
+            error(
+                ErrorKind::Baseline,
+                "benchmark identity, timing model or throughput differs from baseline",
+            ),
+        )
+    }
+    let options = current.options;
+    options.validate()?;
+    let old = sample_values(baseline.samples)?;
+    let new = sample_values(current.samples)?;
+    if (old.len() + new.len()).to_u64() * options.bootstrap_resamples.to_u64() > 20000000 {
+        return Result::Err(error(ErrorKind::Limit, "baseline bootstrap work budget exceeded"))
+    }
+    let state = Ref::new(options.seed);
+    let differences = Vec::with_capacity(options.bootstrap_resamples);
+    for resample in 0..options.bootstrap_resamples {
+        if resample % 32 == 0 {
+            check_context(control)?;
+        }
+        let before = resampled_mean(old, state);
+        let after = resampled_mean(new, state);
+        differences.push(after / before - 1.0);
+    }
+    let ordered = sorted(differences);
+    let tail = (1.0 - options.confidence) / 2.0;
+    let lower = quantile(ordered, tail);
+    let upper = quantile(ordered, 1.0 - tail);
+    let estimate = mean(new) / mean(old) - 1.0;
+    let threshold = options.noise_threshold;
+    let change = if lower > threshold {
+        Change::Regressed
+    } else if upper < 0.0 - threshold {
+        Change::Improved
+    } else if lower >= 0.0 - threshold && upper <= threshold {
+        Change::WithinNoise
+    } else {
+        Change::Inconclusive
+    };
+    Result::Ok(
+        Comparison {
+            change,
+            relative_change: Interval { lower, estimate, upper },
+            confidence: options.confidence,
+            noise_threshold: threshold,
+        },
+    )
+}
+
+pub fn compare(baseline: Report, current: Report) -> Result[Comparison, Error] {
+    compare_with(baseline, current, context::Context::background())
+}

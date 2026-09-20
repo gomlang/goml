@@ -1,0 +1,386 @@
+package csv;
+
+use std::math;
+use std::num;
+use std::serde;
+use std::text;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ScalarType {
+    Text,
+    Bool,
+    Signed(isize),
+    Unsigned(isize),
+    Float(isize),
+    Char,
+}
+
+#[derive(Debug)]
+pub struct Column {
+    pub name: string,
+    pub kind: ScalarType,
+    pub nullable: bool,
+    pub trim: bool,
+}
+
+impl Column {
+    pub fn new(name: string, kind: ScalarType) -> Column {
+        Column { name, kind, nullable: false, trim: false }
+    }
+
+    pub fn optional(self: Column) -> Column {
+        Column { nullable: true, ..self }
+    }
+}
+
+pub struct Schema {
+    columns: Vec[Column],
+    extra: bool,
+}
+
+impl Schema {
+    pub fn new(columns: Vec[Column]) -> Result[Schema, Error] {
+        if columns.is_empty() {
+            return Result::Err(
+                error(
+                    ErrorKind::Options,
+                    Position::start(),
+                    Option::None,
+                    "schema must contain at least one column",
+                ),
+            )
+        }
+        let seen = HashMap::new();
+        for column in columns {
+            if column.name == "" || seen.get(column.name).is_some() {
+                return Result::Err(
+                    error(
+                        ErrorKind::Header,
+                        Position::start(),
+                        Option::None,
+                        "schema column names must be unique and nonempty",
+                    ),
+                )
+            }
+            seen.set(column.name, true);
+            let valid = match column.kind {
+                ScalarType::Signed(width) | ScalarType::Unsigned(width) => width == 0 || width == 8
+                    || width == 16
+                    || width == 32
+                    || width == 64,
+                ScalarType::Float(width) => width == 32 || width == 64,
+                _ => true,
+            };
+            if !valid {
+                return Result::Err(
+                    error(
+                        ErrorKind::Options,
+                        Position::start(),
+                        Option::None,
+                        "unsupported numeric width",
+                    ),
+                )
+            }
+        }
+        Result::Ok(Schema { columns: columns.copy(), extra: false })
+    }
+
+    pub fn allow_extra(self: Schema, extra: bool) -> Schema {
+        Schema { extra, ..self }
+    }
+
+    pub fn headers(self: Schema) -> StringRecord {
+        let names = Vec::new();
+        for column in self.columns {
+            names.push(column.name);
+        }
+        StringRecord::new(names)
+    }
+
+    pub fn decode[T: serde::Deserialize](
+        self: Schema,
+        record: StringRecord,
+        headers: Option[StringRecord],
+        duplicates: HeaderPolicy,
+    ) -> Result[T, Error] {
+        let indices = self.indices(record, headers, duplicates)?;
+        let fields = Vec::new();
+        for index in 0..self.columns.len() {
+            let physical = indices[index];
+            let column = self.columns[index];
+            let value = parse_cell(record.values[physical], column).map_err(
+                |message| error(
+                    ErrorKind::Type,
+                    record.positions[physical],
+                    Option::Some(physical),
+                    column.name + ": " + message,
+                ),
+            )?;
+            fields.push((column.name, value));
+        }
+        serde::from_value(serde::Value::Struct(fields)).map_err(
+            |message| error(ErrorKind::Type, record.position, Option::None, message),
+        )
+    }
+
+    fn indices(
+        self: Schema,
+        record: StringRecord,
+        headers: Option[StringRecord],
+        duplicates: HeaderPolicy,
+    ) -> Result[Vec[isize], Error] {
+        let result = Vec::new();
+        if let Some(headers) = headers {
+            check_headers(headers, duplicates)?;
+            if headers.len() != record.len() {
+                return Result::Err(
+                    error(
+                        ErrorKind::Width,
+                        record.position,
+                        Option::None,
+                        "typed record width differs from header",
+                    ),
+                )
+            }
+            let lookup = HashMap::new();
+            let wanted = HashMap::new();
+            for column in self.columns {
+                wanted.set(column.name, true);
+            }
+            for index in 0..headers.len() {
+                let name = headers.values[index];
+                if !self.extra && wanted.get(name).is_none() {
+                    return Result::Err(
+                        error(
+                            ErrorKind::Header,
+                            headers.positions[index],
+                            Option::Some(index),
+                            "unknown header: " + name,
+                        ),
+                    )
+                }
+                if duplicates == HeaderPolicy::Last || lookup.get(name).is_none() {
+                    lookup.set(name, index);
+                }
+            }
+            for column in self.columns {
+                result.push(
+                    lookup.get(column.name).ok_or(
+                        error(
+                            ErrorKind::Header,
+                            headers.position,
+                            Option::None,
+                            "missing header: " + column.name,
+                        ),
+                    )?,
+                );
+            }
+        } else {
+            if record.len() != self.columns.len() {
+                return Result::Err(
+                    error(
+                        ErrorKind::Width,
+                        record.position,
+                        Option::None,
+                        "typed record width differs from schema",
+                    ),
+                )
+            }
+            for index in 0..record.len() {
+                result.push(index);
+            }
+        }
+        Result::Ok(result)
+    }
+
+    pub fn encode[T: serde::Serialize](self: Schema, value: T) -> Result[StringRecord, Error] {
+        let value = serde::to_value(value).map_err(
+            |message| error(ErrorKind::Type, Position::start(), Option::None, message),
+        )?;
+        let fields = match value {
+            serde::Value::Struct(fields) => fields,
+            _ => return Result::Err(
+                error(
+                    ErrorKind::Type,
+                    Position::start(),
+                    Option::None,
+                    "typed CSV rows must serialize as flat structs",
+                ),
+            ),
+        };
+        let lookup = HashMap::new();
+        let wanted = HashMap::new();
+        for column in self.columns {
+            wanted.set(column.name, true);
+        }
+        for (name, value) in fields {
+            if lookup.get(name).is_some() || !self.extra && wanted.get(name).is_none() {
+                return Result::Err(
+                    error(
+                        ErrorKind::Type,
+                        Position::start(),
+                        Option::None,
+                        "duplicate or unknown serialized field: " + name,
+                    ),
+                )
+            }
+            lookup.set(name, value);
+        }
+        let output = Vec::new();
+        for index in 0..self.columns.len() {
+            let column = self.columns[index];
+            let value = lookup.get(column.name).ok_or(
+                error(
+                    ErrorKind::Type,
+                    Position::start(),
+                    Option::Some(index),
+                    "missing serialized field: " + column.name,
+                ),
+            )?;
+            let encoded = scalar_text(value, 0).map_err(
+                |message| error(
+                    ErrorKind::Type,
+                    Position::start(),
+                    Option::Some(index),
+                    column.name + ": " + message,
+                ),
+            )?;
+            let value = match encoded {
+                Some(value) => value,
+                None if column.nullable => "",
+                None => return Result::Err(
+                    error(
+                        ErrorKind::Type,
+                        Position::start(),
+                        Option::Some(index),
+                        "null in a required column: " + column.name,
+                    ),
+                ),
+            };
+            let _ = parse_cell(value, column).map_err(
+                |message| error(
+                    ErrorKind::Type,
+                    Position::start(),
+                    Option::Some(index),
+                    column.name + ": " + message,
+                ),
+            )?;
+            output.push(value);
+        }
+        Result::Ok(StringRecord::new(output))
+    }
+}
+
+fn integer_cell(value: string, signed: bool, width: isize) -> Result[serde::Value, string] {
+    if signed {
+        let parsed = num::parse_int_structured(value).map_err(|error| error.to_string())?;
+        if width > 0 && width < 64 {
+            let bound: isize = 1 << (width - 1);
+            if parsed < -bound || parsed >= bound {
+                return Result::Err("signed integer is out of range")
+            }
+        }
+    } else {
+        let parsed = num::parse_uint_structured(value).map_err(|error| error.to_string())?;
+        if width > 0 && width < 64 {
+            let bound: usize = 1 << width;
+            if parsed >= bound {
+                return Result::Err("unsigned integer is out of range")
+            }
+        }
+    }
+    Result::Ok(serde::Value::Number(value))
+}
+
+fn parse_cell(input: string, column: Column) -> Result[serde::Value, string] {
+    let value = if column.trim {
+        text::trim(input)
+    } else {
+        input
+    };
+    if value == "" && column.nullable {
+        return Result::Ok(serde::Value::Unit)
+    }
+    match column.kind {
+        ScalarType::Text => Result::Ok(serde::Value::String(value)),
+        ScalarType::Bool => match value {
+            "true" => Result::Ok(serde::Value::Bool(true)),
+            "false" => Result::Ok(serde::Value::Bool(false)),
+            _ => Result::Err("expected true or false"),
+        },
+        ScalarType::Signed(width) => integer_cell(value, true, width),
+        ScalarType::Unsigned(width) => integer_cell(value, false, width),
+        ScalarType::Float(width) => {
+            if width == 32 {
+                let parsed = num::parse_float32_structured(value).map_err(|error| error.to_string())?;
+                if !math::is_finite32(parsed) {
+                    return Result::Err("expected a finite float")
+                }
+            } else {
+                let parsed = num::parse_float64_structured(value).map_err(|error| error.to_string())?;
+                if !math::is_finite(parsed) {
+                    return Result::Err("expected a finite float")
+                }
+            }
+            Result::Ok(serde::Value::Number(value))
+        },
+        ScalarType::Char => {
+            let mut count = 0;
+            let mut scalar = '\u0000';
+            for character in value.chars() {
+                count += 1;
+                scalar = character;
+                if count > 1 {
+                    break
+                }
+            }
+            if count != 1 {
+                return Result::Err("expected one Unicode scalar")
+            }
+            Result::Ok(serde::Value::Char(scalar))
+        },
+    }
+}
+
+fn scalar_text(value: serde::Value, depth: isize) -> Result[Option[string], string] {
+    if depth > 1 {
+        return Result::Err("nested optional values are not supported")
+    }
+    let result = match value {
+        serde::Value::Unit => return Result::Err("unit values are not CSV scalars"),
+        serde::Value::Optional(values) => {
+            if depth > 0 {
+                return Result::Err("nested optional values are not supported")
+            }
+            if values.is_empty() {
+                return Result::Ok(Option::None)
+            }
+            if values.len() != 1 {
+                return Result::Err("invalid optional value")
+            }
+            return scalar_text(values[0], depth + 1)
+        },
+        serde::Value::Bool(value) => if value {
+            "true"
+        } else {
+            "false"
+        },
+        serde::Value::String(value) => value,
+        serde::Value::Char(value) => value.to_string(),
+        serde::Value::Number(value) => value,
+        serde::Value::Int(value) => value.to_string(),
+        serde::Value::Int8(value) => value.to_string(),
+        serde::Value::Int16(value) => value.to_string(),
+        serde::Value::Int32(value) => value.to_string(),
+        serde::Value::Int64(value) => value.to_string(),
+        serde::Value::Uint(value) => value.to_string(),
+        serde::Value::Uint8(value) => value.to_string(),
+        serde::Value::Uint16(value) => value.to_string(),
+        serde::Value::Uint32(value) => value.to_string(),
+        serde::Value::Uint64(value) => value.to_string(),
+        serde::Value::Float32(value) => value.to_string(),
+        serde::Value::Float64(value) => value.to_string(),
+        _ => return Result::Err("nested values, enums, maps and binary fields are not supported"),
+    };
+    Result::Ok(Option::Some(result))
+}

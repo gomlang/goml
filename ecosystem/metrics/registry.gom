@@ -1,0 +1,358 @@
+package metrics;
+
+use std::context;
+
+struct Cell {
+    labels: Vec[Label],
+    value: Ref[Value],
+    active: Ref[bool],
+}
+
+struct Family {
+    descriptor: Descriptor,
+    series: Ref[Vec[Cell]],
+}
+
+pub struct Registry {
+    options: Options,
+    gate: Channel[()],
+    families: Ref[Vec[Family]],
+}
+
+fn context_error(problem: context::Error) -> Error {
+    error(
+        match problem {
+            Cancelled => ErrorKind::Cancelled,
+            DeadlineExceeded => ErrorKind::Timeout,
+        },
+        problem.to_string(),
+    )
+}
+
+impl Registry {
+    pub fn new(options: Options) -> Result[Registry, Error] {
+        options.validate()?;
+        let gate = Channel::new(1);
+        gate.send(());
+        Result::Ok(Registry { options, gate, families: Ref::new(Vec::new()) })
+    }
+
+    fn acquire(self: Registry, ctx: context::Context) -> Result[(), Error] {
+        ctx.check().map_err(context_error)?;
+        select {
+            recv(self.gate) as _ => {
+                if let Err(problem) = ctx.check() {
+                    self.gate.send(());
+                    return Result::Err(context_error(problem))
+                }
+                Result::Ok(())
+            },
+            recv(ctx.done()) as _ => Result::Err(
+                context_error(ctx.error().unwrap_or(context::Error::Cancelled)),
+            ),
+        }
+    }
+
+    fn lock(self: Registry) -> () {
+        let _ = self.gate.recv();
+    }
+
+    fn unlock(self: Registry) -> () {
+        self.gate.send(());
+    }
+
+    fn family(self: Registry, descriptor: Descriptor) -> Result[Option[Family], Error] {
+        for family in self.families.get() {
+            if family.descriptor.name == descriptor.name {
+                if compatible(family.descriptor, descriptor) {
+                    return Result::Ok(Option::Some(family))
+                }
+                return Result::Err(
+                    error(
+                        ErrorKind::Conflict,
+                        "metric descriptor differs from previous registration",
+                    ),
+                )
+            }
+            for incoming in sample_names(descriptor) {
+                for existing in sample_names(family.descriptor) {
+                    if incoming == existing {
+                        return Result::Err(
+                            error(
+                                ErrorKind::Conflict,
+                                "metric collides with an exported sample name",
+                            ),
+                        )
+                    }
+                }
+            }
+        }
+        if self.families.get().len() >= self.options.max_families {
+            return Result::Err(error(ErrorKind::Limit, "metric family limit reached"))
+        }
+        Result::Ok(Option::None)
+    }
+
+    pub fn register(self: Registry, descriptor: Descriptor) -> Result[(), Error] {
+        let descriptor = descriptor.validate(self.options)?;
+        self.lock();
+        defer self.unlock();
+        if self.family(descriptor)?.is_none() {
+            self.families.get().push(Family { descriptor, series: Ref::new(Vec::new()) });
+        }
+        Result::Ok(())
+    }
+
+    fn labels(self: Registry, descriptor: Descriptor, labels: Labels) -> Result[Vec[Label], Error] {
+        if labels.values.len() != descriptor.label_names.len() {
+            return Result::Err(
+                error(ErrorKind::InvalidLabels, "labels do not match descriptor schema"),
+            )
+        }
+        for index in 0..labels.values.len() {
+            let value = labels.values[index];
+            if value.name != descriptor.label_names[index] {
+                return Result::Err(
+                    error(ErrorKind::InvalidLabels, "labels do not match descriptor schema"),
+                )
+            }
+            if value.value.byte_len() > self.options.max_label_value_bytes {
+                return Result::Err(error(ErrorKind::Limit, "label value exceeds byte limit"))
+            }
+        }
+        Result::Ok(labels.values.copy())
+    }
+
+    fn cell(self: Registry, descriptor: Descriptor, labels: Labels, expected: Kind) -> Result[
+        Cell,
+        Error,
+    ] {
+        let descriptor = descriptor.validate(self.options)?;
+        if descriptor.kind != expected {
+            return Result::Err(
+                error(ErrorKind::Conflict, "requested handle does not match metric kind"),
+            )
+        }
+        let labels = self.labels(descriptor, labels)?;
+        self.lock();
+        defer self.unlock();
+        let existing = self.family(descriptor)?;
+        if let Some(family) = existing {
+            for cell in family.series.get() {
+                if cell.labels == labels {
+                    return Result::Ok(cell)
+                }
+            }
+            if family.series.get().len() >= self.options.max_series_per_family {
+                return Result::Err(error(ErrorKind::Limit, "per-family series limit reached"))
+            }
+        }
+        let mut count = 0;
+        for family in self.families.get() {
+            count += family.series.get().len();
+        }
+        if count >= self.options.max_series {
+            return Result::Err(error(ErrorKind::Limit, "registry series limit reached"))
+        }
+        let family = match existing {
+            Some(family) => family,
+            None => {
+                let family = Family { descriptor, series: Ref::new(Vec::new()) };
+                self.families.get().push(family);
+                family
+            },
+        };
+        let cell = Cell {
+            labels,
+            value: Ref::new(initial_value(descriptor)),
+            active: Ref::new(true),
+        };
+        family.series.get().push(cell);
+        Result::Ok(cell)
+    }
+
+    pub fn counter(self: Registry, descriptor: Descriptor, labels: Labels) -> Result[Counter, Error] {
+        Result::Ok(Counter { registry: self, cell: self.cell(descriptor, labels, Kind::Counter)? })
+    }
+
+    pub fn gauge(self: Registry, descriptor: Descriptor, labels: Labels) -> Result[Gauge, Error] {
+        Result::Ok(Gauge { registry: self, cell: self.cell(descriptor, labels, Kind::Gauge)? })
+    }
+
+    pub fn histogram(self: Registry, descriptor: Descriptor, labels: Labels) -> Result[
+        Histogram,
+        Error,
+    ] {
+        Result::Ok(
+            Histogram { registry: self, cell: self.cell(descriptor, labels, Kind::Histogram)? },
+        )
+    }
+
+    pub fn remove_series(self: Registry, name: string, labels: Labels) -> Result[bool, Error] {
+        self.lock();
+        defer self.unlock();
+        for family in self.families.get() {
+            if family.descriptor.name == name {
+                let labels = self.labels(family.descriptor, labels)?;
+                let mut found = false;
+                let retained = Vec::new();
+                for cell in family.series.get() {
+                    if cell.labels == labels {
+                        cell.active.set(false);
+                        found = true;
+                    } else {
+                        retained.push(cell);
+                    }
+                }
+                family.series.set(retained);
+                return Result::Ok(found)
+            }
+        }
+        Result::Ok(false)
+    }
+
+    pub fn unregister(self: Registry, name: string) -> bool {
+        self.lock();
+        defer self.unlock();
+        let retained = Vec::new();
+        let mut found = false;
+        for family in self.families.get() {
+            if family.descriptor.name == name {
+                for cell in family.series.get() {
+                    cell.active.set(false);
+                }
+                found = true;
+            } else {
+                retained.push(family);
+            }
+        }
+        self.families.set(retained);
+        found
+    }
+
+    pub fn clear(self: Registry) -> () {
+        self.lock();
+        defer self.unlock();
+        for family in self.families.get() {
+            for cell in family.series.get() {
+                cell.active.set(false);
+            }
+        }
+        self.families.set(Vec::new());
+    }
+
+    pub fn snapshot(self: Registry) -> Snapshot {
+        self.lock();
+        defer self.unlock();
+        self.capture()
+    }
+
+    pub fn snapshot_with(self: Registry, ctx: context::Context) -> Result[Snapshot, Error] {
+        self.acquire(ctx)?;
+        defer self.unlock();
+        let snapshot = self.capture();
+        ctx.check().map_err(context_error)?;
+        Result::Ok(snapshot)
+    }
+
+    fn capture(self: Registry) -> Snapshot {
+        let families = Vec::new();
+        for family in self.families.get() {
+            let samples = Vec::new();
+            for cell in family.series.get() {
+                samples.push(Sample { labels: cell.labels.copy(), value: cell.value.get().copy() });
+            }
+            for index in 1..samples.len() {
+                let mut at = index;
+                while at > 0 && labels_before(samples[at].labels, samples[at - 1].labels) {
+                    let sample = samples[at];
+                    samples[at] = samples[at - 1];
+                    samples[at - 1] = sample;
+                    at -= 1;
+                }
+            }
+            families.push(FamilySnapshot { descriptor: family.descriptor.copy(), samples });
+        }
+        for index in 1..families.len() {
+            let mut at = index;
+            while at > 0 && families[at].descriptor.name < families[at - 1].descriptor.name {
+                let family = families[at];
+                families[at] = families[at - 1];
+                families[at - 1] = family;
+                at -= 1;
+            }
+        }
+        Snapshot { families_value: families }
+    }
+
+    pub fn render(self: Registry) -> string {
+        self.snapshot().prometheus()
+    }
+
+    pub fn render_with(self: Registry, ctx: context::Context) -> Result[string, Error] {
+        let snapshot = self.snapshot_with(ctx)?;
+        let output = snapshot.prometheus();
+        ctx.check().map_err(context_error)?;
+        Result::Ok(output)
+    }
+}
+
+fn labels_before(left: Vec[Label], right: Vec[Label]) -> bool {
+    for index in 0..left.len() {
+        if left[index].value != right[index].value {
+            return left[index].value < right[index].value
+        }
+    }
+    false
+}
+
+fn initial_value(descriptor: Descriptor) -> Value {
+    match descriptor.kind {
+        Counter => Value::Counter(0),
+        Gauge => Value::Gauge(0.0),
+        Histogram => {
+            let counts = Vec::new();
+            for _ in descriptor.buckets {
+                counts.push(0);
+            }
+            Value::Histogram(
+                HistogramValue {
+                    boundaries: descriptor.buckets.copy(),
+                    cumulative: counts,
+                    count: 0,
+                    sum: 0.0,
+                },
+            )
+        },
+    }
+}
+
+impl Snapshot {
+    pub fn families(self: Snapshot) -> Vec[FamilySnapshot] {
+        let families = Vec::new();
+        for family in self.families_value {
+            let samples = Vec::new();
+            for sample in family.samples {
+                samples.push(Sample { labels: sample.labels.copy(), value: sample.value.copy() });
+            }
+            families.push(FamilySnapshot { descriptor: family.descriptor.copy(), samples });
+        }
+        families
+    }
+
+    pub fn series_count(self: Snapshot) -> isize {
+        let mut count = 0;
+        for family in self.families_value {
+            count += family.samples.len();
+        }
+        count
+    }
+}
+
+fn attached(cell: Cell) -> Result[(), Error] {
+    if cell.active.get() {
+        Result::Ok(())
+    } else {
+        Result::Err(error(ErrorKind::Detached, "metric series has been removed"))
+    }
+}

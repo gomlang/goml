@@ -53,6 +53,14 @@ tracks completed improvements and the remaining functional gaps.
 | [progress](progress/README.md) | Concurrent bars/spinners, snapshots, rate/ETA, throttling, coordinated logging, redirected output and cancellable shutdown | Implemented; 12 library tests, independent consumer, 400 numerical cases, race detector and real PTY checks pass |
 | [diagnostics](diagnostics/README.md) | Checked source caches/spans, Unicode multi-file labels, themes, clipping, suggestions and conflict-checked edits | Implemented; 22 library tests, 3 consumer tests and 6,236 independent source/edit/rendering cases pass |
 | [tui_markdown](tui_markdown/README.md) | CommonMark terminal layout, themed blocks/inlines, tables, links, scrolling and searchable previews | Implemented; 13 library tests, 2 consumer tests, 1,118 independent cases and real PTY checks pass |
+| [fuzzy](fuzzy/README.md) | Unicode ranked subsequences, full case folding, grapheme-safe highlights, anchored modes, stable Top-K, persistent incremental queries and cancellable parallel search | Implemented; 16 library tests, 1,270 exhaustive reference cases, versioned consumer and race checks pass |
+| [config](config/README.md) | Layered typed JSON/TOML, environment and CLI sources, merge policies, JSON Pointer edits, provenance, validation, immutable snapshots and filesystem hot reload | Implemented; 19 library tests, real inotify reloads, versioned consumer and race checks pass |
+| [csv](csv/README.md) | Streaming standard I/O, quoted multiline fields, configurable dialects, byte/UTF-8 records, headers, precise positions, limits and typed Serde schemas | Implemented; 22 library tests, 1,500 generated roundtrips, versioned file consumer and race checks pass |
+| [websocket](websocket/README.md) | RFC 6455 handshakes, frames, masking, fragmented UTF-8 messages, control/close state machines, bounded queues and cancellable duplex TCP/TLS/standard I/O | Implemented; 23 library tests, live TCP consumer, fixed protocol vectors and race checks pass |
+| [highlight](highlight/README.md) | Extensible logos grammars, GoML/JSON/TOML/Markdown scopes, nested and cross-line regions, embedded fences, persistent incremental documents and ANSI/HTML output | Implemented; 17 library tests, 200 incremental/full rebuild comparisons, rope consumer and race checks pass |
+| [archive](archive/README.md) | GoML USTAR/PAX and classic ZIP codecs, CRC32, bounded TAR streaming and ZIP indexing, Deflate/GZIP adapters, metadata and rooted extraction | Implemented; 9 library tests, GNU tar/Info-ZIP interoperability, versioned consumer and race checks pass |
+| [metrics](metrics/README.md) | Concurrent counters/gauges/histograms, descriptor and label validation, cardinality limits, consistent snapshots, atomic gauge collection, timers and Prometheus exposition | Implemented; 16 library tests, live HTTP scrape consumer and race checks pass |
+| [bench](bench/README.md) | Adaptive sampling, parameterized workloads, setup exclusion, bootstrap statistics, baseline comparisons, throughput, cancellation and JSON/HTML reports | Implemented; 14 library tests, deterministic clocks, real sorting consumer and race checks pass |
 
 Validation includes module-local public API tests, separate consuming modules,
 deterministic negative cases, reference interoperability where applicable, and
@@ -78,6 +86,12 @@ adds structured styles; `terminal` owns one application's input/output session.
 application models. `progress` can own a separate progress region or expose pure
 snapshots for a TUI, and `diagnostics` produces explicit plain or colored reports.
 Keep one output owner per live terminal region when composing the libraries.
+
+`fuzzy` supplies reusable ranking and grapheme-safe match ranges for file pickers
+and completion menus. `highlight` adds lexical scopes, cross-line state and
+incremental ANSI/HTML code previews; its consumer composes edits with `rope` and
+highlights embedded GoML inside Markdown fences. These are separate public
+libraries, so applications can use their models with either a TUI or another UI.
 
 [`examples/explorer`](examples/explorer/README.md) combines a directory tree,
 Markdown preview, background scan progress and filesystem refresh. It provides
@@ -108,6 +122,7 @@ Run the available library and independent consumer checks from the repository ro
 just ecosystem-test
 just ecosystem-test lsp markdown diff
 just ecosystem-test color unicode_text ansi terminal tui prompt progress diagnostics tui_markdown
+just ecosystem-test fuzzy config csv websocket highlight archive metrics bench
 cd ecosystem/verification && ../../stage2/bin/goml test
 ```
 

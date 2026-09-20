@@ -1,0 +1,293 @@
+package fuzzy;
+
+use ecosystem::unicode_text;
+use std::context;
+use std::unicode;
+
+const MISSING: isize = -1000000000;
+
+fn first_scalar(value: string) -> char {
+    for ch in value.chars() {
+        return ch;
+    }
+    '\u0000'
+}
+
+fn boundary_bonus(previous: char, current: char, first: bool, paths: bool) -> isize {
+    if first {
+        12
+    } else if paths && (previous == '/' || previous == '\\') {
+        14
+    } else if !unicode::is_letter(previous) && !unicode::is_number(previous) {
+        10
+    } else if unicode::is_lowercase(previous) && unicode::is_uppercase(current) {
+        8
+    } else {
+        0
+    }
+}
+
+fn insensitive(mode: CaseMode, pattern: string) -> bool {
+    if mode == CaseMode::Sensitive {
+        return false;
+    }
+    if mode == CaseMode::Smart {
+        for ch in pattern.chars() {
+            if unicode::is_uppercase(ch) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn filled(size: isize, value: isize) -> Vec[isize] {
+    let output = Vec::with_capacity(size);
+    for _ in 0..size {
+        output.push(value);
+    }
+    output
+}
+
+impl Matcher {
+    pub fn new(options: Options) -> Result[Matcher, Error] {
+        if options.max_bytes < 1 || options.max_bytes > 16777216 || options.max_units < 1
+            || options.max_units > 1048576
+            || options.max_pattern_units < 1
+            || options.max_pattern_units > 4096
+            || options.max_cells < 1
+            || options.max_cells > 67108864
+            || options.max_results < 1
+            || options.max_results > 1000000 {
+            return Result::Err(Error::InvalidOptions);
+        }
+        Result::Ok(Matcher { options })
+    }
+
+    pub fn prepare(self: Matcher, value: string) -> Result[Candidate, Error] {
+        if value.byte_len() > self.options.max_bytes {
+            return Result::Err(Error::InputLimit);
+        }
+        let sensitive = Vec::new();
+        let folded = Vec::new();
+        let mut previous = '\u0000';
+        let mut index = 0;
+        for cluster in unicode_text::graphemes(value) {
+            let current = first_scalar(cluster.text);
+            let bonus = boundary_bonus(previous, current, index == 0, self.options.path_bonus);
+            let mut first = true;
+            for ch in cluster.text.chars() {
+                sensitive.push(
+                    Unit {
+                        value: ch,
+                        start: cluster.start,
+                        end: cluster.end,
+                        grapheme: index,
+                        bonus: if first {
+                            bonus
+                        } else {
+                            0
+                        },
+                    },
+                );
+                first = false;
+                previous = ch;
+            }
+            first = true;
+            for ch in unicode::case_fold(cluster.text).chars() {
+                folded.push(
+                    Unit {
+                        value: ch,
+                        start: cluster.start,
+                        end: cluster.end,
+                        grapheme: index,
+                        bonus: if first {
+                            bonus
+                        } else {
+                            0
+                        },
+                    },
+                );
+                first = false;
+            }
+            if sensitive.len() > self.options.max_units || folded.len() > self.options.max_units {
+                return Result::Err(Error::InputLimit);
+            }
+            index += 1;
+        }
+        Result::Ok(Candidate { value, sensitive, folded, path_bonus: self.options.path_bonus })
+    }
+
+    pub fn pattern(self: Matcher, value: string, kind: MatchKind) -> Result[Pattern, Error] {
+        if value.byte_len() > self.options.max_bytes {
+            return Result::Err(Error::PatternLimit);
+        }
+        let sensitive = !insensitive(self.options.case_mode, value);
+        let normalized = if sensitive {
+            value
+        } else {
+            unicode::case_fold(value)
+        };
+        let units = Vec::new();
+        for ch in normalized.chars() {
+            units.push(ch);
+            if units.len() > self.options.max_pattern_units {
+                return Result::Err(Error::PatternLimit);
+            }
+        }
+        Result::Ok(Pattern { value, units, sensitive, kind, case_mode: self.options.case_mode })
+    }
+
+    pub fn find(self: Matcher, query: string, value: string) -> Result[Option[Match], Error] {
+        self.find_with(query, value, MatchKind::Fuzzy, context::Context::background())
+    }
+
+    pub fn find_with(
+        self: Matcher,
+        query: string,
+        value: string,
+        kind: MatchKind,
+        ctx: context::Context,
+    ) -> Result[Option[Match], Error] {
+        check_context(ctx)?;
+        self.match_prepared(self.pattern(query, kind)?, self.prepare(value)?, ctx)
+    }
+
+    pub fn match_prepared(
+        self: Matcher,
+        pattern: Pattern,
+        candidate: Candidate,
+        ctx: context::Context,
+    ) -> Result[Option[Match], Error] {
+        check_context(ctx)?;
+        if candidate.value.byte_len() > self.options.max_bytes
+            || candidate.sensitive.len() > self.options.max_units
+            || candidate.folded.len() > self.options.max_units {
+            return Result::Err(Error::InputLimit);
+        }
+        if pattern.value.byte_len() > self.options.max_bytes
+            || pattern.units.len() > self.options.max_pattern_units {
+            return Result::Err(Error::PatternLimit);
+        }
+        if candidate.path_bonus != self.options.path_bonus
+            || pattern.case_mode != self.options.case_mode {
+            return Result::Err(Error::IncompatiblePreparation);
+        }
+        let source = if pattern.sensitive {
+            candidate.sensitive
+        } else {
+            candidate.folded
+        };
+        let rows = pattern.units.len();
+        let columns = source.len();
+        if rows == 0 {
+            if pattern.kind == MatchKind::Exact && columns != 0 {
+                return Result::Ok(Option::None);
+            }
+            return Result::Ok(
+                Option::Some(Match { score: 0, ranges: Vec::new(), graphemes: Vec::new() }),
+            );
+        }
+        if rows > columns || (pattern.kind == MatchKind::Exact && rows != columns) {
+            return Result::Ok(Option::None);
+        }
+        if columns > self.options.max_cells / rows {
+            return Result::Err(Error::WorkLimit);
+        }
+        let parents = filled(rows * columns, -1);
+        let mut previous = filled(columns, MISSING);
+        let mut current = filled(columns, MISSING);
+        for row in 0..rows {
+            check_context(ctx)?;
+            let mut best_gap = MISSING;
+            let mut best_parent = -1;
+            for column in 0..columns {
+                if column % 1024 == 0 {
+                    check_context(ctx)?;
+                }
+                current[column] = MISSING;
+                if row > 0 && column >= 2 && previous[column - 2] != MISSING {
+                    let score = previous[column - 2] + column - 2;
+                    if score > best_gap {
+                        best_gap = score;
+                        best_parent = column - 2;
+                    }
+                }
+                if pattern.units[row] != source[column].value {
+                    continue;
+                }
+                let reward = 16 + source[column].bonus;
+                if row == 0 {
+                    if column == 0
+                        || (pattern.kind != MatchKind::Prefix && pattern.kind != MatchKind::Exact) {
+                        current[column] = reward - column;
+                    }
+                } else {
+                    let mut score = MISSING;
+                    let mut parent = -1;
+                    if pattern.kind == MatchKind::Fuzzy && best_gap != MISSING {
+                        score = best_gap - (column - 1) - 3;
+                        parent = best_parent;
+                    }
+                    if column > 0 && previous[column - 1] != MISSING {
+                        let adjacent = previous[column - 1] + 8;
+                        if adjacent > score {
+                            score = adjacent;
+                            parent = column - 1;
+                        }
+                    }
+                    if parent >= 0 {
+                        current[column] = score + reward;
+                        parents[row * columns + column] = parent;
+                    }
+                }
+            }
+            let swap = previous;
+            previous = current;
+            current = swap;
+        }
+        let mut best = MISSING;
+        let mut end = -1;
+        for column in 0..columns {
+            if previous[column] == MISSING {
+                continue;
+            }
+            if (pattern.kind == MatchKind::Suffix || pattern.kind == MatchKind::Exact)
+                && column != columns - 1 {
+                continue;
+            }
+            let score = previous[column] - (columns - column - 1) / 4;
+            if score > best {
+                best = score;
+                end = column;
+            }
+        }
+        if end < 0 {
+            return Result::Ok(Option::None);
+        }
+        let chosen = Vec::new();
+        let mut row = rows - 1;
+        while row >= 0 {
+            chosen.push(source[end]);
+            end = parents[row * columns + end];
+            row -= 1;
+        }
+        chosen.reverse();
+        let ranges: Vec[Range] = Vec::new();
+        let graphemes = Vec::new();
+        for unit in chosen {
+            if graphemes.last() != Option::Some(unit.grapheme) {
+                graphemes.push(unit.grapheme);
+            }
+            match ranges.last() {
+                Some(last) => if unit.start <= last.end {
+                    ranges[ranges.len() - 1] = Range { start: last.start, end: unit.end };
+                } else {
+                    ranges.push(Range { start: unit.start, end: unit.end });
+                },
+                None => ranges.push(Range { start: unit.start, end: unit.end }),
+            }
+        }
+        Result::Ok(Option::Some(Match { score: best, ranges, graphemes }))
+    }
+}
