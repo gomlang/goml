@@ -1,0 +1,181 @@
+package tests;
+
+use ecosystem::tempfile;
+use std::fs;
+use std::io;
+use io::{Read, Write};
+use std::path;
+use std::task;
+use std::testing;
+
+#[test]
+fn spooling_threshold_sparse_writes_and_cursor_preservation() -> () {
+    let file = must(tempfile::SpooledTempFile::new(8));
+    defer {
+        let _ = file.close();
+    };
+    must(file.write_all(content("12345678").as_slice()));
+    testing::assert(!file.is_rolled());
+    testing::assert_eq(must(file.len()), 8);
+    must(file.rewind());
+    testing::assert_eq(must(file.read_to_string(8)), "12345678");
+    must(file.write_all(content("9").as_slice()));
+    testing::assert(file.is_rolled());
+    testing::assert_eq(must(file.seek(tempfile::SeekFrom::Current(0))), 9);
+    must(file.rewind());
+    testing::assert_eq(must(file.read_to_string(9)), "123456789");
+    must(file.set_len(2));
+    testing::assert(file.is_rolled());
+    testing::assert_eq(must(file.seek(tempfile::SeekFrom::End(2))), 4);
+    must(file.write_all(content("x").as_slice()));
+    must(file.rewind());
+    testing::assert(must(file.read_to_end(5)).to_vec() == Vec::from_array([b'1', b'2', 0, 0, b'x']));
+    must(file.sync_all());
+}
+
+#[test]
+fn memory_seek_holes_truncate_extend_and_invalid_offsets() -> () {
+    let file = must(tempfile::SpooledTempFile::new(32));
+    defer {
+        let _ = file.close();
+    };
+    must(file.seek(tempfile::SeekFrom::Start(4)));
+    must(file.write_all(content("x").as_slice()));
+    must(file.rewind());
+    testing::assert(must(file.read_to_end(5)).to_vec() == Vec::from_array([0, 0, 0, 0, b'x']));
+    must(file.set_len(2));
+    testing::assert_eq(must(file.seek(tempfile::SeekFrom::Current(0))), 5);
+    must(file.set_len(7));
+    must(file.rewind());
+    testing::assert_eq(must(file.read_to_end(7)).len(), 7);
+    testing::assert(!file.is_rolled());
+    testing::assert_err(file.seek(tempfile::SeekFrom::Start(-1)));
+    testing::assert_err(file.seek(tempfile::SeekFrom::End(-8)));
+    must(file.seek(tempfile::SeekFrom::Start(9223372036854775807)));
+    testing::assert_err(file.seek(tempfile::SeekFrom::Current(1)));
+    testing::assert_err(file.write(content("x").as_slice()));
+    testing::assert_eq(must(file.write(Vec::new().as_slice())), 0);
+    testing::assert(!file.is_rolled());
+    testing::assert_err(file.set_len(-1));
+    testing::assert_err(tempfile::SpooledTempFile::new(-1));
+}
+
+#[test]
+fn manual_rollover_into_file_and_close_aliases() -> () {
+    let root = directory();
+    defer {
+        let _ = root.close();
+    };
+    let file = must(
+        tempfile::SpooledTempFile::with_builder(64, tempfile::Builder::new().parent(root.path())),
+    );
+    let alias = file;
+    must(file.write_all(content("data").as_slice()));
+    must(file.seek(tempfile::SeekFrom::Start(2)));
+    must(file.rollover());
+    must(file.rollover());
+    testing::assert(file.is_rolled());
+    testing::assert_eq(must(file.seek(tempfile::SeekFrom::Current(0))), 2);
+    testing::assert_eq(
+        testing::expect_ok(fs::read_dir(root.path()), "unlinked disk backing").len(),
+        0,
+    );
+    let extracted = must(file.into_file());
+    defer {
+        let _ = extracted.close();
+    };
+    testing::assert(alias.is_closed());
+    testing::assert_err(alias.write(content("x").as_slice()));
+    must(alias.close());
+    testing::assert_eq(must(extracted.read_to_string(2)), "ta");
+    let zero = must(tempfile::SpooledTempFile::new(0));
+    defer {
+        let _ = zero.close();
+    };
+    must(zero.write_all(content("x").as_slice()));
+    testing::assert(zero.is_rolled());
+}
+
+#[test]
+fn failed_rollover_keeps_memory_and_can_retry() -> () {
+    let root = directory();
+    defer {
+        let _ = root.close();
+    };
+    let parent = path::join(root.path(), "later");
+    let file = must(
+        tempfile::SpooledTempFile::with_builder(4, tempfile::Builder::new().parent(parent)),
+    );
+    defer {
+        let _ = file.close();
+    };
+    must(file.write_all(content("data").as_slice()));
+    testing::assert_err(file.write(content("!").as_slice()));
+    testing::assert(!file.is_rolled());
+    testing::assert_eq(must(file.len()), 4);
+    testing::assert_eq(must(file.seek(tempfile::SeekFrom::Current(0))), 4);
+    testing::assert_ok(fs::create_dir(parent));
+    must(file.write_all(content("!").as_slice()));
+    testing::assert(file.is_rolled());
+    must(file.rewind());
+    testing::assert_eq(must(file.read_to_string(5)), "data!");
+}
+
+#[test]
+fn set_len_rollover_and_scope_cleanup() -> () {
+    let file = must(tempfile::SpooledTempFile::new(4));
+    defer {
+        let _ = file.close();
+    };
+    must(file.set_len(5));
+    testing::assert(file.is_rolled());
+    testing::assert_eq(must(file.seek(tempfile::SeekFrom::Current(0))), 0);
+    testing::assert(must(file.read_to_end(5)).to_vec() == Vec::from_array([0, 0, 0, 0, 0]));
+    let escaped = testing::expect_ok(
+        tempfile::with_spooled(
+            4,
+            tempfile::Builder::new(),
+            |file| {
+                file.write_all(content("spill").as_slice())?;
+                Result::Ok(file)
+            },
+        ),
+        "scope",
+    );
+    testing::assert(escaped.is_closed());
+    testing::assert_err(escaped.len());
+    testing::assert_err(escaped.flush());
+}
+
+#[test]
+fn concurrent_spool_writes_and_close_are_serialized() -> () {
+    let file = must(tempfile::SpooledTempFile::new(16));
+    defer {
+        let _ = file.close();
+    };
+    task::scope(
+        |scope| {
+            let jobs = Vec::new();
+            for _ in 0..32 {
+                jobs.push(scope.spawn(|_| must(file.write_all(content("abcd").as_slice()))));
+            }
+            let _ = task::join_all(jobs);
+        },
+    );
+    testing::assert_eq(must(file.len()), 128);
+    must(file.rewind());
+    let result = must(file.read_to_string(128));
+    for index in 0..32 {
+        testing::assert_eq(result.byte_slice(index * 4, index * 4 + 4), "abcd");
+    }
+    task::scope(
+        |scope| {
+            let jobs = Vec::new();
+            for _ in 0..16 {
+                jobs.push(scope.spawn(|_| must(file.close())));
+            }
+            let _ = task::join_all(jobs);
+        },
+    );
+    testing::assert(file.is_closed());
+}

@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parent
 MODULES = (
     "parser", "proptest", "cli", "msgpack", "graph", "template", "redis",
     "pipeline", "ndarray", "sqlite", "lsp", "markdown", "diff",
+    "bitflags", "logos", "tempfile", "reqwest", "llvm",
 )
 IGNORED = {"_artifact", "_bootstrap", ".git", "__pycache__"}
 
@@ -102,13 +103,13 @@ def main():
                 raise RuntimeError(f"cached build changed public artifacts for {name}")
             binary = consumer / "_artifact" / "bin" / name
             run([str(binary)], consumer, environment, logs / "consumer-run.log", records)
-            if name in ("diff", "lsp", "markdown", "msgpack", "template", "redis", "pipeline", "ndarray", "sqlite"):
+            if name in ("diff", "lsp", "markdown", "msgpack", "template", "redis", "pipeline", "ndarray", "sqlite", "bitflags", "logos", "tempfile", "reqwest", "llvm"):
                 run([sys.executable, str(library / "interop.py")], ROOT.parent, environment, logs / "interoperability.log", records)
             if name == "ndarray":
                 run([sys.executable, str(library / "simd_check.py")], ROOT.parent, environment, logs / "simd.log", records)
-            if name in ("redis", "pipeline", "sqlite"):
+            if name in ("redis", "pipeline", "sqlite", "tempfile", "reqwest", "llvm"):
                 run([sys.executable, str(library / "race.py")], ROOT.parent, environment, logs / "race-detector.log", records)
-            if name == "cli":
+            if name in ("cli", "bitflags"):
                 run([sys.executable, str(library / "diagnostics.py")], ROOT.parent, environment, logs / "derive-diagnostics.log", records)
         if set(selected) == set(MODULES):
             for name in ("unit_identity", "erased_generic", "specialized_static", "ffi_error_alias"):

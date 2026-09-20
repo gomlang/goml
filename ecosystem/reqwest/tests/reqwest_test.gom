@@ -1,0 +1,380 @@
+package tests;
+
+use ecosystem::reqwest::{Client, Headers, Url, ErrorKind, RedirectPolicy, StatusCode, Multipart, Part};
+use std::testing;
+use std::bytes::{Bytes};
+use std::json;
+use std::context;
+use std::time::{Duration};
+use std::task;
+use std::serde::{Serialize, Deserialize};
+
+fn client() -> Client {
+    testing::expect_ok(Client::new(), "client")
+}
+
+fn field(value: json::Value, name: string) -> string {
+    testing::expect_some(
+        json::as_string(testing::expect_some(json::field(value, name), "field")),
+        "text",
+    )
+}
+
+#[test]
+fn headers_urls_and_builder_validation() -> () {
+    let headers = testing::expect_ok(Headers::new().append("X-Name", "one"), "header");
+    let duplicate = testing::expect_ok(headers.append("x-name", "two"), "duplicate");
+    testing::assert_eq(headers.len(), 1);
+    testing::assert_eq(duplicate.get_all("X-NAME").len(), 2);
+    testing::assert_eq(duplicate.remove("X-Name").len(), 0);
+    testing::assert(Headers::new().insert("bad name", "value").is_err());
+    testing::assert(Headers::new().insert("name", "bad\r\nvalue").is_err());
+    let url = testing::expect_ok(Url::parse("HTTPS://Example.COM:443/a#fragment"), "URL");
+    testing::assert_eq(url.origin(), "https://example.com:443");
+    testing::assert(url.is_https());
+    testing::assert_eq(
+        testing::expect_ok(url.join("../b?q=1"), "relative").as_string(),
+        "https://example.com:443/b?q=1",
+    );
+    testing::assert(Url::parse("ftp://example.com").is_err());
+    testing::assert(Url::parse("https://name:secret@example.com").is_err());
+    testing::assert(Client::builder().timeout(Duration::zero()).build().is_err());
+    testing::assert(Client::builder().body_limit(-1).build().is_err());
+    testing::assert(Client::builder().redirect(RedirectPolicy::Limited(-1)).build().is_err());
+    testing::assert(Client::builder().add_root_certificate("invalid").build().is_err());
+    let client = client();
+    defer client.close();
+    testing::assert(client.request("bad method", "http://localhost").build().is_err());
+    testing::assert(client.get("http://localhost").header("Content-Length", "10").build().is_err());
+    testing::assert(client.get("http://localhost").basic_auth("bad:name", "x").build().is_err());
+    testing::assert(StatusCode::from_u16(99).is_err());
+    testing::assert(testing::expect_ok(StatusCode::from_u16(204), "status").is_success());
+}
+
+#[test]
+fn requests_preserve_query_forms_auth_and_headers() -> () {
+    let server = start(false, false);
+    defer close(server);
+    let client = testing::expect_ok(
+        Client::builder().user_agent("goml-reqwest-test").build(),
+        "client",
+    );
+    defer client.close();
+    let request = client.post(url(server) + "/echo?existing=one").query(
+        Vec::from_array([("space", "a b"), ("repeat", "1"), ("repeat", "2"), ("unicode", "中😀")]),
+    ).append_header("X-Custom", "a").append_header("x-custom", "b").basic_auth("user", "pass").form(
+        Vec::from_array([("name", "a b+中"), ("empty", "")]),
+    );
+    let response = testing::expect_ok(request.send(), "send form");
+    let value: json::Value = testing::expect_ok(response.json(), "decode echo");
+    testing::assert_eq(field(value, "method"), "POST");
+    testing::assert_eq(
+        field(value, "query"),
+        "existing=one&repeat=1&repeat=2&space=a+b&unicode=%E4%B8%AD%F0%9F%98%80",
+    );
+    testing::assert_eq(field(value, "body"), "empty=&name=a+b%2B%E4%B8%AD");
+    testing::assert_eq(field(value, "authorization"), "Basic dXNlcjpwYXNz");
+    testing::assert_eq(field(value, "custom"), "a|b");
+    testing::assert_eq(field(value, "user_agent"), "goml-reqwest-test");
+    let built = testing::expect_ok(client.get(url(server)).build(), "request");
+    testing::assert_eq(built.method(), "GET");
+    testing::assert(built.body().is_empty());
+    testing::assert(testing::expect_ok(client.execute(built), "execute").status().is_success());
+}
+
+#[derive(Serialize, Deserialize)]
+struct Payload {
+    name: string,
+    count: isize,
+}
+
+#[test]
+fn typed_json_binary_status_and_response_snapshots() -> () {
+    let server = start(false, false);
+    defer close(server);
+    let client = client();
+    defer client.close();
+    let response = testing::expect_ok(
+        client.post(url(server) + "/json").json(Payload { name: "中😀", count: 42 }).send(),
+        "json",
+    );
+    let decoded: Payload = testing::expect_ok(response.json(), "typed JSON");
+    testing::assert_eq(decoded.name, "中😀");
+    testing::assert_eq(decoded.count, 42);
+    let bytes = response.bytes();
+    bytes.clear();
+    testing::assert(response.content_length() > 0);
+    let headers = testing::expect_ok(client.get(url(server) + "/headers").send(), "headers").headers();
+    testing::assert_eq(headers.get_all("x-many").len(), 2);
+    let invalid = testing::expect_ok(client.get(url(server) + "/invalid").send(), "binary");
+    testing::assert_eq(invalid.bytes().len(), 3);
+    testing::assert(invalid.text().is_err());
+    let status = testing::expect_ok(client.get(url(server) + "/status").send(), "status");
+    testing::assert(status.status().is_client_error());
+    let error = testing::expect_err(status.error_for_status(), "status error");
+    testing::assert_eq(error.kind, ErrorKind::Status);
+    testing::assert_eq(testing::expect_some(error.status, "status code"), 422);
+}
+
+#[test]
+fn redirects_apply_method_replay_limits_and_origin_rules() -> () {
+    let server = start(false, false);
+    let other = start(false, false);
+    defer close(server);
+    defer close(other);
+    let client = client();
+    defer client.close();
+    let request = client.post(url(server) + "/redirect?to=/echo&code=302").text("payload").bearer_auth(
+        "secret",
+    );
+    let response = testing::expect_ok(request.send(), "302");
+    let value: json::Value = testing::expect_ok(response.json(), "echo");
+    testing::assert_eq(field(value, "method"), "GET");
+    testing::assert_eq(field(value, "body"), "");
+    testing::assert_eq(field(value, "authorization"), "Bearer secret");
+    testing::assert_eq(response.history().len(), 1);
+    let preserved = testing::expect_ok(
+        client.post(url(server) + "/redirect?to=/echo&code=307").text("payload").send(),
+        "307",
+    );
+    let value: json::Value = testing::expect_ok(preserved.json(), "echo");
+    testing::assert_eq(field(value, "method"), "POST");
+    testing::assert_eq(field(value, "body"), "payload");
+    let cross = client.get(url(server) + "/redirect").query(
+        Vec::from_array([("to", url(other) + "/echo")]),
+    ).bearer_auth("secret").header("cookie", "secret=value");
+    let value: json::Value = testing::expect_ok(
+        testing::expect_ok(cross.send(), "cross redirect").json(),
+        "echo",
+    );
+    testing::assert_eq(field(value, "authorization"), "");
+    testing::assert_eq(field(value, "cookie"), "");
+    testing::assert_eq(
+        testing::expect_err(cross.redirect(RedirectPolicy::SameOrigin(5)).send(), "origin").kind,
+        ErrorKind::Redirect,
+    );
+    testing::assert_eq(
+        testing::expect_err(
+            client.get(url(server) + "/loop").redirect(RedirectPolicy::Limited(2)).send(),
+            "loop",
+        ).kind,
+        ErrorKind::Redirect,
+    );
+    testing::assert_eq(
+        testing::expect_ok(
+            client.get(url(server) + "/loop").redirect(RedirectPolicy::None).send(),
+            "no redirect",
+        ).status().as_isize(),
+        302,
+    );
+}
+
+#[test]
+fn limits_cover_declared_chunked_and_decompressed_bodies() -> () {
+    let server = start(false, false);
+    defer close(server);
+    let client = client();
+    defer client.close();
+    for path in Vec::from_array(["/large", "/chunked", "/gzip"]) {
+        let error = testing::expect_err(
+            client.get(url(server) + path).body_limit(4).send(),
+            "body limit",
+        );
+        testing::assert_eq(error.kind, ErrorKind::BodyLimit);
+    }
+    let gzip = testing::expect_ok(client.get(url(server) + "/gzip").send(), "gzip");
+    testing::assert_eq(gzip.content_length(), 11264);
+    testing::assert(!gzip.headers().contains("content-encoding"));
+    let chunked = testing::expect_ok(client.get(url(server) + "/chunked").send(), "chunked");
+    testing::assert_eq(testing::expect_ok(chunked.text(), "text"), "chunk-onechunk-two");
+    let tiny = testing::expect_ok(Client::builder().request_body_limit(1).build(), "tiny");
+    defer tiny.close();
+    testing::assert_eq(
+        testing::expect_err(
+            tiny.post(url(server)).body(Bytes::from_string("large")).send(),
+            "request limit",
+        ).kind,
+        ErrorKind::BodyLimit,
+    );
+}
+
+#[test]
+fn deadlines_cancellation_and_client_close_interrupt_io() -> () {
+    let server = start(false, false);
+    defer close(server);
+    let client = client();
+    defer client.close();
+    for path in Vec::from_array(["/slow", "/slowbody"]) {
+        let error = testing::expect_err(
+            client.get(url(server) + path).timeout(Duration::from_milliseconds(50)).send(),
+            "timeout",
+        );
+        testing::assert_eq(error.kind, ErrorKind::Timeout);
+    }
+    context::with_timeout(
+        context::Context::background(),
+        Duration::from_milliseconds(50),
+        |ctx, _| {
+            testing::assert_eq(
+                testing::expect_err(client.get(url(server) + "/slow").send_with(ctx), "deadline").kind,
+                ErrorKind::Timeout,
+            );
+        },
+    );
+    context::with_cancel(
+        context::Context::background(),
+        |ctx, cancel| {
+            task::scope(
+                |scope| {
+                    let work = scope.spawn(|_| client.get(url(server) + "/slow").send_with(ctx));
+                    cancel.cancel();
+                    testing::assert_eq(
+                        testing::expect_err(work.join(), "cancel").kind,
+                        ErrorKind::Cancelled,
+                    );
+                },
+            );
+        },
+    );
+    client.close();
+    client.close();
+    testing::assert(client.is_closed());
+    testing::assert_eq(
+        testing::expect_err(client.get(url(server)).send(), "closed").kind,
+        ErrorKind::Closed,
+    );
+}
+
+#[test]
+fn https_validates_certificates_supports_mtls_and_http2() -> () {
+    let server = start(true, false);
+    defer close(server);
+    let untrusted = client();
+    defer untrusted.close();
+    testing::assert(untrusted.get(url(server)).send().is_err());
+    let trusted = testing::expect_ok(
+        Client::builder().add_root_certificate(certificate(server)).build(),
+        "trusted",
+    );
+    defer trusted.close();
+    let response = testing::expect_ok(trusted.get(url(server)).send(), "HTTPS");
+    testing::assert_eq(response.version(), "HTTP/2.0");
+    let plain = start(false, false);
+    defer close(plain);
+    let downgrade = trusted.get(url(server) + "/redirect").query(
+        Vec::from_array([("to", url(plain))]),
+    );
+    testing::assert_eq(testing::expect_err(downgrade.send(), "downgrade").kind, ErrorKind::Redirect);
+    let mutual = start(true, true);
+    defer close(mutual);
+    let no_identity = testing::expect_ok(
+        Client::builder().add_root_certificate(certificate(mutual)).build(),
+        "root",
+    );
+    defer no_identity.close();
+    testing::assert(no_identity.get(url(mutual)).send().is_err());
+    let identity = testing::expect_ok(
+        Client::builder().add_root_certificate(certificate(mutual)).identity(
+            certificate(mutual),
+            key(mutual),
+        ).build(),
+        "identity",
+    );
+    defer identity.close();
+    testing::assert(
+        testing::expect_ok(identity.get(url(mutual)).send(), "mTLS").status().is_success(),
+    );
+}
+
+#[test]
+fn pooled_client_supports_parallel_requests_and_cookie_store() -> () {
+    let server = start(false, false);
+    defer close(server);
+    let client = testing::expect_ok(Client::builder().cookie_store(true).build(), "cookies");
+    defer client.close();
+    let first = testing::expect_ok(client.get(url(server)).send(), "first");
+    let second = testing::expect_ok(client.get(url(server)).send(), "second");
+    testing::assert(first.headers().get("x-remote") == second.headers().get("x-remote"));
+    let _ = testing::expect_ok(
+        client.get(url(server) + "/cookie/set?domain=127.0.0.1").send(),
+        "cookie set",
+    );
+    let cookie = testing::expect_ok(
+        testing::expect_ok(client.get(url(server) + "/cookie/get").send(), "cookie get").text(),
+        "text",
+    );
+    testing::assert_eq(cookie, "session=goml");
+    task::scope(
+        |scope| {
+            let tasks = Vec::new();
+            for _ in 0..12 {
+                tasks.push(scope.spawn(|_| client.get(url(server)).send().is_ok()))
+            }
+            for work in tasks {
+                testing::assert(work.join())
+            }
+        },
+    );
+    client.close_idle_connections();
+    testing::assert(
+        testing::expect_ok(client.get(url(server)).send(), "new connection").status().is_success(),
+    );
+}
+
+#[test]
+fn multipart_preserves_binary_files_and_rejects_injected_metadata() -> () {
+    let server = start(false, false);
+    defer close(server);
+    let client = client();
+    defer client.close();
+    let multipart = Multipart::new().text("name", "中😀").part(
+        "upload",
+        Part::bytes(Bytes::from_string("file\u0000bytes")).file_name("data.txt").mime_type(
+            "text/plain",
+        ),
+    );
+    let response = testing::expect_ok(
+        client.post(url(server) + "/multipart").multipart(multipart).send(),
+        "multipart",
+    );
+    let value: json::Value = testing::expect_ok(response.json(), "multipart echo");
+    testing::assert_eq(field(value, "name"), "中😀");
+    testing::assert_eq(field(value, "filename"), "data.txt");
+    testing::assert_eq(field(value, "mime"), "text/plain");
+    testing::assert_eq(field(value, "body"), "file\u0000bytes");
+    let invalid = Multipart::new().part("upload", Part::text("x").file_name("bad\r\nname"));
+    testing::assert(client.post(url(server)).multipart(invalid).build().is_err());
+}
+
+#[test]
+fn cancellation_and_close_wake_requests_already_in_flight() -> () {
+    let server = start(false, false);
+    defer close(server);
+    let client = client();
+    defer client.close();
+    context::with_cancel(
+        context::Context::background(),
+        |ctx, cancel| {
+            task::scope(
+                |scope| {
+                    let work = scope.spawn(|_| client.get(url(server) + "/slowbody").send_with(ctx));
+                    testing::assert(wait_request(server));
+                    cancel.cancel();
+                    testing::assert_eq(
+                        testing::expect_err(work.join(), "in-flight cancellation").kind,
+                        ErrorKind::Cancelled,
+                    );
+                },
+            );
+        },
+    );
+    task::scope(
+        |scope| {
+            let work = scope.spawn(|_| client.get(url(server) + "/slowbody").send());
+            testing::assert(wait_request(server));
+            client.close();
+            let error = testing::expect_err(work.join(), "in-flight close");
+            testing::assert(error.kind == ErrorKind::Cancelled || error.kind == ErrorKind::Closed);
+        },
+    );
+}
