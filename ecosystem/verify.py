@@ -15,6 +15,8 @@ MODULES = (
     "parser", "proptest", "cli", "msgpack", "graph", "template", "redis",
     "pipeline", "ndarray", "sqlite", "lsp", "markdown", "diff",
     "bitflags", "logos", "tempfile", "reqwest", "llvm",
+    "rope", "tracing", "web", "ignore", "syntax", "cache", "bigint",
+    "decimal", "incremental", "datetime",
 )
 IGNORED = {"_artifact", "_bootstrap", ".git", "__pycache__"}
 
@@ -82,6 +84,7 @@ def main():
     goml = str(args.goml.resolve())
     environment = os.environ.copy()
     environment["GOML_HOME"] = str(registry_snapshot())
+    environment["GOML_VERIFY_DRIVER"] = goml
     records = []
     report = ROOT / "_artifact" / "verification" / "report.json"
     report.parent.mkdir(parents=True, exist_ok=True)
@@ -103,13 +106,13 @@ def main():
                 raise RuntimeError(f"cached build changed public artifacts for {name}")
             binary = consumer / "_artifact" / "bin" / name
             run([str(binary)], consumer, environment, logs / "consumer-run.log", records)
-            if name in ("diff", "lsp", "markdown", "msgpack", "template", "redis", "pipeline", "ndarray", "sqlite", "bitflags", "logos", "tempfile", "reqwest", "llvm"):
+            if (library / "interop.py").is_file():
                 run([sys.executable, str(library / "interop.py")], ROOT.parent, environment, logs / "interoperability.log", records)
             if name == "ndarray":
                 run([sys.executable, str(library / "simd_check.py")], ROOT.parent, environment, logs / "simd.log", records)
-            if name in ("redis", "pipeline", "sqlite", "tempfile", "reqwest", "llvm"):
+            if (library / "race.py").is_file():
                 run([sys.executable, str(library / "race.py")], ROOT.parent, environment, logs / "race-detector.log", records)
-            if name in ("cli", "bitflags"):
+            if (library / "diagnostics.py").is_file():
                 run([sys.executable, str(library / "diagnostics.py")], ROOT.parent, environment, logs / "derive-diagnostics.log", records)
         if set(selected) == set(MODULES):
             for name in ("unit_identity", "erased_generic", "specialized_static", "ffi_error_alias"):

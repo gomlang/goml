@@ -1,0 +1,310 @@
+package main;
+
+use ecosystem::syntax;
+use std::json;
+use std::testing;
+use std::io;
+use std::env;
+use std::iter;
+
+#[derive(json::Deserialize)]
+struct Command {
+    op: string,
+    kind: u32,
+    text: string,
+}
+
+#[derive(json::Deserialize)]
+struct Replacement {
+    path: Vec[isize],
+    kind: u32,
+    text: string,
+}
+
+#[derive(json::Deserialize)]
+struct TreeCase {
+    commands: Vec[Command],
+    replacements: Vec[Replacement],
+    offsets: Vec[isize],
+    slices: Vec[Vec[isize]],
+}
+
+#[derive(json::Deserialize)]
+struct ConfigCase {
+    text: string,
+    path: Vec[string],
+    key: string,
+    value: string,
+}
+
+#[derive(json::Deserialize)]
+struct Inputs {
+    trees: Vec[TreeCase],
+    configs: Vec[ConfigCase],
+}
+
+#[derive(json::Serialize)]
+struct ElementReport {
+    path: Vec[isize],
+    node: bool,
+    kind: u32,
+    start: isize,
+    end: isize,
+    children: isize,
+}
+
+#[derive(json::Serialize)]
+struct OffsetReport {
+    offset: isize,
+    ok: bool,
+    kinds: Vec[u32],
+    starts: Vec[isize],
+    ends: Vec[isize],
+}
+
+#[derive(json::Serialize)]
+struct SliceReport {
+    ok: bool,
+    text: string,
+}
+
+#[derive(json::Serialize)]
+struct TreeReport {
+    text: string,
+    bytes: isize,
+    elements: isize,
+    depth: isize,
+    descriptions: Vec[ElementReport],
+    offsets: Vec[OffsetReport],
+    slices: Vec[SliceReport],
+}
+
+#[derive(json::Serialize)]
+struct EditReport {
+    ok: bool,
+    report: TreeReport,
+}
+
+#[derive(json::Serialize)]
+struct TreeOutput {
+    original: TreeReport,
+    edits: Vec[EditReport],
+    snapshot: string,
+}
+
+#[derive(json::Serialize)]
+struct ConfigOutput {
+    lossless: string,
+    diagnostics: Vec[Diagnostic],
+    ok: bool,
+    rewritten: string,
+    snapshot: string,
+    entries: Vec[Vec[string]],
+}
+
+#[derive(json::Serialize)]
+struct Outputs {
+    trees: Vec[TreeOutput],
+    configs: Vec[ConfigOutput],
+}
+
+fn describe(root: syntax::SyntaxNode, offsets: Vec[isize], slices: Vec[Vec[isize]]) -> TreeReport {
+    let descriptions = Vec::new();
+    for element in root.descendants_with_tokens() {
+        let path = Vec::new();
+        let mut current = element;
+        while let Some(parent) = current.parent() {
+            path.push(current.index());
+            current = parent.element();
+        }
+        path.reverse();
+        descriptions.push(
+            ElementReport {
+                path,
+                node: element.as_node().is_some(),
+                kind: element.kind(),
+                start: element.range().start(),
+                end: element.range().end(),
+                children: element.as_node().map(|node| node.green().child_count()).unwrap_or(0),
+            },
+        );
+    }
+    let offset_reports = Vec::new();
+    for offset in offsets {
+        let kinds = Vec::new();
+        let starts = Vec::new();
+        let ends = Vec::new();
+        let tokens = Vec::new();
+        let mut ok = true;
+        match root.token_at_offset(offset) {
+            Ok(value) => match value {
+                None => (),
+                Single(token) => tokens.push(token),
+                Between(a, b) => {
+                    tokens.push(a);
+                    tokens.push(b);
+                },
+            },
+            Err(_) => {
+                ok = false;
+            },
+        }
+        for token in tokens {
+            kinds.push(token.kind());
+            starts.push(token.range().start());
+            ends.push(token.range().end());
+        }
+        offset_reports.push(OffsetReport { offset, ok, kinds, starts, ends });
+    }
+    let slice_reports = Vec::new();
+    for pair in slices {
+        let result = syntax::TextRange::new(pair[0], pair[1]).and_then(
+            |range| root.text_slice(range),
+        );
+        slice_reports.push(
+            match result {
+                Ok(text) => SliceReport { ok: true, text },
+                Err(_) => SliceReport { ok: false, text: "" },
+            },
+        );
+    }
+    let mut walked_tokens = 0;
+    let mut cursor = root.first_token();
+    while let Some(token) = cursor {
+        if let Some(next) = token.next_token() {
+            testing::assert(
+                testing::expect_some(next.prev_token(), "backward navigation").same_occurrence(
+                    token,
+                ),
+            );
+        }
+        walked_tokens += 1;
+        cursor = token.next_token();
+    }
+    testing::assert_eq(walked_tokens, iter::count(root.tokens()));
+    TreeReport {
+        text: root.text(),
+        bytes: root.green().len_bytes(),
+        elements: root.green().element_count(),
+        depth: root.green().depth(),
+        descriptions,
+        offsets: offset_reports,
+        slices: slice_reports,
+    }
+}
+
+fn locate(root: syntax::SyntaxNode, path: Vec[isize]) -> Option[syntax::SyntaxElement] {
+    let mut current = root.element();
+    for index in path {
+        current = match current.as_node() {
+            Some(node) => match node.child_at(index) {
+                Some(child) => child,
+                None => return Option::None,
+            },
+            None => return Option::None,
+        };
+    }
+    Option::Some(current)
+}
+
+fn exercise_tree(input: TreeCase) -> TreeOutput {
+    let builder = syntax::GreenBuilder::new();
+    for command in input.commands {
+        match command.op {
+            "start" => testing::assert_ok(builder.start_node(command.kind)),
+            "token" => testing::assert_ok(builder.token(command.kind, command.text)),
+            "finish" => testing::assert_ok(builder.finish_node()),
+            _ => testing::assert(false),
+        }
+    }
+    let old = syntax::SyntaxNode::new_root(testing::expect_ok(builder.finish(), "oracle tree"));
+    let original = describe(old, input.offsets, input.slices);
+    let mut root = old;
+    let edits = Vec::new();
+    for replacement in input.replacements {
+        let result = match locate(root, replacement.path) {
+            Some(value) => value.replace_with(
+                testing::expect_ok(
+                    syntax::GreenToken::new(replacement.kind, replacement.text),
+                    "replacement",
+                ).element(),
+                syntax::Limits::standard(),
+            ),
+            None => Result::Err(syntax::Error::Bounds),
+        };
+        let ok = result.is_ok();
+        if let Ok(green) = result {
+            root = syntax::SyntaxNode::new_root(green);
+        }
+        edits.push(EditReport { ok, report: describe(root, input.offsets, input.slices) });
+    }
+    TreeOutput { original, edits, snapshot: old.text() }
+}
+
+fn exercise_config(input: ConfigCase) -> ConfigOutput {
+    let parsed = testing::expect_ok(parse(input.text), "parse config");
+    let values = Vec::new();
+    if let Some(target) = section(parsed.root, input.path) {
+        for entry in entries(target) {
+            values.push(Vec::from_array([entry.key(), entry.value()]));
+        }
+    }
+    let rewritten = rewrite(parsed.root, input.path, input.key, input.value);
+    ConfigOutput {
+        lossless: parsed.root.text(),
+        diagnostics: parsed.diagnostics,
+        ok: rewritten.is_ok(),
+        rewritten: match rewritten {
+            Ok(value) => value.text(),
+            Err(_) => parsed.root.text(),
+        },
+        snapshot: parsed.root.text(),
+        entries: values,
+    }
+}
+
+pub fn exercise() -> () {
+    let source = "# settings\r\nserver {\n  host = \"本地😀\" # preserved\n  port = 8080\n}\n";
+    let parsed = testing::expect_ok(parse(source), "configuration");
+    testing::assert(parsed.diagnostics.is_empty());
+    testing::assert_eq(parsed.root.text(), source);
+    let target = testing::expect_some(
+        section(parsed.root, Vec::from_array(["server"])),
+        "server section",
+    );
+    let values = entries(target);
+    testing::assert_eq(values.len(), 2);
+    testing::assert_eq(testing::expect_ok(values[0].string_value(), "string value"), "本地😀");
+    testing::assert_eq(testing::expect_ok(values[1].integer_value(), "port"), 8080);
+    let changed = testing::expect_ok(
+        rewrite(parsed.root, Vec::from_array(["server"]), "port", "9090"),
+        "rewrite port",
+    );
+    testing::assert_eq(
+        changed.text(),
+        "# settings\r\nserver {\n  host = \"本地😀\" # preserved\n  port = 9090\n}\n",
+    );
+    testing::assert_eq(parsed.root.text(), source);
+}
+
+fn main() -> () {
+    let args = env::args();
+    if args.len() > 1 && args[1] == "--json" {
+        let input = testing::expect_ok(io::read_stdin_to_string(), "stdin");
+        let values: Inputs = testing::expect_ok(json::from_string(input), "oracle request");
+        let trees = Vec::new();
+        let configs = Vec::new();
+        for tree in values.trees {
+            trees.push(exercise_tree(tree));
+        }
+        for config in values.configs {
+            configs.push(exercise_config(config));
+        }
+        println(
+            testing::expect_ok(json::try_to_string(Outputs { trees, configs }), "JSON response"),
+        );
+    } else {
+        exercise();
+        println("syntax consumer: ok");
+    }
+}

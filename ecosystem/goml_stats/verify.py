@@ -4,10 +4,15 @@ import os
 from pathlib import Path
 import random
 import subprocess
+import sys
 import tempfile
 
 
 ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT.parent))
+import verify as ecosystem_verify
+
+
 COUNTERS = ("files", "test_files", "lines", "code", "comments", "blank", "bytes")
 
 
@@ -30,10 +35,12 @@ def main():
     artifact.mkdir(parents=True, exist_ok=True)
     log = (artifact / "commands.log").open("w")
     commands = []
+    environment = os.environ.copy()
+    environment["GOML_HOME"] = str(ecosystem_verify.registry_snapshot())
 
     def run(command, cwd=ROOT, expected=0):
         result = subprocess.run([str(value) for value in command], cwd=cwd,
-                                capture_output=True, text=True, timeout=180)
+                                env=environment, capture_output=True, text=True, timeout=180)
         log.write(f"$ {command!r}\n{result.stdout}{result.stderr}\n")
         log.flush()
         commands.append({"command": [str(value) for value in command],
@@ -172,6 +179,45 @@ def main():
         failure = run([binary, "--json", root], expected=1)
         assert failure.stdout == "" and "invalid.gom" in failure.stderr
         invalid.unlink()
+
+        ignored_root = root / "ignore_fixture"
+        ignore_sources = ["main.gom", "ignored.gom", "generated/hidden.gom",
+                          "generated/keep.gom", "logs/a.gom", "logs/keep.gom",
+                          "src/private.gom", "src/keep.gom", "src/deep/kept.gom",
+                          "info.gom", "info_hidden.gom", "#literal.gom"]
+        for name in ignore_sources:
+            write("ignore_fixture/" + name, "code\n")
+        write("ignore_fixture/.gitignore",
+              "ignored.gom\ngenerated/\n!generated/keep.gom\nlogs/*\n!logs/keep.gom\n!info.gom\n\\#literal.gom\n")
+        write("ignore_fixture/src/.gitignore", "/private.gom\n")
+        write("ignore_fixture/.git/info/exclude", "info.gom\ninfo_hidden.gom\n")
+        ignore_counts = {name: counts("code\n", 1, 0, 0) for name in ignore_sources}
+        visible = {"main.gom", "logs/keep.gom", "src/keep.gom", "src/deep/kept.gom", "info.gom"}
+        check(report(target=ignored_root), {name: ignore_counts[name] for name in visible})
+        check(report("--no-ignore", target=ignored_root), ignore_counts)
+        check(report("--no-default-excludes", target=ignored_root),
+              {name: ignore_counts[name] for name in visible})
+        check(report("--exclude", "src", target=ignored_root),
+              {name: ignore_counts[name] for name in visible if not name.startswith("src/")})
+        check(report(target=ignored_root / "ignored.gom"), {"ignored.gom": counts("code\n", 1, 0, 0)})
+        check(report(target=ignored_root / "generated"),
+              {"hidden.gom": counts("code\n", 1, 0, 0), "keep.gom": counts("code\n", 1, 0, 0)})
+
+        worktree_root = root / "worktree"
+        worktree_git = root / "worktree metadata/common/worktrees/linked"
+        worktree_git.mkdir(parents=True)
+        write("worktree metadata/common/info/exclude", "ignored.gom\noverride.gom\n")
+        write("worktree metadata/common/worktrees/linked/commondir", "../..\n")
+        write("worktree/.git", "gitdir: ../worktree metadata/common/worktrees/linked\n")
+        write("worktree/.gitignore", "!override.gom\n")
+        for name in ("main.gom", "ignored.gom", "override.gom"):
+            write("worktree/" + name, "code\n")
+        worktree_visible = {name: counts("code\n", 1, 0, 0) for name in ("main.gom", "override.gom")}
+        check(report(target=worktree_root), worktree_visible)
+        write("worktree/.git", "gitdir: " + str(worktree_git) + "\n")
+        check(report(target=worktree_root), worktree_visible)
+        check(report("--no-ignore", target=worktree_root),
+              {name: counts("code\n", 1, 0, 0) for name in ("main.gom", "ignored.gom", "override.gom")})
 
         rng = random.Random(20260920)
         blocks = [(["// comment"], (0, 1, 0)), (["", " \t"], (0, 0, 2)),

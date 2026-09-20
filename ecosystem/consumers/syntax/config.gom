@@ -1,0 +1,335 @@
+package main;
+
+use ecosystem::syntax;
+use syntax::AstNode;
+use std::json;
+use std::num;
+
+pub const ROOT: u32 = 100;
+
+pub const ENTRY: u32 = 101;
+
+pub const SECTION: u32 = 102;
+
+pub const ERROR: u32 = 103;
+
+pub const WORD: u32 = 1;
+
+pub const NUMBER: u32 = 2;
+
+pub const STRING: u32 = 3;
+
+pub const SPACE: u32 = 4;
+
+pub const COMMENT: u32 = 5;
+
+pub const EQUAL: u32 = 6;
+
+pub const OPEN: u32 = 7;
+
+pub const CLOSE: u32 = 8;
+
+pub const NEWLINE: u32 = 9;
+
+pub const BAD: u32 = 10;
+
+pub const MISSING: u32 = 11;
+
+#[derive(json::Serialize)]
+pub struct Diagnostic {
+    pub start: isize,
+    pub end: isize,
+    pub message: string,
+}
+
+pub struct Parsed {
+    pub root: syntax::SyntaxNode,
+    pub diagnostics: Vec[Diagnostic],
+}
+
+struct Lexeme {
+    kind: u32,
+    text: string,
+    start: isize,
+    end: isize,
+}
+
+fn delimiter(ch: char) -> bool {
+    ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == '#' || ch == '=' || ch == '{'
+        || ch == '}'
+        || ch == '"'
+}
+
+fn lex(source: string) -> Vec[Lexeme] {
+    let tokens = Vec::new();
+    let mut at = 0;
+    while at < source.byte_len() {
+        let start = at;
+        let (ch, width) = source.decode_at(at).unwrap_or(('�', 1));
+        at += width;
+        let mut kind = WORD;
+        if ch == ' ' || ch == '\t' || ch == '\r' {
+            kind = SPACE;
+            while at < source.byte_len() {
+                let (next, size) = source.decode_at(at).unwrap_or(('�', 1));
+                if next != ' ' && next != '\t' && next != '\r' {
+                    break
+                }
+                at += size;
+            }
+        } else if ch == '\n' {
+            kind = NEWLINE;
+        } else if ch == '#' {
+            kind = COMMENT;
+            while at < source.byte_len() && source.byte_get(at) != b'\n' {
+                at += 1;
+            }
+        } else if ch == '=' {
+            kind = EQUAL;
+        } else if ch == '{' {
+            kind = OPEN;
+        } else if ch == '}' {
+            kind = CLOSE;
+        } else if ch == '"' {
+            kind = BAD;
+            let mut escaped = false;
+            while at < source.byte_len() {
+                let (next, size) = source.decode_at(at).unwrap_or(('�', 1));
+                if next == '\n' {
+                    break
+                }
+                at += size;
+                if escaped {
+                    escaped = false;
+                } else if next == '\\' {
+                    escaped = true;
+                } else if next == '"' {
+                    let decoded: Result[string, string] = json::from_string(
+                        source.byte_slice(start, at),
+                    );
+                    if decoded.is_ok() {
+                        kind = STRING;
+                    }
+                    break
+                }
+            }
+        } else {
+            while at < source.byte_len() {
+                let (next, size) = source.decode_at(at).unwrap_or(('�', 1));
+                if delimiter(next) {
+                    break
+                }
+                at += size;
+            }
+            if num::parse_int_structured(source.byte_slice(start, at)).is_ok() {
+                kind = NUMBER;
+            }
+        }
+        tokens.push(Lexeme { kind, text: source.byte_slice(start, at), start, end: at });
+    }
+    tokens
+}
+
+fn significant(tokens: Vec[Lexeme], from: isize) -> isize {
+    let mut index = from;
+    while index < tokens.len() && tokens[index].kind == SPACE {
+        index += 1;
+    }
+    index
+}
+
+fn emit(builder: syntax::GreenBuilder, token: Lexeme) -> Result[(), syntax::Error] {
+    builder.token(token.kind, token.text)
+}
+
+pub fn parse(source: string) -> Result[Parsed, syntax::Error] {
+    let _ = syntax::GreenToken::new(0, source)?;
+    let tokens = lex(source);
+    let builder = syntax::GreenBuilder::new();
+    builder.start_node(ROOT)?;
+    let diagnostics = Vec::new();
+    let mut index = 0;
+    let mut sections = 0;
+    while index < tokens.len() {
+        let token = tokens[index];
+        if token.kind == SPACE || token.kind == COMMENT || token.kind == NEWLINE {
+            emit(builder, token)?;
+            index += 1;
+            continue
+        }
+        if token.kind == CLOSE && sections > 0 {
+            emit(builder, token)?;
+            let _ = builder.finish_node()?;
+            sections -= 1;
+            index += 1;
+            continue
+        }
+        let after_key = significant(tokens, index + 1);
+        if token.kind == WORD && after_key < tokens.len() && tokens[after_key].kind == OPEN {
+            if sections >= 128 {
+                return Result::Err(syntax::Error::Limit)
+            }
+            builder.start_node(SECTION)?;
+            for at in index..=after_key {
+                emit(builder, tokens[at])?;
+            }
+            index = after_key + 1;
+            sections += 1;
+            continue
+        }
+        if token.kind == WORD && after_key < tokens.len() && tokens[after_key].kind == EQUAL {
+            let value_at = significant(tokens, after_key + 1);
+            if value_at < tokens.len()
+                && (tokens[value_at].kind == WORD || tokens[value_at].kind == NUMBER
+                    || tokens[value_at].kind == STRING) {
+                let after_value = significant(tokens, value_at + 1);
+                if after_value == tokens.len() || tokens[after_value].kind == NEWLINE
+                    || tokens[after_value].kind == COMMENT
+                    || tokens[after_value].kind == CLOSE {
+                    builder.start_node(ENTRY)?;
+                    for at in index..=value_at {
+                        emit(builder, tokens[at])?;
+                    }
+                    let _ = builder.finish_node()?;
+                    index = value_at + 1;
+                    continue
+                }
+            }
+        }
+        builder.start_node(ERROR)?;
+        let start = token.start;
+        let mut end = token.end;
+        emit(builder, token)?;
+        index += 1;
+        while index < tokens.len() && tokens[index].kind != NEWLINE && tokens[index].kind != CLOSE {
+            end = tokens[index].end;
+            emit(builder, tokens[index])?;
+            index += 1;
+        }
+        let _ = builder.finish_node()?;
+        diagnostics.push(
+            Diagnostic {
+                start,
+                end,
+                message: "expected a key = scalar, a section, or a matching brace",
+            },
+        );
+    }
+    while sections > 0 {
+        builder.token(MISSING, "")?;
+        let _ = builder.finish_node()?;
+        sections -= 1;
+        diagnostics.push(
+            Diagnostic {
+                start: source.byte_len(),
+                end: source.byte_len(),
+                message: "missing closing brace",
+            },
+        );
+    }
+    let _ = builder.finish_node()?;
+    Result::Ok(Parsed { root: syntax::SyntaxNode::new_root(builder.finish()?), diagnostics })
+}
+
+pub struct Entry {
+    node: syntax::SyntaxNode,
+}
+
+impl AstNode for Entry {
+    fn cast(node: syntax::SyntaxNode) -> Option[Entry] {
+        if node.kind() == ENTRY {
+            Option::Some(Entry { node })
+        } else {
+            Option::None
+        }
+    }
+
+    fn syntax(self: Entry) -> syntax::SyntaxNode {
+        self.node
+    }
+}
+
+impl Entry {
+    pub fn key(self: Entry) -> string {
+        self.node.first_token().map(|token| token.text()).unwrap_or("")
+    }
+
+    pub fn value_token(self: Entry) -> Option[syntax::SyntaxToken] {
+        self.node.last_token()
+    }
+
+    pub fn value(self: Entry) -> string {
+        self.value_token().map(|token| token.text()).unwrap_or("")
+    }
+
+    pub fn string_value(self: Entry) -> Result[string, string] {
+        let token = match self.value_token() {
+            Some(value) => value,
+            None => return Result::Err("missing value"),
+        };
+        if token.kind() != STRING {
+            return Result::Err("expected a quoted string")
+        }
+        json::from_string(token.text()).map_err(|_| "invalid string")
+    }
+
+    pub fn integer_value(self: Entry) -> Result[isize, string] {
+        num::parse_int_structured(self.value()).map_err(|_| "expected a machine integer")
+    }
+}
+
+pub fn entries(root: syntax::SyntaxNode) -> Vec[Entry] {
+    syntax::ast_children(root)
+}
+
+pub fn section(root: syntax::SyntaxNode, path: Vec[string]) -> Option[syntax::SyntaxNode] {
+    let mut current = root;
+    for part in path {
+        let mut found = Option::None;
+        for child in current.children() {
+            if child.kind() == SECTION
+                && child.first_token().map(|token| token.text()).unwrap_or("") == part {
+                found = Option::Some(child);
+                break
+            }
+        }
+        match found {
+            Some(value) => {
+                current = value;
+            },
+            None => return Option::None,
+        }
+    }
+    Option::Some(current)
+}
+
+pub fn rewrite(root: syntax::SyntaxNode, path: Vec[string], key: string, literal: string) -> Result[
+    syntax::GreenNode,
+    string,
+] {
+    let _ = syntax::GreenToken::new(0, literal).map_err(|error| error.to_string())?;
+    let tokens = lex(literal);
+    if tokens.len() != 1
+        || (tokens[0].kind != WORD && tokens[0].kind != NUMBER && tokens[0].kind != STRING) {
+        return Result::Err("replacement must be one valid scalar literal")
+    }
+    let target = match section(root, path) {
+        Some(value) => value,
+        None => return Result::Err("section not found"),
+    };
+    for entry in entries(target) {
+        if entry.key() == key {
+            let token = match entry.value_token() {
+                Some(value) => value,
+                None => return Result::Err("missing value"),
+            };
+            let replacement = syntax::GreenToken::new(tokens[0].kind, literal).map_err(
+                |error| error.to_string(),
+            )?;
+            return token.replace_with(replacement, syntax::Limits::standard()).map_err(
+                |error| error.to_string(),
+            )
+        }
+    }
+    Result::Err("key not found")
+}
