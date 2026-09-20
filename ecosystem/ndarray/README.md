@@ -125,7 +125,7 @@ the same element type; conversion uses `map`.
 | `sum`, `product`, `sum_axes`, `product_axes` | Generic scalar reductions, with optional retained dimensions |
 | `where_array` | Broadcast boolean selection over generic arrays |
 | `all`, `any` | Boolean reductions; empty results are true/false respectively |
-| `linspace(start, end, count, endpoint)` | Module function constructing `Array[f64]` |
+| `Array::[f64]::linspace(start, end, count, endpoint)` | Specialized associated constructor; `Array::linspace` infers the owner and the module-level `linspace` remains available |
 | `mean`, `variance(ddof)`, `stddev(ddof)`, `norm` | `f64` statistics and scaled Euclidean/Frobenius norm |
 | `mean_axes`, `variance_axes`, `min_axes`, `max_axes` | Multi-axis `f64` reductions |
 | `minimum`, `maximum`, `argmin`, `argmax` | Global `f64` extrema and flat positions |

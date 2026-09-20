@@ -3,7 +3,9 @@
 This directory exercises GoML through reusable libraries, each with its own
 `goml.toml`, public API, documentation, and external tests. Implementations are
 independent GoML modules. Libraries with native integration document their
-ordinary Go FFI adapters and system dependencies.
+ordinary Go FFI adapters and system dependencies. The current implementations
+require GoML 0.1.50 or later, including its standard I/O, resource, byte snapshot
+and derive capabilities.
 
 The libraries below have implementations, public documentation, independent
 consumers and executable verification. The table records their implemented scope;
@@ -15,20 +17,20 @@ tracks completed improvements and the remaining functional gaps.
 | [parser](parser/README.md) | Text/binary combinators, recursive grammars, shared work/depth budgets, spans, contextual errors and operator precedence | Implemented; module and consumer tests pass |
 | [proptest](proptest/README.md) | Composable and stateful generators, lazy budgeted shrinking, discard/coverage reports, persistent replay, unique collections and IEEE edge cases | Implemented; module and consumer tests pass |
 | [cli](cli/README.md) | Command schemas, aliases, inherited global options, argument groups, help, validation and third-party derives | Implemented; module and consumer tests pass |
-| [msgpack](msgpack/README.md) | MessagePack wire types, direct Serde integration, typed and dynamic APIs, malformed-input limits and interoperability | Implemented; 14 library tests, consumer checks and 2,490 reference interoperability cases pass |
+| [msgpack](msgpack/README.md) | MessagePack wire types, direct Serde and standard stream integration, typed/dynamic frames, malformed-input limits and interoperability | Implemented; 20 library tests, consumer checks and 2,490 reference interoperability cases pass |
 | [graph](graph/README.md) | Mutable directed/undirected graphs, stable IDs, traversal, components, topological order, shortest paths and spanning trees | Implemented; independent algorithm checks and consumer tests pass |
 | [template](template/README.md) | Expressions, lexical scopes, conditions, loops, filters, includes, inheritance, escaping and contextual diagnostics | Implemented; 11 library tests, 2 consumer tests and 1,367 Jinja shared-syntax comparisons pass |
-| [redis](redis/README.md) | RESP2/3 codec, typed commands, pipelining, transactions, Pub/Sub, injectable transport, cancellation and total deadlines | Implemented; 18 library tests and race checks, versioned consumers, 2,391 protocol cases and Redis 7.2.5 RESP2/3 interoperability pass |
+| [redis](redis/README.md) | RESP2/3 codec, typed commands, pipelining, transactions, Pub/Sub, DNS/TLS, injectable transport, context cancellation and total deadlines | Implemented; 19 library tests and race checks, versioned consumers, 2,391 protocol cases, Redis 7.2.5 RESP2/3 interoperability and 11 DNS/TLS cases in normal/race builds pass |
 | [pipeline](pipeline/README.md) | Lazy streams, bounded parallel transforms, filtering, ordering, batching/windows, merge/zip, backpressure and cancellation | Implemented; 21 library tests and race checks, versioned consumer and 1,253 Python oracle cases pass |
 | [ndarray](ndarray/README.md) | Generic shared views, slicing, broadcasting, checked arithmetic, reductions, batched multiplication, LU/Cholesky/QR solves and SIMD | Implemented; 17 library tests, versioned consumer, 2,929 NumPy cases and native/SSE2/scalar builds pass |
 | [sqlite](sqlite/README.md) | Typed binding/rows, prepared statements, streaming queries, nested savepoints, rollback, cancellation and explicit resource management | Implemented; 13 GoML tests, 4 native tests, versioned consumer, 2,754 SQLite comparisons and race checks pass |
 | [lsp](lsp/README.md) | JSON-RPC framing, persistent rope document snapshots, UTF-16 positions, synchronous/deferred dispatch, cancellation and deadlines | Implemented; module, consumer and subprocess interoperability tests pass |
 | [markdown](markdown/README.md) | Block and inline parsing, AST, HTML rendering, escaping, links, code, lists and reference conformance | Implemented; 652/652 CommonMark examples, entity, module and consumer checks pass |
 | [diff](diff/README.md) | Myers and linear-space Hirschberg differences, unified patches, checked application, context and newline preservation | Implemented; tests and GNU interoperability pass |
-| [bitflags](bitflags/README.md) | Typed integer flag sets, third-party derives, unknown-bit policies, set algebra, name iteration, text and numeric Serde | Implemented; 10 library tests, consumer, 16 derive diagnostics and 4,601 Rust reference comparisons pass |
+| [bitflags](bitflags/README.md) | Typed integer flag sets, trait and inherent derives, unknown-bit policies, set algebra, name iteration, text and numeric Serde | Implemented; 11 library tests, consumer, 19 derive diagnostics and 4,601 Rust reference comparisons pass |
 | [logos](logos/README.md) | Typed UTF-8 lexers, regex/literal rules, longest match, priorities, callbacks/extras, mode switching and bounded Thompson NFA matching | Implemented; 11 library tests, consumer, race checks and 3,155 Python reference cases pass |
 | [tempfile](tempfile/README.md) | Secure temporary files/directories, anonymous files, atomic persistence, ownership transfer, scoped cleanup and memory-to-disk spooling | Implemented; 24 library tests and race checks, consumer and 160 concurrent filesystem comparisons pass |
-| [reqwest](reqwest/README.md) | HTTP(S)/HTTP2 clients, request builders, JSON/form/multipart, redirects, cancellation, TLS policy and bounded responses | Implemented; 10 library tests and race checks, 4 native race tests, consumer and Python HTTP interoperability pass |
+| [reqwest](reqwest/README.md) | HTTP(S)/HTTP2 clients, request builders, JSON/form/multipart, redirects, cancellation, TLS policy, immutable body snapshots and bounded responses | Implemented; 11 library tests and race checks, 4 native race tests, consumer and Python HTTP interoperability pass |
 | [llvm](llvm/README.md) | LLVM 18 typed handles, IR construction/parsing, verification, optimization, bitcode and native object/assembly output | Implemented; 7 library tests, 4 native tests and race checks, consumer and 9,624 linked-function comparisons pass |
 | [rope](rope/README.md) | Persistent balanced UTF-8 text, shared snapshots, checked edits/slices, UTF-16 and line indexing, chunk iterators and streaming I/O | Implemented; 11 library tests and race checks, versioned consumer and 3,266 Python reference edits pass |
 | [tracing](tracing/README.md) | Structured events, nested spans, explicit task contexts, filtering/sampling, composed sinks, bounded asynchronous output and coordinated cleanup | Implemented; 26 library tests and race checks, 3 consumer tests and 1,307 Python reference records pass |
@@ -93,8 +95,9 @@ SQLite also requires its declared native Go dependencies to be fetched before
 readonly compilation (`cd ecosystem/sqlite && go mod download all`). The NumPy
 reference check uses CPython 3.12 on Linux amd64. Reference programs and wheels
 are downloaded into ignored `_artifact/` directories as documented by each
-library; race checks require the repository's C compiler prerequisite. The
-bitflags reference checker additionally requires `rustc` and downloads a
+library; race checks require the repository's C compiler prerequisite. Redis's
+DNS/TLS checks additionally use OpenSSL to generate ephemeral local certificates.
+The bitflags reference checker additionally requires `rustc` and downloads a
 checksum-pinned reference crate; the GoML library itself has no Rust dependency.
 The LLVM binding requires LLVM 18 development headers and `libLLVM-18` under
 `/usr/lib/llvm-18`, plus a C compiler and enabled cgo. Its verification also uses

@@ -46,8 +46,11 @@ They distinguish supported designs from current compiler or API boundaries.
   generic reply decoders and captured fallible transformations; consumer-defined
   `FromReply` implementations specialize across the versioned module boundary.
   Incremental recursive RESP values preserve binary data, attributes and streamed
-  aggregates. All 15 library tests also pass under Go's race detector, including
+  aggregates. All 19 library tests also pass under Go's race detector, including
   concurrent calls, close wakeups and cancellation during partial replies.
+  DNS/TLS connectors now use the released standard network APIs. Eleven Python
+  TLS-server cases, repeated under the race detector, verify trust, mTLS,
+  setup/operation deadlines and both context and legacy cancellation.
 
 - Pipeline composes lazy generic push functions across module interfaces, with
   separate item/error type parameters and consumer-defined records. Parallel
@@ -81,8 +84,10 @@ They distinguish supported designs from current compiler or API boundaries.
   trait methods, typed iterators, and explicit text/numeric Serde wrappers work
   across a versioned dependency. Exhaustive byte-set algebra and 4,601 comparisons
   with Rust bitflags cover aliases, overlapping flags, unknown bits and parsing.
-  GoML now supports inherent derive output, but associated constants remain
-  unsupported; this library retains its trait API and module constants.
+  The optional `FlagValues` derive now emits public inherent constructors such
+  as `Access::flag_read()`, including across package interfaces without trait
+  imports. Existing trait APIs and module constants remain compatible;
+  associated constants remain unsupported.
 
 - Logos implements a recursive regex AST, bounded Thompson NFA construction,
   generic callbacks with extras/error types and cross-package iterator methods
@@ -98,8 +103,9 @@ They distinguish supported designs from current compiler or API boundaries.
 - Reqwest uses an ordinary Go FFI transport with GoML request/response types,
   redirect policy and scoped cancellation. Native HTTP/HTTPS servers and Python
   interoperability exercise certificate validation, HTTP/2, bounded bodies,
-  multipart, sensitive-header isolation and connection reuse. Public byte
-  boundaries copy bytes explicitly: `bytes::Bytes::to_vec()` is not an isolation
+  multipart, sensitive-header isolation and connection reuse. Private body
+  storage now uses `FrozenBytes`, with shared immutable accessors and explicit
+  mutable copies at the public boundary. `Bytes::to_vec()` is not an isolation
   guarantee for later mutations of the returned `Vec`.
 
 - LLVM exposes distinct GoML handle types over an opaque Go FFI interface and
@@ -203,7 +209,7 @@ escape was emitted as a literal BOM inside generated Go, which Go rejects.
 The backend now emits `\ufeff`, preserving the UTF-8 value. Printer and real
 Go compilation/execution regressions cover embedded and repeated marks.
 
-The development compiler now passes all four retained reproducers in `repros/`:
+GoML 0.1.50 passes all four retained reproducers in `repros/`:
 
 - `unit_identity`: separately allocated `Ref[()]` values remain distinct when
   stored in containers. Empty structs, nested zero-size values and zero-length
@@ -222,8 +228,11 @@ The development compiler now passes all four retained reproducers in `repros/`:
 `python3 ecosystem/verify.py` runs these reproducers after the library matrix.
 Compiler pipeline fixtures 286–288 and module fixtures 084–087 cover these fixes,
 including serialization through independently compiled interfaces. The existing
-`TypedCommand[T]`, ndarray module constructor, and SQLite transport package remain
-valid API designs, but their original compiler workarounds are no longer required.
+`TypedCommand[T]` is retained for compatibility, while CLI now exposes
+`schema::[T]() -> Command` and exercises erased generic arguments through
+forwarding and function values. Ndarray adds `Array::[f64]::linspace` with inferred
+owner calls and a compatible module-level forwarder. SQLite's consumer removes
+the transport workaround and uses standard I/O directly in its FFI package.
 
 ## Type inference and standard-library interfaces
 
@@ -241,6 +250,8 @@ valid API designs, but their original compiler workarounds are no longer require
 - `std::resource` combines action and cleanup errors and provides concurrent,
   idempotent LIFO scopes. `Bytes::copy` and `freeze` make buffer isolation explicit.
   Serde formats can distinguish text from binary through `is_human_readable`.
+  Tempfile's scope helpers now use `io::with_resource` while retaining their
+  existing single-cleanup-error API and deferred idempotent close.
 - Native adapter declarations now resolve Go modules from registry source paths
   using generated artifact-local module files. LLVM major and cgo prerequisites
   are checked; system packages and linker search paths still require setup.
@@ -251,7 +262,9 @@ valid API designs, but their original compiler workarounds are no longer require
 - Scalar conversion is available through `std::num::{ToFloat, TryToInt}`.
   Integer-to-float rounding and checked float-to-integer conversion are verified
   against native Go across all rounding modes, boundary values and random bit
-  patterns. Existing bit-based generator code remains valid.
+  patterns. Ndarray count conversion and template numeric coercion now use
+  `ToFloat`; property generators retain bit construction for reproducible IEEE
+  distributions.
 - `Debug` is not universally implemented for standard generic containers. Tests
   compare container values through `PartialEq`, while scalar assertions retain
   detailed diagnostics.
@@ -271,6 +284,14 @@ TCP, TLS and Linux descriptors implement the stream traits. Partial transfers,
 failed flush retries, exact limits, binary stdin and malformed stream counts have
 regression coverage. Buffered adapters require serialized shared access and
 explicit flushing/closing.
+
+MessagePack now provides generic `StreamReader[R: Read]` and
+`StreamWriter[W: Write]` adapters. Its retained frame scanner supports typed
+decoding directly from buffered bytes, preserving binary and extension events.
+Tests cover downstream Serde derives, bounded concatenated frames, partial
+transfers, invalid stream counts, clean/truncated EOF, type-mismatch retry and
+terminal partial-write failure. Values remain buffered individually; incremental
+field callbacks are still outside this interface.
 
 `std::context` provides scoped cancellation, inherited monotonic deadlines and
 sleep. Existing TCP/UDP waits compose contexts with legacy cancel tokens and

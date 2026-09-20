@@ -66,6 +66,11 @@ There are no GC finalizers or automatic destruction assumptions. Every returned 
 
 Scope callbacks return `Result[T, io::Error]`. The helper returns `Result[T, ScopeError]`, retaining both `action` and `cleanup` errors when both fail. Creation errors occupy `action`. A callback may deliberately `keep` or `persist` its resource; the helper then has nothing left to clean up. Resource aliases that escape an ordinary scope are already closed. Cleanup follows GoML's normal control-flow guarantees; it is not guaranteed during an unrecovered panic, abrupt process termination or signals.
 
+Scope helpers use `std::io::with_resource` and the standard resource error
+combiner. The existing `ScopeError` shape and its optional single cleanup error
+remain compatible. The deferred idempotent close still follows the language's
+normal unwinding behavior.
+
 `close` always releases owned descriptors, including when removal fails. It returns that failure and becomes closed; it does not retry removal on a later close. The caller may inspect and recover any remaining path. Cleanup cannot delete a renamed resource under an unknown new name. If the original pathname was removed, closing succeeds; if it was replaced, closing reports `InvalidData` and leaves the replacement untouched.
 
 ## Filesystem guarantees and limits

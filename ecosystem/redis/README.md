@@ -3,7 +3,8 @@
 `ecosystem::redis` is a standalone GoML RESP2/RESP3 client. It includes an
 incremental binary codec, typed requests, heterogeneous pipelines, transactions,
 optimistic updates, subscriptions, bounded push handling, cancellation and TCP
-connection management and injectable transports. It uses `std::net`, `std::task` and `std::time`; it does not
+connection management, DNS/TLS and injectable transports. It uses `std::net`,
+`std::net::tls`, `std::context`, `std::task` and `std::time`; it does not
 wrap a Go Redis client.
 
 ## Connection and typed commands
@@ -43,18 +44,28 @@ QUIT and then closes. Applications should explicitly close connections.
 
 ### Custom transports and dialing
 
+`Connection::connect_host(host, port, options, operation)` resolves DNS and tries
+the returned addresses through the standard TCP connector. It enables
+TCP_NODELAY just like numeric-address `connect`.
+`Connection::connect_tls(host, port, tls_config, options, operation)` uses
+`std::net::tls::ClientConfig` for verified server names, system/custom trust roots,
+client certificates, ALPN and TLS version policy. There is no insecure mode.
+The operation's total deadline includes DNS, TCP/TLS setup and HELLO/SELECT;
+the TLS configuration's connect timeout can impose an earlier setup limit.
+`Transport::tls(stream)` also wraps an existing standard TLS stream.
+
 `Transport::new(read, write_all, close, is_closed)` adapts an ordered duplex byte
 stream. `Connection::from_transport` takes ownership immediately, including on
 invalid options or failed setup. `Connection::dial(options, operation, dialer)`
 validates options before dialing and gives the dialer the remaining `Operation`.
 The same total deadline covers dialing, transport setup and HELLO/SELECT. This
-allows applications to supply DNS resolution, TLS or Unix sockets without
-reimplementing RESP, pipelines, transactions or subscriptions. These adapters
-are supplied by the application; TLS and DNS implementations are not bundled.
+allows applications to supply additional transports, such as Unix sockets,
+without reimplementing RESP, pipelines, transactions or subscriptions.
 
 Each read/write callback receives the remaining timeout and cancellation token,
-available through `Operation.timeout()` and `cancel_token()`. Native socket
-adapters can use `wait_options()`. A read returns 0 at EOF; counts outside the
+available through `Operation.timeout()` and `cancel_token()`. An attached standard
+context is available through `context()`; adapters must honor it as well. Native
+socket adapters can use `wait_options()`. A read returns 0 at EOF; counts outside the
 provided buffer are rejected. A successful write must transmit all bytes.
 Callbacks must honor these limits, avoid retaining buffers after returning, and
 return structured `std::io::Error` values. The connection also checks the total
@@ -140,7 +151,11 @@ preempted by the operation timeout.
 ## Deadlines, concurrency and pushes
 
 `Operation::new()` has a five-second total timeout. `with_timeout`,
-`without_timeout` and `with_cancel` configure each operation. The deadline covers
+`without_timeout`, `with_cancel` and `with_context` configure each operation.
+Context cancellation and legacy cancel tokens are both honored when supplied;
+the earlier of the context deadline and operation timeout wins. `without_timeout` does
+not disable a context deadline. Scoped cancellation bridges for DNS/TLS are joined
+before their operation returns. The deadline covers
 waiting for the connection, writing requests and reading every reply, including
 interleaved push traffic. Continued network progress does not reset it.
 Concurrent requests share a channel gate and cannot exchange each other's
@@ -158,7 +173,10 @@ bounded queue. `drain_pushes` removes currently queued values; `next_push` waits
 for a queued or newly arriving push. Push limits count both frames and wire
 bytes; overflow during a request closes the connection. `next_push` timeout or
 cancellation preserves an incomplete decoder frame for the next call because
-no request was sent. Reading an unexpected ordinary reply this way is a
+no request was sent, provided the transport remains open. Standard TLS closes
+the stream when active I/O times out or is cancelled; check `is_closed()` and
+establish a new connection in that case. Queued cancellation before TLS I/O
+begins leaves it usable. Reading an unexpected ordinary reply this way is a
 protocol failure.
 
 `subscribe(channels, SubscriptionKind, operation)` enters dedicated channel or
@@ -166,8 +184,9 @@ pattern subscription mode. `Subscription.change` adds/removes explicit nonempty
 lists, consumes and validates all acknowledgements, and queues messages arriving
 between them. `next` returns `Event::Message(channel, payload, pattern)`,
 subscription changes, pong or an unknown event. Binary channel names and payloads
-are preserved. A read-only subscription timeout can resume a partial frame;
-an interrupted subscription change closes the connection. Ordinary command
+are preserved. A read-only subscription timeout can resume a partial frame on
+transports that remain open; standard TLS requires reconnection after active I/O
+interruption. An interrupted subscription change closes the connection. Ordinary command
 execution is rejected while subscribed, in both RESP versions. Removing the last
 subscription restores ordinary mode. `count` reads the server's acknowledged
 subscription count; `close` closes the underlying connection. Publishers use a
@@ -242,6 +261,13 @@ disabled. It terminates/reaps the process in `finally`. It never connects to an
 existing Redis instance. A C compiler, make and network access for the first
 reference download are needed. `race.py` compiles the generated library test
 runner with Go's race detector and invokes every test separately.
+
+`network_check.py` adds eleven loopback DNS/TLS cases using Python's TLS server
+and ephemeral OpenSSL-generated certificates. They cover verified and mutual
+TLS, untrusted certificates, hostname mismatch, handshake/HELLO/I/O timeouts,
+context deadlines and cancellation through both APIs. Cancellation is released
+only after the server receives the request. `race.py` repeats these cases with
+a race-built GoML consumer. OpenSSL is required for these local fixtures.
 
 Protocol references: [Redis RESP specification](https://redis.io/docs/latest/develop/reference/protocol-spec/),
 [RESP3 streamed types](https://github.com/antirez/RESP3/blob/master/spec.md),

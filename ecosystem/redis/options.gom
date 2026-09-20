@@ -4,6 +4,7 @@ use std::net;
 use std::task;
 use std::time;
 use std::io;
+use std::context;
 
 #[derive(Debug, PartialEq)]
 pub enum Protocol {
@@ -41,11 +42,16 @@ impl ConnectionOptions {
 pub struct Operation {
     timeout: Option[time::Duration],
     cancel: Option[task::CancelToken],
+    context_value: Option[context::Context],
 }
 
 impl Operation {
     pub fn new() -> Operation {
-        Operation { timeout: Option::Some(time::Duration::from_seconds(5)), cancel: Option::None }
+        Operation {
+            timeout: Option::Some(time::Duration::from_seconds(5)),
+            cancel: Option::None,
+            context_value: Option::None,
+        }
     }
 
     pub fn with_timeout(self: Operation, timeout: time::Duration) -> Operation {
@@ -58,6 +64,14 @@ impl Operation {
 
     pub fn with_cancel(self: Operation, cancel: task::CancelToken) -> Operation {
         Operation { cancel: Option::Some(cancel), ..self }
+    }
+
+    pub fn with_context(self: Operation, context: context::Context) -> Operation {
+        Operation { context_value: Option::Some(context), ..self }
+    }
+
+    pub fn context(self: Operation) -> Option[context::Context] {
+        self.context_value
     }
 
     pub fn timeout(self: Operation) -> Option[time::Duration] {
@@ -76,7 +90,42 @@ impl Operation {
         if let Some(cancel) = self.cancel {
             options = options.with_cancel(cancel);
         }
+        if let Some(context) = self.context_value {
+            options = options.with_context(context);
+        }
         options
+    }
+
+    fn with_io_context[T](self: Operation, action: (context::Context) -> Result[T, io::Error]) -> Result[
+        T,
+        io::Error,
+    ] {
+        let parent = self.context_value.unwrap_or(context::Context::background());
+        let body = |ctx: context::Context, handle: context::CancelHandle| {
+            task::scope(
+                |scope| {
+                    defer scope.cancel();
+                    if let Some(cancel) = self.cancel {
+                        if cancel.is_cancelled() {
+                            handle.cancel();
+                        }
+                        let _ = scope.spawn(
+                            |worker| {
+                                select {
+                                    recv(cancel.done()) as _ => handle.cancel(),
+                                    recv(worker.done()) as _ => (),
+                                }
+                            },
+                        );
+                    }
+                    action(ctx)
+                },
+            )
+        };
+        match self.timeout {
+            Some(timeout) => context::with_timeout(parent, timeout, body),
+            None => context::with_cancel(parent, body),
+        }
     }
 }
 
@@ -86,11 +135,22 @@ struct Deadline {
     timer: Option[time::Timer],
     expired: Receiver[()],
     cancelled: Receiver[()],
+    context_signal: Receiver[()],
 }
 
 impl Deadline {
     fn new(operation: Operation) -> Deadline {
         let never: Channel[()] = Channel::new(0);
+        let operation = if let Some(remaining) = operation.context_value.and_then(
+            |ctx| ctx.remaining(),
+        ) {
+            match operation.timeout {
+                Some(timeout) if timeout.compare(remaining) <= 0 => operation,
+                _ => operation.with_timeout(remaining),
+            }
+        } else {
+            operation
+        };
         let start = time::Instant::now();
         let timer = operation.timeout.map(|value| time::Timer::new(value));
         Deadline {
@@ -99,6 +159,9 @@ impl Deadline {
             timer,
             expired: timer.map(|value| value.done()).unwrap_or(never.receiver()),
             cancelled: operation.cancel.map(|value| value.done()).unwrap_or(never.receiver()),
+            context_signal: operation.context_value.map(|ctx| ctx.done()).unwrap_or(
+                never.receiver(),
+            ),
         }
     }
 
@@ -113,6 +176,9 @@ impl Deadline {
             if cancel.is_cancelled() {
                 return Result::Err(error(ErrorKind::Cancelled, 0, "Redis operation cancelled"))
             }
+        }
+        if let Some(ctx) = self.operation.context_value {
+            ctx.check().map_err(context_error)?;
         }
         if let Some(timeout) = self.operation.timeout {
             if self.start.elapsed().compare(timeout) >= 0 {
@@ -143,9 +209,21 @@ impl Deadline {
             recv(self.expired) as _ => Result::Err(
                 error(ErrorKind::Timeout, 0, "Redis operation timed out while queued"),
             ),
+            recv(self.context_signal) as _ => {
+                self.check()?;
+                Result::Err(error(ErrorKind::Cancelled, 0, "Redis context cancelled while queued"))
+            },
             recv(gate) as _ => Result::Ok(()),
         }
     }
+}
+
+fn context_error(problem: context::Error) -> Error {
+    let kind = match problem {
+        context::Error::Cancelled => ErrorKind::Cancelled,
+        context::Error::DeadlineExceeded => ErrorKind::Timeout,
+    };
+    error(kind, 0, problem.to_string())
 }
 
 fn io_error(problem: io::Error) -> Error {

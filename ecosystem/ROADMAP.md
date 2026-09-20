@@ -19,12 +19,26 @@ Each addition has library and independently resolved consumer coverage. The
 verification entry point remains `python3 ecosystem/verify.py`; CI integration
 is intentionally deferred.
 
+## Adoption of GoML 0.1.50
+
+| Module | Improved |
+| --- | --- |
+| cli | Ordinary command schemas through erased generic functions, including generic forwarding and function values; existing typed wrappers remain compatible |
+| ndarray | Specialized `Array::[f64]::linspace` constructor and scalar `ToFloat` count conversion |
+| template | Direct standard integer-to-float conversion for numeric coercion |
+| sqlite | Direct standard I/O in the FFI consumer; removed the error-alias transport workaround |
+| tempfile | Standard resource cleanup/error combination with compatible scope results |
+| reqwest | Immutable request/response/multipart byte snapshots and shared snapshot accessors |
+| msgpack | Standard reader/writer integration, direct typed frame decoding, bounded concatenated values and partial-I/O handling |
+| redis | Bundled DNS/TLS connectors, mTLS and standard Context cancellation/deadlines composed with existing operation controls |
+| bitflags | Optional `FlagValues` inherent derive for named flag constructors without trait imports |
+
 ## Remaining work
 
 | Module | Remaining capabilities |
 | --- | --- |
 | proptest | Distribution histograms and richer report formatting, failure aggregation, application-oriented state-machine execution helpers; custom callbacks remain responsible for their own bounded work |
-| redis | Bundled DNS/TLS adapters, connection pools and health/reconnection policies, Cluster/Sentinel, typed Streams commands and sharded subscriptions; no automatic retry of ambiguous writes |
+| redis | Connection pools and health/reconnection policies, Cluster/Sentinel, typed Streams commands and sharded subscriptions; no automatic retry of ambiguous writes; active standard TLS I/O interruption requires reconnection |
 | lsp | Position-encoding negotiation, broader typed feature models (completion, code actions, workspace edits and semantic tokens) and outgoing deadline scheduling |
 | cli | Nested/flattened argument derives, derived subcommands, shell completion, defaults/environment for flags and counters |
 | diff | Multi-file and Git metadata support, three-way merge, offset/fuzzy application; the linear-space algorithm is explicitly selected and has O(NM) worst-case time |
@@ -34,7 +48,7 @@ is intentionally deferred.
 | sqlite | Row derives, batch helpers, connection/statement caching, custom functions, backup and incremental blob APIs |
 | pipeline | Error recovery/retry, time-based operators, parallel flat-map and metrics |
 | ndarray | Masked selection/scatter, sorting/quantiles, NPY interchange, SVD/eigen and rank-deficient solve support |
-| msgpack | Reader/writer integration and incremental field processing, reduced copying and richer typed extension support |
+| msgpack | Incremental field processing, reduced materialization and richer typed extension support; standard I/O adapters buffer one bounded value at a time |
 | graph | Flow/matching algorithms, serialization and configurable cost types |
 | goml_stats | Manifest-based canonical identities, declaration counts and historical comparisons; hierarchical Git ignore rules are provided by the ignore dependency |
 | bitflags | Associated-constant or operator syntax depends on language support; Serde wrappers support explicit or format-sensitive representations; arbitrary declaration expressions and generic storage newtypes are not generated |

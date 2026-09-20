@@ -10,5 +10,6 @@ cd ecosystem/repros/specialized_static
 ../../../stage2/bin/goml run
 ```
 
-The complete ecosystem verifier includes this reproducer. Ndarray's existing
-module-level `linspace` remains a valid convenience API.
+The complete ecosystem verifier includes this reproducer. Ndarray now exposes
+`Array::[f64]::linspace` and inferred `Array::linspace`, with its existing
+module-level `linspace` retained as a forwarding convenience API.

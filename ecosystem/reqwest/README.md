@@ -69,6 +69,14 @@ original request or response. Host, Content-Length, Transfer-Encoding,
 Connection, Proxy-Connection, Trailer and Upgrade are transport-managed and
 cannot be supplied manually.
 
+Request, response and multipart bodies use private `FrozenBytes` snapshots.
+`RequestBuilder.frozen_body(snapshot)` and `Part::frozen_bytes(snapshot)` accept
+an existing immutable snapshot without copying it; `Request.frozen_body()` and
+`Response.frozen_bytes()` share it for repeated inspection or forwarding.
+The existing `body(Bytes)` and `Part::bytes(Bytes)` snapshot mutable inputs, and
+the `body()` / `bytes()` accessors still return independent mutable copies.
+This does not change the buffered request/response size limits.
+
 ```gom
 use ecosystem::reqwest::{Client, Multipart, Part, Error};
 use std::bytes::{Bytes};

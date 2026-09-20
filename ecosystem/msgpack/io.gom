@@ -1,0 +1,212 @@
+package msgpack;
+
+use std::bytes;
+use std::io;
+use io::{Read, Write};
+use std::serde::{Serialize, Deserialize};
+
+pub enum StreamError {
+    Io(io::Error),
+    Codec(Error),
+}
+
+impl ToString for StreamError {
+    fn to_string(self: StreamError) -> string {
+        match self {
+            Io(error) => error.to_string(),
+            Codec(error) => error.to_string(),
+        }
+    }
+}
+
+impl Debug for StreamError {
+    fn debug(self: StreamError) -> string {
+        self.to_string()
+    }
+}
+
+pub struct StreamReader[R] {
+    reader: R,
+    unpacker: Unpacker,
+    scratch: bytes::Bytes,
+    eof: Ref[bool],
+    failure: Ref[Option[StreamError]],
+}
+
+impl[R: Read] StreamReader[R] {
+    pub fn new(reader: R, options: Options) -> Result[StreamReader[R], StreamError] {
+        StreamReader::with_capacity(reader, 8192, options)
+    }
+
+    pub fn with_capacity(reader: R, capacity: isize, options: Options) -> Result[
+        StreamReader[R],
+        StreamError,
+    ] {
+        let unpacker = Unpacker::new(options).map_err(StreamError::Codec)?;
+        if capacity <= 0 {
+            return Result::Err(
+                StreamError::Codec(
+                    error(ErrorKind::Limit, 0, "stream read capacity must be positive"),
+                ),
+            )
+        }
+        let capacity = if capacity > options.limits.max_bytes {
+            if options.limits.max_bytes == 0 {
+                1
+            } else {
+                options.limits.max_bytes
+            }
+        } else {
+            capacity
+        };
+        let scratch = bytes::Bytes::with_capacity(capacity);
+        for _ in 0..capacity {
+            scratch.push(0)
+        }
+        Result::Ok(
+            StreamReader {
+                reader,
+                unpacker,
+                scratch,
+                eof: Ref::new(false),
+                failure: Ref::new(Option::None),
+            },
+        )
+    }
+
+    pub fn buffered(self: StreamReader[R]) -> isize {
+        self.unpacker.buffered()
+    }
+
+    fn fill(self: StreamReader[R]) -> Result[bool, StreamError] {
+        loop {
+            if self.unpacker.frame_end().map_err(StreamError::Codec)?.is_some() {
+                return Result::Ok(true)
+            }
+            if self.eof.get() {
+                self.unpacker.finish().map_err(StreamError::Codec)?;
+                return Result::Ok(false)
+            }
+            let remaining = self.unpacker.options.limits.max_bytes - self.unpacker.buffered();
+            if remaining == 0 && self.unpacker.buffered() > 0 {
+                return Result::Err(
+                    StreamError::Codec(
+                        error(
+                            ErrorKind::Limit,
+                            self.unpacker.cursor.get(),
+                            "incomplete value exceeds stream byte limit",
+                        ),
+                    ),
+                )
+            }
+            let capacity = if remaining == 0 {
+                1
+            } else if remaining < self.scratch.len() {
+                remaining
+            } else {
+                self.scratch.len()
+            };
+            let count = match self.reader.read(self.scratch.slice_mut(0, capacity)) {
+                Ok(count) => count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Result::Err(StreamError::Io(error)),
+            };
+            if count < 0 || count > capacity {
+                return Result::Err(
+                    StreamError::Io(
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "MessagePack read",
+                            Option::None,
+                            Option::None,
+                            "reader returned an invalid byte count",
+                        ),
+                    ),
+                )
+            }
+            if count == 0 {
+                self.eof.set(true);
+            } else {
+                self.unpacker.push(self.scratch.slice(0, count)).map_err(StreamError::Codec)?;
+            }
+        }
+    }
+
+    fn ready(self: StreamReader[R]) -> Result[bool, StreamError] {
+        if let Some(error) = self.failure.get() {
+            return Result::Err(error)
+        }
+        match self.fill() {
+            Ok(ready) => Result::Ok(ready),
+            Err(error) => {
+                self.failure.set(Option::Some(error));
+                Result::Err(error)
+            },
+        }
+    }
+
+    pub fn next(self: StreamReader[R]) -> Result[Option[Value], StreamError] {
+        if !self.ready()? {
+            return Result::Ok(Option::None)
+        }
+        self.unpacker.next().map_err(StreamError::Codec)
+    }
+
+    pub fn decode_next[T: Deserialize](self: StreamReader[R]) -> Result[Option[T], StreamError] {
+        if !self.ready()? {
+            return Result::Ok(Option::None)
+        }
+        self.unpacker.decode_next().map_err(StreamError::Codec)
+    }
+}
+
+pub struct StreamWriter[W] {
+    writer: W,
+    options: Options,
+    failure: Ref[Option[io::Error]],
+}
+
+impl[W: Write] StreamWriter[W] {
+    pub fn new(writer: W, options: Options) -> Result[StreamWriter[W], StreamError] {
+        options.limits.validate().map_err(StreamError::Codec)?;
+        Result::Ok(StreamWriter { writer, options, failure: Ref::new(Option::None) })
+    }
+
+    fn check(self: StreamWriter[W]) -> Result[(), StreamError] {
+        match self.failure.get() {
+            Some(error) => Result::Err(StreamError::Io(error)),
+            None => Result::Ok(()),
+        }
+    }
+
+    fn send(self: StreamWriter[W], value: Vec[u8]) -> Result[(), StreamError] {
+        match self.writer.write_all(value.as_slice()) {
+            Ok(()) => Result::Ok(()),
+            Err(error) => {
+                self.failure.set(Option::Some(error));
+                Result::Err(StreamError::Io(error))
+            },
+        }
+    }
+
+    pub fn write(self: StreamWriter[W], value: Value) -> Result[(), StreamError] {
+        self.check()?;
+        self.send(pack_with_options(value, self.options).map_err(StreamError::Codec)?)
+    }
+
+    pub fn serialize[T: Serialize](self: StreamWriter[W], value: T) -> Result[(), StreamError] {
+        self.check()?;
+        self.send(to_vec_with_options(value, self.options).map_err(StreamError::Codec)?)
+    }
+
+    pub fn flush(self: StreamWriter[W]) -> Result[(), StreamError] {
+        self.check()?;
+        match self.writer.flush() {
+            Ok(()) => Result::Ok(()),
+            Err(error) => {
+                self.failure.set(Option::Some(error));
+                Result::Err(StreamError::Io(error))
+            },
+        }
+    }
+}

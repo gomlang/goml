@@ -229,11 +229,10 @@ External handle types use small named Go interfaces rather than exposing the
 large `database/sql` implementation graph. This avoids the current FFI type-graph
 comparison limit while keeping concrete state in the native adapter.
 
-The current compiler also confuses an unrelated `std::io::Error` with the
-`std::ffi::Error` alias in an FFI-importing package. The consumer's separate
-`transport` package maps I/O errors to strings before crossing that boundary.
-The failing [minimal reproducer](../repros/ffi_error_alias/README.md) and
-[findings](../FINDINGS.md) document the limitation; the compiler is unchanged.
+GoML 0.1.50 keeps `std::io::Error` and `std::ffi::Error` distinct. The consumer
+uses standard I/O directly in its FFI-importing package; the former transport
+wrapper has been removed. The retained
+[regression reproducer](../repros/ffi_error_alias/README.md) checks this boundary.
 
 The library does not provide a connection pool, ORM/migrations, asynchronous
 query objects, custom SQL function registration, backup or incremental BLOB APIs.

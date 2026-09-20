@@ -114,9 +114,13 @@ payload variants are rejected. Both derives support imported aliases and use
 definition-site helper identities, so caller names such as `Command` do not
 capture generated references.
 
-`command_for[T]()` returns `TypedCommand[T]`; use its public `command` field for
-validation and help. Keeping `T` in this return type avoids the current compiler's
-erased-generic-function issue documented in `../FINDINGS.md`.
+`schema::[Options]()` returns an ordinary `Command` for validation, help and
+composition. Its generic argument selects the derived schema even though the
+returned command has no type parameter. Generic forwarding and first-class
+schema function values work across dependencies with GoML 0.1.50.
+`command_for::[Options]()` and the `Args::schema` trait method retain their
+`TypedCommand[Options]` result for compatibility; its `command` field exposes
+the same schema.
 
 ## Errors and validation
 

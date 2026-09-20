@@ -9,6 +9,5 @@ cd ecosystem/repros/ffi_error_alias
 ../../../stage2/bin/goml run </dev/null
 ```
 
-The complete ecosystem verifier includes this reproducer. SQLite's separate
-transport package remains useful organization but is no longer required to
-avoid an error-type collision.
+The complete ecosystem verifier includes this reproducer. SQLite's consumer now
+uses standard I/O directly; its former transport workaround has been removed.

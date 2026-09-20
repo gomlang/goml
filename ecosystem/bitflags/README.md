@@ -10,19 +10,17 @@ storage; it is not a string-keyed map or a shared mutable handle.
 use ecosystem::bitflags;
 use bitflags::Flags;
 
-#[derive(Flags, PartialEq, Eq, Hash, Default)]
+#[derive(Flags, bitflags::FlagValues, PartialEq, Eq, Hash, Default)]
 #[flags(NONE = "0", READ = "0b1", WRITE = "0b10", READ_WRITE = "READ | WRITE", unnamed = "0x80")]
 pub struct Permissions {
     bits: u8,
 }
 
-pub const READ: Permissions = Permissions { bits: 1 };
-
 fn example() -> Result[Permissions, bitflags::ParseError] {
-    let write: Permissions = bitflags::parse("WRITE")?;
-    let combined = READ.union(write);
+    let read = Permissions::flag_read();
+    let combined = read.union(Permissions::flag_write());
     let mut current = combined;
-    current = current.set(READ, false);
+    current = current.set(read, false);
     bitflags::parse(current.format())
 }
 ```
@@ -53,11 +51,21 @@ masks. Zero and multi-bit flags are supported. `unnamed` replaces the Rust macro
 `const _` spelling; the GoML attribute metadata does not represent `_` as a named
 argument. Flag names are case-sensitive.
 
-The derive supplies the `Flags` trait implementation. Associated constants remain unsupported by GoML; the library keeps its trait
-API even though the compiler now also supports inherent derive output.
-Declare ordinary module constants when needed, or use `Permissions::from_name`.
-Import `Flags` in each file using its methods. GoML does not overload bitwise
-operators for structs; use the methods below.
+`Flags` supplies the trait implementation. The optional `FlagValues` derive uses
+GoML 0.1.50 inherent output to generate public static constructors for named flags:
+`READ` becomes `Permissions::flag_read()` and `READ_WRITE` becomes
+`Permissions::flag_read_write()`. These methods work across package interfaces
+without importing the `Flags` trait. They preserve zero, aliases, composite masks
+and signed high bits; `unnamed` produces no accessor.
+
+Accessor names use ASCII lowercase while preserving digits and underscores.
+Non-ASCII names and names that collide after this conversion, such as `READ` and
+`read`, are rejected.
+`FlagValues` validates the same declaration rules as `Flags` and can also be used
+alone for constructors. Both derives can be combined with equality/hash/default
+derives. Existing module constants and `Permissions::from_name` remain available;
+associated constants and overloaded bitwise operators are still unsupported.
+Import `Flags` in each file using the trait methods below.
 
 ## Bit operations
 

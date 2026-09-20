@@ -116,11 +116,42 @@ value is incomplete; repeatedly drain it after each push. `finish()` requires an
 empty, fully drained stream. Malformed input or buffer overflow poisons the
 unpacker until `reset()`. `buffered()` counts only unconsumed bytes.
 
+`decode_next[T: Deserialize]()` decodes the next complete frame directly into a
+consumer-defined type, preserving binary and extension events without building
+a dynamic value tree. A typed decoding error leaves the frame available for a
+different decoder or `next()`. Incomplete input returns `None` as with `next()`.
+
 The scanner retains its token cursor and outstanding child counts between
 chunks. It materializes a value only once complete. Consumed messages advance a
 buffer head, avoiding a tail copy on every `next()` call. Pushes compact consumed
 storage when needed. This is bounded buffering of complete values, not an API
 that streams individual fields to a callback.
+
+### Standard I/O streams
+
+`StreamReader::new(reader, options)` accepts any `std::io::Read` implementation.
+`with_capacity(reader, capacity, options)` controls its positive read chunk size.
+`next()` reads a dynamic value; `decode_next()` reads a typed value. Both return
+`None` only at a clean, drained EOF. Short reads and interrupted calls are handled
+internally; truncated input, malformed byte counts and exceeded limits return
+`StreamError::{Io, Codec}`, retaining the structured underlying error.
+Transport/framing failures are terminal. A typed mismatch retains its current
+frame, allowing another typed decode or dynamic `next()` before continuing.
+
+`StreamWriter::new(writer, options)` accepts any `std::io::Write` implementation.
+`write(Value)` and `serialize(value)` validate and encode one bounded frame before
+writing any of it, then complete partial writes with `Write::write_all`.
+Encoding failures leave the destination untouched. I/O failures make the writer
+terminal because part of a frame may have reached the destination. `flush()` is
+explicit, including for `io::BufWriter`; flushing failure is also terminal.
+
+Reader byte limits bound the unconsumed buffer, and writer byte limits bound each
+encoded frame. A stream can contain arbitrarily many individually bounded values.
+Reader scratch allocation is capped by the byte budget, with one byte used to
+distinguish EOF from input when the budget is zero. Clones share stream state;
+serialize access and close underlying resources explicitly. Readers may retain
+lookahead bytes, so continue reading through the wrapper. Field-by-field streaming
+serialization and deserialization are still outside this API.
 
 `Limits::standard()` sets:
 
@@ -160,11 +191,12 @@ python3 ecosystem/verify.py msgpack
 python3 ecosystem/msgpack/interop.py
 ```
 
-The library has 15 external tests covering integer boundaries, all length
+The library has 20 external tests covering integer boundaries, all length
 families (including 65,536-element maps/arrays), floating bits, Unicode and raw
 strings, arbitrary/duplicate map keys, timestamps, every truncation of selected
 nested values, limits, streaming compaction, all chunk sizes, direct Serde
-derives, event protocol errors and tagged options.
+derives, event protocol errors, tagged options, partial standard I/O transfers,
+terminal write failures, typed frame retries and bounded concatenated streams.
 
 The separate consumer resolves a normal versioned dependency from the isolated
 registry snapshot. It tests downstream derives and generic specialization;
