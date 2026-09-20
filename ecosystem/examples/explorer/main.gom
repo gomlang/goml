@@ -1,0 +1,238 @@
+package main;
+
+use ecosystem::notify;
+use ecosystem::ansi;
+use ecosystem::terminal;
+use ecosystem::tui;
+use std::context;
+use std::env;
+use std::fs;
+use std::io;
+use std::process;
+use std::task;
+use std::time;
+
+pub fn snapshot_path(root: string, limits: Limits, width: isize, height: isize) -> Result[
+    string,
+    string,
+] {
+    let result = scan_now(root, limits)?;
+    let state = Explorer::new(root, limits)?.begin_scan().accept(ScanEvent::Batch(result.entries))?.accept(
+        ScanEvent::Done(result.summary),
+    )?;
+    snapshot(state, width, height)
+}
+
+fn interactive(root: string, limits: Limits) -> Result[(), string] {
+    limits.validate()?;
+    let metadata = fs::symlink_metadata(root).map_err(|error| error.to_string())?;
+    if !metadata.file_type().is_dir() {
+        return Result::Err("Explorer requires a directory root and does not follow a root symlink.");
+    }
+    let watcher = notify::watch_with(
+        root,
+        notify::Options::new().with_ignored_names(
+            Vec::from_array(
+                [
+                    ".git",
+                    "node_modules",
+                    "_artifact",
+                    "_bootstrap",
+                    "stage0",
+                    "stage2",
+                    "stage3",
+                    "__pycache__",
+                ],
+            ),
+        ),
+    );
+    let watch_note = match watcher {
+        Ok(_) => "watch: root entries",
+        Err(error) => "watch disabled: " + error.to_string(),
+    };
+    let watcher = match watcher {
+        Ok(value) => Option::Some(value),
+        Err(_) => Option::None,
+    };
+    defer {
+        if let Some(watcher) = watcher {
+            let _ = watcher.close();
+        }
+    };
+    let session = terminal::Session::open(terminal::Options::interactive()).map_err(
+        |error| error.to_string(),
+    )?;
+    defer {
+        let _ = session.close();
+    };
+    let screen = tui::Terminal::new(session).map_err(|error| error.to_string())?;
+    let outcome: Result[(), string] = task::scope(
+        |scope| {
+            defer scope.cancel();
+            let requests = Channel::new(1);
+            let events = Channel::new(16);
+            let _ = scope.spawn(|cancel| scan_worker(root, limits, cancel, requests, events));
+            let mut state = Explorer::new(root, limits)?;
+            let mut started = time::Instant::now();
+            let mut last_draw = time::Instant::now();
+            let mut dirty = true;
+            let mut watch_active = watcher.is_some();
+            let mut watch_note = watch_note;
+            loop {
+                if state.pending && !state.scanning {
+                    state = state.begin_scan();
+                    started = time::Instant::now();
+                    requests.send(());
+                    dirty = true;
+                }
+                for _ in 0..16 {
+                    let event = select {
+                        recv(events) as value => value,
+                        default => Option::None,
+                    };
+                    let Some(event) = event else {
+                        break;
+                    };
+                    state = state.accept(event)?;
+                    dirty = true;
+                }
+                if watch_active {
+                    if let Some(watcher) = watcher {
+                        match watcher.try_read() {
+                            Ok(batch) => {
+                                if !batch.is_empty() {
+                                    state = state.request_refresh(true);
+                                    dirty = true;
+                                }
+                                if watcher.is_closed() {
+                                    watch_active = false;
+                                    watch_note = "watch ended; use r to retry scanning";
+                                }
+                            },
+                            Err(error) => {
+                                watch_active = false;
+                                watch_note = "watch disabled: " + error.to_string();
+                                dirty = true;
+                            },
+                        }
+                    }
+                }
+                if dirty || (state.scanning && last_draw.elapsed().as_milliseconds() >= 100) {
+                    state = Explorer {
+                        elapsed_ms: if state.scanning {
+                            started.elapsed().as_milliseconds()
+                        } else {
+                            state.elapsed_ms
+                        },
+                        ..state,
+                    };
+                    let updated = Ref::new(state);
+                    context::with_timeout(
+                        context::Context::background(),
+                        time::Duration::from_seconds(2),
+                        |ctx, _| {
+                            screen.draw_with(
+                                ctx,
+                                |buffer| {
+                                    let current = state.draw(buffer)?;
+                                    if buffer.area().height >= 8 {
+                                        let area = tui::Rect {
+                                            x: 0,
+                                            y: buffer.area().height - 2,
+                                            width: buffer.area().width,
+                                            height: 1,
+                                        };
+                                        buffer.fill(area, ansi::Style::new())?;
+                                        buffer.draw_text(
+                                            area,
+                                            ansi::StyledText::plain(
+                                                f"scans {state.scans} changes {state.changes} | "
+                                                    + label(state.status)
+                                                    + " | "
+                                                    + label(watch_note),
+                                            ),
+                                        )?;
+                                    }
+                                    updated.set(current);
+                                    Result::Ok(())
+                                },
+                            )
+                        },
+                    ).map_err(|error| error.to_string())?;
+                    state = updated.get();
+                    dirty = false;
+                    last_draw = time::Instant::now();
+                }
+                if let Some(event) = screen.next_event(context::Context::background(), 50).map_err(
+                    |error| error.to_string(),
+                )? {
+                    if event == terminal::Event::End {
+                        break;
+                    }
+                    if let terminal::Event::Key(key) = event {
+                        if key.code == terminal::KeyCode::Char('q')
+                            || key.code == terminal::KeyCode::Escape
+                            || (key.modifiers.control && key.code == terminal::KeyCode::Char('c')) {
+                            break;
+                        }
+                    }
+                    let rows = session.size().map(
+                        |size| if size.rows > 6 {
+                            size.rows - 6
+                        } else {
+                            1
+                        },
+                    ).unwrap_or(1);
+                    state = state.update(event, rows)?;
+                    dirty = true;
+                }
+            }
+            Result::Ok(())
+        },
+    );
+    let watch_cleanup = if let Some(watcher) = watcher {
+        watcher.close().map_err(|error| error.to_string())
+    } else {
+        Result::Ok(())
+    };
+    let cleanup = screen.close().map_err(|error| error.to_string());
+    outcome?;
+    watch_cleanup?;
+    cleanup
+}
+
+fn main() -> () {
+    let args = env::args();
+    let result = if args.len() > 3 || (args.len() > 2 && args[1] == "--demo") {
+        Result::Err(
+            "Usage: explorer [DIRECTORY], explorer --snapshot [DIRECTORY], or explorer --demo",
+        )
+    } else if args.len() > 1 && (args[1] == "--help" || args[1] == "-h") {
+        println(
+            "Usage: explorer [DIRECTORY]\n       explorer --snapshot [DIRECTORY]\n       explorer --demo\nRead-only directory tree and Markdown preview. q exits; Tab changes pane; r refreshes.",
+        );
+        Result::Ok(())
+    } else if args.len() > 1 && (args[1] == "--snapshot" || args[1] == "--demo") {
+        let output = if args.len() > 2 {
+            snapshot_path(args[2], Limits::defaults(), 100, 28)
+        } else {
+            demo().and_then(|state| snapshot(state, 100, 28))
+        };
+        output.map(|value| print(value))
+    } else if args.len() > 2 {
+        Result::Err("Usage: explorer [DIRECTORY] or explorer --snapshot [DIRECTORY]")
+    } else {
+        interactive(
+            if args.len() > 1 {
+                args[1]
+            } else {
+                "."
+            },
+            Limits::defaults(),
+        )
+    };
+    if let Err(error) = result {
+        io::eprintln("explorer: " + error);
+        process::exit(1);
+    }
+}

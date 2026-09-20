@@ -1,0 +1,510 @@
+package progress;
+
+use std::io::{Error};
+use ecosystem::ansi;
+use ecosystem::terminal;
+use ecosystem::unicode_text;
+use std::context;
+use std::io;
+use std::task;
+use std::time;
+
+pub struct Manager {
+    session: terminal::Session,
+    options: Options,
+    interactive: bool,
+    profile: ansi::Profile,
+    gate: Channel[State],
+    closing: Channel[()],
+    close_gate: Channel[Option[Result[(), Error]]],
+}
+
+pub struct Job {
+    manager: Manager,
+    id_value: i64,
+}
+
+fn context_check(ctx: context::Context) -> Result[(), Error] {
+    ctx.check().map_err(
+        |error| match error {
+            context::Error::Cancelled => failure(io::ErrorKind::Interrupted, "operation cancelled"),
+            context::Error::DeadlineExceeded => failure(
+                io::ErrorKind::TimedOut,
+                "deadline exceeded",
+            ),
+        },
+    )
+}
+
+fn erase(rows: isize) -> string {
+    if rows == 0 {
+        ""
+    } else {
+        "\r" + "\u001b[1A\u001b[2K".repeat(rows)
+    }
+}
+
+fn frame_text(lines: Vec[string]) -> string {
+    let mut output = "";
+    for line in lines {
+        output += line + "\r\n";
+    }
+    output
+}
+
+impl Manager {
+    pub fn new(session: terminal::Session, options: Options) -> Result[Manager, Error] {
+        if options.max_jobs < 1 || options.max_jobs > 1000 || options.max_message_bytes < 1
+            || options.max_message_bytes > 65536
+            || options.max_visible < 1
+            || options.max_visible > 100
+            || options.width < 1
+            || options.width > 4096
+            || options.refresh_ms < 0
+            || options.refresh_ms > 60000
+            || options.spinner_ms < 1
+            || options.spinner_ms > 60000 {
+            return Result::Err(invalid("progress options exceed limits"))
+        }
+        validate_style(options.style)?;
+        let frames = Vec::new();
+        for frame in options.style.frames {
+            frames.push(frame);
+        }
+        let options = Options { style: Style { frames, ..options.style }, ..options };
+        let caps = session.capabilities();
+        let interactive = match options.mode {
+            Mode::Auto => caps.interactive,
+            Mode::Interactive => true,
+            Mode::Lines => false,
+        };
+        let profile = if !interactive {
+            ansi::Profile::Plain
+        } else {
+            match caps.color {
+                terminal::ColorDepth::None => ansi::Profile::Plain,
+                terminal::ColorDepth::Ansi16 => if options.profile == ansi::Profile::Plain {
+                    ansi::Profile::Plain
+                } else {
+                    ansi::Profile::Ansi16
+                },
+                terminal::ColorDepth::Ansi256 => if options.profile == ansi::Profile::TrueColor {
+                    ansi::Profile::Ansi256
+                } else {
+                    options.profile
+                },
+                terminal::ColorDepth::TrueColor => options.profile,
+            }
+        };
+        let gate = Channel::new(1);
+        gate.send(
+            State {
+                entries: Vec::new(),
+                next_id: 1,
+                now: 0,
+                last_draw: Option::None,
+                dirty: false,
+                rows: 0,
+                width: Option::None,
+                failure: Option::None,
+            },
+        );
+        let close_gate = Channel::new(1);
+        close_gate.send(Option::None);
+        Result::Ok(
+            Manager {
+                session,
+                options,
+                interactive,
+                profile,
+                gate,
+                closing: Channel::new(0),
+                close_gate,
+            },
+        )
+    }
+
+    pub fn is_closed(self: Manager) -> bool {
+        select {
+            recv(self.closing) as _ => true,
+            default => false,
+        }
+    }
+
+    fn acquire(self: Manager, ctx: context::Context) -> Result[State, Error] {
+        context_check(ctx)?;
+        if self.is_closed() {
+            return Result::Err(closed())
+        }
+        let mut state = select {
+            recv(self.gate) as value => value.ok_or(closed())?,
+            recv(self.closing) as _ => return Result::Err(closed()),
+            recv(ctx.done()) as _ => {
+                context_check(ctx)?;
+                return Result::Err(closed())
+            },
+        };
+        if self.is_closed() {
+            self.gate.send(state);
+            return Result::Err(closed())
+        }
+        if let Err(error) = context_check(ctx) {
+            self.gate.send(state);
+            return Result::Err(error)
+        }
+        state.now = read_time(state, self.options.clock);
+        Result::Ok(state)
+    }
+
+    pub fn add(self: Manager, name: string, total: Option[i64]) -> Result[Job, Error] {
+        self.add_with(context::Context::background(), name, total)
+    }
+
+    pub fn add_with(self: Manager, ctx: context::Context, name: string, total: Option[i64]) -> Result[
+        Job,
+        Error,
+    ] {
+        safe_text(name, self.options.max_message_bytes)?;
+        valid_total(total)?;
+        let mut state = self.acquire(ctx)?;
+        defer self.gate.send(state);
+        if state.entries.len() >= self.options.max_jobs || state.next_id >= MAX_POSITION {
+            return Result::Err(invalid("job capacity or identifier limit exceeded"))
+        }
+        let id = state.next_id;
+        state.next_id += 1;
+        state.entries.push(
+            Entry {
+                id,
+                name,
+                message: "",
+                position: 0,
+                total,
+                status: Status::Running,
+                started: state.now,
+                ended: Option::None,
+                dirty: true,
+            },
+        );
+        state.dirty = true;
+        Result::Ok(Job { manager: self, id_value: id })
+    }
+
+    pub fn snapshot(self: Manager) -> Result[Snapshot, Error] {
+        self.snapshot_with(context::Context::background())
+    }
+
+    pub fn snapshot_with(self: Manager, ctx: context::Context) -> Result[Snapshot, Error] {
+        let state = self.acquire(ctx)?;
+        defer self.gate.send(state);
+        Result::Ok(state_snapshot(state, self.options.spinner_ms, false))
+    }
+
+    pub fn set_width(self: Manager, width: Option[isize]) -> Result[(), Error] {
+        if let Some(width) = width {
+            if width < 1 || width > 4096 {
+                return Result::Err(invalid("width must be in 1..4096"))
+            }
+        }
+        let mut state = self.acquire(context::Context::background())?;
+        defer self.gate.send(state);
+        state.width = width;
+        state.dirty = true;
+        Result::Ok(())
+    }
+
+    fn dimensions(self: Manager, state: State) -> (isize, isize) {
+        let mut width = state.width.unwrap_or(self.options.width);
+        let mut rows = self.options.max_visible;
+        if self.interactive && self.options.follow_terminal_size {
+            if let Ok(size) = self.session.size() {
+                if state.width.is_none() && size.columns > 0 {
+                    width = if size.columns > 4096 {
+                        4096
+                    } else {
+                        size.columns
+                    };
+                }
+                if size.rows > 1 && rows >= size.rows {
+                    rows = size.rows - 1;
+                }
+                if size.rows <= 1 {
+                    rows = 1;
+                }
+            }
+        }
+        let columns = if self.interactive {
+            width - 1
+        } else {
+            width
+        };
+        (columns, rows)
+    }
+
+    fn write(self: Manager, ctx: context::Context, text: string) -> Result[(), Error] {
+        context::with_cancel(
+            ctx,
+            |ctx, cancel| task::scope(
+                |scope| {
+                    defer scope.cancel();
+                    let _ = scope.spawn(
+                        |token| {
+                            select {
+                                recv(self.closing) as _ => cancel.cancel(),
+                                recv(token.done()) as _ => (),
+                            }
+                        },
+                    );
+                    if self.is_closed() {
+                        return Result::Err(closed())
+                    }
+                    self.session.write_with(ctx, text)
+                },
+            ),
+        )
+    }
+
+    pub fn tick(self: Manager, ctx: context::Context) -> Result[bool, Error] {
+        self.draw(ctx, false, Option::None)
+    }
+
+    pub fn flush(self: Manager, ctx: context::Context) -> Result[bool, Error] {
+        self.draw(ctx, true, Option::None)
+    }
+
+    pub fn log(self: Manager, ctx: context::Context, message: string) -> Result[(), Error] {
+        safe_text(message, self.options.max_message_bytes)?;
+        self.draw(ctx, true, Option::Some(message)).map(|_| ())
+    }
+
+    fn draw(self: Manager, ctx: context::Context, force: bool, log: Option[string]) -> Result[
+        bool,
+        Error,
+    ] {
+        let mut state = self.acquire(ctx)?;
+        defer self.gate.send(state);
+        if let Some(error) = state.failure {
+            return Result::Err(error)
+        }
+        if !force {
+            if let Some(last) = state.last_draw {
+                if state.now - last < self.options.refresh_ms {
+                    return Result::Ok(false)
+                }
+            }
+        }
+        let mut running = false;
+        for entry in state.entries {
+            if entry.status == Status::Running {
+                running = true;
+            }
+        }
+        if !force && !state.dirty && !(self.interactive && running) {
+            return Result::Ok(false)
+        }
+        let (width, rows) = self.dimensions(state);
+        let snapshot = state_snapshot(state, self.options.spinner_ms, false);
+        let mut text = "";
+        let mut drawn_rows = 0;
+        if self.interactive {
+            text = erase(state.rows);
+            if let Some(message) = log {
+                for line in unicode_text::wrap(
+                    message,
+                    if width < 1 {
+                        1
+                    } else {
+                        width
+                    },
+                ) {
+                    text += unicode_text::truncate(line, width) + "\r\n";
+                }
+            }
+            let lines = render(snapshot, width, rows, self.options.style, self.profile)?;
+            text += frame_text(lines);
+            drawn_rows = lines.len();
+        } else {
+            if let Some(message) = log {
+                text += message + "\n";
+            }
+            for index in 0..state.entries.len() {
+                if state.entries[index].dirty {
+                    text += render_job(
+                        snapshot.jobs[index],
+                        width,
+                        self.options.style,
+                        ansi::Profile::Plain,
+                    )?
+                        + "\n";
+                }
+            }
+        }
+        if text != "" {
+            if let Err(error) = self.write(ctx, text) {
+                state.failure = Option::Some(error);
+                return Result::Err(error)
+            }
+        }
+        for index in 0..state.entries.len() {
+            state.entries[index] = Entry { dirty: false, ..state.entries[index] };
+        }
+        state.dirty = false;
+        state.rows = drawn_rows;
+        state.last_draw = Option::Some(state.now);
+        Result::Ok(text != "")
+    }
+
+    pub fn shutdown(self: Manager) -> Result[(), Error] {
+        let previous = self.close_gate.recv().unwrap_or(Option::Some(Result::Ok(())));
+        if let Some(result) = previous {
+            self.close_gate.send(previous);
+            return result
+        }
+        self.closing.close();
+        let Some(mut state) = self.gate.recv() else {
+            self.close_gate.send(Option::Some(Result::Err(closed())));
+            return Result::Err(closed())
+        };
+        state.now = read_time(state, self.options.clock);
+        for index in 0..state.entries.len() {
+            let entry = state.entries[index];
+            if entry.status == Status::Running {
+                state.entries[index] = Entry {
+                    status: Status::Cancelled,
+                    ended: Option::Some(state.now),
+                    dirty: true,
+                    ..entry,
+                };
+            }
+        }
+        let (width, rows) = self.dimensions(state);
+        let snapshot = state_snapshot(state, self.options.spinner_ms, true);
+        let mut text = if self.interactive {
+            erase(state.rows)
+        } else {
+            ""
+        };
+        let rendered = if self.interactive {
+            render(snapshot, width, rows, self.options.style, self.profile).map(
+                |lines| frame_text(lines),
+            )
+        } else {
+            let lines = Vec::new();
+            for index in 0..state.entries.len() {
+                if state.entries[index].dirty {
+                    lines.push(
+                        render_job(
+                            snapshot.jobs[index],
+                            width,
+                            self.options.style,
+                            ansi::Profile::Plain,
+                        ).unwrap_or("progress rendering failed"),
+                    );
+                }
+            }
+            Result::Ok(
+                lines.join("\n")
+                    + if lines.is_empty() {
+                        ""
+                    } else {
+                        "\n"
+                    },
+            )
+        };
+        let result = match rendered {
+            Ok(value) => {
+                text += value;
+                if text == "" {
+                    Result::Ok(())
+                } else {
+                    context::with_timeout(
+                        context::Context::background(),
+                        time::Duration::from_milliseconds(200),
+                        |ctx, _| self.session.write_with(ctx, text),
+                    )
+                }
+            },
+            Err(error) => Result::Err(error),
+        };
+        state.rows = 0;
+        self.gate.send(state);
+        let result = match state.failure {
+            Some(error) => Result::Err(error),
+            None => result,
+        };
+        self.close_gate.send(Option::Some(result));
+        result
+    }
+}
+
+impl Job {
+    pub fn id(self: Job) -> i64 {
+        self.id_value
+    }
+
+    pub fn apply(self: Job, update: Update) -> Result[(), Error] {
+        self.apply_with(context::Context::background(), update)
+    }
+
+    pub fn apply_with(self: Job, ctx: context::Context, update: Update) -> Result[(), Error] {
+        let mut state = self.manager.acquire(ctx)?;
+        defer self.manager.gate.send(state);
+        let index = find_entry(state, self.id_value)?;
+        let entry = apply_update(
+            state.entries[index],
+            update,
+            state.now,
+            self.manager.options.max_message_bytes,
+        )?;
+        state.entries[index] = entry;
+        state.dirty = true;
+        Result::Ok(())
+    }
+
+    pub fn advance(self: Job, amount: i64) -> Result[(), Error] {
+        self.apply(Update::Advance(amount))
+    }
+
+    pub fn set_position(self: Job, position: i64) -> Result[(), Error] {
+        self.apply(Update::Position(position))
+    }
+
+    pub fn set_total(self: Job, total: i64) -> Result[(), Error] {
+        self.apply(Update::Total(total))
+    }
+
+    pub fn set_message(self: Job, message: string) -> Result[(), Error] {
+        self.apply(Update::Message(message))
+    }
+
+    pub fn reset(self: Job, total: Option[i64]) -> Result[(), Error] {
+        self.apply(Update::Reset(total))
+    }
+
+    pub fn finish(self: Job, message: string) -> Result[(), Error] {
+        self.apply(Update::Finish(message))
+    }
+
+    pub fn fail(self: Job, message: string) -> Result[(), Error] {
+        self.apply(Update::Fail(message))
+    }
+
+    pub fn cancel(self: Job, message: string) -> Result[(), Error] {
+        self.apply(Update::Cancel(message))
+    }
+
+    pub fn remove(self: Job, ctx: context::Context) -> Result[(), Error] {
+        let mut state = self.manager.acquire(ctx)?;
+        defer self.manager.gate.send(state);
+        let index = find_entry(state, self.id_value)?;
+        let retained = Vec::new();
+        for current in 0..state.entries.len() {
+            if current != index {
+                retained.push(state.entries[current]);
+            }
+        }
+        state.entries = retained;
+        state.dirty = true;
+        Result::Ok(())
+    }
+}

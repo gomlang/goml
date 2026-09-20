@@ -1,0 +1,322 @@
+package prompt;
+
+use ecosystem::terminal;
+use ecosystem::tui;
+use std::num;
+
+pub struct InputOptions {
+    pub question: string,
+    pub help: string,
+    pub initial: string,
+    pub password: bool,
+    pub multiline: bool,
+    pub max_bytes: isize,
+    pub history: Vec[string],
+    pub theme: Theme,
+}
+
+impl InputOptions {
+    pub fn new(question: string) -> InputOptions {
+        InputOptions {
+            question,
+            help: "Enter: submit · Esc: cancel · Tab: complete",
+            initial: "",
+            password: false,
+            multiline: false,
+            max_bytes: 65536,
+            history: Vec::new(),
+            theme: Theme::defaults(),
+        }
+    }
+}
+
+struct InputState {
+    error: string,
+    history_index: isize,
+    draft: string,
+    completions: Vec[string],
+    completion_index: isize,
+    finished: bool,
+}
+
+pub struct TextInput[T] {
+    options: InputOptions,
+    editor: tui::Editor,
+    parse: (string) -> Result[T, string],
+    complete: (string) -> Vec[string],
+    state: Ref[InputState],
+}
+
+impl[T] TextInput[T] {
+    pub fn new(options: InputOptions, parse: (string) -> Result[T, string]) -> Result[
+        TextInput[T],
+        Error,
+    ] {
+        if !label_valid(options.question) || !label_valid(options.help) || options.max_bytes < 1
+            || options.max_bytes > 1048576
+            || options.initial.byte_len() > options.max_bytes
+            || options.history.len() > 1000
+            || (options.password && options.multiline) {
+            return Result::Err(invalid("invalid input options"))
+        }
+        if !options.multiline && (options.initial.contains("\n") || options.initial.contains("\r")) {
+            return Result::Err(invalid("single-line initial value contains a line break"))
+        }
+        let history = if options.password {
+            Vec::new()
+        } else {
+            options.history.copy()
+        };
+        let mut history_bytes = 0;
+        for value in history {
+            history_bytes += value.byte_len();
+            if history_bytes > 4194304 {
+                return Result::Err(invalid("history byte limit exceeded"))
+            }
+            if value.byte_len() > options.max_bytes
+                || (!options.multiline && (value.contains("\n") || value.contains("\r"))) {
+                return Result::Err(invalid("history entry exceeds input limits"))
+            }
+        }
+        let editor = tui::Editor::new(options.initial, options.max_bytes).map_err(ui_error)?;
+        Result::Ok(
+            TextInput {
+                options: InputOptions { history, ..options },
+                editor,
+                parse,
+                complete: |_| Vec::new(),
+                state: Ref::new(
+                    InputState {
+                        error: "",
+                        history_index: -1,
+                        draft: "",
+                        completions: Vec::new(),
+                        completion_index: -1,
+                        finished: false,
+                    },
+                ),
+            },
+        )
+    }
+
+    pub fn with_completion(self: TextInput[T], complete: (string) -> Vec[string]) -> TextInput[T] {
+        TextInput { complete, ..self }
+    }
+
+    pub fn value(self: TextInput[T]) -> string {
+        self.editor.text()
+    }
+
+    pub fn validation_message(self: TextInput[T]) -> string {
+        self.state.get().error
+    }
+
+    pub fn submit(self: TextInput[T]) -> Result[Outcome[T], Error] {
+        let state = self.state.get();
+        if state.finished {
+            return Result::Err(invalid("prompt has already finished"))
+        }
+        match (self.parse)(self.editor.text()) {
+            Ok(value) => {
+                self.state.set(InputState { finished: true, ..state });
+                Result::Ok(Outcome::Submitted(value))
+            },
+            Err(message) => {
+                let error = if message.byte_len() > 4096 {
+                    "validation message exceeds limit"
+                } else {
+                    label_text(message)
+                };
+                self.state.set(InputState { error, ..state });
+                Result::Ok(Outcome::Pending)
+            },
+        }
+    }
+
+    fn history(self: TextInput[T], direction: isize) -> Result[(), Error] {
+        if self.options.password || self.options.history.is_empty() {
+            return Result::Ok(())
+        }
+        let mut state = self.state.get();
+        if state.history_index == -1 && direction < 0 {
+            state.draft = self.editor.text();
+            state.history_index = self.options.history.len();
+        }
+        if state.history_index == -1 {
+            return Result::Ok(())
+        }
+        let next = state.history_index + direction;
+        if next < 0 {
+            return Result::Ok(())
+        }
+        if next >= self.options.history.len() {
+            self.editor.set_text(state.draft).map_err(ui_error)?;
+            state.history_index = -1;
+        } else {
+            self.editor.set_text(self.options.history[next]).map_err(ui_error)?;
+            state.history_index = next;
+        }
+        state.error = "";
+        state.completions = Vec::new();
+        self.state.set(state);
+        Result::Ok(())
+    }
+
+    fn completion(self: TextInput[T]) -> Result[(), Error] {
+        if self.options.password {
+            return Result::Ok(())
+        }
+        let mut state = self.state.get();
+        if state.completions.is_empty() {
+            let candidates = (self.complete)(self.editor.text());
+            if candidates.len() > 256 {
+                return Result::Err(invalid("completion count limit exceeded"))
+            }
+            let mut bytes = 0;
+            for value in candidates {
+                bytes += value.byte_len();
+                if bytes > 4194304 {
+                    return Result::Err(invalid("completion byte limit exceeded"))
+                }
+                if value.byte_len() > self.options.max_bytes
+                    || (!self.options.multiline && (value.contains("\n") || value.contains("\r"))) {
+                    return Result::Err(invalid("invalid completion text"))
+                }
+            }
+            state.completions = candidates.copy();
+            state.completion_index = -1;
+        }
+        if state.completions.is_empty() {
+            return Result::Ok(())
+        }
+        state.completion_index = (state.completion_index + 1) % state.completions.len();
+        self.editor.set_text(state.completions[state.completion_index]).map_err(ui_error)?;
+        state.error = "";
+        self.state.set(state);
+        Result::Ok(())
+    }
+}
+
+impl[T] Model for TextInput[T] {
+    type Output = T;
+
+    fn update(self: TextInput[T], event: terminal::Event) -> Result[Outcome[T], Error] {
+        let state = self.state.get();
+        if state.finished {
+            return Result::Err(invalid("prompt has already finished"))
+        }
+        if cancelled_event(event) {
+            self.state.set(InputState { finished: true, ..state });
+            return Result::Ok(Outcome::Cancelled)
+        }
+        if event == terminal::Event::End {
+            self.state.set(InputState { finished: true, ..state });
+            return Result::Ok(Outcome::EndOfInput)
+        }
+        if let terminal::Event::Key(key) = event {
+            if key.code == terminal::KeyCode::Enter
+                && (!self.options.multiline || key.modifiers.control || key.modifiers.alt) {
+                return self.submit()
+            }
+            if control(key, 'd') && self.editor.text() == "" {
+                self.state.set(InputState { finished: true, ..state });
+                return Result::Ok(Outcome::EndOfInput)
+            }
+            if key.code == terminal::KeyCode::Tab && !self.options.multiline {
+                self.completion()?;
+                return Result::Ok(Outcome::Pending)
+            }
+            if !self.options.multiline && (key.code == terminal::KeyCode::Up || control(key, 'p')) {
+                self.history(-1)?;
+                return Result::Ok(Outcome::Pending)
+            }
+            if !self.options.multiline && (key.code == terminal::KeyCode::Down || control(key, 'n')) {
+                self.history(1)?;
+                return Result::Ok(Outcome::Pending)
+            }
+            if self.options.password && (control(key, 'z') || control(key, 'y')) {
+                return Result::Ok(Outcome::Pending)
+            }
+        }
+        let accepted = match event {
+            terminal::Event::Paste(value) if !self.options.multiline => terminal::Event::Paste(
+                value.replace("\r\n", " ").replace("\n", " ").replace("\r", " "),
+            ),
+            _ => event,
+        };
+        if let Err(error) = self.editor.update(accepted) {
+            self.state.set(InputState { error: label_text(error.to_string()), ..state });
+            return Result::Ok(Outcome::Pending)
+        }
+        if self.options.password {
+            self.editor.clear_history();
+        }
+        self.state.set(
+            InputState { error: "", completions: Vec::new(), completion_index: -1, ..state },
+        );
+        Result::Ok(Outcome::Pending)
+    }
+
+    fn render(self: TextInput[T], buffer: tui::Buffer) -> Result[(), tui::Error] {
+        let area = buffer.area();
+        draw_line(buffer, 0, "? " + self.options.question, self.options.theme.question)?;
+        if area.height > 1 {
+            let height = if self.options.multiline && area.height > 3 {
+                area.height - 3
+            } else {
+                1
+            };
+            self.editor.render(
+                buffer,
+                tui::Rect { x: 0, y: 1, width: area.width, height },
+                tui::EditorOptions {
+                    multiline: self.options.multiline,
+                    password: self.options.password,
+                    focused: !self.state.get().finished,
+                    style: self.options.theme.input,
+                    selection_style: self.options.theme.selected,
+                    cursor_style: self.options.theme.selected,
+                },
+            )?;
+            let row = 1 + height;
+            let error = self.state.get().error;
+            if error != "" {
+                draw_line(buffer, row, error, self.options.theme.error)?;
+            } else {
+                draw_line(buffer, row, self.options.help, self.options.theme.muted)?;
+            }
+        }
+        Result::Ok(())
+    }
+}
+
+pub fn text(question: string) -> Result[TextInput[string], Error] {
+    TextInput::new(InputOptions::new(question), |value| Result::Ok(value))
+}
+
+pub fn password(question: string) -> Result[TextInput[string], Error] {
+    TextInput::new(
+        InputOptions {
+            password: true,
+            help: "Enter: submit · Esc: cancel",
+            ..InputOptions::new(question),
+        },
+        |value| Result::Ok(value),
+    )
+}
+
+pub fn integer(question: string, minimum: isize, maximum: isize) -> Result[TextInput[isize], Error] {
+    if minimum > maximum {
+        return Result::Err(invalid("invalid integer bounds"))
+    }
+    TextInput::new(InputOptions::new(question), |value| parse_integer(value, minimum, maximum))
+}
+
+fn parse_integer(value: string, minimum: isize, maximum: isize) -> Result[isize, string] {
+    let number = num::parse_int_structured(value.trim()).map_err(|_| "enter an integer")?;
+    if number < minimum || number > maximum {
+        Result::Err(f"value must be between {minimum} and {maximum}")
+    } else {
+        Result::Ok(number)
+    }
+}

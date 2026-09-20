@@ -1,0 +1,227 @@
+package tui;
+
+use ecosystem::ansi;
+use ecosystem::unicode_text;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Cell {
+    pub text: string,
+    pub style: ansi::Style,
+    pub width: isize,
+    pub continuation: bool,
+}
+
+impl Cell {
+    pub fn blank(style: ansi::Style) -> Cell {
+        Cell { text: " ", style, width: 1, continuation: false }
+    }
+}
+
+pub struct Buffer {
+    bounds: Rect,
+    cells: Vec[Cell],
+    text_bytes: Ref[isize],
+}
+
+impl Buffer {
+    pub fn new(width: isize, height: isize) -> Result[Buffer, Error] {
+        let bounds = Rect::new(0, 0, width, height)?;
+        if width * height > MAX_CELLS {
+            return Result::Err(failure("buffer cell limit exceeded"))
+        }
+        let cells = Vec::new();
+        for _ in 0..width * height {
+            cells.push(Cell::blank(ansi::Style::new()));
+        }
+        Result::Ok(Buffer { bounds, cells, text_bytes: Ref::new(width * height) })
+    }
+
+    pub fn area(self: Buffer) -> Rect {
+        self.bounds
+    }
+
+    pub fn get(self: Buffer, x: isize, y: isize) -> Option[Cell] {
+        if self.bounds.contains(x, y) {
+            Option::Some(self.cells[y * self.bounds.width + x])
+        } else {
+            Option::None
+        }
+    }
+
+    pub fn snapshot(self: Buffer) -> Buffer {
+        Buffer {
+            bounds: self.bounds,
+            cells: self.cells.copy(),
+            text_bytes: Ref::new(self.text_bytes.get()),
+        }
+    }
+
+    fn assign(self: Buffer, index: isize, cell: Cell) -> () {
+        self.text_bytes.set(
+            self.text_bytes.get() + cell.text.byte_len() - self.cells[index].text.byte_len(),
+        );
+        self.cells[index] = cell;
+    }
+
+    fn erase(self: Buffer, x: isize, y: isize) -> () {
+        if !self.bounds.contains(x, y) {
+            return
+        }
+        let index = y * self.bounds.width + x;
+        let cell = self.cells[index];
+        if cell.continuation && x > 0 {
+            let old = self.cells[index - 1];
+            self.assign(index - 1, Cell::blank(old.style));
+        } else if cell.width == 2 && x + 1 < self.bounds.width {
+            let old = self.cells[index + 1];
+            self.assign(index + 1, Cell::blank(old.style));
+        }
+        self.assign(index, Cell::blank(cell.style));
+    }
+
+    pub fn put(self: Buffer, x: isize, y: isize, text: string, style: ansi::Style) -> Result[
+        isize,
+        Error,
+    ] {
+        if text.byte_len() > 4096 {
+            return Result::Err(failure("cell grapheme too large"))
+        }
+        let clean = safe_cell_text(text);
+        let graphemes = unicode_text::graphemes(clean);
+        if graphemes.len() != 1 {
+            return Result::Err(failure("cell requires one printable grapheme"))
+        }
+        let measured = unicode_text::width(clean);
+        let (value, width) = if measured == 0 {
+            ("◌" + clean, 1)
+        } else {
+            (clean, measured)
+        };
+        if width > 2 {
+            return Result::Err(failure("cell width exceeds two columns"))
+        }
+        if !self.bounds.contains(x, y) || x + width > self.bounds.right() {
+            return Result::Ok(0)
+        }
+        let start = if self.cells[y * self.bounds.width + x].continuation {
+            x - 1
+        } else {
+            x
+        };
+        let last = x + width - 1;
+        let end = if self.cells[y * self.bounds.width + last].width == 2 {
+            last + 2
+        } else {
+            last + 1
+        };
+        let mut removed = 0;
+        for column in start..end {
+            removed += self.cells[y * self.bounds.width + column].text.byte_len();
+        }
+        let final_bytes = self.text_bytes.get() - removed + value.byte_len() + end - start - width;
+        if final_bytes > 4194304 {
+            return Result::Err(failure("buffer text budget exceeded"))
+        }
+        for dx in 0..width {
+            self.erase(x + dx, y);
+        }
+        let index = y * self.bounds.width + x;
+        self.assign(index, Cell { text: value, style, width, continuation: false });
+        if width == 2 {
+            self.assign(index + 1, Cell { text: "", style, width: 0, continuation: true });
+        }
+        Result::Ok(width)
+    }
+
+    pub fn fill(self: Buffer, area: Rect, style: ansi::Style) -> Result[(), Error] {
+        area.validate()?;
+        let clip = self.bounds.intersection(area);
+        for y in clip.y..clip.bottom() {
+            for x in clip.x..clip.right() {
+                self.erase(x, y);
+                self.assign(y * self.bounds.width + x, Cell::blank(style));
+            }
+        }
+        Result::Ok(())
+    }
+
+    pub fn draw_text(self: Buffer, area: Rect, text: ansi::StyledText) -> Result[(), Error] {
+        area.validate()?;
+        if text.plain_text().byte_len() > MAX_TEXT_BYTES {
+            return Result::Err(failure("text limit exceeded"))
+        }
+        let clip = area.intersection(self.bounds);
+        let mut x = area.x;
+        let mut y = area.y;
+        for part in text.graphemes(unicode_text::WidthOptions::new()) {
+            if part.text == "\n" || part.text == "\r\n" || part.text == "\r" {
+                y += 1;
+                x = area.x;
+            } else if part.text == "\t" {
+                let count = 8 - (x - area.x) % 8;
+                for _ in 0..count {
+                    if clip.contains(x, y) {
+                        self.put(x, y, " ", part.style)?;
+                    }
+                    x += 1;
+                }
+            } else {
+                let width = maximum(1, part.width);
+                if clip.contains(x, y) && x + width <= clip.right() {
+                    self.put(x, y, part.text, part.style)?;
+                }
+                x += width;
+            }
+            if y >= clip.bottom() {
+                break
+            }
+        }
+        Result::Ok(())
+    }
+
+    pub fn lines(self: Buffer) -> Vec[string] {
+        let lines = Vec::new();
+        for y in 0..self.bounds.height {
+            let values: Vec[string] = Vec::new();
+            for x in 0..self.bounds.width {
+                let cell = self.cells[y * self.bounds.width + x];
+                if !cell.continuation {
+                    values.push(cell.text);
+                }
+            }
+            lines.push(values.join(""));
+        }
+        lines
+    }
+
+    pub fn validate(self: Buffer) -> Result[(), Error] {
+        for y in 0..self.bounds.height {
+            for x in 0..self.bounds.width {
+                let index = y * self.bounds.width + x;
+                let cell = self.cells[index];
+                if cell.continuation {
+                    if x == 0 || self.cells[index - 1].width != 2 {
+                        return Result::Err(failure("orphan continuation"))
+                    }
+                } else if cell.width == 2 {
+                    if x + 1 >= self.bounds.width || !self.cells[index + 1].continuation {
+                        return Result::Err(failure("missing continuation"))
+                    }
+                }
+            }
+        }
+        Result::Ok(())
+    }
+}
+
+fn safe_cell_text(text: string) -> string {
+    let result: Vec[string] = Vec::new();
+    for value in text.chars() {
+        if value < '\u0020' || (value >= '\u007f' && value <= '\u009f') {
+            result.push("�");
+        } else {
+            result.push(value.to_string());
+        }
+    }
+    result.join("")
+}

@@ -1,0 +1,161 @@
+package progress;
+
+use std::io::{Error};
+use std::math;
+use std::num::{ToFloat, TryToInt};
+use std::io;
+
+struct Entry {
+    id: i64,
+    name: string,
+    message: string,
+    position: i64,
+    total: Option[i64],
+    status: Status,
+    started: i64,
+    ended: Option[i64],
+    dirty: bool,
+}
+
+struct State {
+    entries: Vec[Entry],
+    next_id: i64,
+    now: i64,
+    last_draw: Option[i64],
+    dirty: bool,
+    rows: isize,
+    width: Option[isize],
+    failure: Option[Error],
+}
+
+fn read_time(state: State, clock: Clock) -> i64 {
+    let read = clock.read;
+    let now = read();
+    if now < state.now {
+        state.now
+    } else if now > MAX_POSITION {
+        MAX_POSITION
+    } else {
+        now
+    }
+}
+
+fn find_entry(state: State, id: i64) -> Result[isize, Error] {
+    for index in 0..state.entries.len() {
+        if state.entries[index].id == id {
+            return Result::Ok(index)
+        }
+    }
+    Result::Err(failure(io::ErrorKind::NotFound, "job was removed"))
+}
+
+fn entry_snapshot(entry: Entry, now: i64, spinner_ms: i64) -> JobSnapshot {
+    let elapsed = entry.ended.unwrap_or(now) - entry.started;
+    let rate = if elapsed > 0 && entry.position > 0 {
+        Option::Some(entry.position.to_f64() * 1000.0 / elapsed.to_f64())
+    } else {
+        Option::None
+    };
+    let eta = match (entry.total, rate) {
+        (Some(total), Some(rate)) if entry.status == Status::Running => {
+            let value = math::ceil((total - entry.position).to_f64() * 1000.0 / rate);
+            if value <= MAX_POSITION.to_f64() {
+                Option::Some(value.try_to_i64().unwrap_or(0))
+            } else {
+                Option::None
+            }
+        },
+        _ => Option::None,
+    };
+    JobSnapshot {
+        id: entry.id,
+        name: entry.name,
+        message: entry.message,
+        position: entry.position,
+        total: entry.total,
+        status: entry.status,
+        elapsed_ms: elapsed,
+        per_second: rate,
+        eta_ms: eta,
+        frame: elapsed / spinner_ms,
+    }
+}
+
+fn state_snapshot(state: State, spinner_ms: i64, closed: bool) -> Snapshot {
+    let jobs = Vec::new();
+    for entry in state.entries {
+        jobs.push(entry_snapshot(entry, state.now, spinner_ms));
+    }
+    Snapshot { jobs, now_ms: state.now, closed }
+}
+
+fn apply_update(entry: Entry, update: Update, now: i64, text_limit: isize) -> Result[Entry, Error] {
+    if let Update::Reset(total) = update {
+        valid_total(total)?;
+        return Result::Ok(
+            Entry {
+                position: 0,
+                total,
+                started: now,
+                ended: Option::None,
+                status: Status::Running,
+                message: "",
+                dirty: true,
+                ..entry,
+            },
+        )
+    }
+    if entry.status != Status::Running {
+        return Result::Err(invalid("completed jobs require reset before further updates"))
+    }
+    let result = match update {
+        Update::Advance(amount) => {
+            if amount < 0 || amount > MAX_POSITION - entry.position {
+                return Result::Err(invalid("advance is negative or overflows MAX_POSITION"))
+            }
+            Entry { position: entry.position + amount, ..entry }
+        },
+        Update::Position(position) => {
+            if position < entry.position || position > MAX_POSITION {
+                return Result::Err(invalid("position must increase and remain within MAX_POSITION"))
+            }
+            Entry { position, ..entry }
+        },
+        Update::Total(total) => {
+            valid_total(Option::Some(total))?;
+            if total < entry.total.unwrap_or(0) {
+                return Result::Err(invalid("total may decrease only through reset"))
+            }
+            Entry { total: Option::Some(total), ..entry }
+        },
+        Update::Message(message) => {
+            safe_text(message, text_limit)?;
+            Entry { message, ..entry }
+        },
+        Update::Finish(message) => {
+            safe_text(message, text_limit)?;
+            Entry {
+                message,
+                position: entry.total.unwrap_or(entry.position),
+                status: Status::Finished,
+                ended: Option::Some(now),
+                ..entry,
+            }
+        },
+        Update::Fail(message) => {
+            safe_text(message, text_limit)?;
+            Entry { message, status: Status::Failed, ended: Option::Some(now), ..entry }
+        },
+        Update::Cancel(message) => {
+            safe_text(message, text_limit)?;
+            Entry { message, status: Status::Cancelled, ended: Option::Some(now), ..entry }
+        },
+        Update::Reset(_) => entry,
+    };
+    if let Some(total) = result.total {
+        if result.position > total {
+            return Result::Err(invalid("position exceeds total"))
+        }
+    }
+    Result::Ok(Entry { dirty: true, ..result })
+}

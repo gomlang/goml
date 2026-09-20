@@ -1,0 +1,137 @@
+package diagnostics;
+
+use std::text;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct EditLimits {
+    pub max_edits: isize,
+    pub max_replacement_bytes: isize,
+    pub max_output_bytes: isize,
+}
+
+impl EditLimits {
+    pub fn new() -> EditLimits {
+        EditLimits { max_edits: 1024, max_replacement_bytes: 16777216, max_output_bytes: 67108864 }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ChangedSource {
+    pub file: FileId,
+    pub name: string,
+    pub original: string,
+    pub updated: string,
+}
+
+struct IndexedEdit {
+    value: Edit,
+    index: isize,
+}
+
+fn sorted_edits(cache: SourceCache, edits: Vec[Edit], limits: EditLimits) -> Result[
+    Vec[IndexedEdit],
+    Error,
+] {
+    if limits.max_edits < 0 || limits.max_edits > 10000 || limits.max_replacement_bytes < 0
+        || limits.max_replacement_bytes > 67108864
+        || limits.max_output_bytes < 0
+        || limits.max_output_bytes > 268435456 {
+        return Result::Err(Error::InvalidOptions("suggestion edit limits"));
+    }
+    if edits.len() > limits.max_edits {
+        return Result::Err(Error::Limit("suggestion edits"));
+    }
+    let sorted: Vec[IndexedEdit] = Vec::new();
+    let mut replacement_bytes = 0;
+    for index in 0..edits.len() {
+        let value = edits[index];
+        cache.text(value.span)?;
+        if value.replacement.byte_len() > limits.max_replacement_bytes - replacement_bytes {
+            return Result::Err(Error::Limit("suggestion replacement bytes"));
+        }
+        replacement_bytes += value.replacement.byte_len();
+        sorted.push(IndexedEdit { value, index });
+    }
+    sorted.sort_by(
+        |a, b| {
+            let af = a.value.span.file.index;
+            let bf = b.value.span.file.index;
+            if af != bf {
+                af - bf
+            } else if a.value.span.start != b.value.span.start {
+                a.value.span.start - b.value.span.start
+            } else {
+                a.value.span.end - b.value.span.end
+            }
+        },
+    );
+    for i in 1..sorted.len() {
+        let a = sorted[i - 1];
+        let b = sorted[i];
+        if a.value.span.file == b.value.span.file {
+            if b.value.span.start < a.value.span.end
+                || (a.value.span.is_empty() && b.value.span.is_empty()
+                    && a.value.span.start == b.value.span.start) {
+                return Result::Err(Error::ConflictingEdits { first: a.index, second: b.index });
+            }
+        }
+    }
+    let mut index = 0;
+    let mut total = 0;
+    while index < sorted.len() {
+        let source = cache.get(sorted[index].value.span.file)?;
+        let mut size = source.byte_len();
+        while index < sorted.len() && sorted[index].value.span.file == source.id {
+            let edit = sorted[index].value;
+            size += edit.replacement.byte_len() - (edit.span.end - edit.span.start);
+            index += 1;
+        }
+        if size > limits.max_output_bytes - total {
+            return Result::Err(Error::Limit("suggestion output bytes"));
+        }
+        total += size;
+    }
+    Result::Ok(sorted)
+}
+
+impl Suggestion {
+    pub fn validate(self: Suggestion, cache: SourceCache, limits: EditLimits) -> Result[(), Error] {
+        sorted_edits(cache, self.edits, limits)?;
+        Result::Ok(())
+    }
+
+    pub fn apply(self: Suggestion, cache: SourceCache, limits: EditLimits) -> Result[
+        Vec[ChangedSource],
+        Error,
+    ] {
+        let edits = sorted_edits(cache, self.edits, limits)?;
+        let output = Vec::new();
+        let mut index = 0;
+        while index < edits.len() {
+            let source = cache.get(edits[index].value.span.file)?;
+            let mut last = index;
+            while last < edits.len() && edits[last].value.span.file == source.id {
+                last += 1;
+            }
+            let builder = text::StringBuilder::new();
+            let mut at = 0;
+            for i in index..last {
+                let edit = edits[i].value;
+                builder.write_string(source.text.byte_slice(at, edit.span.start));
+                builder.write_string(edit.replacement);
+                at = edit.span.end;
+            }
+            builder.write_string(source.text.byte_slice(at, source.byte_len()));
+            output.push(
+                ChangedSource {
+                    file: source.id,
+                    name: source.name,
+                    original: source.text,
+                    updated: builder.finish(),
+                },
+            );
+            index = last;
+        }
+        Result::Ok(output)
+    }
+}

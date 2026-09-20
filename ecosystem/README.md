@@ -44,6 +44,15 @@ tracks completed improvements and the remaining functional gaps.
 | [cache](cache/README.md) | Generic concurrent weighted LRU, TTL/TTI, injectable clocks, bounded singleflight loading, invalidation generations, copy policy and removal callbacks | Implemented; 22 library tests and race checks, versioned consumer and 42,240 Python reference operations pass |
 | [ignore](ignore/README.md) | Glob sets, hierarchical Git ignore rules, match explanations, worktree metadata, bounded traversal, cancellation and parallel callbacks | Implemented; 21 library tests and race checks, versioned consumer and 9,400 real Git reference queries pass |
 | [syntax](syntax/README.md) | Immutable lossless green trees, red navigation, typed AST views, bounded interning/builders, checked ranges and persistent subtree edits | Implemented; 18 library tests and race checks, versioned consumer, 3,840 model-checked edits and 240 lossless rewrites pass |
+| [color](color/README.md) | Checked sRGB/linear/HSL/HSV/XYZ/Lab/Oklab conversions, CSS colors, alpha compositing, gamut mapping, contrast, Delta E and gradients | Implemented; 20 library tests, 2 consumer tests and 4,659 numerical reference cases pass |
+| [unicode_text](unicode_text/README.md) | Unicode 16 grapheme/word/line segmentation, terminal width policies, truncation, padding, tab expansion and bounded wrapping | Implemented; 13 library tests, 2 consumer tests and all 19,591 official Unicode segmentation cases pass |
+| [ansi](ansi/README.md) | Structured styles, 16/256/truecolor profiles, streaming UTF-8/escape parsing, hyperlinks, styled graphemes and partial-write adapters | Implemented; 13 library tests, 2 consumer tests and 2,800 independent protocol/rendering cases pass |
+| [terminal](terminal/README.md) | Linux raw sessions, typed keyboard/mouse/paste/focus/resize events, capability detection, cancellable I/O and explicit restoration | Implemented; 18 library tests, independent consumer, race detector and real PTY checks pass |
+| [tui](tui/README.md) | Unicode cell buffers, incremental rendering, constrained layout, tables/trees/charts, focus and grapheme-aware editing | Implemented; 21 library tests, 2 consumer tests, 2,505 model-checked ANSI frames and real PTY checks pass |
+| [prompt](prompt/README.md) | Typed text/password/integer input, validation, history/completion, searchable single/multiple choices and confirmation | Implemented; 15 library tests, independent consumer and nine real PTY sessions pass |
+| [progress](progress/README.md) | Concurrent bars/spinners, snapshots, rate/ETA, throttling, coordinated logging, redirected output and cancellable shutdown | Implemented; 12 library tests, independent consumer, 400 numerical cases, race detector and real PTY checks pass |
+| [diagnostics](diagnostics/README.md) | Checked source caches/spans, Unicode multi-file labels, themes, clipping, suggestions and conflict-checked edits | Implemented; 22 library tests, 3 consumer tests and 6,236 independent source/edit/rendering cases pass |
+| [tui_markdown](tui_markdown/README.md) | CommonMark terminal layout, themed blocks/inlines, tables, links, scrolling and searchable previews | Implemented; 13 library tests, 2 consumer tests, 1,118 independent cases and real PTY checks pass |
 
 Validation includes module-local public API tests, separate consuming modules,
 deterministic negative cases, reference interoperability where applicable, and
@@ -60,6 +69,23 @@ Current development command, from a module directory:
 Modules with ecosystem dependencies need those versions in the selected registry.
 For this checkout, use the verification command below to create the isolated
 registry snapshot and check both the library and its consumer.
+
+## Terminal application stack
+
+`color` and `unicode_text` supply reusable numeric and text foundations. `ansi`
+adds structured styles; `terminal` owns one application's input/output session.
+`tui` draws frames on that session, while `prompt` and `tui_markdown` supply
+application models. `progress` can own a separate progress region or expose pure
+snapshots for a TUI, and `diagnostics` produces explicit plain or colored reports.
+Keep one output owner per live terminal region when composing the libraries.
+
+[`examples/explorer`](examples/explorer/README.md) combines a directory tree,
+Markdown preview, background scan progress and filesystem refresh. It provides
+both an interactive application and a deterministic textual snapshot mode:
+
+```sh
+python3 ecosystem/examples/explorer/verify.py
+```
 
 ## Tools
 
@@ -81,14 +107,20 @@ Run the available library and independent consumer checks from the repository ro
 ```sh
 python3 ecosystem/verify.py
 python3 ecosystem/verify.py lsp markdown diff
+python3 ecosystem/verify.py color unicode_text ansi terminal tui prompt progress diagnostics tui_markdown
+python3 -m unittest discover -s ecosystem/tests
 ```
 
 With no module arguments, the verifier checks all registered libraries and their
 consumers. A missing module or failed check is an error. It creates an isolated,
 content-addressed registry snapshot under `ecosystem/_artifact/`, leaving the
 user's registry untouched. Consumers resolve normal versioned dependencies from
-that snapshot. Verification logs and command timings are written under
-`ecosystem/_artifact/verification/`.
+that snapshot. Snapshot contents are captured once and published atomically so
+parallel verifiers cannot observe a partially populated registry. Verification
+logs and command timings are written under
+`ecosystem/_artifact/verification/`. Real terminal checks run automatically for
+modules containing `pty_test.py`; they use local pseudo-terminals and do not
+require a human-controlled terminal.
 
 Each implemented library has a README describing its API, semantics, limits and
 tests. [FINDINGS.md](FINDINGS.md) records language capabilities and compiler/API boundaries discovered during this work.
@@ -99,6 +131,8 @@ reference check uses CPython 3.12 on Linux amd64. Reference programs and wheels
 are downloaded into ignored `_artifact/` directories as documented by each
 library; race checks require the repository's C compiler prerequisite. Redis's
 DNS/TLS checks additionally use OpenSSL to generate ephemeral local certificates.
+Unicode conformance checks freshly download the checksum-pinned Unicode source
+files on every invocation; compressed datasets are not versioned.
 The bitflags reference checker additionally requires `rustc` and downloads a
 checksum-pinned reference crate; the GoML library itself has no Rust dependency.
 The LLVM binding requires LLVM 18 development headers and `libLLVM-18` under

@@ -1,0 +1,271 @@
+package color;
+
+use std::math;
+use std::num::{ToFloat};
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum HueDirection {
+    Shorter,
+    Longer,
+    Increasing,
+    Decreasing,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum MixSpace {
+    Srgb,
+    LinearRgb,
+    Lab,
+    Oklab,
+    Hsl(HueDirection),
+    Oklch(HueDirection),
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum Extension {
+    Clamp,
+    Repeat,
+    Mirror,
+}
+
+#[derive(PartialEq, Debug)]
+pub struct Stop {
+    pub position: f64,
+    pub color: Srgb,
+}
+
+pub struct Gradient {
+    stops: Vec[Stop],
+    space: MixSpace,
+    gamut: Gamut,
+    extension: Extension,
+}
+
+fn alpha_weights(a: f64, b: f64, t: f64) -> (f64, f64, f64) {
+    let scale = max(a, b);
+    if scale == 0.0 {
+        return (0.0, 0.0, 0.0)
+    }
+    let left = a / scale * (1.0 - t);
+    let right = b / scale * t;
+    let sum = left + right;
+    let alpha = scale * sum;
+    if alpha == 0.0 {
+        (0.0, 0.0, 0.0)
+    } else {
+        (alpha, left / sum, right / sum)
+    }
+}
+
+fn mix_hue(a: f64, b: f64, t: f64, direction: HueDirection) -> f64 {
+    let mut delta = b - a;
+    match direction {
+        Shorter => {
+            if delta > 180.0 {
+                delta -= 360.0;
+            } else if delta < -180.0 {
+                delta += 360.0;
+            }
+        },
+        Longer => {
+            if delta > 0.0 && delta < 180.0 {
+                delta -= 360.0;
+            } else if delta > -180.0 && delta <= 0.0 {
+                delta += 360.0;
+            }
+        },
+        Increasing => {
+            if delta < 0.0 {
+                delta += 360.0;
+            }
+        },
+        Decreasing => {
+            if delta > 0.0 {
+                delta -= 360.0;
+            }
+        },
+    }
+    hue(a + t * delta)
+}
+
+fn borrow_hue(a: f64, b: f64, ac: f64, bc: f64) -> (f64, f64) {
+    if ac < 0.0000001 && bc >= 0.0000001 {
+        (b, b)
+    } else if bc < 0.0000001 && ac >= 0.0000001 {
+        (a, a)
+    } else if ac < 0.0000001 && bc < 0.0000001 {
+        (0.0, 0.0)
+    } else {
+        (a, b)
+    }
+}
+
+pub fn mix(a: Srgb, b: Srgb, t: f64, space: MixSpace, gamut: Gamut) -> Result[Srgb, Error] {
+    unit(t, "mix fraction")?;
+    if t == 0.0 {
+        return Result::Ok(a)
+    }
+    if t == 1.0 {
+        return Result::Ok(b)
+    }
+    let (alpha, left, right) = alpha_weights(a.alpha, b.alpha, t);
+    let component = |x: f64, y: f64| {
+        x * left + y * right
+    };
+    let result = match space {
+        Srgb => Srgb {
+            r: clamp(component(a.r, b.r), 0.0, 1.0),
+            g: clamp(component(a.g, b.g), 0.0, 1.0),
+            b: clamp(component(a.b, b.b), 0.0, 1.0),
+            alpha,
+        },
+        LinearRgb => {
+            let a = a.to_linear();
+            let b = b.to_linear();
+            (LinearRgb {
+                r: component(a.r, b.r),
+                g: component(a.g, b.g),
+                b: component(a.b, b.b),
+                alpha,
+            }).to_srgb(gamut)
+        },
+        Lab => {
+            let a = a.to_lab();
+            let b = b.to_lab();
+            (Lab { l: component(a.l, b.l), a: component(a.a, b.a), b: component(a.b, b.b), alpha }).to_srgb(
+                gamut,
+            )
+        },
+        Oklab => {
+            let a = a.to_oklab();
+            let b = b.to_oklab();
+            (Oklab { l: component(a.l, b.l), a: component(a.a, b.a), b: component(a.b, b.b), alpha }).to_srgb(
+                gamut,
+            )
+        },
+        Hsl(direction) => {
+            let a = a.to_hsl();
+            let b = b.to_hsl();
+            let (ah, bh) = borrow_hue(
+                a.h,
+                b.h,
+                a.s * min(a.l, 1.0 - a.l),
+                b.s * min(b.l, 1.0 - b.l),
+            );
+            (Hsl {
+                h: mix_hue(ah, bh, t, direction),
+                s: clamp(component(a.s, b.s), 0.0, 1.0),
+                l: clamp(component(a.l, b.l), 0.0, 1.0),
+                alpha,
+            }).to_srgb()
+        },
+        Oklch(direction) => {
+            let a = a.to_oklch();
+            let b = b.to_oklch();
+            let (ah, bh) = borrow_hue(a.h, b.h, a.c, b.c);
+            (Oklch {
+                h: mix_hue(ah, bh, t, direction),
+                c: component(a.c, b.c),
+                l: component(a.l, b.l),
+                alpha,
+            }).to_srgb(gamut)
+        },
+    };
+    Result::Ok(result)
+}
+
+impl Gradient {
+    pub fn new(stops: Vec[Stop], space: MixSpace, gamut: Gamut, extension: Extension) -> Result[
+        Gradient,
+        Error,
+    ] {
+        if stops.len() < 2 || stops.len() > 65536 {
+            return Result::Err(Error::InvalidGradient("expected 2 through 65536 stops"))
+        }
+        let copy: Vec[Stop] = Vec::with_capacity(stops.len());
+        let mut previous = 0.0;
+        for stop in stops {
+            unit(stop.position, "stop position")?;
+            if stop.position < previous {
+                return Result::Err(Error::InvalidGradient("stop positions must be sorted"))
+            }
+            previous = stop.position;
+            copy.push(stop);
+        }
+        Result::Ok(Gradient { stops: copy, space, gamut, extension })
+    }
+
+    pub fn evenly_spaced(colors: Vec[Srgb], space: MixSpace, gamut: Gamut) -> Result[
+        Gradient,
+        Error,
+    ] {
+        if colors.len() < 2 || colors.len() > 65536 {
+            return Result::Err(Error::InvalidGradient("expected 2 through 65536 colors"))
+        }
+        let stops: Vec[Stop] = Vec::with_capacity(colors.len());
+        for index in 0..colors.len() {
+            stops.push(
+                Stop {
+                    position: index.to_f64() / (colors.len() - 1).to_f64(),
+                    color: colors[index],
+                },
+            );
+        }
+        Gradient::new(stops, space, gamut, Extension::Clamp)
+    }
+
+    pub fn len(self: Gradient) -> isize {
+        self.stops.len()
+    }
+
+    pub fn sample(self: Gradient, position: f64) -> Result[Srgb, Error] {
+        check(position, -1000000000.0, 1000000000.0, "gradient position")?;
+        let t = match self.extension {
+            Clamp => clamp(position, 0.0, 1.0),
+            Repeat => position - math::floor(position),
+            Mirror => {
+                let cycle = position - 2.0 * math::floor(position / 2.0);
+                if cycle <= 1.0 {
+                    cycle
+                } else {
+                    2.0 - cycle
+                }
+            },
+        };
+        if t < self.stops[0].position {
+            return Result::Ok(self.stops[0].color)
+        }
+        let mut low = 0;
+        let mut high = self.stops.len();
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if self.stops[mid].position <= t {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        if low == self.stops.len() {
+            return Result::Ok(self.stops[low - 1].color)
+        }
+        let a = self.stops[low - 1];
+        let b = self.stops[low];
+        mix(a.color, b.color, (t - a.position) / (b.position - a.position), self.space, self.gamut)
+    }
+
+    pub fn samples(self: Gradient, count: isize) -> Result[Vec[Srgb], Error] {
+        if count < 0 || count > 65536 {
+            return Result::Err(Error::InvalidGradient("sample count must be 0 through 65536"))
+        }
+        let result: Vec[Srgb] = Vec::with_capacity(count);
+        for index in 0..count {
+            let t = if count <= 1 {
+                0.0
+            } else {
+                index.to_f64() / (count - 1).to_f64()
+            };
+            result.push(self.sample(t)?);
+        }
+        Result::Ok(result)
+    }
+}

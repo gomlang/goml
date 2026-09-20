@@ -1,0 +1,473 @@
+package main;
+
+use ecosystem::ansi;
+use ecosystem::color;
+use ecosystem::progress;
+use ecosystem::terminal;
+use ecosystem::tui;
+use ecosystem::tui_markdown;
+
+pub struct Explorer {
+    root: string,
+    entries: Vec[Entry],
+    tree: tui::TreeState,
+    viewer: tui_markdown::Viewer,
+    preview_path: string,
+    preview_markdown: bool,
+    preview_error: string,
+    focus_preview: bool,
+    status: string,
+    scanning: bool,
+    pending: bool,
+    scans: isize,
+    changes: isize,
+    elapsed_ms: i64,
+    retained_path: string,
+    limits: Limits,
+    demo: bool,
+}
+
+fn ui_error(value: string) -> tui::Error {
+    tui::Error { message: value }
+}
+
+fn label(value: string) -> string {
+    ansi::safe_text(value).replace("\n", "�").replace("\t", " ")
+}
+
+impl Explorer {
+    pub fn new(root: string, limits: Limits) -> Result[Explorer, string] {
+        limits.validate()?;
+        let viewer = tui_markdown::Viewer::new(
+            "# Preview\n\nSelect a Markdown file.\n",
+            tui_markdown::Options {
+                pipe_tables: true,
+                max_input_bytes: if limits.max_file_bytes < 1024 {
+                    1024
+                } else {
+                    limits.max_file_bytes
+                },
+                max_lines: 8192,
+                max_nodes: 16384,
+                max_depth: 32,
+                ..tui_markdown::Options::defaults(40),
+            },
+        ).map_err(|error| error.to_string())?;
+        Result::Ok(
+            Explorer {
+                root,
+                entries: Vec::new(),
+                tree: tui::TreeState::new(),
+                viewer,
+                preview_path: "",
+                preview_markdown: false,
+                preview_error: "",
+                focus_preview: false,
+                status: "Starting background scan",
+                scanning: false,
+                pending: true,
+                scans: 0,
+                changes: 0,
+                elapsed_ms: 0,
+                retained_path: "",
+                limits,
+                demo: false,
+            },
+        )
+    }
+
+    pub fn entries(self: Explorer) -> Vec[Entry] {
+        let values = Vec::new();
+        for entry in self.entries {
+            values.push(entry);
+        }
+        values
+    }
+
+    pub fn selected_path(self: Explorer) -> string {
+        if self.entries.is_empty() {
+            ""
+        } else {
+            self.entries[self.tree.selection.visible(self.entries.len(), 1).selected].path
+        }
+    }
+
+    pub fn request_refresh(self: Explorer, changed: bool) -> Explorer {
+        Explorer {
+            pending: true,
+            changes: self.changes
+                + if changed {
+                    1
+                } else {
+                    0
+                },
+            ..self,
+        }
+    }
+
+    pub fn begin_scan(self: Explorer) -> Explorer {
+        Explorer {
+            entries: Vec::new(),
+            tree: tui::TreeState::new(),
+            retained_path: self.selected_path(),
+            pending: false,
+            scanning: true,
+            scans: self.scans + 1,
+            elapsed_ms: 0,
+            status: "Scanning in background",
+            ..self,
+        }
+    }
+
+    pub fn accept(self: Explorer, event: ScanEvent) -> Result[Explorer, string] {
+        match event {
+            Batch(batch) => {
+                let mut tree = self.tree;
+                for entry in batch {
+                    if entry.kind == Kind::Directory && !tree.is_expanded(entry.path) {
+                        tree = tree.toggle(entry.path).map_err(|error| error.to_string())?;
+                    }
+                    self.entries.push(entry);
+                }
+                Result::Ok(Explorer { tree, ..self })
+            },
+            Done(summary) => {
+                let mut selected = 0;
+                let mut preferred = false;
+                for index in 0..self.entries.len() {
+                    if self.entries[index].path == self.retained_path && self.retained_path != "" {
+                        selected = index;
+                        preferred = true;
+                        break;
+                    }
+                }
+                if !preferred {
+                    for index in 0..self.entries.len() {
+                        if markdown_file(self.entries[index]) {
+                            selected = index;
+                            break;
+                        }
+                    }
+                }
+                let selection = tui::SelectionState { selected, ..self.tree.selection };
+                let status = if !summary.errors.is_empty() {
+                    "Scan warning: " + summary.errors[0]
+                } else if summary.truncated {
+                    f"Scan complete: {summary.entries} entries (entry limit reached)"
+                } else {
+                    f"Scan complete: {summary.entries} entries"
+                };
+                Explorer {
+                    tree: self.tree.with_selection(selection),
+                    scanning: false,
+                    status,
+                    ..self,
+                }.load_selected()
+            },
+        }
+    }
+
+    fn load_selected(self: Explorer) -> Result[Explorer, string] {
+        if self.entries.is_empty() {
+            self.viewer.set_source("# Empty tree\n\nNo readable entries were found.\n").map_err(
+                |error| error.to_string(),
+            )?;
+            return Result::Ok(Explorer { preview_path: "", preview_error: "", ..self });
+        }
+        let entry = self.entries[self.tree.selection.visible(self.entries.len(), 1).selected];
+        let content = if self.demo && entry.path == "demo/README.md" {
+            Result::Ok(demo_markdown())
+        } else if self.demo {
+            Result::Err("Select README.md to preview the built-in document.")
+        } else if markdown_file(entry) {
+            read_preview(entry, self.limits)
+        } else if entry.kind == Kind::Directory {
+            Result::Err("Directory selected. Use Up/Down to select a Markdown file.")
+        } else if entry.kind == Kind::Symlink {
+            Result::Err("Symbolic links are listed without following or reading them.")
+        } else {
+            Result::Err("This demo previews .md and .markdown files only.")
+        };
+        match content {
+            Ok(source) => {
+                match self.viewer.set_source(source) {
+                    Ok(()) => Result::Ok(
+                        Explorer {
+                            preview_path: entry.path,
+                            preview_markdown: true,
+                            preview_error: "",
+                            ..self,
+                        },
+                    ),
+                    Err(error) => Result::Ok(
+                        Explorer {
+                            preview_path: entry.path,
+                            preview_markdown: false,
+                            preview_error: error.to_string(),
+                            ..self,
+                        },
+                    ),
+                }
+            },
+            Err(error) => Result::Ok(
+                Explorer {
+                    preview_path: entry.path,
+                    preview_markdown: false,
+                    preview_error: error,
+                    ..self,
+                },
+            ),
+        }
+    }
+
+    pub fn update(self: Explorer, event: terminal::Event, rows: isize) -> Result[Explorer, string] {
+        if let terminal::Event::Key(key) = event {
+            if key.code == terminal::KeyCode::Tab || key.code == terminal::KeyCode::BackTab {
+                return Result::Ok(Explorer { focus_preview: !self.focus_preview, ..self });
+            }
+            if key.code == terminal::KeyCode::Char('r') {
+                return Result::Ok(self.request_refresh(false));
+            }
+        }
+        if self.focus_preview {
+            self.viewer.update(event).map_err(|error| error.to_string())?;
+            Result::Ok(self)
+        } else {
+            let translated = if let terminal::Event::Key(key) = event {
+                let code = match key.code {
+                    Char('j') => terminal::KeyCode::Down,
+                    Char('k') => terminal::KeyCode::Up,
+                    _ => key.code,
+                };
+                terminal::Event::Key(terminal::KeyEvent { code, ..key })
+            } else {
+                event
+            };
+            let before = self.tree.selection.selected;
+            let selection = self.tree.selection.update(translated, self.entries.len(), rows);
+            let next = Explorer { tree: self.tree.with_selection(selection), ..self };
+            if selection.selected != before {
+                next.load_selected()
+            } else {
+                Result::Ok(next)
+            }
+        }
+    }
+
+    pub fn draw(self: Explorer, buffer: tui::Buffer) -> Result[Explorer, tui::Error] {
+        let area = buffer.area();
+        let theme = explorer_theme()?;
+        if area.width < 30 || area.height < 8 {
+            buffer.draw_text(
+                area,
+                ansi::StyledText::plain("Explorer: enlarge terminal (30x8), q quits"),
+            )?;
+            return Result::Ok(self);
+        }
+        let rows = tui::layout(
+            area,
+            tui::Direction::Vertical,
+            Vec::from_array(
+                [
+                    tui::Constraint::Fixed(1),
+                    tui::Constraint::Fill(1),
+                    tui::Constraint::Fixed(1),
+                    tui::Constraint::Fixed(1),
+                    tui::Constraint::Fixed(1),
+                ],
+            ),
+            0,
+        )?;
+        buffer.draw_text(
+            rows[0],
+            ansi::StyledText::from_spans(
+                Vec::from_array(
+                    [ansi::Span::new("GoML Explorer | " + label(self.root), theme.title)],
+                ),
+            ),
+        )?;
+        let panes = tui::layout(
+            rows[1],
+            tui::Direction::Horizontal,
+            Vec::from_array([tui::Constraint::Ratio(1, 3), tui::Constraint::Fill(1)]),
+            1,
+        )?;
+        let left = tui::block(
+            buffer,
+            panes[0],
+            if self.focus_preview {
+                " Files "
+            } else {
+                " Files [focus] "
+            },
+            theme,
+        )?;
+        let right = tui::block(
+            buffer,
+            panes[1],
+            if self.focus_preview {
+                " Markdown [focus] "
+            } else {
+                " Markdown "
+            },
+            theme,
+        )?;
+        let nodes = Vec::new();
+        for entry in self.entries {
+            nodes.push(
+                tui::TreeNode {
+                    id: entry.path,
+                    depth: entry.depth,
+                    label: ansi::StyledText::from_spans(
+                        Vec::from_array(
+                            [
+                                ansi::Span::new(
+                                    label(entry.name)
+                                        + if entry.kind == Kind::Directory {
+                                            "/"
+                                        } else if entry.kind == Kind::Symlink {
+                                            " @"
+                                        } else {
+                                            ""
+                                        },
+                                    if entry.kind == Kind::Directory {
+                                        theme.accent
+                                    } else {
+                                        theme.base
+                                    },
+                                ),
+                            ],
+                        ),
+                    ),
+                },
+            );
+        }
+        let tree = tui::tree(
+            buffer,
+            left,
+            nodes,
+            self.tree.with_selection(
+                tui::SelectionState { focused: !self.focus_preview, ..self.tree.selection },
+            ),
+            theme,
+        )?;
+        if self.preview_error != "" {
+            tui::paragraph(
+                buffer,
+                right,
+                ansi::StyledText::plain(self.preview_error),
+                tui::ParagraphOptions::defaults(),
+            )?;
+        } else {
+            self.viewer.draw(buffer, right).map_err(|error| ui_error(error.to_string()))?;
+        }
+        let job = progress::JobSnapshot {
+            id: 1,
+            name: "scan",
+            message: if self.scanning {
+                "background worker"
+            } else {
+                "ready"
+            },
+            position: self.entries.len().to_i64(),
+            total: if self.scanning {
+                Option::None
+            } else {
+                Option::Some(self.entries.len().to_i64())
+            },
+            status: if self.scanning {
+                progress::Status::Running
+            } else {
+                progress::Status::Finished
+            },
+            elapsed_ms: self.elapsed_ms,
+            per_second: Option::None,
+            eta_ms: Option::None,
+            frame: self.elapsed_ms / 100,
+        };
+        let progress_line = progress::render_job(
+            job,
+            area.width,
+            progress::Style { show_rate: false, show_eta: false, ..progress::Style::defaults() },
+            ansi::Profile::TrueColor,
+        ).map_err(|error| ui_error(error.to_string()))?;
+        buffer.draw_text(
+            rows[2],
+            ansi::parse(progress_line).map_err(|error| ui_error(error.to_string()))?,
+        )?;
+        buffer.draw_text(
+            rows[3],
+            ansi::StyledText::plain(
+                label(self.status) + f" | scans {self.scans} changes {self.changes}",
+            ),
+        )?;
+        buffer.draw_text(
+            rows[4],
+            ansi::StyledText::plain(
+                "Up/Down j/k select | Tab pane | PgUp/PgDn scroll | r refresh | q quit",
+            ),
+        )?;
+        Result::Ok(Explorer { tree, ..self })
+    }
+}
+
+fn explorer_theme() -> Result[tui::Theme, tui::Error] {
+    let accent = ansi::Color::from_srgb(
+        color::parse("#73c7ee").map_err(|error| ui_error(error.to_string()))?,
+    );
+    Result::Ok(
+        tui::Theme {
+            title: ansi::Style::new().foreground(accent).with_attribute(ansi::BOLD, true),
+            accent: ansi::Style::new().foreground(accent),
+            ..tui::Theme::defaults(),
+        },
+    )
+}
+
+pub fn demo_markdown() -> string {
+    "# GoML terminal ecosystem\n\nA **read-only explorer** composed from GoML libraries.\n\n- Unicode: 中文 and 👩‍💻\n- A shared terminal session owns the screen.\n- Scans run in a bounded background worker.\n\n## Shortcuts\n\n| Key | Action |\n| --- | --- |\n| Tab | Switch pane |\n| r | Refresh tree |\n| q | Quit safely |\n\n> Root changes trigger a fresh scan.\n\n```gom\nuse ecosystem::tui;\n```\n\n[GoML documentation](https://example.invalid/goml)\n"
+}
+
+pub fn demo() -> Result[Explorer, string] {
+    let entries = Vec::from_array(
+        [
+            Entry { path: "demo", name: "demo", depth: 0, kind: Kind::Directory, bytes: 0 },
+            Entry {
+                path: "demo/README.md",
+                name: "README.md",
+                depth: 1,
+                kind: Kind::File,
+                bytes: demo_markdown().byte_len().to_i64(),
+            },
+            Entry { path: "demo/src", name: "src", depth: 1, kind: Kind::Directory, bytes: 0 },
+            Entry {
+                path: "demo/src/main.gom",
+                name: "main.gom",
+                depth: 2,
+                kind: Kind::File,
+                bytes: 128,
+            },
+            Entry { path: "demo/文档", name: "文档", depth: 1, kind: Kind::Directory, bytes: 0 },
+            Entry {
+                path: "demo/文档/guide.md",
+                name: "guide.md",
+                depth: 2,
+                kind: Kind::File,
+                bytes: 64,
+            },
+        ],
+    );
+    let state = Explorer { demo: true, ..Explorer::new("demo", Limits::defaults())? }.begin_scan();
+    state.accept(ScanEvent::Batch(entries))?.accept(
+        ScanEvent::Done(
+            ScanSummary { entries: 6, errors: Vec::new(), truncated: false, cancelled: false },
+        ),
+    )
+}
+
+pub fn snapshot(state: Explorer, width: isize, height: isize) -> Result[string, string] {
+    let buffer = tui::Buffer::new(width, height).map_err(|error| error.to_string())?;
+    state.draw(buffer).map_err(|error| error.to_string())?;
+    buffer.validate().map_err(|error| error.to_string())?;
+    Result::Ok(buffer.lines().join("\n") + "\n")
+}

@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tempfile
 import tomllib
 
 
@@ -17,6 +18,8 @@ MODULES = (
     "bitflags", "logos", "tempfile", "notify", "walkdir", "reqwest", "llvm",
     "rope", "tracing", "web", "ignore", "syntax", "cache", "bigint",
     "decimal", "incremental", "datetime",
+    "color", "unicode_text", "ansi", "terminal", "tui", "prompt",
+    "progress", "diagnostics", "tui_markdown",
 )
 IGNORED = {"_artifact", "_bootstrap", ".git", "__pycache__"}
 
@@ -30,31 +33,46 @@ def source_files(directory):
 
 def registry_snapshot():
     available = [name for name in MODULES if (ROOT / name / "goml.toml").is_file()]
-    digest = hashlib.sha256()
+    digest = hashlib.sha256(b"goml-ecosystem-registry-v2\0")
+    captured = {}
     for name in available:
+        files = []
         for path in source_files(ROOT / name):
+            content = path.read_bytes()
+            relative = path.relative_to(ROOT / name)
             digest.update(str(path.relative_to(ROOT)).encode())
             digest.update(b"\0")
-            digest.update(path.read_bytes())
+            digest.update(content)
             digest.update(b"\0")
-    home = ROOT / "_artifact" / "registry-snapshots" / digest.hexdigest()
-    registry = home / "cache" / "registry"
-    if not (registry / "index.toml").exists():
-        registry.mkdir(parents=True, exist_ok=True)
+            files.append((relative, content))
+        captured[name] = files
+    snapshots = ROOT / "_artifact" / "registry-snapshots"
+    home = snapshots / digest.hexdigest()
+    if (home / "cache" / "registry" / "index.toml").is_file():
+        return home
+    snapshots.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".registry-", dir=snapshots) as directory:
+        staged = Path(directory) / "home"
+        registry = staged / "cache" / "registry"
+        registry.mkdir(parents=True)
         entries = []
-        for name in available:
-            source = ROOT / name
-            manifest = tomllib.loads((source / "goml.toml").read_text())
+        for name, files in captured.items():
+            manifest = tomllib.loads(dict(files)[Path("goml.toml")].decode())
             coordinate = manifest["module"]["path"]
             if coordinate != f"ecosystem::{name}":
                 raise RuntimeError(f"unexpected module coordinate: {coordinate}")
             target = registry / "ecosystem" / name / "0.1.0"
-            for path in source_files(source):
-                destination = target / path.relative_to(source)
+            for relative, content in files:
+                destination = target / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_bytes(path.read_bytes())
+                destination.write_bytes(content)
             entries.append(f'[modules."{coordinate}"]\nlatest = "0.1.0"\nversions = ["0.1.0"]\n')
         (registry / "index.toml").write_text("\n".join(entries))
+        try:
+            staged.rename(home)
+        except OSError:
+            if not (home / "cache" / "registry" / "index.toml").is_file():
+                raise
     return home
 
 
@@ -108,6 +126,8 @@ def main():
             run([str(binary)], consumer, environment, logs / "consumer-run.log", records)
             if (library / "interop.py").is_file():
                 run([sys.executable, str(library / "interop.py")], ROOT.parent, environment, logs / "interoperability.log", records)
+            if (library / "pty_test.py").is_file():
+                run([sys.executable, str(library / "pty_test.py")], ROOT.parent, environment, logs / "pty.log", records)
             if name == "ndarray":
                 run([sys.executable, str(library / "simd_check.py")], ROOT.parent, environment, logs / "simd.log", records)
             if (library / "race.py").is_file():

@@ -1,0 +1,504 @@
+package prompt;
+
+use ecosystem::terminal;
+use ecosystem::tui;
+use std::unicode;
+
+pub struct Choice[T] {
+    pub label: string,
+    pub description: string,
+    pub value: T,
+    pub disabled: bool,
+}
+
+impl[T] Choice[T] {
+    pub fn new(label: string, value: T) -> Choice[T] {
+        Choice { label, description: "", value, disabled: false }
+    }
+}
+
+pub struct SelectOptions {
+    pub question: string,
+    pub page_size: isize,
+    pub searchable: bool,
+    pub multiple: bool,
+    pub min_selected: isize,
+    pub max_selected: isize,
+    pub theme: Theme,
+}
+
+impl SelectOptions {
+    pub fn new(question: string) -> SelectOptions {
+        SelectOptions {
+            question,
+            page_size: 8,
+            searchable: true,
+            multiple: false,
+            min_selected: 1,
+            max_selected: 1,
+            theme: Theme::defaults(),
+        }
+    }
+}
+
+struct SelectionState {
+    query: string,
+    visible: Vec[isize],
+    cursor: isize,
+    selected: Vec[bool],
+    error: string,
+    finished: bool,
+}
+
+pub struct Selection[T] {
+    choices: Vec[Choice[T]],
+    folded: Vec[string],
+    options: SelectOptions,
+    search: tui::Editor,
+    state: Ref[SelectionState],
+}
+
+impl[T] Selection[T] {
+    pub fn new(options: SelectOptions, choices: Vec[Choice[T]]) -> Result[Selection[T], Error] {
+        if choices.is_empty() || choices.len() > 10000 || !label_valid(options.question)
+            || options.page_size < 1
+            || options.page_size > 100
+            || options.min_selected < 0
+            || options.max_selected < options.min_selected
+            || options.max_selected > choices.len()
+            || (!options.multiple && (options.min_selected != 1 || options.max_selected != 1)) {
+            return Result::Err(invalid("invalid selection options"))
+        }
+        let visible = Vec::new();
+        let selected = Vec::new();
+        let folded = Vec::new();
+        let mut enabled = 0;
+        let mut cursor = 0;
+        let mut total_bytes = 0;
+        for index in 0..choices.len() {
+            let choice = choices[index];
+            if !label_valid(choice.label) || !label_valid(choice.description) {
+                return Result::Err(invalid("choice text limit exceeded"))
+            }
+            total_bytes += choice.label.byte_len() + choice.description.byte_len();
+            if total_bytes > 4194304 {
+                return Result::Err(invalid("total choice text limit exceeded"))
+            }
+            if !choice.disabled {
+                if enabled == 0 {
+                    cursor = index;
+                }
+                enabled += 1;
+            }
+            visible.push(index);
+            selected.push(false);
+            folded.push(unicode::case_fold(choice.label));
+        }
+        if enabled == 0 || options.min_selected > enabled {
+            return Result::Err(invalid("not enough enabled choices"))
+        }
+        Result::Ok(
+            Selection {
+                choices: choices.copy(),
+                folded,
+                options,
+                search: tui::Editor::new("", 4096).map_err(ui_error)?,
+                state: Ref::new(
+                    SelectionState {
+                        query: "",
+                        visible,
+                        cursor,
+                        selected,
+                        error: "",
+                        finished: false,
+                    },
+                ),
+            },
+        )
+    }
+
+    pub fn query(self: Selection[T]) -> string {
+        self.state.get().query
+    }
+
+    pub fn visible_indices(self: Selection[T]) -> Vec[isize] {
+        self.state.get().visible.copy()
+    }
+
+    pub fn highlighted(self: Selection[T]) -> Option[isize] {
+        let state = self.state.get();
+        match state.visible.get_checked(state.cursor) {
+            Some(index) if !self.choices[index].disabled => Option::Some(index),
+            _ => Option::None,
+        }
+    }
+
+    pub fn selected_indices(self: Selection[T]) -> Vec[isize] {
+        let selected = self.state.get().selected;
+        let result = Vec::new();
+        for index in 0..selected.len() {
+            if selected[index] {
+                result.push(index);
+            }
+        }
+        result
+    }
+
+    pub fn validation_message(self: Selection[T]) -> string {
+        self.state.get().error
+    }
+
+    fn move_cursor(self: Selection[T], direction: isize, steps: isize) -> () {
+        let mut state = self.state.get();
+        if state.visible.is_empty() {
+            return
+        }
+        for _ in 0..steps {
+            let mut next = state.cursor + direction;
+            while next >= 0 && next < state.visible.len()
+                && self.choices[state.visible[next]].disabled {
+                next += direction;
+            }
+            if next < 0 || next >= state.visible.len() {
+                break
+            }
+            state.cursor = next;
+        }
+        state.error = "";
+        self.state.set(state);
+    }
+
+    fn refilter(self: Selection[T]) -> () {
+        let query = unicode::case_fold(self.search.text());
+        let mut state = self.state.get();
+        if state.query == self.search.text() {
+            return
+        }
+        let visible = Vec::new();
+        let mut cursor = -1;
+        for index in 0..self.choices.len() {
+            if self.folded[index].contains(query) {
+                if cursor == -1 && !self.choices[index].disabled {
+                    cursor = visible.len();
+                }
+                visible.push(index);
+            }
+        }
+        if cursor == -1 {
+            cursor = 0;
+        }
+        state.query = self.search.text();
+        state.visible = visible;
+        state.cursor = cursor;
+        state.error = "";
+        self.state.set(state);
+    }
+
+    fn toggle(self: Selection[T]) -> () {
+        let mut state = self.state.get();
+        let Some(index) = state.visible.get_checked(state.cursor) else {
+            return
+        };
+        if self.choices[index].disabled {
+            return
+        }
+        if !state.selected[index] && self.selected_indices().len() >= self.options.max_selected {
+            state.error = f"select at most {self.options.max_selected} items";
+        } else {
+            state.selected.set(index, !state.selected[index]);
+            state.error = "";
+        }
+        self.state.set(state);
+    }
+
+    pub fn submit(self: Selection[T]) -> Result[Outcome[Vec[T]], Error] {
+        let mut state = self.state.get();
+        if state.finished {
+            return Result::Err(invalid("prompt has already finished"))
+        }
+        let indices = if self.options.multiple {
+            self.selected_indices()
+        } else {
+            let result = Vec::new();
+            if let Some(index) = state.visible.get_checked(state.cursor) {
+                if !self.choices[index].disabled {
+                    result.push(index);
+                }
+            }
+            result
+        };
+        if indices.len() < self.options.min_selected || indices.len() > self.options.max_selected {
+            state.error = f"select {self.options.min_selected}..{self.options.max_selected} items";
+            self.state.set(state);
+            return Result::Ok(Outcome::Pending)
+        }
+        let values = Vec::new();
+        for index in indices {
+            values.push(self.choices[index].value);
+        }
+        state.finished = true;
+        self.state.set(state);
+        Result::Ok(Outcome::Submitted(values))
+    }
+}
+
+impl[T] Model for Selection[T] {
+    type Output = Vec[T];
+
+    fn update(self: Selection[T], event: terminal::Event) -> Result[Outcome[Vec[T]], Error] {
+        let state = self.state.get();
+        if state.finished {
+            return Result::Err(invalid("prompt has already finished"))
+        }
+        if cancelled_event(event) {
+            self.state.set(SelectionState { finished: true, ..state });
+            return Result::Ok(Outcome::Cancelled)
+        }
+        if event == terminal::Event::End {
+            self.state.set(SelectionState { finished: true, ..state });
+            return Result::Ok(Outcome::EndOfInput)
+        }
+        if let terminal::Event::Key(key) = event {
+            match key.code {
+                Enter => return self.submit(),
+                Up => {
+                    self.move_cursor(-1, 1);
+                    return Result::Ok(Outcome::Pending)
+                },
+                Down => {
+                    self.move_cursor(1, 1);
+                    return Result::Ok(Outcome::Pending)
+                },
+                PageUp => {
+                    self.move_cursor(-1, self.options.page_size);
+                    return Result::Ok(Outcome::Pending)
+                },
+                PageDown => {
+                    self.move_cursor(1, self.options.page_size);
+                    return Result::Ok(Outcome::Pending)
+                },
+                Home => {
+                    self.move_cursor(-1, self.choices.len());
+                    return Result::Ok(Outcome::Pending)
+                },
+                End => {
+                    self.move_cursor(1, self.choices.len());
+                    return Result::Ok(Outcome::Pending)
+                },
+                Char(' ') if self.options.multiple => {
+                    self.toggle();
+                    return Result::Ok(Outcome::Pending)
+                },
+                _ => (),
+            }
+        }
+        if self.options.searchable {
+            let accepted = match event {
+                terminal::Event::Paste(value) => terminal::Event::Paste(
+                    value.replace("\r", "").replace("\n", ""),
+                ),
+                _ => event,
+            };
+            if let Err(error) = self.search.update(accepted) {
+                self.state.set(SelectionState { error: label_text(error.to_string()), ..state });
+            } else {
+                self.refilter();
+            }
+        }
+        Result::Ok(Outcome::Pending)
+    }
+
+    fn render(self: Selection[T], buffer: tui::Buffer) -> Result[(), tui::Error] {
+        let area = buffer.area();
+        let state = self.state.get();
+        draw_line(buffer, 0, "? " + self.options.question, self.options.theme.question)?;
+        let first = if self.options.searchable {
+            draw_line(buffer, 1, "Search: " + self.search.text(), self.options.theme.input)?;
+            2
+        } else {
+            1
+        };
+        let available = if area.height > first + 1 {
+            area.height - first - 1
+        } else {
+            0
+        };
+        let count = if available < self.options.page_size {
+            available
+        } else {
+            self.options.page_size
+        };
+        let start = if count > 0 {
+            (state.cursor / count) * count
+        } else {
+            0
+        };
+        for row in 0..count {
+            let position = start + row;
+            if position >= state.visible.len() {
+                break
+            }
+            let index = state.visible[position];
+            let choice = self.choices[index];
+            let selected = state.selected[index];
+            let prefix = if self.options.multiple {
+                if selected {
+                    "[x] "
+                } else {
+                    "[ ] "
+                }
+            } else {
+                if position == state.cursor {
+                    "> "
+                } else {
+                    "  "
+                }
+            };
+            let description = if choice.description == "" {
+                ""
+            } else {
+                " — " + choice.description
+            };
+            let style = if choice.disabled {
+                self.options.theme.muted
+            } else if position == state.cursor {
+                self.options.theme.selected
+            } else {
+                self.options.theme.input
+            };
+            draw_line(buffer, first + row, prefix + choice.label + description, style)?;
+        }
+        if state.visible.is_empty() {
+            draw_line(buffer, first, "No matching choices", self.options.theme.muted)?;
+        }
+        let help = if state.error != "" {
+            state.error
+        } else {
+            if self.options.multiple {
+                f"Space: toggle · Enter: submit · {self.selected_indices().len()} selected"
+            } else {
+                "↑↓: choose · Enter: submit · Esc: cancel"
+            }
+        };
+        if area.height <= first {
+            return Result::Ok(())
+        }
+        draw_line(
+            buffer,
+            area.height - 1,
+            help,
+            if state.error == "" {
+                self.options.theme.muted
+            } else {
+                self.options.theme.error
+            },
+        )
+    }
+}
+
+pub struct Select[T] {
+    inner: Selection[T],
+}
+
+impl[T] Select[T] {
+    pub fn new(question: string, choices: Vec[Choice[T]]) -> Result[Select[T], Error] {
+        Result::Ok(Select { inner: Selection::new(SelectOptions::new(question), choices)? })
+    }
+
+    pub fn selection(self: Select[T]) -> Selection[T] {
+        self.inner
+    }
+}
+
+impl[T] Model for Select[T] {
+    type Output = T;
+
+    fn update(self: Select[T], event: terminal::Event) -> Result[Outcome[T], Error] {
+        Result::Ok(
+            match self.inner.update(event)? {
+                Pending => Outcome::Pending,
+                Submitted(values) => Outcome::Submitted(values[0]),
+                Cancelled => Outcome::Cancelled,
+                EndOfInput => Outcome::EndOfInput,
+            },
+        )
+    }
+
+    fn render(self: Select[T], buffer: tui::Buffer) -> Result[(), tui::Error] {
+        self.inner.render(buffer)
+    }
+}
+
+pub fn multi_select[T](question: string, choices: Vec[Choice[T]]) -> Result[Selection[T], Error] {
+    Selection::new(
+        SelectOptions {
+            multiple: true,
+            min_selected: 0,
+            max_selected: choices.len(),
+            ..SelectOptions::new(question),
+        },
+        choices,
+    )
+}
+
+pub struct Confirm {
+    question: string,
+    default_value: Option[bool],
+    finished: Ref[bool],
+    theme: Theme,
+}
+
+impl Confirm {
+    pub fn new(question: string, default_value: Option[bool]) -> Result[Confirm, Error] {
+        if !label_valid(question) {
+            return Result::Err(invalid("question limit exceeded"))
+        }
+        Result::Ok(
+            Confirm { question, default_value, finished: Ref::new(false), theme: Theme::defaults() },
+        )
+    }
+}
+
+impl Model for Confirm {
+    type Output = bool;
+
+    fn update(self: Confirm, event: terminal::Event) -> Result[Outcome[bool], Error] {
+        if self.finished.get() {
+            return Result::Err(invalid("prompt has already finished"))
+        }
+        if cancelled_event(event) {
+            self.finished.set(true);
+            return Result::Ok(Outcome::Cancelled)
+        }
+        if event == terminal::Event::End {
+            self.finished.set(true);
+            return Result::Ok(Outcome::EndOfInput)
+        }
+        let value = match event {
+            terminal::Event::Key(key) if !key.modifiers.control && !key.modifiers.alt => match key.code {
+                Char('y') | Char('Y') => Option::Some(true),
+                Char('n') | Char('N') => Option::Some(false),
+                Enter => self.default_value,
+                _ => Option::None,
+            },
+            _ => Option::None,
+        };
+        match value {
+            Some(value) => {
+                self.finished.set(true);
+                Result::Ok(Outcome::Submitted(value))
+            },
+            None => Result::Ok(Outcome::Pending),
+        }
+    }
+
+    fn render(self: Confirm, buffer: tui::Buffer) -> Result[(), tui::Error] {
+        let choices = match self.default_value {
+            Some(true) => "[Y/n]",
+            Some(false) => "[y/N]",
+            None => "[y/n]",
+        };
+        draw_line(buffer, 0, "? " + self.question + " " + choices, self.theme.question)?;
+        draw_line(buffer, 1, "Y/N: answer · Esc: cancel", self.theme.muted)
+    }
+}

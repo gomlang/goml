@@ -1,0 +1,269 @@
+package main;
+
+use ecosystem::walkdir;
+use std::fs;
+use std::io;
+use std::os::linux::fd;
+use std::task;
+use std::utf8;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Limits {
+    pub max_entries: isize,
+    pub max_depth: isize,
+    pub max_file_bytes: isize,
+}
+
+impl Limits {
+    pub fn defaults() -> Limits {
+        Limits { max_entries: 1024, max_depth: 8, max_file_bytes: 262144 }
+    }
+
+    pub fn validate(self: Limits) -> Result[(), string] {
+        if self.max_entries < 1 || self.max_entries > 4096 || self.max_depth < 0
+            || self.max_depth > 32
+            || self.max_file_bytes < 1
+            || self.max_file_bytes > 1048576 {
+            Result::Err("limits require entries 1..4096, depth 0..32, and preview bytes 1..1048576")
+        } else {
+            Result::Ok(())
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Kind {
+    Directory,
+    File,
+    Symlink,
+    Other,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Entry {
+    pub path: string,
+    pub name: string,
+    pub depth: isize,
+    pub kind: Kind,
+    pub bytes: i64,
+}
+
+pub struct ScanSummary {
+    pub entries: isize,
+    pub errors: Vec[string],
+    pub truncated: bool,
+    pub cancelled: bool,
+}
+
+pub struct ScanResult {
+    pub entries: Vec[Entry],
+    pub summary: ScanSummary,
+}
+
+pub enum ScanEvent {
+    Batch(Vec[Entry]),
+    Done(ScanSummary),
+}
+
+pub fn accepted_name(value: string) -> bool {
+    value != ".git" && value != "node_modules" && value != "_artifact" && value != "_bootstrap"
+        && value != "stage0"
+        && value != "stage2"
+        && value != "stage3"
+        && value != "__pycache__"
+}
+
+pub fn markdown_file(entry: Entry) -> bool {
+    let name = entry.name.to_ascii_lowercase();
+    entry.kind == Kind::File && (name.ends_with(".md") || name.ends_with(".markdown"))
+}
+
+fn converted(entry: walkdir::DirEntry) -> Entry {
+    let kind = match entry.file_type() {
+        fs::FileType::Directory => Kind::Directory,
+        fs::FileType::File => Kind::File,
+        fs::FileType::Symlink => Kind::Symlink,
+        fs::FileType::Other => Kind::Other,
+    };
+    Entry {
+        path: entry.path(),
+        name: entry.file_name().unwrap_or(entry.path()),
+        depth: entry.depth(),
+        kind,
+        bytes: entry.metadata().len(),
+    }
+}
+
+pub fn scan_with(
+    root: string,
+    limits: Limits,
+    cancel: task::CancelToken,
+    emit: (Vec[Entry]) -> bool,
+) -> Result[ScanSummary, string] {
+    limits.validate()?;
+    let iterator = walkdir::WalkDir::new(root).max_depth(limits.max_depth).filter_entry(
+        |entry| entry.depth() == 0 || accepted_name(entry.file_name().unwrap_or("")),
+    ).iter();
+    defer iterator.close();
+    let errors = Vec::new();
+    let mut count = 0;
+    let mut truncated = false;
+    let mut batch = Vec::new();
+    loop {
+        if cancel.is_cancelled() {
+            return Result::Ok(ScanSummary { entries: count, errors, truncated, cancelled: true });
+        }
+        let Some(item) = iterator.next() else {
+            break;
+        };
+        match item {
+            Ok(value) => {
+                if count >= limits.max_entries {
+                    truncated = true;
+                    break;
+                }
+                if value.path().byte_len() > 4096 {
+                    if errors.len() < 16 {
+                        errors.push("path exceeds 4096-byte tree identifier limit");
+                    }
+                    iterator.skip_current_dir();
+                    continue;
+                }
+                batch.push(converted(value));
+                count += 1;
+                if batch.len() == 32 {
+                    if !emit(batch) {
+                        return Result::Ok(
+                            ScanSummary { entries: count, errors, truncated, cancelled: true },
+                        );
+                    }
+                    batch = Vec::new();
+                }
+            },
+            Err(error) => {
+                if errors.len() < 16 {
+                    errors.push(error.to_string());
+                }
+            },
+        }
+    }
+    if !batch.is_empty() && !emit(batch) {
+        return Result::Ok(ScanSummary { entries: count, errors, truncated, cancelled: true });
+    }
+    Result::Ok(ScanSummary { entries: count, errors, truncated, cancelled: false })
+}
+
+pub fn scan_now(root: string, limits: Limits) -> Result[ScanResult, string] {
+    task::scope(
+        |scope| {
+            let entries = Vec::new();
+            let summary = scan_with(
+                root,
+                limits,
+                scope.token(),
+                |batch| {
+                    for entry in batch {
+                        entries.push(entry);
+                    }
+                    true
+                },
+            )?;
+            Result::Ok(ScanResult { entries, summary })
+        },
+    )
+}
+
+pub fn scan_worker(
+    root: string,
+    limits: Limits,
+    cancel: task::CancelToken,
+    requests: Channel[()],
+    events: Channel[ScanEvent],
+) -> () {
+    loop {
+        match task::recv_with(cancel, requests) {
+            Completed(Some(_)) => (),
+            _ => return,
+        }
+        let result = scan_with(
+            root,
+            limits,
+            cancel,
+            |batch| {
+                match task::send_with(cancel, events, ScanEvent::Batch(batch)) {
+                    Completed(()) => true,
+                    Cancelled => false,
+                }
+            },
+        );
+        let summary = match result {
+            Ok(summary) => summary,
+            Err(error) => ScanSummary {
+                entries: 0,
+                errors: Vec::from_array([error]),
+                truncated: false,
+                cancelled: false,
+            },
+        };
+        if summary.cancelled {
+            return;
+        }
+        if let task::WaitResult::Cancelled = task::send_with(
+            cancel,
+            events,
+            ScanEvent::Done(summary),
+        ) {
+            return;
+        }
+    }
+}
+
+pub fn read_preview(entry: Entry, limits: Limits) -> Result[string, string] {
+    limits.validate()?;
+    if entry.kind != Kind::File {
+        return Result::Err("Preview accepts regular files only; symbolic links are not followed.");
+    }
+    if entry.bytes > limits.max_file_bytes.to_i64() {
+        return Result::Err(f"Preview exceeds the {limits.max_file_bytes}-byte limit.");
+    }
+    let file = fd::open(
+        entry.path,
+        fd::O_RDONLY | fd::O_CLOEXEC | fd::O_NOFOLLOW | fd::O_NONBLOCK,
+        0,
+    ).map_err(|error| error.to_string())?;
+    defer {
+        let _ = file.close();
+    };
+    let metadata = file.stat().map_err(|error| error.to_string())?;
+    if metadata.mode.to_usize() & fd::S_IFMT != fd::S_IFREG {
+        return Result::Err("The selected path is no longer a regular file.");
+    }
+    if metadata.size > limits.max_file_bytes.to_i64() {
+        return Result::Err(f"Preview exceeds the {limits.max_file_bytes}-byte limit.");
+    }
+    let output = Vec::new();
+    let buffer = Vec::new();
+    for _ in 0..4096 {
+        buffer.push(0);
+    }
+    loop {
+        let count = match file.read(buffer.as_mut_slice()) {
+            Ok(value) => value,
+            Err(error) => if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            } else {
+                return Result::Err(error.to_string());
+            },
+        };
+        if count == 0 {
+            break;
+        }
+        if count > limits.max_file_bytes - output.len() {
+            return Result::Err(f"Preview exceeds the {limits.max_file_bytes}-byte limit.");
+        }
+        for index in 0..count {
+            output.push(buffer[index]);
+        }
+    }
+    utf8::decode(output).map_err(|error| error.to_string())
+}

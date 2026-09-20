@@ -1,0 +1,496 @@
+package tui_markdown;
+
+use ecosystem::markdown;
+use ecosystem::ansi;
+use ecosystem::unicode_text;
+
+struct Build {
+    options: Options,
+    lines: Vec[ansi::StyledText],
+    links: Vec[Link],
+    nodes: Ref[isize],
+    bytes: Ref[isize],
+    metadata_bytes: Ref[isize],
+    source_lines: Vec[string],
+}
+
+impl Build {
+    fn tick(self: Build, depth: isize) -> Result[(), Error] {
+        if depth > self.options.max_depth || self.nodes.get() >= self.options.max_nodes {
+            return Result::Err(failure("Markdown traversal budget exceeded"))
+        }
+        self.nodes.set(self.nodes.get() + 1);
+        Result::Ok(())
+    }
+
+    fn push_line(self: Build, line: ansi::StyledText) -> Result[(), Error] {
+        let line = line.truncate(self.options.width).map_err(|error| failure(error.to_string()))?;
+        let bytes = line.plain_text().byte_len();
+        if self.lines.len() >= self.options.max_lines
+            || bytes + 1 > self.options.max_output_bytes - self.bytes.get() {
+            return Result::Err(failure("Markdown layout output budget exceeded"))
+        }
+        self.bytes.set(self.bytes.get() + bytes + 1);
+        self.lines.push(line);
+        Result::Ok(())
+    }
+
+    fn blank(self: Build) -> Result[(), Error] {
+        if !self.lines.is_empty() && self.lines[self.lines.len() - 1].plain_text() != "" {
+            self.push_line(ansi::StyledText::new())?;
+        }
+        Result::Ok(())
+    }
+
+    fn emit_literal(self: Build, content: ansi::StyledText, prefix: ansi::StyledText) -> Result[
+        (),
+        Error,
+    ] {
+        let available = maximum(1, self.options.width - prefix.width());
+        let lines = content.wrap(available).map_err(|error| failure(error.to_string()))?;
+        for value in lines {
+            let line = prefix.snapshot();
+            line.append(value);
+            self.push_line(line)?;
+        }
+        Result::Ok(())
+    }
+
+    fn emit(
+        self: Build,
+        content: ansi::StyledText,
+        first_prefix: ansi::StyledText,
+        rest_prefix: ansi::StyledText,
+    ) -> Result[(), Error] {
+        let prefix_width = maximum(first_prefix.width(), rest_prefix.width());
+        let available = maximum(1, self.options.width - prefix_width);
+        let lines = wrap_styled(content, available, self.options)?;
+        for index in 0..lines.len() {
+            let prefix = if index == 0 {
+                first_prefix
+            } else {
+                rest_prefix
+            };
+            let line = prefix.snapshot();
+            line.append(lines[index]);
+            self.push_line(
+                line.truncate(self.options.width).map_err(|error| failure(error.to_string()))?,
+            )?;
+        }
+        Result::Ok(())
+    }
+}
+
+pub fn layout(source: string, options: Options) -> Result[Layout, Error] {
+    options.validate()?;
+    if source.byte_len() > options.max_input_bytes {
+        return Result::Err(failure("Markdown input byte limit exceeded"))
+    }
+    let document = markdown::parse_with_options(
+        source,
+        markdown::ParseOptions {
+            max_bytes: options.max_input_bytes,
+            max_depth: options.max_depth,
+            max_nodes: options.max_nodes,
+            max_work: 20000000,
+        },
+    ).map_err(|error| failure(error.to_string()))?;
+    build(document, options, source.replace("\r\n", "\n").replace("\r", "\n").split("\n"))
+}
+
+pub fn render(document: markdown::Document, options: Options) -> Result[Layout, Error] {
+    options.validate()?;
+    build(document, options, Vec::new())
+}
+
+fn build(document: markdown::Document, options: Options, source_lines: Vec[string]) -> Result[
+    Layout,
+    Error,
+] {
+    validate_document(document, options)?;
+    let state = Build {
+        options,
+        lines: Vec::new(),
+        links: Vec::new(),
+        nodes: Ref::new(0),
+        bytes: Ref::new(0),
+        metadata_bytes: Ref::new(0),
+        source_lines,
+    };
+    render_blocks(state, document.blocks, ansi::StyledText::new(), 0, false)?;
+    if options.link_footnotes && !state.links.is_empty() {
+        state.blank()?;
+        let links = state.links.copy();
+        for link in links {
+            state.emit(
+                ansi::StyledText::from_spans(
+                    Vec::from_array(
+                        [
+                            ansi::Span::new(
+                                "[" + link.index.to_string() + "] " + link.url,
+                                options.theme.muted,
+                            ),
+                        ],
+                    ),
+                ),
+                ansi::StyledText::new(),
+                ansi::StyledText::new(),
+            )?;
+        }
+    }
+    while !state.lines.is_empty() && state.lines[state.lines.len() - 1].plain_text() == "" {
+        let _ = state.lines.pop();
+    }
+    let positions: HashMap[string, isize] = HashMap::new();
+    let mut final_bytes = 0;
+    for index in 0..state.lines.len() {
+        final_bytes += state.lines[index].plain_text().byte_len() + 1;
+        if final_bytes > options.max_output_bytes {
+            return Result::Err(failure("Markdown layout output budget exceeded"))
+        }
+        for span in state.lines[index].spans() {
+            if let Some(link) = span.link {
+                if positions.get(link.id()).is_none() {
+                    positions.insert(link.id(), index);
+                }
+            }
+        }
+    }
+    let links = Vec::new();
+    for link in state.links {
+        links.push(
+            Link { line: positions.get(link.index.to_string()).unwrap_or(link.line), ..link },
+        );
+    }
+    Result::Ok(Layout { lines: state.lines, links, width: options.width })
+}
+
+fn span(text: string, style: ansi::Style) -> ansi::StyledText {
+    ansi::StyledText::from_spans(Vec::from_array([ansi::Span::new(text, style)]))
+}
+
+fn render_blocks(
+    state: Build,
+    blocks: Vec[markdown::Block],
+    prefix: ansi::StyledText,
+    depth: isize,
+    tight: bool,
+) -> Result[(), Error] {
+    for block in blocks {
+        state.tick(depth)?;
+        match block.kind {
+            Paragraph(inlines) => {
+                if depth == 0 && state.options.pipe_tables && try_table(state, block)? {
+                    continue
+                }
+                let text = render_inlines(
+                    state,
+                    inlines,
+                    state.options.theme.text,
+                    Option::None,
+                    depth + 1,
+                )?;
+                state.emit(text, prefix, prefix)?;
+            },
+            Heading(level, inlines) => {
+                if level < 1 || level > 6 {
+                    return Result::Err(failure("invalid heading level"))
+                }
+                let text = render_inlines(
+                    state,
+                    inlines,
+                    state.options.theme.heading,
+                    Option::None,
+                    depth + 1,
+                )?;
+                let first = prefix.snapshot();
+                first.append(span("#".repeat(level) + " ", state.options.theme.heading));
+                let rest = prefix.snapshot();
+                rest.append(span(" ".repeat(level + 1), state.options.theme.heading));
+                state.emit(text, first, rest)?;
+            },
+            Code(info, code) => {
+                if code.byte_len() > state.options.max_output_bytes {
+                    return Result::Err(failure("code block byte limit exceeded"))
+                }
+                let border = prefix.snapshot();
+                border.append(span("┌ " + info, state.options.theme.border));
+                state.push_line(
+                    border.truncate(state.options.width).map_err(|error| failure(error.to_string()))?,
+                )?;
+                let lead = prefix.snapshot();
+                lead.append(span("│ ", state.options.theme.border));
+                let lines = code.split("\n");
+                let count = if !lines.is_empty() && lines[lines.len() - 1] == "" {
+                    lines.len() - 1
+                } else {
+                    lines.len()
+                };
+                for index in 0..count {
+                    state.emit_literal(span(lines[index], state.options.theme.code), lead)?;
+                }
+                let border = prefix.snapshot();
+                border.append(span("└", state.options.theme.border));
+                state.push_line(border)?;
+            },
+            Html(value) => {
+                state.emit(span(value, state.options.theme.muted), prefix, prefix)?;
+            },
+            Quote(children) => {
+                let lead = prefix.snapshot();
+                lead.append(span("│ ", state.options.theme.quote));
+                render_blocks(state, children, lead, depth + 1, tight)?;
+            },
+            List(ordered, start, list_tight, items) => {
+                if start < 0 || start > 999999999 {
+                    return Result::Err(failure("invalid ordered list start"))
+                }
+                for index in 0..items.len() {
+                    state.tick(depth + 1)?;
+                    let marker = if ordered {
+                        (start + index).to_string() + ". "
+                    } else {
+                        "• "
+                    };
+                    let lead = prefix.snapshot();
+                    lead.append(
+                        span(" ".repeat(unicode_text::width(marker)), state.options.theme.text),
+                    );
+                    let before = state.lines.len();
+                    render_blocks(state, items[index], lead, depth + 1, list_tight)?;
+                    if state.lines.len() == before {
+                        state.push_line(prefix.snapshot())?;
+                    }
+                    let original = state.lines[before];
+                    let line = prefix.snapshot();
+                    line.append(span(marker, state.options.theme.text));
+                    line.append(
+                        original.clip(lead.width(), maximum(0, state.options.width - lead.width())).map_err(
+                            |error| failure(error.to_string()),
+                        )?,
+                    );
+                    state.lines[before] = line.truncate(state.options.width).map_err(
+                        |error| failure(error.to_string()),
+                    )?;
+                }
+            },
+            ThematicBreak => {
+                let line = prefix.snapshot();
+                line.append(
+                    span(
+                        "─".repeat(maximum(0, state.options.width - prefix.width())),
+                        state.options.theme.border,
+                    ),
+                );
+                state.push_line(line)?;
+            },
+        }
+        if !tight {
+            state.blank()?;
+        }
+    }
+    Result::Ok(())
+}
+
+fn render_inlines(
+    state: Build,
+    values: Vec[markdown::Inline],
+    style: ansi::Style,
+    link: Option[ansi::Hyperlink],
+    depth: isize,
+) -> Result[ansi::StyledText, Error] {
+    let result = ansi::StyledText::new();
+    for value in values {
+        state.tick(depth)?;
+        match value {
+            Text(text) | Html(text) => {
+                if text.byte_len() > state.options.max_output_bytes {
+                    return Result::Err(failure("inline byte limit exceeded"))
+                }
+                result.push(ansi::Span { text, style, link });
+            },
+            Code(text) => {
+                result.push(ansi::Span { text, style: state.options.theme.code, link });
+            },
+            Emphasis(children) => {
+                result.append(
+                    render_inlines(
+                        state,
+                        children,
+                        style.with_attribute(ansi::ITALIC, true),
+                        link,
+                        depth + 1,
+                    )?,
+                );
+            },
+            Strong(children) => {
+                result.append(
+                    render_inlines(
+                        state,
+                        children,
+                        style.with_attribute(ansi::BOLD, true),
+                        link,
+                        depth + 1,
+                    )?,
+                );
+            },
+            SoftBreak => {
+                result.push(ansi::Span { text: " ", style, link });
+            },
+            HardBreak => {
+                result.push(ansi::Span { text: "\n", style, link });
+            },
+            Link(url, title, children) | Image(url, title, children) => {
+                let image = match value {
+                    Image(_, _, _) => true,
+                    _ => false,
+                };
+                let allowed = safe_destination(url);
+                let label = markdown::inline_text(children).map_err(
+                    |error| failure(error.to_string()),
+                )?;
+                if image {
+                    result.push(ansi::Span::new("[image: ", state.options.theme.muted));
+                }
+                if allowed {
+                    if state.links.len() >= state.options.max_links {
+                        return Result::Err(failure("Markdown link limit exceeded"))
+                    }
+                    let metadata_bytes = label.byte_len() + url.byte_len() + title.byte_len();
+                    if metadata_bytes > state.options.max_output_bytes - state.metadata_bytes.get() {
+                        return Result::Err(failure("Markdown link metadata budget exceeded"))
+                    }
+                    state.metadata_bytes.set(state.metadata_bytes.get() + metadata_bytes);
+                    let index = state.links.len() + 1;
+                    let target = ansi::Hyperlink::new(url, index.to_string()).map_err(
+                        |error| failure(error.to_string()),
+                    )?;
+                    state.links.push(Link { index, url, title, label, line: state.lines.len() });
+                    let link_style = ansi::Style {
+                        attributes: state.options.theme.link.attributes | style.attributes,
+                        ..state.options.theme.link,
+                    };
+                    result.append(
+                        render_inlines(state, children, link_style, Option::Some(target), depth + 1)?,
+                    );
+                    if state.options.link_numbers {
+                        result.push(
+                            ansi::Span {
+                                text: "[" + index.to_string() + "]",
+                                style: state.options.theme.muted,
+                                link: Option::Some(target),
+                            },
+                        );
+                    }
+                } else {
+                    result.append(render_inlines(state, children, style, Option::None, depth + 1)?);
+                }
+                if image {
+                    result.push(ansi::Span::new("]", state.options.theme.muted));
+                }
+            },
+        }
+    }
+    Result::Ok(result)
+}
+
+pub fn safe_destination(url: string) -> bool {
+    if url == "" || url.byte_len() > 4096 || !markdown::safe_url(url) {
+        return false
+    }
+    for character in url.chars() {
+        if character < '\u0020' || (character >= '\u007f' && character <= '\u009f') {
+            return false
+        }
+    }
+    true
+}
+
+struct AstBudget {
+    options: Options,
+    nodes: Ref[isize],
+    bytes: Ref[isize],
+}
+
+impl AstBudget {
+    fn node(self: AstBudget, depth: isize) -> Result[(), Error] {
+        if depth > self.options.max_depth || self.nodes.get() >= self.options.max_nodes {
+            return Result::Err(failure("Markdown AST node/depth limit exceeded"))
+        }
+        self.nodes.set(self.nodes.get() + 1);
+        Result::Ok(())
+    }
+
+    fn text(self: AstBudget, value: string) -> Result[(), Error] {
+        if value.byte_len() > self.options.max_input_bytes - self.bytes.get() {
+            return Result::Err(failure("Markdown AST input byte limit exceeded"))
+        }
+        self.bytes.set(self.bytes.get() + value.byte_len());
+        Result::Ok(())
+    }
+
+    fn children(self: AstBudget, count: isize) -> Result[(), Error] {
+        if count > self.options.max_nodes - self.nodes.get() {
+            Result::Err(failure("Markdown AST node limit exceeded"))
+        } else {
+            Result::Ok(())
+        }
+    }
+}
+
+fn validate_document(document: markdown::Document, options: Options) -> Result[(), Error] {
+    validate_blocks(
+        AstBudget { options, nodes: Ref::new(0), bytes: Ref::new(0) },
+        document.blocks,
+        0,
+    )
+}
+
+fn validate_blocks(budget: AstBudget, blocks: Vec[markdown::Block], depth: isize) -> Result[
+    (),
+    Error,
+] {
+    budget.children(blocks.len())?;
+    for block in blocks {
+        budget.node(depth)?;
+        match block.kind {
+            Paragraph(inlines) | Heading(_, inlines) => validate_inlines(budget, inlines, depth + 1)?,
+            Code(info, text) => {
+                budget.text(info)?;
+                budget.text(text)?;
+            },
+            Html(text) => budget.text(text)?,
+            Quote(children) => validate_blocks(budget, children, depth + 1)?,
+            List(_, _, _, items) => {
+                budget.children(items.len())?;
+                for item in items {
+                    budget.node(depth + 1)?;
+                    validate_blocks(budget, item, depth + 1)?;
+                }
+            },
+            ThematicBreak => (),
+        }
+    }
+    Result::Ok(())
+}
+
+fn validate_inlines(budget: AstBudget, inlines: Vec[markdown::Inline], depth: isize) -> Result[
+    (),
+    Error,
+] {
+    budget.children(inlines.len())?;
+    for inline in inlines {
+        budget.node(depth)?;
+        match inline {
+            Text(text) | Code(text) | Html(text) => budget.text(text)?,
+            Emphasis(children) | Strong(children) => validate_inlines(budget, children, depth + 1)?,
+            Link(url, title, children) | Image(url, title, children) => {
+                budget.text(url)?;
+                budget.text(title)?;
+                validate_inlines(budget, children, depth + 1)?;
+            },
+            SoftBreak | HardBreak => (),
+        }
+    }
+    Result::Ok(())
+}

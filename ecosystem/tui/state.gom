@@ -1,0 +1,410 @@
+package tui;
+
+use ecosystem::ansi;
+use ecosystem::terminal;
+use ecosystem::unicode_text;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SelectionState {
+    pub selected: isize,
+    pub offset: isize,
+    pub focused: bool,
+}
+
+impl SelectionState {
+    pub fn new() -> SelectionState {
+        SelectionState { selected: 0, offset: 0, focused: true }
+    }
+
+    pub fn visible(self: SelectionState, count: isize, rows: isize) -> SelectionState {
+        let count = clamp(count, 0, MAX_TEXT_BYTES);
+        let rows = clamp(rows, 0, MAX_DIMENSION);
+        let selected = clamp(self.selected, 0, maximum(0, count - 1));
+        let mut offset = clamp(self.offset, 0, maximum(0, count - rows));
+        if selected < offset {
+            offset = selected;
+        }
+        if rows > 0 && selected >= offset + rows {
+            offset = selected - rows + 1;
+        }
+        SelectionState { selected, offset, ..self }
+    }
+
+    pub fn update(self: SelectionState, event: terminal::Event, count: isize, rows: isize) -> SelectionState {
+        if !self.focused {
+            return self.visible(count, rows)
+        }
+        let count = clamp(count, 0, MAX_TEXT_BYTES);
+        let rows = clamp(rows, 0, MAX_DIMENSION);
+        let mut next = self.visible(count, rows).selected;
+        match event {
+            Key(key) => match key.code {
+                Up | Left => {
+                    next -= 1;
+                },
+                Down | Right => {
+                    next += 1;
+                },
+                Home => {
+                    next = 0;
+                },
+                End => {
+                    next = count - 1;
+                },
+                PageUp => {
+                    next -= maximum(1, rows);
+                },
+                PageDown => {
+                    next += maximum(1, rows);
+                },
+                _ => (),
+            },
+            Mouse(mouse) => match mouse.kind {
+                ScrollUp => {
+                    next -= 1;
+                },
+                ScrollDown => {
+                    next += 1;
+                },
+                _ => (),
+            },
+            _ => (),
+        }
+        SelectionState { selected: next, ..self }.visible(count, rows)
+    }
+}
+
+pub fn list(
+    buffer: Buffer,
+    area: Rect,
+    items: Vec[ansi::StyledText],
+    state: SelectionState,
+    theme: Theme,
+) -> Result[SelectionState, Error] {
+    area.validate()?;
+    if items.len() > 65536 {
+        return Result::Err(failure("list item limit exceeded"))
+    }
+    let state = state.visible(items.len(), area.height);
+    buffer.fill(area, theme.base)?;
+    for row in 0..area.height {
+        let index = state.offset + row;
+        if index >= items.len() {
+            break
+        }
+        let selected = state.focused && index == state.selected;
+        let style = if selected {
+            theme.selected
+        } else {
+            theme.base
+        };
+        let line = Rect { y: area.y + row, height: 1, ..area };
+        buffer.fill(line, style)?;
+        let text = if selected {
+            ansi::StyledText::from_spans(
+                Vec::from_array([ansi::Span::new(items[index].plain_text(), style)]),
+            )
+        } else {
+            items[index]
+        };
+        buffer.draw_text(line, text)?;
+    }
+    Result::Ok(state)
+}
+
+pub fn tabs(buffer: Buffer, area: Rect, labels: Vec[string], state: SelectionState, theme: Theme) -> Result[
+    SelectionState,
+    Error,
+] {
+    area.validate()?;
+    if labels.len() > 4096 {
+        return Result::Err(failure("tab limit exceeded"))
+    }
+    let selected = clamp(state.selected, 0, maximum(0, labels.len() - 1));
+    let widths = Vec::new();
+    let mut bytes = 0;
+    for label in labels {
+        bytes += label.byte_len();
+        if bytes > MAX_TEXT_BYTES {
+            return Result::Err(failure("tab text limit exceeded"))
+        }
+        widths.push(unicode_text::width(label) + 3);
+    }
+    let mut offset = clamp(state.offset, 0, selected);
+    let mut visible_width = 0;
+    for index in offset..minimum(selected + 1, labels.len()) {
+        visible_width += widths[index];
+    }
+    while visible_width > area.width && offset < selected {
+        visible_width -= widths[offset];
+        offset += 1;
+    }
+    let state = SelectionState { selected, offset, ..state };
+    let text = ansi::StyledText::new();
+    let mut columns = 0;
+    for index in offset..labels.len() {
+        if columns >= area.width {
+            break
+        }
+        text.push(
+            ansi::Span::new(
+                " " + labels[index].replace("\n", " ").replace("\t", " ") + " ",
+                if state.focused && index == selected {
+                    theme.selected
+                } else {
+                    theme.base
+                },
+            ),
+        );
+        if index + 1 < labels.len() {
+            text.push(ansi::Span::new("│", theme.border));
+        }
+        columns += widths[index];
+    }
+    buffer.fill(area, theme.base)?;
+    buffer.draw_text(Rect { height: minimum(1, area.height), ..area }, text)?;
+    Result::Ok(state)
+}
+
+pub fn table(
+    buffer: Buffer,
+    area: Rect,
+    header: Vec[ansi::StyledText],
+    rows: Vec[Vec[ansi::StyledText]],
+    columns: Vec[Constraint],
+    state: SelectionState,
+    theme: Theme,
+) -> Result[SelectionState, Error] {
+    area.validate()?;
+    if rows.len() > 65536 || columns.len() > 256 || header.len() > columns.len() {
+        return Result::Err(failure("table limits exceeded"))
+    }
+    let regions = layout(area, Direction::Horizontal, columns, 1)?;
+    let header_rows = if header.is_empty() || area.height == 0 {
+        0
+    } else {
+        1
+    };
+    let state = state.visible(rows.len(), area.height - header_rows);
+    buffer.fill(area, theme.base)?;
+    for column in 0..header.len() {
+        buffer.draw_text(Rect { height: 1, ..regions[column] }, header[column])?;
+    }
+    for row in 0..area.height - header_rows {
+        let index = state.offset + row;
+        if index >= rows.len() {
+            break
+        }
+        if rows[index].len() > regions.len() {
+            return Result::Err(failure("table row exceeds column count"))
+        }
+        let selected = state.focused && state.selected == index;
+        if selected {
+            buffer.fill(Rect { y: area.y + row + header_rows, height: 1, ..area }, theme.selected)?;
+        }
+        for column in 0..rows[index].len() {
+            let text = if selected {
+                ansi::StyledText::from_spans(
+                    Vec::from_array(
+                        [ansi::Span::new(rows[index][column].plain_text(), theme.selected)],
+                    ),
+                )
+            } else {
+                rows[index][column]
+            };
+            buffer.draw_text(
+                Rect { y: area.y + row + header_rows, height: 1, ..regions[column] },
+                text,
+            )?;
+        }
+    }
+    Result::Ok(state)
+}
+
+pub struct TreeNode {
+    pub id: string,
+    pub depth: isize,
+    pub label: ansi::StyledText,
+}
+
+pub struct TreeState {
+    pub selection: SelectionState,
+    expanded: Vec[string],
+}
+
+impl TreeState {
+    pub fn new() -> TreeState {
+        TreeState { selection: SelectionState::new(), expanded: Vec::new() }
+    }
+
+    pub fn with_selection(self: TreeState, selection: SelectionState) -> TreeState {
+        TreeState { selection, ..self }
+    }
+
+    pub fn is_expanded(self: TreeState, id: string) -> bool {
+        self.expanded.contains(id)
+    }
+
+    pub fn toggle(self: TreeState, id: string) -> Result[TreeState, Error] {
+        if id.byte_len() > 4096 {
+            return Result::Err(failure("tree id limit exceeded"))
+        }
+        let expanded = Vec::new();
+        let exists = self.is_expanded(id);
+        for value in self.expanded {
+            if value != id {
+                expanded.push(value);
+            }
+        }
+        if !exists {
+            if expanded.len() >= 65536 {
+                return Result::Err(failure("expanded node limit exceeded"))
+            }
+            expanded.push(id);
+        }
+        Result::Ok(TreeState { expanded, ..self })
+    }
+
+    pub fn update(self: TreeState, event: terminal::Event, nodes: Vec[TreeNode], rows: isize) -> Result[
+        TreeState,
+        Error,
+    ] {
+        let visible = visible_nodes(nodes, self)?;
+        if !self.selection.focused {
+            return Result::Ok(self)
+        }
+        let selected = self.selection.visible(visible.len(), rows).selected;
+        if !visible.is_empty() {
+            if let terminal::Event::Key(key) = event {
+                let node = visible[selected];
+                if key.code == terminal::KeyCode::Enter || key.code == terminal::KeyCode::Char(' ') {
+                    return self.toggle(node.id)
+                }
+                if key.code == terminal::KeyCode::Right && !self.is_expanded(node.id) {
+                    return self.toggle(node.id)
+                }
+                if key.code == terminal::KeyCode::Left && self.is_expanded(node.id) {
+                    return self.toggle(node.id)
+                }
+            }
+        }
+        Result::Ok(
+            TreeState { selection: self.selection.update(event, visible.len(), rows), ..self },
+        )
+    }
+}
+
+fn visible_nodes(nodes: Vec[TreeNode], state: TreeState) -> Result[Vec[TreeNode], Error] {
+    if nodes.len() > 65536 {
+        return Result::Err(failure("tree node limit exceeded"))
+    }
+    let result = Vec::new();
+    let mut previous_depth = 0;
+    let mut hidden_depth: Option[isize] = Option::None;
+    let ids: HashMap[string, bool] = HashMap::new();
+    let expanded: HashMap[string, bool] = HashMap::new();
+    for id in state.expanded {
+        expanded.insert(id, true);
+    }
+    let mut text_bytes = 0;
+    for index in 0..nodes.len() {
+        let node = nodes[index];
+        text_bytes += node.id.byte_len() + node.label.plain_text().byte_len();
+        if text_bytes > 8388608 {
+            return Result::Err(failure("tree text budget exceeded"))
+        }
+        if node.depth < 0 || node.depth > 256 || (index == 0 && node.depth != 0)
+            || node.depth > previous_depth + 1
+            || node.id.byte_len() > 4096
+            || ids.get(node.id).is_some() {
+            return Result::Err(failure("invalid tree hierarchy or duplicate id"))
+        }
+        ids.insert(node.id, true);
+        previous_depth = node.depth;
+        if let Some(depth) = hidden_depth {
+            if node.depth > depth {
+                continue
+            }
+            hidden_depth = Option::None;
+        }
+        result.push(node);
+        if expanded.get(node.id).is_none() {
+            hidden_depth = Option::Some(node.depth);
+        }
+    }
+    Result::Ok(result)
+}
+
+pub fn tree(buffer: Buffer, area: Rect, nodes: Vec[TreeNode], state: TreeState, theme: Theme) -> Result[
+    TreeState,
+    Error,
+] {
+    let visible = visible_nodes(nodes, state)?;
+    let branches: HashMap[string, bool] = HashMap::new();
+    for index in 0..nodes.len() {
+        if index + 1 < nodes.len() && nodes[index + 1].depth > nodes[index].depth {
+            branches.insert(nodes[index].id, true);
+        }
+    }
+    let labels = Vec::new();
+    let expanded: HashMap[string, bool] = HashMap::new();
+    for id in state.expanded {
+        expanded.insert(id, true);
+    }
+    for node in visible {
+        let text = ansi::StyledText::from_spans(
+            Vec::from_array(
+                [
+                    ansi::Span::new(
+                        "  ".repeat(node.depth)
+                            + if branches.get(node.id).is_none() {
+                                "  "
+                            } else if expanded.get(node.id).is_some() {
+                                "▾ "
+                            } else {
+                                "▸ "
+                            },
+                        theme.muted,
+                    ),
+                ],
+            ),
+        );
+        text.append(node.label);
+        labels.push(text);
+    }
+    let selection = list(buffer, area, labels, state.selection, theme)?;
+    Result::Ok(TreeState { selection, ..state })
+}
+
+pub struct Focus {
+    current: Ref[isize],
+    count: isize,
+}
+
+impl Focus {
+    pub fn new(count: isize) -> Result[Focus, Error] {
+        if count < 1 || count > 4096 {
+            return Result::Err(failure("invalid focus count"))
+        }
+        Result::Ok(Focus { current: Ref::new(0), count })
+    }
+
+    pub fn current(self: Focus) -> isize {
+        self.current.get()
+    }
+
+    pub fn update(self: Focus, event: terminal::Event) -> bool {
+        if let terminal::Event::Key(key) = event {
+            if key.code == terminal::KeyCode::Tab || key.code == terminal::KeyCode::BackTab {
+                let delta = if key.code == terminal::KeyCode::BackTab || key.modifiers.shift {
+                    self.count - 1
+                } else {
+                    1
+                };
+                self.current.set((self.current.get() + delta) % self.count);
+                return true
+            }
+        }
+        false
+    }
+}

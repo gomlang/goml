@@ -354,3 +354,69 @@ state. This interface-based adapter passes required FFI checking; the compiler's
 graph-comparison limit remains unchanged. Go pointer alias pointees must also
 be publicly nameable: an exported alias of a private pointee was rejected before
 that graph comparison.
+
+## Terminal and color libraries
+
+The terminal batch compiles as ordinary versioned ecosystem modules without new
+compiler syntax, builtin hooks or standard-library changes. Public Linux
+syscalls, descriptor wrappers, contexts, scoped tasks and channels are sufficient
+for raw terminal sessions, cancellable poll/read/write and concurrent progress
+state. Real PTY and race checks exercise descriptor restoration and copied handle
+ownership. Resize is detected by polling; a portable, runtime-coordinated signal
+subscription API remains absent. No library installs raw signal handlers in the
+Go runtime or claims restoration after process termination or panic.
+
+Unicode segmentation and layout can be implemented entirely in GoML with compact,
+version-pinned property tables. The Unicode 16 implementation passes all official
+grapheme, word and line-break cases. Applications must distinguish UTF-8 byte
+positions, grapheme boundaries and terminal columns: tabs, combining marks and
+wide emoji exposed actual editor and diagnostic alignment bugs during review.
+Terminal glyph width still depends on fonts and emulator policy.
+
+Color conversion, gamut mapping and interpolation are GoML algorithms; ordinary
+FFI supplies only primitive math operations absent from the public math API.
+A high-precision reference exposed underflow from multiplying colors directly by
+subnormal alpha. Normalizing the blend weights before mixing preserves tiny
+nonzero alpha and finite channels, including unequal color endpoints.
+
+Associated output types and generic callbacks support `prompt::Model` consumers
+returning strings, integers, booleans and arbitrary selected values. Closures
+that only produce an error can require an explicit expected concrete output
+type; typed helper functions also avoid unstable inference around `?`. Generic
+`Option` and some tuple arities lack `Debug`, so public APIs use explicit debug
+implementations and tests compare such values without assuming that bound.
+
+Snapshots need deliberate container copies because `Vec`, `Ref` and model handle
+copies share storage. Cross-library tests cover detached buffers, choices,
+gradient stops and progress snapshots. Mutable render/editor/prompt state has one
+event-loop owner; synchronized terminal/progress handles explicitly support
+concurrency. Progress snapshots let a full-screen UI own output without competing
+with a second cursor-control writer.
+
+Terminal lifecycle and output limits remain API responsibilities. Ordinary
+failure must leave input intact, invalidate partially written frames, wake
+blocked operations and restore modes. Cross-review added regressions for wide
+cell replacement budgets, tab navigation, replacing selected text with the same
+text, bounded undo/redo storage and callback invalidation during rendering.
+
+One remaining compiler boundary is independently reproducible with the current
+stage2 toolchain (version 0.1.50):
+assigning a public field of a dependency struct that also contains private fields
+can typecheck and then fail ANF validation at link time. For example, with a normal
+`ecosystem::tui = "0.1.0"` dependency:
+
+```gom
+use ecosystem::tui;
+
+fn assign(state: tui::TreeState) -> tui::TreeState {
+    let mut value = state;
+    value.selection = tui::SelectionState { selected: 2, ..value.selection };
+    value
+}
+```
+
+The linker reports `constructor argument count does not match ecosystem::tui::TreeState`. This is a compiler limitation, not an intended field
+visibility rule. The ecosystem batch does not alter compiler lowering;
+`TreeState::with_selection` performs the update inside its defining package,
+and the Explorer uses that public builder. The API's independent consumer and
+Explorer normal/race/PTY tests verify the working path.

@@ -1,0 +1,273 @@
+package tui_markdown;
+
+use ecosystem::markdown;
+use ecosystem::ansi;
+use ecosystem::unicode_text;
+use std::text;
+
+fn table_cells(line: string) -> Vec[string] {
+    let line = text::trim(line);
+    let pieces = Vec::new();
+    let current: Vec[string] = Vec::new();
+    let mut escaped = false;
+    for character in line.chars() {
+        if escaped {
+            if character != '|' {
+                current.push("\\");
+            }
+            current.push(character.to_string());
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '|' {
+            pieces.push(text::trim(current.join("")));
+            current.clear();
+        } else {
+            current.push(character.to_string());
+        }
+    }
+    if escaped {
+        current.push("\\");
+    }
+    pieces.push(text::trim(current.join("")));
+    let start = if line.starts_with("|") {
+        1
+    } else {
+        0
+    };
+    let end = if pieces.len() > start && pieces[pieces.len() - 1] == "" {
+        pieces.len() - 1
+    } else {
+        pieces.len()
+    };
+    let result = Vec::new();
+    for index in start..end {
+        result.push(pieces[index]);
+    }
+    result
+}
+
+fn table_alignment(value: string) -> Option[isize] {
+    let trimmed = text::trim(value);
+    let mut hyphens = 0;
+    for character in trimmed.chars() {
+        if character == '-' {
+            hyphens += 1;
+        } else if character != ':' {
+            return Option::None
+        }
+    }
+    if hyphens < 3 {
+        return Option::None
+    }
+    let first = trimmed.starts_with(":");
+    let last = trimmed.ends_with(":");
+    let middle = trimmed.byte_slice(
+        if first {
+            1
+        } else {
+            0
+        },
+        trimmed.byte_len()
+            - if last {
+                1
+            } else {
+                0
+            },
+    );
+    for character in middle.chars() {
+        if character != '-' {
+            return Option::None
+        }
+    }
+    Option::Some(
+        if first && last {
+            1
+        } else if last {
+            2
+        } else {
+            0
+        },
+    )
+}
+
+fn try_table(state: Build, block: markdown::Block) -> Result[bool, Error] {
+    let start = block.span.start;
+    let end = block.span.end;
+    if start < 0 || end >= state.source_lines.len() || end <= start {
+        return Result::Ok(false)
+    }
+    let header_line = state.source_lines[start];
+    let delimiter_line = state.source_lines[start + 1];
+    if !header_line.contains("|") || !delimiter_line.contains("|") {
+        return Result::Ok(false)
+    }
+    let headers = table_cells(header_line);
+    let delimiters = table_cells(delimiter_line);
+    if headers.len() != delimiters.len() || headers.is_empty() || headers.len() > 32 {
+        return Result::Ok(false)
+    }
+    let alignment = Vec::new();
+    for delimiter in delimiters {
+        let Some(value) = table_alignment(delimiter) else {
+            return Result::Ok(false)
+        };
+        alignment.push(value);
+    }
+    if end - start > 257 || (end - start) * headers.len() > 2048 {
+        return Result::Err(failure("pipe table cell limit exceeded"))
+    }
+    if state.options.width < headers.len() * 2 + 1 {
+        return Result::Ok(false)
+    }
+    let rows = Vec::from_array([headers]);
+    for index in start + 2..end + 1 {
+        if !state.source_lines[index].contains("|") {
+            return Result::Ok(false)
+        }
+        let cells = table_cells(state.source_lines[index]);
+        if cells.len() != headers.len() {
+            return Result::Ok(false)
+        }
+        rows.push(cells);
+    }
+    let widths = Vec::new();
+    let available = state.options.width - headers.len() - 1;
+    for index in 0..headers.len() {
+        widths.push(
+            available / headers.len()
+                + if index < available % headers.len() {
+                    1
+                } else {
+                    0
+                },
+        );
+    }
+    table_border(state, widths)?;
+    for row_index in 0..rows.len() {
+        let rendered: Vec[Vec[ansi::StyledText]] = Vec::new();
+        let mut height = 1;
+        for column in 0..headers.len() {
+            let cell = rows[row_index][column];
+            if cell.byte_len() > 65536 {
+                return Result::Err(failure("pipe table cell byte limit exceeded"))
+            }
+            let document = markdown::parse_with_options(
+                cell,
+                markdown::ParseOptions {
+                    max_bytes: 65536,
+                    max_depth: minimum(32, state.options.max_depth),
+                    max_nodes: minimum(4096, state.options.max_nodes),
+                    max_work: 100000,
+                },
+            ).map_err(|error| failure(error.to_string()))?;
+            let style = if row_index == 0 {
+                state.options.theme.heading
+            } else {
+                state.options.theme.text
+            };
+            let mut value = span(cell, style);
+            if document.blocks.len() == 1 {
+                if let markdown::BlockKind::Paragraph(inlines) = document.blocks[0].kind {
+                    value = render_inlines(state, inlines, style, Option::None, 1)?;
+                }
+            }
+            let lines = wrap_styled(value, widths[column], state.options)?;
+            height = maximum(height, lines.len());
+            rendered.push(lines);
+        }
+        for line in 0..height {
+            let text = span("│", state.options.theme.border);
+            for column in 0..headers.len() {
+                let cell = if line < rendered[column].len() {
+                    rendered[column][line]
+                } else {
+                    ansi::StyledText::new()
+                };
+                let padding = maximum(0, widths[column] - cell.width());
+                let before = if alignment[column] == 1 {
+                    padding / 2
+                } else if alignment[column] == 2 {
+                    padding
+                } else {
+                    0
+                };
+                text.append(span(" ".repeat(before), state.options.theme.text));
+                text.append(cell);
+                text.append(span(" ".repeat(padding - before) + "│", state.options.theme.border));
+            }
+            state.push_line(text)?;
+        }
+        if row_index == 0 {
+            table_border(state, widths)?;
+        }
+    }
+    table_border(state, widths)?;
+    state.blank()?;
+    Result::Ok(true)
+}
+
+fn table_border(state: Build, widths: Vec[isize]) -> Result[(), Error] {
+    let text = span("┼", state.options.theme.border);
+    for width in widths {
+        text.append(span("─".repeat(width) + "┼", state.options.theme.border));
+    }
+    state.push_line(text)
+}
+
+fn wrap_styled(text: ansi::StyledText, width: isize, options: Options) -> Result[
+    Vec[ansi::StyledText],
+    Error,
+] {
+    let normalized = ansi::StyledText::new();
+    let mut column = 0;
+    for part in text.graphemes(unicode_text::WidthOptions::new()) {
+        let value = if part.text == "\t" {
+            " ".repeat(8 - column % 8)
+        } else {
+            part.text
+        };
+        normalized.push(ansi::Span { text: value, style: part.style, link: part.link });
+        if part.text == "\n" {
+            column = 0;
+        } else {
+            column += unicode_text::width(value);
+        }
+    }
+    let wrapped = unicode_text::wrap_configured(
+        normalized.plain_text(),
+        unicode_text::WrapOptions {
+            limits: unicode_text::LayoutLimits {
+                max_input_bytes: options.max_output_bytes,
+                max_output_bytes: options.max_output_bytes,
+                max_lines: options.max_lines,
+            },
+            ..unicode_text::WrapOptions::new(width),
+        },
+    ).map_err(|error| failure(error.to_string()))?;
+    let spans = normalized.spans();
+    let mut index = 0;
+    let mut offset = 0;
+    let result = Vec::new();
+    for line in wrapped {
+        while index < spans.len() && offset + spans[index].text.byte_len() <= line.start {
+            offset += spans[index].text.byte_len();
+            index += 1;
+        }
+        let text = ansi::StyledText::new();
+        let mut at = index;
+        let mut start = offset;
+        while at < spans.len() && start < line.end {
+            let value = spans[at];
+            let left = maximum(0, line.start - start);
+            let right = minimum(value.text.byte_len(), line.end - start);
+            if right > left {
+                text.push(ansi::Span { text: value.text.byte_slice(left, right), ..value });
+            }
+            start += value.text.byte_len();
+            at += 1;
+        }
+        result.push(text.truncate(width).map_err(|error| failure(error.to_string()))?);
+    }
+    Result::Ok(result)
+}

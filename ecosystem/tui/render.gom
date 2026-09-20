@@ -1,0 +1,226 @@
+package tui;
+
+use ecosystem::ansi;
+use ecosystem::terminal;
+use std::context;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct FrameStats {
+    pub changed_cells: isize,
+    pub bytes: isize,
+    pub full_redraw: bool,
+}
+
+pub struct Renderer {
+    bounds: Ref[Rect],
+    previous: Ref[Option[Buffer]],
+    profile: ansi::Profile,
+    busy: Ref[bool],
+    epoch: Ref[isize],
+}
+
+impl Renderer {
+    pub fn new(width: isize, height: isize, profile: ansi::Profile) -> Result[Renderer, Error] {
+        let buffer = Buffer::new(width, height)?;
+        Result::Ok(
+            Renderer {
+                bounds: Ref::new(buffer.area()),
+                previous: Ref::new(Option::None),
+                profile,
+                busy: Ref::new(false),
+                epoch: Ref::new(0),
+            },
+        )
+    }
+
+    pub fn area(self: Renderer) -> Rect {
+        self.bounds.get()
+    }
+
+    pub fn invalidate(self: Renderer) -> () {
+        self.previous.set(Option::None);
+        self.epoch.set(self.epoch.get() + 1);
+    }
+
+    pub fn resize(self: Renderer, width: isize, height: isize) -> Result[(), Error] {
+        let buffer = Buffer::new(width, height)?;
+        if self.bounds.get() != buffer.area() {
+            self.bounds.set(buffer.area());
+            self.invalidate();
+        }
+        Result::Ok(())
+    }
+
+    pub fn render(self: Renderer, buffer: Buffer, writer: (string) -> Result[(), Error]) -> Result[
+        FrameStats,
+        Error,
+    ] {
+        if self.busy.get() {
+            return Result::Err(failure("renderer is already writing a frame"))
+        }
+        self.busy.set(true);
+        defer {
+            self.busy.set(false);
+        };
+        let epoch = self.epoch.get();
+        buffer.validate()?;
+        if buffer.area() != self.bounds.get() {
+            return Result::Err(failure("frame dimensions differ from renderer"))
+        }
+        let frame = buffer.snapshot();
+        let previous = self.previous.get();
+        let full_redraw = previous.is_none();
+        let output: Vec[string] = Vec::new();
+        let mut changed = 0;
+        let mut estimated_bytes = 0;
+        let mut style = ansi::Style::new();
+        for y in 0..frame.area().height {
+            for x in 0..frame.area().width {
+                let cell = frame.get(x, y).unwrap_or(Cell::blank(ansi::Style::new()));
+                if cell.continuation {
+                    continue
+                }
+                let dirty = match previous {
+                    None => true,
+                    Some(old) => old.get(x, y) != Option::Some(cell),
+                };
+                if dirty {
+                    let cursor = "\u001b[" + (y + 1).to_string() + ";" + (x + 1).to_string() + "H";
+                    let transition = cell.style.transition(style, self.profile);
+                    estimated_bytes += cell.text.byte_len() + cursor.byte_len()
+                        + transition.byte_len();
+                    if estimated_bytes > 16777208 {
+                        return Result::Err(failure("render output budget exceeded"))
+                    }
+                    if changed == 0 {
+                        output.push("\u001b[0m");
+                    }
+                    output.push(cursor);
+                    output.push(transition);
+                    output.push(cell.text);
+                    style = cell.style;
+                    changed += 1;
+                }
+            }
+        }
+        if changed > 0 {
+            output.push("\u001b[0m");
+        }
+        let text = output.join("");
+        if text != "" {
+            if let Err(error) = writer(text) {
+                self.invalidate();
+                return Result::Err(error)
+            }
+        }
+        if self.epoch.get() == epoch {
+            self.previous.set(Option::Some(frame));
+        }
+        Result::Ok(FrameStats { changed_cells: changed, bytes: text.byte_len(), full_redraw })
+    }
+}
+
+pub struct MemoryBackend {
+    frames: Vec[string],
+    fail_next: Ref[bool],
+    bytes: Ref[isize],
+}
+
+impl MemoryBackend {
+    pub fn new() -> MemoryBackend {
+        MemoryBackend { frames: Vec::new(), fail_next: Ref::new(false), bytes: Ref::new(0) }
+    }
+
+    pub fn output(self: MemoryBackend) -> Vec[string] {
+        self.frames.copy()
+    }
+
+    pub fn fail_once(self: MemoryBackend) -> () {
+        self.fail_next.set(true);
+    }
+
+    pub fn write(self: MemoryBackend, text: string) -> Result[(), Error] {
+        if self.fail_next.get() {
+            self.fail_next.set(false);
+            return Result::Err(failure("injected backend failure"))
+        }
+        if self.frames.len() >= 1024 || text.byte_len() > 16777216 - self.bytes.get() {
+            return Result::Err(failure("memory backend frame limit exceeded"))
+        }
+        self.bytes.set(self.bytes.get() + text.byte_len());
+        self.frames.push(text);
+        Result::Ok(())
+    }
+
+    pub fn clear(self: MemoryBackend) -> () {
+        self.frames.clear();
+        self.bytes.set(0);
+    }
+}
+
+pub struct Terminal {
+    session: terminal::Session,
+    renderer: Renderer,
+}
+
+impl Terminal {
+    pub fn new(session: terminal::Session) -> Result[Terminal, Error] {
+        let capabilities = session.capabilities();
+        if !capabilities.interactive {
+            return Result::Err(failure("TUI requires an interactive terminal"))
+        }
+        let size = session.size().map_err(|error| failure(error.to_string()))?;
+        let profile = match capabilities.color {
+            None => ansi::Profile::Plain,
+            Ansi16 => ansi::Profile::Ansi16,
+            Ansi256 => ansi::Profile::Ansi256,
+            TrueColor => ansi::Profile::TrueColor,
+        };
+        Result::Ok(Terminal { session, renderer: Renderer::new(size.columns, size.rows, profile)? })
+    }
+
+    pub fn area(self: Terminal) -> Rect {
+        self.renderer.area()
+    }
+
+    pub fn invalidate(self: Terminal) -> () {
+        self.renderer.invalidate();
+    }
+
+    pub fn draw(self: Terminal, body: (Buffer) -> Result[(), Error]) -> Result[FrameStats, Error] {
+        self.draw_with(context::Context::background(), body)
+    }
+
+    pub fn draw_with(self: Terminal, context: context::Context, body: (Buffer) -> Result[(), Error]) -> Result[
+        FrameStats,
+        Error,
+    ] {
+        let size = self.session.size().map_err(|error| failure(error.to_string()))?;
+        self.renderer.resize(size.columns, size.rows)?;
+        let buffer = Buffer::new(size.columns, size.rows)?;
+        body(buffer)?;
+        self.renderer.render(
+            buffer,
+            |value| self.session.write_with(context, value).map_err(
+                |error| failure(error.to_string()),
+            ),
+        )
+    }
+
+    pub fn next_event(self: Terminal, context: context::Context, timeout_ms: i32) -> Result[
+        Option[terminal::Event],
+        Error,
+    ] {
+        let event = self.session.next_event(context, timeout_ms).map_err(
+            |error| failure(error.to_string()),
+        )?;
+        if let Some(terminal::Event::Resize(size)) = event {
+            self.renderer.resize(size.columns, size.rows)?;
+        }
+        Result::Ok(event)
+    }
+
+    pub fn close(self: Terminal) -> Result[(), Error] {
+        self.session.close().map_err(|error| failure(error.to_string()))
+    }
+}

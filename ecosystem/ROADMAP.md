@@ -43,6 +43,24 @@ is intentionally deferred.
 | cli | Nested flattened Args, typed required/optional subcommand derives, generic payloads, multilevel aliases/help/globals and composition diagnostics |
 | notify / walkdir | Complete filesystem notification and traversal packages moved from `lib/std/fs` into normal versioned dependencies, with their original behavior suites retained as independent consumers |
 
+## Terminal and color batch
+
+| Module | Added |
+| --- | --- |
+| color | Checked color spaces, CSS values, alpha compositing, contrast and differences, gamut policies, hue interpolation and gradients |
+| unicode_text | Version-pinned Unicode 16 tables, full grapheme/word/line conformance, terminal width policies and bounded text layout |
+| ansi | Typed styles and hyperlinks, palette reduction, streaming escape tokenizer, styled Unicode text and standard writer adapters |
+| terminal | Linux raw sessions, incremental typed input, mouse/paste/focus/resize, cancellable I/O, synchronized aliases and explicit restoration |
+| tui | Cell invariants, constrained layout, incremental frames, common widgets, focus, Unicode editing and bounded history |
+| prompt | Generic validators, history/completion, password display, search/select/multiselect, confirmation and cancellable model execution |
+| progress | Concurrent job state, pure snapshots, rate/ETA, throttled bars/spinners, coordinated logs, plain output and bounded shutdown |
+| diagnostics | Owned source identity, byte spans, multi-file labels, Unicode/tab alignment, themes, clipping and checked multi-file suggestions |
+| tui_markdown | CommonMark terminal rendering, optional pipe tables, link handling, themes, scrolling and search |
+
+The Explorer example composes the libraries with `walkdir` and `notify`.
+Verification uses independent registry consumers, official/reference data,
+pseudo-terminals and race checks where relevant. CI integration remains deferred.
+
 ## Remaining work
 
 | Module | Remaining capabilities |
@@ -75,6 +93,15 @@ is intentionally deferred.
 | cache | Frequency-based admission, sharding and indexed/background expiry; current exact LRU uses O(n) expiry scans when timed entries exist, and synchronous loaders cooperate with cancellation |
 | ignore | Combined multi-pattern automata, tracked-file/index-aware selection, configurable file-type groups and additional platforms; current matching is byte-oriented with explicit work budgets and traversal targets Linux amd64 |
 | syntax | Incremental parsing/reparse orchestration, syntax pointers stable across revisions, multi-edit transactions and weak-reference interning; current library provides immutable lossless trees and checked persistent edits |
+| color | CSS Color 4's full grammar, additional RGB profiles, chromatic adaptation, HDR and ICC; Lab currently uses D65 and the parser documents its subset |
+| unicode_text | Unicode version upgrades, locale/dictionary tailoring, normalization, bidi shaping and sentence segmentation; current tables are pinned to Unicode 16 |
+| ansi | Screen emulation, single-byte C1 mode, extended underline styles/colors and terminal-specific palette discovery |
+| terminal | Additional operating systems, portable signal subscriptions and suspend/resume, Kitty keyboard/modifyOtherKeys, broader terminfo negotiation; current resize detection uses bounded polling |
+| tui | Configurable font/terminal width policies, soft-wrapped persistent editing, system clipboard, widget mouse-hit routing and graphics protocols |
+| prompt | Fuzzy/ranked completion menus, date/file pickers and batch-mode policies; current callbacks are synchronous and password values are ordinary GC strings |
+| progress | Byte-stream adapters, recursive job trees, pause/resume accounting and arbitrary format templates; applications explicitly drive ticks |
+| diagnostics | Bidi/font shaping, richer graphical label routing and persistent source revisions; edit application returns checked new text without writing files |
+| tui_markdown | Full GFM extensions and syntax highlighting integrations; terminal rendering and optional pipe tables do not change the CommonMark parser's scope |
 
 Further work should preserve resource bounds, recoverable errors, normal
 versioned dependency consumption and the independent reference checks already

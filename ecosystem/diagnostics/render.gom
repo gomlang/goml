@@ -1,0 +1,534 @@
+package diagnostics;
+
+use ecosystem::ansi;
+use ecosystem::unicode_text;
+use std::text;
+
+pub struct Theme {
+    pub error: ansi::Style,
+    pub warning: ansi::Style,
+    pub advice: ansi::Style,
+    pub note: ansi::Style,
+    pub secondary: ansi::Style,
+    pub gutter: ansi::Style,
+    pub help: ansi::Style,
+}
+
+impl Theme {
+    pub fn new() -> Theme {
+        Theme {
+            error: ansi::Style::new().foreground(ansi::Color::Indexed(9)).with_attribute(
+                ansi::BOLD,
+                true,
+            ),
+            warning: ansi::Style::new().foreground(ansi::Color::Indexed(11)).with_attribute(
+                ansi::BOLD,
+                true,
+            ),
+            advice: ansi::Style::new().foreground(ansi::Color::Indexed(14)),
+            note: ansi::Style::new().foreground(ansi::Color::Indexed(12)),
+            secondary: ansi::Style::new().foreground(ansi::Color::Indexed(14)),
+            gutter: ansi::Style::new().foreground(ansi::Color::Indexed(8)),
+            help: ansi::Style::new().foreground(ansi::Color::Indexed(10)),
+        }
+    }
+}
+
+pub struct RenderOptions {
+    pub profile: ansi::Profile,
+    pub theme: Theme,
+    pub width: unicode_text::WidthOptions,
+    pub columns: isize,
+    pub tab_stop: isize,
+    pub context_lines: isize,
+    pub max_source_lines: isize,
+    pub max_labels: isize,
+    pub max_notes: isize,
+    pub max_suggestions: isize,
+    pub max_edits: isize,
+    pub max_text_bytes: isize,
+    pub max_line_bytes: isize,
+    pub max_output_bytes: isize,
+}
+
+impl RenderOptions {
+    pub fn new() -> RenderOptions {
+        RenderOptions {
+            profile: ansi::Profile::Plain,
+            theme: Theme::new(),
+            width: unicode_text::WidthOptions::new(),
+            columns: 100,
+            tab_stop: 4,
+            context_lines: 2,
+            max_source_lines: 64,
+            max_labels: 64,
+            max_notes: 64,
+            max_suggestions: 16,
+            max_edits: 64,
+            max_text_bytes: 65536,
+            max_line_bytes: 1048576,
+            max_output_bytes: 1048576,
+        }
+    }
+}
+
+pub struct Renderer {
+    options: RenderOptions,
+}
+
+struct Output {
+    value: text::StringBuilder,
+    options: RenderOptions,
+}
+
+struct OrderedLabel {
+    label: Label,
+    order: isize,
+    first_line: isize,
+    last_line: isize,
+}
+
+struct SelectedLine {
+    file: FileId,
+    line: isize,
+}
+
+fn severity_style(theme: Theme, severity: Severity) -> ansi::Style {
+    match severity {
+        Error => theme.error,
+        Warning => theme.warning,
+        Advice => theme.advice,
+        Note => theme.note,
+    }
+}
+
+impl Output {
+    fn line(self: Output, prefix: string, content: string, style: ansi::Style) -> Result[(), Error] {
+        let columns = self.options.columns - unicode_text::width_with(prefix, self.options.width);
+        let safe = clipped(content, maximum(columns, 0), self.options.width);
+        let rendered = prefix + style.paint(safe, self.options.profile) + "\n";
+        if rendered.byte_len() > self.options.max_output_bytes - self.value.len() {
+            return Result::Err(Error::Limit("rendered output bytes"));
+        }
+        self.value.write_string(rendered);
+        Result::Ok(())
+    }
+}
+
+fn validate_options(options: RenderOptions) -> Result[(), Error] {
+    if options.columns < 24 || options.columns > 4096 || options.tab_stop < 1
+        || options.tab_stop > 256
+        || options.context_lines < 0
+        || options.context_lines > 32
+        || options.max_source_lines < 1
+        || options.max_source_lines > 4096
+        || options.max_labels < 0
+        || options.max_labels > 1024
+        || options.max_notes < 0
+        || options.max_notes > 1024
+        || options.max_suggestions < 0
+        || options.max_suggestions > 1024
+        || options.max_edits < 0
+        || options.max_edits > 10000
+        || options.max_text_bytes < 0
+        || options.max_text_bytes > 1048576
+        || options.max_line_bytes < 0
+        || options.max_line_bytes > 67108864
+        || options.max_output_bytes < 0
+        || options.max_output_bytes > 67108864 {
+        return Result::Err(Error::InvalidOptions("renderer bounds"));
+    }
+    Result::Ok(())
+}
+
+fn bounded_text(value: string, options: RenderOptions) -> Result[(), Error] {
+    if value.byte_len() > options.max_text_bytes {
+        Result::Err(Error::Limit("diagnostic text bytes"))
+    } else {
+        Result::Ok(())
+    }
+}
+
+fn ordered_labels(cache: SourceCache, report: Diagnostic, options: RenderOptions) -> Result[
+    Vec[OrderedLabel],
+    Error,
+] {
+    if report.labels.len() > options.max_labels {
+        return Result::Err(Error::Limit("labels"));
+    }
+    let result = Vec::new();
+    for order in 0..report.labels.len() {
+        let label = report.labels[order];
+        bounded_text(label.message, options)?;
+        let source = cache.get(label.span.file)?;
+        source.span(label.span.start, label.span.end)?;
+        let first_line = line_at(source, label.span.start);
+        let last_line = line_at(
+            source,
+            if label.span.is_empty() {
+                label.span.end
+            } else {
+                label.span.end - 1
+            },
+        );
+        result.push(OrderedLabel { label, order, first_line, last_line });
+    }
+    result.sort_by(
+        |a, b| {
+            if a.label.span.file.index != b.label.span.file.index {
+                a.label.span.file.index - b.label.span.file.index
+            } else if a.label.span.start != b.label.span.start {
+                a.label.span.start - b.label.span.start
+            } else if a.label.kind != b.label.kind {
+                if a.label.kind == LabelKind::Primary {
+                    -1
+                } else {
+                    1
+                }
+            } else {
+                a.order - b.order
+            }
+        },
+    );
+    Result::Ok(result)
+}
+
+fn selected_lines(cache: SourceCache, labels: Vec[OrderedLabel], options: RenderOptions) -> Result[
+    Vec[SelectedLine],
+    Error,
+] {
+    let values: Vec[SelectedLine] = Vec::new();
+    for label in labels {
+        let source = cache.get(label.label.span.file)?;
+        for endpoint in[label.first_line, label.last_line] {
+            let first = maximum(0, endpoint - options.context_lines);
+            let end = minimum(source.line_count(), endpoint + options.context_lines + 1);
+            for line in first..end {
+                values.push(SelectedLine { file: source.id, line });
+            }
+        }
+    }
+    values.sort_by(
+        |a, b| if a.file.index != b.file.index {
+            a.file.index - b.file.index
+        } else {
+            a.line - b.line
+        },
+    );
+    let unique: Vec[SelectedLine] = Vec::new();
+    for value in values {
+        if unique.is_empty() || unique[unique.len() - 1].file != value.file
+            || unique[unique.len() - 1].line != value.line {
+            unique.push(value);
+        }
+    }
+    if unique.len() <= options.max_source_lines {
+        return Result::Ok(unique);
+    }
+    let selected = Vec::new();
+    let first_count = (options.max_source_lines + 1) / 2;
+    let last_count = options.max_source_lines / 2;
+    for index in 0..first_count {
+        selected.push(unique[index]);
+    }
+    for index in unique.len() - last_count..unique.len() {
+        selected.push(unique[index]);
+    }
+    Result::Ok(selected)
+}
+
+fn label_intersects(label: OrderedLabel, line: isize) -> bool {
+    label.first_line <= line && line <= label.last_line
+}
+
+fn gutter(number: string, digits: isize) -> string {
+    text::repeat(" ", maximum(0, digits - number.byte_len())) + number + " | "
+}
+
+fn render_source_line(
+    output: Output,
+    source: Source,
+    number: isize,
+    labels: Vec[OrderedLabel],
+    severity: Severity,
+    digits: isize,
+) -> Result[(), Error] {
+    let options = output.options;
+    let line = source.lines[number];
+    if line.text.byte_len() > options.max_line_bytes {
+        return Result::Err(Error::Limit("source line bytes"));
+    }
+    let cells = line_cells(line, options.width, options.tab_stop);
+    let total = cells_width(cells);
+    let available = options.columns - digits - 7;
+    let mut focus = 0;
+    for item in labels {
+        if label_intersects(item, number) {
+            focus = column_at(cells, maximum(line.start, item.label.span.start), false);
+            break;
+        }
+    }
+    let start = minimum(maximum(0, focus - available / 3), maximum(0, total - available));
+    let left = if start > 0 {
+        "< "
+    } else {
+        "  "
+    };
+    let right = if total > start + available {
+        " >"
+    } else {
+        ""
+    };
+    output.line(
+        gutter((number + 1).to_string(), digits),
+        left + cell_window(cells, start, available) + right,
+        ansi::Style::new(),
+    )?;
+    for item in labels {
+        if !label_intersects(item, number) {
+            continue;
+        }
+        let first = column_at(cells, maximum(line.start, item.label.span.start), false);
+        let last = column_at(cells, minimum(line.end, item.label.span.end), true);
+        let marker = if item.label.kind == LabelKind::Primary {
+            "^"
+        } else {
+            "-"
+        };
+        let mut begin = maximum(0, first - start);
+        let mut count = maximum(1, last - maximum(first, start));
+        let mut outside = "";
+        if first >= start + available {
+            begin = available - 1;
+            count = 1;
+            outside = ">";
+        } else if last <= start && first < start {
+            begin = 0;
+            count = 1;
+            outside = "<";
+        }
+        count = minimum(count, available - begin);
+        let continuation = if item.first_line != item.last_line {
+            if number == item.first_line {
+                " [begins]"
+            } else if number == item.last_line {
+                " [ends]"
+            } else {
+                " [continues]"
+            }
+        } else {
+            ""
+        };
+        let suffix = if item.label.message == "" {
+            continuation
+        } else {
+            continuation + " " + clean_metadata(item.label.message)
+        };
+        let content = "  " + text::repeat(" ", begin) + text::repeat(marker, count) + outside
+            + suffix;
+        let style = if item.label.kind == LabelKind::Primary {
+            severity_style(options.theme, severity)
+        } else {
+            options.theme.secondary
+        };
+        if unicode_text::width_with(content, options.width) > options.columns - digits - 3
+            && suffix != "" {
+            output.line(
+                gutter("", digits),
+                "  " + text::repeat(" ", begin) + text::repeat(marker, count) + outside,
+                style,
+            )?;
+            output.line(gutter("", digits), "  =" + suffix, style)?;
+        } else {
+            output.line(gutter("", digits), content, style)?;
+        }
+    }
+    Result::Ok(())
+}
+
+fn render_file(
+    output: Output,
+    source: Source,
+    labels: Vec[OrderedLabel],
+    selected: Vec[SelectedLine],
+    severity: Severity,
+) -> Result[(), Error] {
+    let options = output.options;
+    let mut anchor = labels[0].label.span.start;
+    for item in labels {
+        if item.label.kind == LabelKind::Primary {
+            anchor = item.label.span.start;
+            break;
+        }
+    }
+    if source.lines[line_at(source, anchor)].text.byte_len() > options.max_line_bytes {
+        return Result::Err(Error::Limit("source line bytes"));
+    }
+    let location = source.location(anchor, options.width, options.tab_stop)?;
+    let heading = clean_metadata(source.name)
+        + f":{location.line + 1}:{location.display_column + 1}";
+    output.line(" --> ", heading, options.theme.gutter)?;
+    let digits = source.line_count().to_string().byte_len();
+    let mut first_expected = source.line_count();
+    let mut last_expected = 0;
+    for item in labels {
+        first_expected = minimum(
+            first_expected,
+            maximum(0, item.first_line - options.context_lines),
+        );
+        last_expected = maximum(
+            last_expected,
+            minimum(source.line_count() - 1, item.last_line + options.context_lines),
+        );
+    }
+    let mut previous = first_expected - 1;
+    let mut shown = 0;
+    for value in selected {
+        if value.file != source.id {
+            continue;
+        }
+        if value.line > previous + 1 {
+            output.line(
+                gutter("", digits),
+                f"... {value.line - previous - 1} source lines omitted ...",
+                options.theme.gutter,
+            )?;
+        }
+        render_source_line(output, source, value.line, labels, severity, digits)?;
+        previous = value.line;
+        shown += 1;
+    }
+    if shown == 0 {
+        output.line("     ", "... source excerpt omitted by line budget ...", options.theme.gutter)?;
+    } else if previous < last_expected {
+        output.line(
+            gutter("", digits),
+            f"... {last_expected - previous} source lines omitted ...",
+            options.theme.gutter,
+        )?;
+    }
+    for item in labels {
+        let mut visible = false;
+        for value in selected {
+            if value.file == source.id && label_intersects(item, value.line) {
+                visible = true;
+                break;
+            }
+        }
+        if !visible {
+            let kind = if item.label.kind == LabelKind::Primary {
+                "primary"
+            } else {
+                "secondary"
+            };
+            output.line(
+                "     ",
+                f"{kind} at lines {item.first_line + 1}..{item.last_line + 1}: "
+                    + clean_metadata(item.label.message),
+                options.theme.gutter,
+            )?;
+        }
+    }
+    Result::Ok(())
+}
+
+impl Renderer {
+    pub fn new(options: RenderOptions) -> Result[Renderer, Error] {
+        validate_options(options)?;
+        Result::Ok(Renderer { options })
+    }
+
+    pub fn render(self: Renderer, cache: SourceCache, report: Diagnostic) -> Result[string, Error] {
+        let options = self.options;
+        bounded_text(report.message, options)?;
+        if let Some(code) = report.code {
+            bounded_text(code, options)?;
+        }
+        if report.notes.len() > options.max_notes {
+            return Result::Err(Error::Limit("notes"));
+        }
+        if report.suggestions.len() > options.max_suggestions {
+            return Result::Err(Error::Limit("suggestions"));
+        }
+        let labels = ordered_labels(cache, report, options)?;
+        let selected = selected_lines(cache, labels, options)?;
+        let output = Output { value: text::StringBuilder::new(), options };
+        let code = report.code.map(|value| "[" + clean_metadata(value) + "]").unwrap_or("");
+        output.line(
+            "",
+            report.severity.to_string() + code + ": " + clean_metadata(report.message),
+            severity_style(options.theme, report.severity),
+        )?;
+        let mut first = 0;
+        while first < labels.len() {
+            let file = labels[first].label.span.file;
+            let group = Vec::new();
+            while first < labels.len() && labels[first].label.span.file == file {
+                group.push(labels[first]);
+                first += 1;
+            }
+            render_file(output, cache.get(file)?, group, selected, report.severity)?;
+        }
+        for note in report.notes {
+            bounded_text(note.message, options)?;
+            let name = if note.kind == NoteKind::Help {
+                "help"
+            } else {
+                "note"
+            };
+            let style = if note.kind == NoteKind::Help {
+                options.theme.help
+            } else {
+                options.theme.note
+            };
+            output.line(" = ", name + ": " + clean_metadata(note.message), style)?;
+        }
+        let mut edits = 0;
+        for suggestion in report.suggestions {
+            bounded_text(suggestion.message, options)?;
+            if suggestion.edits.len() > options.max_edits - edits {
+                return Result::Err(Error::Limit("rendered suggestion edits"));
+            }
+            edits += suggestion.edits.len();
+            suggestion.validate(
+                cache,
+                EditLimits {
+                    max_edits: options.max_edits,
+                    max_replacement_bytes: 67108864,
+                    ..EditLimits::new(),
+                },
+            )?;
+            output.line(
+                " = ",
+                "help: " + clean_metadata(suggestion.message) + " ("
+                    + suggestion.applicability.to_string()
+                    + ")",
+                options.theme.help,
+            )?;
+            for edit in suggestion.edits {
+                bounded_text(edit.replacement, options)?;
+                let source = cache.get(edit.span.file)?;
+                if source.lines[line_at(source, edit.span.start)].text.byte_len()
+                    > options.max_line_bytes {
+                    return Result::Err(Error::Limit("source line bytes"));
+                }
+                let position = source.location(edit.span.start, options.width, options.tab_stop)?;
+                output.line(
+                    "   ",
+                    clean_metadata(source.name)
+                        + f":{position.line + 1}:{position.display_column + 1}: replace bytes {edit.span.start}..{edit.span.end}",
+                    options.theme.gutter,
+                )?;
+                output.line("   + ", clean_metadata(edit.replacement), options.theme.help)?;
+            }
+        }
+        Result::Ok(output.value.finish())
+    }
+}
+
+pub fn render(cache: SourceCache, report: Diagnostic, options: RenderOptions) -> Result[
+    string,
+    Error,
+] {
+    Renderer::new(options)?.render(cache, report)
+}

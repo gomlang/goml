@@ -1,0 +1,333 @@
+package diagnostics;
+
+use ecosystem::unicode_text;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Error {
+    InvalidOptions(string),
+    ForeignFile,
+    MissingFile(isize),
+    InvalidSpan {
+        start: isize,
+        end: isize,
+        length: isize,
+    },
+    CharacterBoundary(isize),
+    Limit(string),
+    ConflictingEdits {
+        first: isize,
+        second: isize,
+    },
+}
+
+impl ToString for Error {
+    fn to_string(self: Error) -> string {
+        match self {
+            InvalidOptions(message) => "invalid diagnostics options: " + message,
+            ForeignFile => "source file belongs to a different cache",
+            MissingFile(index) => f"source file {index} is unavailable",
+            InvalidSpan { start, end, length } => f"invalid source span {start}..{end} for {length} bytes",
+            CharacterBoundary(offset) => f"source offset {offset} splits a UTF-8 scalar",
+            Limit(name) => "diagnostics limit exceeded: " + name,
+            ConflictingEdits { first, second } => f"suggestion edits {first} and {second} conflict",
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Hash)]
+pub struct FileId {
+    owner: Ref[()],
+    index: isize,
+}
+
+impl Debug for FileId {
+    fn debug(self: FileId) -> string {
+        f"FileId({self.index})"
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Span {
+    file: FileId,
+    start: isize,
+    end: isize,
+}
+
+impl Span {
+    pub fn file(self: Span) -> FileId {
+        self.file
+    }
+
+    pub fn start(self: Span) -> isize {
+        self.start
+    }
+
+    pub fn end(self: Span) -> isize {
+        self.end
+    }
+
+    pub fn is_empty(self: Span) -> bool {
+        self.start == self.end
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SourceLimits {
+    pub max_files: isize,
+    pub max_file_bytes: isize,
+    pub max_total_bytes: isize,
+    pub max_lines_per_file: isize,
+}
+
+impl SourceLimits {
+    pub fn new() -> SourceLimits {
+        SourceLimits {
+            max_files: 4096,
+            max_file_bytes: 16777216,
+            max_total_bytes: 67108864,
+            max_lines_per_file: 1000000,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SourceLine {
+    pub number: isize,
+    pub start: isize,
+    pub end: isize,
+    pub next: isize,
+    pub text: string,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Location {
+    pub line: isize,
+    pub byte_column: isize,
+    pub display_column: isize,
+}
+
+pub struct Source {
+    id: FileId,
+    name: string,
+    text: string,
+    lines: Vec[SourceLine],
+}
+
+struct CacheState {
+    files: Vec[Source],
+    bytes: isize,
+}
+
+pub struct SourceCache {
+    owner: Ref[()],
+    state: Ref[CacheState],
+    limits: SourceLimits,
+}
+
+impl SourceCache {
+    pub fn new() -> SourceCache {
+        SourceCache {
+            owner: Ref::new(()),
+            state: Ref::new(CacheState { files: Vec::new(), bytes: 0 }),
+            limits: SourceLimits::new(),
+        }
+    }
+
+    pub fn with_limits(limits: SourceLimits) -> Result[SourceCache, Error] {
+        if limits.max_files < 1 || limits.max_files > 100000 || limits.max_file_bytes < 0
+            || limits.max_file_bytes > 67108864
+            || limits.max_total_bytes < 0
+            || limits.max_total_bytes > 268435456
+            || limits.max_lines_per_file < 1
+            || limits.max_lines_per_file > 1000000 {
+            return Result::Err(Error::InvalidOptions("source cache limits"));
+        }
+        Result::Ok(SourceCache { limits, ..SourceCache::new() })
+    }
+
+    pub fn len(self: SourceCache) -> isize {
+        self.state.get().files.len()
+    }
+
+    pub fn total_bytes(self: SourceCache) -> isize {
+        self.state.get().bytes
+    }
+
+    pub fn add(self: SourceCache, name: string, value: string) -> Result[FileId, Error] {
+        let state = self.state.get();
+        if state.files.len() >= self.limits.max_files {
+            return Result::Err(Error::Limit("source files"));
+        }
+        if name.byte_len() > 65536 {
+            return Result::Err(Error::Limit("source name bytes"));
+        }
+        if value.byte_len() > self.limits.max_file_bytes
+            || value.byte_len() > self.limits.max_total_bytes - state.bytes {
+            return Result::Err(Error::Limit("source bytes"));
+        }
+        let lines = source_lines(value, self.limits.max_lines_per_file)?;
+        let id = FileId { owner: self.owner, index: state.files.len() };
+        state.files.push(Source { id, name, text: value, lines });
+        self.state.set(CacheState { files: state.files, bytes: state.bytes + value.byte_len() });
+        Result::Ok(id)
+    }
+
+    pub fn get(self: SourceCache, file: FileId) -> Result[Source, Error] {
+        if !ptr_eq(self.owner, file.owner) {
+            return Result::Err(Error::ForeignFile);
+        }
+        let files = self.state.get().files;
+        if file.index < 0 || file.index >= files.len() {
+            return Result::Err(Error::MissingFile(file.index));
+        }
+        Result::Ok(files[file.index])
+    }
+
+    pub fn span(self: SourceCache, file: FileId, start: isize, end: isize) -> Result[Span, Error] {
+        self.get(file)?.span(start, end)
+    }
+
+    pub fn text(self: SourceCache, span: Span) -> Result[string, Error] {
+        let source = self.get(span.file)?;
+        source.span(span.start, span.end)?;
+        Result::Ok(source.text.byte_slice(span.start, span.end))
+    }
+}
+
+impl Source {
+    pub fn id(self: Source) -> FileId {
+        self.id
+    }
+
+    pub fn name(self: Source) -> string {
+        self.name
+    }
+
+    pub fn text(self: Source) -> string {
+        self.text
+    }
+
+    pub fn byte_len(self: Source) -> isize {
+        self.text.byte_len()
+    }
+
+    pub fn line_count(self: Source) -> isize {
+        self.lines.len()
+    }
+
+    pub fn line(self: Source, number: isize) -> Option[SourceLine] {
+        if number < 0 || number >= self.lines.len() {
+            Option::None
+        } else {
+            Option::Some(self.lines[number])
+        }
+    }
+
+    pub fn span(self: Source, start: isize, end: isize) -> Result[Span, Error] {
+        if start < 0 || end < start || end > self.text.byte_len() {
+            return Result::Err(Error::InvalidSpan { start, end, length: self.text.byte_len() });
+        }
+        if !self.text.is_char_boundary(start) {
+            return Result::Err(Error::CharacterBoundary(start));
+        }
+        if !self.text.is_char_boundary(end) {
+            return Result::Err(Error::CharacterBoundary(end));
+        }
+        Result::Ok(Span { file: self.id, start, end })
+    }
+
+    pub fn location(self: Source, offset: isize, width: unicode_text::WidthOptions, tab_stop: isize) -> Result[
+        Location,
+        Error,
+    ] {
+        self.span(offset, offset)?;
+        if tab_stop < 1 || tab_stop > 256 {
+            return Result::Err(Error::InvalidOptions("tab stop must be 1..256"));
+        }
+        let number = line_at(self, offset);
+        let line = self.lines[number];
+        let byte_column = minimum(offset, line.end) - line.start;
+        let cells = line_cells(line, width, tab_stop);
+        Result::Ok(
+            Location {
+                line: number,
+                byte_column,
+                display_column: column_at(cells, minimum(offset, line.end), false),
+            },
+        )
+    }
+}
+
+fn source_lines(value: string, limit: isize) -> Result[Vec[SourceLine], Error] {
+    let result = Vec::new();
+    let mut start = 0;
+    let mut at = 0;
+    while at < value.byte_len() {
+        let b = value.byte_get(at);
+        if b == b'\n' || b == b'\r' {
+            let end = at;
+            at += 1;
+            if b == b'\r' && at < value.byte_len() && value.byte_get(at) == b'\n' {
+                at += 1;
+            }
+            if result.len() >= limit {
+                return Result::Err(Error::Limit("source lines"));
+            }
+            result.push(
+                SourceLine {
+                    number: result.len(),
+                    start,
+                    end,
+                    next: at,
+                    text: value.byte_slice(start, end),
+                },
+            );
+            start = at;
+        } else {
+            at += 1;
+        }
+    }
+    if result.len() >= limit {
+        return Result::Err(Error::Limit("source lines"));
+    }
+    result.push(
+        SourceLine {
+            number: result.len(),
+            start,
+            end: at,
+            next: at,
+            text: value.byte_slice(start, at),
+        },
+    );
+    Result::Ok(result)
+}
+
+fn line_at(source: Source, offset: isize) -> isize {
+    let mut low = 0;
+    let mut high = source.lines.len();
+    while low + 1 < high {
+        let mid = low + (high - low) / 2;
+        if source.lines[mid].start <= offset {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    low
+}
+
+fn minimum(a: isize, b: isize) -> isize {
+    if a < b {
+        a
+    } else {
+        b
+    }
+}
+
+fn maximum(a: isize, b: isize) -> isize {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}

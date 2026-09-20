@@ -1,0 +1,470 @@
+package terminal;
+
+use std::io::{Error};
+use std::context;
+use std::io;
+use std::os::linux::fd;
+use std::os::linux::ipc;
+use std::os::linux::syscall;
+use std::time;
+
+struct InputState {
+    decoder: Decoder,
+    pending: Vec[Event],
+    offset: isize,
+    escape_since: Option[time::Instant],
+    last_size: Option[Size],
+    ended: bool,
+}
+
+pub struct Session {
+    input: fd::Fd,
+    output: fd::Fd,
+    input_flags: usize,
+    output_flags: usize,
+    original_termios: Option[Vec[byte]],
+    options: Options,
+    capabilities_value: Capabilities,
+    input_gate: Channel[InputState],
+    output_gate: Channel[()],
+    close_gate: Channel[Option[Result[(), Error]]],
+    closing: Channel[()],
+}
+
+fn cancelled(context: context::Context) -> Result[(), Error] {
+    context.check().map_err(
+        |error| match error {
+            context::Error::Cancelled => failure(io::ErrorKind::Interrupted, "operation cancelled"),
+            context::Error::DeadlineExceeded => failure(
+                io::ErrorKind::TimedOut,
+                "context deadline exceeded",
+            ),
+        },
+    )
+}
+
+fn closed() -> Error {
+    failure(io::ErrorKind::BrokenPipe, "session is closed")
+}
+
+fn stopped(session: Session) -> bool {
+    select {
+        recv(session.closing) as _ => true,
+        default => false,
+    }
+}
+
+fn check(session: Session, context: context::Context) -> Result[(), Error] {
+    cancelled(context)?;
+    if stopped(session) {
+        Result::Err(closed())
+    } else {
+        Result::Ok(())
+    }
+}
+
+fn writable(descriptor: fd::Fd, bytes: Slice[byte], check_stop: () -> Result[(), Error]) -> Result[
+    (),
+    Error,
+] {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        check_stop()?;
+        let end = if bytes.len() - offset > 65536 {
+            offset + 65536
+        } else {
+            bytes.len()
+        };
+        match descriptor.write(bytes.sub(offset, end)) {
+            Ok(0) => return Result::Err(
+                failure(io::ErrorKind::WriteZero, "output made no progress"),
+            ),
+            Ok(count) => {
+                offset += count;
+            },
+            Err(error) => {
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    let interests = Vec::from_array(
+                        [ipc::PollInterest { descriptor, events: ipc::POLLOUT }],
+                    );
+                    match ipc::poll(interests.as_slice(), 20) {
+                        Ok(_) => (),
+                        Err(error) => if error.kind() != io::ErrorKind::Interrupted {
+                            return Result::Err(error)
+                        },
+                    }
+                } else if error.kind() != io::ErrorKind::Interrupted {
+                    return Result::Err(error)
+                }
+            },
+        }
+    }
+    Result::Ok(())
+}
+
+fn bounded_write(descriptor: fd::Fd, text: string) -> Result[(), Error] {
+    let start = time::Instant::now();
+    writable(
+        descriptor,
+        text.to_bytes().as_slice(),
+        || {
+            if start.elapsed().as_milliseconds() >= 200 {
+                Result::Err(
+                    failure(io::ErrorKind::TimedOut, "terminal setup or cleanup output timed out"),
+                )
+            } else {
+                Result::Ok(())
+            }
+        },
+    )
+}
+
+fn restore(session: Session) -> Result[(), Error] {
+    let mut result = bounded_write(session.output, mode_sequences(session.options, false));
+    if let Some(original) = session.original_termios {
+        let restored = set_termios(session.input, original);
+        if result.is_ok() {
+            result = restored;
+        }
+    }
+    let input = session.input.set_status_flags(session.input_flags);
+    if result.is_ok() {
+        result = input;
+    }
+    let output = session.output.set_status_flags(session.output_flags);
+    if result.is_ok() {
+        result = output;
+    }
+    let input_close = session.input.close();
+    if result.is_ok() {
+        result = input_close;
+    }
+    let output_close = session.output.close();
+    if result.is_ok() {
+        result = output_close;
+    }
+    result
+}
+
+impl Session {
+    pub fn open(options: Options) -> Result[Session, Error] {
+        let input = open_standard(0, fd::O_RDONLY)?;
+        defer {
+            let _ = input.close();
+        };
+        let output = open_standard(1, fd::O_WRONLY)?;
+        defer {
+            let _ = output.close();
+        };
+        Session::from_fds(input, output, options)
+    }
+
+    pub fn from_fds(input: fd::Fd, output: fd::Fd, options: Options) -> Result[Session, Error] {
+        if options.escape_timeout_ms < 0 || options.escape_timeout_ms > 60000 {
+            return Result::Err(invalid("escape timeout must be in 0..60000 milliseconds"))
+        }
+        let decoder = Decoder::new(
+            DecoderOptions {
+                max_sequence_bytes: options.max_sequence_bytes,
+                max_paste_bytes: options.max_paste_bytes,
+            },
+        )?;
+        let input = input.duplicate()?;
+        let output = match output.duplicate() {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = input.close();
+                return Result::Err(error)
+            },
+        };
+        let mut committed = false;
+        defer {
+            if !committed {
+                let _ = input.close();
+                let _ = output.close();
+            }
+        };
+        let input_flags = input.status_flags()?;
+        let output_flags = output.status_flags()?;
+        let original_termios = if options.raw_mode {
+            Option::Some(termios(input)?)
+        } else {
+            Option::None
+        };
+        let capabilities_value = environment_capabilities(is_terminal(input), is_terminal(output));
+        if !capabilities_value.output_tty && mode_sequences(options, true) != "" {
+            return Result::Err(invalid("terminal control modes require a terminal output"))
+        }
+        let input_gate = Channel::new(1);
+        input_gate.send(
+            InputState {
+                decoder,
+                pending: Vec::new(),
+                offset: 0,
+                escape_since: Option::None,
+                last_size: match terminal_size(output) {
+                    Ok(value) => Option::Some(value),
+                    Err(_) => Option::None,
+                },
+                ended: false,
+            },
+        );
+        let output_gate = Channel::new(1);
+        output_gate.send(());
+        let close_gate = Channel::new(1);
+        close_gate.send(Option::None);
+        let session = Session {
+            input,
+            output,
+            input_flags,
+            output_flags,
+            original_termios,
+            options,
+            capabilities_value,
+            input_gate,
+            output_gate,
+            close_gate,
+            closing: Channel::new(0),
+        };
+        let setup: () -> Result[(), Error] = || {
+            input.set_status_flags(input_flags | fd::O_NONBLOCK)?;
+            output.set_status_flags(output_flags | fd::O_NONBLOCK)?;
+            if let Some(original) = original_termios {
+                set_termios(input, raw_termios(original))?;
+            }
+            bounded_write(output, mode_sequences(options, true))
+        };
+        if let Err(error) = setup() {
+            let _ = restore(session);
+            return Result::Err(error)
+        }
+        committed = true;
+        Result::Ok(session)
+    }
+
+    pub fn capabilities(self: Session) -> Capabilities {
+        self.capabilities_value
+    }
+
+    pub fn size(self: Session) -> Result[Size, Error] {
+        if stopped(self) {
+            return Result::Err(closed())
+        }
+        terminal_size(self.output)
+    }
+
+    pub fn write(self: Session, text: string) -> Result[(), Error] {
+        self.write_with(context::Context::background(), text)
+    }
+
+    pub fn write_with(self: Session, context: context::Context, text: string) -> Result[(), Error] {
+        check(self, context)?;
+        select {
+            recv(self.output_gate) as _ => (),
+            recv(self.closing) as _ => return Result::Err(closed()),
+            recv(context.done()) as _ => {
+                cancelled(context)?;
+                return Result::Err(failure(io::ErrorKind::Interrupted, "operation cancelled"))
+            },
+        }
+        defer self.output_gate.send(());
+        check(self, context)?;
+        writable(self.output, text.to_bytes().as_slice(), || check(self, context))
+    }
+
+    pub fn next_event(self: Session, context: context::Context, timeout_ms: i32) -> Result[
+        Option[Event],
+        Error,
+    ] {
+        if timeout_ms < -1 {
+            return Result::Err(invalid("event timeout must be -1 or nonnegative"))
+        }
+        check(self, context)?;
+        let start = time::Instant::now();
+        let timer = time::Timer::new(
+            time::Duration::from_milliseconds(
+                if timeout_ms < 0 {
+                    2147483647
+                } else {
+                    timeout_ms.to_i64()
+                },
+            ),
+        );
+        defer {
+            let _ = timer.stop();
+        };
+        let acquired = if timeout_ms == 0 {
+            select {
+                recv(self.input_gate) as state => state,
+                default => return Result::Ok(Option::None),
+            }
+        } else {
+            select {
+                recv(self.input_gate) as state => state,
+                recv(self.closing) as _ => return Result::Err(closed()),
+                recv(context.done()) as _ => {
+                    cancelled(context)?;
+                    return Result::Err(failure(io::ErrorKind::Interrupted, "operation cancelled"))
+                },
+                recv(timer.done()) when timeout_ms > 0 match {
+                    _ => return Result::Ok(Option::None),
+                },
+            }
+        };
+        let mut state = acquired.ok_or(closed())?;
+        defer self.input_gate.send(state);
+        let mut polled = false;
+        loop {
+            check(self, context)?;
+            if state.offset < state.pending.len() {
+                let event = state.pending[state.offset];
+                state.offset += 1;
+                return Result::Ok(Option::Some(event))
+            }
+            state.pending = Vec::new();
+            state.offset = 0;
+            if state.ended {
+                return Result::Ok(Option::None)
+            }
+            if let Ok(size) = terminal_size(self.output) {
+                if state.last_size != Option::Some(size) {
+                    state.last_size = Option::Some(size);
+                    return Result::Ok(Option::Some(Event::Resize(size)))
+                }
+            }
+            if let Some(since) = state.escape_since {
+                if since.elapsed().as_milliseconds() >= self.options.escape_timeout_ms.to_i64() {
+                    state.pending = state.decoder.flush_escape();
+                    state.escape_since = Option::None;
+                    if !state.pending.is_empty() {
+                        continue
+                    }
+                }
+            }
+            let elapsed = start.elapsed().as_milliseconds();
+            if polled && timeout_ms >= 0 && elapsed >= timeout_ms.to_i64() {
+                return Result::Ok(Option::None)
+            }
+            let remaining: i32 = if timeout_ms < 0 {
+                20
+            } else {
+                clamp_wait(timeout_ms.to_i64() - elapsed, 20)
+            };
+            let wait = match state.escape_since {
+                Some(since) => clamp_wait(
+                    self.options.escape_timeout_ms.to_i64() - since.elapsed().as_milliseconds(),
+                    remaining,
+                ),
+                None => remaining,
+            };
+            let interests = Vec::from_array(
+                [ipc::PollInterest { descriptor: self.input, events: ipc::POLLIN }],
+            );
+            let ready = match ipc::poll(interests.as_slice(), wait) {
+                Ok(value) => value,
+                Err(error) => {
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue
+                    }
+                    return Result::Err(error)
+                },
+            };
+            polled = true;
+            if ready.is_empty() {
+                continue
+            }
+            let data = zeroes(4096);
+            match self.input.read(data.as_mut_slice()) {
+                Ok(0) => {
+                    state.pending = state.decoder.finish()?;
+                    state.ended = true;
+                },
+                Ok(count) => {
+                    state.pending = state.decoder.feed(data.slice(0, count))?;
+                    if state.decoder.pending_escape() {
+                        if state.escape_since.is_none() {
+                            state.escape_since = Option::Some(time::Instant::now());
+                        }
+                    } else {
+                        state.escape_since = Option::None;
+                    }
+                },
+                Err(error) => if error.kind() != io::ErrorKind::WouldBlock
+                    && error.kind() != io::ErrorKind::Interrupted {
+                    return Result::Err(error)
+                },
+            }
+        }
+    }
+
+    pub fn close(self: Session) -> Result[(), Error] {
+        let previous = self.close_gate.recv().unwrap_or(Option::Some(Result::Ok(())));
+        if let Some(result) = previous {
+            self.close_gate.send(previous);
+            return result
+        }
+        self.closing.close();
+        let state = self.input_gate.recv();
+        let _ = self.output_gate.recv();
+        let result = restore(self);
+        if let Some(state) = state {
+            self.input_gate.send(state);
+        }
+        self.output_gate.send(());
+        self.close_gate.send(Option::Some(result));
+        result
+    }
+}
+
+fn clamp_wait(value: i64, upper: i32) -> i32 {
+    if value < 0 {
+        0
+    } else if value > upper.to_i64() {
+        upper
+    } else {
+        value.to_i32()
+    }
+}
+
+pub fn with_session[T](options: Options, body: (Session) -> Result[T, Error]) -> Result[T, Error] {
+    let session = Session::open(options)?;
+    let result = body(session);
+    let cleanup = session.close();
+    match result {
+        Ok(value) => {
+            cleanup?;
+            Result::Ok(value)
+        },
+        Err(error) => Result::Err(error),
+    }
+}
+
+fn open_standard(number: isize, flags: usize) -> Result[fd::Fd, Error] {
+    let result = syscall::syscall6(
+        syscall::SYS_FCNTL,
+        [number.to_usize(), fd::F_DUPFD_CLOEXEC, 0, 0, 0, 0],
+    ).map_err(|error| failure(io::ErrorKind::Unsupported, error.to_string()))?;
+    if result.errno != 0 {
+        return Result::Err(
+            Error::new(
+                io::ErrorKind::Other,
+                "duplicate standard stream",
+                Option::None,
+                Option::Some(result.errno.to_isize()),
+                syscall::Errno(result.errno).to_string(),
+            ),
+        )
+    }
+    let retained = fd::Fd::from_owned_raw(result.r1.to_isize())?;
+    if is_terminal(retained) {
+        let opened = fd::open(
+            "/proc/self/fd/" + number.to_string(),
+            flags | fd::O_CLOEXEC | fd::O_NOCTTY,
+            0,
+        );
+        let _ = retained.close();
+        opened
+    } else {
+        Result::Ok(retained)
+    }
+}

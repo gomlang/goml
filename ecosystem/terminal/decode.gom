@@ -1,0 +1,405 @@
+package terminal;
+
+use std::io::{Error};
+use std::utf8;
+
+struct DecodeState {
+    buffer: Vec[byte],
+    paste: bool,
+    failed: bool,
+    finished: bool,
+}
+
+pub struct Decoder {
+    options: DecoderOptions,
+    state: Ref[DecodeState],
+}
+
+fn key(code: KeyCode, modifiers: Modifiers) -> Event {
+    Event::Key(KeyEvent { code, modifiers })
+}
+
+fn ascii_key(value: byte, alt: bool) -> Event {
+    let mut modifiers = Modifiers { alt, ..Modifiers::none() };
+    let code = match value {
+        0 => {
+            modifiers.control = true;
+            KeyCode::Char(' ')
+        },
+        9 => KeyCode::Tab,
+        10 | 13 => KeyCode::Enter,
+        27 => KeyCode::Escape,
+        8 | 127 => KeyCode::Backspace,
+        _ => if value < 32 {
+            modifiers.control = true;
+            KeyCode::Char(
+                char_from_u32(
+                    value.to_u32()
+                        + if value < 27 {
+                            96
+                        } else {
+                            64
+                        },
+                ).unwrap_or('?'),
+            )
+        } else {
+            KeyCode::Char(char_from_u32(value.to_u32()).unwrap_or('?'))
+        },
+    };
+    key(code, modifiers)
+}
+
+fn parameters(data: Slice[byte]) -> Option[Vec[isize]] {
+    let result = Vec::new();
+    let mut current = 0;
+    if data.len() == 0 {
+        return Option::Some(result)
+    }
+    for value in data {
+        if value == 59 {
+            result.push(current);
+            current = 0;
+        } else if value >= 48 && value <= 57 && current <= 1000000 {
+            current = current * 10 + value.to_isize() - 48;
+        } else {
+            return Option::None
+        }
+    }
+    result.push(current);
+    Option::Some(result)
+}
+
+fn xterm_modifiers(value: isize) -> Option[Modifiers] {
+    if value < 1 || value > 8 {
+        return Option::None
+    }
+    let bits = value - 1;
+    Option::Some(Modifiers { shift: bits & 1 != 0, alt: bits & 2 != 0, control: bits & 4 != 0 })
+}
+
+fn mouse(data: Slice[byte], final_byte: byte) -> Option[Event] {
+    let parts = parameters(data)?;
+    if parts.len() != 3 || parts[0] > 127 || parts[1] < 1 || parts[2] < 1 {
+        return Option::None
+    }
+    let bits = parts[0];
+    let button = if bits & 64 != 0 {
+        MouseButton::None
+    } else {
+        match bits & 3 {
+            0 => MouseButton::Left,
+            1 => MouseButton::Middle,
+            2 => MouseButton::Right,
+            _ => MouseButton::None,
+        }
+    };
+    let kind = if bits & 64 != 0 {
+        match bits & 3 {
+            0 => MouseKind::ScrollUp,
+            1 => MouseKind::ScrollDown,
+            2 => MouseKind::ScrollLeft,
+            _ => MouseKind::ScrollRight,
+        }
+    } else if final_byte == 109 || bits & 3 == 3 && bits & 32 == 0 {
+        MouseKind::Release
+    } else if bits & 32 != 0 {
+        if bits & 3 == 3 {
+            MouseKind::Move
+        } else {
+            MouseKind::Drag
+        }
+    } else {
+        MouseKind::Press
+    };
+    Option::Some(
+        Event::Mouse(
+            MouseEvent {
+                kind,
+                button,
+                column: parts[1] - 1,
+                row: parts[2] - 1,
+                modifiers: Modifiers {
+                    shift: bits & 4 != 0,
+                    alt: bits & 8 != 0,
+                    control: bits & 16 != 0,
+                },
+            },
+        ),
+    )
+}
+
+fn sequence(data: Slice[byte]) -> Event {
+    let text = utf8::decode_slice(data).unwrap_or("<invalid escape sequence>");
+    let last = data[data.len() - 1];
+    let body = data.sub(2, data.len() - 1);
+    if data[1] == 91 && body.len() != 0 && body[0] == 60 && (last == 77 || last == 109) {
+        return mouse(body.sub(1, body.len()), last).unwrap_or(Event::Unknown(text))
+    }
+    if data[1] == 91 && body.len() == 0 && (last == 73 || last == 79) {
+        return Event::Focus(last == 73)
+    }
+    let parts = match parameters(body) {
+        Some(value) => value,
+        None => return Event::Unknown(text),
+    };
+    if parts.len() > 2 {
+        return Event::Unknown(text)
+    }
+    if data[1] == 79 {
+        if !parts.is_empty() || last == 126 || last == 90 {
+            return Event::Unknown(text)
+        }
+    } else if last != 126 && !parts.is_empty() && parts[0] != 1 {
+        return Event::Unknown(text)
+    }
+    let modifiers = if parts.len() == 2 {
+        match xterm_modifiers(parts[1]) {
+            Some(value) => value,
+            None => return Event::Unknown(text),
+        }
+    } else {
+        Modifiers::none()
+    };
+    let code = match last {
+        65 => Option::Some(KeyCode::Up),
+        66 => Option::Some(KeyCode::Down),
+        67 => Option::Some(KeyCode::Right),
+        68 => Option::Some(KeyCode::Left),
+        72 => Option::Some(KeyCode::Home),
+        70 => Option::Some(KeyCode::End),
+        80 => Option::Some(KeyCode::Function(1)),
+        81 => Option::Some(KeyCode::Function(2)),
+        82 => Option::Some(KeyCode::Function(3)),
+        83 => Option::Some(KeyCode::Function(4)),
+        90 => Option::Some(KeyCode::BackTab),
+        126 => if parts.is_empty() {
+            Option::None
+        } else {
+            match parts[0] {
+                1 | 7 => Option::Some(KeyCode::Home),
+                2 => Option::Some(KeyCode::Insert),
+                3 => Option::Some(KeyCode::Delete),
+                4 | 8 => Option::Some(KeyCode::End),
+                5 => Option::Some(KeyCode::PageUp),
+                6 => Option::Some(KeyCode::PageDown),
+                11 => Option::Some(KeyCode::Function(1)),
+                12 => Option::Some(KeyCode::Function(2)),
+                13 => Option::Some(KeyCode::Function(3)),
+                14 => Option::Some(KeyCode::Function(4)),
+                15 => Option::Some(KeyCode::Function(5)),
+                17 => Option::Some(KeyCode::Function(6)),
+                18 => Option::Some(KeyCode::Function(7)),
+                19 => Option::Some(KeyCode::Function(8)),
+                20 => Option::Some(KeyCode::Function(9)),
+                21 => Option::Some(KeyCode::Function(10)),
+                23 => Option::Some(KeyCode::Function(11)),
+                24 => Option::Some(KeyCode::Function(12)),
+                _ => Option::None,
+            }
+        },
+        _ => Option::None,
+    };
+    match code {
+        Some(code) => key(
+            code,
+            if last == 90 {
+                Modifiers { shift: true, ..modifiers }
+            } else {
+                modifiers
+            },
+        ),
+        None => Event::Unknown(text),
+    }
+}
+
+fn suffix_matches(buffer: Vec[byte], suffix: Slice[byte]) -> bool {
+    if buffer.len() < suffix.len() {
+        return false
+    }
+    for index in 0..suffix.len() {
+        if buffer[buffer.len() - suffix.len() + index] != suffix[index] {
+            return false
+        }
+    }
+    true
+}
+
+fn parse_buffer(state: DecodeState, options: DecoderOptions, output: Vec[Event]) -> Result[
+    DecodeState,
+    Error,
+] {
+    let mut next = state;
+    if next.paste {
+        if suffix_matches(next.buffer, "\u001b[201~".to_bytes().as_slice()) {
+            if next.buffer.len() - 6 > options.max_paste_bytes {
+                return Result::Err(malformed("paste byte limit exceeded"))
+            }
+            let text = utf8::decode_slice(next.buffer.slice(0, next.buffer.len() - 6)).map_err(
+                |e| malformed(e.to_string()),
+            )?;
+            output.push(Event::Paste(text));
+            next.buffer = Vec::new();
+            next.paste = false;
+        } else if next.buffer.len() > options.max_paste_bytes + 6 {
+            return Result::Err(malformed("paste byte limit exceeded"))
+        }
+        return Result::Ok(next)
+    }
+    let buffer = next.buffer;
+    if buffer.is_empty() {
+        return Result::Ok(next)
+    }
+    if buffer[0] == 27 {
+        if buffer.len() == 1 {
+            return Result::Ok(next)
+        }
+        if buffer[1] == 93 || buffer[1] == 80 || buffer[1] == 95 || buffer[1] == 94 {
+            if buffer.len() > options.max_sequence_bytes {
+                return Result::Err(malformed("control string byte limit exceeded"))
+            }
+            let ended = buffer[1] == 93 && buffer[buffer.len() - 1] == 7
+                || buffer.len() > 3 && buffer[buffer.len() - 2] == 27
+                    && buffer[buffer.len() - 1] == 92;
+            if ended {
+                output.push(
+                    Event::Unknown(utf8::decode(buffer).unwrap_or("<invalid control string>")),
+                );
+                next.buffer = Vec::new();
+            }
+            return Result::Ok(next)
+        }
+        if buffer[1] == 91 || buffer[1] == 79 {
+            if buffer.len() > options.max_sequence_bytes {
+                return Result::Err(malformed("escape sequence byte limit exceeded"))
+            }
+            if buffer.len() < 3 {
+                return Result::Ok(next)
+            }
+            let last = buffer[buffer.len() - 1];
+            if last < 0x40 || last > 0x7e {
+                return Result::Ok(next)
+            }
+            if utf8::decode(buffer).unwrap_or("") == "\u001b[200~" {
+                next.paste = true;
+            } else {
+                output.push(sequence(buffer.as_slice()));
+            }
+            next.buffer = Vec::new();
+            return Result::Ok(next)
+        }
+    }
+    let offset = if buffer[0] == 27 {
+        1
+    } else {
+        0
+    };
+    let first = buffer[offset];
+    if first < 128 {
+        output.push(ascii_key(first, offset == 1));
+        next.buffer = Vec::new();
+        return Result::Ok(next)
+    }
+    let length = if first >= 0xc2 && first <= 0xdf {
+        2
+    } else if first >= 0xe0 && first <= 0xef {
+        3
+    } else if first >= 0xf0 && first <= 0xf4 {
+        4
+    } else {
+        return Result::Err(malformed("invalid UTF-8 input"))
+    };
+    if buffer.len() < offset + length {
+        return Result::Ok(next)
+    }
+    let text = utf8::decode_slice(buffer.slice(offset, buffer.len())).map_err(
+        |e| malformed(e.to_string()),
+    )?;
+    output.push(
+        key(KeyCode::Char(text.get(0)), Modifiers { alt: offset == 1, ..Modifiers::none() }),
+    );
+    next.buffer = Vec::new();
+    Result::Ok(next)
+}
+
+impl Decoder {
+    pub fn new(options: DecoderOptions) -> Result[Decoder, Error] {
+        if options.max_sequence_bytes < 8 || options.max_sequence_bytes > 65536
+            || options.max_paste_bytes < 0
+            || options.max_paste_bytes > 16777216 {
+            return Result::Err(invalid("decoder limits out of range"))
+        }
+        Result::Ok(
+            Decoder {
+                options,
+                state: Ref::new(
+                    DecodeState { buffer: Vec::new(), paste: false, failed: false, finished: false },
+                ),
+            },
+        )
+    }
+
+    pub fn pending_escape(self: Decoder) -> bool {
+        let state = self.state.get();
+        !state.paste && !state.buffer.is_empty() && state.buffer[0] == 27
+    }
+
+    pub fn feed(self: Decoder, input: Slice[byte]) -> Result[Vec[Event], Error] {
+        let mut state = self.state.get();
+        if state.failed || state.finished {
+            return Result::Err(malformed("decoder is finished or failed"))
+        }
+        let events = Vec::new();
+        for value in input {
+            state.buffer.push(value);
+            match parse_buffer(state, self.options, events) {
+                Ok(next) => {
+                    state = next;
+                },
+                Err(error) => {
+                    state.failed = true;
+                    self.state.set(state);
+                    return Result::Err(error)
+                },
+            }
+        }
+        self.state.set(state);
+        Result::Ok(events)
+    }
+
+    pub fn flush_escape(self: Decoder) -> Vec[Event] {
+        let mut state = self.state.get();
+        let events = Vec::new();
+        if !state.failed && !state.finished && self.pending_escape() {
+            if state.buffer.len() == 1 {
+                events.push(key(KeyCode::Escape, Modifiers::none()));
+            } else {
+                events.push(
+                    Event::Unknown(
+                        utf8::decode(state.buffer).unwrap_or("<incomplete escape sequence>"),
+                    ),
+                );
+            }
+            state.buffer = Vec::new();
+            self.state.set(state);
+        }
+        events
+    }
+
+    pub fn finish(self: Decoder) -> Result[Vec[Event], Error] {
+        let events = self.flush_escape();
+        let mut state = self.state.get();
+        if state.failed {
+            return Result::Err(malformed("decoder has failed"))
+        }
+        if state.finished {
+            return Result::Ok(events)
+        }
+        state.finished = true;
+        self.state.set(state);
+        if state.paste || !state.buffer.is_empty() {
+            return Result::Err(malformed("truncated UTF-8 or bracketed paste at EOF"))
+        }
+        events.push(Event::End);
+        Result::Ok(events)
+    }
+}

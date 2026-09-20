@@ -1,0 +1,284 @@
+package tui_markdown;
+
+use ecosystem::tui;
+use ecosystem::ansi;
+use ecosystem::terminal;
+use ecosystem::unicode_text;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SearchMatch {
+    pub line: isize,
+    pub start: isize,
+    pub end: isize,
+}
+
+pub struct Viewer {
+    source: Ref[string],
+    options: Ref[Options],
+    current: Ref[Layout],
+    offset: Ref[isize],
+    height: Ref[isize],
+    selected: Ref[isize],
+    query: Ref[string],
+    matches: Ref[Vec[SearchMatch]],
+    match_index: Ref[isize],
+}
+
+impl Viewer {
+    pub fn new(source: string, options: Options) -> Result[Viewer, Error] {
+        let current = layout(source, options)?;
+        Result::Ok(
+            Viewer {
+                source: Ref::new(source),
+                options: Ref::new(options),
+                current: Ref::new(current),
+                offset: Ref::new(0),
+                height: Ref::new(1),
+                selected: Ref::new(-1),
+                query: Ref::new(""),
+                matches: Ref::new(Vec::new()),
+                match_index: Ref::new(-1),
+            },
+        )
+    }
+
+    pub fn set_source(self: Viewer, source: string) -> Result[(), Error] {
+        let current = layout(source, self.options.get())?;
+        let matches = find_matches(current, self.query.get())?;
+        self.source.set(source);
+        self.current.set(current);
+        self.matches.set(matches);
+        self.match_index.set(-1);
+        self.selected.set(-1);
+        self.scroll_to(0);
+        Result::Ok(())
+    }
+
+    pub fn line_count(self: Viewer) -> isize {
+        self.current.get().lines.len()
+    }
+
+    pub fn scroll_offset(self: Viewer) -> isize {
+        self.offset.get()
+    }
+
+    pub fn scroll_to(self: Viewer, line: isize) -> () {
+        self.offset.set(clamp(line, 0, maximum(0, self.line_count() - self.height.get())));
+    }
+
+    pub fn selected_link(self: Viewer) -> Option[Link] {
+        let links = self.current.get().links;
+        let selected = self.selected.get();
+        if selected >= 0 && selected < links.len() {
+            Option::Some(links[selected])
+        } else {
+            Option::None
+        }
+    }
+
+    pub fn select_link(self: Viewer, index: isize) -> Result[(), Error] {
+        let links = self.current.get().links;
+        if index < 0 || index >= links.len() {
+            return Result::Err(failure("link selection out of range"))
+        }
+        self.selected.set(index);
+        self.scroll_to(links[index].line);
+        Result::Ok(())
+    }
+
+    pub fn search(self: Viewer, query: string) -> Result[isize, Error] {
+        let matches = find_matches(self.current.get(), query)?;
+        self.query.set(query);
+        self.matches.set(matches);
+        self.match_index.set(-1);
+        if !matches.is_empty() {
+            self.next_match(false);
+        }
+        Result::Ok(matches.len())
+    }
+
+    pub fn search_matches(self: Viewer) -> Vec[SearchMatch] {
+        self.matches.get().copy()
+    }
+
+    pub fn next_match(self: Viewer, reverse: bool) -> bool {
+        let matches = self.matches.get();
+        if matches.is_empty() {
+            return false
+        }
+        let current = self.match_index.get();
+        let index = if reverse {
+            if current <= 0 {
+                matches.len() - 1
+            } else {
+                current - 1
+            }
+        } else {
+            (current + 1) % matches.len()
+        };
+        self.match_index.set(index);
+        self.scroll_to(matches[index].line);
+        true
+    }
+
+    pub fn snapshot(self: Viewer) -> Layout {
+        let current = self.current.get();
+        let lines = Vec::new();
+        for line in current.lines {
+            lines.push(line.snapshot());
+        }
+        Layout { lines, links: current.links.copy(), width: current.width }
+    }
+
+    pub fn update(self: Viewer, event: terminal::Event) -> Result[bool, Error] {
+        match event {
+            Key(key) => match key.code {
+                Up => {
+                    self.scroll_to(self.offset.get() - 1);
+                },
+                Down => {
+                    self.scroll_to(self.offset.get() + 1);
+                },
+                PageUp => {
+                    self.scroll_to(self.offset.get() - maximum(1, self.height.get() - 1));
+                },
+                PageDown => {
+                    self.scroll_to(self.offset.get() + maximum(1, self.height.get() - 1));
+                },
+                Home => {
+                    self.scroll_to(0);
+                },
+                End => {
+                    self.scroll_to(self.line_count());
+                },
+                Tab | BackTab => {
+                    let links = self.current.get().links;
+                    if links.is_empty() {
+                        return Result::Ok(false)
+                    }
+                    let reverse = key.code == terminal::KeyCode::BackTab || key.modifiers.shift;
+                    let current = self.selected.get();
+                    let index = if reverse {
+                        if current <= 0 {
+                            links.len() - 1
+                        } else {
+                            current - 1
+                        }
+                    } else {
+                        (current + 1) % links.len()
+                    };
+                    self.select_link(index)?;
+                },
+                Char('n') => {
+                    return Result::Ok(self.next_match(false))
+                },
+                Char('N') => {
+                    return Result::Ok(self.next_match(true))
+                },
+                _ => return Result::Ok(false),
+            },
+            Mouse(mouse) => match mouse.kind {
+                ScrollUp => {
+                    self.scroll_to(self.offset.get() - 3);
+                },
+                ScrollDown => {
+                    self.scroll_to(self.offset.get() + 3);
+                },
+                _ => return Result::Ok(false),
+            },
+            _ => return Result::Ok(false),
+        }
+        Result::Ok(true)
+    }
+
+    pub fn draw(self: Viewer, buffer: tui::Buffer, area: tui::Rect) -> Result[(), Error] {
+        area.validate().map_err(|error| failure(error.to_string()))?;
+        if area.width == 0 || area.height == 0 {
+            return Result::Ok(())
+        }
+        let resized = area.width != self.options.get().width;
+        if resized {
+            let options = Options { width: area.width, ..self.options.get() };
+            let current = layout(self.source.get(), options)?;
+            let matches = find_matches(current, self.query.get())?;
+            self.options.set(options);
+            self.current.set(current);
+            self.matches.set(matches);
+            self.match_index.set(-1);
+        }
+        self.height.set(area.height);
+        if resized {
+            if let Some(link) = self.selected_link() {
+                self.scroll_to(link.line);
+            }
+        }
+        self.scroll_to(self.offset.get());
+        let options = self.options.get();
+        buffer.fill(area, options.theme.text).map_err(|error| failure(error.to_string()))?;
+        let current = self.current.get();
+        let selected = self.selected_link().map(|link| link.index.to_string()).unwrap_or("");
+        let matches = self.matches.get();
+        let mut match_index = 0;
+        while match_index < matches.len() && matches[match_index].line < self.offset.get() {
+            match_index += 1;
+        }
+        for row in 0..area.height {
+            let index = self.offset.get() + row;
+            if index >= current.lines.len() {
+                break
+            }
+            let line = ansi::StyledText::new();
+            let mut offset = 0;
+            for part in current.lines[index].graphemes(unicode_text::WidthOptions::new()) {
+                while match_index < matches.len()
+                    && (matches[match_index].line < index
+                        || (matches[match_index].line == index && matches[match_index].end <= offset)) {
+                    match_index += 1;
+                }
+                let searched = match_index < matches.len() && matches[match_index].line == index
+                    && matches[match_index].start < offset + part.text.byte_len()
+                    && matches[match_index].end > offset;
+                let chosen = part.link.map(|value| value.id() == selected).unwrap_or(false);
+                let style = if chosen {
+                    options.theme.selected_link
+                } else if searched {
+                    options.theme.search
+                } else {
+                    part.style
+                };
+                line.push(ansi::Span { text: part.text, style, link: part.link });
+                offset += part.text.byte_len();
+            }
+            buffer.draw_text(tui::Rect { y: area.y + row, height: 1, ..area }, line).map_err(
+                |error| failure(error.to_string()),
+            )?;
+        }
+        Result::Ok(())
+    }
+}
+
+fn find_matches(layout: Layout, query: string) -> Result[Vec[SearchMatch], Error] {
+    if query.byte_len() > 4096 || query.contains("\n") {
+        return Result::Err(failure("invalid search query"))
+    }
+    let result = Vec::new();
+    if query == "" {
+        return Result::Ok(result)
+    }
+    for index in 0..layout.lines.len() {
+        let text = layout.lines[index].plain_text();
+        let mut offset = 0;
+        while offset < text.byte_len() {
+            let Some(found) = text.byte_slice(offset, text.byte_len()).find(query) else {
+                break
+            };
+            let start = offset + found;
+            if result.len() >= 16384 {
+                return Result::Err(failure("search match limit exceeded"))
+            }
+            result.push(SearchMatch { line: index, start, end: start + query.byte_len() });
+            offset = start + query.byte_len();
+        }
+    }
+    Result::Ok(result)
+}
