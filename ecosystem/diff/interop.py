@@ -39,11 +39,12 @@ def main():
         for index, (old, new) in enumerate(cases):
             old_path.write_bytes(old.encode())
             new_path.write_bytes(new.encode())
-            subprocess.run([str(BINARY), "produce", str(old_path), str(new_path), str(generated)], check=True)
-            if old != new:
-                subprocess.run(["patch", "--batch", "--silent", "--output", str(native), str(old_path), str(generated)], env=environment, check=True)
-                if native.read_bytes() != new.encode():
-                    raise AssertionError(f"GNU patch mismatch for case {index}")
+            for algorithm in ("produce", "produce-linear"):
+                subprocess.run([str(BINARY), algorithm, str(old_path), str(new_path), str(generated)], check=True)
+                if old != new:
+                    subprocess.run(["patch", "--batch", "--silent", "--output", str(native), str(old_path), str(generated)], env=environment, check=True)
+                    if native.read_bytes() != new.encode():
+                        raise AssertionError(f"GNU patch mismatch for {algorithm} case {index}")
             result = subprocess.run(["diff", "-u", "--label", "old", "--label", "new", str(old_path), str(new_path)], env=environment, capture_output=True)
             if result.returncode not in (0, 1):
                 raise RuntimeError(result.stderr.decode())
@@ -51,7 +52,7 @@ def main():
             subprocess.run([str(BINARY), "apply", str(old_path), str(reference), str(applied)], check=True)
             if applied.read_bytes() != new.encode():
                 raise AssertionError(f"GoML apply mismatch for GNU diff case {index}")
-    print(f"diff interoperability: {len(cases)} cases passed in both directions")
+    print(f"diff interoperability: {len(cases)} cases passed with both GoML algorithms and GNU diff/patch")
 
 
 if __name__ == "__main__":
