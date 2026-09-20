@@ -406,6 +406,17 @@ type _goml_m_std_p_io_p_Error struct {
     details _goml_m_std_p_io_p_ErrorDetails
 }
 
+type _goml_m_std_p_io_p_Cursor struct {
+    data _goml_m_std_p_bytes_p_Bytes
+    offset *ref_int_x
+}
+
+type _goml_m_std_p_io_p_Stdout struct {}
+
+type _goml_m_std_p_io_p_Stderr struct {}
+
+type _goml_m_std_p_io_p_Stdin struct {}
+
 type _goml_m_std_p_fs_p_Error struct {
     details _goml_m_std_p_io_p_ErrorDetails
 }
@@ -437,7 +448,15 @@ type closure_env_std_fs_read_file_structured_1 struct {
     path_0 string
 }
 
-type closure_env_inherent_Slice_Slice_T_iter_T_u8_2 struct {
+type closure_env_std_io_trait_default_Read_read_to_string_Self_std_io_Cursor_2 struct {}
+
+type closure_env_std_io_trait_default_BufRead_read_line_Self_std_io_Cursor_3 struct {}
+
+type closure_env_std_io_trait_default_BufRead_read_line_Self_std_io_Cursor_4 struct {}
+
+type closure_env_std_io_trait_default_Read_read_to_string_Self_std_io_Stdin_5 struct {}
+
+type closure_env_inherent_Slice_Slice_T_iter_T_u8_6 struct {
     index_0 *ref_int_x
     len_1 int
     self_2 []uint8
@@ -552,6 +571,54 @@ type _goml_m_Result_____o__q_____std_p_io_p_Error_Err struct {
 
 func (_ _goml_m_Result_____o__q_____std_p_io_p_Error_Err) is_goml_m_Result_____o__q_____std_p_io_p_Error() {}
 
+type _goml_m_Result____isize____std_p_io_p_Error interface {
+    is_goml_m_Result____isize____std_p_io_p_Error()
+}
+
+type _goml_m_Result____isize____std_p_io_p_Error_Ok struct {
+    _0 int
+}
+
+func (_ _goml_m_Result____isize____std_p_io_p_Error_Ok) is_goml_m_Result____isize____std_p_io_p_Error() {}
+
+type _goml_m_Result____isize____std_p_io_p_Error_Err struct {
+    _0 _goml_m_std_p_io_p_Error
+}
+
+func (_ _goml_m_Result____isize____std_p_io_p_Error_Err) is_goml_m_Result____isize____std_p_io_p_Error() {}
+
+type _goml_m_Result____Slice_l_u8_r_____std_p_io_p_Error interface {
+    is_goml_m_Result____Slice_l_u8_r_____std_p_io_p_Error()
+}
+
+type _goml_m_Result____Slice_l_u8_r_____std_p_io_p_Error_Ok struct {
+    _0 []uint8
+}
+
+func (_ _goml_m_Result____Slice_l_u8_r_____std_p_io_p_Error_Ok) is_goml_m_Result____Slice_l_u8_r_____std_p_io_p_Error() {}
+
+type _goml_m_Result____Slice_l_u8_r_____std_p_io_p_Error_Err struct {
+    _0 _goml_m_std_p_io_p_Error
+}
+
+func (_ _goml_m_Result____Slice_l_u8_r_____std_p_io_p_Error_Err) is_goml_m_Result____Slice_l_u8_r_____std_p_io_p_Error() {}
+
+type _goml_m_Result____Option____string____std_p_io_p_Error interface {
+    is_goml_m_Result____Option____string____std_p_io_p_Error()
+}
+
+type _goml_m_Result____Option____string____std_p_io_p_Error_Ok struct {
+    _0 Option__string
+}
+
+func (_ _goml_m_Result____Option____string____std_p_io_p_Error_Ok) is_goml_m_Result____Option____string____std_p_io_p_Error() {}
+
+type _goml_m_Result____Option____string____std_p_io_p_Error_Err struct {
+    _0 _goml_m_std_p_io_p_Error
+}
+
+func (_ _goml_m_Result____Option____string____std_p_io_p_Error_Err) is_goml_m_Result____Option____string____std_p_io_p_Error() {}
+
 type _goml_m_Result____std_p_bytes_p_Bytes____std_p_fs_p_Error interface {
     is_goml_m_Result____std_p_bytes_p_Bytes____std_p_fs_p_Error()
 }
@@ -663,6 +730,22 @@ type _goml_m_Result____Vec_l_std_p_fs_p_DirEntry_r_____std_p_fs_p_Error_Err stru
 }
 
 func (_ _goml_m_Result____Vec_l_std_p_fs_p_DirEntry_r_____std_p_fs_p_Error_Err) is_goml_m_Result____Vec_l_std_p_fs_p_DirEntry_r_____std_p_fs_p_Error() {}
+
+type _goml_m_Result____Option____string____std_p_utf8_p_Utf8Error interface {
+    is_goml_m_Result____Option____string____std_p_utf8_p_Utf8Error()
+}
+
+type _goml_m_Result____Option____string____std_p_utf8_p_Utf8Error_Ok struct {
+    _0 Option__string
+}
+
+func (_ _goml_m_Result____Option____string____std_p_utf8_p_Utf8Error_Ok) is_goml_m_Result____Option____string____std_p_utf8_p_Utf8Error() {}
+
+type _goml_m_Result____Option____string____std_p_utf8_p_Utf8Error_Err struct {
+    _0 _goml_m_std_p_utf8_p_Utf8Error
+}
+
+func (_ _goml_m_Result____Option____string____std_p_utf8_p_Utf8Error_Err) is_goml_m_Result____Option____string____std_p_utf8_p_Utf8Error() {}
 
 type Option__char uint64
 
@@ -1837,13 +1920,13 @@ func _goml_m_inherent_i_Slice_i_Slice_l_T_r__i_iter____T__u8(self__0 []uint8) Fn
     var len__0 int
     var inline1 int = len(self__0)
     len__0 = inline1
-    var t0 closure_env_inherent_Slice_Slice_T_iter_T_u8_2 = closure_env_inherent_Slice_Slice_T_iter_T_u8_2{
+    var t0 closure_env_inherent_Slice_Slice_T_iter_T_u8_6 = closure_env_inherent_Slice_Slice_T_iter_T_u8_6{
         index_0: index__0,
         len_1: len__0,
         self_2: self__0,
     }
     var t1 func() Option__u8 = func() Option__u8 {
-        return _goml_m_inherent_i_closure__en_h481af7ced3d7a03f70b6419e8b58e2d0___u8__2_i_apply(t0)
+        return _goml_m_inherent_i_closure__en_h058fcc5d7e2318a71cafff326487f473___u8__6_i_apply(t0)
     }
     var inline0 FnIterator__u8 = FnIterator__u8{
         next_fn: t1,
@@ -2023,7 +2106,7 @@ func _goml_m_inherent_i_closure__en_h3dd0cb03305303b9cfff8ae48a351c84_ured__1_i_
     return inline2
 }
 
-func _goml_m_inherent_i_closure__en_h481af7ced3d7a03f70b6419e8b58e2d0___u8__2_i_apply(env0 closure_env_inherent_Slice_Slice_T_iter_T_u8_2) Option__u8 {
+func _goml_m_inherent_i_closure__en_h058fcc5d7e2318a71cafff326487f473___u8__6_i_apply(env0 closure_env_inherent_Slice_Slice_T_iter_T_u8_6) Option__u8 {
     var index__0 *ref_int_x = env0.index_0
     var len__0 int = env0.len_1
     var self__0 []uint8 = env0.self_2

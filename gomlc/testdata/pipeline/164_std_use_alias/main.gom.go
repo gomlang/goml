@@ -240,6 +240,17 @@ type _goml_m_std_p_io_p_Error struct {
     details _goml_m_std_p_io_p_ErrorDetails
 }
 
+type _goml_m_std_p_io_p_Cursor struct {
+    data _goml_m_std_p_bytes_p_Bytes
+    offset *ref_int_x
+}
+
+type _goml_m_std_p_io_p_Stdout struct {}
+
+type _goml_m_std_p_io_p_Stderr struct {}
+
+type _goml_m_std_p_io_p_Stdin struct {}
+
 type _goml_m_std_p_text_p_LineColumn struct {
     line int
     column int
@@ -284,22 +295,30 @@ type FnIterator__isize struct {
 
 type closure_env_std_io_read_stdin_to_string_0 struct {}
 
-type closure_env_inherent_string_string_char_indices_1 struct {
+type closure_env_std_io_trait_default_Read_read_to_string_Self_std_io_Cursor_1 struct {}
+
+type closure_env_std_io_trait_default_BufRead_read_line_Self_std_io_Cursor_2 struct {}
+
+type closure_env_std_io_trait_default_BufRead_read_line_Self_std_io_Cursor_3 struct {}
+
+type closure_env_std_io_trait_default_Read_read_to_string_Self_std_io_Stdin_4 struct {}
+
+type closure_env_inherent_string_string_char_indices_5 struct {
     index_0 *ref_int_x
     self_1 string
 }
 
-type closure_env_inherent_string_string_chars_2 struct {
+type closure_env_inherent_string_string_chars_6 struct {
     self_0 string
     index_1 *ref_int_x
 }
 
-type closure_env_goml_builtin_range_3 struct {
+type closure_env_goml_builtin_range_7 struct {
     current_0 *ref_int_x
     end_1 int
 }
 
-type closure_env_inherent_Slice_Slice_T_iter_T_u8_4 struct {
+type closure_env_inherent_Slice_Slice_T_iter_T_u8_8 struct {
     index_0 *ref_int_x
     len_1 int
     self_2 []uint8
@@ -398,6 +417,54 @@ type _goml_m_Result_____o__q_____std_p_io_p_Error_Err struct {
 
 func (_ _goml_m_Result_____o__q_____std_p_io_p_Error_Err) is_goml_m_Result_____o__q_____std_p_io_p_Error() {}
 
+type _goml_m_Result____isize____std_p_io_p_Error interface {
+    is_goml_m_Result____isize____std_p_io_p_Error()
+}
+
+type _goml_m_Result____isize____std_p_io_p_Error_Ok struct {
+    _0 int
+}
+
+func (_ _goml_m_Result____isize____std_p_io_p_Error_Ok) is_goml_m_Result____isize____std_p_io_p_Error() {}
+
+type _goml_m_Result____isize____std_p_io_p_Error_Err struct {
+    _0 _goml_m_std_p_io_p_Error
+}
+
+func (_ _goml_m_Result____isize____std_p_io_p_Error_Err) is_goml_m_Result____isize____std_p_io_p_Error() {}
+
+type _goml_m_Result____Slice_l_u8_r_____std_p_io_p_Error interface {
+    is_goml_m_Result____Slice_l_u8_r_____std_p_io_p_Error()
+}
+
+type _goml_m_Result____Slice_l_u8_r_____std_p_io_p_Error_Ok struct {
+    _0 []uint8
+}
+
+func (_ _goml_m_Result____Slice_l_u8_r_____std_p_io_p_Error_Ok) is_goml_m_Result____Slice_l_u8_r_____std_p_io_p_Error() {}
+
+type _goml_m_Result____Slice_l_u8_r_____std_p_io_p_Error_Err struct {
+    _0 _goml_m_std_p_io_p_Error
+}
+
+func (_ _goml_m_Result____Slice_l_u8_r_____std_p_io_p_Error_Err) is_goml_m_Result____Slice_l_u8_r_____std_p_io_p_Error() {}
+
+type _goml_m_Result____Option____string____std_p_io_p_Error interface {
+    is_goml_m_Result____Option____string____std_p_io_p_Error()
+}
+
+type _goml_m_Result____Option____string____std_p_io_p_Error_Ok struct {
+    _0 Option__string
+}
+
+func (_ _goml_m_Result____Option____string____std_p_io_p_Error_Ok) is_goml_m_Result____Option____string____std_p_io_p_Error() {}
+
+type _goml_m_Result____Option____string____std_p_io_p_Error_Err struct {
+    _0 _goml_m_std_p_io_p_Error
+}
+
+func (_ _goml_m_Result____Option____string____std_p_io_p_Error_Err) is_goml_m_Result____Option____string____std_p_io_p_Error() {}
+
 type _goml_m_Option_____o_isize_c_char_q_ struct {
     _p0 Tuple2_3int_4char
     _tag uint8
@@ -423,6 +490,22 @@ type _goml_m_Result____string____std_p_env_p_VarError_Err struct {
 }
 
 func (_ _goml_m_Result____string____std_p_env_p_VarError_Err) is_goml_m_Result____string____std_p_env_p_VarError() {}
+
+type _goml_m_Result____Option____string____std_p_utf8_p_Utf8Error interface {
+    is_goml_m_Result____Option____string____std_p_utf8_p_Utf8Error()
+}
+
+type _goml_m_Result____Option____string____std_p_utf8_p_Utf8Error_Ok struct {
+    _0 Option__string
+}
+
+func (_ _goml_m_Result____Option____string____std_p_utf8_p_Utf8Error_Ok) is_goml_m_Result____Option____string____std_p_utf8_p_Utf8Error() {}
+
+type _goml_m_Result____Option____string____std_p_utf8_p_Utf8Error_Err struct {
+    _0 _goml_m_std_p_utf8_p_Utf8Error
+}
+
+func (_ _goml_m_Result____Option____string____std_p_utf8_p_Utf8Error_Err) is_goml_m_Result____Option____string____std_p_utf8_p_Utf8Error() {}
 
 type _goml_m_Option_____o_char_c_isize_q_ struct {
     _p0 Tuple2_4char_3int
