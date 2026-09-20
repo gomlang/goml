@@ -1,0 +1,413 @@
+package tests;
+
+use ecosystem::highlight;
+use ecosystem::ansi;
+use std::context;
+use std::task;
+use std::testing;
+
+fn highlighter() -> highlight::Highlighter {
+    testing::expect_ok(highlight::Highlighter::new(highlight::Options::new()), "highlighter")
+}
+
+fn document(language: string, source: string) -> highlight::Document {
+    testing::expect_ok(
+        highlighter().document(language, source, context::Context::background()),
+        "document",
+    )
+}
+
+fn kind(document: highlight::Document, offset: isize) -> highlight::Scope {
+    for span in document.spans() {
+        if span.start <= offset && offset < span.end {
+            return span.scope;
+        }
+    }
+    highlight::Scope::Invalid
+}
+
+fn lossless(document: highlight::Document) -> () {
+    let mut offset = 0;
+    for span in document.spans() {
+        testing::assert_eq(span.start, offset);
+        testing::assert(span.end > span.start);
+        testing::assert(document.source().is_char_boundary(span.start));
+        testing::assert(document.source().is_char_boundary(span.end));
+        offset = span.end;
+    }
+    testing::assert_eq(offset, document.source().byte_len());
+}
+
+#[test]
+fn builtin_grammars_classify_keywords_identifiers_and_numbers() -> () {
+    let value = document("goml", "let answer: i64 = 42; // yes\n");
+    testing::assert_eq(kind(value, 0), highlight::Scope::Keyword);
+    testing::assert_eq(kind(value, 4), highlight::Scope::Identifier);
+    testing::assert_eq(kind(value, 12), highlight::Scope::Type);
+    testing::assert_eq(kind(value, 18), highlight::Scope::Number);
+    testing::assert_eq(kind(value, 22), highlight::Scope::Comment);
+    lossless(value);
+    let json = document("json", "{\"x\": -1.5e+3, \"ok\": true, \"bad\": nope}");
+    testing::assert_eq(kind(json, 1), highlight::Scope::String);
+    testing::assert_eq(kind(json, 6), highlight::Scope::Number);
+    testing::assert_eq(kind(json, 34), highlight::Scope::Invalid);
+    lossless(json);
+}
+
+#[test]
+fn goml_loop_labels_do_not_consume_character_literals_or_following_code() -> () {
+    let source = r#"'outer: loop { let ch = 'é'; let escaped = '\u0041'; let byte = b'\x41'; break 'outer; continue 'outer; }"#;
+    let value = document("goml", source);
+    for word in Vec::from_array(["loop", "let", "break", "continue"]) {
+        testing::assert_eq(
+            kind(value, testing::expect_some(source.find(word), "keyword")),
+            highlight::Scope::Keyword,
+        );
+    }
+    testing::assert_eq(kind(value, 0), highlight::Scope::Identifier);
+    for literal in Vec::from_array(["'é'", r#"'\u0041'"#, r#"b'\x41'"#]) {
+        let start = testing::expect_some(source.find(literal), "literal");
+        testing::assert_eq(kind(value, start), highlight::Scope::String);
+        testing::assert_eq(kind(value, start + literal.byte_len() - 1), highlight::Scope::String);
+    }
+    lossless(value);
+}
+
+#[test]
+fn long_unicode_regions_and_cancelled_reused_edits_preserve_boundaries() -> () {
+    let source = "\"" + "é".repeat(4096) + "\"; let done = true;\n";
+    let value = document("goml", source);
+    testing::assert_eq(kind(value, 8193), highlight::Scope::String);
+    testing::assert_eq(kind(value, 8196), highlight::Scope::Keyword);
+    lossless(value);
+    let old = document("goml", "let a = 1;\n".repeat(2048));
+    context::with_cancel(
+        context::Context::background(),
+        |ctx, cancel| {
+            cancel.cancel();
+            testing::assert_err(old.replace(0, 0, "", ctx));
+            testing::assert_err(old.replace(0, 0, "let b = 2;\n", ctx));
+        },
+    );
+    testing::assert_eq(old.line_count(), 2049);
+}
+
+#[test]
+fn nested_comments_and_raw_hash_strings_preserve_state_across_lines() -> () {
+    let source = "/* outer\n/* inner */\nend */ let x = br##\"raw\n\"# still string\n\"##;\n";
+    let value = document("goml", source);
+    testing::assert_eq(kind(value, 10), highlight::Scope::Comment);
+    let second = testing::expect_some(value.line(1), "line");
+    testing::assert(!second.after().is_plain());
+    let final_line = testing::expect_some(value.line(value.line_count() - 1), "last");
+    testing::assert(final_line.after().is_plain());
+    testing::assert_eq(kind(value, source.byte_len() - 5), highlight::Scope::String);
+    lossless(value);
+}
+
+#[test]
+fn escaped_quotes_and_incomplete_single_line_strings_recover() -> () {
+    let value = document("goml", "let x = \"escaped \\\" quote\";\n\"unfinished\nlet y = 2;\n");
+    testing::assert_eq(kind(value, 20), highlight::Scope::String);
+    let line = testing::expect_some(value.line(2), "recovery");
+    testing::assert(line.before().is_plain());
+    testing::assert_eq(line.spans()[0].scope, highlight::Scope::Keyword);
+    lossless(value);
+}
+
+#[test]
+fn toml_multiline_basic_and_literal_strings_handle_comment_markers() -> () {
+    let value = document(
+        "toml",
+        "a = \"\"\"first\n# inside string\nlast\"\"\"\nb = '''literal\n'quoted'\n'''\n# comment\n",
+    );
+    testing::assert_eq(
+        testing::expect_some(value.line(1), "inside").spans()[0].scope,
+        highlight::Scope::String,
+    );
+    testing::assert_eq(
+        testing::expect_some(value.line(4), "literal").spans()[0].scope,
+        highlight::Scope::String,
+    );
+    testing::assert_eq(
+        testing::expect_some(value.line(6), "comment").spans()[0].scope,
+        highlight::Scope::Comment,
+    );
+    lossless(value);
+}
+
+#[test]
+fn markdown_fences_select_embedded_languages_and_close_independently() -> () {
+    let value = document(
+        "markdown",
+        "# Title\n```goml\nlet x = r\"unterminated\n```\n*hello* [site](https://example.test)\n~~~json\n{\"x\": true}\n~~~~\n",
+    );
+    testing::assert_eq(
+        testing::expect_some(value.line(0), "heading").spans()[0].scope,
+        highlight::Scope::Heading,
+    );
+    testing::assert_eq(
+        testing::expect_some(value.line(2), "goml").spans()[0].scope,
+        highlight::Scope::Keyword,
+    );
+    testing::assert(testing::expect_some(value.line(3), "close").after().is_plain());
+    testing::assert_eq(
+        testing::expect_some(value.line(4), "emphasis").spans()[0].scope,
+        highlight::Scope::Emphasis,
+    );
+    testing::assert_eq(
+        testing::expect_some(value.line(6), "json").spans()[0].scope,
+        highlight::Scope::Punctuation,
+    );
+    testing::assert(testing::expect_some(value.line(7), "close").after().is_plain());
+    lossless(value);
+}
+
+#[test]
+fn unknown_and_markdown_fences_are_plain_and_wrong_closers_stay_inside() -> () {
+    let value = document(
+        "markdown",
+        "````unknown\nlet x\n```\n~~~~\n````\n```markdown\n# raw heading\n```\n",
+    );
+    testing::assert_eq(
+        testing::expect_some(value.line(1), "unknown").spans()[0].scope,
+        highlight::Scope::Text,
+    );
+    testing::assert(!testing::expect_some(value.line(2), "short close").after().is_plain());
+    testing::assert(!testing::expect_some(value.line(3), "wrong close").after().is_plain());
+    testing::assert(testing::expect_some(value.line(4), "close").after().is_plain());
+    testing::assert_eq(
+        testing::expect_some(value.line(6), "nested markdown").spans()[0].scope,
+        highlight::Scope::Text,
+    );
+}
+
+#[test]
+fn language_registration_and_rule_failures_are_recoverable() -> () {
+    let rules = Vec::from_array(
+        [
+            highlight::Rule::literal("SELECT", highlight::Scope::Keyword),
+            highlight::Rule::regex("[a-z]+", highlight::Scope::Identifier),
+        ],
+    );
+    let language = testing::expect_ok(
+        highlight::Language::compile(
+            "query",
+            Vec::from_array(["sql"]),
+            rules,
+            Vec::from_array([highlight::Region::new("/*", "*/", highlight::Scope::Comment)]),
+        ),
+        "language",
+    );
+    let original = highlighter();
+    let extended = original.with_language(language);
+    testing::assert_eq(extended.detect("test.sql"), "query");
+    testing::assert_eq(original.detect("test.sql"), "text");
+    let value = testing::expect_ok(
+        extended.document("query", "SELECT x /* note */", context::Context::background()),
+        "custom",
+    );
+    testing::assert_eq(kind(value, 0), highlight::Scope::Keyword);
+    testing::assert_eq(kind(value, 11), highlight::Scope::Comment);
+    testing::assert_err(
+        highlight::Language::compile(
+            "bad",
+            Vec::new(),
+            Vec::from_array([highlight::Rule::regex("(", highlight::Scope::Text)]),
+            Vec::new(),
+        ),
+    );
+    testing::assert_err(
+        highlight::Language::compile(
+            "bad",
+            Vec::new(),
+            Vec::new(),
+            Vec::from_array([highlight::Region::new("", "x", highlight::Scope::Text)]),
+        ),
+    );
+    testing::assert_err(original.document("missing", "", context::Context::background()));
+}
+
+#[test]
+fn incremental_edits_reuse_stable_suffix_and_preserve_old_document() -> () {
+    let source = "let a = 1;\nlet b = 2;\nlet c = 3;\n";
+    let old = document("goml", source);
+    let update = testing::expect_ok(
+        old.replace(8, 9, "100", context::Context::background()),
+        "replace",
+    );
+    testing::assert_eq(update.reparsed_lines, 1);
+    testing::assert_eq(update.reused_lines, 3);
+    testing::assert_eq(old.source(), source);
+    let rebuilt = document("goml", update.document.source());
+    testing::assert(update.document.spans() == rebuilt.spans());
+    let same = testing::expect_ok(old.replace(0, 0, "", context::Context::background()), "no-op");
+    testing::assert_eq(same.reparsed_lines, 0);
+}
+
+#[test]
+fn state_changes_reparse_until_the_old_state_is_reached() -> () {
+    let old = document("goml", "let x = 1;\nbody\n*/ let y = 2;\nlet z = 3;\n");
+    let update = testing::expect_ok(
+        old.replace(0, 0, "/*", context::Context::background()),
+        "open comment",
+    );
+    testing::assert_eq(update.reparsed_lines, 3);
+    testing::assert_eq(update.reused_lines, 2);
+    testing::assert_eq(kind(update.document, 0), highlight::Scope::Comment);
+    testing::assert(update.document.spans() == document("goml", update.document.source()).spans());
+}
+
+#[test]
+fn unicode_edits_reject_partial_scalars_and_return_detached_spans() -> () {
+    let old = document("goml", "let 名字 = \"👩‍💻\";\n");
+    testing::assert_err(old.replace(5, 5, "x", context::Context::background()));
+    testing::assert_err(old.replace(-1, 0, "x", context::Context::background()));
+    let spans = old.spans();
+    spans.clear();
+    let line_spans = testing::expect_some(old.line(0), "line").spans();
+    line_spans.clear();
+    lossless(old);
+    testing::assert(old.line(-1).is_none());
+}
+
+#[test]
+fn empty_documents_crlf_and_final_newlines_are_preserved() -> () {
+    let empty = document("goml", "");
+    testing::assert_eq(empty.line_count(), 1);
+    testing::assert(empty.spans().is_empty());
+    let value = document("goml", "let a = 1;\r\nlet b = 2;\r\n");
+    testing::assert_eq(value.line_count(), 3);
+    lossless(value);
+    testing::assert_err(
+        highlighter().line(
+            "goml",
+            "a\nb\n",
+            highlight::State::new(),
+            context::Context::background(),
+        ),
+    );
+}
+
+#[test]
+fn html_escapes_and_ansi_sanitizes_untrusted_source_with_output_bounds() -> () {
+    let value = document("text", "<&\"'\u001b[2J");
+    let html = testing::expect_ok(value.to_html(10000), "html");
+    testing::assert(html.contains("&lt;&amp;&quot;&#39;"));
+    let plain = testing::expect_ok(
+        value.to_ansi(highlight::Theme::dark(), ansi::Profile::Plain, 10000),
+        "plain",
+    );
+    testing::assert_eq(plain, "<&\"'�[2J");
+    let colored = testing::expect_ok(
+        document("goml", "let a = 42;").to_ansi(
+            highlight::Theme::dark(),
+            ansi::Profile::TrueColor,
+            10000,
+        ),
+        "ansi",
+    );
+    testing::assert(colored.contains("\u001b["));
+    testing::assert_err(value.to_html(2));
+    testing::assert_err(value.to_ansi(highlight::Theme::light(), ansi::Profile::Plain, 1));
+}
+
+#[test]
+fn budgets_and_cancellation_fail_without_mutating_documents() -> () {
+    testing::assert_err(
+        highlight::Highlighter::new(
+            highlight::Options { max_bytes: 0, ..highlight::Options::new() },
+        ),
+    );
+    let limited = testing::expect_ok(
+        highlight::Highlighter::new(
+            highlight::Options {
+                max_bytes: 100,
+                max_line_bytes: 20,
+                max_lines: 3,
+                max_depth: 2,
+                ..highlight::Options::new(),
+            },
+        ),
+        "limits",
+    );
+    let ctx = context::Context::background();
+    testing::assert_err(limited.document("goml", "x".repeat(21), ctx));
+    testing::assert_err(limited.document("goml", "a\nb\nc\n", ctx));
+    testing::assert_err(limited.document("goml", "/* /* /* */ */ */", ctx));
+    context::with_cancel(
+        ctx,
+        |cancelled, cancel| {
+            cancel.cancel();
+            testing::assert_err(limited.document("goml", "let x = 1;", cancelled));
+        },
+    );
+}
+
+#[test]
+fn generated_edits_match_full_rehighlighting() -> () {
+    let engine = highlighter();
+    let ctx = context::Context::background();
+    let mut value = testing::expect_ok(
+        engine.document("goml", "let a = 1;\n/* text */\nlet b = r#\"hello\"#;\n", ctx),
+        "initial",
+    );
+    let replacements = Vec::from_array(
+        ["/*", "*/", "\n", "let ", "\"", "r#\"", "\"#", "", "//x", "名"],
+    );
+    let mut seed = 731;
+    for turn in 0..200 {
+        seed = (seed * 48271) % 2147483647;
+        let boundaries = Vec::from_array([0]);
+        for (offset, ch) in value.source().char_indices() {
+            boundaries.push(offset + ch.to_string().byte_len());
+        }
+        let start = boundaries[seed % boundaries.len()];
+        let end = if turn % 4 == 0 {
+            value.source().byte_len()
+        } else {
+            start
+        };
+        let edited = value.replace(start, end, replacements[turn % replacements.len()], ctx);
+        if let Result::Err(error) = edited {
+            testing::fail(
+                "edit " + turn.to_string() + ": " + error.to_string() + " in " + value.source(),
+            );
+        }
+        let update = testing::expect_ok(edited, "edit");
+        value = update.document;
+        let rebuilt = testing::expect_ok(engine.document("goml", value.source(), ctx), "rebuild");
+        testing::assert(value.spans() == rebuilt.spans());
+        lossless(value);
+    }
+}
+
+#[test]
+fn one_registry_supports_independent_concurrent_documents() -> () {
+    let engine = highlighter();
+    task::scope(
+        |scope| {
+            let jobs = Vec::new();
+            for _ in 0..8 {
+                jobs.push(
+                    scope.spawn(
+                        |_| {
+                            let value = testing::expect_ok(
+                                engine.document(
+                                    "markdown",
+                                    "```goml\nlet n = 1;\n```\n",
+                                    context::Context::background(),
+                                ),
+                                "parallel",
+                            );
+                            lossless(value);
+                        },
+                    ),
+                );
+            }
+            for job in jobs {
+                job.join();
+            }
+        },
+    );
+}

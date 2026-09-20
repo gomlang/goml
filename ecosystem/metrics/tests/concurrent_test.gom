@@ -1,0 +1,243 @@
+package tests;
+
+use ecosystem::metrics as metrics;
+use std::context;
+use std::task;
+use std::testing;
+
+#[test]
+fn concurrent_handle_updates_and_histogram_snapshots_are_consistent() -> () {
+    let registry = registry();
+    let total = counter(registry, "operations_total");
+    let current = gauge(registry, "workers");
+    let distribution = histogram(registry, "work_seconds");
+    task::scope(
+        |scope| {
+            let workers = Vec::new();
+            for _ in 0..8 {
+                workers.push(
+                    scope.spawn(
+                        |_| {
+                            for _ in 0..500 {
+                                testing::assert_ok(total.increment());
+                                testing::assert_ok(current.increment(1.0));
+                                testing::assert_ok(distribution.observe(0.25));
+                                testing::assert_ok(current.decrement(1.0));
+                            }
+                        },
+                    ),
+                );
+            }
+            for _ in 0..100 {
+                for family in registry.snapshot().families() {
+                    for sample in family.samples {
+                        if let metrics::Value::Histogram(value) = sample.value {
+                            testing::assert_eq(value.cumulative[0], 0);
+                            testing::assert_eq(value.cumulative[1], value.count);
+                            testing::assert_eq(value.cumulative[2], value.count);
+                        }
+                    }
+                }
+            }
+            for worker in workers {
+                worker.join();
+            }
+        },
+    );
+    testing::assert_eq(testing::expect_ok(total.get(), "total"), 4000);
+    testing::assert_eq(testing::expect_ok(current.get(), "gauge"), 0.0);
+    testing::assert_eq(testing::expect_ok(distribution.get(), "histogram").count, 4000);
+    testing::assert_eq(testing::expect_ok(distribution.get(), "sum").sum, 1000.0);
+}
+
+#[test]
+fn concurrent_registration_shares_series_and_respects_cardinality() -> () {
+    let registry = testing::expect_ok(
+        metrics::Registry::new(
+            metrics::Options {
+                max_series: 1,
+                max_series_per_family: 1,
+                ..metrics::Options::standard(),
+            },
+        ),
+        "registry",
+    );
+    task::scope(
+        |scope| {
+            let workers = Vec::new();
+            for _ in 0..8 {
+                workers.push(
+                    scope.spawn(
+                        |_| {
+                            for _ in 0..100 {
+                                testing::assert_ok(counter(registry, "one_total").increment());
+                            }
+                        },
+                    ),
+                );
+            }
+            for worker in workers {
+                worker.join();
+            }
+        },
+    );
+    testing::assert_eq(registry.snapshot().series_count(), 1);
+    testing::assert_eq(testing::expect_ok(counter(registry, "one_total").get(), "sum"), 800);
+    testing::assert_eq(
+        testing::expect_err(
+            registry.gauge(metrics::Descriptor::gauge("second", ""), empty()),
+            "global bound",
+        ).kind,
+        metrics::ErrorKind::Limit,
+    );
+    testing::assert_eq(registry.snapshot().families().len(), 1);
+}
+
+#[test]
+fn collector_callbacks_are_reentrant_and_commit_as_one_consistent_batch() -> () {
+    let registry = registry();
+    let left = gauge(registry, "left");
+    let right = gauge(registry, "right");
+    task::scope(
+        |scope| {
+            let writer = scope.spawn(
+                |_| {
+                    for _ in 0..500 {
+                        testing::assert_ok(
+                            registry.collect_gauges(
+                                context::Context::background(),
+                                |_| {
+                                    let _ = registry.snapshot();
+                                    Result::Ok(
+                                        Vec::from_array(
+                                            [
+                                                metrics::GaugeReading {
+                                                    name: "left",
+                                                    labels: empty(),
+                                                    value: 1.0,
+                                                },
+                                                metrics::GaugeReading {
+                                                    name: "right",
+                                                    labels: empty(),
+                                                    value: 1.0,
+                                                },
+                                            ],
+                                        ),
+                                    )
+                                },
+                            ),
+                        );
+                        testing::assert_ok(
+                            registry.collect_gauges(
+                                context::Context::background(),
+                                |_| Result::Ok(
+                                    Vec::from_array(
+                                        [
+                                            metrics::GaugeReading {
+                                                name: "left",
+                                                labels: empty(),
+                                                value: 0.0,
+                                            },
+                                            metrics::GaugeReading {
+                                                name: "right",
+                                                labels: empty(),
+                                                value: 0.0,
+                                            },
+                                        ],
+                                    ),
+                                ),
+                            ),
+                        );
+                    }
+                },
+            );
+            for _ in 0..500 {
+                let values = registry.snapshot().families();
+                let metrics::Value::Gauge(left) = values[0].samples[0].value else {
+                    testing::fail("left gauge");
+                    return
+                };
+                let metrics::Value::Gauge(right) = values[1].samples[0].value else {
+                    testing::fail("right gauge");
+                    return
+                };
+                testing::assert_eq(left, right);
+            }
+            writer.join();
+        },
+    );
+    testing::assert_eq(testing::expect_ok(left.get(), "left"), 0.0);
+    testing::assert_eq(testing::expect_ok(right.get(), "right"), 0.0);
+}
+
+#[test]
+fn collector_failure_duplicates_unknown_series_and_cancellation_do_not_partially_apply() -> () {
+    let registry = registry();
+    let value = gauge(registry, "first");
+    let _ = gauge(registry, "second");
+    let first = metrics::GaugeReading { name: "first", labels: empty(), value: 42.0 };
+    for second in Vec::from_array(
+        [
+            metrics::GaugeReading {
+                name: "second",
+                labels: empty(),
+                value: float64_from_bits(0x7ff0000000000000),
+            },
+            metrics::GaugeReading { name: "missing", labels: empty(), value: 1.0 },
+            first,
+        ],
+    ) {
+        testing::assert_err(
+            registry.collect_gauges(
+                context::Context::background(),
+                |_| Result::Ok(Vec::from_array([first, second])),
+            ),
+        );
+        testing::assert_eq(testing::expect_ok(value.get(), "unchanged"), 0.0);
+    }
+    context::with_cancel(
+        context::Context::background(),
+        |ctx, cancel| {
+            testing::assert_err(
+                registry.collect_gauges(
+                    ctx,
+                    |_| {
+                        cancel.cancel();
+                        Result::Ok(Vec::from_array([first]))
+                    },
+                ),
+            );
+        },
+    );
+    testing::assert_eq(testing::expect_ok(value.get(), "cancelled unchanged"), 0.0);
+}
+
+#[test]
+fn deletion_races_have_explicit_detached_handle_semantics() -> () {
+    let registry = registry();
+    let value = counter(registry, "deleted_total");
+    task::scope(
+        |scope| {
+            let writer = scope.spawn(
+                |_| {
+                    for _ in 0..1000 {
+                        if let Err(problem) = value.increment() {
+                            testing::assert_eq(problem.kind, metrics::ErrorKind::Detached);
+                            break
+                        }
+                    }
+                },
+            );
+            testing::assert(registry.unregister("deleted_total"));
+            writer.join();
+        },
+    );
+    testing::assert_eq(
+        testing::expect_err(value.increment(), "stale").kind,
+        metrics::ErrorKind::Detached,
+    );
+    testing::assert_eq(
+        testing::expect_ok(counter(registry, "deleted_total").get(), "new generation"),
+        0,
+    );
+}

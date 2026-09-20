@@ -1,0 +1,353 @@
+package tests;
+
+use ecosystem::csv;
+use std::bytes;
+use std::io;
+use io::{Read, Write};
+use std::serde::{Deserialize, Serialize};
+use std::task;
+use std::testing;
+use std::utf8;
+
+#[derive(Serialize, Deserialize)]
+struct Person {
+    name: string,
+    age: u8,
+    active: bool,
+    rating: Option[f64],
+}
+
+fn person_schema() -> csv::Schema {
+    ok(
+        csv::Schema::new(
+            Vec::from_array(
+                [
+                    csv::Column::new("name", csv::ScalarType::Text),
+                    csv::Column::new("age", csv::ScalarType::Unsigned(8)),
+                    csv::Column::new("active", csv::ScalarType::Bool),
+                    csv::Column::new("rating", csv::ScalarType::Float(64)).optional(),
+                ],
+            ),
+        ),
+    )
+}
+
+#[test]
+fn typed_rows_decode_reordered_headers_and_optional_values_without_guessing_strings() -> () {
+    let source = chunks("active,rating,name,age\r\ntrue,4.5,Ada,37\r\nfalse,,0042,8\r\n", 1);
+    let reader = ok(
+        csv::Reader::new(source, csv::ReadOptions { headers: true, ..csv::ReadOptions::new() }),
+    );
+    let header = testing::expect_some(ok(reader.headers()), "header");
+    testing::assert(header.values() == Vec::from_array(["active", "rating", "name", "age"]));
+    let first: Person = testing::expect_some(ok(reader.decode_next(person_schema())), "person");
+    testing::assert_eq(first.name, "Ada");
+    testing::assert_eq(first.age, 37);
+    testing::assert(first.active);
+    testing::assert(first.rating == Option::Some(4.5));
+    let second: Person = testing::expect_some(ok(reader.decode_next(person_schema())), "person");
+    testing::assert_eq(second.name, "0042");
+    testing::assert_none(second.rating);
+    testing::assert_none(ok(reader.decode_next::[Person](person_schema())));
+}
+
+#[test]
+fn duplicate_headers_have_reject_first_and_last_policies() -> () {
+    let input = "name,name,age,active,rating\nfirst,last,2,true,\n";
+    let rejected = ok(
+        csv::Reader::new(
+            chunks(input, 1),
+            csv::ReadOptions { headers: true, ..csv::ReadOptions::new() },
+        ),
+    );
+    let duplicate = kind(rejected.headers(), csv::ErrorKind::Header);
+    testing::assert_eq(duplicate.position.byte, 5);
+    kind(rejected.next(), csv::ErrorKind::Header);
+    for (policy, expected) in Vec::from_array(
+        [(csv::HeaderPolicy::First, "first"), (csv::HeaderPolicy::Last, "last")],
+    ) {
+        let reader = ok(
+            csv::Reader::new(
+                chunks(input, 2),
+                csv::ReadOptions {
+                    headers: true,
+                    duplicate_headers: policy,
+                    ..csv::ReadOptions::new(),
+                },
+            ),
+        );
+        let person: Person = testing::expect_some(ok(reader.decode_next(person_schema())), "person");
+        testing::assert_eq(person.name, expected);
+    }
+    let empty = ok(
+        csv::Reader::new(
+            chunks("name,,age\n", 1),
+            csv::ReadOptions { headers: true, ..csv::ReadOptions::new() },
+        ),
+    );
+    kind(empty.headers(), csv::ErrorKind::Header);
+}
+
+#[test]
+fn typed_conversion_errors_identify_the_cell_and_allow_following_complete_rows() -> () {
+    let input = "name,age,active,rating\nAda,256,true,2\nBob,3,false,\n";
+    let reader = ok(
+        csv::Reader::new(
+            chunks(input, 1),
+            csv::ReadOptions { headers: true, ..csv::ReadOptions::new() },
+        ),
+    );
+    let invalid = kind(reader.decode_next::[Person](person_schema()), csv::ErrorKind::Type);
+    testing::assert_eq(invalid.position.line, 2);
+    testing::assert_eq(invalid.position.column, 5);
+    testing::assert(invalid.field == Option::Some(1));
+    let following: Person = testing::expect_some(
+        ok(reader.decode_next(person_schema())),
+        "following row",
+    );
+    testing::assert_eq(following.name, "Bob");
+    let raw = csv::StringRecord::new(Vec::from_array(["Ada", "1", "yes", "0"]));
+    kind(
+        person_schema().decode::[Person](raw, Option::None, csv::HeaderPolicy::Reject),
+        csv::ErrorKind::Type,
+    );
+    let raw = csv::StringRecord::new(Vec::from_array(["Ada", "1", "true", "NaN"]));
+    kind(
+        person_schema().decode::[Person](raw, Option::None, csv::HeaderPolicy::Reject),
+        csv::ErrorKind::Type,
+    );
+}
+
+#[test]
+fn typed_serde_roundtrips_flat_structs_with_auto_headers_bom_and_short_io() -> () {
+    let output = sink(1);
+    let writer = ok(
+        csv::Writer::new(
+            output,
+            csv::WriteOptions { headers: true, emit_bom: true, ..csv::WriteOptions::new() },
+        ),
+    );
+    testing::assert_ok(
+        writer.serialize(
+            Person { name: "A, \"B\"\nC", age: 255, active: true, rating: Option::Some(3.25) },
+            person_schema(),
+        ),
+    );
+    testing::assert_ok(
+        writer.serialize(
+            Person { name: "第二", age: 0, active: false, rating: Option::None },
+            person_schema(),
+        ),
+    );
+    testing::assert_ok(writer.flush());
+    let reader = ok(
+        csv::Reader::new(
+            Chunks { data: output.data, ..chunks("", 1) },
+            csv::ReadOptions { headers: true, ..csv::ReadOptions::new() },
+        ),
+    );
+    let first: Person = testing::expect_some(ok(reader.decode_next(person_schema())), "first");
+    testing::assert_eq(first.name, "A, \"B\"\nC");
+    testing::assert_eq(first.age, 255);
+    let second: Person = testing::expect_some(ok(reader.decode_next(person_schema())), "second");
+    testing::assert_eq(second.name, "第二");
+    testing::assert_none(second.rating);
+    testing::assert_none(ok(reader.next()));
+}
+
+#[derive(Serialize, Deserialize)]
+struct Nested {
+    name: Vec[string],
+}
+
+#[derive(Serialize, Deserialize)]
+struct TextOnly {
+    name: string,
+}
+
+#[test]
+fn schemas_reject_nested_values_missing_columns_unknown_headers_and_width_mismatches() -> () {
+    let schema = ok(
+        csv::Schema::new(Vec::from_array([csv::Column::new("name", csv::ScalarType::Text)])),
+    );
+    kind(schema.encode(Nested { name: Vec::from_array(["nested"]) }), csv::ErrorKind::Type);
+    kind(
+        schema.decode::[Nested](
+            csv::StringRecord::new(Vec::from_array(["value"])),
+            Option::None,
+            csv::HeaderPolicy::Reject,
+        ),
+        csv::ErrorKind::Type,
+    );
+    let record = csv::StringRecord::new(Vec::from_array(["Ada", "ignored"]));
+    let header = csv::StringRecord::new(Vec::from_array(["name", "extra"]));
+    kind(
+        schema.decode::[TextOnly](record, Option::Some(header), csv::HeaderPolicy::Reject),
+        csv::ErrorKind::Header,
+    );
+    let value: TextOnly = ok(
+        schema.allow_extra(true).decode(record, Option::Some(header), csv::HeaderPolicy::Reject),
+    );
+    testing::assert_eq(value.name, "Ada");
+    kind(
+        schema.decode::[TextOnly](record, Option::None, csv::HeaderPolicy::Reject),
+        csv::ErrorKind::Width,
+    );
+    kind(
+        schema.decode::[TextOnly](
+            csv::StringRecord::new(Vec::from_array(["x"])),
+            Option::Some(csv::StringRecord::new(Vec::from_array(["other"]))),
+            csv::HeaderPolicy::Reject,
+        ),
+        csv::ErrorKind::Header,
+    );
+    kind(
+        csv::Schema::new(Vec::from_array([csv::Column::new("n", csv::ScalarType::Signed(7))])),
+        csv::ErrorKind::Options,
+    );
+    kind(
+        csv::Schema::new(
+            Vec::from_array(
+                [
+                    csv::Column::new("n", csv::ScalarType::Text),
+                    csv::Column::new("n", csv::ScalarType::Text),
+                ],
+            ),
+        ),
+        csv::ErrorKind::Header,
+    );
+    let reader = ok(csv::Reader::new(chunks("a,b\nc\n", 1), csv::ReadOptions::new()));
+    let _ = one(reader);
+    kind(reader.next(), csv::ErrorKind::Width);
+    let reader = ok(
+        csv::Reader::new(
+            chunks("a,b\nc\n", 1),
+            csv::ReadOptions { flexible: true, ..csv::ReadOptions::new() },
+        ),
+    );
+    testing::assert_eq(rows(reader).len(), 2);
+}
+
+#[derive(Serialize, Deserialize)]
+struct Numeric {
+    signed: i64,
+    unsigned: u64,
+    character: char,
+}
+
+#[test]
+fn scalar_schemas_preserve_full_integer_ranges_chars_and_trim_policy() -> () {
+    let schema = ok(
+        csv::Schema::new(
+            Vec::from_array(
+                [
+                    csv::Column {
+                        trim: true,
+                        ..csv::Column::new("signed", csv::ScalarType::Signed(64)),
+                    },
+                    csv::Column::new("unsigned", csv::ScalarType::Unsigned(64)),
+                    csv::Column::new("character", csv::ScalarType::Char),
+                ],
+            ),
+        ),
+    );
+    let record = csv::StringRecord::new(
+        Vec::from_array([" -9223372036854775808 ", "18446744073709551615", "界"]),
+    );
+    let decoded: Numeric = ok(schema.decode(record, Option::None, csv::HeaderPolicy::Reject));
+    testing::assert_eq(decoded.signed, -9223372036854775807 - 1);
+    testing::assert_eq(decoded.unsigned, 18446744073709551615);
+    testing::assert_eq(decoded.character, '界');
+    let encoded = ok(schema.encode(decoded));
+    testing::assert(
+        encoded.values() == Vec::from_array(["-9223372036854775808", "18446744073709551615", "界"]),
+    );
+}
+
+#[test]
+fn failed_typed_serialization_and_combined_header_limits_write_nothing() -> () {
+    let output = sink(2);
+    let limits = csv::Limits { max_total_bytes: 20, ..csv::Limits::new() };
+    let writer = ok(
+        csv::Writer::new(
+            output,
+            csv::WriteOptions { headers: true, limits, ..csv::WriteOptions::new() },
+        ),
+    );
+    kind(
+        writer.serialize(
+            Person { name: "Ada", age: 1, active: true, rating: Option::None },
+            person_schema(),
+        ),
+        csv::ErrorKind::Limit,
+    );
+    testing::assert(output.data.is_empty());
+    let output = sink(2);
+    let writer = ok(
+        csv::Writer::new(output, csv::WriteOptions { headers: true, ..csv::WriteOptions::new() }),
+    );
+    let schema = ok(
+        csv::Schema::new(Vec::from_array([csv::Column::new("name", csv::ScalarType::Text)])),
+    );
+    kind(writer.serialize(Nested { name: Vec::new() }, schema), csv::ErrorKind::Type);
+    testing::assert(output.data.is_empty());
+    testing::assert_ok(writer.serialize(TextOnly { name: "valid" }, schema));
+    kind(
+        writer.serialize(
+            Person { name: "Ada", age: 1, active: true, rating: Option::None },
+            person_schema(),
+        ),
+        csv::ErrorKind::Width,
+    );
+}
+
+#[test]
+fn shared_reader_and_writer_handles_serialize_concurrent_calls() -> () {
+    let output = sink(1);
+    let writer = ok(csv::Writer::new(output, csv::WriteOptions::new()));
+    task::scope(
+        |scope| {
+            for worker in 0..4 {
+                let _ = scope.spawn(
+                    |_: task::CancelToken| {
+                        for index in 0..30 {
+                            testing::assert_ok(
+                                writer.write(
+                                    csv::StringRecord::new(
+                                        Vec::from_array([worker.to_string(), index.to_string()]),
+                                    ),
+                                ),
+                            );
+                        }
+                    },
+                );
+            }
+        },
+    );
+    let reader = ok(
+        csv::Reader::new(Chunks { data: output.data, ..chunks("", 1) }, csv::ReadOptions::new()),
+    );
+    let collected = Channel::new(120);
+    task::scope(
+        |scope| {
+            for _ in 0..4 {
+                let _ = scope.spawn(
+                    |_: task::CancelToken| {
+                        while let Some(record) = ok(reader.next()) {
+                            collected.send(record.values()[0] + ":" + record.values()[1]);
+                        }
+                    },
+                );
+            }
+        },
+    );
+    collected.close();
+    let seen = HashMap::new();
+    let mut count = 0;
+    while let Some(key) = collected.recv() {
+        testing::assert(seen.get(key).is_none());
+        seen.set(key, true);
+        count += 1;
+    }
+    testing::assert_eq(count, 120);
+}

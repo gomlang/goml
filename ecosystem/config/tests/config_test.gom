@@ -1,0 +1,463 @@
+package tests;
+
+use ecosystem::config;
+use std::json;
+use std::serde;
+use serde::{Deserialize, Serialize};
+use std::testing;
+
+#[derive(Serialize, Deserialize)]
+struct Database {
+    host: string,
+    port: isize,
+}
+
+#[derive(Serialize, Deserialize)]
+struct App {
+    database: Database,
+    debug: bool,
+    tags: Vec[string],
+}
+
+fn ok[T](result: Result[T, config::Error]) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.to_string());
+            loop {}
+        },
+    }
+}
+
+fn build(input: string) -> config::Snapshot {
+    ok(config::Builder::new().with_source(config::Source::json("input", input)).build())
+}
+
+fn read_int(snapshot: config::Snapshot, path: string) -> isize {
+    ok(snapshot.decode_at(path))
+}
+
+fn kind[T](result: Result[T, config::Error], expected: config::ErrorKind) -> () {
+    testing::assert_eq(testing::expect_err(result, "expected configuration failure").kind, expected);
+}
+
+#[test]
+fn all_sources_merge_in_insertion_order_and_decode_typed_values() -> () {
+    let defaults = ok(
+        config::Source::defaults(
+            App {
+                database: Database { host: "localhost", port: 5000 },
+                debug: false,
+                tags: Vec::from_array(["default"]),
+            },
+        ),
+    );
+    let environment = config::Source::environment_values(
+        "environment",
+        config::EnvOptions::new("APP_"),
+        Vec::from_array(
+            [("APP_DATABASE__PORT", "7000"), ("APP_DEBUG", "true"), ("OTHER_DATABASE__PORT", "42")],
+        ),
+    );
+    let overrides = config::Source::overrides(
+        "cli",
+        Vec::from_array([ok(config::Override::value("/database/port", 8000))]),
+    );
+    let snapshot = ok(
+        config::Builder::new().with_source(defaults).with_source(
+            config::Source::json("json", "{\"database\":{\"port\":6000}}"),
+        ).with_source(config::Source::toml("toml", "[database]\nhost = 'production'\n")).with_source(
+            environment,
+        ).with_source(overrides).validate_with(
+            |snapshot| {
+                let _: App = snapshot.decode()?;
+                Result::Ok(())
+            },
+        ).build(),
+    );
+    let app: App = ok(snapshot.decode());
+    testing::assert_eq(app.database.host, "production");
+    testing::assert_eq(app.database.port, 8000);
+    testing::assert(app.debug);
+    testing::assert(app.tags == Vec::from_array(["default"]));
+    testing::assert_eq(ok(snapshot.origin("/database/host")).source, "toml");
+    testing::assert_eq(ok(snapshot.origin("/database/port")).source, "cli");
+    testing::assert_eq(ok(snapshot.origin("/debug")).detail, "APP_DEBUG");
+    testing::assert_eq(ok(snapshot.origin("/tags/0")).source, "defaults");
+}
+
+#[test]
+fn arrays_have_explicit_replace_and_append_policies_and_element_origins() -> () {
+    let base = config::Builder::new().with_source(config::Source::json("base", "{\"items\":[1,2]}")).with_source(
+        config::Source::json("next", "{\"items\":[3]}"),
+    );
+    let replaced = ok(base.build());
+    let values: Vec[isize] = ok(replaced.decode_at("/items"));
+    testing::assert(values == Vec::from_array([3]));
+    let appended = ok(base.with_arrays(config::ArrayMerge::Append).build());
+    let values: Vec[isize] = ok(appended.decode_at("/items"));
+    testing::assert(values == Vec::from_array([1, 2, 3]));
+    testing::assert_eq(ok(appended.origin("/items/0")).source, "base");
+    testing::assert_eq(ok(appended.origin("/items/2")).source, "next");
+    testing::assert_eq(ok(appended.origin("/items")).source, "next");
+}
+
+#[test]
+fn null_and_unset_are_distinct_and_scalar_replacement_is_explicit() -> () {
+    let snapshot = ok(
+        config::Builder::new().with_source(
+            config::Source::json("base", "{\"a\":1,\"b\":2,\"nested\":{\"old\":true}}"),
+        ).with_source(config::Source::json("next", "{\"a\":null,\"nested\":false}")).with_source(
+            config::Source::overrides(
+                "cli",
+                Vec::from_array(
+                    [config::Override::unset("/b"), config::Override::unset("/missing/child")],
+                ),
+            ),
+        ).build(),
+    );
+    testing::assert(ok(snapshot.contains("/a")));
+    testing::assert(!ok(snapshot.contains("/b")));
+    let value: Option[isize] = ok(snapshot.decode_at("/a"));
+    testing::assert_none(value);
+    let value: bool = ok(snapshot.decode_at("/nested"));
+    testing::assert(!value);
+    kind(snapshot.get("/nested/old"), config::ErrorKind::Type);
+}
+
+#[test]
+fn json_pointer_escaping_arrays_append_and_remove_are_checked() -> () {
+    let base = config::Builder::new().with_source(
+        config::Source::json("base", "{\"a/b\":{\"~key\":[10,20]},\"\":9}"),
+    );
+    let snapshot = ok(
+        base.with_source(
+            config::Source::overrides(
+                "cli",
+                Vec::from_array(
+                    [
+                        config::Override::unset("/a~1b/~0key/0"),
+                        ok(config::Override::value("/a~1b/~0key/-", 30)),
+                        ok(config::Override::value("/new/deep", true)),
+                    ],
+                ),
+            ),
+        ).build(),
+    );
+    testing::assert_eq(read_int(snapshot, "/a~1b/~0key/0"), 20);
+    testing::assert_eq(read_int(snapshot, "/a~1b/~0key/1"), 30);
+    testing::assert_eq(read_int(snapshot, "/"), 9);
+    kind(snapshot.get("a/b"), config::ErrorKind::Path);
+    kind(snapshot.get("/~2"), config::ErrorKind::Path);
+    kind(snapshot.get("/a~1b/~0key/01"), config::ErrorKind::Path);
+    kind(snapshot.get("/a~1b/~0key/-1"), config::ErrorKind::Path);
+    kind(snapshot.get("/a~1b/~0key/2"), config::ErrorKind::Missing);
+    kind(
+        base.with_source(
+            config::Source::overrides("cli", Vec::from_array([config::Override::unset("")])),
+        ).build(),
+        config::ErrorKind::Path,
+    );
+}
+
+#[test]
+fn environment_value_modes_preserve_strings_and_parse_structured_values() -> () {
+    let pairs = Vec::from_array(
+        [
+            ("APP_NUMBER", "42"),
+            ("APP_LIST", "[1,2]"),
+            ("APP_TEXT", "unquoted"),
+            ("APP_NULL", "null"),
+        ],
+    );
+    let snapshot = ok(
+        config::Builder::new().with_source(
+            config::Source::environment_values("env", config::EnvOptions::new("APP_"), pairs),
+        ).build(),
+    );
+    testing::assert_eq(read_int(snapshot, "/number"), 42);
+    let list: Vec[isize] = ok(snapshot.decode_at("/list"));
+    testing::assert(list == Vec::from_array([1, 2]));
+    let text_value: string = ok(snapshot.decode_at("/text"));
+    testing::assert_eq(text_value, "unquoted");
+    let options = config::EnvOptions {
+        lowercase: false,
+        separator: "_",
+        mode: config::ValueMode::String,
+        ..config::EnvOptions::new("APP_"),
+    };
+    let snapshot = ok(
+        config::Builder::new().with_source(
+            config::Source::environment_values(
+                "env",
+                options,
+                Vec::from_array([("APP_DB_PORT", "0042")]),
+            ),
+        ).build(),
+    );
+    let text_value: string = ok(snapshot.decode_at("/DB/PORT"));
+    testing::assert_eq(text_value, "0042");
+    let options = config::EnvOptions {
+        mode: config::ValueMode::Json,
+        ..config::EnvOptions::new("APP_"),
+    };
+    kind(
+        config::Builder::new().with_source(
+            config::Source::environment_values(
+                "env",
+                options,
+                Vec::from_array([("APP_KEY", "not-json")]),
+            ),
+        ).build(),
+        config::ErrorKind::Parse,
+    );
+}
+
+#[test]
+fn environment_mapping_rejects_collisions_and_empty_segments() -> () {
+    for entries in Vec::from_array(
+        [
+            Vec::from_array([("APP_DB", "1"), ("APP_db", "2")]),
+            Vec::from_array([("APP_DB", "1"), ("APP_DB__PORT", "2")]),
+            Vec::from_array([("APP_DB__PORT", "2"), ("APP_DB", "1")]),
+        ],
+    ) {
+        kind(
+            config::Builder::new().with_source(
+                config::Source::environment_values("env", config::EnvOptions::new("APP_"), entries),
+            ).build(),
+            config::ErrorKind::Duplicate,
+        );
+    }
+    for name in Vec::from_array(["APP_", "APP_DB__", "APP___PORT"]) {
+        kind(
+            config::Builder::new().with_source(
+                config::Source::environment_values(
+                    "env",
+                    config::EnvOptions::new("APP_"),
+                    Vec::from_array([(name, "1")]),
+                ),
+            ).build(),
+            config::ErrorKind::Path,
+        );
+    }
+    let options = config::EnvOptions { separator: "", ..config::EnvOptions::new("APP_") };
+    kind(
+        config::Builder::new().with_source(
+            config::Source::environment_values("env", options, Vec::new()),
+        ).build(),
+        config::ErrorKind::InvalidOptions,
+    );
+}
+
+#[test]
+fn snapshots_builders_sources_and_returned_values_do_not_alias_mutable_vectors() -> () {
+    let entries = Vec::from_array([("APP_ITEM", "1")]);
+    let source = config::Source::environment_values("env", config::EnvOptions::new("APP_"), entries);
+    entries.push(("APP_LATE", "2"));
+    let base = config::Builder::new().with_source(source);
+    let next = base.with_source(config::Source::json("next", "{\"items\":[{\"x\":1}]}"));
+    let old = ok(base.build());
+    let snapshot = ok(next.build());
+    testing::assert(!ok(old.contains("/items")));
+    testing::assert(!ok(snapshot.contains("/late")));
+    if let json::Value::Array(items) = ok(snapshot.get("/items")) {
+        items.push(json::Value::Null);
+        if let json::Value::Object(fields) = items[0] {
+            fields.push(("injected", json::Value::Bool(true)));
+        }
+    }
+    testing::assert(!ok(snapshot.contains("/items/0/injected")));
+    kind(snapshot.get("/items/1"), config::ErrorKind::Missing);
+    let origins = snapshot.origins();
+    let original_count = origins.len();
+    origins.push(("injected", config::Origin { source: "outside", detail: "" }));
+    testing::assert_eq(snapshot.origins().len(), original_count);
+}
+
+#[test]
+fn malformed_documents_duplicate_keys_and_non_objects_fail_with_sources() -> () {
+    for input in Vec::from_array(["[1]", "null", "true", "42", "\"text\""]) {
+        kind(
+            config::Builder::new().with_source(config::Source::json("root", input)).build(),
+            config::ErrorKind::Type,
+        );
+    }
+    let error = testing::expect_err(
+        config::Builder::new().with_source(config::Source::json("duplicate", "{\"a\":1,\"a\":2}")).build(),
+        "duplicate",
+    );
+    testing::assert_eq(error.kind, config::ErrorKind::Duplicate);
+    testing::assert_eq(error.path, "/a");
+    testing::assert_eq(error.origin.source, "duplicate");
+    kind(
+        config::Builder::new().with_source(config::Source::json("invalid", "{broken")).build(),
+        config::ErrorKind::Parse,
+    );
+    kind(
+        config::Builder::new().with_source(config::Source::toml("invalid", "[broken")).build(),
+        config::ErrorKind::Parse,
+    );
+}
+
+#[test]
+fn type_errors_and_custom_validation_include_paths_and_provenance() -> () {
+    let snapshot = build("{\"database\":{\"port\":\"bad\"}}");
+    let error = testing::expect_err(snapshot.decode_at::[isize]("/database/port"), "type");
+    testing::assert_eq(error.path, "/database/port");
+    testing::assert_eq(error.origin.source, "input");
+    let builder = config::Builder::new().with_source(config::Source::json("ports", "{\"port\":0}")).validate_with(
+        |snapshot| {
+            let port: isize = snapshot.decode_at("/port")?;
+            if port < 1 || port > 65535 {
+                Result::Err(snapshot.invalid("/port", "port out of range"))
+            } else {
+                Result::Ok(())
+            }
+        },
+    );
+    let error = testing::expect_err(builder.build(), "validation");
+    testing::assert_eq(error.kind, config::ErrorKind::Validation);
+    testing::assert_eq(error.path, "/port");
+    testing::assert_eq(error.origin.source, "ports");
+}
+
+#[test]
+fn limits_cover_bytes_sources_nodes_depth_and_generated_paths() -> () {
+    let base = config::Builder::new().with_source(config::Source::json("a", "{\"a\":1}"));
+    kind(
+        base.with_limits(config::Limits { max_source_bytes: 2, ..config::Limits::new() }).build(),
+        config::ErrorKind::Limit,
+    );
+    kind(
+        base.with_source(config::Source::json("b", "{\"b\":2}")).with_limits(
+            config::Limits { max_total_bytes: 10, ..config::Limits::new() },
+        ).build(),
+        config::ErrorKind::Limit,
+    );
+    kind(
+        base.with_source(config::Source::json("b", "{}")).with_limits(
+            config::Limits { max_sources: 1, ..config::Limits::new() },
+        ).build(),
+        config::ErrorKind::Limit,
+    );
+    kind(
+        base.with_limits(config::Limits { max_nodes: 1, ..config::Limits::new() }).build(),
+        config::ErrorKind::Limit,
+    );
+    kind(
+        base.with_limits(config::Limits { max_depth: 0, ..config::Limits::new() }).build(),
+        config::ErrorKind::InvalidOptions,
+    );
+    kind(
+        config::Builder::new().with_source(config::Source::json("nested", "{\"a\":[[[1]]]}")).with_limits(
+            config::Limits { max_depth: 2, ..config::Limits::new() },
+        ).build(),
+        config::ErrorKind::Limit,
+    );
+    kind(
+        config::Builder::new().with_source(
+            config::Source::overrides(
+                "paths",
+                Vec::from_array([ok(config::Override::value("/a/b/c", 1))]),
+            ),
+        ).with_limits(config::Limits { max_depth: 2, ..config::Limits::new() }).build(),
+        config::ErrorKind::Limit,
+    );
+    let quoted = ok(
+        config::Builder::new().with_source(config::Source::json("quoted", "{\"s\":\"[[[[[[[\"}")).with_limits(
+            config::Limits { max_depth: 1, ..config::Limits::new() },
+        ).build(),
+    );
+    let text_value: string = ok(quoted.decode_at("/s"));
+    testing::assert_eq(text_value, "[[[[[[[");
+}
+
+#[test]
+fn toml_strings_comments_and_nested_keys_share_the_same_data_model() -> () {
+    let snapshot = ok(
+        config::Builder::new().with_source(
+            config::Source::toml(
+                "toml",
+                "# [[[[[[[\nname = '[literal]'\nmessage = \"line 1\\n[[ line 2 ]]\"\nvalues = [1, 2]\n[database]\nhost = 'local'\nport = 9000\n",
+            ),
+        ).build(),
+    );
+    let name: string = ok(snapshot.decode_at("/name"));
+    testing::assert_eq(name, "[literal]");
+    let database: Database = ok(snapshot.decode_at("/database"));
+    testing::assert_eq(database.port, 9000);
+    let encoded = snapshot.json();
+    let roundtrip = build(encoded);
+    testing::assert_eq(read_int(roundtrip, "/database/port"), 9000);
+}
+
+#[test]
+fn ordered_overrides_support_create_replace_remove_and_checked_traversal() -> () {
+    let items = Vec::from_array(
+        [
+            ok(config::Override::value("/created/nested", 1)),
+            ok(config::Override::value("/created/nested", 2)),
+            config::Override::unset("/created/nested"),
+            ok(config::Override::value("/created/reborn", "ok")),
+        ],
+    );
+    let snapshot = ok(
+        config::Builder::new().with_source(config::Source::overrides("cli", items)).build(),
+    );
+    testing::assert(!ok(snapshot.contains("/created/nested")));
+    let value: string = ok(snapshot.decode_at("/created/reborn"));
+    testing::assert_eq(value, "ok");
+    kind(
+        config::Builder::new().with_source(config::Source::json("base", "{\"a\":1}")).with_source(
+            config::Source::overrides(
+                "cli",
+                Vec::from_array([ok(config::Override::value("/a/b", 2))]),
+            ),
+        ).build(),
+        config::ErrorKind::Type,
+    );
+}
+
+#[test]
+fn source_limits_apply_across_override_entries_and_environment_values() -> () {
+    let limits = config::Limits { max_source_bytes: 8, ..config::Limits::new() };
+    let overrides = Vec::from_array(
+        [
+            config::Override::text("/one", "1", config::ValueMode::Json),
+            config::Override::text("/two", "2", config::ValueMode::Json),
+        ],
+    );
+    kind(
+        config::Builder::new().with_limits(limits).with_source(
+            config::Source::overrides("cli", overrides),
+        ).build(),
+        config::ErrorKind::Limit,
+    );
+    kind(
+        config::Builder::new().with_limits(limits).with_source(
+            config::Source::environment_values(
+                "env",
+                config::EnvOptions::new("A_"),
+                Vec::from_array([("A_X", "12"), ("A_Y", "34")]),
+            ),
+        ).build(),
+        config::ErrorKind::Limit,
+    );
+    let error = testing::expect_err(
+        config::Builder::new().with_source(
+            config::Source::overrides(
+                "command line",
+                Vec::from_array(
+                    [config::Override::text("/server/port", "broken", config::ValueMode::Json)],
+                ),
+            ),
+        ).build(),
+        "invalid CLI value",
+    );
+    testing::assert_eq(error.path, "/server/port");
+    testing::assert_eq(error.origin.source, "command line");
+    let left = build("{\"b\":2,\"a\":{\"d\":4,\"c\":3}}");
+    let right = build("{\"a\":{\"c\":3,\"d\":4},\"b\":2}");
+    testing::assert_eq(left.json(), right.json());
+}

@@ -1,0 +1,476 @@
+package tests;
+
+use ecosystem::fuzzy;
+use std::context;
+use std::testing;
+use std::time;
+
+fn matcher() -> fuzzy::Matcher {
+    testing::expect_ok(fuzzy::Matcher::new(fuzzy::Options::new()), "matcher")
+}
+
+fn found(query: string, source: string) -> fuzzy::Match {
+    testing::expect_some(testing::expect_ok(matcher().find(query, source), "match"), "found")
+}
+
+#[test]
+fn contiguous_matches_and_path_boundaries_rank_first() -> () {
+    testing::assert(found("abc", "abc").score > found("abc", "a_b_c").score);
+    testing::assert(found("file", "src/file.gom").score > found("file", "src/profile.gom").score);
+    testing::assert(found("fb", "FooBar").score > found("fb", "foobaz").score);
+    testing::assert_eq(found("abc", "abc").score, 76);
+    testing::assert(testing::expect_ok(matcher().find("acb", "abc"), "missing").is_none());
+}
+
+#[test]
+fn unicode_folding_maps_expansions_to_original_graphemes() -> () {
+    let result = found("strasse", "Straße");
+    testing::assert(result.ranges == Vec::from_array([fuzzy::Range { start: 0, end: 7 }]));
+    testing::assert(result.graphemes == Vec::from_array([0, 1, 2, 3, 4, 5]));
+    let accent = found("e", "e\u0301");
+    testing::assert(accent.ranges == Vec::from_array([fuzzy::Range { start: 0, end: 3 }]));
+    let emoji = found("👩", "x👩‍💻z");
+    testing::assert(emoji.graphemes == Vec::from_array([1]));
+    testing::assert(emoji.ranges == Vec::from_array([fuzzy::Range { start: 1, end: 12 }]));
+    testing::assert(testing::expect_ok(matcher().find("σ", "Σς"), "greek").is_some());
+}
+
+#[test]
+fn smart_case_and_explicit_case_modes() -> () {
+    testing::assert(testing::expect_ok(matcher().find("Foo", "foo"), "smart").is_none());
+    testing::assert(testing::expect_ok(matcher().find("foo", "FOO"), "smart").is_some());
+    let sensitive = testing::expect_ok(
+        fuzzy::Matcher::new(
+            fuzzy::Options { case_mode: fuzzy::CaseMode::Sensitive, ..fuzzy::Options::new() },
+        ),
+        "sensitive",
+    );
+    testing::assert(testing::expect_ok(sensitive.find("a", "A"), "case").is_none());
+    let folded = testing::expect_ok(
+        fuzzy::Matcher::new(
+            fuzzy::Options { case_mode: fuzzy::CaseMode::Fold, ..fuzzy::Options::new() },
+        ),
+        "fold",
+    );
+    testing::assert(testing::expect_ok(folded.find("STRASSE", "Straße"), "expansion").is_some());
+}
+
+#[test]
+fn contiguous_kinds_enforce_both_anchors() -> () {
+    let ctx = context::Context::background();
+    let cases = Vec::from_array(
+        [
+            (fuzzy::MatchKind::Fuzzy, "a/b/c", true),
+            (fuzzy::MatchKind::Substring, "a/b/c", false),
+            (fuzzy::MatchKind::Substring, "xabcx", true),
+            (fuzzy::MatchKind::Prefix, "abcx", true),
+            (fuzzy::MatchKind::Prefix, "xabc", false),
+            (fuzzy::MatchKind::Suffix, "xabc", true),
+            (fuzzy::MatchKind::Suffix, "abcx", false),
+            (fuzzy::MatchKind::Exact, "abc", true),
+            (fuzzy::MatchKind::Exact, "abcx", false),
+        ],
+    );
+    for (kind, text, expected) in cases {
+        testing::assert_eq(
+            testing::expect_ok(matcher().find_with("abc", text, kind, ctx), "kind").is_some(),
+            expected,
+        );
+    }
+    testing::assert(
+        testing::expect_ok(matcher().find_with("", "x", fuzzy::MatchKind::Exact, ctx), "empty").is_none(),
+    );
+    testing::assert(
+        testing::expect_ok(matcher().find_with("", "", fuzzy::MatchKind::Exact, ctx), "empty").is_some(),
+    );
+}
+
+#[test]
+fn highlights_merge_adjacent_clusters_but_keep_gaps() -> () {
+    let result = found("abcd", "ab__cd");
+    testing::assert(
+        result.ranges
+            == Vec::from_array(
+                [fuzzy::Range { start: 0, end: 2 }, fuzzy::Range { start: 4, end: 6 }],
+            ),
+    );
+    testing::assert(result.graphemes == Vec::from_array([0, 1, 4, 5]));
+    testing::assert_eq(found("", "anything").score, 0);
+}
+
+#[test]
+fn work_input_and_output_budgets_are_explicit_errors() -> () {
+    testing::assert_err(
+        fuzzy::Matcher::new(fuzzy::Options { max_cells: 0, ..fuzzy::Options::new() }),
+    );
+    let limited = testing::expect_ok(
+        fuzzy::Matcher::new(
+            fuzzy::Options {
+                max_cells: 3,
+                max_pattern_units: 2,
+                max_bytes: 5,
+                ..fuzzy::Options::new(),
+            },
+        ),
+        "limits",
+    );
+    testing::assert_eq(
+        testing::expect_err(limited.find("ab", "abc"), "work"),
+        fuzzy::Error::WorkLimit,
+    );
+    testing::assert_eq(
+        testing::expect_err(limited.find("abc", "abc"), "pattern"),
+        fuzzy::Error::PatternLimit,
+    );
+    testing::assert_eq(
+        testing::expect_err(limited.prepare("123456"), "bytes"),
+        fuzzy::Error::InputLimit,
+    );
+    testing::assert_err(matcher().search("a", Vec::new(), -1, context::Context::background()));
+    testing::assert_err(
+        matcher().search_parallel("a", Vec::new(), 1, 0, context::Context::background()),
+    );
+}
+
+#[test]
+fn top_k_counts_all_matches_and_breaks_ties_by_input_order() -> () {
+    let values = Vec::from_array(["abc", "abc", "a_b_c", "none", "xabc"]);
+    let report = testing::expect_ok(
+        matcher().search("abc", values, 2, context::Context::background()),
+        "search",
+    );
+    testing::assert_eq(report.total, 4);
+    testing::assert_eq(report.scanned, 5);
+    testing::assert_eq(report.hits.len(), 2);
+    testing::assert_eq(report.hits[0].index, 0);
+    testing::assert_eq(report.hits[1].index, 1);
+    let count = testing::expect_ok(
+        matcher().search("abc", values, 0, context::Context::background()),
+        "count",
+    );
+    testing::assert_eq(count.total, 4);
+    testing::assert(count.hits.is_empty());
+}
+
+#[test]
+fn incremental_sessions_retain_all_matches_and_are_persistent() -> () {
+    let ctx = context::Context::background();
+    let original = testing::expect_ok(
+        fuzzy::Session::new(matcher(), Vec::from_array(["alpha", "alpine", "beta", "xyz"])),
+        "session",
+    );
+    let (first, report) = testing::expect_ok(original.update("a", 1, ctx), "first");
+    testing::assert_eq(report.total, 3);
+    let (second, report) = testing::expect_ok(first.update("alp", 1, ctx), "narrow");
+    testing::assert_eq(report.scanned, 3);
+    testing::assert_eq(report.total, 2);
+    let (_, report) = testing::expect_ok(second.update("alpi", 1, ctx), "outside prior top-k");
+    testing::assert_eq(report.hits[0].text, "alpine");
+    let (_, report) = testing::expect_ok(second.update("x", 5, ctx), "reset");
+    testing::assert_eq(report.scanned, 4);
+    testing::assert_eq(report.hits[0].text, "xyz");
+    let (_, report) = testing::expect_ok(original.update("", 5, ctx), "original intact");
+    testing::assert_eq(report.total, 4);
+}
+
+#[test]
+fn smart_case_transition_and_mutable_input_do_not_corrupt_sessions() -> () {
+    let values = Vec::from_array(["ab", "aB", "ABC"]);
+    let session = testing::expect_ok(fuzzy::Session::new(matcher(), values), "session");
+    values.clear();
+    let ctx = context::Context::background();
+    let (first, _) = testing::expect_ok(session.update("a", 3, ctx), "first");
+    let (_, report) = testing::expect_ok(first.update("aB", 3, ctx), "case transition");
+    testing::assert_eq(report.scanned, 3);
+    testing::assert_eq(report.total, 1);
+    testing::assert_eq(report.hits[0].text, "aB");
+}
+
+#[test]
+fn parallel_search_matches_serial_scores_indices_and_highlights() -> () {
+    let values = Vec::new();
+    for index in 0..240 {
+        values.push("src/" + index.to_string() + "/fuzzy_match.gom");
+    }
+    let ctx = context::Context::background();
+    let serial = testing::expect_ok(matcher().search("fm", values, 25, ctx), "serial");
+    for workers in Vec::from_array([1, 2, 7, 32]) {
+        let parallel = testing::expect_ok(
+            matcher().search_parallel("fm", values, 25, workers, ctx),
+            "parallel",
+        );
+        testing::assert_eq(parallel.total, serial.total);
+        testing::assert_eq(parallel.scanned, serial.scanned);
+        for index in 0..serial.hits.len() {
+            testing::assert_eq(parallel.hits[index].index, serial.hits[index].index);
+            testing::assert_eq(parallel.hits[index].matched.score, serial.hits[index].matched.score);
+            testing::assert(
+                parallel.hits[index].matched.ranges == serial.hits[index].matched.ranges,
+            );
+        }
+    }
+}
+
+#[test]
+fn cancellation_and_expired_deadlines_propagate_without_leaking_tasks() -> () {
+    let before = std::task::active_scope_count();
+    context::with_cancel(
+        context::Context::background(),
+        |ctx, cancel| {
+            cancel.cancel();
+            testing::assert_eq(
+                testing::expect_err(
+                    matcher().find_with("a", "abc", fuzzy::MatchKind::Fuzzy, ctx),
+                    "cancel",
+                ),
+                fuzzy::Error::Cancelled,
+            );
+            testing::assert_err(matcher().search_parallel("a", Vec::from_array(["a"]), 1, 4, ctx));
+            testing::assert_err(fuzzy::Session::new_with(matcher(), Vec::from_array(["a"]), ctx));
+        },
+    );
+    context::with_timeout(
+        context::Context::background(),
+        time::Duration::zero(),
+        |ctx, _| {
+            testing::assert_eq(
+                testing::expect_err(
+                    matcher().find_with("a", "abc", fuzzy::MatchKind::Fuzzy, ctx),
+                    "deadline",
+                ),
+                fuzzy::Error::DeadlineExceeded,
+            );
+        },
+    );
+    testing::assert_eq(std::task::active_scope_count(), before);
+}
+
+fn brute_score(query: string, source: string, at: isize, from: isize, chosen: Vec[isize]) -> Option[
+    isize,
+] {
+    if at == query.byte_len() {
+        if chosen.is_empty() {
+            return Option::Some(0);
+        }
+        let mut score = 0;
+        for index in 0..chosen.len() {
+            let column = chosen[index];
+            score += 16
+                + if column == 0 {
+                    12
+                } else {
+                    0
+                };
+            if index == 0 {
+                score -= column;
+            } else if column == chosen[index - 1] + 1 {
+                score += 8;
+            } else {
+                score -= column - chosen[index - 1] - 1 + 3;
+            }
+        }
+        return Option::Some(score - (source.byte_len() - chosen[chosen.len() - 1] - 1) / 4);
+    }
+    let mut best = Option::None;
+    for index in from..source.byte_len() {
+        if query.byte_slice(at, at + 1) == source.byte_slice(index, index + 1) {
+            let next = chosen.copy();
+            next.push(index);
+            if let Some(score) = brute_score(query, source, at + 1, index + 1, next) {
+                if best.is_none() || score > best.unwrap_or(0) {
+                    best = Option::Some(score);
+                }
+            }
+        }
+    }
+    best
+}
+
+#[test]
+fn dynamic_programming_agrees_with_exhaustive_subsequence_enumeration() -> () {
+    for length in 0..7 {
+        for bits in 0..(1 << length) {
+            let mut source = "";
+            for index in 0..length {
+                source += if bits & (1 << index) == 0 {
+                    "a"
+                } else {
+                    "b"
+                };
+            }
+            for query in Vec::from_array(
+                ["", "a", "b", "aa", "ab", "ba", "bb", "aba", "bab", "aaaa"],
+            ) {
+                let expected = brute_score(query, source, 0, 0, Vec::new());
+                let actual = testing::expect_ok(matcher().find(query, source), "exhaustive");
+                testing::assert(actual.map(|value| value.score) == expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn prepared_inputs_recheck_receiver_byte_budgets_before_early_returns() -> () {
+    let donor = matcher();
+    let limited = testing::expect_ok(
+        fuzzy::Matcher::new(fuzzy::Options { max_bytes: 1, ..fuzzy::Options::new() }),
+        "limited bytes",
+    );
+    let large = testing::expect_ok(donor.prepare("é"), "two-byte scalar");
+    let small = testing::expect_ok(donor.prepare("a"), "small candidate");
+    let ctx = context::Context::background();
+    for kind in Vec::from_array([fuzzy::MatchKind::Fuzzy, fuzzy::MatchKind::Exact]) {
+        for query in Vec::from_array(["", "a"]) {
+            let pattern = testing::expect_ok(donor.pattern(query, kind), "pattern");
+            testing::assert_eq(
+                testing::expect_err(limited.match_prepared(pattern, large, ctx), "candidate bytes"),
+                fuzzy::Error::InputLimit,
+            );
+        }
+        let large_pattern = testing::expect_ok(donor.pattern("é", kind), "two-byte pattern");
+        testing::assert_eq(
+            testing::expect_err(limited.match_prepared(large_pattern, small, ctx), "pattern bytes"),
+            fuzzy::Error::PatternLimit,
+        );
+    }
+}
+
+#[test]
+fn prepared_units_and_patterns_cannot_bypass_limits_with_empty_or_impossible_matches() -> () {
+    let donor = matcher();
+    let limited = testing::expect_ok(
+        fuzzy::Matcher::new(
+            fuzzy::Options { max_units: 1, max_pattern_units: 1, ..fuzzy::Options::new() },
+        ),
+        "unit limits",
+    );
+    let ctx = context::Context::background();
+    let large = testing::expect_ok(donor.prepare("ab"), "large candidate");
+    let empty = testing::expect_ok(donor.pattern("", fuzzy::MatchKind::Fuzzy), "empty pattern");
+    testing::assert_eq(
+        testing::expect_err(
+            limited.match_prepared(empty, large, ctx),
+            "empty still checks candidate units",
+        ),
+        fuzzy::Error::InputLimit,
+    );
+    let large_pattern = testing::expect_ok(
+        donor.pattern("abc", fuzzy::MatchKind::Exact),
+        "large pattern",
+    );
+    let short = testing::expect_ok(donor.prepare("a"), "short candidate");
+    testing::assert_eq(
+        testing::expect_err(
+            limited.match_prepared(large_pattern, short, ctx),
+            "impossible match still checks pattern units",
+        ),
+        fuzzy::Error::PatternLimit,
+    );
+    let sensitive = testing::expect_ok(
+        fuzzy::Matcher::new(
+            fuzzy::Options {
+                max_units: 1,
+                case_mode: fuzzy::CaseMode::Sensitive,
+                ..fuzzy::Options::new(),
+            },
+        ),
+        "sensitive limits",
+    );
+    let folded_expansion = testing::expect_ok(donor.prepare("ß"), "cached both representations");
+    let pattern = testing::expect_ok(
+        sensitive.pattern("ß", fuzzy::MatchKind::Fuzzy),
+        "sensitive pattern",
+    );
+    testing::assert_eq(
+        testing::expect_err(
+            sensitive.match_prepared(pattern, folded_expansion, ctx),
+            "both cached forms respect candidate unit budget",
+        ),
+        fuzzy::Error::InputLimit,
+    );
+}
+
+#[test]
+fn prepared_inputs_require_compatible_case_and_boundary_scoring_policies() -> () {
+    let donor = matcher();
+    let sensitive = testing::expect_ok(
+        fuzzy::Matcher::new(
+            fuzzy::Options { case_mode: fuzzy::CaseMode::Sensitive, ..fuzzy::Options::new() },
+        ),
+        "sensitive matcher",
+    );
+    let no_paths = testing::expect_ok(
+        fuzzy::Matcher::new(fuzzy::Options { path_bonus: false, ..fuzzy::Options::new() }),
+        "no path bonus",
+    );
+    let ctx = context::Context::background();
+    let candidate = testing::expect_ok(donor.prepare("src/Foo"), "candidate");
+    for query in Vec::from_array(["foo", ""]) {
+        let pattern = testing::expect_ok(donor.pattern(query, fuzzy::MatchKind::Fuzzy), "pattern");
+        testing::assert_eq(
+            testing::expect_err(sensitive.match_prepared(pattern, candidate, ctx), "case policy"),
+            fuzzy::Error::IncompatiblePreparation,
+        );
+        testing::assert_eq(
+            testing::expect_err(no_paths.match_prepared(pattern, candidate, ctx), "path policy"),
+            fuzzy::Error::IncompatiblePreparation,
+        );
+    }
+    let sensitive_pattern = testing::expect_ok(
+        sensitive.pattern("Foo", fuzzy::MatchKind::Fuzzy),
+        "new pattern",
+    );
+    testing::assert_some(
+        testing::expect_ok(
+            sensitive.match_prepared(sensitive_pattern, candidate, ctx),
+            "candidate preprocessing is independent of case mode",
+        ),
+    );
+    let no_paths_candidate = testing::expect_ok(no_paths.prepare("src/Foo"), "no path candidate");
+    let pattern = testing::expect_ok(
+        donor.pattern("foo", fuzzy::MatchKind::Fuzzy),
+        "shared pattern",
+    );
+    testing::assert_some(
+        testing::expect_ok(
+            no_paths.match_prepared(pattern, no_paths_candidate, ctx),
+            "pattern preprocessing is independent of path bonus",
+        ),
+    );
+}
+
+#[test]
+fn prepared_inputs_can_cross_budget_configurations_when_they_fit() -> () {
+    let donor = matcher();
+    let limited = testing::expect_ok(
+        fuzzy::Matcher::new(
+            fuzzy::Options {
+                max_bytes: 16,
+                max_units: 8,
+                max_pattern_units: 4,
+                max_cells: 32,
+                ..fuzzy::Options::new(),
+            },
+        ),
+        "receiver",
+    );
+    let pattern = testing::expect_ok(
+        donor.pattern("ss", fuzzy::MatchKind::Fuzzy),
+        "folding pattern",
+    );
+    let candidate = testing::expect_ok(donor.prepare("a/ß"), "folding candidate");
+    let prepared = testing::expect_some(
+        testing::expect_ok(
+            limited.match_prepared(pattern, candidate, context::Context::background()),
+            "compatible prepared",
+        ),
+        "match",
+    );
+    let direct = testing::expect_some(
+        testing::expect_ok(limited.find("ss", "a/ß"), "direct"),
+        "match",
+    );
+    testing::assert_eq(prepared.score, direct.score);
+    testing::assert(prepared.ranges == direct.ranges);
+    testing::assert(prepared.graphemes == direct.graphemes);
+}

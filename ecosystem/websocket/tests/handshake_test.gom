@@ -1,0 +1,135 @@
+package tests;
+
+use ecosystem::websocket as ws;
+use std::bytes;
+use std::testing;
+use std::text;
+use std::utf8;
+
+fn request() -> ws::ClientRequest {
+    testing::expect_ok(
+        ws::ClientRequest::with_key(
+            "server.example.com",
+            "/chat",
+            Vec::from_array(["chat", "superchat"]),
+            "dGhlIHNhbXBsZSBub25jZQ==",
+        ),
+        "request",
+    )
+}
+
+#[test]
+fn rfc6455_accept_digest_and_subprotocol_negotiation() -> () {
+    equal(
+        testing::expect_ok(ws::accept_key("dGhlIHNhbXBsZSBub25jZQ=="), "RFC digest"),
+        "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
+    );
+    let request = testing::expect_ok(request().with_origin("http://example.com"), "origin");
+    let parsed = testing::expect_ok(
+        ws::ServerRequest::parse(request.encode(), 16384),
+        "server request",
+    );
+    equal(parsed.host, "server.example.com");
+    equal(parsed.target, "/chat");
+    equal(testing::expect_some(parsed.origin, "origin"), "http://example.com");
+    equal(parsed.protocols, Vec::from_array(["chat", "superchat"]));
+    let response = testing::expect_ok(parsed.response(Option::Some("chat")), "response");
+    equal(
+        testing::expect_some(
+            testing::expect_ok(request.validate_response(response, 16384), "client validate"),
+            "selected",
+        ),
+        "chat",
+    );
+    testing::assert_none(
+        testing::expect_ok(
+            request.validate_response(
+                testing::expect_ok(parsed.response(Option::None), "none"),
+                16384,
+            ),
+            "none response",
+        ),
+    );
+    testing::assert_err(parsed.response(Option::Some("other")));
+}
+
+#[test]
+fn bytewise_handshake_retains_coalesced_frame_bytes() -> () {
+    let input = request().encode();
+    for split in 0..input.len() {
+        let decoder = testing::expect_ok(ws::HandshakeDecoder::new(input.len()), "decoder");
+        equal(testing::expect_ok(decoder.push(input.slice(0, split)), "prefix"), split);
+        testing::assert_none(decoder.head());
+        let tail = bytes::Bytes::from_slice_copy(input.slice(split, input.len()));
+        tail.extend_from_slice(data(Vec::from_array([0x81, 0])).as_slice());
+        equal(testing::expect_ok(decoder.push(tail.as_slice()), "tail"), input.len() - split);
+        equal(testing::expect_some(decoder.head(), "complete").to_vec(), input.to_vec());
+    }
+    let decoder = testing::expect_ok(ws::HandshakeDecoder::new(4), "small");
+    testing::assert_err(decoder.push("GET /".to_bytes().as_slice()));
+}
+
+#[test]
+fn request_rejects_smuggling_duplicates_invalid_nonce_and_version() -> () {
+    let raw = testing::expect_ok(utf8::decode(request().encode().to_vec()), "request text");
+    let bad = Vec::from_array(
+        [
+            text::replace(raw, "GET ", "POST "),
+            text::replace(raw, "HTTP/1.1", "HTTP/1.0"),
+            text::replace(raw, "Connection: Upgrade", "Connection: keep-alive"),
+            text::replace(raw, "Upgrade: websocket", "Upgrade: h2c"),
+            text::replace(raw, "Version: 13", "Version: 12"),
+            text::replace(raw, "dGhlIHNhbXBsZSBub25jZQ==", "Zm9v"),
+            text::replace(raw, "Host: ", "Host : "),
+            text::replace(raw, "Host: ", " Host: "),
+            text::replace(raw, "Host: server.example.com", "Host: one\r\nHost: two"),
+            text::replace(
+                raw,
+                "Sec-WebSocket-Version: 13",
+                "Sec-WebSocket-Version: 13\r\nContent-Length: 4",
+            ),
+            text::replace(
+                raw,
+                "Sec-WebSocket-Version: 13",
+                "Sec-WebSocket-Version: 13\r\nTransfer-Encoding: chunked",
+            ),
+            text::replace(raw, "chat, superchat", "chat, chat"),
+            text::replace(raw, "\r\n", "\n"),
+            text::replace(raw, "server.example.com", "example\nInjected: x"),
+        ],
+    );
+    for value in bad {
+        testing::assert_err(ws::ServerRequest::parse(bytes::Bytes::from_string(value), 16384));
+    }
+    testing::assert_err(ws::ServerRequest::parse(request().encode(), 10));
+    testing::assert_err(ws::ClientRequest::new("host\r\nx:y", "/", Vec::new()));
+    testing::assert_err(ws::ClientRequest::new("host", "/bad path", Vec::new()));
+    testing::assert_err(request().with_origin("origin\r\nInjected: x"));
+}
+
+#[test]
+fn response_rejects_unoffered_extensions_protocols_and_bad_accept() -> () {
+    let parsed = testing::expect_ok(ws::ServerRequest::parse(request().encode(), 16384), "parse");
+    let raw = testing::expect_ok(
+        utf8::decode(testing::expect_ok(parsed.response(Option::Some("chat")), "response").to_vec()),
+        "text",
+    );
+    for value in Vec::from_array(
+        [
+            text::replace(raw, "101", "200"),
+            text::replace(raw, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", "s3pPLMBiTxaQ9kYGzzhZRbK+xOoA"),
+            text::replace(raw, "Protocol: chat", "Protocol: unknown"),
+            text::replace(raw, "Protocol: chat", "Protocol: chat, superchat"),
+            text::replace(raw, "Protocol: chat", "Protocol: chat\r\nSec-WebSocket-Protocol: chat"),
+            text::replace(
+                raw,
+                "Protocol: chat",
+                "Protocol: chat\r\nSec-WebSocket-Extensions: permessage-deflate",
+            ),
+        ],
+    ) {
+        testing::assert_err(request().validate_response(bytes::Bytes::from_string(value), 16384));
+    }
+    let varied = text::replace(raw, "Connection: Upgrade", "connection: keep-alive, UpGrAdE");
+    testing::assert_ok(request().validate_response(bytes::Bytes::from_string(varied), 16384));
+}

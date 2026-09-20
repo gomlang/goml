@@ -1,0 +1,217 @@
+package tests;
+
+use ecosystem::websocket as ws;
+use std::bytes;
+use std::testing;
+
+fn session(role: ws::Role) -> ws::Session {
+    testing::expect_ok(ws::Session::new(role, ws::Limits::standard()), "session")
+}
+
+fn feed(session: ws::Session, kind: ws::Opcode, final: bool, payload: bytes::Bytes) -> () {
+    let wire = testing::expect_ok(
+        ws::encode_frame(ws::Frame { opcode: kind, final, payload }, Option::None),
+        "frame",
+    );
+    testing::assert_ok(session.feed(wire.as_slice()));
+}
+
+fn move_output(from: ws::Session, to: ws::Session) -> () {
+    while let Some(output) = from.output() {
+        testing::assert_ok(to.feed(output.as_slice()));
+        testing::assert_ok(from.consume_output(output.len()));
+    }
+}
+
+fn next_text(session: ws::Session) -> string {
+    match testing::expect_some(testing::expect_ok(session.next(), "next"), "event") {
+        Text(value) => value,
+        _ => {
+            testing::fail("expected text");
+            ""
+        },
+    }
+}
+
+#[test]
+fn fragmented_utf8_with_interleaved_ping_and_pong() -> () {
+    let client = session(ws::Role::Client);
+    feed(client, ws::Opcode::Text, false, data(Vec::from_array([0xf0, 0x9f])));
+    feed(client, ws::Opcode::Ping, true, bytes::Bytes::from_string("probe"));
+    feed(client, ws::Opcode::Continuation, true, data(Vec::from_array([0x98, 0x80])));
+    match testing::expect_some(testing::expect_ok(client.next(), "ping"), "ping") {
+        Ping(value) => equal(value.to_vec(), "probe".to_bytes()),
+        _ => testing::fail("expected ping"),
+    }
+    equal(next_text(client), "😀");
+    let server = session(ws::Role::Server);
+    move_output(client, server);
+    match testing::expect_some(testing::expect_ok(server.next(), "pong"), "pong") {
+        Pong(value) => equal(value.to_vec(), "probe".to_bytes()),
+        _ => testing::fail("expected automatic pong"),
+    }
+}
+
+#[test]
+fn outgoing_fragmentation_roundtrip_and_payload_snapshot() -> () {
+    let client = session(ws::Role::Client);
+    let server = session(ws::Role::Server);
+    let payload = bytes::Bytes::from_string("binary payload");
+    testing::assert_ok(client.send_fragmented(ws::Message::Binary(payload), 2));
+    payload.set(0, 0);
+    equal(client.queued_frames(), 7);
+    move_output(client, server);
+    match testing::expect_some(testing::expect_ok(server.next(), "binary"), "binary") {
+        Binary(value) => equal(value.to_vec(), "binary payload".to_bytes()),
+        _ => testing::fail("expected binary"),
+    }
+    testing::assert_ok(server.send_fragmented(ws::Message::Text("中😀text"), 1));
+    move_output(server, client);
+    equal(next_text(client), "中😀text");
+}
+
+#[test]
+fn close_exchange_waits_for_wire_drain_and_rejects_more_data() -> () {
+    let client = session(ws::Role::Client);
+    let server = session(ws::Role::Server);
+    testing::assert_ok(
+        client.send(
+            ws::Message::Close(Option::Some(ws::CloseFrame { code: 1000, reason: "done ✓" })),
+        ),
+    );
+    equal(client.state(), ws::State::CloseSent);
+    testing::assert_err(client.send(ws::Message::Text("late")));
+    move_output(client, server);
+    match testing::expect_some(testing::expect_ok(server.next(), "close"), "close") {
+        Close(Some(value)) => {
+            equal(value.code, 1000);
+            equal(value.reason, "done ✓");
+        },
+        _ => testing::fail("expected close"),
+    }
+    equal(server.state(), ws::State::CloseReceived);
+    let output = testing::expect_some(server.output(), "echo");
+    testing::assert_ok(client.feed(output.slice(0, 1)));
+    testing::assert_ok(server.consume_output(1));
+    equal(server.state(), ws::State::CloseReceived);
+    move_output(server, client);
+    equal(server.state(), ws::State::Closed);
+    testing::assert_some(testing::expect_ok(client.next(), "echo close"));
+    equal(client.state(), ws::State::Closed);
+    testing::assert_ok(client.finish());
+    testing::assert_ok(server.finish());
+    testing::assert_err(server.feed(bytes::Bytes::new().as_slice()));
+}
+
+#[test]
+fn simultaneous_and_empty_close_handshakes() -> () {
+    let client = session(ws::Role::Client);
+    let server = session(ws::Role::Server);
+    testing::assert_ok(client.send(ws::Message::Close(Option::None)));
+    testing::assert_ok(server.send(ws::Message::Close(Option::None)));
+    move_output(client, server);
+    move_output(server, client);
+    for current in Vec::from_array([client, server]) {
+        match testing::expect_some(testing::expect_ok(current.next(), "close"), "event") {
+            Close(None) => {},
+            _ => testing::fail("empty close"),
+        }
+        equal(current.state(), ws::State::Closed);
+    }
+}
+
+#[test]
+fn control_backpressure_preserves_ping_for_retry() -> () {
+    let limits = ws::Limits { queued_frames: 1, ..ws::Limits::standard() };
+    let client = testing::expect_ok(ws::Session::new(ws::Role::Client, limits), "bounded");
+    testing::assert_ok(client.send(ws::Message::Text("occupied")));
+    feed(client, ws::Opcode::Ping, true, bytes::Bytes::from_string("ping"));
+    equal(testing::expect_err(client.next(), "backpressure").kind, ws::ErrorKind::Backpressure);
+    equal(client.state(), ws::State::Open);
+    let output = testing::expect_some(client.output(), "occupied");
+    testing::assert_ok(client.consume_output(output.len()));
+    testing::assert_some(testing::expect_ok(client.next(), "retry ping"));
+    equal(client.queued_frames(), 1);
+    let server = session(ws::Role::Server);
+    move_output(client, server);
+    match testing::expect_some(testing::expect_ok(server.next(), "pong"), "pong") {
+        Pong(value) => equal(value.to_vec(), "ping".to_bytes()),
+        _ => testing::fail("pong"),
+    }
+}
+
+#[test]
+fn rejected_send_is_atomic_and_output_consumption_checked() -> () {
+    let client = testing::expect_ok(
+        ws::Session::new(
+            ws::Role::Client,
+            ws::Limits { queued_frames: 2, queued_bytes: 139, ..ws::Limits::standard() },
+        ),
+        "bounded",
+    );
+    equal(
+        testing::expect_err(client.send_fragmented(ws::Message::Text("abcdef"), 2), "three frames").kind,
+        ws::ErrorKind::Backpressure,
+    );
+    equal(client.queued_frames(), 0);
+    testing::assert_ok(client.send(ws::Message::Text("abc")));
+    let before = client.queued_bytes();
+    testing::assert_err(client.consume_output(before + 1));
+    testing::assert_err(client.consume_output(-1));
+    equal(client.queued_bytes(), before);
+    let copy = testing::expect_some(client.output(), "snapshot");
+    copy.set(0, 0);
+    equal(testing::expect_some(client.output(), "unchanged").get(0), 0x81);
+    testing::assert_ok(client.consume_output(before));
+    equal(client.queued_bytes(), 0);
+}
+
+#[test]
+fn bad_utf8_fragment_order_and_close_payloads_fail_session() -> () {
+    let cases = Vec::new();
+    cases.push((ws::Opcode::Text, data(Vec::from_array([0xc0, 0xaf])), ws::ErrorKind::Utf8));
+    cases.push((ws::Opcode::Text, data(Vec::from_array([0xed, 0xa0, 0x80])), ws::ErrorKind::Utf8));
+    cases.push((ws::Opcode::Continuation, bytes::Bytes::new(), ws::ErrorKind::Protocol));
+    cases.push((ws::Opcode::Close, data(Vec::from_array([1])), ws::ErrorKind::Protocol));
+    cases.push((ws::Opcode::Close, data(Vec::from_array([3, 237])), ws::ErrorKind::Protocol));
+    cases.push((ws::Opcode::Close, data(Vec::from_array([3, 232, 255])), ws::ErrorKind::Utf8));
+    for (kind, payload, expected) in cases {
+        let client = session(ws::Role::Client);
+        feed(client, kind, true, payload);
+        equal(testing::expect_err(client.next(), "bad message").kind, expected);
+        equal(client.state(), ws::State::Failed);
+        testing::assert_err(client.send(ws::Message::Text("after error")));
+    }
+    let client = session(ws::Role::Client);
+    feed(client, ws::Opcode::Binary, false, bytes::Bytes::new());
+    feed(client, ws::Opcode::Text, true, bytes::Bytes::new());
+    testing::assert_err(client.next());
+    for code in Vec::from_array([0, 999, 1004, 1005, 1006, 1015, 2000, 2999, 5000]) {
+        testing::assert(!ws::valid_close_code(code));
+    }
+    for code in Vec::from_array([1000, 1001, 1007, 1011, 1014, 3000, 4999]) {
+        testing::assert(ws::valid_close_code(code));
+    }
+}
+
+#[test]
+fn aggregate_limit_and_abnormal_eof() -> () {
+    let client = testing::expect_ok(
+        ws::Session::new(
+            ws::Role::Client,
+            ws::Limits { frame_bytes: 125, message_bytes: 125, ..ws::Limits::standard() },
+        ),
+        "limits",
+    );
+    let payload = bytes::Bytes::new();
+    for _ in 0..100 {
+        payload.push(0);
+    }
+    feed(client, ws::Opcode::Binary, false, payload);
+    feed(client, ws::Opcode::Continuation, true, payload);
+    equal(testing::expect_err(client.next(), "aggregate").kind, ws::ErrorKind::Limit);
+    equal(
+        testing::expect_err(session(ws::Role::Client).finish(), "abnormal EOF").kind,
+        ws::ErrorKind::UnexpectedEof,
+    );
+}

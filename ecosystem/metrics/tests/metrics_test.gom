@@ -1,0 +1,341 @@
+package tests;
+
+use ecosystem::metrics as metrics;
+use std::context;
+use std::testing;
+use std::time;
+
+fn registry() -> metrics::Registry {
+    testing::expect_ok(metrics::Registry::new(metrics::Options::standard()), "registry")
+}
+
+fn empty() -> metrics::Labels {
+    metrics::Labels::empty()
+}
+
+fn labels(name: string, value: string) -> metrics::Labels {
+    testing::expect_ok(metrics::Labels::new(Vec::from_array([(name, value)])), "labels")
+}
+
+fn same[T: PartialEq](actual: T, expected: T) -> () {
+    testing::assert(actual == expected)
+}
+
+fn counter(registry: metrics::Registry, name: string) -> metrics::Counter {
+    testing::expect_ok(
+        registry.counter(metrics::Descriptor::counter(name, "Counter help"), empty()),
+        "counter",
+    )
+}
+
+fn gauge(registry: metrics::Registry, name: string) -> metrics::Gauge {
+    testing::expect_ok(
+        registry.gauge(metrics::Descriptor::gauge(name, "Gauge help"), empty()),
+        "gauge",
+    )
+}
+
+fn histogram(registry: metrics::Registry, name: string) -> metrics::Histogram {
+    testing::expect_ok(
+        registry.histogram(
+            metrics::Descriptor::histogram(name, "Histogram help", Vec::from_array([0.1, 0.5, 1.0])).with_unit(
+                "seconds",
+            ),
+            empty(),
+        ),
+        "histogram",
+    )
+}
+
+#[test]
+fn counter_is_shared_monotonic_and_checked_at_u64_boundary() -> () {
+    let registry = registry();
+    let first = counter(registry, "requests_total");
+    let second = counter(registry, "requests_total");
+    testing::assert_ok(first.increment());
+    testing::assert_ok(second.add(4));
+    testing::assert_eq(testing::expect_ok(first.get(), "value"), 5);
+    testing::assert_ok(first.absolute(3));
+    testing::assert_eq(testing::expect_ok(second.get(), "monotonic"), 5);
+    testing::assert_ok(first.absolute(18446744073709551615));
+    testing::assert_eq(
+        testing::expect_err(second.increment(), "overflow").kind,
+        metrics::ErrorKind::Overflow,
+    );
+    testing::assert_eq(testing::expect_ok(first.get(), "unchanged"), 18446744073709551615);
+    testing::assert_ok(first.add(0));
+}
+
+#[test]
+fn gauges_reject_nonfinite_input_and_overflow_atomically() -> () {
+    let registry = registry();
+    let value = gauge(registry, "temperature");
+    testing::assert_ok(value.set(-3.0));
+    testing::assert_ok(value.increment(2.0));
+    testing::assert_ok(value.decrement(0.5));
+    testing::assert_eq(testing::expect_ok(value.get(), "gauge"), -1.5);
+    for bad in Vec::from_array(
+        [
+            float64_from_bits(0x7ff8000000000001),
+            float64_from_bits(0x7ff0000000000000),
+            float64_from_bits(0xfff0000000000000),
+        ],
+    ) {
+        testing::assert_eq(
+            testing::expect_err(value.set(bad), "nonfinite").kind,
+            metrics::ErrorKind::InvalidValue,
+        );
+        testing::assert_err(value.add(bad));
+        testing::assert_err(value.decrement(bad));
+    }
+    testing::assert_eq(testing::expect_ok(value.get(), "unchanged"), -1.5);
+    testing::assert_err(value.increment(-1.0));
+    testing::assert_err(value.decrement(-1.0));
+    testing::assert_ok(value.set(1.7976931348623157e308));
+    testing::assert_eq(
+        testing::expect_err(value.add(1.7976931348623157e308), "overflow").kind,
+        metrics::ErrorKind::Overflow,
+    );
+    testing::assert_eq(testing::expect_ok(value.get(), "unchanged max"), 1.7976931348623157e308);
+}
+
+#[test]
+fn histogram_boundary_inclusion_cumulative_counts_and_checked_sum() -> () {
+    let value = histogram(registry(), "latency_seconds");
+    for observation in Vec::from_array([-0.5, 0.1, 0.5, 1.0, 2.0]) {
+        testing::assert_ok(value.observe(observation));
+    }
+    let snapshot = testing::expect_ok(value.get(), "snapshot");
+    same(snapshot.cumulative, Vec::from_array([2, 3, 4]));
+    testing::assert_eq(snapshot.count, 5);
+    testing::assert_eq(snapshot.sum, 3.1);
+    snapshot.cumulative[0] = 999;
+    snapshot.boundaries[0] = 999.0;
+    same(testing::expect_ok(value.get(), "isolated").cumulative, Vec::from_array([2, 3, 4]));
+    testing::assert_err(value.observe(float64_from_bits(0x7ff0000000000000)));
+    let huge = histogram(registry(), "huge");
+    testing::assert_ok(huge.observe(1.7976931348623157e308));
+    testing::assert_eq(
+        testing::expect_err(huge.observe(1.7976931348623157e308), "sum overflow").kind,
+        metrics::ErrorKind::Overflow,
+    );
+    testing::assert_eq(testing::expect_ok(huge.get(), "atomic sum").count, 1);
+    let count = histogram(registry(), "count");
+    testing::assert_ok(count.observe_many(0.0, 18446744073709551615));
+    testing::assert_eq(
+        testing::expect_err(count.observe(0.0), "count overflow").kind,
+        metrics::ErrorKind::Overflow,
+    );
+    let current = testing::expect_ok(count.get(), "count unchanged");
+    testing::assert_eq(current.count, 18446744073709551615);
+    testing::assert_eq(current.cumulative[0], current.count);
+}
+
+#[test]
+fn descriptors_normalize_labels_and_reject_incompatible_registrations() -> () {
+    let registry = registry();
+    let descriptor = metrics::Descriptor::counter("calls_total", "Calls").with_labels(
+        Vec::from_array(["route", "method"]),
+    ).with_unit("requests");
+    let values = testing::expect_ok(
+        metrics::Labels::new(Vec::from_array([("method", "GET"), ("route", "/")])),
+        "labels",
+    );
+    let first = testing::expect_ok(registry.counter(descriptor, values), "register");
+    descriptor.label_names[0] = "mutation";
+    let descriptor = metrics::Descriptor::counter("calls_total", "Calls").with_labels(
+        Vec::from_array(["method", "route"]),
+    ).with_unit("requests");
+    let second = testing::expect_ok(registry.counter(descriptor, values), "same schema");
+    testing::assert_ok(first.increment());
+    testing::assert_eq(testing::expect_ok(second.get(), "shared"), 1);
+    for changed in Vec::from_array(
+        [
+            metrics::Descriptor { help: "other", ..descriptor },
+            metrics::Descriptor { unit: "bytes", ..descriptor },
+            metrics::Descriptor { kind: metrics::Kind::Gauge, ..descriptor },
+            metrics::Descriptor { label_names: Vec::from_array(["different"]), ..descriptor },
+        ],
+    ) {
+        testing::assert_eq(
+            testing::expect_err(registry.register(changed), "conflict").kind,
+            metrics::ErrorKind::Conflict,
+        );
+    }
+    testing::assert_err(registry.counter(descriptor, empty()));
+    testing::assert_err(
+        metrics::Labels::new(Vec::from_array([("route", "/"), ("route", "/other")])),
+    );
+    for name in Vec::from_array(["", "9bad", "a-b", "__reserved", "x:y"]) {
+        testing::assert_err(metrics::Labels::new(Vec::from_array([(name, "value")])));
+    }
+}
+
+#[test]
+fn exported_histogram_suffixes_are_reserved_in_both_registration_orders() -> () {
+    for suffix in Vec::from_array(["_bucket", "_sum", "_count"]) {
+        let first = registry();
+        let _ = histogram(first, "latency");
+        testing::assert_eq(
+            testing::expect_err(
+                first.register(metrics::Descriptor::gauge("latency" + suffix, "collision")),
+                "suffix collision",
+            ).kind,
+            metrics::ErrorKind::Conflict,
+        );
+        let second = registry();
+        let _ = gauge(second, "latency" + suffix);
+        testing::assert_eq(
+            testing::expect_err(
+                second.register(metrics::Descriptor::histogram("latency", "collision", Vec::new())),
+                "reverse collision",
+            ).kind,
+            metrics::ErrorKind::Conflict,
+        );
+    }
+    let registry = registry();
+    let _ = histogram(registry, "latency");
+    testing::assert_err(registry.register(metrics::Descriptor::counter("latency", "collision")));
+    testing::assert_err(
+        registry.register(
+            metrics::Descriptor::histogram("another", "help", Vec::from_array([1.0])).with_labels(
+                Vec::from_array(["le"]),
+            ),
+        ),
+    );
+}
+
+#[test]
+fn limits_are_transactional_and_series_removal_invalidates_old_handles() -> () {
+    let registry = testing::expect_ok(
+        metrics::Registry::new(
+            metrics::Options {
+                max_families: 1,
+                max_series: 2,
+                max_series_per_family: 2,
+                max_label_value_bytes: 3,
+                ..metrics::Options::standard(),
+            },
+        ),
+        "limits",
+    );
+    let descriptor = metrics::Descriptor::counter("requests_total", "requests").with_labels(
+        Vec::from_array(["key"]),
+    );
+    let first = testing::expect_ok(registry.counter(descriptor, labels("key", "one")), "one");
+    let _ = testing::expect_ok(registry.counter(descriptor, labels("key", "two")), "two");
+    testing::assert_eq(
+        testing::expect_err(registry.counter(descriptor, labels("key", "tri")), "series limit").kind,
+        metrics::ErrorKind::Limit,
+    );
+    testing::assert_eq(
+        testing::expect_err(registry.counter(descriptor, labels("key", "long")), "label limit").kind,
+        metrics::ErrorKind::Limit,
+    );
+    testing::assert_eq(
+        testing::expect_err(
+            registry.register(metrics::Descriptor::gauge("other", "")),
+            "family limit",
+        ).kind,
+        metrics::ErrorKind::Limit,
+    );
+    testing::assert(
+        testing::expect_ok(registry.remove_series("requests_total", labels("key", "one")), "remove"),
+    );
+    testing::assert_eq(
+        testing::expect_err(first.increment(), "detached").kind,
+        metrics::ErrorKind::Detached,
+    );
+    let fresh = testing::expect_ok(
+        registry.counter(descriptor, labels("key", "one")),
+        "replacement",
+    );
+    testing::assert_eq(testing::expect_ok(fresh.get(), "fresh"), 0);
+    testing::assert(registry.unregister("requests_total"));
+    testing::assert(!registry.unregister("requests_total"));
+    testing::assert_eq(
+        testing::expect_err(fresh.get(), "detached fresh").kind,
+        metrics::ErrorKind::Detached,
+    );
+    let new = gauge(registry, "new");
+    registry.clear();
+    testing::assert_err(new.set(1.0));
+    testing::assert_eq(registry.snapshot().series_count(), 0);
+    testing::assert_eq(registry.render(), "");
+}
+
+#[test]
+fn bucket_generators_reject_nonmonotonic_precision_and_nonfinite_values() -> () {
+    same(
+        testing::expect_ok(metrics::linear_buckets(0.0, 0.25, 4), "linear"),
+        Vec::from_array([0.0, 0.25, 0.5, 0.75]),
+    );
+    same(
+        testing::expect_ok(metrics::exponential_buckets(0.5, 2.0, 4), "exponential"),
+        Vec::from_array([0.5, 1.0, 2.0, 4.0]),
+    );
+    testing::assert_err(metrics::linear_buckets(1e100, 1.0, 2));
+    testing::assert_err(metrics::exponential_buckets(1e308, 10.0, 2));
+    testing::assert_err(metrics::linear_buckets(0.0, 0.0, 3));
+    testing::assert_err(metrics::exponential_buckets(1.0, 1.0, 3));
+    let registry = registry();
+    for buckets in Vec::from_array(
+        [
+            Vec::from_array([1.0, 1.0]),
+            Vec::from_array([2.0, 1.0]),
+            Vec::from_array([float64_from_bits(0x7ff0000000000000)]),
+            Vec::from_array([float64_from_bits(0x7ff8000000000001)]),
+        ],
+    ) {
+        testing::assert_eq(
+            testing::expect_err(
+                registry.register(metrics::Descriptor::histogram("bad", "", buckets)),
+                "bad buckets",
+            ).kind,
+            metrics::ErrorKind::InvalidBuckets,
+        );
+    }
+    testing::assert_ok(
+        registry.register(metrics::Descriptor::histogram("empty", "only +Inf", Vec::new())),
+    );
+}
+
+#[test]
+fn context_prevents_updates_and_timer_stops_exactly_once() -> () {
+    let registry = registry();
+    let value = counter(registry, "calls_total");
+    context::with_cancel(
+        context::Context::background(),
+        |ctx, cancel| {
+            cancel.cancel();
+            testing::assert_eq(
+                testing::expect_err(value.add_with(1, ctx), "cancelled").kind,
+                metrics::ErrorKind::Cancelled,
+            );
+            testing::assert_err(registry.snapshot_with(ctx));
+            testing::assert_err(registry.render_with(ctx));
+        },
+    );
+    testing::assert_eq(testing::expect_ok(value.get(), "unchanged"), 0);
+    context::with_timeout(
+        context::Context::background(),
+        time::Duration::zero(),
+        |ctx, _| {
+            testing::assert_eq(
+                testing::expect_err(value.add_with(1, ctx), "expired").kind,
+                metrics::ErrorKind::Timeout,
+            );
+        },
+    );
+    let duration = histogram(registry, "duration_seconds");
+    let timer = duration.start_timer();
+    let elapsed = testing::expect_ok(timer.stop(), "stop");
+    testing::assert(elapsed.as_nanoseconds() >= 0);
+    testing::assert_eq(testing::expect_err(timer.stop(), "once").kind, metrics::ErrorKind::Finished);
+    let cancelled = duration.start_timer();
+    testing::assert(cancelled.cancel());
+    testing::assert(!cancelled.cancel());
+    testing::assert_err(cancelled.stop());
+    testing::assert_eq(testing::expect_ok(duration.time(|| 42), "timed function"), 42);
+    testing::assert_eq(testing::expect_ok(duration.get(), "observations").count, 2);
+}

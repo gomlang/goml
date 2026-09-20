@@ -1,0 +1,159 @@
+package tests;
+
+use ecosystem::websocket as ws;
+use std::bytes;
+use std::testing;
+
+fn data(values: Vec[u8]) -> bytes::Bytes {
+    bytes::Bytes::from_vec(values)
+}
+
+fn text_frame(value: string) -> ws::Frame {
+    ws::Frame { final: true, opcode: ws::Opcode::Text, payload: bytes::Bytes::from_string(value) }
+}
+
+fn mask() -> bytes::Bytes {
+    data(Vec::from_array([0x37, 0xfa, 0x21, 0x3d]))
+}
+
+fn decoder(role: ws::Role) -> ws::Decoder {
+    testing::expect_ok(ws::Decoder::new(role, ws::Limits::standard()), "decoder")
+}
+
+#[test]
+fn rfc6455_hello_masked_and_unmasked_vectors() -> () {
+    let plain = testing::expect_ok(ws::encode_frame(text_frame("Hello"), Option::None), "encode");
+    equal(plain.to_vec(), Vec::from_array([0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f]));
+    let masked = testing::expect_ok(
+        ws::encode_frame(text_frame("Hello"), Option::Some(mask())),
+        "encode mask",
+    );
+    equal(
+        masked.to_vec(),
+        Vec::from_array([0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58]),
+    );
+    for split in 0..(masked.len() + 1) {
+        let parser = decoder(ws::Role::Server);
+        testing::assert_ok(parser.push(masked.slice(0, split)));
+        if split < masked.len() {
+            testing::assert_none(testing::expect_ok(parser.next(), "partial"));
+        }
+        testing::assert_ok(parser.push(masked.slice(split, masked.len())));
+        let frame = testing::expect_some(testing::expect_ok(parser.next(), "frame"), "complete");
+        testing::assert(frame.final);
+        equal(frame.opcode, ws::Opcode::Text);
+        equal(frame.payload.to_vec(), "Hello".to_bytes());
+        testing::assert_ok(parser.finish());
+    }
+}
+
+#[test]
+fn extended_lengths_and_arbitrary_binary_round_trip() -> () {
+    for length in Vec::from_array([0, 1, 125, 126, 255, 65535, 65536]) {
+        let payload = bytes::Bytes::new();
+        for index in 0..length {
+            payload.push((index % 251).to_u8());
+        }
+        for role in Vec::from_array([ws::Role::Client, ws::Role::Server]) {
+            let wire = testing::expect_ok(
+                ws::encode_frame(
+                    ws::Frame { final: true, opcode: ws::Opcode::Binary, payload },
+                    if role == ws::Role::Server {
+                        Option::Some(mask())
+                    } else {
+                        Option::None
+                    },
+                ),
+                "encode binary",
+            );
+            let parser = decoder(role);
+            let mut offset = 0;
+            while offset < wire.len() {
+                let end = if wire.len() - offset > 97 {
+                    offset + 97
+                } else {
+                    wire.len()
+                };
+                testing::assert_ok(parser.push(wire.slice(offset, end)));
+                if end < wire.len() {
+                    testing::assert_none(testing::expect_ok(parser.next(), "incremental"));
+                }
+                offset = end;
+            }
+            let frame = testing::expect_some(
+                testing::expect_ok(parser.next(), "binary"),
+                "complete",
+            );
+            equal(frame.payload.to_vec(), payload.to_vec());
+            equal(parser.buffered(), 0);
+        }
+    }
+}
+
+#[test]
+fn malformed_headers_reject_before_payload_allocation_and_poison_decoder() -> () {
+    let wires = Vec::new();
+    wires.push(data(Vec::from_array([0xc1, 0])));
+    wires.push(data(Vec::from_array([0x83, 0])));
+    wires.push(data(Vec::from_array([0x89, 126])));
+    wires.push(data(Vec::from_array([0x09, 0])));
+    wires.push(data(Vec::from_array([0x82, 126, 0, 125])));
+    wires.push(data(Vec::from_array([0x82, 127, 0, 0, 0, 0, 0, 0, 255, 255])));
+    wires.push(data(Vec::from_array([0x82, 127, 128, 0, 0, 0, 0, 0, 0, 0])));
+    wires.push(data(Vec::from_array([0x81, 128, 1, 2, 3, 4])));
+    for wire in wires {
+        let parser = decoder(ws::Role::Client);
+        testing::assert_ok(parser.push(wire.as_slice()));
+        equal(testing::expect_err(parser.next(), "bad frame").kind, ws::ErrorKind::Protocol);
+        equal(testing::expect_err(parser.next(), "poisoned").kind, ws::ErrorKind::Closed);
+    }
+    let parser = decoder(ws::Role::Server);
+    testing::assert_ok(parser.push(data(Vec::from_array([0x81, 0])).as_slice()));
+    testing::assert_err(parser.next());
+    let parser = decoder(ws::Role::Client);
+    testing::assert_ok(
+        parser.push(data(Vec::from_array([0x82, 127, 0, 0, 0, 0, 0, 32, 0, 0])).as_slice()),
+    );
+    equal(testing::expect_err(parser.next(), "length limit").kind, ws::ErrorKind::Limit);
+}
+
+#[test]
+fn buffer_backpressure_is_retryable_and_truncation_detected() -> () {
+    let limits = ws::Limits { frame_bytes: 125, buffered_bytes: 139, ..ws::Limits::standard() };
+    let parser = testing::expect_ok(ws::Decoder::new(ws::Role::Client, limits), "small decoder");
+    let full = bytes::Bytes::new();
+    for _ in 0..70 {
+        full.push(0x81);
+        full.push(0);
+    }
+    equal(
+        testing::expect_err(parser.push(full.as_slice()), "bounded input").kind,
+        ws::ErrorKind::Backpressure,
+    );
+    equal(parser.buffered(), 0);
+    testing::assert_ok(parser.push(full.slice(0, 138)));
+    for _ in 0..69 {
+        testing::assert_some(testing::expect_ok(parser.next(), "empty frame"));
+    }
+    testing::assert_ok(parser.push(full.slice(138, 140)));
+    testing::assert_some(testing::expect_ok(parser.next(), "retry"));
+    testing::assert_ok(parser.push(data(Vec::from_array([0x82, 3, 1])).as_slice()));
+    equal(testing::expect_err(parser.finish(), "truncated").kind, ws::ErrorKind::UnexpectedEof);
+}
+
+#[test]
+fn invalid_encoder_arguments_and_limits() -> () {
+    testing::assert_err(ws::encode_frame(text_frame("x"), Option::Some(bytes::Bytes::new())));
+    testing::assert_err(
+        ws::encode_frame(
+            ws::Frame { final: false, opcode: ws::Opcode::Ping, payload: bytes::Bytes::new() },
+            Option::None,
+        ),
+    );
+    testing::assert_err(ws::Limits { frame_bytes: 0, ..ws::Limits::standard() }.validate());
+    testing::assert_err(ws::Limits { queued_frames: 0, ..ws::Limits::standard() }.validate());
+}
+
+fn equal[T: PartialEq](actual: T, expected: T) -> () {
+    testing::assert(actual == expected)
+}

@@ -1,0 +1,252 @@
+package tests;
+
+use ecosystem::config;
+use std::env;
+use std::fs;
+use std::serde;
+use serde::Deserialize;
+use std::task;
+use std::testing;
+use std::time;
+
+#[go_ffi("os", "Getpid")]
+extern fn getpid() -> isize;
+
+fn directory(label: string) -> string {
+    let root = "/tmp/goml-config-" + label + "-" + getpid().to_string() + "-"
+        + time::SystemTime::now().unix_nanoseconds().to_string();
+    testing::expect_ok(fs::create_dir(root), "create temporary directory");
+    root
+}
+
+fn write(file: string, value: string) -> () {
+    testing::expect_ok(fs::write_file_structured(file, value), "write config file");
+}
+
+fn file_source(file: string, required: bool) -> config::Source {
+    ok(config::Source::file("file", file, config::Format::Json, required))
+}
+
+#[test]
+fn files_are_loaded_fresh_with_required_optional_and_bounded_read_policies() -> () {
+    let root = directory("files");
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    let file = root + "/app.json";
+    let builder = config::Builder::new().with_source(file_source(file, false));
+    testing::assert_eq(ok(builder.build()).json(), "{}");
+    kind(config::Builder::new().with_source(file_source(file, true)).build(), config::ErrorKind::Io);
+    write(file, "{\"value\":1}");
+    let first = ok(builder.build());
+    testing::assert_eq(read_int(first, "/value"), 1);
+    testing::assert_eq(ok(first.origin("/value")).detail, file);
+    write(file, "{\"value\":2}");
+    testing::assert_eq(read_int(ok(builder.build()), "/value"), 2);
+    testing::assert_eq(read_int(first, "/value"), 1);
+    testing::assert_err(
+        builder.with_limits(config::Limits { max_source_bytes: 4, ..config::Limits::new() }).build(),
+    );
+    kind(
+        config::Builder::new().with_source(file_source(root, false)).build(),
+        config::ErrorKind::Io,
+    );
+    write(file, "invalid");
+    kind(builder.build(), config::ErrorKind::Parse);
+}
+
+#[test]
+fn reload_publishes_complete_snapshots_and_retains_old_values_on_parse_or_validation_error() -> () {
+    let root = directory("reload");
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    let file = root + "/app.json";
+    write(file, "{\"port\":8000}");
+    let builder = config::Builder::new().with_source(file_source(file, true)).validate_with(
+        |snapshot| {
+            let port: isize = snapshot.decode_at("/port")?;
+            if port > 0 && port <= 65535 {
+                Result::Ok(())
+            } else {
+                Result::Err(snapshot.invalid("/port", "invalid port"))
+            }
+        },
+    );
+    let live = ok(config::Live::new(builder));
+    let original = live.snapshot();
+    testing::assert_eq(original.revision(), 1);
+    write(file, "{\"port\":9000}");
+    let applied = ok(live.reload());
+    testing::assert(applied.changed);
+    testing::assert_eq(applied.revision, 2);
+    testing::assert_eq(read_int(live.snapshot(), "/port"), 9000);
+    testing::assert_eq(read_int(original, "/port"), 8000);
+    write(file, "{broken");
+    kind(live.reload(), config::ErrorKind::Parse);
+    testing::assert_eq(live.snapshot().revision(), 2);
+    testing::assert_some(live.last_error());
+    write(file, "{\"port\":0}");
+    kind(live.reload(), config::ErrorKind::Validation);
+    testing::assert_eq(read_int(live.snapshot(), "/port"), 9000);
+    write(file, "{\"port\":9000}");
+    let unchanged = ok(live.reload());
+    testing::assert(!unchanged.changed);
+    testing::assert_eq(unchanged.revision, 3);
+    testing::assert_none(live.last_error());
+}
+
+#[test]
+fn hot_reload_observes_atomic_replacements_ignores_unrelated_files_and_can_cancel() -> () {
+    let root = directory("watch");
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    let file = root + "/app.json";
+    write(file, "{\"value\":1}");
+    let live = ok(config::Live::new(config::Builder::new().with_source(file_source(file, true))));
+    let watch = ok(live.watch());
+    defer {
+        let _ = watch.close();
+    };
+    let initial = watch.snapshot();
+    write(root + "/unrelated", "ignored");
+    testing::assert_none(ok(watch.poll(time::Duration::from_milliseconds(50))));
+    testing::expect_ok(fs::atomic_write(file, "{\"value\":2}"), "atomic replace");
+    let started = time::Instant::now();
+    let mut seen = false;
+    while started.elapsed().as_milliseconds() < 2000 {
+        if let Some(result) = ok(watch.poll(time::Duration::from_milliseconds(100))) {
+            if result.changed {
+                seen = true;
+                break
+            }
+        }
+    }
+    testing::assert(seen);
+    testing::assert_eq(read_int(watch.snapshot(), "/value"), 2);
+    testing::assert_eq(read_int(initial, "/value"), 1);
+    task::scope(
+        |scope| {
+            scope.cancel();
+            match ok(watch.poll_with(scope.token(), time::Duration::from_milliseconds(1000))) {
+                task::WaitResult::Cancelled => (),
+                task::WaitResult::Completed(_) => testing::fail("cancelled watch returned events"),
+            }
+        },
+    );
+    testing::assert_ok(watch.close());
+    testing::assert_ok(watch.close());
+    kind(watch.poll(time::Duration::from_milliseconds(0)), config::ErrorKind::Watch);
+}
+
+#[test]
+fn optional_file_creation_deletion_and_bad_replacements_keep_consistent_state() -> () {
+    let root = directory("optional");
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    let file = root + "/optional.json";
+    let live = ok(
+        config::Live::new(
+            config::Builder::new().with_source(config::Source::json("defaults", "{\"value\":10}")).with_source(
+                file_source(file, false),
+            ),
+        ),
+    );
+    let watch = ok(live.watch());
+    defer {
+        let _ = watch.close();
+    };
+    write(file, "{\"value\":20}");
+    testing::assert_some(ok(watch.poll(time::Duration::from_milliseconds(2000))));
+    testing::assert_eq(read_int(live.snapshot(), "/value"), 20);
+    write(file, "malformed");
+    kind(watch.poll(time::Duration::from_milliseconds(2000)), config::ErrorKind::Parse);
+    testing::assert_eq(read_int(live.snapshot(), "/value"), 20);
+    testing::expect_ok(fs::remove_file(file), "remove optional file");
+    testing::assert_some(ok(watch.poll(time::Duration::from_milliseconds(2000))));
+    testing::assert_eq(read_int(live.snapshot(), "/value"), 10);
+    testing::assert_eq(ok(live.snapshot().origin("/value")).source, "defaults");
+}
+
+#[derive(Deserialize)]
+struct Pair {
+    a: isize,
+    b: isize,
+}
+
+#[test]
+fn concurrent_reload_and_readers_observe_whole_immutable_snapshots() -> () {
+    let root = directory("race");
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    let file = root + "/app.json";
+    write(file, "{\"a\":0,\"b\":0}");
+    let live = ok(
+        config::Live::new(
+            config::Builder::new().with_source(file_source(file, true)).validate_with(
+                |snapshot| {
+                    let _: Pair = snapshot.decode()?;
+                    Result::Ok(())
+                },
+            ),
+        ),
+    );
+    task::scope(
+        |scope| {
+            for _ in 0..4 {
+                let _ = scope.spawn(
+                    |_: task::CancelToken| {
+                        let mut last: u64 = 0;
+                        for _ in 0..150 {
+                            let snapshot = live.snapshot();
+                            let pair: Pair = ok(snapshot.decode());
+                            testing::assert_eq(pair.a, pair.b);
+                            testing::assert(snapshot.revision() >= last);
+                            last = snapshot.revision();
+                        }
+                    },
+                );
+            }
+            let _ = scope.spawn(
+                |_: task::CancelToken| {
+                    for index in 1..25 {
+                        let content = "{\"a\":" + index.to_string() + ",\"b\":" + index.to_string()
+                            + "}";
+                        testing::expect_ok(
+                            fs::atomic_write(file, content),
+                            "atomic configuration update",
+                        );
+                        let _ = ok(live.reload());
+                    }
+                },
+            );
+            let _ = scope.spawn(
+                |_: task::CancelToken| {
+                    for _ in 0..25 {
+                        let _ = ok(live.reload());
+                    }
+                },
+            );
+        },
+    );
+    testing::assert_eq(read_int(live.snapshot(), "/a"), 24);
+}
+
+#[test]
+fn real_environment_source_reads_process_values_and_rejects_watching_without_files() -> () {
+    let snapshot = ok(
+        config::Builder::new().with_source(
+            config::Source::environment("process", config::EnvOptions::new("GOML_")),
+        ).build(),
+    );
+    let home: string = ok(snapshot.decode_at("/home"));
+    testing::assert_eq(
+        home,
+        testing::expect_ok(env::var_structured("GOML_HOME"), "test registry home"),
+    );
+    let live = ok(config::Live::new(config::Builder::new()));
+    kind(live.watch(), config::ErrorKind::InvalidOptions);
+}

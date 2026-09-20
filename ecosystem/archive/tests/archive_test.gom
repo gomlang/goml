@@ -1,0 +1,435 @@
+package tests;
+
+use ecosystem::archive;
+use archive::{Entry, Header, EntryKind, Limits, Compression, TarWriter, TarReader, ZipWriter, ZipArchive, ErrorKind};
+use std::bytes;
+use std::io;
+use io::{Read, Write};
+use std::testing;
+use std::utf8;
+use utf8::BytesUtf8;
+
+fn must[T](value: Result[T, archive::Error]) -> T {
+    testing::expect_ok(value, "archive")
+}
+
+fn sample() -> Vec[Entry] {
+    Vec::from_array(
+        [
+            Entry::directory("docs/"),
+            Entry {
+                header: Header {
+                    modified: 1700000000,
+                    mode: 0o640,
+                    user: "goml",
+                    group: "users",
+                    ..Header::file("docs/你好.txt"),
+                },
+                data: bytes::Bytes::from_string("hello\n世界\u0000"),
+            },
+            Entry::file("empty", bytes::Bytes::new()),
+        ],
+    )
+}
+
+fn assert_sample(entries: Vec[Entry]) -> () {
+    testing::assert_eq(entries.len(), 3);
+    testing::assert_eq(entries[0].header.kind, EntryKind::Directory);
+    testing::assert_eq(entries[1].header.path, "docs/你好.txt");
+    testing::assert_eq(entries[1].header.modified, 1700000000);
+    testing::assert_eq(
+        testing::expect_ok(entries[1].data.to_string_utf8(), "text"),
+        "hello\n世界\u0000",
+    );
+    testing::assert_eq(entries[2].data.len(), 0);
+}
+
+#[test]
+fn tar_zip_gzip_roundtrips_and_metadata() -> () {
+    let limits = Limits::standard();
+    let tiny = bytes::Bytes::from_string("bounded");
+    let packed = must(archive::gzip(tiny));
+    testing::assert(must(archive::gunzip(packed, 9223372036854775807)).to_vec() == tiny.to_vec());
+    testing::assert(must(archive::gunzip(packed, tiny.len())).to_vec() == tiny.to_vec());
+    testing::assert_err(archive::gunzip(packed, tiny.len() - 1));
+    assert_sample(must(archive::decode_tar(must(archive::encode_tar(sample(), limits)), limits)));
+    assert_sample(
+        must(archive::decode_tar_gz(must(archive::encode_tar_gz(sample(), limits)), limits)),
+    );
+    for method in Vec::from_array([Compression::Stored, Compression::Deflate]) {
+        assert_sample(
+            must(archive::decode_zip(must(archive::encode_zip(sample(), method, limits)), limits)),
+        );
+    }
+    testing::assert_eq(archive::crc32(bytes::Bytes::from_string("123456789")), 0xcbf43926);
+    let crc = archive::crc32(bytes::Bytes::from_string("1234"));
+    testing::assert_eq(
+        archive::crc32_update(crc, bytes::Bytes::from_string("56789").as_slice()),
+        0xcbf43926,
+    );
+}
+
+#[test]
+fn pax_long_paths_large_ids_custom_keys_and_links() -> () {
+    let mut path = "";
+    for _ in 0..70 {
+        path += "目录";
+    }
+    path += "/file";
+    let entries = Vec::from_array(
+        [
+            Entry {
+                header: Header {
+                    path,
+                    uid: 9000000,
+                    gid: 8000000,
+                    modified: 9000000000,
+                    pax: Vec::from_array([("vendor.label", "two\nlines=ok")]),
+                    ..Header::file(""),
+                },
+                data: bytes::Bytes::from_string("PAX"),
+            },
+            Entry::symlink("link", path),
+            Entry {
+                header: Header { kind: EntryKind::Hardlink, link: path, ..Header::file("hard") },
+                data: bytes::Bytes::new(),
+            },
+        ],
+    );
+    let decoded = must(
+        archive::decode_tar(
+            must(archive::encode_tar(entries, Limits::standard())),
+            Limits::standard(),
+        ),
+    );
+    testing::assert_eq(decoded[0].header.path, path);
+    testing::assert_eq(decoded[0].header.uid, 9000000);
+    testing::assert_eq(decoded[0].header.modified, 9000000000);
+    testing::assert_eq(decoded[1].header.link, path);
+    testing::assert_eq(decoded[2].header.kind, EntryKind::Hardlink);
+    let zip = must(
+        archive::encode_zip(Vec::from_array([entries[1]]), Compression::Deflate, Limits::standard()),
+    );
+    testing::assert_eq(must(archive::decode_zip(zip, Limits::standard()))[0].header.link, path);
+}
+
+struct Fragmented {
+    reader: io::Cursor,
+    calls: Ref[isize],
+}
+
+impl Read for Fragmented {
+    fn read(self: Fragmented, buffer: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        if self.calls.get() % 5 == 1 {
+            return Result::Err(
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "fragmented",
+                    Option::None,
+                    Option::None,
+                    "retry",
+                ),
+            )
+        }
+        self.reader.read(
+            buffer.sub(
+                0,
+                if buffer.len() > 7 {
+                    7
+                } else {
+                    buffer.len()
+                },
+            ),
+        )
+    }
+}
+
+struct ShortWriter {
+    output: io::Cursor,
+    fail_at: isize,
+    calls: Ref[isize],
+}
+
+impl Write for ShortWriter {
+    fn write(self: ShortWriter, data: Slice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        if self.fail_at > 0 && self.calls.get() >= self.fail_at {
+            return Result::Err(
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    "writer",
+                    Option::None,
+                    Option::None,
+                    "injected failure",
+                ),
+            )
+        }
+        self.output.write(
+            data.sub(
+                0,
+                if data.len() > 13 {
+                    13
+                } else {
+                    data.len()
+                },
+            ),
+        )
+    }
+}
+
+#[test]
+fn streaming_short_io_interrupts_and_sticky_failure() -> () {
+    let output = io::Cursor::new(bytes::Bytes::new());
+    let writer = must(
+        TarWriter::new(ShortWriter { output, fail_at: 0, calls: Ref::new(0) }, Limits::standard()),
+    );
+    let data = bytes::Bytes::from_string("stream me");
+    must(
+        writer.append_reader(
+            Header::file("stream"),
+            data.len(),
+            Fragmented { reader: io::Cursor::new(data), calls: Ref::new(0) },
+        ),
+    );
+    must(writer.finish());
+    must(writer.finish());
+    testing::assert(writer.append(Entry::directory("late")).is_err());
+    let reader = must(
+        TarReader::new(
+            Fragmented { reader: io::Cursor::new(output.bytes()), calls: Ref::new(0) },
+            Limits::standard(),
+        ),
+    );
+    let entry = testing::expect_some(must(reader.next()), "entry");
+    testing::assert(entry.data.to_vec() == data.to_vec());
+    testing::assert(must(reader.next()).is_none());
+    testing::assert(must(reader.next()).is_none());
+    let calls = Ref::new(0);
+    let failed = must(
+        TarWriter::new(
+            ShortWriter { output: io::Cursor::new(bytes::Bytes::new()), fail_at: 2, calls },
+            Limits::standard(),
+        ),
+    );
+    testing::assert(failed.append(Entry::file("file", data)).is_err());
+    testing::assert(failed.finish().is_err());
+    testing::assert_eq(calls.get(), 2);
+    let zip_output = io::Cursor::new(bytes::Bytes::new());
+    let zip_writer = must(
+        ZipWriter::new(
+            ShortWriter { output: zip_output, fail_at: 0, calls: Ref::new(0) },
+            Limits::standard(),
+        ),
+    );
+    must(
+        zip_writer.append_reader(
+            Header::file("stream"),
+            data.len(),
+            io::Cursor::new(data),
+            Compression::Deflate,
+        ),
+    );
+    must(zip_writer.finish("archive comment"));
+    let zip = must(
+        ZipArchive::read(
+            Fragmented { reader: io::Cursor::new(zip_output.bytes()), calls: Ref::new(0) },
+            Limits::standard(),
+        ),
+    );
+    testing::assert_eq(zip.comment(), "archive comment");
+    testing::assert(must(zip.entry(0)).data.to_vec() == data.to_vec());
+}
+
+#[test]
+fn truncated_headers_payloads_and_checksums_are_errors() -> () {
+    let limits = Limits::standard();
+    let tar = must(
+        archive::encode_tar(
+            Vec::from_array([Entry::file("file", bytes::Bytes::from_string("payload"))]),
+            limits,
+        ),
+    );
+    for length in Vec::from_array([0, 1, 511, 512, 513, 1024, 1535, 2047]) {
+        testing::assert(
+            archive::decode_tar(bytes::Bytes::from_slice_copy(tar.slice(0, length)), limits).is_err(),
+        );
+    }
+    let bad = tar.copy();
+    bad.set(0, b'z');
+    testing::assert_eq(
+        testing::expect_err(archive::decode_tar(bad, limits), "checksum").kind,
+        ErrorKind::Checksum,
+    );
+    let zip = must(
+        archive::encode_zip(
+            Vec::from_array([Entry::file("file", bytes::Bytes::from_string("payload"))]),
+            Compression::Stored,
+            limits,
+        ),
+    );
+    for length in 0..zip.len() {
+        testing::assert(
+            ZipArchive::open(bytes::Bytes::from_slice_copy(zip.slice(0, length)), limits).is_err(),
+        );
+    }
+    let bad_zip = zip.copy();
+    bad_zip.set(43, b'X');
+    let parsed = must(ZipArchive::open(bad_zip, limits));
+    testing::assert_eq(testing::expect_err(parsed.entry(0), "CRC").kind, ErrorKind::Checksum);
+    let source = bytes::Bytes::from_string("gzip payload");
+    let gzip = must(archive::gzip(source));
+    gzip.set(gzip.len() - 8, gzip.get(gzip.len() - 8) ^ 1);
+    testing::assert(archive::gunzip(gzip, 100).is_err());
+}
+
+#[test]
+fn resource_limits_and_safe_paths() -> () {
+    let limits = Limits { max_entry_bytes: 2, ..Limits::standard() };
+    testing::assert(archive::encode_tar(sample(), limits).is_err());
+    let tar = must(archive::encode_tar(sample(), Limits::standard()));
+    testing::assert(archive::decode_tar(tar, limits).is_err());
+    let zip = must(archive::encode_zip(sample(), Compression::Deflate, Limits::standard()));
+    testing::assert(ZipArchive::open(zip, limits).is_err());
+    testing::assert(ZipArchive::open(zip, Limits { max_entries: 1, ..Limits::standard() }).is_err());
+    testing::assert(
+        archive::gunzip(must(archive::gzip(bytes::Bytes::from_string("123"))), 2).is_err(),
+    );
+    testing::assert(
+        TarWriter::new(
+            io::Cursor::new(bytes::Bytes::new()),
+            Limits { max_archive_bytes: -1, ..Limits::standard() },
+        ).is_err(),
+    );
+    for name in Vec::from_array(
+        ["", "/absolute", "../escape", "a/../b", "./file", "a//b", "C:/file", "a\\b", "a\u0000b"],
+    ) {
+        testing::assert(archive::safe_path(name, 4096).is_err());
+    }
+    testing::assert_eq(must(archive::safe_path("a/b/", 4096)), "a/b");
+}
+
+fn little(data: bytes::Bytes, start: isize, value: u64, count: isize) -> () {
+    for index in 0..count {
+        data.set(start + index, (value >> (index * 8).to_u64()).to_u8())
+    }
+}
+
+fn signature(data: bytes::Bytes, value: Vec[byte]) -> isize {
+    for index in 0..data.len() - 3 {
+        if data.get(index) == value[0] && data.get(index + 1) == value[1]
+            && data.get(index + 2) == value[2]
+            && data.get(index + 3) == value[3] {
+            return index
+        }
+    }
+    testing::fail("missing signature");
+    0
+}
+
+#[test]
+fn zip_data_descriptors_and_directory_consistency() -> () {
+    let limits = Limits::standard();
+    let payload = bytes::Bytes::from_string("descriptor");
+    let original = must(
+        archive::encode_zip(
+            Vec::from_array([Entry::file("file", payload)]),
+            Compression::Stored,
+            limits,
+        ),
+    );
+    let central = signature(original, Vec::from_array([0x50, 0x4b, 0x01, 0x02]));
+    for signed in Vec::from_array([false, true]) {
+        let descriptor_length = if signed {
+            16
+        } else {
+            12
+        };
+        let data = bytes::Bytes::from_slice_copy(original.slice(0, central));
+        for _ in 0..descriptor_length {
+            data.push(0)
+        }
+        data.extend_from_slice(original.slice(central, original.len()));
+        let descriptor = if signed {
+            central + 4
+        } else {
+            central
+        };
+        if signed {
+            little(data, central, 0x08074b50, 4);
+        }
+        little(data, descriptor, archive::crc32(payload).to_u64(), 4);
+        little(data, descriptor + 4, payload.len().to_u64(), 4);
+        little(data, descriptor + 8, payload.len().to_u64(), 4);
+        little(data, 6, 0x0808, 2);
+        little(data, 14, 0, 4);
+        little(data, 18, 0, 4);
+        little(data, 22, 0, 4);
+        little(data, central + descriptor_length + 8, 0x0808, 2);
+        little(data, data.len() - 22 + 16, (central + descriptor_length).to_u64(), 4);
+        testing::assert(
+            must(must(ZipArchive::open(data, limits)).entry(0)).data.to_vec() == payload.to_vec(),
+        );
+        data.set(descriptor, data.get(descriptor) ^ 1);
+        testing::assert(ZipArchive::open(data, limits).is_err());
+    }
+    for offset in Vec::from_array(
+        [
+            0,
+            6,
+            8,
+            14,
+            18,
+            22,
+            30,
+            central + 16,
+            central + 20,
+            central + 24,
+            central + 42,
+            original.len() - 22 + 12,
+            original.len() - 22 + 16,
+        ],
+    ) {
+        let bad = original.copy();
+        bad.set(offset, bad.get(offset) ^ 1);
+        testing::assert(ZipArchive::open(bad, limits).is_err());
+    }
+    let snapshot = must(ZipArchive::open(original, limits));
+    original.set(43, original.get(43) ^ 1);
+    testing::assert(must(snapshot.entry(0)).data.to_vec() == payload.to_vec());
+}
+
+#[test]
+fn pax_records_are_validated_and_reencoding_preserves_extensions() -> () {
+    let mut path = "";
+    for _ in 0..150 {
+        path += "a";
+    }
+    let limits = Limits::standard();
+    let original = must(
+        archive::encode_tar(
+            Vec::from_array(
+                [
+                    Entry {
+                        header: Header {
+                            pax: Vec::from_array([("vendor.key", "value")]),
+                            ..Header::file(path),
+                        },
+                        data: bytes::Bytes::from_string("value"),
+                    },
+                ],
+            ),
+            limits,
+        ),
+    );
+    let entries = must(archive::decode_tar(original, limits));
+    let again = must(archive::decode_tar(must(archive::encode_tar(entries, limits)), limits));
+    testing::assert_eq(again[0].header.path, path);
+    testing::assert(again[0].header.pax == Vec::from_array([("vendor.key", "value")]));
+    let bad = original.copy();
+    bad.set(512, b'9');
+    testing::assert(archive::decode_tar(bad, limits).is_err());
+    let bad_length = original.copy();
+    bad_length.set(512, b'x');
+    testing::assert(archive::decode_tar(bad_length, limits).is_err());
+}

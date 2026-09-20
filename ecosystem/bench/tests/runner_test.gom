@@ -1,0 +1,334 @@
+package tests;
+
+use ecosystem::bench;
+use bench::{Case, Clock, Options, ErrorKind, Timing};
+use std::context;
+use std::testing;
+use std::time;
+use std::task;
+
+fn run_options() -> Options {
+    Options {
+        warmup_ns: 25,
+        measurement_ns: 400,
+        samples: 4,
+        max_iterations: 100,
+        max_total_iterations: 10000,
+        max_wall_ns: 1000000,
+        bootstrap_resamples: 100,
+        ..Options::standard(),
+    }
+}
+
+#[test]
+fn warmup_adapts_batches_and_retains_results() -> () {
+    let now: Ref[i64] = Ref::new(0);
+    let calls: Ref[u64] = Ref::new(0);
+    let case = Case::new(
+        "work",
+        || {
+            now.set(now.get() + 10);
+            calls.set(calls.get() + 1);
+            calls.get()
+        },
+    );
+    let result = testing::expect_ok(
+        bench::run_with(
+            case,
+            run_options(),
+            Clock::new(|| now.get()),
+            context::Context::background(),
+        ),
+        "run",
+    );
+    testing::assert_eq(result.warmup_iterations, 3);
+    testing::assert_eq(result.samples.len(), 4);
+    testing::assert_eq(result.samples[0].iterations, 10);
+    testing::assert_eq(result.statistics.mean.estimate, 10.0);
+    testing::assert_eq(result.total_iterations, 43);
+    testing::assert_eq(calls.get(), result.total_iterations);
+    testing::assert_eq(result.elapsed_wall_ns, 430);
+}
+
+#[test]
+fn setup_is_excluded_from_per_iteration_timing() -> () {
+    let now: Ref[i64] = Ref::new(0);
+    let setup_calls = Ref::new(0);
+    let case = Case::with_setup(
+        "sort",
+        || {
+            now.set(now.get() + 1000);
+            setup_calls.set(setup_calls.get() + 1);
+            Vec::from_array([3, 1, 2])
+        },
+        |values| {
+            values.sort_by(|left, right| left - right);
+            now.set(now.get() + 7);
+            values[0].to_u64()
+        },
+    );
+    let report = testing::expect_ok(
+        bench::run_with(
+            case,
+            run_options(),
+            Clock::new(|| now.get()),
+            context::Context::background(),
+        ),
+        "setup run",
+    );
+    testing::assert_eq(report.timing, Timing::PerIteration);
+    testing::assert_eq(report.statistics.mean.estimate, 7.0);
+    testing::assert(report.elapsed_wall_ns > report.total_iterations.to_i64() * 1000);
+    testing::assert_eq(setup_calls.get().to_u64(), report.total_iterations);
+}
+
+#[test]
+fn broken_and_stalled_clocks_stop_with_bounded_work() -> () {
+    let stalled = Ref::new(0);
+    let options = Options { max_iterations: 8, max_total_iterations: 100, ..run_options() };
+    let case = Case::new(
+        "stalled",
+        || {
+            stalled.set(stalled.get() + 1);
+            0
+        },
+    );
+    let failure = testing::expect_err(
+        bench::run_with(case, options, Clock::new(|| 0), context::Context::background()),
+        "zero clock",
+    );
+    testing::assert_eq(failure.kind, ErrorKind::Clock);
+    testing::assert_eq(stalled.get(), 15);
+    let decreasing = Ref::new(10);
+    testing::assert(
+        bench::run_with(
+            Case::new("backwards", || 1),
+            options,
+            Clock::new(
+                || {
+                    decreasing.set(decreasing.get() - 1);
+                    decreasing.get()
+                },
+            ),
+            context::Context::background(),
+        ).is_err(),
+    );
+    testing::assert(Clock::new(|| -1).now().is_err());
+    testing::assert(Options { max_iterations: 18446744073709551615, ..options }.validate().is_err());
+    testing::assert(Options { min_iterations: 0, ..options }.validate().is_err());
+}
+
+#[test]
+fn budget_failures_cancellation_deadlines_and_workload_errors() -> () {
+    let now: Ref[i64] = Ref::new(0);
+    let case = Case::new(
+        "bounded",
+        || {
+            now.set(now.get() + 10);
+            1
+        },
+    );
+    let limited = Options { max_total_iterations: 2, ..run_options() };
+    testing::assert_eq(
+        testing::expect_err(
+            bench::run_with(case, limited, Clock::new(|| now.get()), context::Context::background()),
+            "iteration budget",
+        ).kind,
+        ErrorKind::Limit,
+    );
+    now.set(0);
+    testing::assert_eq(
+        testing::expect_err(
+            bench::run_with(
+                case,
+                Options { max_wall_ns: 5, ..run_options() },
+                Clock::new(|| now.get()),
+                context::Context::background(),
+            ),
+            "wall budget",
+        ).kind,
+        ErrorKind::Limit,
+    );
+    context::with_cancel(
+        context::Context::background(),
+        |control, cancel| {
+            cancel.cancel();
+            testing::assert_eq(
+                testing::expect_err(
+                    bench::run_with(
+                        Case::new("cancelled", || 1),
+                        run_options(),
+                        Clock::monotonic(),
+                        control,
+                    ),
+                    "cancelled",
+                ).kind,
+                ErrorKind::Cancelled,
+            );
+        },
+    );
+    context::with_timeout(
+        context::Context::background(),
+        time::Duration::zero(),
+        |control, _| {
+            testing::assert(
+                bench::run_with(
+                    Case::new("deadline", || 1),
+                    run_options(),
+                    Clock::monotonic(),
+                    control,
+                ).is_err(),
+            );
+        },
+    );
+    testing::assert_eq(
+        testing::expect_err(
+            bench::run(Case::fallible("failure", || Result::Err("workload failed")), run_options()),
+            "workload",
+        ).kind,
+        ErrorKind::Workload,
+    );
+}
+
+#[test]
+fn parameterized_cases_and_duplicate_identities() -> () {
+    let cases = bench::parameterized(
+        "hash",
+        "integer",
+        Vec::from_array([("small", 3), ("large", 7)]),
+        |value| value.to_u64(),
+    );
+    testing::assert_eq(cases.len(), 2);
+    testing::assert_eq(cases[0].parameter, "small");
+    testing::assert_eq(cases[1].group, "hash");
+    let duplicate = Vec::from_array([cases[0], cases[0]]);
+    testing::assert(bench::run_suite(duplicate, run_options()).is_err());
+    testing::assert_eq(bench::black_box(55), 55);
+}
+
+#[test]
+fn cancellation_during_work_and_statistical_analysis() -> () {
+    context::with_cancel(
+        context::Context::background(),
+        |control, cancel| {
+            let now: Ref[i64] = Ref::new(0);
+            let calls = Ref::new(0);
+            let case = Case::new(
+                "cancel within batch",
+                || {
+                    now.set(now.get() + 1);
+                    calls.set(calls.get() + 1);
+                    if calls.get() == 3 {
+                        cancel.cancel();
+                    }
+                    1
+                },
+            );
+            let result = bench::run_with(case, run_options(), Clock::new(|| now.get()), control);
+            testing::assert_eq(
+                testing::expect_err(result, "cancel in work").kind,
+                ErrorKind::Cancelled,
+            );
+        },
+    );
+    context::with_cancel(
+        context::Context::background(),
+        |control, cancel| {
+            cancel.cancel();
+            let values = Vec::from_array([1.0, 2.0]);
+            testing::assert_eq(
+                testing::expect_err(
+                    bench::bootstrap_mean_with(values, 20, 0.95, 17, control),
+                    "cancel bootstrap",
+                ).kind,
+                ErrorKind::Cancelled,
+            );
+            let samples = Vec::from_array(
+                [
+                    bench::Sample { iterations: 1, elapsed_ns: 1 },
+                    bench::Sample { iterations: 1, elapsed_ns: 2 },
+                ],
+            );
+            testing::assert_eq(
+                testing::expect_err(
+                    bench::analyze_with(samples, run_options(), control),
+                    "cancel statistics",
+                ).kind,
+                ErrorKind::Cancelled,
+            );
+        },
+    );
+}
+
+#[test]
+fn black_box_preserves_inputs_under_concurrent_calls() -> () {
+    task::scope(
+        |scope| {
+            let tasks = Vec::new();
+            for worker in 0..8 {
+                tasks.push(
+                    scope.spawn(
+                        |_| {
+                            for index in 0..1000 {
+                                let value = (worker * 1000 + index).to_u64();
+                                testing::assert_eq(bench::black_box(value), value);
+                            }
+                        },
+                    ),
+                );
+            }
+            for task in tasks {
+                task.join();
+            }
+        },
+    );
+}
+
+#[test]
+fn zero_measurement_after_successful_calibration_is_rejected() -> () {
+    let now: Ref[i64] = Ref::new(0);
+    let first = Ref::new(true);
+    let case = Case::new(
+        "stalled after calibration",
+        || {
+            if first.get() {
+                now.set(1);
+                first.set(false);
+            }
+            1
+        },
+    );
+    let configured = Options { warmup_ns: 0, ..run_options() };
+    let result = bench::run_with(
+        case,
+        configured,
+        Clock::new(|| now.get()),
+        context::Context::background(),
+    );
+    testing::assert_eq(testing::expect_err(result, "zero sample").kind, ErrorKind::Clock);
+}
+
+#[test]
+fn minimum_iterations_apply_to_calibration_and_every_sample() -> () {
+    let now: Ref[i64] = Ref::new(0);
+    let case = Case::new(
+        "minimum batch",
+        || {
+            now.set(now.get() + 10);
+            1
+        },
+    );
+    let configured = Options { warmup_ns: 0, measurement_ns: 1, min_iterations: 3, ..run_options() };
+    let report = testing::expect_ok(
+        bench::run_with(case, configured, Clock::new(|| now.get()), context::Context::background()),
+        "minimum iterations",
+    );
+    testing::assert_eq(report.warmup_iterations, 3);
+    for sample in report.samples {
+        testing::assert_eq(sample.iterations, 3);
+    }
+    testing::assert_eq(report.statistics.mean.estimate, 10.0);
+    testing::assert(bench::run_suite(Vec::new(), Options { samples: 0, ..configured }).is_err());
+    let empty = testing::expect_ok(bench::run_suite(Vec::new(), configured), "empty valid suite");
+    testing::assert(empty.reports.is_empty());
+}

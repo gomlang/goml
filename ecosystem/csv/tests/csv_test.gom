@@ -1,0 +1,529 @@
+package tests;
+
+use ecosystem::csv;
+use std::bytes;
+use std::io;
+use io::{Read, Write};
+use std::testing;
+use std::utf8;
+
+fn ok[T](value: Result[T, csv::Error]) -> T {
+    match value {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.to_string());
+            loop {}
+        },
+    }
+}
+
+fn kind[T](value: Result[T, csv::Error], expected: csv::ErrorKind) -> csv::Error {
+    let error = testing::expect_err(value, "expected CSV error");
+    testing::assert_eq(error.kind, expected);
+    error
+}
+
+struct Chunks {
+    data: Vec[byte],
+    offset: Ref[isize],
+    chunk: isize,
+    fail_after: isize,
+    calls: Ref[isize],
+    interrupt: Ref[bool],
+}
+
+fn chunks(input: string, chunk: isize) -> Chunks {
+    Chunks {
+        data: utf8::encode(input),
+        offset: Ref::new(0),
+        chunk,
+        fail_after: -1,
+        calls: Ref::new(0),
+        interrupt: Ref::new(false),
+    }
+}
+
+fn failure(operation: string) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Other,
+        operation,
+        Option::None,
+        Option::None,
+        "injected I/O failure",
+    )
+}
+
+impl Read for Chunks {
+    fn read(self: Chunks, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        if self.interrupt.get() {
+            self.interrupt.set(false);
+            return Result::Err(
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "read",
+                    Option::None,
+                    Option::None,
+                    "retry",
+                ),
+            )
+        }
+        if self.fail_after >= 0 && self.offset.get() >= self.fail_after {
+            return Result::Err(failure("read"))
+        }
+        let mut count = self.data.len() - self.offset.get();
+        if count > self.chunk {
+            count = self.chunk;
+        }
+        if count > output.len() {
+            count = output.len();
+        }
+        if self.fail_after >= 0 && count > self.fail_after - self.offset.get() {
+            count = self.fail_after - self.offset.get();
+        }
+        for index in 0..count {
+            output[index] = self.data[self.offset.get() + index];
+        }
+        self.offset.set(self.offset.get() + count);
+        Result::Ok(count)
+    }
+}
+
+struct Sink {
+    data: Vec[byte],
+    chunk: isize,
+    fail_after: isize,
+    calls: Ref[isize],
+    interrupt: Ref[bool],
+    flush_error: bool,
+}
+
+fn sink(chunk: isize) -> Sink {
+    Sink {
+        data: Vec::new(),
+        chunk,
+        fail_after: -1,
+        calls: Ref::new(0),
+        interrupt: Ref::new(false),
+        flush_error: false,
+    }
+}
+
+impl Write for Sink {
+    fn write(self: Sink, value: Slice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        if self.interrupt.get() {
+            self.interrupt.set(false);
+            return Result::Err(
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "write",
+                    Option::None,
+                    Option::None,
+                    "retry",
+                ),
+            )
+        }
+        if self.fail_after >= 0 && self.data.len() >= self.fail_after {
+            return Result::Err(failure("write"))
+        }
+        let mut count = value.len();
+        if count > self.chunk {
+            count = self.chunk;
+        }
+        if self.fail_after >= 0 && count > self.fail_after - self.data.len() {
+            count = self.fail_after - self.data.len();
+        }
+        for index in 0..count {
+            self.data.push(value[index]);
+        }
+        Result::Ok(count)
+    }
+
+    fn flush(self: Sink) -> Result[(), io::Error] {
+        if self.flush_error {
+            Result::Err(failure("flush"))
+        } else {
+            Result::Ok(())
+        }
+    }
+}
+
+fn rows[R: Read](reader: csv::Reader[R]) -> Vec[Vec[string]] {
+    let output = Vec::new();
+    while let Some(record) = ok(reader.next()) {
+        output.push(record.values());
+    }
+    output
+}
+
+fn one[R: Read](reader: csv::Reader[R]) -> csv::StringRecord {
+    testing::expect_some(ok(reader.next()), "record")
+}
+
+#[test]
+fn rfc4180_examples_and_adversarial_boundaries_parse_for_every_chunk_size() -> () {
+    let examples = Vec::from_array(
+        [
+            (
+                "aaa,bbb,ccc\r\nzzz,yyy,xxx\r\n",
+                Vec::from_array(
+                    [Vec::from_array(["aaa", "bbb", "ccc"]), Vec::from_array(["zzz", "yyy", "xxx"])],
+                ),
+            ),
+            (
+                "\"aaa\",\"b\r\nbb\",\"ccc\"\r\nzzz,yyy,xxx",
+                Vec::from_array(
+                    [
+                        Vec::from_array(["aaa", "b\r\nbb", "ccc"]),
+                        Vec::from_array(["zzz", "yyy", "xxx"]),
+                    ],
+                ),
+            ),
+            (
+                "\"aaa\",\"b\"\"bb\",\"ccc\"",
+                Vec::from_array([Vec::from_array(["aaa", "b\"bb", "ccc"])]),
+            ),
+            (
+                ",,\r\n\"\",x,",
+                Vec::from_array([Vec::from_array(["", "", ""]), Vec::from_array(["", "x", ""])]),
+            ),
+            (
+                "\"你好,🌈\",é\nlast,\"two\nlines\"",
+                Vec::from_array(
+                    [Vec::from_array(["你好,🌈", "é"]), Vec::from_array(["last", "two\nlines"])],
+                ),
+            ),
+        ],
+    );
+    for (input, expected) in examples {
+        for chunk in 1..input.byte_len() + 2 {
+            let options = csv::ReadOptions { buffer_size: chunk, ..csv::ReadOptions::new() };
+            let reader = ok(csv::Reader::new(chunks(input, chunk), options));
+            testing::assert(rows(reader) == expected);
+            testing::assert_none(ok(reader.next()));
+        }
+    }
+}
+
+#[test]
+fn empty_input_blank_records_trailing_delimiters_and_blank_skipping_are_distinct() -> () {
+    testing::assert(rows(ok(csv::Reader::new(chunks("", 1), csv::ReadOptions::new()))).is_empty());
+    let input = "\n\r\n\"\"\n,\n";
+    let options = csv::ReadOptions { flexible: true, ..csv::ReadOptions::new() };
+    testing::assert(
+        rows(ok(csv::Reader::new(chunks(input, 1), options)))
+            == Vec::from_array(
+                [
+                    Vec::from_array([""]),
+                    Vec::from_array([""]),
+                    Vec::from_array([""]),
+                    Vec::from_array(["", ""]),
+                ],
+            ),
+    );
+    let options = csv::ReadOptions { skip_blank: true, ..options };
+    testing::assert(
+        rows(ok(csv::Reader::new(chunks(input, 1), options)))
+            == Vec::from_array([Vec::from_array([""]), Vec::from_array(["", ""])]),
+    );
+}
+
+#[test]
+fn strict_syntax_rejects_bare_quotes_trailing_junk_and_unclosed_quotes_and_fuses() -> () {
+    for (input, offset) in Vec::from_array([("a\"b,c", 1), ("\"x\"z,y", 3), ("\"unterminated", 13)]) {
+        let source = chunks(input, 1);
+        let reader = ok(csv::Reader::new(source, csv::ReadOptions::new()));
+        let first = kind(reader.next(), csv::ErrorKind::Syntax);
+        testing::assert_eq(first.position.byte, offset);
+        let calls = source.calls.get();
+        let second = kind(reader.next(), csv::ErrorKind::Syntax);
+        testing::assert_eq(first.position, second.position);
+        testing::assert_eq(source.calls.get(), calls);
+    }
+    let options = csv::ReadOptions { strict: false, ..csv::ReadOptions::new() };
+    let records = rows(
+        ok(
+            csv::Reader::new(
+                chunks("a\"b,c\n\"x\"z,y\n\"unfinished", 1),
+                csv::ReadOptions { flexible: true, ..options },
+            ),
+        ),
+    );
+    testing::assert(
+        records
+            == Vec::from_array(
+                [
+                    Vec::from_array(["a\"b", "c"]),
+                    Vec::from_array(["xz", "y"]),
+                    Vec::from_array(["unfinished"]),
+                ],
+            ),
+    );
+}
+
+#[test]
+fn custom_dialects_crlf_policy_and_ascii_trimming_are_explicit() -> () {
+    let options = csv::ReadOptions {
+        delimiter: 59,
+        quote: 39,
+        terminator: csv::Terminator::Byte(124),
+        trim: true,
+        ..csv::ReadOptions::new(),
+    };
+    let actual = rows(ok(csv::Reader::new(chunks("'a;''b';  x\t|y;z|", 1), options)));
+    testing::assert(
+        actual == Vec::from_array([Vec::from_array(["a;'b", "x"]), Vec::from_array(["y", "z"])]),
+    );
+    let strict = csv::ReadOptions { terminator: csv::Terminator::CrLf, ..csv::ReadOptions::new() };
+    for input in Vec::from_array(["a\n", "a\r", "a\rb"]) {
+        kind(ok(csv::Reader::new(chunks(input, 1), strict)).next(), csv::ErrorKind::Syntax);
+    }
+    testing::assert(
+        rows(ok(csv::Reader::new(chunks("a\r\nb", 1), strict)))
+            == Vec::from_array([Vec::from_array(["a"]), Vec::from_array(["b"])]),
+    );
+    for options in Vec::from_array(
+        [
+            csv::ReadOptions { delimiter: 34, ..csv::ReadOptions::new() },
+            csv::ReadOptions { quote: 10, ..csv::ReadOptions::new() },
+            csv::ReadOptions { terminator: csv::Terminator::Byte(44), ..csv::ReadOptions::new() },
+            csv::ReadOptions { buffer_size: 0, ..csv::ReadOptions::new() },
+        ],
+    ) {
+        kind(csv::Reader::new(chunks("", 1), options), csv::ErrorKind::Options);
+    }
+}
+
+#[test]
+fn bom_is_optional_only_at_start_and_byte_records_preserve_invalid_utf8() -> () {
+    let input = "\uFEFFname,value\n\uFEFFinside,2";
+    for chunk in 1..5 {
+        let reader = ok(csv::Reader::new(chunks(input, chunk), csv::ReadOptions::new()));
+        let first = one(reader);
+        testing::assert(first.values() == Vec::from_array(["name", "value"]));
+        testing::assert_eq(first.position().byte, 3);
+        testing::assert(one(reader).values() == Vec::from_array(["\uFEFFinside", "2"]));
+    }
+    let options = csv::ReadOptions { strip_bom: false, ..csv::ReadOptions::new() };
+    testing::assert_eq(
+        one(ok(csv::Reader::new(chunks(input, 1), options))).values()[0],
+        "\uFEFFname",
+    );
+    let source = Chunks {
+        data: Vec::from_array([34.to_u8(), 97, 34, 34, 255, 34, 10, 111, 107, 10]),
+        ..chunks("", 1),
+    };
+    let reader = ok(csv::Reader::new(source, csv::ReadOptions::new()));
+    let record = testing::expect_some(ok(reader.next_bytes()), "raw record");
+    let bytes = testing::expect_some(record.get(0), "field");
+    testing::assert(bytes.to_vec() == Vec::from_array([97.to_u8(), 34, 255]));
+    let invalid = kind(record.strings(), csv::ErrorKind::Utf8);
+    testing::assert_eq(invalid.position.byte, 4);
+    testing::assert_eq(invalid.position.column, 5);
+    testing::assert_eq(one(reader).values()[0], "ok");
+}
+
+#[test]
+fn record_and_field_positions_track_physical_lines_and_crlf_across_chunks() -> () {
+    let reader = ok(
+        csv::Reader::new(chunks("\"a\r\nb\",c\r\nx,\"q\"z\r\n", 1), csv::ReadOptions::new()),
+    );
+    let first = one(reader);
+    testing::assert_eq(first.position(), csv::Position::start());
+    let field = testing::expect_some(first.field_position(1), "field position");
+    testing::assert_eq(field.byte, 7);
+    testing::assert_eq(field.line, 2);
+    testing::assert_eq(field.column, 4);
+    let invalid = kind(reader.next(), csv::ErrorKind::Syntax);
+    testing::assert_eq(invalid.position.byte, 15);
+    testing::assert_eq(invalid.position.line, 3);
+    testing::assert_eq(invalid.position.column, 6);
+    testing::assert_eq(invalid.position.record, 2);
+}
+
+#[test]
+fn limits_cover_fields_wire_bytes_columns_records_and_total_input() -> () {
+    let cases = Vec::from_array(
+        [
+            ("abcd\n", csv::Limits { max_field_bytes: 3, ..csv::Limits::new() }),
+            ("\"a\"\"b\"\r\n", csv::Limits { max_record_bytes: 7, ..csv::Limits::new() }),
+            ("a,b,c\n", csv::Limits { max_columns: 2, ..csv::Limits::new() }),
+            ("a\nb\n", csv::Limits { max_records: 1, ..csv::Limits::new() }),
+            ("a\nb\n", csv::Limits { max_total_bytes: 3, ..csv::Limits::new() }),
+        ],
+    );
+    for (input, limits) in cases {
+        let reader = ok(
+            csv::Reader::new(
+                chunks(input, 2),
+                csv::ReadOptions { limits, ..csv::ReadOptions::new() },
+            ),
+        );
+        let mut failed = false;
+        for _ in 0..5 {
+            match reader.next() {
+                Ok(Some(_)) => (),
+                Ok(None) => break,
+                Err(error) => {
+                    testing::assert_eq(error.kind, csv::ErrorKind::Limit);
+                    failed = true;
+                    break
+                },
+            }
+        }
+        testing::assert(failed);
+    }
+    let source = chunks("a\n", 1);
+    let reader = ok(
+        csv::Reader::new(
+            source,
+            csv::ReadOptions {
+                limits: csv::Limits { max_total_bytes: 2, ..csv::Limits::new() },
+                ..csv::ReadOptions::new(),
+            },
+        ),
+    );
+    testing::assert_eq(one(reader).values()[0], "a");
+    testing::assert_none(ok(reader.next()));
+    let calls = source.calls.get();
+    testing::assert_none(ok(reader.next()));
+    testing::assert_eq(source.calls.get(), calls);
+}
+
+#[test]
+fn stream_errors_preserve_completed_rows_and_partial_error_position_and_are_sticky() -> () {
+    let source = Chunks { fail_after: 6, interrupt: Ref::new(true), ..chunks("one\nsecond", 2) };
+    let reader = ok(
+        csv::Reader::new(source, csv::ReadOptions { buffer_size: 2, ..csv::ReadOptions::new() }),
+    );
+    testing::assert_eq(one(reader).values()[0], "one");
+    let invalid = kind(reader.next(), csv::ErrorKind::Io);
+    testing::assert_eq(invalid.position.byte, 6);
+    testing::assert_eq(invalid.position.line, 2);
+    testing::assert_some(invalid.cause);
+    let calls = source.calls.get();
+    let repeated = kind(reader.next(), csv::ErrorKind::Io);
+    testing::assert_eq(repeated.position, invalid.position);
+    testing::assert_eq(source.calls.get(), calls);
+    let source = Chunks { fail_after: 2, ..chunks("a\r", 1) };
+    let reader = ok(csv::Reader::new(source, csv::ReadOptions::new()));
+    testing::assert_eq(one(reader).values()[0], "a");
+    kind(reader.next(), csv::ErrorKind::Io);
+}
+
+#[test]
+fn raw_record_aliases_and_returned_vectors_are_independent() -> () {
+    let data = bytes::Bytes::from_vec(utf8::encode("before"));
+    let record = csv::ByteRecord::new(Vec::from_array([data]));
+    data.set(0, 88);
+    let returned = testing::expect_some(record.get(0), "byte field");
+    returned.set(0, 89);
+    testing::assert_eq(ok(record.strings()).values()[0], "before");
+    let values = Vec::from_array(["first"]);
+    let record = csv::StringRecord::new(values);
+    values.push("second");
+    record.values().push("third");
+    testing::assert_eq(record.len(), 1);
+}
+
+#[test]
+fn writer_roundtrips_all_quote_newline_unicode_and_dialect_combinations() -> () {
+    let samples = Vec::from_array(
+        ["", "plain", "a,b", "a\"b", "a\nb", "a\rb", "a\r\nb", "你好🌈", "nul\u0000byte", " x "],
+    );
+    for chunk in 1..6 {
+        for terminator in Vec::from_array(
+            [csv::Terminator::CrLf, csv::Terminator::Any, csv::Terminator::Byte(124)],
+        ) {
+            let output = sink(chunk);
+            let options = csv::WriteOptions { terminator, ..csv::WriteOptions::new() };
+            let writer = ok(csv::Writer::new(output, options));
+            for left in samples {
+                for right in samples {
+                    testing::assert_ok(
+                        writer.write(csv::StringRecord::new(Vec::from_array([left, right]))),
+                    );
+                }
+            }
+            testing::assert_ok(writer.flush());
+            let source = Chunks { data: output.data, ..chunks("", chunk) };
+            let reader = ok(
+                csv::Reader::new(source, csv::ReadOptions { terminator, ..csv::ReadOptions::new() }),
+            );
+            for left in samples {
+                for right in samples {
+                    testing::assert(one(reader).values() == Vec::from_array([left, right]));
+                }
+            }
+            testing::assert_none(ok(reader.next()));
+        }
+    }
+}
+
+#[test]
+fn writer_partial_io_errors_and_flush_failures_fuse_without_replaying_bytes() -> () {
+    let output = Sink { fail_after: 4, interrupt: Ref::new(true), ..sink(1) };
+    let writer = ok(csv::Writer::new(output, csv::WriteOptions::new()));
+    let invalid = kind(
+        writer.write(csv::StringRecord::new(Vec::from_array(["abcdef"]))),
+        csv::ErrorKind::Io,
+    );
+    testing::assert_eq(invalid.position.byte, 4);
+    testing::assert_some(invalid.cause);
+    testing::assert_eq(testing::expect_ok(utf8::decode(output.data), "partial output"), "abcd");
+    let calls = output.calls.get();
+    kind(writer.write(csv::StringRecord::new(Vec::from_array(["retry"]))), csv::ErrorKind::Io);
+    testing::assert_eq(output.calls.get(), calls);
+    let zero = ok(csv::Writer::new(sink(0), csv::WriteOptions::new()));
+    kind(zero.write(csv::StringRecord::new(Vec::from_array(["a"]))), csv::ErrorKind::Io);
+    let flushing = ok(
+        csv::Writer::new(Sink { flush_error: true, ..sink(1) }, csv::WriteOptions::new()),
+    );
+    kind(flushing.flush(), csv::ErrorKind::Io);
+    kind(flushing.write(csv::StringRecord::new(Vec::from_array(["a"]))), csv::ErrorKind::Io);
+}
+
+#[test]
+fn writer_validates_before_output_handles_bom_and_enforces_quoting_and_limits() -> () {
+    let output = sink(1);
+    let writer = ok(
+        csv::Writer::new(
+            output,
+            csv::WriteOptions {
+                emit_bom: true,
+                quoting: csv::QuoteStyle::Always,
+                ..csv::WriteOptions::new(),
+            },
+        ),
+    );
+    testing::assert_ok(writer.write(csv::StringRecord::new(Vec::from_array([""]))));
+    testing::assert_ok(writer.write(csv::StringRecord::new(Vec::from_array(["x"]))));
+    testing::assert_eq(
+        testing::expect_ok(utf8::decode(output.data.copy()), "BOM output"),
+        "\uFEFF\"\"\r\n\"x\"\r\n",
+    );
+    let output = sink(4);
+    let writer = ok(
+        csv::Writer::new(
+            output,
+            csv::WriteOptions { quoting: csv::QuoteStyle::Never, ..csv::WriteOptions::new() },
+        ),
+    );
+    kind(writer.write(csv::StringRecord::new(Vec::from_array(["a,b"]))), csv::ErrorKind::Syntax);
+    testing::assert(output.data.is_empty());
+    testing::assert_ok(writer.write(csv::StringRecord::new(Vec::from_array(["ok"]))));
+    kind(
+        writer.write(csv::StringRecord::new(Vec::from_array(["one", "two"]))),
+        csv::ErrorKind::Width,
+    );
+    let limits = csv::Limits { max_record_bytes: 3, max_total_bytes: 3, ..csv::Limits::new() };
+    let output = sink(1);
+    let writer = ok(
+        csv::Writer::new(output, csv::WriteOptions { limits, ..csv::WriteOptions::new() }),
+    );
+    kind(writer.write(csv::StringRecord::new(Vec::from_array(["long"]))), csv::ErrorKind::Limit);
+    testing::assert(output.data.is_empty());
+    testing::assert_ok(writer.write(csv::StringRecord::new(Vec::from_array(["a"]))));
+    kind(writer.write(csv::StringRecord::new(Vec::from_array(["b"]))), csv::ErrorKind::Limit);
+}
