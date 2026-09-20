@@ -55,12 +55,12 @@ def exercise(binary, certificate, key, mode):
                 if mode == 'handshake_timeout':
                     stopped.wait(8)
                     return
-                if mode == 'plain':
+                if mode in ('plain', 'pool_plain'):
                     connection = raw
                 else:
                     config = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
                     config.load_cert_chain(certificate, key)
-                    if mode == 'mutual':
+                    if mode in ('mutual', 'pool_mutual'):
                         config.load_verify_locations(certificate)
                         config.verify_mode = ssl.CERT_REQUIRED
                     try:
@@ -120,6 +120,8 @@ def exercise(binary, certificate, key, mode):
         raise AssertionError(f'{mode}: {failures!r}')
     if mode in ('plain', 'tls', 'mutual') and len(observed) != 5:
         raise AssertionError(f'{mode}: incomplete command sequence: {observed!r}')
+    if mode in ('pool_plain', 'pool_tls', 'pool_mutual', 'pool_timeout') and len(observed) != 8:
+        raise AssertionError(f'{mode}: incomplete pooled command sequence: {observed!r}')
     if mode in ('untrusted', 'name', 'handshake_timeout') and observed:
         raise AssertionError(f'{mode}: commands were sent before TLS validation')
 
@@ -139,7 +141,7 @@ def main():
         certificate = Path(directory) / 'certificate.pem'
         key = Path(directory) / 'key.pem'
         subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '2', '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost,IP:127.0.0.1', '-keyout', str(key), '-out', str(certificate)], check=True, capture_output=True, timeout=15)
-        modes = ('plain', 'tls', 'mutual', 'untrusted', 'name', 'handshake_timeout', 'hello_timeout', 'io_timeout', 'context_timeout', 'cancel', 'legacy')
+        modes = ('plain', 'tls', 'mutual', 'untrusted', 'name', 'handshake_timeout', 'hello_timeout', 'io_timeout', 'context_timeout', 'cancel', 'legacy', 'pool_plain', 'pool_tls', 'pool_mutual', 'pool_timeout')
         for mode in modes:
             exercise(binary, certificate, key, mode)
     print(f'Redis DNS/TLS/context checks: {len(modes)} passed' + (' under race detector' if args.race else ''))

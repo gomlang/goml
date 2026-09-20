@@ -1,0 +1,158 @@
+package main;
+
+use ecosystem::redis::{Pool, PoolOptions, HealthCheck, Connection, ConnectionOptions, Operation, ErrorKind, Pipeline, TransactionOutcome, Blob};
+use ecosystem::redis;
+use ecosystem::redis::commands as cmd;
+use std::net;
+use std::task;
+use std::testing;
+use std::time;
+
+fn pool_live(address: net::SocketAddr, connection_options: ConnectionOptions) -> () {
+    let options = PoolOptions {
+        max_connections: 2,
+        max_idle: 2,
+        health_check: HealthCheck::OnCheckout,
+        ..PoolOptions::standard(),
+    };
+    let pool = testing::expect_ok(
+        Pool::connect(address, connection_options, options),
+        "consumer pool",
+    );
+    defer {
+        let _ = pool.close();
+    };
+    let first = testing::expect_ok(pool.acquire(Operation::new()), "first consumer lease");
+    let second = testing::expect_ok(pool.acquire(Operation::new()), "second consumer lease");
+    let identity = testing::expect_ok(
+        first.execute(testing::expect_ok(cmd::client_id(), "client ID"), Operation::new()),
+        "first identity",
+    );
+    let other_id = testing::expect_ok(
+        second.execute(testing::expect_ok(cmd::client_id(), "client ID"), Operation::new()),
+        "second identity",
+    );
+    testing::assert(identity != other_id);
+    testing::assert_eq(pool.stats().leased, 2);
+    testing::assert_eq(
+        testing::expect_err(
+            pool.acquire(Operation::new().with_timeout(time::Duration::from_milliseconds(20))),
+            "bounded consumer pool",
+        ).kind,
+        ErrorKind::Timeout,
+    );
+    testing::assert_ok(second.discard());
+    testing::assert_ok(first.release());
+    let admin = testing::expect_ok(
+        Connection::connect(address, connection_options, Operation::new()),
+        "pool observer",
+    );
+    defer {
+        let _ = admin.close();
+    };
+    let killed: redis::Request[i64] = testing::expect_ok(
+        redis::request(
+            "CLIENT",
+            Vec::from_array(["KILL".to_bytes(), "ID".to_bytes(), identity.to_string().to_bytes()]),
+        ),
+        "kill idle connection",
+    );
+    testing::assert_eq(
+        testing::expect_ok(admin.execute(killed, Operation::new()), "server closes idle socket"),
+        1,
+    );
+    let new_id = testing::expect_ok(
+        pool.execute(testing::expect_ok(cmd::client_id(), "client ID"), Operation::new()),
+        "health reconnect",
+    );
+    testing::assert(new_id != identity);
+    let key = "goml:pool:counter";
+    testing::assert_ok(
+        pool.execute(
+            testing::expect_ok(
+                cmd::set(key, "0", cmd::SetOptions::standard()),
+                "reset pool counter",
+            ),
+            Operation::new(),
+        ),
+    );
+    task::scope(
+        |scope| {
+            let jobs = Vec::new();
+            for _ in 0..8 {
+                jobs.push(
+                    scope.spawn(
+                        |_| {
+                            for _ in 0..10 {
+                                testing::assert_ok(
+                                    pool.execute(
+                                        testing::expect_ok(cmd::incrby(key, 1), "pool increment"),
+                                        Operation::new(),
+                                    ),
+                                );
+                            }
+                        },
+                    ),
+                );
+            }
+            for job in jobs {
+                job.join();
+            }
+        },
+    );
+    let lease = testing::expect_ok(pool.acquire(Operation::new()), "transaction lease");
+    let read = Pipeline::new();
+    let counter = read.queue(testing::expect_ok(cmd::get(key), "read counter"));
+    let responses = testing::expect_ok(lease.pipeline(read, Operation::new()), "pooled pipeline");
+    testing::assert_eq(present(testing::expect_ok(responses.get(counter), "counter value")), "80");
+    let write = Pipeline::new();
+    let updated = write.queue(testing::expect_ok(cmd::incrby(key, 2), "transaction increment"));
+    let TransactionOutcome::Committed(committed) = testing::expect_ok(
+        lease.transaction(write, Operation::new()),
+        "pooled transaction",
+    ) else {
+        testing::fail("committed transaction");
+        return
+    };
+    testing::assert_eq(testing::expect_ok(committed.get(updated), "transaction result"), 82);
+    let watched = testing::expect_ok(
+        lease.compare_and_set(
+            Vec::from_array([Blob::from_string(key)]),
+            read,
+            |values| {
+                testing::assert_eq(
+                    present(testing::expect_ok(values.get(counter), "watched counter")),
+                    "82",
+                );
+                Result::Ok(write)
+            },
+            Operation::new(),
+        ),
+        "pooled WATCH",
+    );
+    testing::assert(
+        match watched {
+            TransactionOutcome::Committed(_) => true,
+            _ => false,
+        },
+    );
+    let invalid = Pipeline::new();
+    let _ = invalid.queue(testing::expect_ok(cmd::select(9), "forbidden SELECT"));
+    testing::assert_eq(
+        testing::expect_err(lease.transaction(invalid, Operation::new()), "pool state isolation").kind,
+        ErrorKind::InvalidCommand,
+    );
+    testing::assert_ok(lease.release());
+    testing::assert_eq(
+        testing::expect_err(
+            lease.execute(testing::expect_ok(cmd::ping(), "ping"), Operation::new()),
+            "released consumer handle",
+        ).kind,
+        ErrorKind::Closed,
+    );
+    testing::assert_eq(pool.stats().opening, 0);
+    testing::assert(pool.stats().idle <= 2);
+    testing::assert_ok(pool.close());
+    testing::assert_ok(pool.close());
+    println("redis pool: bounded leases, concurrent requests, reconnect, pipeline and WATCH ok");
+}

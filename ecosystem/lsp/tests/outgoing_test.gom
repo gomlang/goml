@@ -1,0 +1,176 @@
+package tests;
+
+use ecosystem::lsp;
+use std::json;
+use std::testing;
+use std::time;
+
+#[test]
+fn outgoing_deadlines_are_bounded_complete_once_and_keep_directions_separate() -> () {
+    let session = testing::expect_ok(lsp::Session::new(2), "session");
+    let id = lsp::Id::Text("work");
+    let incoming = testing::expect_ok(session.begin(id, "incoming"), "incoming");
+    testing::assert_ok(
+        session.request_with_timeout(
+            id,
+            "outgoing",
+            Option::None,
+            Option::Some(time::Duration::from_milliseconds(0)),
+        ),
+    );
+    testing::assert_ok(
+        session.request_with_timeout(
+            lsp::Id::Number(2),
+            "later",
+            Option::None,
+            Option::Some(time::Duration::from_seconds(3600)),
+        ),
+    );
+    testing::assert_err(session.request_with_timeout(id, "duplicate", Option::None, Option::None));
+    testing::assert_err(
+        session.request_with_timeout(
+            lsp::Id::Number(3),
+            "limit",
+            Option::None,
+            Option::Some(time::Duration::from_milliseconds(0)),
+        ),
+    );
+    testing::assert_eq(
+        testing::expect_some(session.next_outgoing_timeout(), "next").compare(
+            time::Duration::from_milliseconds(0),
+        ),
+        0,
+    );
+    let expired = testing::expect_ok(session.poll_outgoing_timeouts(), "poll");
+    testing::assert_eq(expired.len(), 1);
+    testing::assert_eq(expired[0].completed.id, id);
+    testing::assert_eq(expired[0].completed.method, "outgoing");
+    testing::assert_eq(testing::expect_err(expired[0].completed.result, "deadline").code, -32803);
+    testing::assert_eq(
+        testing::expect_ok(lsp::encode(expired[0].cancellation), "cancel"),
+        "{\"jsonrpc\":\"2.0\",\"method\":\"$/cancelRequest\",\"params\":{\"id\":\"work\"}}",
+    );
+    testing::assert(incoming.is_active());
+    testing::assert_eq(session.outgoing_count(), 1);
+    testing::assert_eq(testing::expect_ok(session.poll_outgoing_timeouts(), "repeat").len(), 0);
+    testing::assert_err(
+        session.receive(lsp::Message::Response(Option::Some(id), Result::Ok(json::Value::Null))),
+    );
+    testing::assert_ok(session.cancel_outgoing(lsp::Id::Number(2)));
+    testing::assert_some(session.next_outgoing_timeout());
+    let completed = testing::expect_ok(
+        session.receive(
+            lsp::Message::Response(Option::Some(lsp::Id::Number(2)), Result::Ok(json::Value::Null)),
+        ),
+        "reply after cooperative cancellation",
+    );
+    testing::assert_ok(completed.result);
+    testing::assert_none(session.next_outgoing_timeout());
+    testing::assert_ok(session.complete(incoming, Result::Ok(json::Value::Null)));
+}
+
+#[test]
+fn outgoing_response_deadline_races_and_close_clean_up_registration() -> () {
+    let session = testing::expect_ok(lsp::Session::new(4), "session");
+    let id = lsp::Id::Number(1);
+    testing::assert_ok(
+        session.request_with_timeout(
+            id,
+            "expired",
+            Option::None,
+            Option::Some(time::Duration::from_milliseconds(0)),
+        ),
+    );
+    let response = lsp::Message::Response(
+        Option::Some(id),
+        Result::Ok(json::Value::String("too late")),
+    );
+    let completed = testing::expect_ok(session.receive(response), "receive before poll");
+    testing::assert_eq(testing::expect_err(completed.result, "timeout wins").code, -32803);
+    testing::assert_eq(
+        testing::expect_ok(session.poll_outgoing_timeouts(), "no duplicate").len(),
+        0,
+    );
+    testing::assert_err(session.receive(response));
+    testing::assert_ok(
+        session.request_with_timeout(
+            id,
+            "current",
+            Option::None,
+            Option::Some(time::Duration::from_seconds(3600)),
+        ),
+    );
+    testing::assert_eq(
+        testing::expect_ok(session.poll_outgoing_timeouts(), "no stale timer").len(),
+        0,
+    );
+    testing::assert_ok(testing::expect_ok(session.receive(response), "early response").result);
+    testing::assert_none(session.next_outgoing_timeout());
+    testing::assert_ok(
+        session.request_with_timeout(
+            id,
+            "manual",
+            Option::None,
+            Option::Some(time::Duration::from_seconds(3600)),
+        ),
+    );
+    testing::assert_ok(session.expire(id));
+    testing::assert_none(session.next_outgoing_timeout());
+    testing::assert_ok(
+        session.request_with_timeout(
+            id,
+            "closed",
+            Option::None,
+            Option::Some(time::Duration::from_milliseconds(0)),
+        ),
+    );
+    session.close();
+    session.close();
+    testing::assert_none(session.next_outgoing_timeout());
+    testing::assert_eq(testing::expect_ok(session.poll_outgoing_timeouts(), "closed poll").len(), 0);
+    testing::assert_eq(session.outgoing_count(), 0);
+    testing::assert_err(session.request(id, "closed", Option::None));
+}
+
+#[test]
+fn server_timer_combines_incoming_and_outgoing_and_exit_clears_both() -> () {
+    let server = running_server(Ref::new(0), 8);
+    let _ = testing::expect_ok(
+        server.accept_with_timeout(
+            work_message(1),
+            Option::Some(time::Duration::from_seconds(3600)),
+        ),
+        "incoming",
+    );
+    testing::assert_ok(
+        server.session().request_with_timeout(
+            lsp::Id::Number(1),
+            "client/work",
+            Option::None,
+            Option::Some(time::Duration::from_milliseconds(0)),
+        ),
+    );
+    testing::assert_eq(
+        testing::expect_some(server.next_timeout(), "next").compare(
+            time::Duration::from_milliseconds(0),
+        ),
+        0,
+    );
+    testing::assert_eq(testing::expect_ok(server.poll_timeouts(), "incoming unchanged").len(), 0);
+    testing::assert_eq(
+        testing::expect_ok(server.poll_outgoing_timeouts(), "outgoing expired").len(),
+        1,
+    );
+    testing::assert_some(server.next_timeout());
+    testing::assert_ok(
+        server.session().request_with_timeout(
+            lsp::Id::Number(2),
+            "abandoned",
+            Option::None,
+            Option::Some(time::Duration::from_milliseconds(0)),
+        ),
+    );
+    testing::assert_ok(server.handle(lsp::Message::Notification("exit", Option::None)));
+    testing::assert_none(server.next_timeout());
+    testing::assert_eq(testing::expect_ok(server.poll_outgoing_timeouts(), "exit cleanup").len(), 0);
+}

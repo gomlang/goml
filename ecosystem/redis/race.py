@@ -4,6 +4,8 @@ import re
 import subprocess
 import sys
 
+import interop
+
 
 ROOT = Path(__file__).resolve().parent
 GENERATED = ROOT / '_artifact' / 'test' / 'external' / 'goml_generated.go'
@@ -21,6 +23,9 @@ def main():
         subprocess.run([str(BINARY), f'ecosystem::redis::tests::{name}'], cwd=ROOT, env=environment, check=True, timeout=30)
     print(f'Redis race detector: {len(tests)} tests passed')
     subprocess.run([sys.executable, str(ROOT / 'network_check.py'), '--race'], check=True, timeout=180)
+    interop.BINARY = ROOT / '_artifact' / 'network' / 'consumer-race'
+    interop.live_cases()
+    print('Redis pool and command consumer: RESP2/RESP3 passed under race detector')
 
 
 if __name__ == '__main__':

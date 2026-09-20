@@ -49,7 +49,7 @@ class Client:
             result.extend(data)
         return bytes(result)
 
-    def read(self):
+    def read(self, protocol_message=False):
         header = bytearray()
         while not header.endswith(b"\r\n\r\n"):
             header.extend(self.read_exact(1))
@@ -59,8 +59,9 @@ class Client:
         assert 0 <= length <= 16777216
         reply = json.loads(self.read_exact(length).decode("utf-8"))
         assert reply["jsonrpc"] == "2.0"
-        assert ("result" in reply) != ("error" in reply)
-        self.responses += 1
+        if not protocol_message:
+            assert ("result" in reply) != ("error" in reply)
+            self.responses += 1
         return reply
 
     def request(self, method, params=None, error=None, fragmented=False):
@@ -172,6 +173,113 @@ def check_server(executable):
         client.close()
 
 
+def encoding_length(value, encoding):
+    if encoding == "utf-8":
+        return len(value.encode("utf-8"))
+    if encoding == "utf-16":
+        return utf16_length(value)
+    return len(value)
+
+
+def check_encodings(executable):
+    positions = 0
+    edits = 0
+    for encoding in ("utf-8", "utf-16", "utf-32"):
+        client = Client(executable)
+        try:
+            client.request("initialize", {"capabilities": {"general": {"positionEncodings": [encoding, 7]}}}, error=-32602)
+            result = client.request("initialize", {"capabilities": {"general": {"positionEncodings": ["future-encoding", encoding]}}})
+            assert result["capabilities"]["positionEncoding"] == encoding
+            client.notification("initialized", {})
+            rng = random.Random(2407)
+            for sample in range(16):
+                text = "".join(rng.choice(["a", "中", "😀", "é", "e\u0301", "\r", "\n", "\r\n"]) for _ in range(24))
+                if sample == 0:
+                    text = "x" * 1023 + "\r\n😀中é\r\ne\u0301\n"
+                uri = f"file:///{encoding}-{sample}"
+                client.notification("textDocument/didOpen", {"textDocument": {"uri": uri, "languageId": "text", "version": 1, "text": text}})
+                line_start = [0] + [m.end() for m in re.finditer(r"\r\n|\r|\n", text)]
+                for line, content in enumerate(re.split(r"\r\n|\r|\n", text)):
+                    start_byte = len(text[:line_start[line]].encode("utf-8"))
+                    valid = {encoding_length(content[:index], encoding): start_byte + len(content[:index].encode("utf-8")) for index in range(len(content) + 1)}
+                    for character in range(encoding_length(content, encoding) + 1):
+                        params = {"textDocument": {"uri": uri}, "position": {"line": line, "character": character}}
+                        if character in valid:
+                            assert client.request("test/offset", params) == valid[character]
+                        else:
+                            client.request("test/offset", params, error=-32602)
+                        positions += 1
+                    assert client.request("test/offset", {"textDocument": {"uri": uri}, "position": {"line": line, "character": 2147483647}}) == start_byte + len(content.encode("utf-8"))
+                emoji_width = encoding_length("😀", encoding)
+                wide_width = encoding_length("中", encoding)
+                changes = [
+                    {"text": "a😀b\r\n中\n"},
+                    {"range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1 + emoji_width}}, "rangeLength": emoji_width, "text": "中"},
+                    {"range": {"start": {"line": 0, "character": 1}, "end": {"line": 1, "character": wide_width}}, "rangeLength": wide_width * 2 + 3, "text": "done"},
+                ]
+                client.notification("textDocument/didChange", {"textDocument": {"uri": uri, "version": 2}, "contentChanges": changes})
+                assert client.request("test/document", {"uri": uri}) == {"text": "adone\n", "version": 2}
+                client.notification("textDocument/didChange", {"textDocument": {"uri": uri, "version": 3}, "contentChanges": [
+                    {"text": "a😀"},
+                    {"range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1 + emoji_width}}, "rangeLength": 99, "text": "invalid"},
+                ]})
+                assert client.request("test/document", {"uri": uri}) == {"text": "adone\n", "version": 2}
+                client.notification("textDocument/didClose", {"textDocument": {"uri": uri}})
+                edits += 1
+            assert client.request("shutdown") is None
+            client.notification("exit")
+            _, stderr = client.process.communicate(timeout=10)
+            assert client.process.returncode == 0, stderr.decode()
+        finally:
+            client.close()
+    print(f"LSP encoding negotiation: {positions} UTF-8/16/32 positions and invalid boundaries, {edits} transactional change sequences")
+
+
+def check_outgoing_deadlines(executable):
+    client = Client(executable)
+    try:
+        client.request("initialize", {"capabilities": {}})
+        client.notification("initialized", {})
+        client.notification("test/outgoing", {"id": "zero", "timeout": 0})
+        request = client.read(protocol_message=True)
+        assert request["id"] == "zero" and request["method"] == "client/echo", request
+        client.notification("test/poll", {})
+        cancellation = client.read(protocol_message=True)
+        assert cancellation["method"] == "$/cancelRequest" and cancellation["params"]["id"] == "zero", cancellation
+        expired = client.read(protocol_message=True)
+        assert expired["method"] == "test/completed" and expired["params"]["error"]["code"] == -32803, expired
+        client.send({"jsonrpc": "2.0", "id": "zero", "result": "late"})
+        assert client.request("test/echo", {}) == {}
+        client.notification("test/outgoing", {"id": "early", "timeout": 10000})
+        assert client.read(protocol_message=True)["id"] == "early"
+        client.send({"jsonrpc": "2.0", "id": "early", "result": {"unicode": "😀"}})
+        completed = client.read(protocol_message=True)
+        assert completed["method"] == "test/completed" and completed["params"]["result"] == {"unicode": "😀"}, completed
+        client.notification("test/outgoing", {"id": "late", "timeout": 20})
+        assert client.read(protocol_message=True)["id"] == "late"
+        time.sleep(0.05)
+        client.send({"jsonrpc": "2.0", "id": "late", "result": "overdue"})
+        completed = client.read(protocol_message=True)
+        assert completed["method"] == "test/completed" and completed["params"]["error"]["code"] == -32803, completed
+        client.notification("test/outgoing", {"id": "poll", "timeout": 20})
+        assert client.read(protocol_message=True)["id"] == "poll"
+        time.sleep(0.05)
+        client.notification("test/poll", {})
+        assert client.read(protocol_message=True)["method"] == "$/cancelRequest"
+        assert client.read(protocol_message=True)["params"]["error"]["code"] == -32803
+        client.notification("test/poll", {})
+        assert client.request("test/echo", {}) == {}
+        client.notification("test/outgoing", {"id": "exit", "timeout": 10000})
+        assert client.read(protocol_message=True)["id"] == "exit"
+        assert client.request("shutdown") is None
+        client.notification("exit")
+        stdout, stderr = client.process.communicate(timeout=10)
+        assert client.process.returncode == 0 and not stdout, (stdout, stderr)
+        print("LSP outgoing deadlines: explicit polling, cancellation, response/deadline races, duplicate suppression and exit cleanup")
+    finally:
+        client.close()
+
+
 def check_termination(executable):
     cases = [
         (b"Content-Length: 10\r\n\r\nx", 1),
@@ -194,6 +302,8 @@ def main():
     if not args.consumer.is_file():
         raise RuntimeError("build the consumer with ecosystem/verify.py lsp first")
     check_server(args.consumer)
+    check_encodings(args.consumer)
+    check_outgoing_deadlines(args.consumer)
     check_termination(args.consumer)
 
 

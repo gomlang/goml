@@ -6,6 +6,7 @@ use std::io;
 use std::json;
 use std::process;
 use std::serde;
+use std::time;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -84,21 +85,75 @@ pub fn server() -> Result[lsp::Server, lsp::RpcError] {
     )
 }
 
+fn completed_notification(completed: lsp::Completed) -> lsp::Message {
+    lsp::Message::Notification(
+        "test/completed",
+        Option::Some(
+            lsp::encode_value(lsp::Message::Response(Option::Some(completed.id), completed.result)),
+        ),
+    )
+}
+
+fn outgoing_fixture(server: lsp::Server, message: lsp::Message) -> Result[
+    Option[lsp::Message],
+    string,
+] {
+    let lsp::Message::Notification(method, Some(params)) = message else {
+        return Result::Ok(Option::None)
+    };
+    if method != "test/outgoing" {
+        return Result::Ok(Option::None)
+    }
+    let id = lsp::Id::from_json(json::field(params, "id").ok_or("id required")?).map_err(
+        |error| error.to_string(),
+    )?;
+    let timeout = json::field(params, "timeout").and_then(|value| json::as_int(value)).ok_or(
+        "timeout required",
+    )?;
+    let duration = time::Duration::checked_from_milliseconds(timeout.to_i64()).ok_or(
+        "invalid timeout",
+    )?;
+    Result::Ok(
+        Option::Some(
+            server.session().request_with_timeout(
+                id,
+                "client/echo",
+                Option::Some(json::object(Vec::new())),
+                Option::Some(duration),
+            ).map_err(|error| error.to_string())?,
+        ),
+    )
+}
+
 fn serve() -> Result[isize, string] {
     let server = server().map_err(|problem| problem.to_string())?;
     let transport = lsp::Stdio::new(lsp::FrameLimits::standard())?;
     while let Some(body) = transport.read_body()? {
         match lsp::decode(body) {
-            Ok(message) => match server.handle(message) {
-                Ok(event) => {
-                    if let Some(reply) = event.reply {
-                        transport.write(reply)?;
+            Ok(message) => {
+                if let Some(request) = outgoing_fixture(server, message)? {
+                    transport.write(request)?;
+                    continue
+                } else {
+                    match server.handle(message) {
+                        Ok(event) => {
+                            if let Some(reply) = event.reply {
+                                transport.write(reply)?;
+                            }
+                            if let Some(completed) = event.completed {
+                                transport.write(completed_notification(completed))?;
+                            }
+                            if let Some(code) = event.exit_code {
+                                return Result::Ok(code)
+                            }
+                        },
+                        Err(problem) => io::eprintln(problem),
                     }
-                    if let Some(code) = event.exit_code {
-                        return Result::Ok(code)
-                    }
-                },
-                Err(problem) => io::eprintln(problem),
+                }
+                for expired in server.poll_outgoing_timeouts().map_err(|error| error.to_string())? {
+                    transport.write(expired.cancellation)?;
+                    transport.write(completed_notification(expired.completed))?;
+                }
             },
             Err(problem) => transport.write(
                 lsp::Message::Response(Option::None, Result::Err(problem)),

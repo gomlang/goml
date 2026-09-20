@@ -1,0 +1,230 @@
+package tests;
+
+use ecosystem::lsp;
+use std::json;
+use std::testing;
+
+#[test]
+fn all_position_encodings_preserve_unicode_edits_and_snapshots() -> () {
+    for encoding in Vec::from_array(
+        [lsp::PositionEncoding::Utf8, lsp::PositionEncoding::Utf16, lsp::PositionEncoding::Utf32],
+    ) {
+        let document = testing::expect_ok(
+            lsp::Document::new_with_encoding(
+                "file:///encoding",
+                "text",
+                1,
+                "a😀é\r\n中\ré\n",
+                encoding,
+            ),
+            "document",
+        );
+        testing::assert_eq(document.encoding(), encoding);
+        let emoji_end = encoding.length("a😀");
+        testing::assert_eq(testing::expect_ok(document.offset(pos(0, emoji_end)), "emoji end"), 5);
+        testing::assert_eq(testing::expect_ok(document.position(5), "position"), pos(0, emoji_end));
+        testing::assert_eq(
+            testing::expect_ok(document.position(8), "CRLF interior"),
+            pos(0, encoding.length("a😀é")),
+        );
+        testing::assert_eq(testing::expect_ok(document.offset(pos(0, 2147483647)), "clamped"), 7);
+        testing::assert_eq(testing::expect_ok(document.offset(pos(3, 0)), "trailing line"), 17);
+        testing::assert_err(document.position(3));
+        testing::assert_err(document.offset(pos(0, -1)));
+        if encoding != lsp::PositionEncoding::Utf32 {
+            testing::assert_err(document.offset(pos(0, 2)));
+        }
+        let span = range(0, 1, emoji_end);
+        testing::assert_eq(testing::expect_ok(document.text_in(span), "slice"), "😀");
+        testing::assert_eq(
+            testing::expect_ok(
+                document.apply_edits(
+                    Vec::from_array([lsp::TextEdit { range: span, new_text: "中" }]),
+                ),
+                "text edits",
+            ),
+            "a中é\r\n中\ré\n",
+        );
+        let changed = testing::expect_ok(
+            document.changed(
+                2,
+                Vec::from_array(
+                    [
+                        lsp::Change {
+                            range: Option::Some(span),
+                            range_length: Option::Some(encoding.length("😀")),
+                            text: "中",
+                        },
+                        lsp::Change {
+                            range: Option::Some(range(0, 1, encoding.length("a中"))),
+                            range_length: Option::Some(encoding.length("中")),
+                            text: "XYZ",
+                        },
+                    ],
+                ),
+                128,
+            ),
+            "sequential changes",
+        );
+        testing::assert_eq(changed.content(), "aXYZé\r\n中\ré\n");
+        testing::assert_eq(changed.encoding(), encoding);
+        testing::assert_eq(document.content(), "a😀é\r\n中\ré\n");
+        testing::assert_err(
+            document.changed(
+                2,
+                Vec::from_array(
+                    [
+                        lsp::Change {
+                            range: Option::Some(span),
+                            range_length: Option::Some(99),
+                            text: "bad",
+                        },
+                    ],
+                ),
+                128,
+            ),
+        );
+        let store = testing::expect_ok(lsp::Documents::new_with_encoding(2, 128, encoding), "store");
+        testing::assert_ok(
+            store.open(
+                testing::expect_ok(lsp::Document::new("a", "text", 1, "😀"), "legacy document"),
+            ),
+        );
+        testing::assert_eq(testing::expect_some(store.get("a"), "adapted").encoding(), encoding);
+    }
+}
+
+fn encoding_server(supported: Vec[lsp::PositionEncoding]) -> lsp::Server {
+    testing::expect_ok(
+        lsp::Server::new_with_encodings(
+            lsp::Router::new(),
+            testing::expect_ok(lsp::Documents::new(2, 128), "store"),
+            8,
+            json::object(Vec::new()),
+            supported,
+        ),
+        "server",
+    )
+}
+
+#[test]
+fn negotiation_defaults_filters_unknown_values_and_rejects_malformed_capabilities() -> () {
+    let all = Vec::from_array(
+        [lsp::PositionEncoding::Utf8, lsp::PositionEncoding::Utf16, lsp::PositionEncoding::Utf32],
+    );
+    for (capabilities, expected) in Vec::from_array(
+        [
+            ("{}", lsp::PositionEncoding::Utf16),
+            ("{\"general\":{\"positionEncodings\":[]}}", lsp::PositionEncoding::Utf16),
+            ("{\"general\":{\"positionEncodings\":[\"unknown\"]}}", lsp::PositionEncoding::Utf16),
+            (
+                "{\"general\":{\"positionEncodings\":[\"unknown\",\"utf-32\",\"utf-8\"]}}",
+                lsp::PositionEncoding::Utf32,
+            ),
+            ("{\"general\":{\"positionEncodings\":[\"utf-8\"]}}", lsp::PositionEncoding::Utf8),
+        ],
+    ) {
+        let server = encoding_server(all);
+        let result = testing::expect_ok(
+            request(
+                server,
+                "initialize",
+                Option::Some(
+                    json::object(
+                        Vec::from_array(
+                            [
+                                (
+                                    "capabilities",
+                                    testing::expect_ok(json::parse(capabilities), "JSON"),
+                                ),
+                            ],
+                        ),
+                    ),
+                ),
+            ),
+            "initialize",
+        );
+        testing::assert_eq(server.position_encoding(), expected);
+        let capabilities = testing::expect_some(json::field(result, "capabilities"), "capabilities");
+        testing::assert_eq(
+            testing::expect_some(
+                json::as_string(
+                    testing::expect_some(json::field(capabilities, "positionEncoding"), "encoding"),
+                ),
+                "name",
+            ),
+            expected.as_string(),
+        );
+    }
+    let server = encoding_server(Vec::from_array([lsp::PositionEncoding::Utf16]));
+    testing::assert_ok(
+        request(
+            server,
+            "initialize",
+            Option::Some(
+                testing::expect_ok(
+                    json::parse(
+                        "{\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-8\",\"utf-32\"]}}}",
+                    ),
+                    "params",
+                ),
+            ),
+        ),
+    );
+    testing::assert_eq(server.position_encoding(), lsp::PositionEncoding::Utf16);
+    for value in Vec::from_array(["null", "3", "\"utf-8\"", "[\"utf-8\",5]"]) {
+        let server = encoding_server(all);
+        let params = json::object(
+            Vec::from_array(
+                [
+                    (
+                        "capabilities",
+                        json::object(
+                            Vec::from_array(
+                                [
+                                    (
+                                        "general",
+                                        json::object(
+                                            Vec::from_array(
+                                                [
+                                                    (
+                                                        "positionEncodings",
+                                                        testing::expect_ok(
+                                                            json::parse(value),
+                                                            "value",
+                                                        ),
+                                                    ),
+                                                ],
+                                            ),
+                                        ),
+                                    ),
+                                ],
+                            ),
+                        ),
+                    ),
+                ],
+            ),
+        );
+        testing::assert_err(request(server, "initialize", Option::Some(params)));
+        testing::assert_eq(server.phase(), lsp::Phase::New);
+        testing::assert_eq(server.position_encoding(), lsp::PositionEncoding::Utf16);
+        testing::assert_ok(
+            request(
+                server,
+                "initialize",
+                Option::Some(
+                    json::object(Vec::from_array([("capabilities", json::object(Vec::new()))])),
+                ),
+            ),
+        );
+    }
+    testing::assert_err(
+        lsp::Server::new_with_encodings(
+            lsp::Router::new(),
+            testing::expect_ok(lsp::Documents::new(1, 32), "store"),
+            1,
+            json::object(Vec::new()),
+            Vec::from_array([lsp::PositionEncoding::Utf8]),
+        ),
+    );
+}

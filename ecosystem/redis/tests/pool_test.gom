@@ -1,0 +1,634 @@
+package tests;
+
+use ecosystem::redis::{Connection, ConnectionOptions, Pool, PoolOptions, HealthCheck, Operation, ErrorKind, Decoder, Limits};
+use ecosystem::redis::commands;
+use std::context;
+use std::net;
+use std::task;
+use std::testing;
+use std::time;
+
+fn pool_options() -> PoolOptions {
+    PoolOptions { max_connections: 1, max_idle: 1, ..PoolOptions::standard() }
+}
+
+fn pool_ping() -> ecosystem::redis::Request[string] {
+    testing::expect_ok(commands::ping(), "pool ping")
+}
+
+fn with_pool_peers(
+    count: isize,
+    options: PoolOptions,
+    server: (Peer, isize) -> (),
+    client: (Pool) -> (),
+) -> () {
+    let listener = testing::expect_ok(
+        net::TcpListener::bind(testing::expect_ok(net::SocketAddr::parse("127.0.0.1:0"), "address")),
+        "pool listen",
+    );
+    let address = testing::expect_ok(listener.local_addr(), "pool address");
+    task::scope(
+        |scope| {
+            let worker = scope.spawn(
+                |_| task::scope(
+                    |servers| {
+                        let jobs = Vec::new();
+                        for index in 0..count {
+                            let stream = testing::expect_ok(
+                                listener.accept_with(wait_options()),
+                                "pool accept",
+                            ).0;
+                            jobs.push(
+                                servers.spawn(
+                                    |_| {
+                                        defer {
+                                            let _ = stream.close();
+                                        };
+                                        let peer = Peer {
+                                            stream,
+                                            decoder: testing::expect_ok(
+                                                Decoder::new(Limits::standard()),
+                                                "pool server decoder",
+                                            ),
+                                        };
+                                        let hello = peer.request();
+                                        testing::assert_eq(
+                                            testing::expect_ok(hello[0].text(), "HELLO"),
+                                            "HELLO",
+                                        );
+                                        peer.send("%1\r\n+proto\r\n:3\r\n");
+                                        server(peer, index);
+                                    },
+                                ),
+                            );
+                        }
+                        for job in jobs {
+                            job.join();
+                        }
+                    },
+                ),
+            );
+            let pool = testing::expect_ok(
+                Pool::connect(address, ConnectionOptions::standard(), options),
+                "pool",
+            );
+            client(pool);
+            testing::assert_ok(pool.close());
+            worker.join();
+        },
+    );
+    testing::assert_ok(listener.close());
+}
+
+#[test]
+fn pool_reuses_exclusive_leases_and_rejects_session_changes() -> () {
+    with_pool_peers(
+        1,
+        pool_options(),
+        |peer, _| {
+            for _ in 0..3 {
+                testing::assert_eq(testing::expect_ok(peer.request()[0].text(), "PING"), "PING");
+                peer.send("+PONG\r\n");
+            }
+        },
+        |pool| {
+            let lease = testing::expect_ok(pool.acquire(Operation::new()), "first lease");
+            testing::assert_eq(pool.stats().leased, 1);
+            testing::assert_eq(
+                testing::expect_ok(lease.execute(pool_ping(), Operation::new()), "first request"),
+                "PONG",
+            );
+            testing::assert_eq(
+                testing::expect_err(
+                    lease.execute(
+                        testing::expect_ok(commands::select(2), "select"),
+                        Operation::new(),
+                    ),
+                    "session isolation",
+                ).kind,
+                ErrorKind::InvalidCommand,
+            );
+            task::scope(
+                |scope| {
+                    let first = scope.spawn(|_| lease.release());
+                    let second = scope.spawn(|_| lease.release());
+                    testing::assert_ok(first.join());
+                    testing::assert_ok(second.join());
+                },
+            );
+            testing::assert_eq(pool.stats().idle, 1);
+            let next = testing::expect_ok(pool.acquire(Operation::new()), "reused lease");
+            testing::assert_eq(
+                testing::expect_err(lease.execute(pool_ping(), Operation::new()), "stale lease").kind,
+                ErrorKind::Closed,
+            );
+            testing::assert_eq(
+                testing::expect_ok(next.execute(pool_ping(), Operation::new()), "reused request"),
+                "PONG",
+            );
+            testing::assert_ok(next.release());
+            testing::assert_eq(pool.stats().idle, 1);
+            testing::assert_ok(pool.close());
+            testing::assert_ok(pool.close());
+            testing::assert(pool.stats().closed);
+            testing::assert_eq(pool.stats().idle, 0);
+        },
+    );
+}
+
+#[test]
+fn pool_capacity_waiters_honor_timeouts_context_and_close() -> () {
+    let done: Channel[()] = Channel::new(1);
+    with_pool_peers(
+        1,
+        pool_options(),
+        |_, _| {
+            let _ = done.recv();
+        },
+        |pool| {
+            let lease = testing::expect_ok(pool.acquire(Operation::new()), "held lease");
+            let problem = testing::expect_err(
+                pool.acquire(Operation::new().with_timeout(time::Duration::from_milliseconds(20))),
+                "pool exhausted",
+            );
+            testing::assert_eq(problem.kind, ErrorKind::Timeout);
+            testing::assert(!problem.may_have_executed);
+            context::with_timeout(
+                context::Context::background(),
+                time::Duration::from_milliseconds(20),
+                |ctx, _| {
+                    testing::assert_eq(
+                        testing::expect_err(
+                            pool.acquire(Operation::new().without_timeout().with_context(ctx)),
+                            "context pool timeout",
+                        ).kind,
+                        ErrorKind::Timeout,
+                    );
+                },
+            );
+            task::scope(
+                |cancelled| {
+                    cancelled.cancel();
+                    testing::assert_eq(
+                        testing::expect_err(
+                            pool.acquire(Operation::new().with_cancel(cancelled.token())),
+                            "cancelled pool waiter",
+                        ).kind,
+                        ErrorKind::Cancelled,
+                    );
+                },
+            );
+            task::scope(
+                |scope| {
+                    let waiting = scope.spawn(|_| pool.acquire(Operation::new().without_timeout()));
+                    testing::assert_ok(pool.close());
+                    testing::assert_eq(
+                        testing::expect_err(waiting.join(), "pool close wakes waiter").kind,
+                        ErrorKind::Closed,
+                    );
+                },
+            );
+            testing::assert_ok(lease.release());
+            testing::assert_eq(pool.stats().leased, 0);
+            done.send(());
+        },
+    );
+}
+
+#[test]
+fn pool_close_interrupts_leased_io_and_release_waits_for_active_use() -> () {
+    for close in Vec::from_array([false, true]) {
+        let received: Channel[()] = Channel::new(1);
+        let resume: Channel[()] = Channel::new(1);
+        with_pool_peers(
+            1,
+            pool_options(),
+            |peer, _| {
+                let _ = peer.request();
+                received.send(());
+                let _ = resume.recv();
+                if !close {
+                    peer.send("+PONG\r\n");
+                }
+            },
+            |pool| {
+                let lease = testing::expect_ok(pool.acquire(Operation::new()), "lease");
+                task::scope(
+                    |scope| {
+                        let active = scope.spawn(|_| lease.execute(pool_ping(), Operation::new()));
+                        let _ = received.recv();
+                        let releasing = scope.spawn(|_| lease.release());
+                        if close {
+                            testing::assert_ok(pool.close());
+                            let error = testing::expect_err(active.join(), "active pool close");
+                            testing::assert_eq(error.kind, ErrorKind::Closed);
+                            testing::assert(error.may_have_executed);
+                            resume.send(());
+                        } else {
+                            testing::assert_eq(
+                                testing::expect_err(
+                                    pool.acquire(
+                                        Operation::new().with_timeout(
+                                            time::Duration::from_milliseconds(20),
+                                        ),
+                                    ),
+                                    "release waits for command",
+                                ).kind,
+                                ErrorKind::Timeout,
+                            );
+                            resume.send(());
+                            testing::assert_eq(
+                                testing::expect_ok(active.join(), "active request finishes"),
+                                "PONG",
+                            );
+                        }
+                        testing::assert_ok(releasing.join());
+                    },
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn pool_replaces_failed_health_connections_without_replaying_user_commands() -> () {
+    with_pool_peers(
+        3,
+        pool_options(),
+        |peer, index| {
+            let _ = peer.request();
+            if index == 0 {
+                peer.send("+PONG\r\n");
+                let _ = peer.request();
+            } else if index == 2 {
+                peer.send("+PONG\r\n");
+            }
+        },
+        |pool| {
+            testing::assert_eq(
+                testing::expect_ok(pool.execute(pool_ping(), Operation::new()), "initial request"),
+                "PONG",
+            );
+            let error = testing::expect_err(
+                pool.execute(pool_ping(), Operation::new()),
+                "user request fails once",
+            );
+            testing::assert(error.may_have_executed);
+            testing::assert_eq(pool.stats().idle, 0);
+            testing::assert_eq(
+                testing::expect_ok(
+                    pool.execute(pool_ping(), Operation::new()),
+                    "next independent request reconnects",
+                ),
+                "PONG",
+            );
+        },
+    );
+}
+
+#[test]
+fn pool_idle_limits_expiry_and_explicit_discard_free_capacity() -> () {
+    for mode in 0..4 {
+        let next_connection: Channel[()] = Channel::new(1);
+        let options = match mode {
+            0 => PoolOptions { max_idle: 0, ..pool_options() },
+            1 => PoolOptions {
+                idle_timeout: Option::Some(time::Duration::from_milliseconds(5)),
+                ..pool_options(),
+            },
+            2 => PoolOptions {
+                max_lifetime: Option::Some(time::Duration::from_milliseconds(5)),
+                ..pool_options(),
+            },
+            _ => pool_options(),
+        };
+        with_pool_peers(
+            2,
+            PoolOptions { health_check: HealthCheck::Never, ..options },
+            |peer, index| {
+                let _ = peer.request();
+                peer.send("+PONG\r\n");
+                if index == 0 {
+                    let _ = next_connection.recv();
+                } else {
+                    next_connection.send(());
+                }
+            },
+            |pool| {
+                let lease = testing::expect_ok(pool.acquire(Operation::new()), "expiring lease");
+                testing::assert_ok(lease.execute(pool_ping(), Operation::new()));
+                if mode == 3 {
+                    testing::assert_ok(lease.discard());
+                } else {
+                    testing::assert_ok(lease.release());
+                }
+                if mode == 1 || mode == 2 {
+                    time::sleep(time::Duration::from_milliseconds(15));
+                }
+                testing::assert_ok(pool.execute(pool_ping(), Operation::new()));
+            },
+        );
+    }
+}
+
+#[test]
+fn pool_health_timeout_is_bounded_by_total_acquire_budget() -> () {
+    for replace in Vec::from_array([false, true]) {
+        let done: Channel[()] = Channel::new(1);
+        let options = PoolOptions {
+            health_timeout: time::Duration::from_milliseconds(20),
+            ..pool_options(),
+        };
+        with_pool_peers(
+            if replace {
+                2
+            } else {
+                1
+            },
+            options,
+            |peer, index| {
+                let _ = peer.request();
+                peer.send("+PONG\r\n");
+                if index == 0 {
+                    let _ = peer.request();
+                    let _ = done.recv();
+                }
+            },
+            |pool| {
+                testing::assert_ok(pool.execute(pool_ping(), Operation::new()));
+                if replace {
+                    testing::assert_ok(pool.execute(pool_ping(), Operation::new()));
+                } else {
+                    let error = testing::expect_err(
+                        pool.execute(
+                            pool_ping(),
+                            Operation::new().with_timeout(time::Duration::from_milliseconds(10)),
+                        ),
+                        "health shares total budget",
+                    );
+                    testing::assert_eq(error.kind, ErrorKind::Timeout);
+                    testing::assert(!error.may_have_executed);
+                }
+                done.send(());
+            },
+        );
+    }
+}
+
+#[test]
+fn pool_validates_limits_and_failed_dials_release_reservations() -> () {
+    let address = testing::expect_ok(net::SocketAddr::parse("127.0.0.1:1"), "address");
+    for options in Vec::from_array(
+        [
+            PoolOptions { max_connections: 0, ..pool_options() },
+            PoolOptions { max_idle: 2, ..pool_options() },
+            PoolOptions { health_timeout: time::Duration::zero(), ..pool_options() },
+            PoolOptions { idle_timeout: Option::Some(time::Duration::zero()), ..pool_options() },
+        ],
+    ) {
+        testing::assert_eq(
+            testing::expect_err(
+                Pool::connect(address, ConnectionOptions::standard(), options),
+                "invalid pool options",
+            ).kind,
+            ErrorKind::Limit,
+        );
+    }
+    let pool = testing::expect_ok(
+        Pool::new(
+            pool_options(),
+            |_| Result::Err(ecosystem::redis::Error::new(ErrorKind::Io, "dial failed")),
+        ),
+        "failing pool",
+    );
+    for _ in 0..3 {
+        testing::assert_eq(
+            testing::expect_err(pool.acquire(Operation::new()), "dial failure").kind,
+            ErrorKind::Io,
+        );
+        testing::assert_eq(pool.stats().opening, 0);
+    }
+    testing::assert_ok(pool.close());
+}
+
+#[test]
+fn pool_pending_handshakes_reserve_capacity_and_close_cancels_setup() -> () {
+    let listener = testing::expect_ok(
+        net::TcpListener::bind(testing::expect_ok(net::SocketAddr::parse("127.0.0.1:0"), "address")),
+        "listen",
+    );
+    let address = testing::expect_ok(listener.local_addr(), "address");
+    let received: Channel[()] = Channel::new(1);
+    let done: Channel[()] = Channel::new(1);
+    let scopes = task::active_scope_count();
+    task::scope(
+        |scope| {
+            let server = scope.spawn(
+                |_| {
+                    let stream = testing::expect_ok(
+                        listener.accept_with(wait_options()),
+                        "accept opening pool",
+                    ).0;
+                    defer {
+                        let _ = stream.close();
+                    };
+                    let peer = Peer {
+                        stream,
+                        decoder: testing::expect_ok(Decoder::new(Limits::standard()), "decoder"),
+                    };
+                    let _ = peer.request();
+                    received.send(());
+                    let _ = done.recv();
+                },
+            );
+            let pool = testing::expect_ok(
+                Pool::connect(address, ConnectionOptions::standard(), pool_options()),
+                "opening pool",
+            );
+            let opening = scope.spawn(|_| pool.acquire(Operation::new().without_timeout()));
+            let _ = received.recv();
+            testing::assert_eq(pool.stats().opening, 1);
+            testing::assert_eq(
+                testing::expect_err(
+                    pool.acquire(
+                        Operation::new().with_timeout(time::Duration::from_milliseconds(20)),
+                    ),
+                    "opening counts toward capacity",
+                ).kind,
+                ErrorKind::Timeout,
+            );
+            testing::assert_ok(pool.close());
+            let error = testing::expect_err(opening.join(), "close cancels HELLO");
+            testing::assert_eq(error.kind, ErrorKind::Closed);
+            testing::assert(!error.may_have_executed);
+            testing::assert_eq(pool.stats().opening, 0);
+            done.send(());
+            server.join();
+        },
+    );
+    testing::assert_ok(listener.close());
+    testing::assert_eq(task::active_scope_count(), scopes);
+}
+
+#[test]
+fn pool_waiting_checkout_uses_one_budget_and_idle_age_starts_on_release() -> () {
+    let received: Channel[()] = Channel::new(1);
+    let resume: Channel[()] = Channel::new(1);
+    with_pool_peers(
+        1,
+        PoolOptions {
+            health_check: HealthCheck::Never,
+            idle_timeout: Option::Some(time::Duration::from_milliseconds(30)),
+            ..pool_options(),
+        },
+        |peer, _| {
+            for index in 0..2 {
+                let _ = peer.request();
+                received.send(());
+                if index == 0 {
+                    let _ = resume.recv();
+                    peer.send("+PONG\r\n");
+                } else {
+                    time::sleep(time::Duration::from_milliseconds(80));
+                    let _ = peer.stream.write_all_with(
+                        "+PONG\r\n".to_bytes().as_slice(),
+                        wait_options(),
+                    );
+                }
+            }
+        },
+        |pool| {
+            let held = testing::expect_ok(pool.acquire(Operation::new()), "initial held lease");
+            time::sleep(time::Duration::from_milliseconds(40));
+            testing::assert_ok(held.release());
+            testing::assert_eq(pool.stats().idle, 1);
+            task::scope(
+                |scope| {
+                    let active = scope.spawn(|_| pool.execute(pool_ping(), Operation::new()));
+                    let _ = received.recv();
+                    let waiting = scope.spawn(
+                        |_| pool.execute(
+                            pool_ping(),
+                            Operation::new().with_timeout(time::Duration::from_milliseconds(100)),
+                        ),
+                    );
+                    time::sleep(time::Duration::from_milliseconds(30));
+                    resume.send(());
+                    testing::assert_ok(active.join());
+                    let _ = received.recv();
+                    let error = testing::expect_err(
+                        waiting.join(),
+                        "request budget includes pool wait",
+                    );
+                    testing::assert_eq(error.kind, ErrorKind::Timeout);
+                    testing::assert(error.may_have_executed);
+                },
+            );
+        },
+    );
+}
+
+#[test]
+fn pool_late_factory_close_keeps_bookkeeping_available() -> () {
+    let listener = testing::expect_ok(
+        net::TcpListener::bind(testing::expect_ok(net::SocketAddr::parse("127.0.0.1:0"), "address")),
+        "listen",
+    );
+    let address = testing::expect_ok(listener.local_addr(), "address");
+    let created: Channel[()] = Channel::new(1);
+    let deliver: Channel[()] = Channel::new(1);
+    let closing: Channel[()] = Channel::new(1);
+    let finish_close: Channel[()] = Channel::new(1);
+    let finish_server: Channel[()] = Channel::new(1);
+    task::scope(
+        |scope| {
+            let server = scope.spawn(
+                |_| {
+                    let stream = testing::expect_ok(
+                        listener.accept_with(wait_options()),
+                        "accept delayed connector",
+                    ).0;
+                    defer {
+                        let _ = stream.close();
+                    };
+                    let peer = Peer {
+                        stream,
+                        decoder: testing::expect_ok(Decoder::new(Limits::standard()), "decoder"),
+                    };
+                    let _ = peer.request();
+                    peer.send("%1\r\n+proto\r\n:3\r\n");
+                    let _ = finish_server.recv();
+                },
+            );
+            let pool = testing::expect_ok(
+                Pool::new(
+                    pool_options(),
+                    |operation| {
+                        let connection = Connection::dial(
+                            ConnectionOptions::standard(),
+                            operation,
+                            |remaining| {
+                                let stream = net::TcpStream::connect_with(
+                                    address,
+                                    remaining.wait_options(),
+                                )?;
+                                Result::Ok(
+                                    ecosystem::redis::Transport::new(
+                                        |buffer, options| stream.read_with(
+                                            buffer,
+                                            options.wait_options(),
+                                        ),
+                                        |buffer, options| stream.write_all_with(
+                                            buffer,
+                                            options.wait_options(),
+                                        ),
+                                        || {
+                                            closing.send(());
+                                            let _ = finish_close.recv();
+                                            stream.close()
+                                        },
+                                        || stream.is_closed(),
+                                    ),
+                                )
+                            },
+                        )?;
+                        created.send(());
+                        let _ = deliver.recv();
+                        Result::Ok(connection)
+                    },
+                ),
+                "delayed connector pool",
+            );
+            let opening = scope.spawn(|_| pool.acquire(Operation::new().without_timeout()));
+            let _ = created.recv();
+            testing::assert_ok(pool.close());
+            deliver.send(());
+            let _ = closing.recv();
+            let observed: Channel[bool] = Channel::new(1);
+            let inspect = scope.spawn(
+                |_| {
+                    let stats = pool.stats();
+                    observed.send(
+                        stats.closed && stats.opening == 0 && stats.leased == 0 && stats.idle == 0,
+                    );
+                },
+            );
+            let timeout = time::Timer::new(time::Duration::from_milliseconds(250));
+            let available = select {
+                recv(observed) as value => value.unwrap_or(false),
+                recv(timeout.done()) as _ => false,
+            };
+            let _ = timeout.stop();
+            finish_close.send(());
+            testing::assert_eq(
+                testing::expect_err(opening.join(), "late connection closed").kind,
+                ErrorKind::Closed,
+            );
+            inspect.join();
+            finish_server.send(());
+            server.join();
+            testing::assert(available);
+        },
+    );
+    testing::assert_ok(listener.close());
+}

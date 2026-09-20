@@ -1,0 +1,178 @@
+package tests;
+
+use ecosystem::proptest;
+use std::testing;
+
+fn counter_machine(events: Vec[string], buggy: bool, cleanup_fails: bool) -> proptest::StateMachine[
+    isize,
+    Ref[isize],
+    isize,
+] {
+    testing::expect_ok(
+        proptest::StateMachine::new(
+            20,
+            || {
+                events.push("setup");
+                Result::Ok((0, Ref::new(0)))
+            },
+            |model: isize, command: isize| if model + command < 0 {
+                Result::Err("negative")
+            } else {
+                Result::Ok(model + command)
+            },
+            |system: Ref[isize], command: isize| {
+                events.push(f"execute {command}");
+                if command == 99 {
+                    return Result::Err("execution refused")
+                }
+                system.set(
+                    system.get() + command
+                        + if buggy && command == 2 {
+                            1
+                        } else {
+                            0
+                        },
+                );
+                Result::Ok(())
+            },
+            |model: isize, system: Ref[isize]| if model == system.get() {
+                Result::Ok(())
+            } else {
+                Result::Err("counter differs")
+            },
+            |_| {
+                events.push("cleanup");
+                if cleanup_fails {
+                    Result::Err("close failed")
+                } else {
+                    Result::Ok(())
+                }
+            },
+        ),
+        "machine",
+    )
+}
+
+#[test]
+fn state_machine_checks_each_step_and_cleans_every_exit() -> () {
+    let events = Vec::new();
+    let machine = counter_machine(events, true, false);
+    let report = machine.run(Vec::from_array([1, 2, 3]));
+    testing::assert(report.stage == Option::Some(proptest::MachineStage::Invariant));
+    testing::assert(report.step == Option::Some(1));
+    testing::assert_eq(report.completed, 2);
+    testing::assert(events == Vec::from_array(["setup", "execute 1", "execute 2", "cleanup"]));
+    events.clear();
+    let report = machine.run(Vec::from_array([-1, 2]));
+    testing::assert(report.stage == Option::Some(proptest::MachineStage::Transition));
+    testing::assert_eq(
+        report.case.verdict,
+        proptest::Verdict::Discard("command 0 precondition: negative"),
+    );
+    testing::assert(events == Vec::from_array(["setup", "cleanup"]));
+    events.clear();
+    let report = machine.run(Vec::from_array([99]));
+    testing::assert(report.stage == Option::Some(proptest::MachineStage::Execute));
+    testing::assert_eq(report.completed, 0);
+    testing::assert(events == Vec::from_array(["setup", "execute 99", "cleanup"]));
+    events.clear();
+    let report = machine.run(Vec::from_array([1, -1]));
+    testing::assert_eq(report.case.verdict, proptest::Verdict::Pass);
+    testing::assert_eq(report.completed, 2);
+    testing::assert_none(report.stage);
+    testing::assert(events == Vec::from_array(["setup", "execute 1", "execute -1", "cleanup"]));
+}
+
+#[test]
+fn state_machine_preserves_cleanup_and_primary_errors() -> () {
+    let machine = counter_machine(Vec::new(), true, true);
+    let report = machine.run(Vec::from_array([2]));
+    testing::assert(report.stage == Option::Some(proptest::MachineStage::Invariant));
+    testing::assert(report.cleanup_error == Option::Some("close failed"));
+    testing::assert_eq(
+        report.case.verdict,
+        proptest::Verdict::Fail("command 0 invariant: counter differs; cleanup: close failed"),
+    );
+    let report = machine.run(Vec::new());
+    testing::assert(report.stage == Option::Some(proptest::MachineStage::Cleanup));
+    testing::assert_eq(report.case.verdict, proptest::Verdict::Fail("cleanup: close failed"));
+    let report = machine.run(Vec::from_array([-1]));
+    testing::assert_eq(
+        report.case.verdict,
+        proptest::Verdict::Fail("command 0 precondition: negative; cleanup: close failed"),
+    );
+}
+
+#[test]
+fn state_machine_setup_initial_invariant_and_limit_have_clear_lifecycles() -> () {
+    let closed = Ref::new(0);
+    let make = |fails: bool, limit: isize| proptest::StateMachine::new(
+        limit,
+        || if fails {
+            Result::Err("setup refused")
+        } else {
+            Result::Ok((0, Ref::new(1)))
+        },
+        |model: isize, command: isize| Result::Ok(model + command),
+        |_: Ref[isize], _: isize| Result::Ok(()),
+        |model: isize, system: Ref[isize]| if model == system.get() {
+            Result::Ok(())
+        } else {
+            Result::Err("invalid initial state")
+        },
+        |_| {
+            closed.set(closed.get() + 1);
+            Result::Ok(())
+        },
+    );
+    testing::assert_err(make(false, -1));
+    testing::assert_err(make(false, 1000001));
+    let report = testing::expect_ok(make(true, 1), "setup").run(Vec::new());
+    testing::assert(report.stage == Option::Some(proptest::MachineStage::Setup));
+    testing::assert_eq(closed.get(), 0);
+    let machine = testing::expect_ok(make(false, 0), "initial invariant");
+    let report = machine.run(Vec::new());
+    testing::assert(report.stage == Option::Some(proptest::MachineStage::InitialInvariant));
+    testing::assert_eq(closed.get(), 1);
+    let report = machine.run(Vec::from_array([1]));
+    testing::assert(report.stage == Option::Some(proptest::MachineStage::Limit));
+    testing::assert_eq(closed.get(), 1);
+}
+
+#[test]
+fn shrinking_state_machine_failures_recreates_and_closes_the_system() -> () {
+    let events = Vec::new();
+    let machine = counter_machine(events, true, false);
+    let generator = proptest::Generator::new(
+        |_, _| Result::Ok(
+            proptest::Sample::new(
+                Vec::from_array([1, 2, 3]),
+                || Vec::from_array(
+                    [
+                        proptest::Sample::leaf(Vec::new()),
+                        proptest::Sample::leaf(Vec::from_array([2])),
+                    ],
+                ),
+            ),
+        ),
+    );
+    let report = testing::expect_ok(
+        proptest::run(generator, proptest::RunOptions::new(42), |commands| machine.check(commands)),
+        "run",
+    );
+    let failure = testing::expect_some(report.failure, "failure");
+    testing::assert(failure.minimal == Vec::from_array([2]));
+    testing::assert_eq(failure.attempts, 2);
+    let mut setups = 0;
+    let mut cleanups = 0;
+    for event in events {
+        if event == "setup" {
+            setups += 1;
+        }
+        if event == "cleanup" {
+            cleanups += 1;
+        }
+    }
+    testing::assert_eq(setups, 3);
+    testing::assert_eq(cleanups, setups);
+}
