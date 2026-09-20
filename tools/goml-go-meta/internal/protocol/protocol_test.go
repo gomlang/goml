@@ -14,7 +14,7 @@ func validRequest() Request {
 	return Request{
 		ProtocolVersion: Version,
 		BuildContext: BuildContext{
-			GoExecutable: `C:\Program Files\Go\bin\go.exe`, Toolchain: "go1.25.8",
+			GoExecutable: `C:\Program Files\Go\bin\go.exe`, Toolchain: "go1.26.0",
 			ModuleDir: `C:\my project`, GOOS: "windows", GOARCH: "amd64", CGOEnabled: "0",
 			GO111MODULE: "on", GOWORK: "off", Dependencies: "readonly", Network: "off",
 		},

@@ -1,3 +1,3 @@
 module example.com/goml-std-capabilities
 
-go 1.25
+go 1.26

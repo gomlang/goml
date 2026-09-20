@@ -38,7 +38,7 @@ mkdir -p "$smoke_root/ffi/gen"
 cat > "$smoke_root/ffi/go.mod" <<'GOMOD'
 module example.com/ffi-smoke
 
-go 1.25.0
+go 1.26.0
 GOMOD
 jq -n \
     --arg go_executable "$(command -v go)" \

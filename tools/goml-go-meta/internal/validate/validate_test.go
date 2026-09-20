@@ -25,7 +25,7 @@ func fixture(t *testing.T) protocol.Request {
 			t.Fatal(err)
 		}
 	}
-	write("go.mod", "module example.com/host\n\ngo 1.25.0\n")
+	write("go.mod", "module example.com/host\n\ngo 1.26.0\n")
 	write("shim/shim.go", `package shim
 
 type Alias = int64

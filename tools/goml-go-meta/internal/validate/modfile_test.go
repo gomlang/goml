@@ -14,10 +14,10 @@ import (
 func TestModuleFileFlagWithSpaces(t *testing.T) {
 	request := fixture(t)
 	file := filepath.Join(request.BuildContext.ModuleDir, "alternate go.mod")
-	if err := os.WriteFile(file, []byte("module example.com/host\n\ngo 1.25.0\n"), 0644); err != nil {
+	if err := os.WriteFile(file, []byte("module example.com/host\n\ngo 1.26.0\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	original := []byte("module example.com/unselected\n\ngo 1.25.0\n")
+	original := []byte("module example.com/unselected\n\ngo 1.26.0\n")
 	if err := os.WriteFile(filepath.Join(request.BuildContext.ModuleDir, "go.mod"), original, 0644); err != nil {
 		t.Fatal(err)
 	}
