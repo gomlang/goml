@@ -1,0 +1,568 @@
+package redis;
+
+use std::context;
+use std::net;
+use std::net::tls;
+use std::task;
+use std::time;
+
+pub enum HealthCheck {
+    Never,
+    OnCheckout,
+    AfterIdle(time::Duration),
+}
+
+pub struct PoolOptions {
+    pub max_connections: isize,
+    pub max_idle: isize,
+    pub idle_timeout: Option[time::Duration],
+    pub max_lifetime: Option[time::Duration],
+    pub health_check: HealthCheck,
+    pub health_timeout: time::Duration,
+}
+
+impl PoolOptions {
+    pub fn standard() -> PoolOptions {
+        PoolOptions {
+            max_connections: 16,
+            max_idle: 16,
+            idle_timeout: Option::Some(time::Duration::from_seconds(300)),
+            max_lifetime: Option::None,
+            health_check: HealthCheck::OnCheckout,
+            health_timeout: time::Duration::from_seconds(1),
+        }
+    }
+}
+
+pub struct PoolStats {
+    pub capacity: isize,
+    pub idle: isize,
+    pub leased: isize,
+    pub opening: isize,
+    pub closed: bool,
+}
+
+struct PooledConnection {
+    connection: Connection,
+    born: time::Instant,
+    returned: time::Instant,
+}
+
+enum PoolSlot {
+    Empty,
+    Opening,
+    Leased(PooledConnection),
+    Idle(PooledConnection),
+}
+
+enum PoolChoice {
+    Inspect(isize, PooledConnection),
+    Create(isize),
+    Wait(Channel[()]),
+}
+
+pub struct Pool {
+    options: PoolOptions,
+    connector: (Operation) -> Result[Connection, Error],
+    slots: Vec[PoolSlot],
+    gate: Channel[()],
+    changed: Ref[Channel[()]],
+    closed: Channel[()],
+    close_gate: Channel[()],
+    close_error: Ref[Option[Error]],
+}
+
+pub struct Lease {
+    pool: Pool,
+    slot: isize,
+    entry: PooledConnection,
+    gate: Channel[()],
+    released: Ref[bool],
+}
+
+fn pool_closed() -> Error {
+    error(ErrorKind::Closed, 0, "Redis pool or lease is closed")
+}
+
+impl Pool {
+    pub fn new(options: PoolOptions, connector: (Operation) -> Result[Connection, Error]) -> Result[
+        Pool,
+        Error,
+    ] {
+        if options.max_connections < 1 || options.max_connections > 65536 || options.max_idle < 0
+            || options.max_idle > options.max_connections
+            || options.health_timeout.compare(time::Duration::zero()) <= 0 {
+            return Result::Err(
+                error(ErrorKind::Limit, 0, "invalid Redis pool capacity or health timeout"),
+            )
+        }
+        for value in Vec::from_array([options.idle_timeout, options.max_lifetime]) {
+            if let Some(duration) = value {
+                if duration.compare(time::Duration::zero()) <= 0 {
+                    return Result::Err(
+                        error(ErrorKind::Limit, 0, "pool expiry durations must be positive"),
+                    )
+                }
+            }
+        }
+        let slots = Vec::with_capacity(options.max_connections);
+        for _ in 0..options.max_connections {
+            slots.push(PoolSlot::Empty);
+        }
+        let gate = Channel::new(1);
+        gate.send(());
+        let close_gate = Channel::new(1);
+        close_gate.send(());
+        Result::Ok(
+            Pool {
+                options,
+                connector,
+                slots,
+                gate,
+                changed: Ref::new(Channel::new(0)),
+                closed: Channel::new(0),
+                close_gate,
+                close_error: Ref::new(Option::None),
+            },
+        )
+    }
+
+    pub fn connect(address: net::SocketAddr, connection: ConnectionOptions, options: PoolOptions) -> Result[
+        Pool,
+        Error,
+    ] {
+        validate_connection_options(connection)?;
+        Pool::new(options, |operation| Connection::connect(address, connection, operation))
+    }
+
+    pub fn connect_host(
+        host: string,
+        port: u16,
+        connection: ConnectionOptions,
+        options: PoolOptions,
+    ) -> Result[Pool, Error] {
+        validate_connection_options(connection)?;
+        Pool::new(options, |operation| Connection::connect_host(host, port, connection, operation))
+    }
+
+    pub fn connect_tls(
+        host: string,
+        port: u16,
+        config: tls::ClientConfig,
+        connection: ConnectionOptions,
+        options: PoolOptions,
+    ) -> Result[Pool, Error] {
+        validate_connection_options(connection)?;
+        Pool::new(
+            options,
+            |operation| Connection::connect_tls(host, port, config, connection, operation),
+        )
+    }
+
+    pub fn is_closed(self: Pool) -> bool {
+        select {
+            recv(self.closed) as _ => true,
+            default => false,
+        }
+    }
+
+    fn notify(self: Pool) -> () {
+        self.changed.get().close();
+        self.changed.set(Channel::new(0));
+    }
+
+    pub fn stats(self: Pool) -> PoolStats {
+        let _ = self.gate.recv();
+        defer self.gate.send(());
+        let mut result = PoolStats {
+            capacity: self.options.max_connections,
+            idle: 0,
+            leased: 0,
+            opening: 0,
+            closed: self.is_closed(),
+        };
+        for slot in self.slots {
+            match slot {
+                PoolSlot::Empty => (),
+                PoolSlot::Opening => {
+                    result.opening += 1;
+                },
+                PoolSlot::Leased(_) => {
+                    result.leased += 1;
+                },
+                PoolSlot::Idle(_) => {
+                    result.idle += 1;
+                },
+            }
+        }
+        result
+    }
+
+    fn choose(self: Pool, deadline: Deadline) -> Result[PoolChoice, Error] {
+        deadline.acquire(self.gate, self.closed)?;
+        defer self.gate.send(());
+        deadline.check()?;
+        if self.is_closed() {
+            return Result::Err(pool_closed())
+        }
+        let mut empty = Option::None;
+        for index in 0..self.slots.len() {
+            match self.slots[index] {
+                PoolSlot::Idle(entry) => {
+                    self.slots[index] = PoolSlot::Leased(entry);
+                    return Result::Ok(PoolChoice::Inspect(index, entry))
+                },
+                PoolSlot::Empty => {
+                    empty = Option::Some(index);
+                },
+                _ => (),
+            }
+        }
+        if let Some(index) = empty {
+            self.slots[index] = PoolSlot::Opening;
+            Result::Ok(PoolChoice::Create(index))
+        } else {
+            Result::Ok(PoolChoice::Wait(self.changed.get()))
+        }
+    }
+
+    fn empty(self: Pool, index: isize) -> () {
+        let _ = self.gate.recv();
+        defer self.gate.send(());
+        self.slots[index] = PoolSlot::Empty;
+        self.notify();
+    }
+
+    fn discard(self: Pool, index: isize, entry: PooledConnection) -> Result[(), Error] {
+        let result = entry.connection.close();
+        self.empty(index);
+        result
+    }
+
+    fn expired(self: Pool, entry: PooledConnection) -> bool {
+        self.options.idle_timeout.map(|limit| entry.returned.elapsed().compare(limit) >= 0).unwrap_or(
+            false,
+        )
+            || self.options.max_lifetime.map(|limit| entry.born.elapsed().compare(limit) >= 0).unwrap_or(
+                false,
+            )
+    }
+
+    fn needs_health(self: Pool, entry: PooledConnection) -> bool {
+        match self.options.health_check {
+            HealthCheck::Never => false,
+            HealthCheck::OnCheckout => true,
+            HealthCheck::AfterIdle(duration) => entry.returned.elapsed().compare(duration) >= 0,
+        }
+    }
+
+    fn establish(self: Pool, operation: Operation) -> Result[Connection, Error] {
+        context::with_cancel(
+            operation.context().unwrap_or(context::Context::background()),
+            |ctx, cancel| task::scope(
+                |scope| {
+                    defer scope.cancel();
+                    let _ = scope.spawn(
+                        |worker| {
+                            select {
+                                recv(self.closed) as _ => cancel.cancel(),
+                                recv(worker.done()) as _ => (),
+                            }
+                        },
+                    );
+                    if self.is_closed() {
+                        return Result::Err(pool_closed())
+                    }
+                    let connect = self.connector;
+                    connect(operation.with_context(ctx))
+                },
+            ),
+        )
+    }
+
+    fn lease(self: Pool, index: isize, entry: PooledConnection, deadline: Deadline) -> Result[
+        Lease,
+        Error,
+    ] {
+        if let Err(problem) = deadline.check() {
+            let _ = self.discard(index, entry);
+            return Result::Err(problem)
+        }
+        let _ = self.gate.recv();
+        if self.is_closed() {
+            self.slots[index] = PoolSlot::Empty;
+            self.gate.send(());
+            let _ = entry.connection.close();
+            return Result::Err(pool_closed())
+        }
+        self.slots[index] = PoolSlot::Leased(entry);
+        self.gate.send(());
+        let gate = Channel::new(1);
+        gate.send(());
+        Result::Ok(Lease { pool: self, slot: index, entry, gate, released: Ref::new(false) })
+    }
+
+    pub fn acquire(self: Pool, operation: Operation) -> Result[Lease, Error] {
+        let deadline = Deadline::new(operation);
+        defer deadline.stop();
+        loop {
+            match self.choose(deadline)? {
+                PoolChoice::Wait(changed) => deadline.acquire(changed, self.closed)?,
+                PoolChoice::Create(index) => {
+                    let opened = match deadline.remaining() {
+                        Ok(remaining) => self.establish(remaining),
+                        Err(problem) => Result::Err(problem),
+                    };
+                    match opened {
+                        Ok(connection) => {
+                            let now = time::Instant::now();
+                            return self.lease(
+                                index,
+                                PooledConnection { connection, born: now, returned: now },
+                                deadline,
+                            )
+                        },
+                        Err(problem) => {
+                            self.empty(index);
+                            return Result::Err(
+                                if self.is_closed() {
+                                    pool_closed()
+                                } else {
+                                    Error {
+                                        may_have_executed: false,
+                                        partial: Vec::new(),
+                                        ..problem,
+                                    }
+                                },
+                            )
+                        },
+                    }
+                },
+                PoolChoice::Inspect(index, entry) => {
+                    if entry.connection.is_closed() || self.expired(entry) {
+                        let _ = self.discard(index, entry);
+                        continue
+                    }
+                    if self.needs_health(entry) {
+                        let operation = match deadline.remaining() {
+                            Ok(operation) => operation,
+                            Err(problem) => {
+                                let _ = self.discard(index, entry);
+                                return Result::Err(problem)
+                            },
+                        };
+                        let timeout = match operation.timeout() {
+                            Some(timeout) if timeout.compare(self.options.health_timeout) < 0 => timeout,
+                            _ => self.options.health_timeout,
+                        };
+                        let result: Result[string, Error] = entry.connection.execute(
+                            Request::new(
+                                single("PING", Vec::new()),
+                                |value| {
+                                    let reply: string = FromReply::from_reply(value)?;
+                                    Result::Ok(reply)
+                                },
+                            ),
+                            operation.with_timeout(timeout),
+                        );
+                        if !result.map(|reply| reply == "PONG").unwrap_or(false) {
+                            let _ = self.discard(index, entry);
+                            deadline.check()?;
+                            continue
+                        }
+                    }
+                    return self.lease(index, entry, deadline)
+                },
+            }
+        }
+    }
+
+    pub fn execute[T](self: Pool, request: Request[T], operation: Operation) -> Result[T, Error] {
+        validate_pooled_command(request.command)?;
+        let deadline = Deadline::new(operation);
+        defer deadline.stop();
+        let lease = self.acquire(deadline.remaining()?)?;
+        defer {
+            let _ = lease.release();
+        };
+        lease.execute(request, deadline.remaining()?)
+    }
+
+    pub fn close(self: Pool) -> Result[(), Error] {
+        let _ = self.close_gate.recv();
+        defer self.close_gate.send(());
+        if self.is_closed() {
+            return match self.close_error.get() {
+                Some(problem) => Result::Err(problem),
+                None => Result::Ok(()),
+            }
+        }
+        let connections = Vec::new();
+        let _ = self.gate.recv();
+        self.closed.close();
+        for index in 0..self.slots.len() {
+            match self.slots[index] {
+                PoolSlot::Idle(entry) | PoolSlot::Leased(entry) => connections.push(
+                    entry.connection,
+                ),
+                _ => (),
+            }
+            self.slots[index] = PoolSlot::Empty;
+        }
+        self.notify();
+        self.gate.send(());
+        for connection in connections {
+            if let Err(problem) = connection.close() {
+                if self.close_error.get().is_none() {
+                    self.close_error.set(Option::Some(problem));
+                }
+            }
+        }
+        match self.close_error.get() {
+            Some(problem) => Result::Err(problem),
+            None => Result::Ok(()),
+        }
+    }
+}
+
+fn validate_pooled_command(command: Command) -> Result[(), Error] {
+    command.validate_regular()?;
+    match command.name {
+        "AUTH" | "SELECT" | "READONLY" | "READWRITE" | "ASKING" => return Result::Err(
+            error(
+                ErrorKind::InvalidCommand,
+                0,
+                "command changes pooled session state; use a dedicated Connection",
+            ),
+        ),
+        "CLIENT" => {
+            let subcommand = if command.arguments.is_empty() {
+                ""
+            } else {
+                string_from_utf8(command.arguments[0]).1.to_ascii_uppercase()
+            };
+            if subcommand != "ID" && subcommand != "INFO" && subcommand != "GETNAME" {
+                return Result::Err(
+                    error(
+                        ErrorKind::InvalidCommand,
+                        0,
+                        "CLIENT subcommand is not safe for a pooled session",
+                    ),
+                )
+            }
+        },
+        _ => (),
+    }
+    Result::Ok(())
+}
+
+fn validate_pooled_pipeline(pipeline: Pipeline) -> Result[(), Error] {
+    for command in pipeline.commands {
+        validate_pooled_command(command)?;
+    }
+    Result::Ok(())
+}
+
+impl Lease {
+    fn enter(self: Lease, deadline: Deadline) -> Result[(), Error] {
+        deadline.acquire(self.gate, self.pool.closed)?;
+        if self.released.get() || self.pool.is_closed() {
+            self.gate.send(());
+            return Result::Err(pool_closed())
+        }
+        Result::Ok(())
+    }
+
+    pub fn execute[T](self: Lease, request: Request[T], operation: Operation) -> Result[T, Error] {
+        validate_pooled_command(request.command)?;
+        let deadline = Deadline::new(operation);
+        defer deadline.stop();
+        self.enter(deadline)?;
+        defer self.gate.send(());
+        self.entry.connection.execute(request, deadline.remaining()?)
+    }
+
+    pub fn pipeline(self: Lease, plan: Pipeline, operation: Operation) -> Result[Responses, Error] {
+        validate_pooled_pipeline(plan)?;
+        let deadline = Deadline::new(operation);
+        defer deadline.stop();
+        self.enter(deadline)?;
+        defer self.gate.send(());
+        self.entry.connection.pipeline(plan, deadline.remaining()?)
+    }
+
+    pub fn transaction(self: Lease, plan: Pipeline, operation: Operation) -> Result[
+        TransactionOutcome,
+        Error,
+    ] {
+        validate_pooled_pipeline(plan)?;
+        let deadline = Deadline::new(operation);
+        defer deadline.stop();
+        self.enter(deadline)?;
+        defer self.gate.send(());
+        self.entry.connection.transaction(plan, deadline.remaining()?)
+    }
+
+    pub fn compare_and_set(
+        self: Lease,
+        keys: Vec[Blob],
+        reads: Pipeline,
+        build: (Responses) -> Result[Pipeline, Error],
+        operation: Operation,
+    ) -> Result[TransactionOutcome, Error] {
+        validate_pooled_pipeline(reads)?;
+        let deadline = Deadline::new(operation);
+        defer deadline.stop();
+        self.enter(deadline)?;
+        defer self.gate.send(());
+        self.entry.connection.compare_and_set(
+            keys,
+            reads,
+            |responses| {
+                let plan = build(responses)?;
+                validate_pooled_pipeline(plan)?;
+                Result::Ok(plan)
+            },
+            deadline.remaining()?,
+        )
+    }
+
+    fn finish(self: Lease, discard: bool) -> Result[(), Error] {
+        let _ = self.gate.recv();
+        defer self.gate.send(());
+        if self.released.get() {
+            return Result::Ok(())
+        }
+        self.released.set(true);
+        let _ = self.pool.gate.recv();
+        let mut idle = 0;
+        for slot in self.pool.slots {
+            if let PoolSlot::Idle(_) = slot {
+                idle += 1;
+            }
+        }
+        if !discard && !self.pool.is_closed() && !self.entry.connection.is_closed()
+            && !self.pool.options.max_lifetime.map(
+                |limit| self.entry.born.elapsed().compare(limit) >= 0,
+            ).unwrap_or(false)
+            && idle < self.pool.options.max_idle {
+            self.pool.slots[self.slot] = PoolSlot::Idle(
+                PooledConnection { returned: time::Instant::now(), ..self.entry },
+            );
+            self.pool.notify();
+            self.pool.gate.send(());
+            Result::Ok(())
+        } else {
+            self.pool.gate.send(());
+            self.pool.discard(self.slot, self.entry)
+        }
+    }
+
+    pub fn release(self: Lease) -> Result[(), Error] {
+        self.finish(false)
+    }
+
+    pub fn discard(self: Lease) -> Result[(), Error] {
+        self.finish(true)
+    }
+}

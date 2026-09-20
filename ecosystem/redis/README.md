@@ -3,7 +3,7 @@
 `ecosystem::redis` is a standalone GoML RESP2/RESP3 client. It includes an
 incremental binary codec, typed requests, heterogeneous pipelines, transactions,
 optimistic updates, subscriptions, bounded push handling, cancellation and TCP
-connection management, DNS/TLS and injectable transports. It uses `std::net`,
+connection management, bounded pools, DNS/TLS and injectable transports. It uses `std::net`,
 `std::net::tls`, `std::context`, `std::task` and `std::time`; it does not
 wrap a Go Redis client.
 
@@ -120,6 +120,90 @@ REPLY are rejected by ordinary execution; use the dedicated transaction,
 subscription and close APIs. Raw commands that alter server state otherwise have
 the semantics of those commands; there is no automatic retry or reconnection.
 
+## Bounded connection pools
+
+`Pool::connect(address, connection_options, pool_options)`, `connect_host` and
+`connect_tls` construct a lazy pool. No socket is opened until `acquire` or
+`execute`. Each new connection completes the same authenticated HELLO/SELECT
+setup as `Connection`. `Pool::new(pool_options, connector)` accepts a custom
+`Operation -> Result[Connection, Error]` factory. Each successful factory call
+must transfer a fresh, exclusively owned connection; the factory must honor the
+remaining operation timeout, cancellation token and context.
+
+```gom
+let pool = Pool::connect(address, ConnectionOptions::standard(), PoolOptions::standard())?;
+defer { let _ = pool.close(); };
+let pong = pool.execute(commands::ping()?, Operation::new())?;
+let lease = pool.acquire(Operation::new())?;
+defer { let _ = lease.release(); };
+let values = lease.pipeline(plan, Operation::new())?;
+```
+
+`PoolOptions` has these defaults:
+
+| Option | Default | Behavior |
+| --- | --- | --- |
+| `max_connections` | 16 | Bounds idle, leased and currently opening connections together; accepted range 1–65,536 |
+| `max_idle` | 16 | Closes surplus connections on release; zero disables idle retention; cannot exceed capacity |
+| `idle_timeout` | 300 seconds | Retires an idle connection on its next checkout; `None` disables idle expiry |
+| `max_lifetime` | `None` | Optional lifetime limit, enforced at checkout and release |
+| `health_check` | `HealthCheck::OnCheckout` | PING before reusing an idle connection |
+| `health_timeout` | 1 second | Maximum PING budget, capped by the acquisition's remaining deadline |
+
+Expiry durations and the health timeout must be positive. `HealthCheck::Never`
+skips PING; `AfterIdle(duration)` checks only after the specified idle duration,
+with zero equivalent to `OnCheckout`. Newly established connections rely on
+HELLO validation. Expiration never interrupts a borrowed connection, and idle
+age starts when it is returned, not when it was originally created. Reaping is
+lazy; there are no periodic pool tasks or minimum-idle prefill. `stats()` provides
+a synchronized snapshot of `capacity`, `idle`, `leased`, `opening` and `closed`;
+`leased` includes an idle connection undergoing checkout validation.
+
+`acquire(operation)` reserves capacity before dialing and waits when all slots
+are occupied. One total deadline covers queueing, health checks and connection
+setup. Context cancellation, context deadlines and legacy cancel tokens also
+interrupt acquisition. Pool closure wakes waiters and cancels pending standard
+connectors. Invalid configuration is `ErrorKind::Limit`, exhaustion expires as
+`Timeout`, and cancellation/closure returns `Cancelled`/`Closed`. Acquisition
+errors never set `may_have_executed`, because no caller command was sent. A failed
+connection attempt frees its reservation and returns its error; it does not spin
+or retry repeatedly. Waiters have no fairness guarantee or separate queue bound;
+applications should bound their own concurrent work.
+
+`Lease` provides `execute`, `pipeline`, `transaction` and `compare_and_set`.
+Its connection remains private. Aliases of a lease share one execution gate;
+`release()` waits for active use before returning the connection and prevents
+later operations through any alias. Repeated release/discard calls are no-ops.
+`discard()` closes the connection instead of retaining it. Explicitly release
+leases, normally with `defer`; garbage collection does not return pool capacity.
+Per-lease operations have their own supplied deadline, including waiting for
+another operation on that lease. `pool.execute(request, operation)` acquires,
+executes once and releases automatically under one shared total deadline.
+
+A closed, expired or unhealthy idle connection is discarded before checkout;
+the pool establishes a replacement on demand. It **never replays a caller
+command**, including an ambiguous failed write. Application code receives the
+original command error and `may_have_executed` flag. Failed health PINGs may be
+replaced within the remaining acquisition budget. Standard TLS interruption
+closes the stream, so releasing that lease evicts it. A complete server or typed
+decoding error leaves an otherwise synchronized connection reusable.
+
+Pooled requests reject session-changing AUTH, SELECT, READONLY, READWRITE,
+ASKING and CLIENT commands other than ID/INFO/GETNAME, in addition to the ordinary
+connection's protocol-state restrictions. Pipelines, transactions and WATCH
+callbacks apply the same checks. Use a dedicated `Connection` for subscriptions
+or mutable session configuration. Applications issuing custom module commands
+remain responsible for avoiding module-specific session changes. WATCH callbacks
+must not reenter their lease or acquire from an exhausted pool.
+
+`pool.close()` is idempotent, immediately closes all tracked idle/borrowed
+connections and wakes queued operations; it does not wait for leases to be
+returned. It records and returns the first connection-close error. An in-flight
+custom factory that ignores cancellation cannot be preempted; a connection it
+returns after closure is immediately closed and never leased. Explicit
+`release`/`discard` report a close failure; automatic `execute` cleanup preserves
+the command result, so cleanup errors do not masquerade as a failed command.
+
 ## Pipelines and transactions
 
 Create `Pipeline::new()`, enqueue typed requests with `queue`, retain each
@@ -229,8 +313,7 @@ values terminate at the encoder's depth limit. Decoder/builders are mutable and
 require external serialization if shared; `Connection` provides its own gate.
 
 The built-in transport follows `std::net`: Linux amd64 numeric IPv4/IPv6 TCP
-addresses. Custom transports extend that boundary. Connection pools, Cluster
-redirection and Sentinel discovery are outside this implementation. Command availability depends
+addresses. Custom transports extend that boundary. Cluster redirection and Sentinel discovery are outside this implementation. Command availability depends
 on the selected server version; unsupported commands return normal server errors.
 
 ## Validation
@@ -262,12 +345,22 @@ existing Redis instance. A C compiler, make and network access for the first
 reference download are needed. `race.py` compiles the generated library test
 runner with Go's race detector and invokes every test separately.
 
-`network_check.py` adds eleven loopback DNS/TLS cases using Python's TLS server
+`network_check.py` adds fifteen loopback DNS/TLS cases using Python's TLS server
 and ephemeral OpenSSL-generated certificates. They cover verified and mutual
 TLS, untrusted certificates, hostname mismatch, handshake/HELLO/I/O timeouts,
-context deadlines and cancellation through both APIs. Cancellation is released
+context deadlines and cancellation through both APIs. Pool cases also verify
+DNS, TLS/mTLS reuse and eviction after an interrupted TLS request. Cancellation is released
 only after the server receives the request. `race.py` repeats these cases with
 a race-built GoML consumer. OpenSSL is required for these local fixtures.
+
+The 29 library tests include bounded checkout, setup reservations, total acquisition
+budgets, concurrent release, use after release, active close, health replacement,
+idle/lifetime expiry and ambiguous requests without retry over actual loopback TCP.
+The versioned consumer also exercises pooled pipelines, transactions, WATCH,
+80 concurrent increments through a two-connection pool, session restrictions, and
+server-side CLIENT KILL followed by health-based replacement against Redis 7.2.5
+in both protocols. `race.py` repeats these real Redis consumer scenarios as well
+as all library tests and the DNS/TLS fixtures under the Go race detector.
 
 Protocol references: [Redis RESP specification](https://redis.io/docs/latest/develop/reference/protocol-spec/),
 [RESP3 streamed types](https://github.com/antirez/RESP3/blob/master/spec.md),

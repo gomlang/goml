@@ -1,0 +1,293 @@
+package proptest;
+
+use std::rand;
+
+pub struct Observation {
+    pub case: Case,
+    pub values: Vec[(string, string)],
+}
+
+impl Observation {
+    pub fn new(case: Case) -> Observation {
+        Observation { case, values: Vec::new() }
+    }
+
+    pub fn collect(self: Observation, name: string, value: string) -> Observation {
+        Observation { values: self.values.copy().pushed((name, value)), ..self }
+    }
+}
+
+impl Case {
+    pub fn collect(self: Case, name: string, value: string) -> Observation {
+        Observation::new(self).collect(name, value)
+    }
+}
+
+pub struct Histogram {
+    pub name: string,
+    pub samples: isize,
+    pub buckets: Vec[(string, isize)],
+}
+
+pub struct Counterexample[T] {
+    pub failure: Failure[T],
+    pub replay: Replay,
+    pub message: string,
+    pub shrink_work: isize,
+    pub shrink_limited: bool,
+}
+
+pub struct CampaignOptions {
+    pub run: RunOptions,
+    pub max_failures: isize,
+    pub max_histogram_buckets: isize,
+}
+
+impl CampaignOptions {
+    pub fn new(seed: u64) -> CampaignOptions {
+        CampaignOptions {
+            run: RunOptions::new(seed),
+            max_failures: 10,
+            max_histogram_buckets: 1024,
+        }
+    }
+}
+
+pub struct CampaignReport[T] {
+    pub summary: RunReport[T],
+    pub failures: Vec[Counterexample[T]],
+    pub histograms: Vec[Histogram],
+    pub completed: bool,
+    pub stop_reason: string,
+}
+
+fn validate_campaign(options: CampaignOptions) -> Result[(), string] {
+    let run = options.run;
+    let config = run.config;
+    if config.cases < 0 || config.size < 0 || config.max_shrinks < 0 || run.max_discards < 0
+        || run.max_shrink_work < 0 {
+        return Result::Err("test budgets must be nonnegative")
+    }
+    if options.max_failures <= 0 || options.max_failures > 10000 {
+        return Result::Err("failure limit must be between 1 and 10000")
+    }
+    if options.max_histogram_buckets < 0 || options.max_histogram_buckets > 10000 {
+        return Result::Err("histogram bucket limit must be between 0 and 10000")
+    }
+    for entry in run.regressions {
+        if entry.size < 0 {
+            return Result::Err("regression size must be nonnegative")
+        }
+    }
+    for requirement in run.coverage {
+        if requirement.label == "" || requirement.minimum_percent < 0
+            || requirement.minimum_percent > 100 {
+            return Result::Err(
+                "coverage requires a nonempty label and a percentage between 0 and 100",
+            )
+        }
+    }
+    Result::Ok(())
+}
+
+struct Distributions {
+    values: Vec[Histogram],
+    names: HashMap[string, isize],
+    buckets: HashMap[(string, string), isize],
+    limit: isize,
+}
+
+impl Distributions {
+    fn new(limit: isize) -> Distributions {
+        Distributions { values: Vec::new(), names: HashMap::new(), buckets: HashMap::new(), limit }
+    }
+
+    fn record(self: Distributions, observations: Vec[(string, string)]) -> Result[(), string] {
+        if observations.len() > 10000 {
+            return Result::Err("a case cannot contain more than 10000 observations")
+        }
+        let seen: HashMap[string, string] = HashMap::new();
+        for entry in observations {
+            if entry.0 == "" || entry.0.byte_len() > 1024 || entry.1.byte_len() > 1024 {
+                return Result::Err(
+                    "observation names must be nonempty and names/values at most 1024 bytes",
+                )
+            }
+            if let Some(previous) = seen.get(entry.0) {
+                if previous != entry.1 {
+                    return Result::Err(
+                        "a case observed multiple values for distribution: " + entry.0,
+                    )
+                }
+                continue
+            }
+            seen.set(entry.0, entry.1);
+            let bucket = self.buckets.get(entry);
+            if bucket.is_none() && self.buckets.len() >= self.limit {
+                return Result::Err("campaign exceeded its histogram bucket limit")
+            }
+            let index = match self.names.get(entry.0) {
+                Some(index) => index,
+                None => {
+                    let index = self.values.len();
+                    self.names.set(entry.0, index);
+                    self.values.push(Histogram { name: entry.0, samples: 0, buckets: Vec::new() });
+                    index
+                },
+            };
+            let histogram = self.values[index];
+            match bucket {
+                Some(index) => {
+                    let count = histogram.buckets[index].1;
+                    histogram.buckets[index] = (entry.1, count + 1);
+                },
+                None => {
+                    self.buckets.set(entry, histogram.buckets.len());
+                    histogram.buckets.push((entry.1, 1));
+                },
+            }
+            self.values[index] = Histogram { samples: histogram.samples + 1, ..histogram };
+        }
+        Result::Ok(())
+    }
+}
+
+pub fn run_campaign[S: Strategy](
+    strategy: S,
+    options: CampaignOptions,
+    property: (S::Item) -> Observation,
+) -> Result[CampaignReport[S::Item], string] {
+    validate_campaign(options)?;
+    let run = options.run;
+    let config = run.config;
+    let regressions = run.regressions.copy();
+    let coverage = run.coverage.copy();
+    let mut summary = RunReport {
+        status: RunStatus::Passed,
+        cases: 0,
+        generated: 0,
+        regressions: 0,
+        discarded: 0,
+        labels: Vec::new(),
+        discard_reasons: Vec::new(),
+        failure: Option::None,
+        replay: Option::None,
+        message: "",
+        shrink_work: 0,
+        shrink_limited: false,
+    };
+    let failures = Vec::new();
+    let distributions = Distributions::new(options.max_histogram_buckets);
+    let mut seed = config.seed;
+    let mut accepted = 0;
+    let mut attempts = 0;
+    let mut completed = true;
+    let mut stop_reason = "";
+    while summary.regressions < regressions.len() || accepted < config.cases {
+        let regression = summary.regressions < regressions.len();
+        let entry = if regression {
+            let entry = regressions[summary.regressions];
+            summary.regressions += 1;
+            entry
+        } else {
+            let entry = Replay { seed, size: config.size };
+            seed = rand::next_u64(seed);
+            summary.generated += 1;
+            entry
+        };
+        let sample = strategy.generate(entry.seed, entry.size)?;
+        let observation = property(sample.value);
+        let result = observation.case;
+        match result.verdict {
+            Discard(reason) => {
+                summary.discarded += 1;
+                increment_count(summary.discard_reasons, reason);
+                if summary.discarded > run.max_discards {
+                    completed = false;
+                    stop_reason = "property exhausted its discard budget";
+                    if failures.is_empty() {
+                        summary.status = RunStatus::Rejected;
+                        summary.message = stop_reason;
+                    }
+                    break
+                }
+            },
+            _ => {
+                distributions.record(observation.values)?;
+                summary.cases += 1;
+                if !regression {
+                    accepted += 1;
+                }
+                let seen: HashMap[string, bool] = HashMap::new();
+                for name in result.labels {
+                    if seen.get(name).is_none() {
+                        seen.set(name, true);
+                        increment_count(summary.labels, name);
+                    }
+                }
+                if let Fail(message) = result.verdict {
+                    let remaining = RunOptions {
+                        config: Config { max_shrinks: config.max_shrinks - attempts, ..config },
+                        max_shrink_work: run.max_shrink_work - summary.shrink_work,
+                        ..run,
+                    };
+                    let shrunk = shrink_failure(
+                        sample,
+                        entry.seed,
+                        summary.generated + summary.regressions - 1,
+                        message,
+                        remaining,
+                        |value| property(value).case,
+                    );
+                    summary.status = RunStatus::Failed;
+                    summary.shrink_work += shrunk.work;
+                    summary.shrink_limited = summary.shrink_limited || shrunk.limited;
+                    attempts += shrunk.failure.attempts;
+                    if failures.is_empty() {
+                        summary.failure = Option::Some(shrunk.failure);
+                        summary.replay = Option::Some(entry);
+                        summary.message = shrunk.message;
+                    }
+                    failures.push(
+                        Counterexample {
+                            failure: shrunk.failure,
+                            replay: entry,
+                            message: shrunk.message,
+                            shrink_work: shrunk.work,
+                            shrink_limited: shrunk.limited,
+                        },
+                    );
+                    if failures.len() >= options.max_failures {
+                        completed = summary.regressions == regressions.len()
+                            && accepted == config.cases;
+                        if !completed {
+                            stop_reason = "campaign reached its failure limit";
+                        }
+                        break
+                    }
+                }
+            },
+        }
+    }
+    if summary.status == RunStatus::Passed {
+        for requirement in coverage {
+            let minimum = summary.cases / 100 * requirement.minimum_percent
+                + (summary.cases % 100 * requirement.minimum_percent + 99) / 100;
+            if label_count(summary.labels, requirement.label) < minimum
+                || summary.cases == 0 && requirement.minimum_percent > 0 {
+                summary.status = RunStatus::Rejected;
+                summary.message = f"coverage requirement not met: {requirement.label} needs {requirement.minimum_percent}%";
+                break
+            }
+        }
+    }
+    Result::Ok(
+        CampaignReport {
+            summary,
+            failures,
+            histograms: distributions.values,
+            completed,
+            stop_reason,
+        },
+    )
+}

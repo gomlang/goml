@@ -1,0 +1,302 @@
+package cli;
+
+#[comptime_derive]
+fn is_container(ty: MetaType, name: string) -> bool {
+    meta_type_kind(ty) == "application" && meta_type_argument_count(ty) == 1
+        && meta_type_equal(
+            ty,
+            meta_type_apply(meta_type_call_site(name), types_one(meta_type_argument(ty, 0))),
+        )
+}
+
+#[comptime_derive]
+fn validate_value_modes(input: DeriveInput, field: isize) -> () {
+    let optional = field_switch(input, field, "optional");
+    let multiple = field_switch(input, field, "multiple");
+    let count = field_switch(input, field, "count");
+    if (optional && multiple) || (count && (optional || multiple)) {
+        compile_error("CLI optional, multiple and count modes are mutually exclusive")
+    }
+    if optional && field_switch(input, field, "required") {
+        compile_error("CLI required and optional are mutually exclusive")
+    }
+    let ty = derive_field_type(input, field);
+    if optional && !is_container(ty, "Option") {
+        compile_error("CLI optional fields must have type Option[T]")
+    }
+    if multiple && !is_container(ty, "Vec") {
+        compile_error("CLI multiple fields must have type Vec[T]")
+    }
+}
+
+#[comptime_derive]
+fn validate_composed_field(input: DeriveInput, field: isize, flatten: bool) -> () {
+    for index in 0..derive_field_attribute_count(input, field) {
+        let attribute = derive_field_attribute(input, field, index);
+        if meta_attribute_name(attribute) != "arg" {
+            continue;
+        }
+        let mut cursor = attribute_start(attribute);
+        while cursor < meta_attribute_text(attribute).byte_len() {
+            let current = attribute_next(attribute, cursor);
+            if current.0 == "" {
+                break;
+            }
+            let name = current.0;
+            if current.2 || (flatten && name != "flatten")
+                || (!flatten && name != "subcommand" && name != "required" && name != "optional") {
+                compile_error(
+                    "flatten and subcommand fields cannot use ordinary argument attributes",
+                )
+            }
+            cursor = current.3;
+        }
+    }
+    let ty = derive_field_type(input, field);
+    if flatten && (is_container(ty, "Option") || is_container(ty, "Vec")) {
+        compile_error("flatten requires an Args type, not Option or Vec")
+    }
+    if !flatten && is_container(ty, "Vec") {
+        compile_error("subcommand fields cannot have type Vec[T]")
+    }
+    if field_switch(input, field, "optional") {
+        if !is_container(ty, "Option") {
+            compile_error("optional subcommand fields must have type Option[T]")
+        }
+        if field_switch(input, field, "required") {
+            compile_error("CLI required and optional are mutually exclusive")
+        }
+    }
+}
+
+#[comptime_derive]
+fn typed_schema_expression(input: DeriveInput, block: MetaBlock, ty: MetaType, function: string) -> MetaExpr {
+    let name = derive_fresh_name(input, "cli_nested_schema");
+    meta_block_let_typed(
+        block,
+        name,
+        meta_type_apply(meta_type_named(input, "TypedCommand"), types_one(ty)),
+        meta_expr_call(input, function, meta_expr_list_new()),
+    );
+    meta_expr_field(meta_expr_var(name), "command")
+}
+
+#[comptime_derive]
+fn subcommand_attribute(input: DeriveInput, variant: isize, key: string, fallback: string) -> string {
+    let mut result = fallback;
+    for index in 0..derive_variant_attribute_count(input, variant) {
+        let attribute = derive_variant_attribute(input, variant, index);
+        if meta_attribute_name(attribute) == "command" {
+            result = attribute_value(attribute, key, result);
+        }
+    }
+    result
+}
+
+#[comptime_derive]
+fn subcommand_has_attribute(input: DeriveInput, variant: isize, key: string) -> bool {
+    for index in 0..derive_variant_attribute_count(input, variant) {
+        let attribute = derive_variant_attribute(input, variant, index);
+        if meta_attribute_name(attribute) == "command" && attribute_has(attribute, key, true) {
+            return true
+        }
+    }
+    false
+}
+
+#[comptime_derive]
+fn valid_derive_name(name: string) -> bool {
+    if name.byte_len() == 0 || name.byte_get(0) == b'-' {
+        return false
+    }
+    for index in 0..name.byte_len() {
+        let value = name.byte_get(index);
+        if !((value >= b'a' && value <= b'z') || (value >= b'A' && value <= b'Z')
+            || (value >= b'0' && value <= b'9')
+            || value == b'-'
+            || value == b'_') {
+            return false
+        }
+    }
+    true
+}
+
+#[comptime_derive]
+fn validate_subcommand_variant(input: DeriveInput, variant: isize) -> () {
+    let kind = derive_variant_kind(input, variant);
+    if kind != 0 && (kind != 1 || derive_variant_field_count(input, variant) != 1) {
+        compile_error("Subcommands variants must be unit variants or carry exactly one Args value")
+    }
+    for index in 0..derive_variant_attribute_count(input, variant) {
+        let attribute = derive_variant_attribute(input, variant, index);
+        if meta_attribute_name(attribute) != "command" {
+            continue;
+        }
+        validate_attribute_syntax(attribute);
+        let mut cursor = attribute_start(attribute);
+        while cursor < meta_attribute_text(attribute).byte_len() {
+            let current = attribute_next(attribute, cursor);
+            if current.0 == "" {
+                break;
+            }
+            let key = current.0;
+            if !current.2 {
+                compile_error("subcommand attributes require named string values")
+            }
+            if key != "name" && key != "alias" && key != "about" && key != "version" {
+                compile_error("unknown subcommand attribute: " + key)
+            }
+            cursor = current.3;
+        }
+    }
+    let name = subcommand_attribute(
+        input,
+        variant,
+        "name",
+        lower_variant(derive_variant_name(input, variant)),
+    );
+    let alias = subcommand_attribute(input, variant, "alias", "");
+    if !valid_derive_name(name)
+        || (subcommand_has_attribute(input, variant, "alias") && !valid_derive_name(alias))
+        || name == alias {
+        compile_error("invalid subcommand name or alias")
+    }
+    for previous in 0..variant {
+        let prior_name = subcommand_attribute(
+            input,
+            previous,
+            "name",
+            lower_variant(derive_variant_name(input, previous)),
+        );
+        let prior_alias = subcommand_attribute(input, previous, "alias", "");
+        if name == prior_name || name == prior_alias
+            || (alias != "" && (alias == prior_name || alias == prior_alias)) {
+            compile_error("duplicate subcommand name or alias")
+        }
+    }
+}
+
+#[comptime_derive(Subcommands)]
+pub fn derive_subcommands(input: DeriveInput) -> DeriveOutput {
+    if derive_item_kind(input) != 1 || derive_variant_count(input) == 0 {
+        compile_error("Subcommands derive requires a nonempty enum")
+    }
+    for index in 0..derive_attribute_count(input) {
+        if meta_attribute_name(derive_attribute(input, index)) == "command" {
+            compile_error("Subcommands command attributes belong on variants")
+        }
+    }
+    let output = derive_output_new(input, "Subcommands");
+    let schema = meta_block_new();
+    let command_name = derive_fresh_name(input, "cli_commands");
+    meta_block_let_mut(
+        schema,
+        command_name,
+        meta_expr_call(input, "command", args_one(meta_expr_string(derive_item_name(input)))),
+    );
+    let arms = meta_arm_list_new();
+    for variant in 0..derive_variant_count(input) {
+        validate_subcommand_variant(input, variant);
+        let name = subcommand_attribute(
+            input,
+            variant,
+            "name",
+            lower_variant(derive_variant_name(input, variant)),
+        );
+        let alias = subcommand_attribute(input, variant, "alias", "");
+        let unit = derive_variant_kind(input, variant) == 0;
+        let constructor_args = meta_expr_list_new();
+        let mut child = if unit {
+            meta_expr_call(input, "command", args_one(meta_expr_string(name)))
+        } else {
+            let ty = derive_variant_field_type(input, variant, 0);
+            derive_output_add_predicate(output, ty, "Args");
+            meta_expr_list_push(
+                constructor_args,
+                meta_expr_try(
+                    meta_expr_call(input, "decode_args", args_one(meta_expr_var("matches"))),
+                ),
+            );
+            typed_schema_expression(input, schema, ty, "command_for")
+        };
+        child = meta_expr_method_call(child, "named", args_one(meta_expr_string(name)));
+        if alias != "" {
+            child = meta_expr_method_call(child, "alias", args_one(meta_expr_string(alias)));
+        }
+        if subcommand_has_attribute(input, variant, "about") {
+            child = meta_expr_method_call(
+                child,
+                "about",
+                args_one(meta_expr_string(subcommand_attribute(input, variant, "about", ""))),
+            );
+        }
+        if subcommand_has_attribute(input, variant, "version") {
+            child = meta_expr_method_call(
+                child,
+                "version",
+                args_one(meta_expr_string(subcommand_attribute(input, variant, "version", ""))),
+            );
+        }
+        meta_block_assign(
+            schema,
+            meta_expr_var(command_name),
+            meta_expr_method_call(meta_expr_var(command_name), "subcommand", args_one(child)),
+        );
+        let value = meta_expr_target_constructor(
+            input,
+            derive_variant_name(input, variant),
+            constructor_args,
+        );
+        meta_arm_list_push(
+            arms,
+            meta_arm(
+                meta_pattern_string(name),
+                meta_expr_constructor("Result::Ok", args_one(value)),
+            ),
+        );
+    }
+    meta_arm_list_push(
+        arms,
+        meta_arm(
+            meta_pattern_wild(),
+            meta_expr_constructor(
+                "Result::Err",
+                args_one(
+                    meta_expr_method_call(
+                        meta_expr_var("matches"),
+                        "unrecognized_subcommand",
+                        meta_expr_list_new(),
+                    ),
+                ),
+            ),
+        ),
+    );
+    let typed_fields = meta_expr_field_list_new();
+    meta_expr_field_list_push(typed_fields, "command", meta_expr_var(command_name));
+    derive_output_add_method(
+        output,
+        meta_method(
+            "schema",
+            meta_param_list_new(),
+            meta_type_apply(
+                meta_type_named(input, "TypedCommand"),
+                types_one(derive_target_type(input)),
+            ),
+            meta_block_finish(schema, meta_expr_struct(input, "TypedCommand", typed_fields)),
+        ),
+    );
+    let parameters = meta_param_list_new();
+    meta_param_list_push(parameters, "matches", meta_type_named(input, "Matches"));
+    let result_types = types_one(derive_target_type(input));
+    meta_type_list_push(result_types, meta_type_named(input, "Error"));
+    derive_output_add_method(
+        output,
+        meta_method(
+            "from_subcommand",
+            parameters,
+            meta_type_apply(meta_type_call_site("Result"), result_types),
+            meta_expr_match(meta_expr_field(meta_expr_var("matches"), "command"), arms),
+        ),
+    );
+    output
+}

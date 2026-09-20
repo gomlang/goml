@@ -2,7 +2,8 @@
 
 A reusable GoML toolkit for language servers and LSP peers: bounded streaming
 frames, validated JSON-RPC messages, typed handler registration, request tracking,
-document synchronization, UTF-16 coordinates and synchronous or deferred dispatch.
+document synchronization, negotiated UTF-8/UTF-16/UTF-32 coordinates and synchronous
+or deferred dispatch.
 The compiler's internal LSP implementation is not imported.
 
 The wire profile targets [LSP 3.17](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/)
@@ -16,8 +17,8 @@ coverage of every optional LSP feature or generated protocol type.
 | --- | --- |
 | Framing | `FrameLimits`, `FrameDecoder`, `frame_body`, `frame` |
 | Messages | `Id`, `Message`, `RpcError`, `decode`, `decode_value`, `encode`, `encode_value` |
-| Documents | `Position`, `Range`, `TextEdit`, `Change`, `Document`, `Documents`, `utf16_length` |
-| Requests | `Session`, `RequestToken`, `Completed` |
+| Documents | `PositionEncoding`, `Position`, `Range`, `TextEdit`, `Change`, `Document`, `Documents`, `utf16_length` |
+| Requests | `Session`, `RequestToken`, `Completed`, `ExpiredRequest` |
 | Dispatch | `RequestContext`, `Router`, `Server`, `Phase`, `Event`, `Dispatch`, `PendingRequest` |
 | Feature helpers | `DocumentPosition`, `Location`, `Diagnostic`, `publish_diagnostics`, `hover`, `progress` |
 | Standard I/O | `Stdio::new`, `read_body`, `write` |
@@ -67,22 +68,29 @@ or outgoing messages.
 ## Documents and edits
 
 `Document` is an immutable snapshot with URI, language ID, version, source string
-and a standard-library line index. `position(byte_offset)` and `offset(position)`
-convert checked UTF-8 boundaries and UTF-16 coordinates. LF, CRLF, lone CR and
-trailing empty lines are supported. Columns beyond line content clamp to its end;
-negative/out-of-range lines and positions within a surrogate pair are rejected.
-Offsets inside line terminators map to the preceding line end.
+and a persistent rope. `Document::new` and `Documents::new` default to UTF-16;
+`new_with_encoding` selects `PositionEncoding::Utf8`, `Utf16` or `Utf32` explicitly.
+`encoding()` reports that selection. `position(byte_offset)` and `offset(position)`
+convert checked UTF-8 boundaries to and from the snapshot's selected coordinate
+units: UTF-8 bytes, UTF-16 code units or UTF-32 Unicode scalars. LF, CRLF, lone CR
+and trailing empty lines are supported. Columns beyond line content clamp to its
+end; negative/out-of-range lines and positions inside a UTF-8 scalar or UTF-16
+surrogate pair are rejected. Offsets inside line terminators map to the preceding
+line end. `PositionEncoding.length(text)` measures text in the corresponding
+units; `utf16_length` remains available for explicitly UTF-16 computations.
 
 `Document.changed(version, changes, max_bytes)` applies full and incremental
 changes sequentially: each range addresses the result of the previous change.
-Optional deprecated `rangeLength` is checked against the replaced UTF-16 length.
+Optional deprecated `rangeLength` is checked against the replaced length in the
+snapshot encoding, including intervening line terminators.
 Versions must increase, but need not be consecutive. Invalid ranges, oversized
 results and invalid versions return errors.
 
 `Documents` stores open snapshots by exact URI string and enforces document-count
 and per-document byte limits. `open` rejects duplicate opens, `change` commits
 only after the entire batch succeeds, and `close` returns the removed snapshot.
-Failures leave the stored text/version unchanged. `synchronize` decodes and
+Failures leave the stored text/version unchanged. `open` adopts the store encoding
+for its stored snapshot without changing the supplied snapshot. `synchronize` decodes and
 handles didOpen/didChange/didClose parameters; other methods return `false`.
 URIs are opaque identifiers; file access and URI normalization belong to callers.
 
@@ -109,8 +117,28 @@ Outgoing `request` registration is separate from incoming requests, so each peer
 can use the same ID independently. `receive` correlates replies and rejects
 duplicates/unexpected IDs. `cancel_outgoing` retains the pending request while
 creating a cancellation notification; `expire` removes it and creates that
-notification. Applications schedule their own timeouts and send the returned
-messages. Late responses after expiry are recoverable errors.
+notification. `request_with_timeout(id, method, params, Some(duration))` additionally
+registers a monotonic deadline starting when registration succeeds, including any
+later transport delay. `None` preserves the untimed `request` behavior. Deadline
+storage is bounded by the outgoing pending limit, with one deadline per request.
+Invalid messages, duplicate IDs and capacity failures leave registration unchanged.
+Cancellation retains the deadline; manual `expire`, receipt and `close` remove it.
+Late responses after expiry are recoverable errors.
+
+`Session.next_outgoing_timeout()` returns the shortest remaining duration, or
+`None` without timed outgoing work. `poll_outgoing_timeouts()` removes each due
+request exactly once and returns `ExpiredRequest { completed, cancellation }`.
+The local completion carries the original ID/method and RequestFailed (-32803);
+the cancellation is a `$/cancelRequest` notification to send to the peer. If a
+response is received after its deadline but before polling, `receive` instead
+returns that local timeout completion and consumes the response; no cancellation
+is needed for a reply already received. An earlier response removes its deadline
+and wins normally, including a successful result after cooperative cancellation.
+
+No request IDs are reserved permanently. Applications must not reuse an expired
+outgoing ID while a reply to the old request might still arrive: JSON-RPC responses
+carry only IDs, so such replies cannot be distinguished from replies to reused IDs.
+Incoming token identity protection remains independent of this wire limitation.
 
 `Router.on_raw_request` registers a dynamic handler. `on_request[P, R]` uses
 `std::serde::Deserialize` and `Serialize` for typed parameters/results, including
@@ -121,8 +149,20 @@ wire responses. Duplicate handler registration is an error; unknown
 notifications are ignored and missing request handlers return -32601.
 
 `Server` combines these layers. Initialize parameters must contain an object
-`capabilities`; the server supplies UTF-16 and incremental document-sync
-capabilities plus caller-supplied capabilities. Its phases are New,
+`capabilities`; the server supplies negotiated position encoding and incremental
+document-sync capabilities plus caller-supplied capabilities. It selects the first
+supported entry in `capabilities.general.positionEncodings`. Unknown strings are
+ignored; absent, empty or unknown-only lists fall back to mandatory UTF-16.
+Malformed lists or non-string entries fail initialization without changing phase
+or document encoding, allowing a valid retry. This follows the
+[LSP 3.17 negotiation contract](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#clientCapabilities).
+`Server::new` supports all three encodings. `Server::new_with_encodings` restricts
+that set and requires UTF-16; it copies the supplied vector. The negotiated value
+is returned as `capabilities.positionEncoding` and exposed by
+`Server.position_encoding()`. Initialization updates the store and its existing
+snapshots atomically; previously captured snapshots keep their own encoding.
+Subsequent synchronization, ranges, positions and edits use the same encoding.
+Its phases are New,
 AwaitInitialized, Running, Shutdown and Exited. The initialized notification
 enables normal request dispatch; earlier ordinary requests return -32002.
 Shutdown returns null and subsequent requests fail. Exit reports status 0 after
@@ -154,12 +194,20 @@ should be captured before scheduling work when it needs a fixed source version.
 successful partial result after client cancellation, as the protocol allows.
 
 `accept_with_timeout(message, Some(duration))` adds a total deadline for deferred
-work. `next_timeout()` gives the shortest remaining duration for an event-loop
-timer. Call `poll_timeouts()` when it fires and send every returned response.
+work. `next_timeout()` gives the shortest remaining duration across incoming and
+outgoing deadlines for an event-loop timer. When it fires, call `poll_timeouts()`
+and send every returned incoming response; also call `poll_outgoing_timeouts()`,
+deliver each local completion and send each cancellation notification. Both polls
+are non-blocking and require the same owning event loop as normal dispatch.
+Recompute `next_timeout()` after registration, response receipt, expiry and either
+poll; `None` means no timer is needed. A zero duration is immediately due.
 Expired requests finish once with RequestFailed (-32803); late completions are
 rejected, including after an ID is reused. `complete` and `execute` also check
 deadlines, so an overdue result cannot bypass a delayed timer poll. No timer or
-worker goroutine is created. Built-in immediate methods do not receive deadlines.
+worker goroutine is created. The application must arrange a timer wakeup even when
+no input arrives; polling only after reading messages cannot enforce prompt idle
+timeouts. The stdio consumer uses an explicit `test/poll` notification for its
+protocol deadline fixtures. Built-in immediate methods do not receive deadlines.
 
 Shutdown stops accepting ordinary work while allowing already accepted requests
 to finish. Exit invalidates remaining requests, clears deadline tracking and
@@ -177,8 +225,8 @@ tasks should receive immutable inputs and return results to that loop. This libr
 provide a worker pool, timer scheduler or synchronization for concurrent mutation.
 
 Documents use `ecosystem::rope` persistent text storage. Edits share unchanged
-tree nodes with previous snapshots, and UTF-16 coordinates use cached subtree
-counts. `content()` and `apply_edits()` explicitly materialize their string
+tree nodes with previous snapshots, and encoding conversions use cached subtree
+byte, UTF-16 and scalar counts. `content()` and `apply_edits()` explicitly materialize their string
 results; incremental document changes retain the tree representation. Existing
 CRLF clamping, surrogate rejection, size limits and transactional updates remain
 part of the document API.
@@ -203,8 +251,13 @@ Document tests cover transactional rollback, original-coordinate edits, Unicode
 boundaries and source snapshot independence. Typed dispatch is tested in the
 library and its separate consumer.
 
-The independent Python client uses its own JSON framing and UTF-16 encoding
-oracle. It checks 708 replies, 431 Unicode positions, 30 document-change
-sequences, hover/typed dispatch, lifecycle ordering and termination behavior
-through an actual GoML subprocess. This is targeted interoperability coverage,
-not certification against the entire LSP specification.
+The library runs 19 tests and its separate consumer runs 3. The independent Python
+client uses its own JSON framing and Unicode encoding oracle. The original
+UTF-16 suite checks 708 replies, 431 Unicode positions and 30 document-change
+sequences. The negotiation suite adds 4,768 UTF-8/16/32 positions and invalid
+boundaries, 48 transactional change sequences, CRLF split across rope chunks,
+unknown encodings and malformed-initialize retries. Its outgoing request suite
+checks actual cancellation/completion messages, early and overdue responses,
+explicit timer polling, duplicate suppression and exit cleanup through a GoML
+subprocess. This is targeted interoperability coverage, not certification against
+the entire LSP specification.

@@ -118,6 +118,7 @@ pub struct Document {
     language_value: string,
     version_value: isize,
     text_value: rope::Rope,
+    encoding_value: PositionEncoding,
 }
 
 impl Document {
@@ -125,6 +126,16 @@ impl Document {
         Document,
         RpcError,
     ] {
+        Document::new_with_encoding(uri, language_id, version, content, PositionEncoding::Utf16)
+    }
+
+    pub fn new_with_encoding(
+        uri: string,
+        language_id: string,
+        version: isize,
+        content: string,
+        encoding: PositionEncoding,
+    ) -> Result[Document, RpcError] {
         let _ = integer(json::Value::Number(version.to_string()))?;
         if uri == "" {
             return Result::Err(invalid("document URI must not be empty"))
@@ -134,11 +145,28 @@ impl Document {
                 uri_value: uri,
                 language_value: language_id,
                 version_value: version,
+                encoding_value: encoding,
                 text_value: rope::Rope::from_string(content).map_err(
                     |error| invalid(error.to_string()),
                 )?,
             },
         )
+    }
+
+    pub fn encoding(self: Document) -> PositionEncoding {
+        self.encoding_value
+    }
+
+    fn units(self: Document, offset: isize) -> Result[isize, RpcError] {
+        match self.encoding_value {
+            Utf8 => Result::Ok(offset),
+            Utf16 => self.text_value.byte_to_utf16(offset).map_err(
+                |error| invalid(error.to_string()),
+            ),
+            Utf32 => self.text_value.byte_to_scalar(offset).map_err(
+                |error| invalid(error.to_string()),
+            ),
+        }
     }
 
     pub fn uri(self: Document) -> string {
@@ -175,10 +203,8 @@ impl Document {
         } else {
             offset
         };
-        let first = self.text_value.byte_to_utf16(start).map_err(|error| invalid(error.to_string()))?;
-        let current = self.text_value.byte_to_utf16(clamped).map_err(
-            |error| invalid(error.to_string()),
-        )?;
+        let first = self.units(start)?;
+        let current = self.units(clamped)?;
         Result::Ok(Position { line, character: current - first })
     }
 
@@ -191,14 +217,25 @@ impl Document {
         let (start, end) = self.text_value.line_bounds(position.line, false).map_err(
             |error| invalid(error.to_string()),
         )?;
-        let first = self.text_value.byte_to_utf16(start).map_err(|error| invalid(error.to_string()))?;
-        let last = self.text_value.byte_to_utf16(end).map_err(|error| invalid(error.to_string()))?;
+        let first = self.units(start)?;
+        let last = self.units(end)?;
         if position.character >= last - first {
             return Result::Ok(end)
         }
-        self.text_value.utf16_to_byte(first + position.character).map_err(
-            |_| invalid("position splits a UTF-16 surrogate pair"),
-        )
+        let index = first + position.character;
+        match self.encoding_value {
+            Utf8 => if self.text_value.is_char_boundary(index) {
+                Result::Ok(index)
+            } else {
+                Result::Err(invalid("position splits a UTF-8 scalar"))
+            },
+            Utf16 => self.text_value.utf16_to_byte(index).map_err(
+                |_| invalid("position splits a UTF-16 surrogate pair"),
+            ),
+            Utf32 => self.text_value.scalar_to_byte(index).map_err(
+                |error| invalid(error.to_string()),
+            ),
+        }
     }
 
     pub fn offsets(self: Document, range: Range) -> Result[(isize, isize), RpcError] {
@@ -233,15 +270,12 @@ impl Document {
                 None => (0, result.text_value.len_bytes()),
             };
             if let Some(expected) = change.range_length {
-                if change.range.is_none()
-                    || expected
-                        != result.text_value.byte_to_utf16(end).map_err(
-                            |error| invalid(error.to_string()),
-                        )?
-                            - result.text_value.byte_to_utf16(start).map_err(
-                                |error| invalid(error.to_string()),
-                            )? {
-                    return Result::Err(invalid("rangeLength does not match replaced UTF-16 length"))
+                if change.range.is_none() || expected != result.units(end)? - result.units(start)? {
+                    return Result::Err(
+                        invalid(
+                            "rangeLength does not match replaced length in the negotiated encoding",
+                        ),
+                    )
                 }
             }
             if result.text_value.len_bytes() - (end - start) > max_bytes
@@ -316,16 +350,42 @@ pub fn utf16_length(value: string) -> isize {
 
 pub struct Documents {
     values: HashMap[string, Document],
+    encoding_value: Ref[PositionEncoding],
     max_documents: isize,
     max_bytes: isize,
 }
 
 impl Documents {
     pub fn new(max_documents: isize, max_bytes: isize) -> Result[Documents, RpcError] {
+        Documents::new_with_encoding(max_documents, max_bytes, PositionEncoding::Utf16)
+    }
+
+    pub fn new_with_encoding(max_documents: isize, max_bytes: isize, encoding: PositionEncoding) -> Result[
+        Documents,
+        RpcError,
+    ] {
         if max_documents < 0 || max_bytes < 0 {
             return Result::Err(invalid("invalid document limits"))
         }
-        Result::Ok(Documents { values: HashMap::new(), max_documents, max_bytes })
+        Result::Ok(
+            Documents {
+                values: HashMap::new(),
+                encoding_value: Ref::new(encoding),
+                max_documents,
+                max_bytes,
+            },
+        )
+    }
+
+    pub fn encoding(self: Documents) -> PositionEncoding {
+        self.encoding_value.get()
+    }
+
+    fn select_encoding(self: Documents, encoding: PositionEncoding) -> () {
+        self.encoding_value.set(encoding);
+        for (uri, document) in self.values.entries() {
+            self.values.set(uri, Document { encoding_value: encoding, ..document });
+        }
     }
 
     pub fn len(self: Documents) -> isize {
@@ -343,7 +403,7 @@ impl Documents {
         if self.values.len() >= self.max_documents || document.content().byte_len() > self.max_bytes {
             return Result::Err(invalid("document limit exceeded"))
         }
-        self.values.set(document.uri(), document);
+        self.values.set(document.uri(), Document { encoding_value: self.encoding(), ..document });
         Result::Ok(())
     }
 

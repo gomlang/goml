@@ -67,8 +67,9 @@ An impossible uniqueness/precondition requirement returns an error instead of
 looping. `stateful` takes `initial: () -> M`, `command: (M) -> Generator[C]` and
 `transition: (M, C) -> Result[M, string]`. A rejected transition discards that draw.
 Shrinks replay transitions from a fresh initial model and reject invalid command
-prefixes. Transitions must be pure; application execution and reset belong in the
-property. Keys and shared values must not mutate during generation or shrinking.
+prefixes. Transitions must be pure. Application execution and reset can use the
+`StateMachine` helper described below or be implemented in the property. Keys
+and shared values must not mutate during generation or shrinking.
 
 `float64s` mixes explicit IEEE edge cases with random 64-bit payloads. Nonfinite
 values and negative zero shrink to positive zero. Finite values retain the
@@ -131,6 +132,92 @@ and fresh accepted cases, and round the required count upward. Discarded cases
 are excluded. Unmet coverage, including a positive requirement with no accepted
 cases, returns `Rejected` with a diagnostic.
 
+## Campaigns, distributions and failure aggregation
+
+`run_campaign(strategy, CampaignOptions, property)` continues after failures and
+returns a `CampaignReport[T]`. The property returns an `Observation`, created by
+`Observation::new(case)` or `case.collect(name, value)`:
+
+```goml
+let campaign = proptest::run_campaign(
+    values,
+    proptest::CampaignOptions::new(42),
+    |value: isize| {
+        proptest::Case::pass()
+            .classify(value == 0, "zero")
+            .collect("sign", if value < 0 { "negative" } else { "nonnegative" })
+    },
+)?;
+let rendered = campaign.render(|value| value.to_string(), 24)?;
+```
+
+`CampaignOptions.run` contains the compatible `RunOptions`. `max_failures`
+defaults to 10 and must be between 1 and 10,000. The limit counts failing initial
+evaluations, including saved regressions; failures are not deduplicated by error
+message. Every retained `Counterexample` contains its `Failure`, exact `Replay`,
+final message, shrink work and whether shrinking reached a limit. Shrink attempt
+and work budgets are shared by the entire campaign. When they run out, further
+failing cases retain their initial value without expanding their shrink trees.
+
+`summary` retains the original `RunReport` shape and its first counterexample,
+with aggregate case/discard/label counts and shrink work. `completed` means all
+configured regressions and accepted fresh cases were evaluated; it does not
+mean the property passed. An early failure/discard limit sets `completed = false`
+and `stop_reason`. A discovered failure keeps the status `Failed` even if later
+discards exhaust the budget. Coverage is checked after a campaign without
+failures. Generator, configuration and observation errors return `Err`.
+The existing `run` and `check` retain their stop-at-first-failure behavior.
+
+`Observation.collect` attaches string-valued categorical distributions. Numeric
+values can use `to_string()` or application-selected bins. Histograms count only
+accepted initial evaluations, including failures and regressions. Shrinks and
+discards do not contribute. A distribution's denominator is the number of cases
+that observed it, allowing optional observations. Repeating the same name/value
+on a case counts once; conflicting values for one name return an error.
+Distributions and buckets preserve first-observed order.
+
+`max_histogram_buckets` bounds distinct `(name, value)` pairs across the campaign;
+it defaults to 1,024 and allows 0–10,000. Zero disables observations. Each case
+allows at most 10,000 observations, names must be nonempty, and both names and
+values are limited to 1,024 UTF-8 bytes. Exceeding these limits returns an error
+instead of silently dropping samples.
+
+`RunReport.render(format_value)`, `CampaignReport.render(format_value, width)`
+and `Histogram.render(width)` produce deterministic text with replay details,
+counterexamples, classifications, discard reasons, counts, integer percentages
+and histogram bars. Widths are 0–120. Labels, messages and rendered values are
+JSON-quoted to preserve Unicode and distinguish embedded line breaks. The value
+formatter supports types without `ToString`; its own work is caller-controlled.
+The percentage and bar calculations avoid integer multiplication overflow.
+
+## Executing state machines
+
+`StateMachine[M, S, C]` connects pure model transitions to a real system under
+test. Its constructor takes a command limit and five callbacks:
+
+| Callback | Contract |
+| --- | --- |
+| `setup: () -> Result[(M, S), string]` | Create a fresh model and system for every evaluation, including shrink candidates |
+| `transition: (M, C) -> Result[M, string]` | Compute the next model without changing the system; a rejected precondition discards the case |
+| `execute: (S, C) -> Result[(), string]` | Apply one command to the system; errors fail the case |
+| `invariant: (M, S) -> Result[(), string]` | Check the initial state and every successfully executed command |
+| `cleanup: (S) -> Result[(), string]` | Clean up exactly once after successful setup on every normal return path |
+
+`run(commands)` returns `MachineReport`; `check(commands)` returns its `Case`
+for direct use with `run`, `run_campaign` or the `stateful` generator. The report
+records the stage and zero-based step of a failure/discard, the count of commands
+whose execution returned successfully, and any cleanup error. An invariant
+failure includes the command that just executed in that count.
+
+The command limit allows 0–1,000,000. An over-limit sequence is discarded before
+setup. The helper snapshots the command vector, checks each transition before
+executing the command, and stops at the first failure or rejected precondition.
+Cleanup failures promote passing/discarded cases to failures; an existing error
+and its stage remain available alongside the cleanup error. Setup failures must
+clean up partially created resources within the setup callback. Callbacks must
+return normally: panics and nontermination are not caught, and model/command
+values with mutable internals still require a caller-defined isolation policy.
+
 ## Lazy shrinking and budgets
 
 `Sample::lazy(value, factory)` accepts `() -> Candidates[T]`.
@@ -176,6 +263,13 @@ functions use the same versioned text format. Corpora are limited to 10,000 entr
 and 1 MiB. Property IDs must be nonempty, trimmed, at most 1,024 bytes and contain
 no tab, newline or NUL. Full-width unsigned seeds are preserved.
 
+`run_campaign_persisted` performs the same workflow for campaigns and atomically
+saves every collected failure. `RegressionStore.save_all(entries)` merges and
+deduplicates an entire batch before replacing the file once. Invalid entries or
+an exceeded corpus limit leave the old file intact. It has the same external
+writer-coordination requirement as `save`. If generation or observation validation
+returns `Err` before a campaign produces its report, no new failures are saved.
+
 Store one property/generator version per file and keep the generator definition
 stable for replay. The corpus stores seeds and sizes, not arbitrary serialized
 minimal values; changing a generator can change what an old seed produces.
@@ -202,6 +296,11 @@ dependent invariants during shrinking, recursive data, valid Unicode, finite
 floats, invalid configurations and exact seed replay. The expanded suite also
 covers large vectors with tiny budgets, lazy composition, rejected shrink work,
 unique collections, stateful prefixes, IEEE edge cases, discard/coverage
-accounting, persistent replay and corruption preservation. A separate module
+accounting, persistent replay and corruption preservation. Campaign tests cover
+failure limits, shared shrink budgets, distribution cardinality, overflow-safe
+formatting and atomic multi-failure persistence. State-machine tests verify
+per-step checks, rejected preconditions, reset during shrinking and combined
+execution/cleanup errors. A separate module
 implements its own associated-type strategy and lazy shrink callbacks and uses
-the structured runner through a normally resolved dependency.
+the structured runner, campaigns and a custom model/system through a normally
+resolved dependency.
