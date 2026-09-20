@@ -1,0 +1,164 @@
+package main;
+
+use std::context;
+use std::ffi;
+use std::io;
+use std::io::{Read, Write};
+use std::net::tls;
+use std::task;
+use std::testing;
+use std::time;
+
+#[go_ffi("example.com/goml-tls-regression/native", "Start")]
+extern fn start(require_client: bool, stall: bool) -> u16;
+
+#[go_ffi("example.com/goml-tls-regression/native", "Certificate")]
+extern fn certificate() -> ffi::RawSlice[u8];
+
+#[go_ffi("example.com/goml-tls-regression/native", "PrivateKey")]
+extern fn private_key() -> ffi::RawSlice[u8];
+
+#[go_ffi("example.com/goml-tls-regression/native", "Stop")]
+extern fn stop() -> ();
+
+fn config() -> tls::ClientConfig {
+    tls::ClientConfig::new("localhost").with_ca_pem(
+        ffi::slice_to_vec_copy(certificate()).as_slice(),
+    ).with_alpn(Vec::from_array(["goml-test"]))
+}
+
+fn main() -> () {
+    defer stop();
+    let port = start(false, false);
+    testing::assert(tls::connect("127.0.0.1", port, tls::ClientConfig::new("localhost")).is_err());
+    let wrong = tls::ClientConfig::new("wrong.example").with_ca_pem(
+        ffi::slice_to_vec_copy(certificate()).as_slice(),
+    );
+    testing::assert(tls::connect("127.0.0.1", port, wrong).is_err());
+    testing::assert(
+        tls::connect(
+            "127.0.0.1",
+            port,
+            tls::ClientConfig::new("localhost").with_ca_pem("invalid".to_bytes().as_slice()),
+        ).is_err(),
+    );
+    testing::assert(
+        tls::connect("127.0.0.1", port, config().with_minimum_version(tls::Version::Tls13)).is_err(),
+    );
+    let stream = testing::expect_ok(
+        tls::connect("127.0.0.1", port, config()),
+        "verified TLS connect",
+    );
+    let info = testing::expect_ok(stream.connection_info(), "connection info");
+    testing::assert_eq(info.negotiated_protocol, "goml-test");
+    testing::expect_ok(stream.write_all("hello".to_bytes().as_slice()), "write TLS");
+    let buffer = Vec::from_array([0, 0, 0, 0, 0]);
+    testing::expect_ok(stream.read_exact(buffer.as_mut_slice()), "read TLS");
+    testing::assert(buffer == "hello".to_bytes());
+    testing::expect_ok(stream.close(), "close TLS");
+    testing::expect_ok(stream.close(), "idempotent close");
+    testing::assert(stream.read(buffer.as_mut_slice()).is_err());
+    let stream = testing::expect_ok(tls::connect("127.0.0.1", port, config()), "EOF stream");
+    stop();
+    testing::assert_eq(testing::expect_ok(stream.read(buffer.as_mut_slice()), "remote EOF"), 0);
+    let _ = stream.close();
+    println("verification and echo ok");
+    let port = start(true, false);
+    testing::assert(tls::connect("127.0.0.1", port, config()).is_err());
+    let mutual = config().with_client_certificate(
+        ffi::slice_to_vec_copy(certificate()).as_slice(),
+        ffi::slice_to_vec_copy(private_key()).as_slice(),
+    );
+    let stream = testing::expect_ok(tls::connect("127.0.0.1", port, mutual), "mutual TLS");
+    testing::expect_ok(
+        stream.write_all_with("hello".to_bytes().as_slice(), context::Context::background()),
+        "mutual write",
+    );
+    testing::expect_ok(
+        stream.read_exact_with(buffer.as_mut_slice(), context::Context::background()),
+        "mutual read",
+    );
+    testing::expect_ok(stream.close(), "mutual close");
+    println("mutual TLS ok");
+    let port = start(false, false);
+    let stream = testing::expect_ok(tls::connect("127.0.0.1", port, config()), "cancel stream");
+    context::with_timeout(
+        context::Context::background(),
+        time::Duration::from_milliseconds(20),
+        |ctx, _| {
+            let failure = testing::expect_err(
+                stream.read_with(buffer.as_mut_slice(), ctx),
+                "read deadline",
+            );
+            testing::assert_eq(failure.kind(), io::ErrorKind::TimedOut);
+        },
+    );
+    if stream.is_closed() {
+        testing::assert(stream.read(buffer.as_mut_slice()).is_err());
+    } else {
+        testing::expect_ok(
+            stream.write_all("hello".to_bytes().as_slice()),
+            "preflight timeout write",
+        );
+        testing::expect_ok(stream.read_exact(buffer.as_mut_slice()), "preflight timeout read");
+        testing::assert(buffer == "hello".to_bytes());
+        testing::expect_ok(stream.close(), "preflight timeout close");
+    }
+    let stream = testing::expect_ok(
+        tls::connect("127.0.0.1", port, config()),
+        "close wakeup stream",
+    );
+    context::with_cancel(
+        context::Context::background(),
+        |ctx, cancel| {
+            cancel.cancel();
+            let failure = testing::expect_err(
+                stream.read_with(buffer.as_mut_slice(), ctx),
+                "preflight cancellation",
+            );
+            testing::assert_eq(failure.kind(), io::ErrorKind::Interrupted);
+            testing::assert_eq(stream.is_closed(), false);
+        },
+    );
+    task::scope(
+        |scope| {
+            let ready: Channel[()] = Channel::new(0);
+            let reader = scope.spawn(
+                |_| {
+                    ready.send(());
+                    let failure = testing::expect_err(
+                        stream.read(buffer.as_mut_slice()),
+                        "local close",
+                    );
+                    failure.kind() == io::ErrorKind::BrokenPipe
+                },
+            );
+            let _ = ready.recv();
+            let _ = stream.close();
+            testing::assert_eq(reader.join(), true);
+        },
+    );
+    println("read cancellation and close wakeup ok");
+    let port = start(false, true);
+    context::with_timeout(
+        context::Context::background(),
+        time::Duration::from_milliseconds(20),
+        |ctx, _| {
+            let failure = testing::expect_err(
+                tls::connect_with("127.0.0.1", port, config(), ctx),
+                "handshake deadline",
+            );
+            testing::assert_eq(failure.kind(), io::ErrorKind::TimedOut);
+        },
+    );
+    let failure = testing::expect_err(
+        tls::connect(
+            "127.0.0.1",
+            port,
+            config().with_connect_timeout(time::Duration::from_milliseconds(20)),
+        ),
+        "configured handshake timeout",
+    );
+    testing::assert_eq(failure.kind(), io::ErrorKind::TimedOut);
+    println("handshake cancellation ok");
+}

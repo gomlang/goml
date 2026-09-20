@@ -1,0 +1,329 @@
+package main;
+
+use std::bytes;
+use std::context;
+use std::io;
+use std::io::{Read, Write, BufRead};
+use std::json;
+use std::net;
+use std::net::tls;
+use std::num;
+use std::num::{ToFloat, TryToInt};
+use std::serde;
+use std::serde::{Deserializer};
+use std::task;
+use std::testing;
+use std::time;
+use std::toml;
+
+struct ShortReader {
+    cursor: io::Cursor,
+}
+
+impl Read for ShortReader {
+    fn read(self: ShortReader, buffer: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.cursor.read(
+            buffer.sub(
+                0,
+                if buffer.len() < 2 {
+                    buffer.len()
+                } else {
+                    2
+                },
+            ),
+        )
+    }
+}
+
+struct FaultWriter {
+    cursor: io::Cursor,
+    calls: Ref[isize],
+}
+
+impl Write for FaultWriter {
+    fn write(self: FaultWriter, buffer: Slice[byte]) -> Result[isize, io::Error] {
+        let call = self.calls.get();
+        self.calls.set(call + 1);
+        if call == 1 {
+            Result::Err(
+                io::Error::new(io::ErrorKind::Other, "write", Option::None, Option::None, "retry"),
+            )
+        } else {
+            self.cursor.write(
+                buffer.sub(
+                    0,
+                    if buffer.len() < 2 {
+                        buffer.len()
+                    } else {
+                        2
+                    },
+                ),
+            )
+        }
+    }
+}
+
+struct InvalidStream {
+    count: isize,
+}
+
+impl Read for InvalidStream {
+    fn read(self: InvalidStream, buffer: MutSlice[byte]) -> Result[isize, io::Error] {
+        Result::Ok(self.count)
+    }
+}
+
+impl Write for InvalidStream {
+    fn write(self: InvalidStream, buffer: Slice[byte]) -> Result[isize, io::Error] {
+        Result::Ok(self.count)
+    }
+}
+
+fn check_io() -> () {
+    let source = bytes::Bytes::from_string("abc\ndef");
+    let cursor = io::Cursor::new(source);
+    let reader = testing::expect_ok(
+        io::BufReader::with_capacity(ShortReader { cursor }, 3),
+        "reader",
+    );
+    testing::assert_eq(testing::expect_ok(reader.read_line(4), "first line").unwrap_or(""), "abc\n");
+    testing::assert_eq(testing::expect_ok(reader.read_line(3), "last line").unwrap_or(""), "def");
+    testing::assert(testing::expect_ok(reader.read_line(8), "EOF").is_none());
+    testing::assert(reader.consume(1).is_err());
+    let short = ShortReader { cursor: io::Cursor::new(source) };
+    let destination = bytes::Bytes::from_vec(Vec::from_array([0, 0, 0]));
+    testing::expect_ok(short.read_exact(destination.as_mut_slice()), "short read exact");
+    testing::assert(destination.to_vec() == Vec::from_array([97, 98, 99]));
+    testing::assert(io::Cursor::new(source).read_to_end(6).is_err());
+    testing::assert_eq(
+        testing::expect_ok(io::Cursor::new(source).read_to_string(7), "bounded text"),
+        "abc\ndef",
+    );
+    let take = testing::expect_ok(io::Take::new(io::Cursor::new(source), 3), "take");
+    testing::assert_eq(testing::expect_ok(take.read_to_string(3), "limited read"), "abc");
+    testing::assert_eq(take.remaining(), 0);
+    let output = io::Cursor::new(bytes::Bytes::new());
+    let writer = testing::expect_ok(
+        io::BufWriter::with_capacity(FaultWriter { cursor: output, calls: Ref::new(0) }, 8),
+        "writer",
+    );
+    testing::expect_ok(
+        writer.write_all(bytes::Bytes::from_string("hello").as_slice()),
+        "buffer write",
+    );
+    testing::assert(writer.flush().is_err());
+    testing::assert_eq(writer.buffered_len(), 3);
+    testing::expect_ok(writer.flush(), "flush retry");
+    testing::assert(output.bytes().to_vec() == "hello".to_bytes());
+    let copied = io::Cursor::new(bytes::Bytes::new());
+    testing::assert_eq(testing::expect_ok(io::copy(io::Cursor::new(source), copied), "copy"), 7);
+    testing::assert(copied.bytes().to_vec() == source.to_vec());
+    for count in Vec::from_array([-1, 9]) {
+        testing::assert_eq(
+            testing::expect_err(
+                InvalidStream { count }.read_exact(destination.as_mut_slice()),
+                "invalid reader count",
+            ).kind(),
+            io::ErrorKind::InvalidData,
+        );
+        testing::assert_eq(
+            testing::expect_err(
+                InvalidStream { count }.write_all(destination.as_slice()),
+                "invalid writer count",
+            ).kind(),
+            io::ErrorKind::InvalidData,
+        );
+    }
+    testing::assert_eq(
+        testing::expect_err(
+            InvalidStream { count: 0 }.write_all(destination.as_slice()),
+            "zero writer",
+        ).kind(),
+        io::ErrorKind::WriteZero,
+    );
+    testing::assert_eq(
+        testing::expect_err(
+            io::Cursor::new(bytes::Bytes::from_vec(Vec::from_array([255]))).read_to_string(1),
+            "invalid UTF8",
+        ).kind(),
+        io::ErrorKind::InvalidData,
+    );
+    testing::assert(io::BufReader::with_capacity(cursor, 0).is_err());
+    testing::assert(io::Take::new(cursor, -1).is_err());
+    println("io ok")
+}
+
+fn check_numeric() -> () {
+    let unsigned: u64 = 18446744073709551615;
+    let signed: i64 = -9223372036854775807 - 1;
+    testing::assert_eq(unsigned.to_f64(), 18446744073709551616.0);
+    testing::assert_eq(signed.to_f64(), -9223372036854775808.0);
+    let tie: u64 = 9007199254740993;
+    testing::assert_eq(tie.to_f64(), 9007199254740992.0);
+    let tie32: u64 = 16777217;
+    let expected32: f32 = 16777216.0;
+    testing::assert_eq(tie32.to_f32(), expected32);
+    testing::assert_eq(testing::expect_ok((127.9).try_to_i8(), "truncate"), 127);
+    testing::assert((128.0).try_to_i8().is_err());
+    testing::assert((-1.0).try_to_u64().is_err());
+    testing::assert_eq(testing::expect_ok((-0.9).try_to_u64(), "truncate toward zero"), 0);
+    testing::assert((18446744073709551616.0).try_to_u64().is_err());
+    testing::assert_eq(
+        testing::expect_ok((-9223372036854775808.0).try_to_i64(), "signed minimum"),
+        signed,
+    );
+    testing::assert(float64_from_bits(9218868437227405312).try_to_i64().is_err());
+    testing::assert(float64_from_bits(9221120237041090561).try_to_i64().is_err());
+    testing::assert_eq(
+        testing::expect_ok(num::float_to_i64(2.5, num::Rounding::NearestEven), "even"),
+        2,
+    );
+    testing::assert_eq(
+        testing::expect_ok(num::float_to_i64(3.5, num::Rounding::NearestEven), "odd"),
+        4,
+    );
+    testing::assert_eq(
+        testing::expect_ok(num::float_to_i64(-2.5, num::Rounding::NearestAway), "away"),
+        -3,
+    );
+    testing::assert_eq(
+        testing::expect_ok(num::float_to_i64(-0.1, num::Rounding::Floor), "floor"),
+        -1,
+    );
+    println("numeric ok")
+}
+
+fn check_context() -> () {
+    let before = task::active_scope_count();
+    context::with_cancel(
+        context::Context::background(),
+        |parent, cancel| {
+            context::with_cancel(
+                parent,
+                |child, _| {
+                    cancel.cancel();
+                    let _ = child.done().recv();
+                    testing::assert(child.check().is_err());
+                },
+            );
+        },
+    );
+    context::with_timeout(
+        context::Context::background(),
+        time::Duration::zero(),
+        |ctx, _| {
+            testing::assert(ctx.check().is_err());
+            testing::assert(ctx.sleep(time::Duration::from_seconds(1)).is_err());
+            testing::assert(net::resolve_with("localhost", 80, ctx).is_err());
+        },
+    );
+    context::with_timeout(
+        context::Context::background(),
+        time::Duration::from_milliseconds(10),
+        |parent, _| {
+            context::with_timeout(
+                parent,
+                time::Duration::from_seconds(1),
+                |child, _| {
+                    let _ = child.done().recv();
+                    testing::assert_eq(
+                        testing::expect_some(child.error(), "deadline").to_string(),
+                        "deadline exceeded",
+                    );
+                },
+            );
+        },
+    );
+    context::with_timeout(
+        context::Context::background(),
+        time::Duration::from_milliseconds(1),
+        |ctx, cancel| {
+            cancel.cancel();
+            cancel.cancel();
+            time::sleep(time::Duration::from_milliseconds(3));
+            testing::assert_eq(
+                testing::expect_some(ctx.error(), "first cause").to_string(),
+                "operation cancelled",
+            );
+        },
+    );
+    testing::assert_eq(task::active_scope_count(), before);
+    println("context ok")
+}
+
+fn check_serde() -> () {
+    let data = Vec::from_array([0, 255, 7]);
+    let value = serde::Value::Map(
+        Vec::from_array(
+            [
+                (serde::Value::Int(42), serde::Value::Binary(data)),
+                (serde::Value::String("extension"), serde::Value::Extension { tag: -1, data }),
+            ],
+        ),
+    );
+    let copied = testing::expect_ok(serde::to_value(value), "dynamic roundtrip");
+    let decoder = serde::value_deserializer(copied);
+    testing::assert_eq(testing::expect_ok(decoder.begin_map(), "map").unwrap_or(-1), 2);
+    testing::assert(testing::expect_ok(decoder.next_map_entry(), "first entry"));
+    testing::expect_ok(decoder.begin_map_key(), "key");
+    testing::assert_eq(testing::expect_ok(decoder.deserialize_int(), "integer key"), 42);
+    testing::expect_ok(decoder.begin_map_value(), "value");
+    testing::assert(testing::expect_ok(decoder.deserialize_bytes(), "binary value") == data);
+    testing::assert(testing::expect_ok(decoder.next_map_entry(), "second entry"));
+    testing::expect_ok(decoder.begin_map_key(), "key");
+    testing::assert_eq(testing::expect_ok(decoder.deserialize_string(), "string key"), "extension");
+    testing::expect_ok(decoder.begin_map_value(), "extension value");
+    let (tag, bytes) = testing::expect_ok(decoder.deserialize_extension(), "extension");
+    testing::assert_eq(tag, -1);
+    testing::assert(bytes == data);
+    testing::expect_ok(decoder.end_map(), "end map");
+    testing::expect_ok(serde::finish_value_deserializer(decoder), "complete value");
+    testing::assert(json::to_value(value).is_err());
+    testing::assert(toml::from_serde_value(value).is_err());
+    let plain = serde::Value::Map(
+        Vec::from_array([(serde::Value::Int(42), serde::Value::Binary(data))]),
+    );
+    let legacy = serde::Value::Sequence(
+        Vec::from_array(
+            [
+                serde::Value::Tuple(
+                    Vec::from_array(
+                        [
+                            serde::Value::Int(42),
+                            serde::Value::Sequence(
+                                Vec::from_array(
+                                    [
+                                        serde::Value::Uint8(0),
+                                        serde::Value::Uint8(255),
+                                        serde::Value::Uint8(7),
+                                    ],
+                                ),
+                            ),
+                        ],
+                    ),
+                ),
+            ],
+        ),
+    );
+    let actual = testing::expect_ok(toml::to_value(plain), "TOML binary and map projection");
+    let expected = testing::expect_ok(toml::to_value(legacy), "legacy TOML projection");
+    let actual_document = toml::Value::Table(Vec::from_array([("data", actual)]));
+    let expected_document = toml::Value::Table(Vec::from_array([("data", expected)]));
+    testing::assert_eq(
+        testing::expect_ok(toml::encode(actual_document), "TOML encoding"),
+        testing::expect_ok(toml::encode(expected_document), "legacy TOML encoding"),
+    );
+    println("serde ok")
+}
+
+fn main() -> () {
+    check_io();
+    check_numeric();
+    check_numeric_oracle();
+    check_context();
+    check_serde();
+    let addresses = testing::expect_ok(net::resolve("localhost", 8080), "localhost DNS");
+    testing::assert(!addresses.is_empty());
+    testing::assert(tls::connect("", 443, tls::ClientConfig::new("localhost")).is_err());
+    println("network validation ok")
+}

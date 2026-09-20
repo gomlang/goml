@@ -55,9 +55,9 @@ def registry_snapshot():
     return home
 
 
-def run(command, cwd, environment, log, records):
+def run(command, cwd, environment, log, records, input_text=None):
     started = time.monotonic()
-    result = subprocess.run(command, cwd=cwd, env=environment, capture_output=True, text=True)
+    result = subprocess.run(command, cwd=cwd, env=environment, capture_output=True, text=True, input=input_text)
     elapsed = time.monotonic() - started
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text(result.stdout + result.stderr)
@@ -110,6 +110,13 @@ def main():
                 run([sys.executable, str(library / "race.py")], ROOT.parent, environment, logs / "race-detector.log", records)
             if name == "cli":
                 run([sys.executable, str(library / "diagnostics.py")], ROOT.parent, environment, logs / "derive-diagnostics.log", records)
+        if set(selected) == set(MODULES):
+            for name in ("unit_identity", "erased_generic", "specialized_static", "ffi_error_alias"):
+                print(f"Verifying compiler regression {name}", flush=True)
+                directory = ROOT / "repros" / name
+                logs = report.parent / "repros" / name
+                for command in ("check", "build", "run"):
+                    run([goml, command], directory, environment, logs / f"{command}.log", records, input_text="")
     finally:
         report.write_text(json.dumps({"modules": selected, "registry_home": environment["GOML_HOME"], "commands": records}, indent=2) + "\n")
     print(f"Verification report: {report}", flush=True)
