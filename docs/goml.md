@@ -110,6 +110,8 @@ let values: [i16; 3] = [1, 2, 3];
 
 Strings support `\"`, `\\`, `\n`, `\r`, `\t`, `\b`, `\f`, `\/` and four-digit `\uXXXX` escaping; characters are escaped using the same set of control characters, and `\'` is used to represent single quotes. Ordinary strings cannot span lines.
 
+Escaped Unicode characters retain their UTF-8 value through Go code generation. For example, `"\uFEFF"` contains one character and three bytes, including when embedded in another string.
+
 Raw strings use `r"..."` or matching hash delimiters such as `r#"..."#` and `r##"..."##`. Their contents may span lines, and backslashes, quotes, braces, and newlines are retained exactly. Escapes and interpolation are not processed. A quote closes the literal only when it is followed by the same number of `#` characters as the opening delimiter:
 
 ```goml
