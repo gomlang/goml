@@ -505,6 +505,12 @@ type _goml_m_std_p_bytes_p_Bytes struct {
     values *_goml_vec_uint8
 }
 
+type _goml_m_std_p_bytes_p_FrozenBytes struct {
+    values FrozenVec__u8
+    offset int
+    length int
+}
+
 type _goml_m_std_p_utf8_p_Utf8Error struct {
     valid_up_to_value int
     error_length_value Option__isize
@@ -676,6 +682,10 @@ type closure_env_inherent_Slice_Slice_T_iter_T_u8_20 struct {
     index_0 *ref_int_x
     len_1 int
     self_2 []uint8
+}
+
+type FrozenVec__u8 struct {
+    values *_goml_vec_uint8
 }
 
 type Ordering uint8
@@ -1190,6 +1200,11 @@ type _goml_m_Option____Slice_l_u8_r_ struct {
 
 type _goml_m_Option____MutSlice_l_u8_r_ struct {
     _p0 []uint8
+    _tag uint8
+}
+
+type _goml_m_Option____std_p_bytes_p_FrozenBytes struct {
+    _p0 _goml_m_std_p_bytes_p_FrozenBytes
     _tag uint8
 }
 
