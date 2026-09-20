@@ -30,10 +30,11 @@ A GoML consumer declares the normal versioned dependency:
 "ecosystem::llvm" = "0.1.0"
 ```
 
-Its Go module must also resolve `example.com/goml-ecosystem/llvm`. The independent
-consumer supplies a local `replace` in its [go.mod](../consumers/llvm/go.mod).
-Publishing the GoML registry package alone does not publish that Go module or
-install the LLVM shared library.
+The library declares its Go adapter, required cgo, and LLVM major in `[native]`.
+The consumer needs only a minimal [go.mod](../consumers/llvm/go.mod); the driver
+generates requirements and replacements pointing at the selected registry source.
+It verifies cgo and LLVM 18 before compilation. Registry publication includes the
+adapter sources but does not install the LLVM shared library or set linker paths.
 
 ## Building a function
 

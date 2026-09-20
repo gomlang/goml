@@ -110,7 +110,10 @@ func Check(ctx context.Context, request protocol.Request) protocol.Response {
 			firstFile = file
 		}
 	}
-	flags := []string{}
+	flags, err := splitGoFlags(request.BuildContext.GOFLAGS)
+	if err != nil {
+		return failure(request, "ffi-protocol", err.Error())
+	}
 	if request.BuildContext.GO111MODULE == "on" {
 		flags = append(flags, "-mod=readonly")
 	}
@@ -132,7 +135,7 @@ func Check(ctx context.Context, request protocol.Request) protocol.Response {
 		}
 	}
 	loaded, err := packages.Load(&packages.Config{
-		Context: ctx, Dir: request.BuildContext.ModuleDir, Env: env, BuildFlags: flags, Overlay: overlay,
+		Context: ctx, Dir: request.BuildContext.ModuleDir, Env: append(env[:len(env):len(env)], "GOFLAGS="), BuildFlags: flags, Overlay: overlay,
 		Mode: loadMode,
 	}, patterns...)
 	if err := ctx.Err(); err != nil {

@@ -1,0 +1,227 @@
+package project;
+
+use module::manifest;
+use std::env;
+use std::fs;
+use std::json;
+use std::path;
+use std::process;
+use std::text;
+use std::time;
+use std::utf8;
+use utf8::BytesUtf8;
+
+struct NativeModule {
+    name: string,
+    version: string,
+    directory: string,
+    source: string,
+    sums: string,
+}
+
+fn native_read_optional(path: string) -> Result[string, string] {
+    if fs::is_file(path) {
+        fs::read_file_structured(path).map_err(|error| error.to_string())
+    } else {
+        Result::Ok("")
+    }
+}
+
+fn native_output(program: string, args: Vec[string], directory: string) -> Result[string, string] {
+    let output = process::Command::new(program).args(args).current_dir(directory).env(
+        "GOWORK",
+        "off",
+    ).env("GOTOOLCHAIN", "local").output_timeout_structured(
+        time::Duration::from_milliseconds(30000),
+    ).map_err(|error| "native dependency: " + error.to_string())?;
+    if !output.status().success() {
+        return Result::Err(
+            "native dependency: " + output.stderr().to_string_utf8().unwrap_or("command failed"),
+        )
+    }
+    output.stdout().to_string_utf8().map_err(|_| "native dependency: invalid command output")
+}
+
+fn native_go_module_name(directory: string) -> Result[string, string] {
+    let source = native_output(
+        "go",
+        Vec::from_array(["mod", "edit", "-json", path::join(directory, "go.mod")]),
+        directory,
+    )?;
+    let value = json::parse(source)?;
+    let module = json::field(value, "Module").ok_or("native dependency: go.mod has no module")?;
+    json::field(module, "Path").and_then(|value| json::as_string(value)).ok_or(
+        "native dependency: go.mod has no module path",
+    )
+}
+
+fn native_flag(value: string) -> Result[string, string] {
+    if !value.contains(" ") && !value.contains("\t") && !value.contains("\n")
+        && !value.contains("\r")
+        && !value.contains("\"")
+        && !value.contains("'") {
+        Result::Ok(value)
+    } else if !value.contains("\"") {
+        Result::Ok("\"" + value + "\"")
+    } else if !value.contains("'") {
+        Result::Ok("'" + value + "'")
+    } else {
+        Result::Err("native dependency: Go flag path contains both quote characters")
+    }
+}
+
+fn native_llvm_version(module_dir: string, major: string) -> Result[string, string] {
+    let configured = env::var_structured("LLVM_CONFIG").unwrap_or("");
+    let program = if configured != "" {
+        configured
+    } else if let Ok(found) = process::look_path_structured("llvm-config-" + major) {
+        found
+    } else if fs::is_file("/usr/lib/llvm-" + major + "/bin/llvm-config") {
+        "/usr/lib/llvm-" + major + "/bin/llvm-config"
+    } else {
+        "llvm-config"
+    };
+    let version = text::trim(native_output(program, Vec::from_array(["--version"]), module_dir)?);
+    if !version.starts_with(major + ".") {
+        return Result::Err("native dependency: LLVM " + major + " required, found " + version)
+    }
+    Result::Ok(program + ":" + version)
+}
+
+fn prepare_native_environment(context: Context, dry_run: bool) -> Result[
+    Vec[(string, string)],
+    string,
+] {
+    let modules: Vec[NativeModule] = Vec::new();
+    let mut needs_cgo = false;
+    let llvm_versions: Vec[string] = Vec::new();
+    for source in context.graph.sources {
+        let file = path::join(source.directory, manifest::FILENAME);
+        if !fs::is_file(file) {
+            continue;
+        }
+        let config = manifest::load_native(file)?;
+        needs_cgo = needs_cgo || config.cgo;
+        if let Some(major) = config.llvm_major {
+            if !llvm_versions.contains(major) {
+                llvm_versions.push(major);
+            }
+        }
+        if let Some(name) = config.go_module {
+            let directory = fs::canonicalize(source.directory).map_err(|error| error.to_string())?;
+            let native_source = fs::read_file_structured(path::join(directory, "go.mod")).map_err(
+                |error| "native dependency " + name + ": " + error.to_string(),
+            )?;
+            if source.name == context.graph.module_path {
+                if !dry_run && native_go_module_name(directory)? != name {
+                    return Result::Err(
+                        "native dependency: native.go-module disagrees with go.mod in " + directory,
+                    )
+                }
+                continue;
+            }
+            for previous in modules {
+                if previous.name == name {
+                    return Result::Err(
+                        "native dependency: multiple GoML modules provide Go module " + name,
+                    )
+                }
+            }
+            if !dry_run && native_go_module_name(directory)? != name {
+                return Result::Err(
+                    "native dependency: native.go-module disagrees with go.mod in " + directory,
+                )
+            }
+            modules.push(
+                NativeModule {
+                    name,
+                    version: config.go_version,
+                    directory,
+                    source: native_source,
+                    sums: native_read_optional(path::join(directory, "go.sum"))?,
+                },
+            );
+        }
+    }
+    if modules.is_empty() && !needs_cgo && llvm_versions.is_empty() {
+        return Result::Ok(Vec::new())
+    }
+    let mut identity = "native-v1\n";
+    if !dry_run {
+        if needs_cgo {
+            let actual = text::trim(
+                native_output(
+                    "go",
+                    Vec::from_array(["env", "CGO_ENABLED"]),
+                    context.graph.module_dir,
+                )?,
+            );
+            if actual != "1" {
+                return Result::Err("native dependency: CGO_ENABLED=1 is required")
+            }
+            identity += "cgo=1\n";
+        }
+        for major in llvm_versions {
+            identity += native_llvm_version(context.graph.module_dir, major)? + "\n";
+        }
+    }
+    if modules.is_empty() {
+        return Result::Ok(Vec::new())
+    }
+    let root_module = path::join(context.graph.module_dir, "go.mod");
+    if !fs::is_file(root_module) {
+        return Result::Err(
+            "native dependency: consuming GoML module needs a module-root go.mod; dependency requirements and replacements are generated automatically",
+        )
+    }
+    let root_source = fs::read_file_structured(root_module).map_err(|error| error.to_string())?;
+    let mut sums = native_read_optional(path::join(context.graph.module_dir, "go.sum"))?;
+    let flags = env::var_structured("GOFLAGS").unwrap_or("");
+    if flags.contains("-modfile") {
+        return Result::Err(
+            "native dependency: managed Go modules cannot be combined with GOFLAGS -modfile",
+        )
+    }
+    identity += json::encode(json::Value::String(root_source)) + "\n";
+    for module in modules {
+        for value in Vec::from_array(
+            [module.name, module.version, module.directory, module.source, module.sums],
+        ) {
+            identity += json::encode(json::Value::String(value)) + "\n";
+        }
+        sums += "\n" + module.sums;
+    }
+    identity += json::encode(json::Value::String(sums)) + "\n";
+    let directory = path::join(path::join(context.artifact_root, "native"), sha256_text(identity));
+    let modfile = path::join(directory, "go.mod");
+    if !dry_run && !fs::is_file(path::join(directory, "ready")) {
+        fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+        fs::write_file_structured(modfile, root_source).map_err(|error| error.to_string())?;
+        fs::write_file_structured(path::join(directory, "go.sum"), sums).map_err(
+            |error| error.to_string(),
+        )?;
+        let args = Vec::from_array(["mod", "edit", "-modfile=" + modfile]);
+        for module in modules {
+            args.push("-require=" + module.name + "@" + module.version);
+            args.push("-replace=" + module.name + "=" + module.directory);
+        }
+        let _ = native_output("go", args, context.graph.module_dir)?;
+        fs::write_file_structured(path::join(directory, "ready"), "ready\n").map_err(
+            |error| error.to_string(),
+        )?;
+    }
+    Result::Ok(
+        Vec::from_array(
+            [("GOFLAGS", text::trim(flags + " " + native_flag("-modfile=" + modfile)?))],
+        ),
+    )
+}
+
+fn apply_native_environment(command: process::Command, context: Context) -> process::Command {
+    if let Some(foreign) = context.foreign {
+        for (name, value) in foreign.environment {
+            let _ = command.env(name, value);
+        }
+    }
+    command
+}

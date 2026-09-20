@@ -37,7 +37,7 @@ is intentionally deferred.
 | msgpack | Reader/writer integration and incremental field processing, reduced copying and richer typed extension support |
 | graph | Flow/matching algorithms, serialization and configurable cost types |
 | goml_stats | Gitignore/glob semantics, manifest-based canonical identities, declaration counts and historical comparisons |
-| bitflags | Associated-constant or operator syntax depends on language support; wire representation uses explicit Serde wrappers; arbitrary declaration expressions and generic storage newtypes are not generated |
+| bitflags | Associated-constant or operator syntax depends on language support; Serde wrappers support explicit or format-sensitive representations; arbitrary declaration expressions and generic storage newtypes are not generated |
 | logos | Compile-time derive/DFA generation, streaming/byte input, named subpatterns and broader Unicode regex properties; current runtime NFA reports equal-priority ambiguity during matching |
 | tempfile | Platforms beyond Linux amd64, cancellation-aware file operations, crash-durable persistence helpers; cleanup assumes no hostile concurrent filesystem changes |
 | reqwest | Streaming requests/responses, HTTP/3, WebSocket, full domain-cookie policy, custom DNS, application retries and middleware; the synchronous API buffers within explicit limits |

@@ -178,3 +178,5 @@ map/positional cases, timestamp formats, raw strings, and 20,000 concatenated
 small messages. GoML output is checked against independent reference bytes and
 read by the Python implementation. Reports go under
 `ecosystem/_artifact/verification/msgpack/`.
+
+The streaming serializer and deserializer both report `is_human_readable() == false`, so format-sensitive Serde implementations can select their binary representation.

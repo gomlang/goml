@@ -81,8 +81,8 @@ They distinguish supported designs from current compiler or API boundaries.
   trait methods, typed iterators, and explicit text/numeric Serde wrappers work
   across a versioned dependency. Exhaustive byte-set algebra and 4,601 comparisons
   with Rust bitflags cover aliases, overlapping flags, unknown bits and parsing.
-  GoML's derive output does not currently generate associated constants or
-  inherent implementations, so this library uses module constants and methods.
+  GoML now supports inherent derive output, but associated constants remain
+  unsupported; this library retains its trait API and module constants.
 
 - Logos implements a recursive regex AST, bounded Thompson NFA construction,
   generic callbacks with extras/error types and cross-package iterator methods
@@ -141,12 +141,23 @@ valid API designs, but their original compiler workarounds are no longer require
   projection can require an explicit parameter annotation. Consumer tests retain
   this syntax. A typed intermediate `Result[T, string]` also resolves `Self` for
   static trait calls before chaining `map_err`.
-- Imported trait bounds in downstream generic helpers can still need a
-  package-qualified spelling. The bitflags consumer's `F: Flags` checked but
-  failed during monomorphization with a missing trait implementation; using
-  `F: flags::Flags` through its explicit package alias passes linking and the
-  reference matrix. Helpers defined in the trait's own package work with the
-  unqualified bound. The consumer retains the qualified spelling.
+- Imported short trait bounds now retain the defining trait identity through
+  monomorphization. Regression modules cover aliases, re-exports, forwarding
+  helpers, and inherent impl bounds. Generic static inherent methods also retain
+  owner arguments when their parameter and return types erase those arguments.
+- Integer `to_string` now works in CTFE; bitflags uses it when generating masks.
+  Derives can generate public inherent methods. General CTFE collections,
+  associated constants, and const generics remain future work.
+- `std::resource` combines action and cleanup errors and provides concurrent,
+  idempotent LIFO scopes. `Bytes::copy` and `freeze` make buffer isolation explicit.
+  Serde formats can distinguish text from binary through `is_human_readable`.
+- Native adapter declarations now resolve Go modules from registry source paths
+  using generated artifact-local module files. LLVM major and cgo prerequisites
+  are checked; system packages and linker search paths still require setup.
+- A separate pre-existing namespace limitation remains: an imported user trait
+  named `ToString` can interfere with builtin formatting predicates. A minimal
+  package-import reproduction also fails with pinned stage0. The new CTFE path
+  checks builtin identity exactly and does not evaluate such user trait calls.
 - Scalar conversion is available through `std::num::{ToFloat, TryToInt}`.
   Integer-to-float rounding and checked float-to-integer conversion are verified
   against native Go across all rounding modes, boundary values and random bit

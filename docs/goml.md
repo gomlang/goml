@@ -181,6 +181,24 @@ Dependency versions must use the strict `X.Y.Z` form. A dependency version is a 
 
 Each module path segment must be non-empty and may contain ASCII letters, digits, `_`, and `-`. Paths rooted at `builtin` or `prelude` are reserved for the toolchain and cannot be used as a module path or dependency. The `[module]` section currently has no `name`, `kind`, `root`, or similar fields.
 
+### Native dependencies
+
+A module containing a Go adapter can declare its Go module and system prerequisites in the same manifest:
+
+```toml
+[native]
+go-module = "example.com/goml-ecosystem/llvm"
+go-version = "v0.0.0"
+cgo = "required"
+llvm-major = "18"
+```
+
+All values are quoted strings. `go-module` must match the adapter's module-root `go.mod`; `go-version` defaults to `v0.0.0` and can specify a Go module version appropriate for a versioned module path. `cgo` accepts `required` or `optional` (the default). `llvm-major` requires a positive decimal major version. Unknown and duplicate native keys are errors.
+
+The consuming project supplies a minimal module-root `go.mod`. For Go FFI commands, the driver resolves declared adapters from the selected GoML registry sources and generates Go requirements and local replacements under `<target-dir>/native/<hash>/`. It passes the generated module file through `GOFLAGS=-modfile=...` to metadata validation, compilation, tests, and Go export. Source `go.mod` and `go.sum` files remain unchanged. The content hash includes adapter locations and module metadata; dry runs do not run prerequisite probes or create these files. An existing `GOFLAGS -modfile` conflicts with managed dependencies and produces a diagnostic.
+
+The driver checks required `CGO_ENABLED=1` and the requested LLVM major using `LLVM_CONFIG`, `llvm-config-N`, `/usr/lib/llvm-N/bin/llvm-config`, then `llvm-config`. These declarations do not install system packages or configure compiler/linker search paths. Consumers still configure `CGO_CFLAGS`, `CGO_LDFLAGS`, and the shared-library loader when needed. Additional external Go dependencies must satisfy the existing Go FFI read-only module policy; dependency-local replacements are not promoted into the consumer. Registry packages must include their adapter sources and Go module files.
+
 ### Build output layout
 
 The default product layout is as follows; the standard package paths in the path are expanded by directory level, for example, `alice::myapp::utils` corresponds to `alice/myapp/utils`:
@@ -521,13 +539,13 @@ fn table() -> [isize; 4] {
 }
 ```
 
-`#[comptime]` marks a non-generic free function as compile-time-capable. The function remains callable at runtime. A compile-time call may call only other `#[comptime]` free functions or the `compile_error(string) -> never` intrinsic. The compiler validates the complete body of every marked function, including branches not taken by a particular invocation. Attributes with arguments, duplicate attributes, generic functions, methods, extern functions, and other declarations are rejected.
+`#[comptime]` marks a non-generic free function as compile-time-capable. The function remains callable at runtime. A compile-time call may call other `#[comptime]` free functions, the builtin operations listed below, or the `compile_error(string) -> never` intrinsic. The compiler validates the complete body of every marked function, including branches not taken by a particular invocation. Attributes with arguments, duplicate attributes, generic functions, methods, extern functions, and other declarations are rejected.
 
 A top-level constant initializer is an implicit compile-time context, so `const SIX: isize = factorial(3);` and an initializer wrapped in `comptime { ... }` are equivalent. A top-level constant may produce a recursively immutable tuple, fixed array, struct, or enum in addition to scalar values. A `comptime` expression in ordinary code supports the same reifiable value shapes.
 
-Compile-time code may use local bindings and assignment, blocks, `if`, `match`, `while`, `loop`, restricted `for`, `break`, `continue`, `return`, recursion, direct calls, integer conversion methods, and supported operators. A compile-time `for` accepts only a fixed array or the builtin `isize` ranges `start..end` and `start..=end`; its source and range endpoints are evaluated once, and its pattern must be irrefutable. The deterministic string methods `len`, `byte_len`, `get`, `byte_get`, `byte_slice`, `is_char_boundary`, `starts_with`, `ends_with`, and `contains` are also available. String indexes and slices use byte offsets and reject invalid UTF-8 character boundaries.
+Compile-time code may use local bindings and assignment, blocks, `if`, `match`, `while`, `loop`, restricted `for`, `break`, `continue`, `return`, recursion, direct calls, integer conversion methods, integer `to_string()`, and supported operators. A compile-time `for` accepts only a fixed array or the builtin `isize` ranges `start..end` and `start..=end`; its source and range endpoints are evaluated once, and its pattern must be irrefutable. The deterministic string methods `len`, `byte_len`, `get`, `byte_get`, `byte_slice`, `is_char_boundary`, `starts_with`, `ends_with`, and `contains` are also available. String indexes and slices use byte offsets and reject invalid UTF-8 character boundaries. Integer formatting accepts signed and unsigned 8-, 16-, 32-, and 64-bit values, including `byte`, `isize`, and `usize`, and produces decimal text with the full range preserved. This is restricted to the builtin `ToString` implementation; a user trait with the same short name does not become a compile-time intrinsic. For example, `const BITS: u64 = 18446744073709551615; const MASK: string = BITS.to_string();` evaluates without runtime formatting.
 
-Compile-time code cannot capture a surrounding runtime parameter or local. Closures, indirect calls, generic functions, methods other than the integer conversions and string whitelist, trait or dynamic dispatch, general iterators, floating-point computation, `Ref`, `Vec`, `HashMap`, channels, goroutines, extern calls, host I/O, environment access, time, randomness, network access, general type reflection, arbitrary declaration generation, compile-time parameters, value generics, and type-level computation are not supported. The constrained programmable derive interface described below is the only reflection and code-generation facility.
+Compile-time code cannot capture a surrounding runtime parameter or local. Closures, indirect calls, generic functions, methods other than the integer conversions, integer `to_string`, and string whitelist, trait or dynamic dispatch, general iterators, floating-point computation, `Ref`, `Vec`, `HashMap`, channels, goroutines, extern calls, host I/O, environment access, time, randomness, network access, general type reflection, arbitrary declaration generation, compile-time parameters, value generics, and type-level computation are not supported. The constrained programmable derive interface described below is the only reflection and code-generation facility.
 
 `compile_error` is accepted only in a `#[comptime]` function, a `comptime` block, or a top-level constant initializer. It terminates compile-time evaluation with its message. If runtime execution of a `#[comptime]` function reaches it, the program traps:
 
@@ -1693,7 +1711,7 @@ let number = Convert::[i32]::convert(token, 0);
 let text = Convert::[string]::convert(token, "");
 ```
 
-Trait bounds make the corresponding methods available on generic values. Supertraits and associated type bounds also participate in method resolution as implied constraints.
+Trait bounds make the corresponding methods available on generic values. Imported short trait names, renamed imports, and public re-exports retain the defining trait identity in generic bounds and `where` predicates through specialization. Supertraits and associated type bounds also participate in method resolution as implied constraints.
 
 ## `dyn Trait`
 
@@ -1853,6 +1871,8 @@ struct User {
 }
 ```
 
+`Serializer::is_human_readable()` and `Deserializer::is_human_readable()` default to `true`. JSON, TOML, and the generic value adapters use this default; Bincode overrides it with `false`. Custom formats should override both sides consistently. A custom Serde implementation can choose readable names for text formats and an integer representation for binary formats without depending on a particular encoder. This query does not change ordinary derived serialization.
+
 `std::json` supports two deliberately separate modes. The value mode uses `json::Value`, `json::parse`, and `json::encode` for schema-free inspection and editing. JSON numbers remain their exact source text in `Value::Number`. In the typed mode, `json::try_to_string` and `from_string` write and consume JSON directly through the streaming serde traits; neither operation first builds a `json::Value` or `serde::Value` tree. `json::to_value` and `from_value` return `Result` and are the explicit bridge to the dynamic JSON model. Numeric range and destination-width checks happen while deserializing into the requested type.
 
 `json` publicly re-exports the shared `Serialize` and `Deserialize` traits and derive handlers, so either `use serde::Serialize` or `use json::Serialize` selects the same implementation identity. The JSON serializer emits struct fields in source order. Direct maps use JSON objects and therefore require keys whose direct representation is a string or char; `try_to_string` returns a recoverable error for other key types. The deserializer accepts any field order, recursively skips unknown values, rejects duplicate and missing fields, and rejects trailing input. Typed errors retain the byte offset and nested struct, sequence, map, or enum path. JSON uses externally tagged enums: a unit variant is a string, a tuple variant is an object whose value is an array, and a struct-like variant is an object whose value is another object.
@@ -1880,7 +1900,7 @@ A qualified custom derive must have the form `package_alias::export_name`, where
 
 `#[comptime_derive]` and `#[comptime_derive(Name)]` are valid only on non-generic free functions. A public handler must have the exact signature `(DeriveInput) -> DeriveOutput`. Private functions with the unnamed attribute are compile-time-only helpers and are included in the interface when reachable from a public handler. A derive handler may call those helpers and ordinary `#[comptime]` functions, but it cannot be called from runtime code or ordinary value `comptime`. Derive handlers are not exported as runtime functions.
 
-The compiler resolves handlers from already compiled dependency interfaces. A handler cannot be defined and applied within the same package compilation. Put reusable handlers and their generated traits in a separate package. The target may be a generic struct or enum; the generated impl inherits its type parameters. `derive_output_add_predicate` and `derive_output_add_call_site_predicate` add the bounds required by generated methods.
+The compiler resolves handlers from already compiled dependency interfaces. A handler cannot be defined and applied within the same package compilation. Put reusable handlers and their generated traits in a separate package. The target may be a generic struct or enum; the generated impl inherits its type parameters. Explicit owner arguments also specialize static inherent methods whose parameter and return types do not mention those arguments, for example `Record::[string]::type_name()`. `derive_output_add_predicate` and `derive_output_add_call_site_predicate` add the bounds required by generated methods.
 
 The input reflection operations are:
 
@@ -1909,7 +1929,26 @@ derive_fresh_name(input, prefix) -> string
 
 The structured attribute handle exposes `meta_attribute_name`, `meta_attribute_text`, `meta_attribute_has_argument_list`, `meta_attribute_argument_count`, `meta_attribute_argument_kind`, `meta_attribute_argument_name`, `meta_attribute_argument_value_kind`, and `meta_attribute_argument_text`. Argument kind is `ident`, `path`, `string`, or `named`. Named arguments use `name = value`, where the value may be an identifier, path, or string. `argument_name` returns the left-hand name, `argument_value_kind` describes the right-hand value, and `argument_text` returns its decoded value.
 
-The structured output API provides opaque `MetaAttribute`, `MetaType`, `MetaExpr`, `MetaPattern`, `MetaArm`, `MetaBlock`, `MetaParamList`, `MetaGenericList`, `MetaMethod`, and list handles. Constructors use the `meta_type_*`, `meta_expr_*`, `meta_pattern_*`, `meta_arm*`, `meta_block_*`, `meta_param_list_*`, and `meta_generic_list_*` families. `meta_method` creates a concrete trait method; `meta_method_generic` creates a method with explicit type parameters and bounds. A handler creates its single result with `derive_output_new` or `derive_output_new_call_site`, adds trait predicates and methods, and returns it.
+The structured output API provides opaque `MetaAttribute`, `MetaType`, `MetaExpr`, `MetaPattern`, `MetaArm`, `MetaBlock`, `MetaParamList`, `MetaGenericList`, `MetaMethod`, and list handles. Constructors use the `meta_type_*`, `meta_expr_*`, `meta_pattern_*`, `meta_arm*`, `meta_block_*`, `meta_param_list_*`, and `meta_generic_list_*` families. `meta_method` creates a concrete method; `meta_method_generic` creates a method with explicit type parameters and bounds. A handler creates one trait impl with `derive_output_new` or `derive_output_new_call_site`, or one inherent impl with `derive_output_inherent`. It then adds predicates and methods and returns that output. `derive_output_add_method` preserves private visibility for inherent methods and normal trait visibility for trait implementations. `derive_output_add_public_method` exports an inherent method and rejects trait output.
+
+For example, a handler in a separate package can generate a public static method:
+
+```goml
+#[comptime_derive(TypeName)]
+pub fn type_name(input: DeriveInput) -> DeriveOutput {
+    let output = derive_output_inherent(input);
+    derive_output_add_public_method(
+        output,
+        meta_method(
+            "type_name",
+            meta_param_list_new(),
+            meta_type_call_site("string"),
+            meta_expr_string(derive_item_name(input)),
+        ),
+    );
+    output
+}
+```
 
 The builder operations are:
 
@@ -1999,16 +2038,18 @@ meta_method_generic(name, generics, parameters, return_type, body) -> MetaMethod
 
 derive_output_new(input, trait_name) -> DeriveOutput
 derive_output_new_call_site(input, trait_name) -> DeriveOutput
+derive_output_inherent(input) -> DeriveOutput
 derive_output_add_predicate(output, type, trait_name) -> ()
 derive_output_add_call_site_predicate(output, type, trait_name) -> ()
 derive_output_add_method(output, method) -> ()
+derive_output_add_public_method(output, method) -> ()
 ```
 
 `meta_expr_unary` uses operator numbers `0..2` for `-`, `!`, and `~`. `meta_expr_binary` uses operator numbers `0..17` for `+`, `-`, `*`, `/`, `%`, `&`, `|`, `^`, `<<`, `>>`, `&&`, `||`, `<`, `>`, `<=`, `>=`, `==`, and `!=`, respectively. `meta_expr_integer` accepts a normalized integer literal string plus its exact integer type, so builders can represent values outside the host `isize` range. `meta_expr_cast` accepts only a `dyn` target type; generated numeric conversions should use `meta_expr_method_call`. `meta_expr_trait_call` resolves the trait in the handler's defining package and builds a static trait method call. `meta_type_equal` compares structural type identity. `meta_type_kind` returns `primitive`, `named`, `tuple`, `application`, `array`, `function`, or `dyn`; shape-specific accessors reject other kinds. List handles are mutable only through their matching `push` operation and remain local to one derive evaluation.
 
 Unqualified names passed to `derive_output_new`, `derive_output_add_predicate`, `meta_type_named`, `meta_expr_call`, and `meta_generic_list_add_bound` resolve in the handler's defining package. Their `_call_site` variants resolve in the target package. `derive_fresh_name` should be used for generated local bindings that must not collide with user names. The `*_target_*` builders construct or match the annotated item by compiler identity and should be preferred over spelling its name manually.
 
-The result is restricted to one trait `impl` for the annotated type. It cannot create types, traits, functions, constants, modules, imports, inherent impls, extern declarations, attributes, associated types, or raw tokens. Generated method type parameters and trait bounds are supported. The generated impl is processed by ordinary name resolution, orphan and coherence checks, type checking, monomorphization, and backend lowering. Duplicate or invalid generated implementations are regular compiler diagnostics.
+The result is restricted to one trait or inherent `impl` for the annotated type. It cannot create types, traits, free functions, constants, modules, imports, extern declarations, attributes, associated types, or raw tokens. Associated constants and multiple impl blocks in one output remain unsupported. Generated method type parameters and trait bounds are supported. The generated impl is processed by ordinary name resolution, orphan and coherence checks, type checking, monomorphization, and backend lowering. Duplicate or invalid generated implementations are regular compiler diagnostics.
 
 Handlers are deterministic and have no host access. Imported derive CTIR is verified as untrusted artifact data. Evaluation uses the ordinary compile-time limits plus a limit of 100,000 metadata and syntax-builder operations. Failures are anchored to the requesting derive attribute and include the compile-time derive call stack.
 
@@ -2847,7 +2888,7 @@ Public APIs include:
 
 - `ascii::is_ascii`, character-class predicates, ASCII case conversion and comparison, and `escape_default`
 - `bincode::standard`, `legacy`, configuration builders, serde `Serialize` and `Deserialize` re-exports, `encode_to_vec`, and `decode_from_slice`
-- `bytes::Bytes`, `bytes::Builder`, checked and zero-copy byte views, plus `bytes::endian::{Builder, Reader, Writer, Endian}` and checked integer and floating-point reads and writes
+- `bytes::Bytes`, `bytes::FrozenBytes`, `bytes::Builder`, explicit byte copies, immutable snapshots, checked and zero-copy byte views, plus `bytes::endian::{Builder, Reader, Writer, Endian}` and checked integer and floating-point reads and writes
 - `channel::Operation`, `Selection`, `select`, `try_select`, and `try_select_priority` for runtime-sized channel selection
 - `cmp::Ordering`, `Ord`, `Reverse`, comparison helpers, and two-value minimum, maximum, and clamping operations. `Ordering` is a builtin type re-exported by `cmp`.
 - `collections::Arena`, `BinaryHeap`, `BitSet`, `BTreeMap`, `BTreeSet`, `Deque`, `HashSet`, `IndexMap`, `IndexSet`, `IndexVec`, `Interner`, and `Stack`; hash-backed collections require `Hash + Eq`, while tree collections and heaps use `cmp::Ord`
@@ -2876,6 +2917,7 @@ Public APIs include:
 - `os::linux::memory` anonymous/file mappings, checked copied access, protection, sync/advice, page locking, and residency
 - `os::linux::ipc` pipes, Unix socket pairs, descriptor passing, eventfd, timerfd, poll, and epoll
 - `path::join`, `clean`, `is_absolute`, component inspection, and `absolute_structured`
+- `resource::{Scope, ScopeError, scope, with_cleanup, finish}` for explicit cleanup and combined errors
 - `process::Command`, structured whole-process execution, `ExitStatus`, `Output`, `exit`, and `look_path_structured`
 - `rand::ALGORITHM`, `next_u64`, deterministic byte generation, integer ranges, and shuffle with an explicit seed
 - `serde::Value`, `Serializer`, `Deserializer`, `Serialize`, `Deserialize`, `value_serializer`, `value_deserializer`, `to_value`, and `from_value`
@@ -2927,7 +2969,9 @@ Importing `utf8::BytesUtf8` adds `Bytes::to_string_utf8`, which returns `Result[
 
 ### Byte buffers and endian access
 
-`std::bytes` uses `Slice[byte]` and `MutSlice[byte]` for borrowed views. `Bytes::as_slice` and `as_mut_slice` are zero-copy, while `slice_checked` and `slice_mut_checked` validate a subrange. `bytes::Builder` is a lightweight byte accumulator and returns `Bytes`.
+`std::bytes` uses `Slice[byte]` and `MutSlice[byte]` for borrowed views. `Bytes::as_slice` and `as_mut_slice` are zero-copy, while `slice_checked` and `slice_mut_checked` validate a subrange. `bytes::Builder` is a lightweight byte accumulator and returns `Bytes`. `Bytes::from_vec` and `to_vec` share mutable storage. Use `from_vec_copy`, `from_slice_copy`, `to_vec_copy`, or `copy` for independent mutable buffers. `Builder::finish_copy` and `to_vec_copy` detach a snapshot from the builder. These copies do not synchronize concurrent mutations of the source.
+
+`Bytes::freeze` creates a `FrozenBytes` snapshot with private immutable storage. `FrozenBytes::from_vec_copy`, `from_slice_copy`, and `from_string` also create snapshots. `len`, `is_empty`, and `get_checked` inspect them; `slice_checked(start, end)` returns an immutable view sharing that snapshot, including empty ranges. Invalid indexes and ranges return `None`. `to_vec_copy` and `thaw` return independent mutable copies. `FrozenBytes` implements content-based `PartialEq` and `Eq`.
 
 `std::bytes::endian` is an opt-in package for binary formats. Its `Builder` grows while writing typed values; `Reader` advances over a read-only view; `Writer` advances over a fixed mutable view and returns `endian::BoundsError` rather than partially writing past the end. The top-level `read_u16/u32/u64`, `read_i16/i32/i64`, `read_f32/f64` and matching `write_*` functions take an explicit `Endian::Little` or `Endian::Big`. One-byte operations omit endianness. Every operation validates the complete range before reading or writing.
 
@@ -3039,6 +3083,24 @@ There are currently no configurable lane counts, gather/scatter, vector arithmet
 `fs::metadata` and `symlink_metadata` return value-only metadata including file type, length, portable permission bits, and modification time. `Metadata::from_parts(file_type, length, mode, modified_unix_nanoseconds)` constructs the same value without filesystem access; permission bits are masked to `0o777`. `read_dir_structured` eagerly snapshots directory entries. `read_dir_names_structured` returns sorted names without fetching each child's metadata, preserving structured listing errors; a disappearing child does not invalidate the other names. `atomic_write` writes, synchronizes, closes, and atomically renames a same-directory temporary file before returning; temporary cleanup stays inside the runtime call. `replace` exposes the host atomic rename operation under replacement semantics.
 
 `io::read_stdin_structured`, `read_stdin_exact_structured`, `write_stdout_structured`, and `write_stderr_structured` provide structured errors for standard streams. `read_stdin_to_string` validates the complete input as UTF-8 and reports `InvalidData` on failure. A negative exact-read length reports `InvalidInput` before accessing stdin.
+
+### Resource scopes
+
+Import `std::resource` for explicit cleanup of resources managed by libraries. `with_cleanup(action, cleanup)` executes the action and then cleanup on normal return, including an action returning `Err`. `scope(action)` passes a `Scope[C]` into the action, then closes it. `Scope::register` accepts a `() -> Result[(), C]` cleanup callback. Closing runs all registered callbacks in reverse registration order, continues after cleanup errors, and runs each callback once.
+
+`Scope::new`, `register`, `is_closed`, and `close` support concurrent callers. Registration returns `false` once closing begins; the caller retains responsibility for a rejected callback's resource. Concurrent close calls wait for the first close and receive copies of its error vector; subsequent calls return the same errors without repeating cleanup. Callbacks run outside the scope's state gate and may inspect or attempt registration, but must not synchronously close their own scope.
+
+`ScopeError[E, C]` retains `action: Option[E]` and `cleanup: Vec[C]`; cleanup failures do not hide the action error. `finish(action_result, cleanup_errors)` combines already-completed operations using the same rule. Successful actions produce `Ok` only when cleanup also succeeds. `ScopeError` implements `ToString` when both error types do. `io::with_resource(value, action)` uses the same machinery for any `io::Close` value.
+
+```goml
+use std::resource;
+
+fn run_job() -> Result[isize, resource::ScopeError[string, string]] {
+    resource::with_cleanup(|| Result::Ok(42), || Result::Ok(()))
+}
+```
+
+These helpers do not implement destructors or panic recovery. They guarantee cleanup on normal control flow and `Result` errors; a panic or abrupt process termination can bypass cleanup. A scope that escapes its callback remains closed afterward.
 
 ### Composable I/O
 
@@ -3722,6 +3784,9 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | Traverse a directory tree | `std::fs::walkdir` Linux amd64 syscall-backed depth-first iteration with depth bounds, pruning, optional link following, and per-path errors |
 | Watch a directory tree for changes | Use `fs::notify::watch_recursive` or `WatchSet` on Linux amd64, prune ignored paths through `Options`, consume timed reads or scoped subscriptions, handle `Event.rescan`, and close the handle |
 | TCP and UDP networking | `std::net` sockets, DNS resolution, shared epoll readiness, explicit close, and context-aware waits; `std::net::tls` for verified TLS clients |
+| Keep byte snapshots independent | `Bytes::copy` for mutable copies; `Bytes::freeze` and `FrozenBytes` for immutable snapshots |
+| Preserve action and cleanup errors | `std::resource::{with_cleanup, scope, ScopeError}` or `io::with_resource` |
+| Generate public inherent methods | `derive_output_inherent` and `derive_output_add_public_method` |
 | Create and supervise a Linux child | `std::os::linux::process::Command` with runtime-coordinated spawn, stable pidfd signals, and shared wait results |
 | Access mapped memory | `std::os::linux::memory::Mapping` checked copied access with explicit shared unmap state |
 | Pass descriptors or wait for Linux readiness | `std::os::linux::ipc` Unix messages, eventfd/timerfd, poll, and epoll |

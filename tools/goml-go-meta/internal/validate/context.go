@@ -73,3 +73,29 @@ func verifyToolchain(ctx context.Context, c protocol.BuildContext, env []string)
 	}
 	return nil
 }
+
+func splitGoFlags(value string) ([]string, error) {
+	var result []string
+	for {
+		value = strings.TrimLeft(value, " \t\r\n")
+		if value == "" {
+			return result, nil
+		}
+		if value[0] == '\'' || value[0] == '"' {
+			quote := value[0]
+			end := strings.IndexByte(value[1:], quote)
+			if end < 0 {
+				return nil, fmt.Errorf("unterminated quote in GOFLAGS")
+			}
+			result = append(result, value[1:1+end])
+			value = value[2+end:]
+		} else {
+			end := strings.IndexAny(value, " \t\r\n")
+			if end < 0 {
+				return append(result, value), nil
+			}
+			result = append(result, value[:end])
+			value = value[end:]
+		}
+	}
+}

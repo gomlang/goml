@@ -53,8 +53,8 @@ masks. Zero and multi-bit flags are supported. `unnamed` replaces the Rust macro
 `const _` spelling; the GoML attribute metadata does not represent `_` as a named
 argument. Flag names are case-sensitive.
 
-The derive supplies the `Flags` trait implementation. It cannot generate
-associated constants or inherent methods under GoML's current derive contract.
+The derive supplies the `Flags` trait implementation. Associated constants remain unsupported by GoML; the library keeps its trait
+API even though the compiler now also supports inherent derive output.
 Declare ordinary module constants when needed, or use `Permissions::from_name`.
 Import `Flags` in each file using its methods. GoML does not overload bitwise
 operators for structs; use the methods below.
@@ -121,10 +121,11 @@ text have different grammars.
 lossless text form. `Number[F] { value }` uses the unsigned 8/16/32/64-bit Serde
 event matching the storage width. Both preserve unknown in-width bits; numeric
 decoding rejects overflow. Signed storage also uses its unsigned pattern.
-JSON and Bincode round-trips are tested at every width. The wrappers make the
-wire format explicit because GoML's Serde protocol has no human-readable format
-query. Ordinary Serde derives on the flags struct still serialize its field as
-an ordinary struct.
+JSON and Bincode round-trips are tested at every width. `Auto[F] { value }` chooses
+text for human-readable formats and the storage-width integer for binary formats
+through Serde's `is_human_readable` query. `Text` and `Number` continue to force
+their explicit wire formats. Ordinary Serde derives on the flags struct still
+serialize its field as an ordinary struct.
 
 Manual `Flags` implementations are supported: implement `bits`,
 `from_bits_retain`, `storage_mask`, `definitions`, and `type_name`. The default

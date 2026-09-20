@@ -176,10 +176,10 @@ prior knowledge and protocol forcing are not exposed. Client-side file reading
 is separate from multipart byte parts. Proxy handling is delegated to net/http;
 proxy tunnel behavior is not exercised by the local interoperability script.
 
-`go.mod` contains only the module path and Go version. A consuming Go module
-must make `example.com/goml-ecosystem/reqwest` available, as the independent
-consumer does with a local `replace`. GoML registry publication alone does not
-publish a corresponding Go module. `testserver/` is a local HTTP/HTTPS fixture
+`go.mod` contains only the module path and Go version. The library declares
+`native.go-module` in `goml.toml`; the driver generates requirements and
+replacements pointing at the selected registry copy. The independent consumer
+therefore needs only its own minimal `go.mod`, with no manual replacement. `testserver/` is a local HTTP/HTTPS fixture
 used by tests and the consumer; the library's production API imports only
 `adapter/`.
 
