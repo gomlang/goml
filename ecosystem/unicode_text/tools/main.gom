@@ -1,0 +1,452 @@
+package main;
+
+use ecosystem::unicode_text as segmentation;
+use ecosystem::reqwest;
+use std::collections;
+use std::bytes;
+use std::utf8;
+use utf8::BytesUtf8;
+use std::crypto::hash;
+use std::env;
+use std::fs;
+use std::io;
+use std::json;
+use std::process;
+use std::serde::{Deserialize};
+use std::text;
+use std::time;
+use std::unicode;
+
+#[derive(Deserialize)]
+struct Source {
+    url: string,
+    sha256: string,
+}
+
+pub struct Data {
+    version: string,
+    sources: HashMap[string, string],
+}
+
+struct Row {
+    low: isize,
+    high: isize,
+    fields: Vec[string],
+}
+
+fn fetch(client: reqwest::Client, url: string, headers: Vec[(string, string)], limit: isize) -> Result[
+    bytes::Bytes,
+    string,
+] {
+    let mut request = client.get(url).body_limit(limit);
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let response = request.send().map_err(|error| error.to_string())?.error_for_status().map_err(
+        |error| error.to_string(),
+    )?;
+    Result::Ok(response.bytes())
+}
+
+pub fn fetch_source(
+    name: string,
+    url: string,
+    digest: string,
+    fetch: (string, Vec[(string, string)], isize) -> Result[bytes::Bytes, string],
+) -> Result[string, string] {
+    let headers = Vec::from_array([("Cache-Control", "no-cache"), ("Pragma", "no-cache")]);
+    let data = fetch(url, headers, 16777216)?;
+    if data.len() > 16777216 {
+        return Result::Err("Unicode source exceeds download limit: " + name);
+    }
+    if hash::sha256(data) != digest {
+        return Result::Err("Unicode source checksum mismatch: " + name);
+    }
+    data.to_string_utf8().map_err(
+        |error| "invalid Unicode source UTF-8: " + name + ": " + error.to_string(),
+    )
+}
+
+pub fn download_with(
+    root: string,
+    fetch: (string, Vec[(string, string)], isize) -> Result[bytes::Bytes, string],
+) -> Result[Data, string] {
+    let contents = fs::read_file_structured(root + "/data/manifest.json").map_err(
+        |error| error.to_string(),
+    )?;
+    let manifest = json::parse(contents)?;
+    let version = json::field(manifest, "unicode_version").and_then(|value| json::as_string(value)).ok_or(
+        "missing Unicode version",
+    )?;
+    let entries = match json::field(manifest, "sources") {
+        Some(json::Value::Object(entries)) => entries,
+        _ => return Result::Err("invalid Unicode source manifest"),
+    };
+    let sources = HashMap::new();
+    for (name, value) in entries {
+        let source: Source = json::from_value(value)?;
+        if name == "LICENSE.txt" {
+            let actual = hash::sha256_file(root + "/data/" + name).map_err(
+                |error| error.to_string(),
+            )?;
+            if actual != source.sha256 {
+                return Result::Err("Unicode license checksum mismatch");
+            }
+            continue;
+        }
+        println("Downloading " + name);
+        sources.insert(name, fetch_source(name, source.url, source.sha256, fetch)?);
+    }
+    Result::Ok(Data { version, sources })
+}
+
+fn download(root: string) -> Result[Data, string] {
+    let client = reqwest::Client::builder().timeout(time::Duration::from_seconds(30)).body_limit(
+        16777216,
+    ).build().map_err(|error| error.to_string())?;
+    defer client.close();
+    download_with(root, |url, headers, limit| fetch(client, url, headers, limit))
+}
+
+pub fn source(data: Data, name: string) -> Result[string, string] {
+    data.sources.get(name).ok_or("missing freshly downloaded source: " + name)
+}
+
+fn hexadecimal(value: string) -> Result[isize, string] {
+    let mut number = 0;
+    if value == "" {
+        return Result::Err("empty hexadecimal code point");
+    }
+    for byte in value.to_bytes() {
+        let digit = if byte >= 48 && byte <= 57 {
+            (byte - 48).to_isize()
+        } else if byte >= 65 && byte <= 70 {
+            (byte - 55).to_isize()
+        } else if byte >= 97 && byte <= 102 {
+            (byte - 87).to_isize()
+        } else {
+            return Result::Err("invalid hexadecimal code point: " + value);
+        };
+        number = number * 16 + digit;
+        if number > 0x10ffff {
+            return Result::Err("code point exceeds Unicode range");
+        }
+    }
+    Result::Ok(number)
+}
+
+fn rows(data: Data, name: string) -> Result[Vec[Row], string] {
+    let output = Vec::new();
+    for line in source(data, name)?.split("\n") {
+        let body = line.split("#")[0].trim();
+        if body == "" {
+            continue;
+        }
+        let columns = body.split(";");
+        let interval = columns[0].trim().split("..");
+        let low = hexadecimal(interval[0])?;
+        let high = hexadecimal(interval[interval.len() - 1])?;
+        if low > high {
+            return Result::Err("invalid Unicode property interval");
+        }
+        let fields = Vec::new();
+        for index in 1..columns.len() {
+            fields.push(columns[index].trim());
+        }
+        if fields.len() == 0 {
+            return Result::Err("missing Unicode property");
+        }
+        output.push(Row { low, high, fields });
+    }
+    Result::Ok(output)
+}
+
+fn assign(properties: Vec[isize], low: isize, high: isize, value: isize, mask: isize) -> () {
+    for point in low..high + 1 {
+        properties[point] = (properties[point] & ~mask) | value;
+    }
+}
+
+fn flag(properties: Vec[isize], low: isize, high: isize, value: isize) -> () {
+    for point in low..high + 1 {
+        properties[point] = properties[point] | (value << 17);
+    }
+}
+
+fn constant(output: text::StringBuilder, prefix: string, name: string, value: isize) -> () {
+    output.write_string(
+        "const " + prefix + "_" + unicode::uppercase(name) + ": isize = " + value.to_string()
+            + ";\n\n",
+    );
+}
+
+fn category(
+    data: Data,
+    properties: Vec[isize],
+    output: text::StringBuilder,
+    filename: string,
+    prefix: string,
+    shift: isize,
+    bits: isize,
+    default: string,
+) -> Result[(), string] {
+    let records = rows(data, filename)?;
+    let names = Vec::new();
+    for record in records {
+        if record.fields[0] != default && !names.contains(record.fields[0]) {
+            names.push(record.fields[0]);
+        }
+    }
+    collections::sort(names);
+    let values = HashMap::new();
+    values.insert(default, 0);
+    constant(output, prefix, default, 0);
+    for index in 0..names.len() {
+        values.insert(names[index], index + 1);
+        constant(output, prefix, names[index], index + 1);
+    }
+    for record in records {
+        let value = values.get(record.fields[0]).ok_or("unknown generated property")?;
+        assign(properties, record.low, record.high, value << shift, ((1 << bits) - 1) << shift);
+    }
+    Result::Ok(())
+}
+
+fn hex_fixed(value: isize, digits: isize) -> string {
+    let output = text::StringBuilder::new();
+    let alphabet = "0123456789abcdef";
+    for index in 0..digits {
+        let digit = (value >> ((digits - index - 1) * 4)) & 15;
+        output.write_string(alphabet.byte_slice(digit, digit + 1));
+    }
+    output.finish()
+}
+
+fn generate(data: Data) -> Result[string, string] {
+    let properties = Vec::with_capacity(0x110000);
+    for _ in 0..0x110000 {
+        properties.push(512 << 17);
+    }
+    let output = text::StringBuilder::new();
+    output.write_string(
+        "package unicode_text;\n\npub const UNICODE_VERSION: string = \"" + data.version + "\";\n\n",
+    );
+    category(data, properties, output, "GraphemeBreakProperty.txt", "G", 0, 4, "Other")?;
+    category(data, properties, output, "WordBreakProperty.txt", "W", 4, 5, "Other")?;
+    category(data, properties, output, "LineBreak.txt", "L", 9, 6, "XX")?;
+    let indic = Vec::from_array(["None", "Consonant", "Extend", "Linker"]);
+    for index in 0..indic.len() {
+        constant(output, "I", indic[index], index);
+    }
+    for record in rows(data, "DerivedCoreProperties.txt")? {
+        if record.fields[0] == "InCB" {
+            let mut found = false;
+            for index in 0..indic.len() {
+                if record.fields[1] == indic[index] {
+                    assign(properties, record.low, record.high, index << 15, 3 << 15);
+                    found = true;
+                }
+            }
+            if !found {
+                return Result::Err("unknown Indic conjunct property");
+            }
+        }
+        if record.fields[0] == "Default_Ignorable_Code_Point" {
+            flag(properties, record.low, record.high, 1);
+        }
+    }
+    let flags = Vec::from_array(
+        [
+            "ZERO",
+            "PICTOGRAPHIC",
+            "EMOJI",
+            "EMOJI_PRESENTATION",
+            "WIDE",
+            "AMBIGUOUS",
+            "EAST_ASIAN",
+            "INITIAL_QUOTE",
+            "FINAL_QUOTE",
+            "UNASSIGNED",
+            "MARK",
+            "WORD",
+        ],
+    );
+    for index in 0..flags.len() {
+        constant(output, "F", flags[index], 1 << index);
+    }
+    let mut range_start = Option::None;
+    for line in source(data, "UnicodeData.txt")?.split("\n") {
+        if line.trim() == "" {
+            continue;
+        }
+        let fields = line.split(";");
+        let point = hexadecimal(fields[0])?;
+        if fields[1].ends_with(", First>") {
+            range_start = Option::Some(point);
+            continue;
+        }
+        let low = if fields[1].ends_with(", Last>") {
+            range_start.ok_or("missing Unicode range start")?
+        } else {
+            point
+        };
+        range_start = Option::None;
+        assign(properties, low, point, 0, 512 << 17);
+        let category = fields[2];
+        if category == "Mn" || category == "Mc" || category == "Me" || category == "Cf"
+            || category == "Cc"
+            || category == "Zl"
+            || category == "Zp" {
+            flag(properties, low, point, 1);
+        }
+        if category.starts_with("L") || category.starts_with("N") {
+            flag(properties, low, point, 2048);
+        }
+        if category == "Mn" || category == "Mc" {
+            flag(properties, low, point, 1024);
+        }
+        if category == "Pi" {
+            flag(properties, low, point, 128);
+        }
+        if category == "Pf" {
+            flag(properties, low, point, 256);
+        }
+    }
+    for record in rows(data, "EastAsianWidth.txt")? {
+        let category = record.fields[0];
+        if category == "W" || category == "F" {
+            flag(properties, record.low, record.high, 16);
+        }
+        if category == "A" {
+            flag(properties, record.low, record.high, 32);
+        }
+        if category == "W" || category == "F" || category == "H" {
+            flag(properties, record.low, record.high, 64);
+        }
+    }
+    for record in rows(data, "emoji-data.txt")? {
+        let bit = match record.fields[0] {
+            "Extended_Pictographic" => 2,
+            "Emoji" => 4,
+            "Emoji_Presentation" => 8,
+            _ => 0,
+        };
+        if bit != 0 {
+            flag(properties, record.low, record.high, bit);
+        }
+    }
+    output.write_string("const PROPERTY_DATA: string = r\"");
+    let mut low = 0;
+    while low < properties.len() {
+        let mut high = low;
+        while high + 1 < properties.len() && properties[high + 1] == properties[low] {
+            high += 1;
+        }
+        if low > 0 {
+            output.write_string("\n");
+        }
+        output.write_string(hex_fixed(low, 6) + hex_fixed(high, 6) + hex_fixed(properties[low], 8));
+        low = high + 1;
+    }
+    output.write_string("\";\n");
+    Result::Ok(output.finish())
+}
+
+fn conformance(data: Data, name: string, kind: string, expected_count: isize) -> Result[(), string] {
+    let mut count = 0;
+    let mut line_number = 0;
+    for line in source(data, name)?.split("\n") {
+        line_number += 1;
+        let body = line.split("#")[0].trim();
+        if body == "" {
+            continue;
+        }
+        let input = text::StringBuilder::new();
+        let expected = Vec::new();
+        let mut offset = 0;
+        for token in body.replace("\t", " ").split(" ") {
+            if token == "" {
+                continue;
+            }
+            if token == "÷" {
+                expected.push(offset);
+            } else if token != "×" {
+                let point = hexadecimal(token)?;
+                let character = char_from_u32(point.to_u32()).ok_or("invalid test scalar")?.to_string();
+                input.write_string(character);
+                offset += character.len();
+            }
+        }
+        let input = input.finish();
+        let actual = match kind {
+            "grapheme" => segmentation::grapheme_boundaries(input),
+            "word" => segmentation::word_boundaries(input),
+            _ => {
+                let positions = Vec::new();
+                for boundary in segmentation::line_breaks(input) {
+                    positions.push(boundary.offset);
+                }
+                positions
+            },
+        };
+        if actual != expected {
+            return Result::Err(
+                name + ":" + line_number.to_string() + " expected " + json::try_to_string(expected)?
+                    + ", got "
+                    + json::try_to_string(actual)?,
+            );
+        }
+        count += 1;
+    }
+    if count != expected_count {
+        return Result::Err(name + ": incorrect conformance case count " + count.to_string());
+    }
+    println(name + ": " + count.to_string() + " cases passed");
+    Result::Ok(())
+}
+
+pub fn verify(root: string) -> Result[(), string] {
+    let data = download(root)?;
+    let generated = generate(data)?;
+    let existing = fs::read_file_structured(root + "/properties.gom").map_err(
+        |error| error.to_string(),
+    )?;
+    if generated != existing {
+        return Result::Err("generated Unicode tables differ; run the native tool with generate");
+    }
+    conformance(data, "GraphemeBreakTest.txt", "grapheme", 1093)?;
+    conformance(data, "WordBreakTest.txt", "word", 1826)?;
+    conformance(data, "LineBreakTest.txt", "line", 16672)?;
+    Result::Ok(())
+}
+
+fn run() -> Result[(), string] {
+    let args = env::args();
+    let command = if args.len() > 1 {
+        args[1]
+    } else {
+        "check"
+    };
+    let root = if args.len() > 2 {
+        args[2]
+    } else {
+        ".."
+    };
+    if command == "check" {
+        verify(root)
+    } else if command == "generate" {
+        let generated = generate(download(root)?)?;
+        fs::write_file_structured(root + "/properties.gom", generated).map_err(
+            |error| error.to_string(),
+        )
+    } else {
+        Result::Err("usage: unicode_data [check|generate] [unicode_text directory]")
+    }
+}
+
+fn main() -> () {
+    if let Err(error) = run() {
+        io::eprintln(error);
+        process::exit(1);
+    }
+}

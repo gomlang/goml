@@ -66,9 +66,9 @@ Ignore files are read in bounded chunks with `O_NOFOLLOW` and `O_NONBLOCK`; nonr
 From the repository root:
 
 ```sh
-python3 ecosystem/verify.py ignore
+just ecosystem-test ignore
 ```
 
-The suite covers matching, rule explanations and precedence, path validation, aliases, worktree metadata, symlink loops, malformed or oversized sources, deterministic traversal, cancellation, resource bounds, immutable concurrent matching, and bounded parallel callbacks. The independent versioned consumer exercises the exported API. `interop.py` compares 200 generated rule hierarchies and 9,400 path queries with isolated real Git repositories, including the distinction between explicit trailing-slash queries and directory traversal. `race.py` runs all library tests under the Go race detector. CI integration is intentionally left to the parent project.
+The suite covers matching, rule explanations and precedence, path validation, aliases, worktree metadata, symlink loops, malformed or oversized sources, deterministic traversal, cancellation, resource bounds, immutable concurrent matching, and bounded parallel callbacks. The independent versioned consumer exercises the exported API. Native consumer tests compare 200 rule hierarchies and 9,400 path queries with retained expected results from isolated real Git repositories, including explicit trailing-slash queries and directory traversal. [Fixture provenance](../consumers/ignore/tests/data/README.md) records the Git command and seed. The native verifier runs library and consumer tests under Go's race detector. CI integration is intentionally left to the parent project.
 
 Git semantics are based on the [Gitignore documentation](https://git-scm.com/docs/gitignore), [repository layout](https://git-scm.com/docs/gitrepository-layout), and [git check-ignore](https://git-scm.com/docs/git-check-ignore). The JSON consumer's directory requests append a slash to reproduce the exact paths used by the Git oracle.

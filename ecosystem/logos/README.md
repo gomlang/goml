@@ -102,9 +102,9 @@ Simulation costs approximately the inspected characters times the active NFA sta
 From the repository root:
 
 ```sh
-python3 ecosystem/verify.py logos
+just ecosystem-test logos
 ```
 
-The external library tests cover maximal munch, automatic/explicit priorities, ambiguity, nullable loops, bounded repeats, Unicode classes/spans, error recovery, callbacks/bump, extras, modes, snapshots, limits, adversarial alternation, and independent concurrent lexers. A registry consumer verifies the public generic API. `interop.py` compares 3,155 deterministic cases against independent Python `re` full-match evaluation of every candidate prefix; it includes exhaustive short binary inputs and generated multi-rule, Unicode, skip, flag and priority cases. Python is used only for validation.
+The external library tests cover maximal munch, automatic/explicit priorities, ambiguity, nullable loops, bounded repeats, Unicode classes/spans, error recovery, callbacks/bump, extras, modes, snapshots, limits, adversarial alternation, and independent concurrent lexers. A registry consumer verifies the public generic API. Native consumer tests compare all 3,155 retained reference cases from independent `re` full-match evaluation of every candidate prefix; they include exhaustive short binary inputs and generated multi-rule, Unicode, skip, flag and priority cases. [Fixture provenance](../consumers/logos/tests/data/README.md) records the model and seed. Running the tests requires only GoML.
 
 Reference design: [Logos token rules](https://logos.maciej.codes/attributes/token_and_regex.html), [disambiguation](https://logos.maciej.codes/token-disambiguation.html), [callbacks](https://logos.maciej.codes/callbacks.html), and [extras](https://logos.maciej.codes/extras.html).

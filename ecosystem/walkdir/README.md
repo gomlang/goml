@@ -72,12 +72,12 @@ Traversal uses an explicit stack rather than recursive calls; memory scales with
 From the repository root:
 
 ```sh
-python3 ecosystem/verify.py walkdir
+just ecosystem-test walkdir
 ```
 
 The independent consumer preserves the complete former compiler regression
 fixture and exercises the package through a normal versioned dependency. The module retains all 8 original internal tests and adds 6 public-API
-tests for filesystem boundaries and resource lifecycle. `race.py` compiles
+tests for filesystem boundaries and resource lifecycle. The GoML verifier compiles
 the generated library and consumer test runners with Go's race detector and runs
 the same real-filesystem cases. Tests create unique temporary directories and
 remove them after each run; no external service or privileged mount is required.

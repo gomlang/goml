@@ -91,11 +91,13 @@ Protocol semantics follow [XTerm control sequences](https://invisible-island.net
 ## Verification
 
 ```sh
-python3 ecosystem/verify.py ansi
+just ecosystem-test ansi
 ```
 
 Tests cover every attribute combination through all four profiles, fragmented
 UTF-8/CSI/OSC at every byte boundary, malformed/over-limit input, wide-cell clips,
 cross-span combining/ZWJ sequences, hyperlinks and partial consumer writes.
-`interop.py` independently checks 2,800 generated SGR, command stripping, palette
-quantization and rendered terminal-state cases with a deterministic Python model.
+Native consumer tests check all 2,800 retained independent SGR, command stripping, palette
+quantization and rendered terminal-state reference cases. The expected values come
+from the former independent model; emitted ANSI is replayed by a separate GoML
+screen model. See [fixture provenance](../consumers/ansi/tests/data/README.md).

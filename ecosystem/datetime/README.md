@@ -59,19 +59,19 @@ Files containing leap records are rejected: this library uses POSIX seconds, so 
 
 System lookup depends on the installed timezone data and does not invent a version identifier: TZif has no database-version field. Applications needing reproducibility should ship a selected dataset and call `load_from` or `from_tzif`.
 
-`fixtures/VERSION` records `2026c`, as reported by the source system's `tzdata.zi`. The six bundled zone files are compiled distribution data, with individual hashes in `fixtures/SHA256SUMS`; the Dublin file uses the distribution's positive-DST compatibility encoding. These are test fixtures, not a bundled global timezone database. The IANA database is [public-domain data](https://data.iana.org/time-zones/tz-link.html). `fixture_builder.py` deterministically regenerates the separately authored `Synthetic/` files and refreshes the fixture checksums without replacing the six IANA files.
+`fixtures/VERSION` records `2026c`, as reported by the source system's `tzdata.zi`. The six bundled zone files are compiled distribution data, with individual hashes in `fixtures/SHA256SUMS`; the Dublin file uses the distribution's positive-DST compatibility encoding. These are test fixtures, not a bundled global timezone database. The IANA database is [public-domain data](https://data.iana.org/time-zones/tz-link.html). The separately authored raw `Synthetic/` fixtures are retained with [their complete type, transition and footer definitions](fixtures/README.md). Native GoML tests verify every fixture hash and independently rebuild all nine synthetic TZif files from RFC 9636 field layouts before comparing their bytes. No Python runtime is required.
 
 ## Verification and reference differences
 
 Run from the repository root:
 
 ```sh
-python3 ecosystem/verify.py datetime
+just ecosystem-test datetime
 ```
 
-The verification runs 18 library tests, the independent versioned consumer, cached-build checks, 8,140 calendar/timezone/reference cases, and all 18 tests under Go's race detector. The concurrent test shares one immutable zone across 12 workers performing local resolution and reverse conversion.
+The verification runs 19 library tests, the independent versioned consumer, cached-build checks, 8,140 calendar/timezone/reference cases, and all 19 tests under Go's race detector. The concurrent test shares one immutable zone across 12 workers performing local resolution and reverse conversion.
 
-Python `datetime` validates Gregorian/ISO-week arithmetic and month policies. Python `zoneinfo` reads the exact bundled zone bytes for historical second offsets, negative epochs, DST gaps/folds, skipped dates, non-hour transitions, and future timestamps beyond explicit records. Go `time.LoadLocationFromTZData` is an independent oracle for synthetic POSIX cases at nonnegative epochs. RFC 9636 supplies fixed expected values for the all-year DST fixture. The Go reference executable is test tooling only.
+The native consumer test replays [8,140 independently produced reference vectors](../consumers/datetime/tests/data/README.md), without running Python or a reference executable. Their original sources are Python `datetime` for Gregorian/ISO-week arithmetic and month policies. Python `zoneinfo` reads the exact bundled zone bytes for historical second offsets, negative epochs, DST gaps/folds, skipped dates, non-hour transitions, and future timestamps beyond explicit records. Go `time.LoadLocationFromTZData` is an independent oracle for synthetic POSIX cases at nonnegative epochs. RFC 9636 supplies fixed expected values for the all-year DST fixture. The retained Go reference source documents those oracle semantics; ordinary tests use the frozen independent results.
 
 Oracle selection follows the specifications, because the reference implementations also have edge cases:
 

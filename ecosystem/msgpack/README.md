@@ -4,7 +4,7 @@ A native GoML implementation of the [MessagePack wire specification](https://git
 The dynamic codec supports every wire type. The typed codec implements
 `std::serde::Serializer` and `Deserializer` directly, including generic structs,
 enums, tuples, options, sequences, binary data, extensions and maps with arbitrary key types.
-No Go FFI or runtime reflection is used. Python is only a verification dependency.
+No Go FFI, runtime reflection or Python verification dependency is used.
 
 ## Typed API
 
@@ -187,8 +187,7 @@ counter.
 From the repository root:
 
 ```sh
-python3 ecosystem/verify.py msgpack
-python3 ecosystem/msgpack/interop.py
+just ecosystem-test msgpack
 ```
 
 The library has 20 external tests covering integer boundaries, all length
@@ -202,13 +201,12 @@ The separate consumer resolves a normal versioned dependency from the isolated
 registry snapshot. It tests downstream derives and generic specialization;
 the verifier also builds, runs and checks unchanged cached build artifacts.
 
-The interoperability harness uses checksum-pinned
-[msgpack-python 1.1.2](https://pypi.org/project/msgpack/1.1.2/), extracted only under
-`ecosystem/_artifact/reference/`. It performs 2,490 checks, including every valid
-first-byte tag, 1,234 truncations, 400 generated recursive values, 480 typed
-map/positional cases, timestamp formats, raw strings, and 20,000 concatenated
-small messages. GoML output is checked against independent reference bytes and
-read by the Python implementation. Reports go under
-`ecosystem/_artifact/verification/msgpack/`.
+The independent consumer replays 2,490 committed reference cases through GoML
+`#[test]`, covering all 256 tags, malformed/truncated input, exact float bit
+patterns, arbitrary maps, recursive values, timestamps, typed Serde modes and
+incremental streams. Expected bytes were produced by checksum-pinned
+[msgpack-python 1.1.2](https://pypi.org/project/msgpack/1.1.2/) when the fixture was
+captured; the reference implementation is not run or downloaded during tests.
+See [fixture provenance](../consumers/msgpack/tests/data/README.md).
 
 The streaming serializer and deserializer both report `is_human_readable() == false`, so format-sensitive Serde implementations can select their binary representation.

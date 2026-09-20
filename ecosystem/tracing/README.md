@@ -82,11 +82,11 @@ Always close the tracer before leaving its task scope. Cancellation of the ownin
 From the repository root:
 
 ```sh
-python3 ecosystem/verify.py tracing
+just ecosystem-test tracing
 ```
 
-This checks formatting, black-box tests, the standalone registry consumer, cached builds, a deterministic independent Python event/ancestry/field oracle, and every library test under the Go race detector. Tests coordinate blocked sinks with channels and cover saturation, cancellation, deadlines, retryable barriers/closure, filter reload, independent sampling ordinals, alias isolation, concurrent task propagation, concurrent span/tracer closure, and sink failures.
+This checks formatting, black-box tests, the standalone registry consumer, cached builds, a native consumer test replaying a deterministic independent event/ancestry/field oracle, and every library test under the Go race detector. Tests coordinate blocked sinks with channels and cover saturation, cancellation, deadlines, retryable barriers/closure, filter reload, independent sampling ordinals, alias isolation, concurrent task propagation, concurrent span/tracer closure, and sink failures.
 
-The Python oracle generates root/child visibility and sampling decisions independently, compares event multisets, and verifies sequence numbers, start/end pairing, visible ancestry, elapsed-time constraints, typed fields, and metrics. It does not claim binary or API compatibility with Rust tracing or OpenTelemetry.
+The committed reference fixture records 92 scenarios generated independently for root/child visibility and sampling decisions. A GoML `#[test]` compares event multisets and verifies sequence numbers, start/end pairing, visible ancestry, elapsed-time constraints, typed fields and metrics. The test has no Python runtime dependency. See [fixture provenance](../consumers/tracing/tests/data/README.md). It does not claim binary or API compatibility with Rust tracing or OpenTelemetry.
 
 Future work includes W3C trace propagation, OpenTelemetry exporters, richer sampling policies, subscriber lifecycle aggregation, byte-budget admission, and optional instrumentation syntax once supported by the language.

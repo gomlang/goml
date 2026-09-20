@@ -84,7 +84,7 @@ Markdown preview, background scan progress and filesystem refresh. It provides
 both an interactive application and a deterministic textual snapshot mode:
 
 ```sh
-python3 ecosystem/examples/explorer/verify.py
+just ecosystem-test explorer
 ```
 
 ## Tools
@@ -96,7 +96,7 @@ tables and JSON output. Its lexer-aware counting handles raw and multiline
 strings without mistaking their contents for comments.
 
 ```sh
-python3 ecosystem/goml_stats/verify.py
+just ecosystem-test goml_stats
 ecosystem/goml_stats/_artifact/bin/cmd/goml_stats/goml_stats .
 ```
 
@@ -105,36 +105,43 @@ ecosystem/goml_stats/_artifact/bin/cmd/goml_stats/goml_stats .
 Run the available library and independent consumer checks from the repository root:
 
 ```sh
-python3 ecosystem/verify.py
-python3 ecosystem/verify.py lsp markdown diff
-python3 ecosystem/verify.py color unicode_text ansi terminal tui prompt progress diagnostics tui_markdown
-python3 -m unittest discover -s ecosystem/tests
+just ecosystem-test
+just ecosystem-test lsp markdown diff
+just ecosystem-test color unicode_text ansi terminal tui prompt progress diagnostics tui_markdown
+cd ecosystem/verification && ../../stage2/bin/goml test
 ```
 
 With no module arguments, the verifier checks all registered libraries and their
-consumers. A missing module or failed check is an error. It creates an isolated,
+consumers, the statistics CLI and the Explorer application. A missing module or
+failed check is an error. The verifier is a standalone GoML module; all test
+orchestration and assertions run through GoML without Python. It creates an isolated,
 content-addressed registry snapshot under `ecosystem/_artifact/`, leaving the
 user's registry untouched. Consumers resolve normal versioned dependencies from
 that snapshot. Snapshot contents are captured once and published atomically so
 parallel verifiers cannot observe a partially populated registry. Verification
 logs and command timings are written under
 `ecosystem/_artifact/verification/`. Real terminal checks run automatically for
-modules containing `pty_test.py`; they use local pseudo-terminals and do not
-require a human-controlled terminal.
+terminal, tui, prompt, progress, tui_markdown and Explorer; they use local
+pseudo-terminals and do not require a human-controlled terminal. Race checks
+build and run GoML test suites with `GOFLAGS=-race`, including declared native
+adapter tests. `--no-race` skips that extra pass for focused development.
 
 Each implemented library has a README describing its API, semantics, limits and
 tests. [FINDINGS.md](FINDINGS.md) records language capabilities and compiler/API boundaries discovered during this work.
 
 SQLite also requires its declared native Go dependencies to be fetched before
-readonly compilation (`cd ecosystem/sqlite && go mod download all`). The NumPy
-reference check uses CPython 3.12 on Linux amd64. Reference programs and wheels
-are downloaded into ignored `_artifact/` directories as documented by each
-library; race checks require the repository's C compiler prerequisite. Redis's
-DNS/TLS checks additionally use OpenSSL to generate ephemeral local certificates.
+readonly compilation (`cd ecosystem/sqlite && go mod download all`). Its
+bidirectional database-file check uses the system `libsqlite3.so.0` and the C
+compiler; SQLite development headers are not required. Independent
+numeric, protocol and state-machine oracle results are checked-in text fixtures
+with documented source versions and generation provenance; GoML tests compare
+public library behavior with those expected values. These are fixed reference
+vectors, not fresh runs of Python, NumPy or Rust reference implementations.
+Real process, filesystem, network, PTY and GNU diff/patch checks still execute
+against the host. Race checks require the repository's C compiler prerequisite.
+Redis checks use a checksum-pinned reference server and local TLS peers.
 Unicode conformance checks freshly download the checksum-pinned Unicode source
 files on every invocation; compressed datasets are not versioned.
-The bitflags reference checker additionally requires `rustc` and downloads a
-checksum-pinned reference crate; the GoML library itself has no Rust dependency.
 The LLVM binding requires LLVM 18 development headers and `libLLVM-18` under
 `/usr/lib/llvm-18`, plus a C compiler and enabled cgo. Its verification also uses
 the LLVM command-line tools in that installation to check emitted IR and bitcode.

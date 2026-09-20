@@ -209,21 +209,26 @@ recovers the original error for native `errors.Is`/`errors.As` consumers.
 ## Verification and compiler boundaries
 
 ```sh
-python3 ecosystem/verify.py sqlite
+just ecosystem-test sqlite
 ```
 
-The matrix includes 13 GoML library tests, a separate consumer, cached builds,
-243 independent Python SQLite sequences with 2,754 checked operations, and
-bidirectional database-file interoperability. The reference run used Python
-SQLite 3.45.1 against the pinned adapter's SQLite 3.50.4. It compares storage
-classes and exact integers/blobs/text, with tolerances for REAL values. File
-checks also cover read-only opening and rollback on close.
+GoML library and consumer tests cover ordinary APIs and replay 243 independent
+SQLite 3.45.1 reference sequences, including prepared statements, transactions,
+savepoints, joins, aggregates, recursive queries, JSON and errors. The committed
+fixture records the independent engine's results; integers/blobs/text are exact
+and REAL values use a 1e-12 tolerance. No reference interpreter is needed at test
+time. See [fixture provenance](../consumers/sqlite/tests/data/README.md).
 
-`race.py` runs four native Go tests under the race detector, then builds and
-runs all 13 GoML tests with `go build -race`. Native tests cover lock contention
-between physical connections, cancellation while waiting for the connection
-gate, blob copying, retained error identity and a native-transaction termination
-fault injected before commit.
+A database fixture produced by the independent engine is copied into `_artifact`
+for real file reads/writes, rollback-on-close and read-only reopening. A small C
+SQL executor linked to the system `libsqlite3.so.0` independently reads the GoML
+changes, checks rollback visibility through GoML assertions, then writes binary
+and Unicode values which GoML reads back. This verification requires a C compiler
+and the system SQLite runtime; SQLite development headers are not needed. The shared
+verifier runs native and generated tests under Go's race detector. Native tests
+cover lock contention between physical connections, cancellation while waiting
+for the connection gate, blob copying, retained error identity and a
+native-transaction termination fault injected before commit.
 
 External handle types use small named Go interfaces rather than exposing the
 large `database/sql` implementation graph. This avoids the current FFI type-graph

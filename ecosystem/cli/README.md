@@ -216,7 +216,7 @@ before required-value checks. The library never exits the process or prints on
 the caller's behalf.
 
 ```sh
-python3 ecosystem/verify.py cli
+just ecosystem-test cli
 ```
 
 Tests exercise explicit schemas, clusters, terminators, duplicate/missing values,
@@ -227,7 +227,7 @@ optional selectors, flattened positional offsets and argument groups, global
 options at multiple command levels, alias canonicalization, help/version
 inheritance and invalid schemas. The independent consumer verifies
 registry-exported derives, import aliases and generated-name hygiene;
-`diagnostics.py` checks invalid derives through a temporary downstream module.
+A GoML test checks 33 invalid derives through temporary downstream modules, using `std::process` to assert compiler exit status and precise diagnostics.
 
 Shell completion and flag/counter defaults or environment values remain future
 work. Schemas must form a finite command tree; recursive type definitions that

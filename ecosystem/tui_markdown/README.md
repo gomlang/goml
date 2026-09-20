@@ -78,10 +78,8 @@ Default limits are width 1–4,096 columns, 1 MiB source/AST text, 4 MiB layout 
 
 A preflight traversal checks each child vector length before descending, counts scalar text/URL/title bytes and nodes, and rejects cyclic/deep manually constructed ASTs without bulk-copying child vectors onto an unbounded traversal stack. Formatting uses separate output/traversal limits. Errors contain a recoverable message. Callbacks and concurrent mutation of supplied ASTs are outside the traversal contract.
 
-Tests cover block snapshots, Unicode/style boundaries, safe links and literal HTML, optional table escaping and alignment, cycles and resource limits, viewport/search behavior, snapshot isolation and selected-link visibility after resizing. Independent consumers exercise public composition with TUI. `interop.py` checks 1,110 successful cases against a separate Python layout model plus eight resource-limit rejection cases. `pty_test.py` exercises Unicode columns, scrolling, code, tables, quotes, link selection, reflow and terminal restoration through a real Linux PTY.
+Tests cover block snapshots, Unicode/style boundaries, safe links and literal HTML, optional table escaping and alignment, cycles and resource limits, viewport/search behavior, snapshot isolation and selected-link visibility after resizing. Independent consumers exercise public composition with TUI. Native consumer tests check all 1,110 retained independent layout cases plus eight resource-limit rejection cases. The native GoML PTY verifier exercises Unicode columns, scrolling, code, tables, quotes, link selection, reflow and terminal restoration through a real Linux PTY.
 
 ```sh
-python3 ecosystem/verify.py tui_markdown
-python3 ecosystem/tui_markdown/interop.py
-python3 ecosystem/tui_markdown/pty_test.py
+just ecosystem-test tui_markdown
 ```

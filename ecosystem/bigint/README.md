@@ -74,7 +74,7 @@ With `n` and `m` limbs, addition/subtraction and bitwise operations are linear, 
 From the repository root:
 
 ```sh
-python3 ecosystem/verify.py bigint
+just ecosystem-test bigint
 ```
 
-Black-box tests cover signed division identities, quotient-correction boundaries, carry chains, fixed-width conversion extremes, all radices, canonical Serde, resource limits, detached storage, and shared concurrent arithmetic. The versioned consumer has its own tests. `interop.py` compares deterministic multi-limb arithmetic, signed bitwise operations and shifts, both division conventions, radices, signed bytes, powers, GCD/LCM, and modular powers with Python's independent arbitrary-precision integers. `race.py` runs the concurrent immutable arithmetic test under Go's race detector after the normal library test build.
+Black-box tests cover signed division identities, quotient-correction boundaries, carry chains, fixed-width conversion extremes, all radices, canonical Serde, resource limits, detached storage, and shared concurrent arithmetic. The versioned consumer has its own tests. The consumer’s native GoML tests check 1,938 frozen independent reference vectors covering multi-limb arithmetic, signed bitwise operations and shifts, both division conventions, radices, signed bytes, powers, GCD/LCM, and modular powers. [Vector provenance](../consumers/bigint/tests/data/README.md) records the independent arbitrary-precision reference and seed. The native ecosystem verifier also runs the concurrent immutable arithmetic tests under Go’s race detector. Python is not required.

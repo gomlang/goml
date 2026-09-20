@@ -101,6 +101,6 @@ every source, 32 complete four-node graphs compared against exhaustive spanning
 tree subsets, A* reopening and a 3,000-node chain/cycle.
 
 `../consumers/graph` uses normal versioned registry dependencies and downstream
-label types. Run `python3 ecosystem/verify.py graph` from the repository root to
+label types. Run `just ecosystem-test graph` from the repository root to
 check both modules, build a consumer twice, verify cached artifact stability,
 and run the executable.

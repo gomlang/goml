@@ -82,7 +82,16 @@ The current listener serves plain HTTP/1.1 over TCP. TLS termination, HTTP/2, HT
 Run from the repository root:
 
 ```sh
-python3 ecosystem/verify.py web
+just ecosystem-test web
 ```
 
-Verification includes 15 GoML black-box suites, three versioned-consumer suites, cached rebuild checks, Python HTTP client interoperability, 10 native adapter tests and race-detector execution of native tests, generated GoML tests and the concurrently exercised independent consumer. The consumer also runs concurrent typed requests from `ecosystem::reqwest` against a real web server and reads its streamed events, validating both native dependencies in one executable. Native tests cover real streaming before producer completion, slow-reader backpressure, disconnect cancellation, chunked-body limits, slow uploads, bounded admission, graceful and forced shutdown, concurrent shutdown, stale handles, panic handling and timeout/keep-alive behavior. The Python consumer test includes 60 seeded Unicode/form reference cases and covers typed payloads, streaming binary uploads, SSE, disconnection cleanup, concurrent shared state and wire-level deadline responses.
+GoML black-box tests, versioned-consumer tests, cached rebuild checks and native
+adapter tests cover routing, typed payloads, request/body limits and lifecycle.
+The consumer sends 120 generated Unicode query/form requests through
+`ecosystem::reqwest`, exercises concurrent requests and checks real HTTP status
+codes and duplicate headers. GoML `std::process` invokes curl as an independent
+HTTP client for a 200 KiB chunked binary upload and a timed SSE disconnect; it then
+asserts producer cleanup. Streaming events, shared counters and deadline responses
+are tested over actual loopback connections. Native adapter tests cover
+backpressure, admission, graceful/forced shutdown and transport failures. The
+shared verifier runs applicable native and generated tests under the race detector.

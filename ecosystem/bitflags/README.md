@@ -144,7 +144,7 @@ metadata. The derive enforces these conditions and emits constant mask methods.
 ## Verification
 
 ```sh
-python3 ecosystem/verify.py bitflags
+just ecosystem-test bitflags
 ```
 
 This runs public API tests, a separate versioned consumer, fresh/cached build
@@ -153,7 +153,9 @@ cover all 65,536 pairs of 8-bit operands, iterator reconstruction, aliases,
 overlaps, empty and unnamed definitions, signed/full-width storage, Unicode
 whitespace, malformed input, and explicit text/numeric Serde representations.
 
-`interop.py` needs `rustc` and downloads the checksum-pinned bitflags 2.13.2 crate
-into ignored `_artifact/`. It compares seven definition profiles with the real
-Rust implementation across operations, iteration, formatting, and parsing;
-no third-party Rust code is vendored or linked into the GoML library.
+A GoML consumer test replays 4,601 reference cases across seven definition
+profiles. Expected results were captured from the real checksum-pinned Rust
+bitflags 2.13.2 implementation using `oracle.rs`; ordinary tests need neither
+Rust nor a network download. See [fixture provenance](../consumers/bitflags/tests/data/README.md).
+Nineteen compile-fail cases run through GoML `std::process` in temporary downstream
+projects, checking both nonzero exits and precise diagnostic text.

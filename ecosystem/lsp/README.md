@@ -239,25 +239,20 @@ the application. Raw JSON handlers support their protocol messages.
 Run from the repository root:
 
 ```sh
-python3 ecosystem/verify.py lsp
+just ecosystem-test lsp
 ```
 
-The matrix formats/checks both modules, runs their tests, builds the consumer,
-checks cached artifact stability, executes its smoke path and runs `interop.py`.
-The protocol tests cover every two-part split of a Unicode frame, single-byte
-chunks, multiple frames, limits, truncated input, malformed headers, reset,
-malformed JSON, integer overflow, all message variants and request lifecycle.
-Document tests cover transactional rollback, original-coordinate edits, Unicode
-boundaries and source snapshot independence. Typed dispatch is tested in the
-library and its separate consumer.
+The GoML tests cover every two-part split of a Unicode frame, single-byte chunks,
+multiple frames, limits, truncated input, malformed headers, reset, malformed
+JSON, integer overflow, all message variants and request lifecycle. Document
+tests cover transactional rollback, original-coordinate edits and snapshots.
+A consumer test independently counts scalar byte/UTF-16/UTF-32 boundaries across
+300 generated multilingual documents, checking invalid boundaries and clamped
+positions. Deferred dispatch, outgoing deadlines, cancellation and duplicate
+suppression have direct native tests.
 
-The library runs 19 tests and its separate consumer runs 3. The independent Python
-client uses its own JSON framing and Unicode encoding oracle. The original
-UTF-16 suite checks 708 replies, 431 Unicode positions and 30 document-change
-sequences. The negotiation suite adds 4,768 UTF-8/16/32 positions and invalid
-boundaries, 48 transactional change sequences, CRLF split across rope chunks,
-unknown encodings and malformed-initialize retries. Its outgoing request suite
-checks actual cancellation/completion messages, early and overdue responses,
-explicit timer polling, duplicate suppression and exit cleanup through a GoML
-subprocess. This is targeted interoperability coverage, not certification against
-the entire LSP specification.
+A separate GoML test builds and starts the real stdio consumer with
+`std::process`, checks 102 correlated framed replies (decoding output one byte at
+a time), Unicode payloads and shutdown. Additional subprocesses verify premature
+exit, clean EOF, truncated bodies and invalid framing. Every subprocess has a
+deadline. This is targeted protocol coverage, not full LSP certification.

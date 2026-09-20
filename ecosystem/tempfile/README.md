@@ -87,12 +87,15 @@ Lifecycle methods are synchronized for copies of the same object. Named-file `re
 
 ## Local validation
 
-From the repository root:
-
 ```sh
-python3 ecosystem/verify.py tempfile
-python3 ecosystem/tempfile/interop.py
-python3 ecosystem/tempfile/race.py
+just ecosystem-test tempfile
 ```
 
-The library has 24 external tests covering permissions, validation, complete file I/O, sparse writes, reopen/duplicate semantics, no-clobber persistence, symlink behavior, non-UTF-8 cleanup, replaced/deleted names, parent renames, scope errors, transfer races, concurrent creation, descriptor counts, spill thresholds, failed rollover recovery, and concurrent spooled writes. An independent consumer tests the public registry boundary and cached artifact reuse. Python cross-checks binary contents, private permissions, cleanup, and 160 concurrent persists across five isolated directories; the race script runs every library test under Go's race detector.
+GoML tests cover permissions, validation, complete I/O, sparse writes,
+reopen/duplicate semantics, persistence, symlinks, non-UTF-8 cleanup, replaced or
+renamed parents, resource ownership, transfer races, concurrent creation,
+descriptor counts, spill thresholds and failed rollover recovery. Consumer tests
+check the registry boundary and perform five isolated real-filesystem roundtrips,
+verifying binary contents, private permissions, retained trees, scoped cleanup
+and 160 concurrent persists. The shared verifier runs generated GoML tests with
+Go's race detector.

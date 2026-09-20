@@ -1,0 +1,334 @@
+package main;
+
+use module::reference;
+use std::bytes::endian;
+use std::io;
+use std::os::linux::fd;
+use std::os::linux::ipc;
+use std::os::linux::process as linux;
+use std::time;
+use std::utf8;
+
+struct Pty {
+    master: fd::Fd,
+    slave: fd::Fd,
+    errors: fd::Fd,
+    process: linux::Child,
+    before: Vec[byte],
+    flags: usize,
+    output: Vec[byte],
+    screen: reference::Screen,
+    screen_enabled: bool,
+}
+
+fn pty_zeroes(count: isize) -> Vec[byte] {
+    let result = Vec::new();
+    for _ in 0..count {
+        result.push(0);
+    }
+    result
+}
+
+fn pty_termios(handle: fd::Fd) -> Result[Vec[byte], string] {
+    let result = pty_zeroes(36);
+    handle.ioctl(0x5401, result.as_mut_slice()).map_err(|e| e.to_string())?;
+    Result::Ok(result)
+}
+
+fn pty_resize(handle: fd::Fd, width: isize, height: isize) -> Result[(), string] {
+    let data = pty_zeroes(8);
+    endian::write_u16(data.as_mut_slice(), 0, height.to_u16(), endian::Endian::Little).map_err(
+        |e| e.to_string(),
+    )?;
+    endian::write_u16(data.as_mut_slice(), 2, width.to_u16(), endian::Endian::Little).map_err(
+        |e| e.to_string(),
+    )?;
+    handle.ioctl(0x5414, data.as_mut_slice()).map_err(|e| e.to_string())?;
+    Result::Ok(())
+}
+
+fn pty_require(condition: bool, message: string) -> Result[(), string] {
+    if condition {
+        Result::Ok(())
+    } else {
+        Result::Err("PTY: " + message)
+    }
+}
+
+impl Pty {
+    fn open(binary: string, argument: string, width: isize, height: isize) -> Result[Pty, string] {
+        let master = fd::open("/dev/ptmx", fd::O_RDWR | fd::O_NOCTTY | fd::O_NONBLOCK, 0).map_err(
+            |e| e.to_string(),
+        )?;
+        let mut success = false;
+        defer {
+            if !success {
+                let _ = master.close();
+            }
+        };
+        let lock = pty_zeroes(4);
+        master.ioctl(0x40045431, lock.as_mut_slice()).map_err(|e| e.to_string())?;
+        let number = pty_zeroes(4);
+        master.ioctl(0x80045430, number.as_mut_slice()).map_err(|e| e.to_string())?;
+        let index = endian::read_u32(number.as_slice(), 0, endian::Endian::Little).map_err(
+            |e| e.to_string(),
+        )?;
+        let slave = fd::open("/dev/pts/" + index.to_string(), fd::O_RDWR | fd::O_NOCTTY, 0).map_err(
+            |e| e.to_string(),
+        )?;
+        defer {
+            if !success {
+                let _ = slave.close();
+            }
+        };
+        pty_resize(slave, width, height)?;
+        let before = pty_termios(slave)?;
+        let flags = slave.status_flags().map_err(|e| e.to_string())?;
+        let errors = ipc::pipe(fd::O_NONBLOCK).map_err(|e| e.to_string())?;
+        defer {
+            let _ = errors.writer.close();
+            if !success {
+                let _ = errors.reader.close();
+            }
+        };
+        let process = linux::Command::new(binary).arg(argument).stdin(slave).stdout(slave).stderr(
+            errors.writer,
+        ).env("TERM", "xterm-256color").env("COLORTERM", "truecolor").env("NO_COLOR", "").spawn().map_err(
+            |e| e.to_string(),
+        )?;
+        success = true;
+        Result::Ok(
+            Pty {
+                master,
+                slave,
+                errors: errors.reader,
+                process,
+                before,
+                flags,
+                output: Vec::new(),
+                screen: reference::Screen::new(width, height),
+                screen_enabled: argument != "write",
+            },
+        )
+    }
+
+    fn close(self: Pty) -> () {
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+        let _ = self.master.close();
+        let _ = self.slave.close();
+        let _ = self.errors.close();
+    }
+
+    fn raw(self: Pty) -> string {
+        let length = match utf8::validate(self.output.as_slice()) {
+            Ok(_) => self.output.len(),
+            Err(error) => error.valid_up_to(),
+        };
+        utf8::decode_slice(self.output.slice(0, length)).unwrap_or("")
+    }
+
+    fn pump(self: Pty) -> Result[(), string] {
+        let interests = Vec::from_array(
+            [
+                ipc::PollInterest { descriptor: self.master, events: ipc::POLLIN },
+                ipc::PollInterest { descriptor: self.errors, events: ipc::POLLIN },
+            ],
+        );
+        let events = match ipc::poll(interests.as_slice(), 50) {
+            Ok(events) => events,
+            Err(error) => if error.kind() == io::ErrorKind::Interrupted {
+                return Result::Ok(());
+            } else {
+                return Result::Err(error.to_string());
+            },
+        };
+        let buffer = pty_zeroes(65536);
+        for event in events {
+            let descriptor = if event.index == 0 {
+                self.master
+            } else {
+                self.errors
+            };
+            match descriptor.read(buffer.as_mut_slice()) {
+                Ok(count) => {
+                    if count > 0 {
+                        if event.index == 1 {
+                            return Result::Err(
+                                "PTY child stderr: "
+                                    + utf8::decode_slice(buffer.slice(0, count)).unwrap_or(
+                                        "invalid UTF-8",
+                                    ),
+                            )
+                        }
+                        if self.output.len() + count > 16777216 {
+                            return Result::Err("PTY output exceeds 16 MiB limit")
+                        }
+                        for byte in buffer.slice(0, count) {
+                            self.output.push(byte);
+                        }
+                        if self.screen_enabled {
+                            self.screen.feed(buffer.slice(0, count))?;
+                        }
+                    }
+                },
+                Err(error) => if error.kind() != io::ErrorKind::WouldBlock
+                    && error.kind() != io::ErrorKind::Interrupted
+                    && error.raw_os_code() != Option::Some(5) {
+                    return Result::Err(error.to_string())
+                },
+            }
+        }
+        Result::Ok(())
+    }
+
+    fn until(self: Pty, condition: (Pty) -> bool, label: string) -> Result[(), string] {
+        let start = time::Instant::now();
+        while !condition(self) {
+            if start.elapsed().as_seconds() >= 15 {
+                return Result::Err("PTY timeout: " + label + "\n" + self.screen.text())
+            }
+            self.pump()?;
+        }
+        Result::Ok(())
+    }
+
+    fn wait(self: Pty, marker: string) -> Result[(), string] {
+        let scanned = Ref::new(0);
+        let pattern = marker.to_bytes();
+        self.until(
+            |child| {
+                let mut index = scanned.get();
+                while index + pattern.len() <= child.output.len() {
+                    let mut matches = true;
+                    for at in 0..pattern.len() {
+                        if child.output[index + at] != pattern[at] {
+                            matches = false;
+                            break;
+                        }
+                    }
+                    if matches {
+                        return true
+                    }
+                    index += 1;
+                }
+                scanned.set(index);
+                false
+            },
+            marker,
+        )
+    }
+
+    fn visible(self: Pty, marker: string) -> Result[(), string] {
+        self.until(|child| child.screen.text().contains(marker), marker)
+    }
+
+    fn send(self: Pty, value: string) -> Result[(), string] {
+        self.send_bytes(value.to_bytes().as_slice())
+    }
+
+    fn send_bytes(self: Pty, value: Slice[byte]) -> Result[(), string] {
+        let mut offset = 0;
+        let bytes = value.to_vec();
+        let start = time::Instant::now();
+        while offset < bytes.len() {
+            if start.elapsed().as_seconds() >= 10 {
+                return Result::Err("PTY input write timed out")
+            }
+            match self.master.write(bytes.slice(offset, bytes.len())) {
+                Ok(count) => {
+                    offset += count;
+                },
+                Err(error) => if error.kind() == io::ErrorKind::WouldBlock {
+                    self.pump()?;
+                } else if error.kind() != io::ErrorKind::Interrupted {
+                    return Result::Err(error.to_string())
+                },
+            }
+        }
+        Result::Ok(())
+    }
+
+    fn assert_raw(self: Pty, signals: bool) -> Result[(), string] {
+        let state = pty_termios(self.slave)?;
+        let local = endian::read_u32(state.as_slice(), 12, endian::Endian::Little).map_err(
+            |e| e.to_string(),
+        )?;
+        pty_require(
+            local
+                & if signals {
+                    11
+                } else {
+                    10
+                }
+                == 0,
+            "raw input flags",
+        )?;
+        pty_require(
+            self.slave.status_flags().map_err(|e| e.to_string())? == self.flags,
+            "status flags were modified",
+        )
+    }
+
+    fn resize(self: Pty, width: isize, height: isize) -> Result[(), string] {
+        self.screen.resize(width, height);
+        pty_resize(self.slave, width, height)
+    }
+
+    fn finish(self: Pty) -> Result[(), string] {
+        let start = time::Instant::now();
+        loop {
+            self.pump()?;
+            if let Some(outcome) = self.process.try_wait().map_err(|e| e.to_string())? {
+                pty_require(outcome.status.success(), "child exited unsuccessfully")?;
+                self.pump()?;
+                break;
+            }
+            if start.elapsed().as_seconds() >= 10 {
+                return Result::Err("PTY child did not exit")
+            }
+        }
+        pty_require(pty_termios(self.slave)? == self.before, "termios was not restored")?;
+        pty_require(
+            self.slave.status_flags().map_err(|e| e.to_string())? == self.flags,
+            "descriptor flags were not restored",
+        )
+    }
+
+    fn modes(self: Pty, alternate: bool, extras: bool) -> Result[(), string] {
+        let output = self.raw();
+        for sequence in Vec::from_array(["\u001b[?25l", "\u001b[?25h"]) {
+            pty_require(output.contains(sequence), "missing cursor mode " + sequence)?;
+        }
+        if alternate {
+            for sequence in Vec::from_array(
+                ["\u001b[?1049h", "\u001b[?1049l", "\u001b[?2004h", "\u001b[?2004l"],
+            ) {
+                pty_require(output.contains(sequence), "missing terminal mode " + sequence)?;
+            }
+        }
+        if extras {
+            for number in Vec::from_array([1002, 1006, 1004]) {
+                for suffix in Vec::from_array(["h", "l"]) {
+                    pty_require(
+                        output.contains("\u001b[?" + number.to_string() + suffix),
+                        "missing event mode",
+                    )?;
+                }
+            }
+        }
+        Result::Ok(())
+    }
+}
+
+pub fn verify_pty(name: string, binary: string) -> Result[(), string] {
+    match name {
+        "terminal" => verify_terminal_pty(binary),
+        "tui" => verify_tui_pty(binary),
+        "prompt" => verify_prompt_pty(binary),
+        "progress" => verify_progress_pty(binary),
+        "tui_markdown" => verify_markdown_pty(binary),
+        "explorer" => verify_explorer_pty(binary),
+        _ => Result::Ok(()),
+    }
+}

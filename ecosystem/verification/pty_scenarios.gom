@@ -1,0 +1,372 @@
+package main;
+
+use module::reference;
+use std::bytes;
+use std::bytes::endian;
+use std::io;
+use std::os::linux::fd;
+use std::os::linux::process as linux;
+use std::process;
+use std::time;
+use std::utf8;
+use utf8::BytesUtf8;
+
+fn terminal_session(binary: string, mode: string, body: (Pty) -> Result[(), string]) -> Result[
+    (),
+    string,
+] {
+    let child = Pty::open(binary, mode, 80, 24)?;
+    defer child.close();
+    child.wait("READY 80 24\n")?;
+    child.assert_raw(true)?;
+    let state = pty_termios(child.slave)?;
+    let output_flags = endian::read_u32(state.as_slice(), 4, endian::Endian::Little).map_err(
+        |e| e.to_string(),
+    )?;
+    pty_require(output_flags & 1 == 0, "terminal output processing still enabled")?;
+    body(child)?;
+    child.finish()?;
+    child.modes(true, true)
+}
+
+fn verify_terminal_pty(binary: string) -> Result[(), string] {
+    terminal_session(
+        binary,
+        "events",
+        |child| {
+            child.send("\u001b[")?;
+            time::sleep(time::Duration::from_milliseconds(5));
+            child.send("1;5A")?;
+            child.wait("control: true")?;
+            for byte in "中".to_bytes() {
+                child.send_bytes(Vec::from_array([byte]).as_slice())?;
+                time::sleep(time::Duration::from_milliseconds(5));
+            }
+            child.wait("中")?;
+            child.send("\u001b")?;
+            child.wait("Escape")?;
+            child.send("\u001b[200~hello\n")?;
+            child.send("世界\u001b[201~")?;
+            child.wait("PASTE hello\n世界\n")?;
+            child.send("\u001b[I\u001b[O\u001b[<0;12;8M\u001b[<0;12;8m")?;
+            child.wait("FOCUS false")?;
+            child.wait("Release")?;
+            child.resize(101, 41)?;
+            child.wait("RESIZE 101 41\n")?;
+            child.send("q")?;
+            child.wait("CLOSED")
+        },
+    )?;
+    terminal_session(
+        binary,
+        "cancel",
+        |child| {
+            child.wait("CANCEL TimedOut\n")?;
+            child.wait("CLOSED")
+        },
+    )?;
+    terminal_session(
+        binary,
+        "events",
+        |child| {
+            child.send_bytes(Vec::from_array([255.to_u8()]).as_slice())?;
+            child.wait("ERROR InvalidData")
+        },
+    )?;
+    terminal_session(
+        binary,
+        "write",
+        |child| {
+            time::sleep(time::Duration::from_milliseconds(80));
+            child.wait("CLOSED")?;
+            let output = child.raw();
+            let begin = output.find("READY 80 24\n").ok_or("missing write preface")?
+                + "READY 80 24\n".byte_len();
+            let end = output.find("\nWRITE DONE\n").ok_or("missing write completion")?;
+            pty_require(end - begin == 4194304, "partial output length")?;
+            let pattern = "0123456789abcdef";
+            for index in begin..end {
+                if output.byte_get(index) != pattern.byte_get((index - begin) % 16) {
+                    return Result::Err("PTY write payload corruption")
+                }
+            }
+            Result::Ok(())
+        },
+    )?;
+    for append in Vec::from_array([false, true]) {
+        verify_terminal_redirect(binary, append)?;
+    }
+    Result::Ok(())
+}
+
+fn verify_terminal_redirect(binary: string, append: bool) -> Result[(), string] {
+    let output = fd::memfd("goml-terminal-reference", 0).map_err(|e| e.to_string())?;
+    defer {
+        let _ = output.close();
+    };
+    let input = fd::open("/dev/null", fd::O_RDONLY, 0).map_err(|e| e.to_string())?;
+    defer {
+        let _ = input.close();
+    };
+    output.write("prefix".to_bytes().as_slice()).map_err(|e| e.to_string())?;
+    if append {
+        output.set_status_flags(output.status_flags().map_err(|e| e.to_string())? | fd::O_APPEND).map_err(
+            |e| e.to_string(),
+        )?;
+        output.seek(0, fd::SEEK_SET).map_err(|e| e.to_string())?;
+    }
+    let flags = output.status_flags().map_err(|e| e.to_string())?;
+    let child = linux::Command::new(binary).arg("redirect").stdin(input).stdout(output).spawn().map_err(
+        |e| e.to_string(),
+    )?;
+    defer {
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    let started = time::Instant::now();
+    loop {
+        if let Some(outcome) = child.try_wait().map_err(|e| e.to_string())? {
+            pty_require(outcome.status.success(), "redirect child failed")?;
+            break;
+        }
+        if started.elapsed().as_seconds() > 10 {
+            return Result::Err("redirect child timed out")
+        }
+        time::sleep(time::Duration::from_milliseconds(10));
+    }
+    pty_require(
+        output.status_flags().map_err(|e| e.to_string())? == flags,
+        "redirect flags changed",
+    )?;
+    output.seek(0, fd::SEEK_SET).map_err(|e| e.to_string())?;
+    let buffer = pty_zeroes(128);
+    let count = output.read(buffer.as_mut_slice()).map_err(|e| e.to_string())?;
+    pty_require(
+        utf8::decode_slice(buffer.slice(0, count)).map_err(|e| e.to_string())?
+            == "prefixsessionDONE\n",
+        "redirect offset/append mismatch",
+    )
+}
+
+fn verify_tui_pty(binary: string) -> Result[(), string] {
+    let child = Pty::open(binary, "--pty", 20, 6)?;
+    defer child.close();
+    child.wait("\u001b[6;20H")?;
+    child.assert_raw(false)?;
+    child.send("ab界")?;
+    child.visible("界")?;
+    child.send("\u007f")?;
+    child.wait("\u001b[2;3H")?;
+    child.wait("\u001b[2;4H ")?;
+    child.send("\u001b[200~hello\nworld\u001b[201~")?;
+    child.wait("\u001b[3;5H")?;
+    child.resize(32, 9)?;
+    child.wait("\u001b[9;32H")?;
+    child.send("\u001b")?;
+    child.finish()?;
+    child.modes(true, false)
+}
+
+fn prompt_session(binary: string, mode: string, body: (Pty) -> Result[(), string]) -> Result[
+    (),
+    string,
+] {
+    let child = Pty::open(binary, mode, 72, 8)?;
+    defer child.close();
+    body(child)?;
+    child.finish()?;
+    child.modes(true, false)
+}
+
+fn verify_prompt_pty(binary: string) -> Result[(), string] {
+    prompt_session(
+        binary,
+        "text",
+        |child| {
+            child.visible("? Name")?;
+            child.send("é👩‍💻\u007f中\r")?;
+            child.wait("RESULT é中")
+        },
+    )?;
+    prompt_session(
+        binary,
+        "integer",
+        |child| {
+            child.visible("? Port")?;
+            child.send("70000\r")?;
+            child.visible("between 1 and 65535")?;
+            child.send("\u007f\u007f\u007f\u007f\u007f8080\r")?;
+            child.wait("RESULT 8080")
+        },
+    )?;
+    prompt_session(
+        binary,
+        "password",
+        |child| {
+            child.visible("? Secret")?;
+            child.send("\u001b[200~SENSITIVE_PASSWORD\u001b[201~")?;
+            child.visible("•••")?;
+            child.send("\r")?;
+            child.wait("RESULT secret-bytes=18")?;
+            pty_require(
+                !reference::strip_csi(child.raw()).contains("SENSITIVE_PASSWORD"),
+                "secret appeared on terminal",
+            )
+        },
+    )?;
+    prompt_session(
+        binary,
+        "select",
+        |child| {
+            child.visible("? Language")?;
+            child.send("Rust\r")?;
+            child.wait("RESULT rust")
+        },
+    )?;
+    for (input, marker) in Vec::from_array(
+        [("\u0003", "ERROR prompt cancelled"), ("\u0004", "ERROR end of input")],
+    ) {
+        prompt_session(
+            binary,
+            "text",
+            |child| {
+                child.visible("? Name")?;
+                child.send(input)?;
+                child.wait(marker)
+            },
+        )?;
+    }
+    prompt_session(
+        binary,
+        "text",
+        |child| {
+            child.visible("? Name")?;
+            child.send_bytes(Vec::from_array([255.to_u8()]).as_slice())?;
+            child.wait("ERROR terminal:")
+        },
+    )?;
+    prompt_session(binary, "timeout", |child| child.wait("ERROR prompt deadline exceeded"))?;
+    prompt_session(binary, "broken", |child| child.wait("deliberate render failure"))?;
+    let result = process::Command::new(binary).arg("text").input(bytes::Bytes::new()).output_timeout_structured(
+        time::Duration::from_seconds(10),
+    ).map_err(|e| e.to_string())?;
+    let output = result.stdout().to_string_utf8().map_err(|e| e.to_string())?;
+    pty_require(
+        result.status().success() && output.contains("ERROR terminal:")
+            && !output.contains("\u001b"),
+        "redirected prompt did not fail cleanly",
+    )
+}
+
+fn verify_progress_pty(binary: string) -> Result[(), string] {
+    let child = Pty::open(binary, "pty", 80, 12)?;
+    defer child.close();
+    child.wait("READY")?;
+    child.assert_raw(false)?;
+    child.send("u")?;
+    child.wait("UPDATED")?;
+    child.wait("10/100")?;
+    child.send("l")?;
+    child.wait("LOG coordinated output")?;
+    pty_require(
+        child.raw().contains("\r\u001b[1A\u001b[2K\u001b[1A\u001b[2KLOG coordinated output\r\n"),
+        "log did not clear progress rows",
+    )?;
+    let before_resize = child.raw().byte_len();
+    child.resize(24, 8)?;
+    child.wait("RESIZED 24")?;
+    child.send("q")?;
+    child.wait("CLOSED")?;
+    child.wait("\u001b[?25h")?;
+    child.finish()?;
+    child.modes(false, false)?;
+    pty_require(!child.raw().contains("\u001b[?1049"), "progress entered alternate screen")?;
+    let raw = child.raw();
+    let resized = reference::strip_csi(raw.byte_slice(before_resize, raw.byte_len()));
+    pty_require(
+        resized.contains("+ download") && resized.contains("x 扫描"),
+        "finish/cancel output missing",
+    )?;
+    let result = process::Command::new(binary).input(bytes::Bytes::new()).output_timeout_structured(
+        time::Duration::from_seconds(10),
+    ).map_err(|e| e.to_string())?;
+    let output = result.stdout().to_string_utf8().map_err(|e| e.to_string())?;
+    pty_require(
+        result.status().success() && !output.contains("\u001b")
+            && output.contains("located 12 files\n")
+            && output.contains("12/12"),
+        "redirected progress output",
+    )
+}
+
+fn verify_markdown_pty(binary: string) -> Result[(), string] {
+    let child = Pty::open(binary, "--pty", 48, 8)?;
+    defer child.close();
+    child.until(
+        |child| child.screen.text().contains("Markdown Viewer")
+            && child.screen.text().contains("界👩‍💻.")
+            && child.screen.text().contains("second item"),
+        "initial Markdown viewport",
+    )?;
+    child.assert_raw(false)?;
+    for (column, expected) in Vec::from_array(
+        [(15, "界"), (16, ""), (17, "👩‍💻"), (18, ""), (19, ".")],
+    ) {
+        pty_require(
+            child.screen.cell(column, 2).text == expected,
+            "Unicode cell position " + column.to_string(),
+        )?;
+    }
+    pty_require(!child.screen.highlighted("Guide"), "link initially highlighted")?;
+    child.send("\u001b[B")?;
+    child.until(
+        |child| !child.screen.text().contains("Markdown Viewer")
+            && child.screen.text().contains("Hello GoML"),
+        "scroll down one line",
+    )?;
+    child.send("\u001b[A")?;
+    child.visible("Markdown Viewer")?;
+    child.send("\u001b[6~")?;
+    child.until(
+        |child| child.screen.text().contains("Name") && child.screen.text().contains("Value")
+            && child.screen.text().contains("┼"),
+        "table viewport",
+    )?;
+    pty_require(child.screen.text().contains("界"), "Unicode table cell missing")?;
+    child.send("\t")?;
+    child.until(|child| child.screen.highlighted("Guide"), "Tab link focus")?;
+    child.send("\u001b[Z")?;
+    child.until(|child| child.screen.highlighted("Guide"), "BackTab link focus")?;
+    child.send("\u001b[6~")?;
+    child.until(
+        |child| child.screen.text().contains("let ready = true;")
+            && child.screen.text().contains("┌ gom"),
+        "code viewport",
+    )?;
+    child.send("\u001b[F")?;
+    child.until(
+        |child| child.screen.text().contains("Last paragraph.")
+            && child.screen.text().contains("Safe terminal text"),
+        "End key",
+    )?;
+    child.send("\u001b[5~")?;
+    child.until(|child| !child.screen.text().contains("Last paragraph."), "PageUp key")?;
+    child.send("\u001b[H")?;
+    child.visible("Markdown Viewer")?;
+    child.resize(32, 10)?;
+    child.until(
+        |child| child.screen.highlighted("Guide")
+            && child.screen.text().contains("let ready = true;"),
+        "resized link and code viewport",
+    )?;
+    child.wait("\u001b[10;32H")?;
+    child.send("\u001b[H")?;
+    child.until(
+        |child| child.screen.text().contains("Markdown Viewer")
+            && child.screen.text().contains("界👩‍💻."),
+        "resized Home viewport",
+    )?;
+    child.send("\u001b")?;
+    child.finish()?;
+    child.modes(true, false)
+}

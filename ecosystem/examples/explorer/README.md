@@ -9,7 +9,7 @@ This is an application example with module path `example::explorer`, not a publi
 From the repository root:
 
 ```sh
-python3 ecosystem/examples/explorer/verify.py
+just ecosystem-test explorer
 
 ecosystem/examples/explorer/_artifact/bin/explorer .
 
@@ -18,7 +18,7 @@ ecosystem/examples/explorer/_artifact/bin/explorer --snapshot
 ecosystem/examples/explorer/_artifact/bin/explorer --snapshot ecosystem/examples/explorer
 ```
 
-The verifier builds against a private registry snapshot from `ecosystem/verify.py`; it does not publish packages or alter the user's registry. `--demo` is an alias for the built-in snapshot. Snapshots are 100 columns by 28 rows, plain text without terminal escapes. Interactive mode requires Linux amd64 and a real terminal; `--help` works without a terminal.
+The verifier builds against a private registry snapshot from the native `ecosystem/verification` module; it does not publish packages or alter the user's registry. `--demo` is an alias for the built-in snapshot. Snapshots are 100 columns by 28 rows, plain text without terminal escapes. Interactive mode requires Linux amd64 and a real terminal; `--help` works without a terminal.
 
 ## Controls
 
@@ -53,6 +53,6 @@ Traversal never follows directory symlinks, and interactive mode rejects a symli
 
 ## Verification
 
-`verify.py` checks formatting, five application tests, normal and cached builds, repeatable built-in snapshots, real PTY interaction, and the same tests under Go's race detector. It stores logs and a report under `_artifact/verification/`.
+`just ecosystem-test explorer` checks formatting, five application tests, normal and cached builds, repeatable built-in snapshots, real PTY interaction, and the same tests under Go's race detector. It stores logs and a report under `ecosystem/_artifact/verification/explorer/`.
 
 The PTY test uses an isolated temporary tree and a small screen model. It verifies background scan completion, ignored directories, root-file modification/create/delete notifications, selection, Markdown scrolling, manual refresh, resize, read-only behavior and restoration of termios, descriptor flags, cursor and alternate-screen state. The application tests also cover entry/depth bounds, symlink pruning, invalid UTF-8, oversized previews, replacement by a symlink, selection retention, missing roots, and cancellation while the worker is blocked on a full result channel.

@@ -79,9 +79,9 @@ This is not a drop-in Ropey port: there are no grapheme iterators, reverse itera
 From the repository root:
 
 ```sh
-python3 ecosystem/verify.py rope
+just ecosystem-test rope
 ```
 
-The verifier checks formatting, 11 library black-box tests, a separate versioned consumer test, initial and cached consumer builds, the runnable consumer, Python interoperability, and Go's race detector over all library tests.
+The verifier checks formatting, 11 library black-box tests, separate versioned consumer tests, initial and cached consumer builds, the runnable consumer, native reference corpus checks, and Go's race detector over all library tests.
 
-`interop.py` uses an independent Python flat-string / UTF-8 / UTF-16 / newline oracle: 67 deterministic scenarios, 3266 edits, and every final byte/scalar/UTF-16/line boundary. It covers malformed ranges, split surrogate and UTF-8 positions, CRLF at leaf seams, rotations, concatenation, compaction, builder fragments and snapshot preservation. Black-box tests additionally exercise AVL balance under repeated left/right joins, retained snapshots through edits, fragmented/invalid streaming I/O, parallel readers and editors, and checked logical-size overflow through shared doubling without huge allocations.
+Native consumer tests retain every result from an independent flat-string / UTF-8 / UTF-16 / newline model: 67 deterministic scenarios, 3266 edits, and every final byte/scalar/UTF-16/line boundary. It covers malformed ranges, split surrogate and UTF-8 positions, CRLF at leaf seams, rotations, concatenation, compaction, builder fragments and snapshot preservation. Black-box tests additionally exercise AVL balance under repeated left/right joins, retained snapshots through edits, fragmented/invalid streaming I/O, parallel readers and editors, and checked logical-size overflow through shared doubling without huge allocations.

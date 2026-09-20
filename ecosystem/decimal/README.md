@@ -140,15 +140,10 @@ precision versus fixed-scale semantics, cancellation, recurring and finite
 division, representation-preserving serialization, checked conversions,
 machine-integer and resource boundaries, numeric hash identity, immutable
 aliasing, and concurrent shared arithmetic. The independent consumer computes
-an invoice and recurring ratio through a versioned dependency. `interop.py`
-compares 3072 seeded cases with Python's `decimal` across all seven rounding
-modes, including error-versus-success agreement for quantize and division,
-and agreement on the `Rounded` and `Inexact` flags of every successful result.
-`race.py` exercises concurrent arithmetic and detached coefficient bytes
-under Go's race detector.
+an invoice and recurring ratio through a versioned dependency. Its native GoML tests compare 3,072 frozen independent `decimal` reference vectors across all seven rounding modes, including error-versus-success agreement for quantize and division and agreement on the `Rounded` and `Inexact` flags of every successful result. [Vector provenance](../consumers/decimal/tests/data/README.md) records the reference and seed. The native ecosystem verifier exercises concurrent arithmetic and detached coefficient bytes under Go’s race detector. Python is not required.
 
 Run from the repository root:
 
 ```sh
-python3 ecosystem/verify.py decimal
+just ecosystem-test decimal
 ```

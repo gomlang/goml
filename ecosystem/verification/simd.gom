@@ -1,0 +1,167 @@
+package main;
+
+use std::fs;
+use std::json;
+use std::path;
+
+struct SimdKernel {
+    symbol: string,
+    needs_avx: bool,
+}
+
+fn simd_field(value: json::Value, name: string) -> Result[json::Value, string] {
+    json::field(value, name).ok_or("missing SIMD metadata field: " + name)
+}
+
+pub fn verify_simd(context: Verification, consumer: string, binary: string, logs: string) -> Result[
+    (),
+    string,
+] {
+    let source = fs::read_file_structured(
+        path::join(consumer, "_artifact/build/pkg/consumer/ndarray/goml_generated.go"),
+    ).map_err(|error| error.to_string())?;
+    let marker = "const _goml_simd_native = ";
+    let mut metadata = Option::None;
+    for line in source.split("\n") {
+        if line.starts_with(marker) {
+            let encoded = json::parse(line.byte_slice(marker.len(), line.len()))?;
+            let encoded = json::as_string(encoded).ok_or(
+                "SIMD metadata must be an encoded JSON string",
+            )?;
+            metadata = Option::Some(json::parse(encoded)?);
+        }
+    }
+    let metadata = metadata.ok_or("missing native SIMD metadata")?;
+    let kernels = json::as_array(simd_field(metadata, "kernels")?).ok_or(
+        "expected SIMD kernel array",
+    )?;
+    if kernels.len() == 0 {
+        return Result::Err("empty SIMD kernel metadata");
+    }
+    let descriptions = Vec::new();
+    let mut assembly = "";
+    for kernel in kernels {
+        let body = json::as_string(simd_field(kernel, "assembly")?).ok_or("expected SIMD assembly")?;
+        assembly += body + "\n";
+        let definitions = body.split("TEXT ·");
+        if definitions.len() != 2 {
+            return Result::Err("invalid native SIMD symbol definition");
+        }
+        let names = definitions[1].split("(SB)");
+        if names.len() < 2 || names[0] == "" {
+            return Result::Err("missing native SIMD symbol");
+        }
+        let avx2 = json::as_bool(simd_field(kernel, "avx2")?).ok_or("invalid SIMD avx2 flag")?;
+        let fma = json::as_bool(simd_field(kernel, "fma")?).ok_or("invalid SIMD fma flag")?;
+        descriptions.push(
+            SimdKernel { symbol: "main." + names[0] + ".abi0", needs_avx: avx2 || fma },
+        );
+    }
+    for instruction in Vec::from_array(
+        ["ADDPS", "SUBPS", "MULPS", "DIVPS", "VADDPD", "VSUBPD", "VMULPD", "VDIVPD"],
+    ) {
+        if !assembly.contains(instruction) {
+            return Result::Err("missing SIMD instruction: " + instruction);
+        }
+    }
+    let reports = Vec::new();
+    for mode in Vec::from_array(["native", "sse2", "scalar"]) {
+        let target = if mode == "native" {
+            path::join(consumer, "_artifact")
+        } else {
+            path::join(consumer, "_artifact/simd-" + mode)
+        };
+        let selected_binary = if mode == "native" {
+            binary
+        } else {
+            path::join(target, "bin/ndarray")
+        };
+        if mode != "native" {
+            run_command(
+                context,
+                Vec::from_array(
+                    ["env", "GOML_SIMD=" + mode, context.goml, "build", "--target-dir", target],
+                ),
+                consumer,
+                selected_binary,
+                path::join(logs, "simd-" + mode + "-build.log"),
+                false,
+            )?;
+            run_command(
+                context,
+                Vec::from_array(
+                    [
+                        "env",
+                        "GOML_SIMD=" + mode,
+                        context.goml,
+                        "test",
+                        "--target-dir",
+                        target,
+                        "--timeout",
+                        "180s",
+                    ],
+                ),
+                consumer,
+                selected_binary,
+                path::join(logs, "simd-" + mode + "-tests.log"),
+                false,
+            )?;
+        }
+        let table = run_command(
+            context,
+            Vec::from_array(["go", "tool", "nm", selected_binary]),
+            consumer,
+            selected_binary,
+            path::join(logs, "simd-" + mode + "-symbols.log"),
+            false,
+        )?;
+        let linked = Vec::new();
+        for line in table.split("\n") {
+            let fields = Vec::new();
+            for word in line.replace("\t", " ").split(" ") {
+                if word != "" {
+                    fields.push(word);
+                }
+            }
+            if fields.len() > 0 {
+                linked.push(fields[fields.len() - 1]);
+            }
+        }
+        let found = Vec::new();
+        for kernel in descriptions {
+            let actual = linked.contains(kernel.symbol);
+            let expected = mode == "native" || (mode == "sse2" && !kernel.needs_avx);
+            if actual != expected {
+                return Result::Err(
+                    mode + ": unexpected linked status for SIMD symbol " + kernel.symbol,
+                );
+            }
+            if actual {
+                found.push(kernel.symbol);
+            }
+        }
+        run_command(
+            context,
+            Vec::from_array([selected_binary]),
+            consumer,
+            selected_binary,
+            path::join(logs, "simd-" + mode + "-run.log"),
+            false,
+        )?;
+        reports.push(
+            json::object(
+                Vec::from_array(
+                    [
+                        ("mode", json::to_value(mode)?),
+                        ("linked_native_kernels", json::to_value(found.len())?),
+                        ("symbols", json::to_value(found)?),
+                    ],
+                ),
+            ),
+        );
+    }
+    fs::write_file_structured(
+        path::join(logs, "simd-verification.json"),
+        json::encode(json::Value::Array(reports)) + "\n",
+    ).map_err(|error| error.to_string())
+}

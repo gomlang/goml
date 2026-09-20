@@ -185,11 +185,12 @@ TinyLFU, refresh-ahead, stale-while-revalidate, persistence, or distributed prot
 
 ## Validation
 
-Run `python3 ecosystem/verify.py cache` from the repository root. It creates an
+Run `just ecosystem-test cache` from the repository root. It creates an
 isolated versioned registry, formats/checks the projects, runs 22 black-box library
-tests and an independent consumer test, verifies a stable cached build, and runs:
+tests and independent consumer tests, verifies a stable cached build, and runs:
 
-- 160 deterministic histories checked against Python `OrderedDict`, with 42,240
+- 160 deterministic histories checked by native consumer tests against retained
+  independent `OrderedDict` reference results, with 42,240
   operations and 20,303 query results across LRU, weights, TTL, TTI, Unicode values,
   replacement, removal, and clear.
 - The complete library test executable rebuilt with Go's race detector, including

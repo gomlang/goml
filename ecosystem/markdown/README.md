@@ -113,7 +113,7 @@ allocate before they are written.
 Run from the repository root:
 
 ```sh
-python3 ecosystem/verify.py markdown
+just ecosystem-test markdown
 ```
 
 The command checks formatting, library tests, a separately resolved consumer,
@@ -124,17 +124,8 @@ policy, render options and resource/cycle errors. The independent consumer
 imports only public APIs and also offers stdin conversion through `--safe`,
 `--commonmark` and a JSON-array batch interface through `--json`.
 
-`interop.py` runs every example from the [CommonMark 0.31.2 reference corpus](https://spec.commonmark.org/0.31.2/spec.json)
-and fails on any mismatch. The corpus is downloaded into `_artifact/reference`
-and checked against a fixed SHA-256 digest before use. Per-section counts and
-every failure are recorded in `_artifact/verification/markdown/commonmark.json`.
-The CommonMark specification and examples are by John MacFarlane, licensed under
-[CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/).
+The consumer’s native `tests/reference_test.gom` checks all 652 examples from the [CommonMark 0.31.2 reference corpus](https://spec.commonmark.org/0.31.2/spec.json), together with all 2,125 named entities. The checked-in independent corpus records the original CommonMark SHA-256 digest `d431b29d97b6f73e69d547109cf5081578fac931e72afe95639ebe766c1b2a20`; running the tests needs no Python or network access. The CommonMark specification and examples are by John MacFarlane, licensed under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/).
 
-The runner also checks all 2,125 named entities against Python's `html.entities`
-table. `entities.gom` is generated data derived from that table in Python 3.12.3;
-the transformation keeps semicolon-ended names and emits GoML lookup functions.
-The source license is retained in [LICENSE.entities.txt](LICENSE.entities.txt).
-Regenerate with `python3 ecosystem/markdown/generate_entities.py`, then run the
-module's GoML formatter and verification command. Generated data is checked in;
-Python is needed for verification/regeneration, not for library execution.
+`entities.gom` is generated from the independently sourced HTML5 entity data retained in [tools/data/entities.json](tools/data/entities.json). The source is CPython 3.12.3 `html.entities.html5`, restricted to semicolon-ended names. Its license is retained in [LICENSE.entities.txt](LICENSE.entities.txt). The native GoML generator validates the data checksum and 2,125-entry count, then emits the same lookup functions deterministically. Its ordinary native test verifies the exact generated file on each `just ecosystem-test markdown` run.
+
+To regenerate, run `../../../stage2/bin/goml build` from `ecosystem/markdown/tools`, then `_artifact/bin/markdown_entities generate ..`. `check` verifies the file without writing. The data and generator need no Python installation.

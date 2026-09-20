@@ -92,9 +92,9 @@ All edit offsets refer to the original snapshots. Nonempty overlapping ranges ar
 ## Validation
 
 ```sh
-GOML_BUILD_JOBS=2 python3 ecosystem/verify.py diagnostics
+GOML_BUILD_JOBS=2 just ecosystem-test diagnostics
 ```
 
-The suite covers 22 library tests and 3 independent consumer tests: cache identity, malformed spans, CRLF/CR/EOF, combining and emoji boundaries, tabs, overlapping and multiline labels, exact plain layouts, ANSI equivalence, custom themes, horizontal/vertical clipping, output limits, control injection, edit conflicts, final-size preflight, and immutable source revisions.
+The suite covers 22 library tests and 4 independent consumer tests: cache identity, malformed spans, CRLF/CR/EOF, combining and emoji boundaries, tabs, overlapping and multiline labels, exact plain layouts, ANSI equivalence, custom themes, horizontal/vertical clipping, output limits, control injection, edit conflicts, final-size preflight, and immutable source revisions.
 
-`interop.py` uses the separately compiled consumer for 6,236 deterministic Python model checks: 2,976 locations, 1,440 byte spans, 1,500 edit batches, and 320 plain/ANSI rendering checks. The source-position model covers a controlled corpus of independently specified graphemes; the underlying Unicode library owns full Unicode conformance tests. The diagnostics library is not an implementation of Ariadne's API or output format.
+The consumer’s ordinary GoML test replays [independent reference vectors and native render properties](../consumers/diagnostics/tests/data/README.md) for 6,236 deterministic model checks: 2,976 locations, 1,440 byte spans, 1,500 edit batches, and 320 plain/ANSI rendering checks. No Python runtime is required. The source-position model covers a controlled corpus of independently specified graphemes; the underlying Unicode library owns full Unicode conformance tests. The diagnostics library is not an implementation of Ariadne's API or output format.

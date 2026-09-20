@@ -12,6 +12,10 @@ make:
 
 make-tools: make
 
+[positional-arguments]
+ecosystem-test *args:
+    cd ecosystem/verification && ../../stage2/bin/goml build && _artifact/bin/verification "$@"
+
 test: make-tools
     cd tools/goml-go-meta && go test ./...
     bash tools/lib/install.sh _artifact/gomlc-test/test

@@ -201,17 +201,16 @@ separate multiply/add rounding.
 From the repository root:
 
 ```sh
-python3 ecosystem/verify.py ndarray
+just ecosystem-test ndarray
 ```
 
 The verifier runs module and independent versioned-consumer tests, fresh/cached
 build checks, 2,929 deterministic NumPy 2.2.6 reference cases and SIMD checks.
-The reference is a SHA-256-pinned CPython 3.12 Linux amd64 wheel extracted under
-`ecosystem/_artifact/reference`; no global Python installation is modified.
+The native consumer tests read [frozen NumPy 2.2.6 reference vectors](../consumers/ndarray/tests/data/README.md), with the original seed and SHA-256-pinned reference-wheel provenance recorded. No Python or NumPy installation is required.
 Interoperability includes negative cases and independent QR/LU reconstruction,
 not just round trips through the library.
 
-`simd_check.py` checks generated assembly metadata and actual linked symbols,
+The native GoML verifier checks generated assembly metadata and actual linked symbols,
 then builds separate `GOML_SIMD=sse2` and `GOML_SIMD=scalar` targets under the
 consumer's `_artifact/`. Both repeat all reference cases and consumer smoke
 checks. The current consumer links 10 native kernels by default, five with SSE2

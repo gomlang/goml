@@ -288,7 +288,7 @@ and consumer tests exercise this form.
 ## Validation
 
 ```sh
-python3 ecosystem/verify.py proptest
+just ecosystem-test proptest
 ```
 
 Tests include exact integer failure boundaries, wide signed ranges, filtering,

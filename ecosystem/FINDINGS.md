@@ -246,7 +246,7 @@ GoML 0.1.50 passes all four retained reproducers in `repros/`:
 - `ffi_error_alias`: importing `std::ffi` no longer substitutes its `Error` alias
   for the distinct canonical `std::io::Error` type.
 
-`python3 ecosystem/verify.py` runs these reproducers after the library matrix.
+`just ecosystem-test` runs these reproducers after the library matrix.
 Compiler pipeline fixtures 286–288 and module fixtures 084–087 cover these fixes,
 including serialization through independently compiled interfaces. The existing
 `TypedCommand[T]` is retained for compatibility, while CLI now exposes

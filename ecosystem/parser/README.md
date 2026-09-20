@@ -111,7 +111,7 @@ short transport read cannot prematurely select a different branch. `cut` and
 ## Validation
 
 ```sh
-python3 ecosystem/verify.py parser
+just ecosystem-test parser
 ```
 
 The module tests cover precedence, commitment, backtracking, invalid ranges,

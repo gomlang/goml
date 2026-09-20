@@ -163,13 +163,12 @@ errors. Use the error return for expected failures.
 From the repository root:
 
 ```sh
-python3 ecosystem/verify.py pipeline
+just ecosystem-test pipeline
 ```
 
 The verifier checks formatting, the library test suite, a separately resolved
-versioned consumer, fresh/cached builds, executable behavior, Python sequence
-oracles and Go's race detector. The reference checks require only Python's
-standard library; no external service or package is installed.
+versioned consumer, fresh/cached builds, executable behavior, native sequence reference tests and Go's race detector.
+No Python interpreter, external service or package is required.
 
 Library tests cover lazy/repeated execution, generator factories, shallow input
 snapshots, transforms, flattening, chunk/window boundaries, typed errors,
@@ -180,8 +179,7 @@ hold specific tasks at known points instead of relying on sleeps to infer
 concurrency. Scope counts verify cleanup after success, stop, failure and cancel.
 A dedicated test verifies upstream failure wakes blocked downstream callbacks.
 
-`interop.py` compares 1,253 cases against independent Python list, slice,
-accumulation, zip and multiset calculations, including malformed configurations
-and typed errors. `race.py` compiles the generated test runner with `go build
--race` and invokes each test separately. Run `goml test` in this module before
-calling `race.py` directly, so the generated runner matches current sources.
+Native consumer tests compare all 1,253 retained cases against independent list,
+slice, accumulation, zip and multiset reference calculations, including malformed
+configurations and typed errors. [Fixture provenance](../consumers/pipeline/tests/data/README.md) records the model and seed. The native verifier rebuilds and runs
+both library and consumer tests under Go's race detector.

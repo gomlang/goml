@@ -73,7 +73,7 @@ page sizes are 1–100. Invalid options return `InvalidOptions`; typing or paste
 beyond a field's bound leaves its prior value intact and displays a message.
 User callbacks can allocate independently of these returned-value limits.
 
-Run `python3 ecosystem/verify.py prompt` for model tests, a separate registry
+Run `just ecosystem-test prompt` for model tests, a separate registry
 consumer and real PTY tests. PTY coverage includes combining/emoji editing,
 validation retry, password output inspection, searchable selection, cancellation,
 EOF, malformed UTF-8, deadline, deliberate render failure and termios restoration.

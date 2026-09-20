@@ -93,9 +93,9 @@ This package does not supply a grammar, lexer, incremental parser/reparse schedu
 Run from the repository root:
 
 ```sh
-python3 ecosystem/verify.py syntax
+just ecosystem-test syntax
 ```
 
-The verifier checks formatting, 18 library black-box tests, three versioned consumer tests, fresh and cached consumer builds, a runnable example, the independent Python oracle and all 18 library tests under Go's race detector. No CI integration is required.
+The verifier checks formatting, 18 library black-box tests, four versioned consumer tests, fresh and cached consumer builds, a runnable example, native consumer tests over retained independent tree/configuration reference results and all 18 library tests under Go's race detector. No CI integration is required.
 
 The oracle compares 320 tree models, 3,840 persistent edits and 240 configuration rewrites. It independently computes lossless text, full preorder paths/kinds/ranges, tree summaries, all selected byte offsets, Unicode slicing failures, changed trees and retained snapshots. Configuration cases exercise Unicode keys/strings, escapes, nested sections, comments, CRLF and rejected replacement literals. Unit tests add malformed builder states, foreign/stale checkpoints, cache budgets/eviction, duplicate shared zero-width occurrences, error recovery, typed AST trait bounds, 10,000-deep iterative operations, aggregate overflow without enormous allocations, and concurrent interning/read/edit workloads.

@@ -179,19 +179,18 @@ has a different numerical scale from Lab distance.
 
 ## Verification and sources
 
-From the repository root, `python3 ecosystem/verify.py color` formats/checks,
+From the repository root, `just ecosystem-test color` formats/checks,
 tests the library and independent consumer, verifies cached builds, runs a theme
-palette example, and executes `interop.py`. The oracle has no third-party Python
-dependencies and does not access the network.
+palette example, and runs 4,659 independent reference vectors in the consumer’s ordinary GoML tests. No Python runtime or network access is needed.
 
 The GoML suite covers constructor errors, transfer thresholds, a 343-color
 conversion grid, extended signed channels, gamut mapping, premultiplied alpha,
 CSS grammar failures, hue paths, gradient snapshots and hard edges, contrast,
 color difference, and subnormal-alpha mixing across all six interpolation spaces. The consumer uses only the published dependency interface.
-The Python oracle compares deterministic random colors with `colorsys`, an
+The reference vectors record comparisons of deterministic random colors with `colorsys`, an
 independent rational-matrix implementation, linear compositing and mixing;
 it checks all CSS names, all 34 published CIEDE2000 test pairs, and 810 alpha-boundary
-mixtures against high-precision Decimal arithmetic, including exact subnormal alpha.
+mixtures against high-precision Decimal arithmetic, including exact subnormal alpha. [Vector provenance](../consumers/color/tests/data/README.md) identifies the original sources and seed.
 
 Mathematical definitions, reference matrices and data provenance:
 

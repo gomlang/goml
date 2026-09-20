@@ -318,49 +318,31 @@ on the selected server version; unsupported commands return normal server errors
 
 ## Validation
 
-From the repository root:
-
 ```sh
-python3 ecosystem/verify.py redis
-python3 ecosystem/redis/race.py
+just ecosystem-test redis
 ```
 
-The verifier runs the library tests, independent versioned consumer tests,
-fresh/cached builds, a consumer smoke check and `interop.py`. Coverage includes
-all RESP tags, every fixture fragment boundary and truncation, binary payloads,
-100,000 one-byte feeds, numeric bounds, malformed/limited frames, concurrent
-requests, queued versus in-flight cancellation, total deadlines, partial pipeline
-errors, close wakeups, push overflow and resumable subscription reads. Injected
-transport tests cover fragmented reads, setup cleanup, invalid read counts,
-structured dial errors, precancellation and the shared dialing/setup deadline.
+All verification is driven by GoML tests. Library tests cover RESP2/RESP3 codecs,
+malformed frames, bounded allocation, incremental decoding, typed commands,
+pipelines, transactions, transport failures, cancellation and concurrent pools.
+The specification generator constructs binary scalars, streamed arrays/maps,
+attributes and blob chunks independently of the codec and compares canonical wire bytes.
 
-The interoperability script checks 2,391 independently constructed RESP cases
-and exercises command families, authentication failures, binary values, Lua,
-pipelines, queue/execution transaction errors, WATCH conflicts/cleanup and Pub/Sub
-against Redis 7.2.5 in both RESP versions. It downloads the official GitHub tag
-archive with a pinned SHA-256, builds under `ecosystem/_artifact/reference`, and
-starts a fresh authenticated loopback server on an ephemeral port with persistence
-disabled. It terminates/reaps the process in `finally`. It never connects to an
-existing Redis instance. A C compiler, make and network access for the first
-reference download are needed. `race.py` compiles the generated library test
-runner with Go's race detector and invokes every test separately.
+Consumer tests download the official Redis 7.2.5 tag archive with pinned SHA-256,
+build it under `ecosystem/_artifact/reference`, and run both RESP protocols against
+a fresh authenticated loopback server with persistence disabled. `std::process`
+and scoped cancellation own the server lifetime; startup and subprocess commands
+have deadlines. This requires curl, tar, make, a C compiler and network access on
+the first run. Tests include command families, binary values, Lua, pipelines,
+transaction errors, WATCH cleanup, Pub/Sub, concurrent pooled increments, and
+health replacement after CLIENT KILL.
 
-`network_check.py` adds fifteen loopback DNS/TLS cases using Python's TLS server
-and ephemeral OpenSSL-generated certificates. They cover verified and mutual
-TLS, untrusted certificates, hostname mismatch, handshake/HELLO/I/O timeouts,
-context deadlines and cancellation through both APIs. Pool cases also verify
-DNS, TLS/mTLS reuse and eviction after an interrupted TLS request. Cancellation is released
-only after the server receives the request. `race.py` repeats these cases with
-a race-built GoML consumer. OpenSSL is required for these local fixtures.
-
-The 29 library tests include bounded checkout, setup reservations, total acquisition
-budgets, concurrent release, use after release, active close, health replacement,
-idle/lifetime expiry and ambiguous requests without retry over actual loopback TCP.
-The versioned consumer also exercises pooled pipelines, transactions, WATCH,
-80 concurrent increments through a two-connection pool, session restrictions, and
-server-side CLIENT KILL followed by health-based replacement against Redis 7.2.5
-in both protocols. `race.py` repeats these real Redis consumer scenarios as well
-as all library tests and the DNS/TLS fixtures under the Go race detector.
+Fifteen further consumer cases exercise DNS, verified TLS, mTLS, untrusted roots,
+wrong hostnames, handshake/HELLO/I/O deadlines, both cancellation APIs and pooled
+TLS reuse/eviction. A test-only Go TLS peer generates ephemeral certificates;
+GoML tests own scenarios and assertions and synchronize cancellation with request
+arrival. The production Redis package remains entirely GoML. The shared verifier
+runs native and generated tests with Go's race detector.
 
 Protocol references: [Redis RESP specification](https://redis.io/docs/latest/develop/reference/protocol-spec/),
 [RESP3 streamed types](https://github.com/antirez/RESP3/blob/master/spec.md),

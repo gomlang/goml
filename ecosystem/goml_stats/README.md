@@ -11,7 +11,7 @@ Text tables and JSON reports support both interactive use and automation.
 From the repository root:
 
 ```sh
-python3 ecosystem/goml_stats/verify.py
+just ecosystem-test goml_stats
 ecosystem/goml_stats/_artifact/bin/cmd/goml_stats/goml_stats .
 ecosystem/goml_stats/_artifact/bin/cmd/goml_stats/goml_stats gomlc --modules --packages
 ecosystem/goml_stats/_artifact/bin/cmd/goml_stats/goml_stats ecosystem --files
@@ -145,15 +145,15 @@ arguments. Errors go to stderr; JSON goes only to stdout.
 ## Verification
 
 ```sh
-python3 ecosystem/goml_stats/verify.py
+just ecosystem-test goml_stats
 ```
 
-The verifier checks formatting, runs nine GoML tests, builds the executable and
+The GoML verifier checks formatting, builds the executable, runs native tests and
 runs CLI checks on temporary projects. Cases cover nested and empty modules,
 unassigned sources, per-file and aggregate consistency, test-file detection,
 literal exclusions, hierarchical Git ignore rules and negation, symbolic links,
 special files, invalid UTF-8, argument errors, JSON
 escaping, deterministic output and 48 generated source files with known counts.
-Temporary fixtures, command logs and a verification report stay under
-`_artifact/verification/`. Verification needs Python 3 and the GoML toolchain, with
-no manual registry setup or external Python packages.
+Temporary fixtures stay under the module's `_artifact/cli-tests/`; command logs
+and a verification report stay under `ecosystem/_artifact/verification/`.
+Verification uses the GoML toolchain and `mkfifo`, with no manual registry setup.

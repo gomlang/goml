@@ -182,7 +182,7 @@ Text decoding is strict UTF-8 and does not inspect charset labels. Header values
 are UTF-8 strings rather than arbitrary octets. HTTP/2 over TLS uses ALPN; h2c
 prior knowledge and protocol forcing are not exposed. Client-side file reading
 is separate from multipart byte parts. Proxy handling is delegated to net/http;
-proxy tunnel behavior is not exercised by the local interoperability script.
+proxy tunnel behavior is not exercised by the local tests.
 
 `go.mod` contains only the module path and Go version. The library declares
 `native.go-module` in `goml.toml`; the driver generates requirements and
@@ -194,22 +194,16 @@ used by tests and the consumer; the library's production API imports only
 From the repository root:
 
 ```sh
-python3 ecosystem/verify.py reqwest
+just ecosystem-test reqwest
 ```
 
-The suite includes ten black-box GoML tests, an independently compiled registry
-consumer, Python HTTP/1.1 interoperability and Go race checks for native and
-GoML-generated clients. Tests use local ephemeral ports and generated
-certificates, with no external services. Native race tests synchronize with
-server request arrival before cancellation/closure. GoML tests cover the same
-in-flight boundary, TLS/mTLS and HTTP/2, redirect credential stripping, gzip and
-chunked limits, typed Serde, multivalue headers, multipart, cookies and pooling.
-To run the supplemental checks after building/testing:
-
-```sh
-python3 ecosystem/reqwest/interop.py
-python3 ecosystem/reqwest/race.py
-```
+GoML library and consumer tests use local ephemeral HTTP/HTTPS servers and
+fresh certificates. Consumer tests check HTTP/1.1, Unicode query/form data,
+duplicate headers, typed JSON, redirects, response limits and chunked bodies.
+Native Go test fixtures provide HTTP/TLS transport; all scenarios and assertions
+run from `#[test]`. Cancellation tests synchronize with server request arrival.
+The shared verifier runs native adapter/test-server tests and GoML-generated
+clients under Go's race detector. No external service is required.
 
 Reference API: [Rust reqwest ClientBuilder](https://docs.rs/reqwest/latest/reqwest/blocking/struct.ClientBuilder.html),
 [redirect policy](https://docs.rs/reqwest/latest/reqwest/redirect/struct.Policy.html),

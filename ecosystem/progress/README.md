@@ -59,10 +59,7 @@ Defaults: 128 retained jobs, 4 KiB per name/message/log, 20 visible rows, 80 fal
 From the repository root:
 
 ```sh
-GOML_BUILD_JOBS=2 python3 ecosystem/verify.py progress
-python3 ecosystem/progress/interop.py
-python3 ecosystem/progress/pty_test.py
-python3 ecosystem/progress/race.py
+GOML_BUILD_JOBS=2 just ecosystem-test progress
 ```
 
-The test suite covers atomic and concurrent updates, frozen timing and reset, invalid-input rollback, capacity and stale handles, detached snapshots, Unicode/style rendering, deterministic throttling, plain logs, interactive redraw/resize, shared-session input ownership, cancellation before work, queued deadlines, output pressure, sticky errors, shutdown wakeups, and session reuse. The independent consumer exercises the public dependency boundary. The reference oracle checks 400 rate/ETA/spinner/bar cases using Python arithmetic; PTY tests use a real shared terminal session and verify restored termios/flags/cursor modes.
+The test suite covers atomic and concurrent updates, frozen timing and reset, invalid-input rollback, capacity and stale handles, detached snapshots, Unicode/style rendering, deterministic throttling, plain logs, interactive redraw/resize, shared-session input ownership, cancellation before work, queued deadlines, output pressure, sticky errors, shutdown wakeups, and session reuse. The independent consumer exercises the public dependency boundary. The reference oracle checks 400 rate/ETA/spinner/bar cases using independently calculated integer/fraction arithmetic in a GoML consumer test; PTY tests use a real shared terminal session and verify restored termios/flags/cursor modes.

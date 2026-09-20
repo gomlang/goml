@@ -1,0 +1,383 @@
+package main;
+
+use std::bytes;
+use std::env;
+use std::fs;
+use std::io;
+use std::json;
+use std::path;
+use std::process;
+use std::time;
+use std::utf8;
+use utf8::BytesUtf8;
+
+pub struct Verification {
+    pub root: string,
+    pub home: string,
+    pub goml: string,
+    pub records: Vec[json::Value],
+}
+
+pub fn run_command(
+    context: Verification,
+    arguments: Vec[string],
+    directory: string,
+    binary: string,
+    log: string,
+    race: bool,
+) -> Result[string, string] {
+    let started = time::Instant::now();
+    let mut command = process::Command::new(arguments[0]).args(
+        arguments.slice(1, arguments.len()).to_vec(),
+    ).current_dir(directory).env("GOML_HOME", context.home).env("GOML_VERIFY_ROOT", context.root).env(
+        "GOML_VERIFY_DRIVER",
+        context.goml,
+    ).env("GOML_VERIFY_BINARY", binary).env("GOML_BUILD_JOBS", "2").env("GOML_SIMD", "native").input(
+        bytes::Bytes::new(),
+    );
+    if race {
+        command = command.env("GOFLAGS", env::var_structured("GOFLAGS").unwrap_or("") + " -race").env(
+            "GORACE",
+            "halt_on_error=1 atexit_sleep_ms=0",
+        );
+    }
+    let output = command.output_timeout_structured(time::Duration::from_seconds(600));
+    let (status, stdout_bytes, stderr_bytes) = match output {
+        Result::Ok(value) => (value.status().code().unwrap_or(-1), value.stdout(), value.stderr()),
+        Result::Err(error) => (
+            -1,
+            bytes::Bytes::new(),
+            bytes::Bytes::from_string(error.to_string()),
+        ),
+    };
+    fs::create_dir_all(path::parent(log).unwrap_or(directory)).map_err(|error| error.to_string())?;
+    let logged = bytes::Builder::new();
+    logged.extend(stdout_bytes.slice(0, stdout_bytes.len()));
+    logged.extend(stderr_bytes.slice(0, stderr_bytes.len()));
+    fs::write_bytes_structured(log, logged.finish()).map_err(|error| error.to_string())?;
+    context.records.push(
+        json::object(
+            Vec::from_array(
+                [
+                    ("command", json::to_value(arguments)?),
+                    ("cwd", json::to_value(directory)?),
+                    ("milliseconds", json::to_value(started.elapsed().as_milliseconds())?),
+                    ("exit_code", json::to_value(status)?),
+                    ("log", json::to_value(log)?),
+                ],
+            ),
+        ),
+    );
+    let stdout = stdout_bytes.to_string_utf8();
+    let stderr = stderr_bytes.to_string_utf8();
+    if status != 0 {
+        io::eprintln(
+            stdout.unwrap_or("<invalid UTF-8 stdout>") + stderr.unwrap_or("<invalid UTF-8 stderr>"),
+        );
+        return Result::Err("command failed; see " + log);
+    }
+    let stdout = stdout.map_err(|error| error.to_string() + "; see " + log)?;
+    stderr.map_err(|error| error.to_string() + "; see " + log)?;
+    io::println(
+        "  " + path::file_stem(log).unwrap_or(log) + ": passed ("
+            + started.elapsed().as_milliseconds().to_string()
+            + " ms)",
+    );
+    Result::Ok(stdout)
+}
+
+fn driver(
+    context: Verification,
+    arguments: Vec[string],
+    directory: string,
+    binary: string,
+    log: string,
+    race: bool,
+) -> Result[string, string] {
+    let command = Vec::from_array([context.goml]);
+    command.extend(arguments);
+    run_command(context, command, directory, binary, log, race)
+}
+
+fn race_enabled(name: string) -> bool {
+    Vec::from_array(
+        [
+            "redis",
+            "pipeline",
+            "sqlite",
+            "tempfile",
+            "notify",
+            "walkdir",
+            "reqwest",
+            "llvm",
+            "rope",
+            "tracing",
+            "web",
+            "ignore",
+            "syntax",
+            "cache",
+            "bigint",
+            "decimal",
+            "incremental",
+            "datetime",
+            "terminal",
+            "progress",
+            "explorer",
+        ],
+    ).contains(name)
+}
+
+fn verify_module(context: Verification, name: string, race: bool, logs: string) -> Result[
+    (),
+    string,
+] {
+    io::println("Verifying " + name);
+    let ecosystem = path::join(context.root, "ecosystem");
+    let library = if name == "explorer" {
+        path::join(ecosystem, "examples/explorer")
+    } else {
+        path::join(ecosystem, name)
+    };
+    let single = name == "goml_stats" || name == "explorer";
+    let consumer = if single {
+        library
+    } else {
+        path::join(ecosystem, "consumers/" + name)
+    };
+    let executable = if name == "goml_stats" {
+        "cmd/goml_stats/goml_stats"
+    } else {
+        name
+    };
+    let binary = path::join(consumer, "_artifact/bin/" + executable);
+    let directories = Vec::from_array([(library, "library")]);
+    if !single {
+        directories.push((consumer, "consumer"));
+    }
+    for (directory, prefix) in directories {
+        driver(
+            context,
+            Vec::from_array(["fmt", "--check"]),
+            directory,
+            binary,
+            path::join(logs, prefix + "-format.log"),
+            false,
+        )?;
+    }
+    driver(
+        context,
+        Vec::from_array(["build"]),
+        consumer,
+        binary,
+        path::join(logs, "consumer-build.log"),
+        false,
+    )?;
+    for (directory, prefix) in directories {
+        driver(
+            context,
+            Vec::from_array(["test", "--timeout", "300s"]),
+            directory,
+            binary,
+            path::join(logs, prefix + "-tests.log"),
+            false,
+        )?;
+    }
+    let generated = path::join(consumer, "_artifact/build/pkg");
+    let before = artifact_fingerprint(generated)?;
+    driver(
+        context,
+        Vec::from_array(["build"]),
+        consumer,
+        binary,
+        path::join(logs, "consumer-cached-build.log"),
+        false,
+    )?;
+    if before != artifact_fingerprint(generated)? {
+        return Result::Err("cached build changed public artifacts: " + name);
+    }
+    let command = Vec::from_array([binary]);
+    if name == "explorer" {
+        command.push("--snapshot");
+    }
+    if name == "goml_stats" {
+        command.push("--help");
+    }
+    let snapshot = run_command(
+        context,
+        command,
+        consumer,
+        binary,
+        path::join(logs, "consumer-run.log"),
+        false,
+    )?;
+    if name == "explorer" {
+        let repeated = run_command(
+            context,
+            Vec::from_array([binary, "--demo"]),
+            consumer,
+            binary,
+            path::join(logs, "snapshot-repeat.log"),
+            false,
+        )?;
+        if snapshot != repeated || !snapshot.contains("GoML terminal ecosystem")
+            || !snapshot.contains("6/6")
+            || snapshot.contains("\u001b") {
+            return Result::Err("unstable explorer snapshot");
+        }
+    }
+    if Vec::from_array(["terminal", "tui", "prompt", "progress", "tui_markdown", "explorer"]).contains(
+        name,
+    ) {
+        let started = time::Instant::now();
+        let result = verify_pty(name, binary);
+        let log = path::join(logs, "pty.log");
+        let description = match result {
+            Result::Ok(()) => "PTY scenarios passed",
+            Result::Err(error) => error,
+        };
+        fs::write_file_structured(log, description).map_err(|error| error.to_string())?;
+        context.records.push(
+            json::object(
+                Vec::from_array(
+                    [
+                        ("check", json::to_value("pty")?),
+                        ("module", json::to_value(name)?),
+                        ("milliseconds", json::to_value(started.elapsed().as_milliseconds())?),
+                        (
+                            "exit_code",
+                            json::to_value(
+                                if result.is_ok() {
+                                    0
+                                } else {
+                                    1
+                                },
+                            )?,
+                        ),
+                        ("log", json::to_value(log)?),
+                    ],
+                ),
+            ),
+        );
+        result?;
+        io::println("  pty: passed");
+    }
+    if name == "ndarray" {
+        verify_simd(context, consumer, binary, logs)?;
+    }
+    if name == "unicode_text" || name == "markdown" {
+        let tools = path::join(library, "tools");
+        driver(
+            context,
+            Vec::from_array(["fmt", "--check"]),
+            tools,
+            binary,
+            path::join(logs, "data-tools-format.log"),
+            false,
+        )?;
+        driver(
+            context,
+            Vec::from_array(["test", "--timeout", "300s"]),
+            tools,
+            binary,
+            path::join(logs, "data-conformance.log"),
+            false,
+        )?;
+    }
+    if race && race_enabled(name) {
+        let race_binary = path::join(consumer, "_artifact/race/bin/" + executable);
+        driver(
+            context,
+            Vec::from_array(["build", "--target-dir", "_artifact/race"]),
+            consumer,
+            race_binary,
+            path::join(logs, "race-build.log"),
+            true,
+        )?;
+        for (directory, prefix) in directories {
+            driver(
+                context,
+                Vec::from_array(["test", "--target-dir", "_artifact/race", "--timeout", "300s"]),
+                directory,
+                race_binary,
+                path::join(logs, prefix + "-race.log"),
+                true,
+            )?;
+        }
+        let packages = if name == "reqwest" {
+            Vec::from_array(["./adapter", "./testserver"])
+        } else if Vec::from_array(["web", "sqlite", "llvm"]).contains(name) {
+            Vec::from_array(["./adapter"])
+        } else {
+            Vec::new()
+        };
+        if !packages.is_empty() {
+            let command = Vec::from_array(["go", "test", "-race", "-count=1"]);
+            command.extend(packages);
+            run_command(
+                context,
+                command,
+                library,
+                race_binary,
+                path::join(logs, "native-race.log"),
+                true,
+            )?;
+        }
+    }
+    Result::Ok(())
+}
+
+pub fn verify_all(root: string, home: string, options: Options) -> Result[(), string] {
+    let logs = path::join(root, "ecosystem/_artifact/verification");
+    fs::create_dir_all(logs).map_err(|error| error.to_string())?;
+    let context = Verification { root, home, goml: options.goml, records: Vec::new() };
+    let mut result: Result[(), string] = Result::Ok(());
+    for name in options.selected {
+        result = verify_module(context, name, options.race, path::join(logs, name));
+        if result.is_err() {
+            break;
+        }
+    }
+    if result.is_ok() && options.selected.len() == modules().len() + 2 {
+        for name in Vec::from_array(
+            ["unit_identity", "erased_generic", "specialized_static", "ffi_error_alias"],
+        ) {
+            let directory = path::join(root, "ecosystem/repros/" + name);
+            for command in Vec::from_array(["check", "build", "run"]) {
+                result = driver(
+                    context,
+                    Vec::from_array([command]),
+                    directory,
+                    "",
+                    path::join(logs, "repros/" + name + "/" + command + ".log"),
+                    false,
+                ).map(|_| ());
+                if result.is_err() {
+                    break;
+                }
+            }
+            if result.is_err() {
+                break;
+            }
+        }
+    }
+    let report = json::object(
+        Vec::from_array(
+            [
+                ("modules", json::to_value(options.selected)?),
+                ("registry_home", json::to_value(home)?),
+                ("success", json::to_value(result.is_ok())?),
+                ("race", json::to_value(options.race)?),
+                ("commands", json::to_value(context.records)?),
+            ],
+        ),
+    );
+    let report_path = env::var_structured("GOML_VERIFY_REPORT").unwrap_or(
+        path::join(logs, "report.json"),
+    );
+    fs::create_dir_all(path::parent(report_path).unwrap_or(logs)).map_err(|error| error.to_string())?;
+    fs::write_file_structured(report_path, json::encode(report) + "\n").map_err(
+        |error| error.to_string(),
+    )?;
+    io::println("Verification report: " + report_path);
+    result
+}

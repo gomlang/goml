@@ -75,18 +75,19 @@ Trimming removes ASCII spaces at line ends and at the start of a continuation. S
 [Unicode source manifest](data/manifest.json) pins the source URLs and SHA-256 hashes for Unicode 16.0.0 properties and all three official segmentation test suites. Only this manifest, the [Unicode license](data/LICENSE.txt), and generated `properties.gom` are checked in. Raw property files, test corpora and compressed archives are not versioned. Every generator or conformance-checker invocation downloads fresh source bytes from the pinned URLs and checks their SHA-256 hashes; downloads are held in memory for that invocation, with no persistent cache or bundled-data fallback. Ordinary GoML builds and module tests use the generated tables directly and do not need these downloads.
 
 ```sh
-python3 ecosystem/unicode_text/generate.py --check
-python3 ecosystem/unicode_text/generate.py
+just ecosystem-test unicode_text
 ```
 
-`generate.py`, `generate.py --check`, and `interop.py` always download the data again. `--check` verifies exact generated GoML tables without rewriting them. Download failures, a response above 16 MiB, or checksum mismatches stop verification; they never fall back to old files. The conformance step in `ecosystem/verify.py unicode_text` therefore requires network access to unicode.org. The generated table consists of sorted, nonoverlapping intervals encoded in one immutable string and searched with binary search. Segmentation tracks preceding/following significant classes and regional-indicator counts rather than repeatedly scanning long runs. Runtime work is linear in input length with logarithmic property lookup and input-proportional temporary storage.
+The separate native GoML module in `tools/` downloads the sources and runs both exact table verification and official conformance as an ordinary `#[test]`. Its `unicode_data` executable also accepts `check` or `generate` followed by the Unicode module directory. With the local registry configured, build it from `ecosystem/unicode_text/tools` using `../../../stage2/bin/goml build`, then run `_artifact/bin/unicode_data generate ..` to rewrite the table.
+
+Every `check`, `generate`, or native conformance-test invocation downloads fresh data again. Download failures, a response above 16 MiB, or checksum mismatches stop verification; they never fall back to old files. Downloads are held in memory and never written to the repository. Injected-fetch native tests also check fresh requests on every invocation, both no-cache headers, checksum and transport failures without reuse, oversized bodies and invalid UTF-8. The conformance step therefore requires network access to unicode.org. The generated table consists of sorted, nonoverlapping intervals encoded in one immutable string and searched with binary search. Segmentation tracks preceding/following significant classes and regional-indicator counts rather than repeatedly scanning long runs. Runtime work is linear in input length with logarithmic property lookup and input-proportional temporary storage.
 
 ## Validation
 
 From the repository root:
 
 ```sh
-GOML_BUILD_JOBS=2 python3 ecosystem/verify.py unicode_text
+GOML_BUILD_JOBS=2 just ecosystem-test unicode_text
 ```
 
-The independent consumer exercises public imports, byte offsets, widths, and checked layouts. `interop.py` runs all 1,093 official `GraphemeBreakTest`, 1,826 `WordBreakTest`, and 16,672 `LineBreakTest` cases against that separately built executable. Unit tests also cover emoji/variation policies, CJK and ambiguous widths, long combining and flag runs, source ranges, mandatory separators, tabs, overflowing clusters, trim policies, and explicit allocation limits.
+The independent consumer exercises public imports, byte offsets, widths, and checked layouts. The separate native tooling module imports the versioned library and checks all 1,093 official `GraphemeBreakTest`, 1,826 `WordBreakTest`, and 16,672 `LineBreakTest` cases directly. Eleven terminal-width reference samples also run in the consumer’s ordinary GoML tests. Unit tests also cover emoji/variation policies, CJK and ambiguous widths, long combining and flag runs, source ranges, mandatory separators, tabs, overflowing clusters, trim policies, and explicit allocation limits.

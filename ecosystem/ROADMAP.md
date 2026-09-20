@@ -16,7 +16,7 @@ of feature parity with every mature library in that category.
 | parser | Shared text/binary work and depth limits, contextual custom parsers, iterative alternatives and binary backtracking/lookahead primitives |
 
 Each addition has library and independently resolved consumer coverage. The
-verification entry point remains `python3 ecosystem/verify.py`; CI integration
+verification entry point is `just ecosystem-test`, implemented in GoML; CI integration
 is intentionally deferred.
 
 ## Adoption of GoML 0.1.50

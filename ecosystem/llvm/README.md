@@ -178,11 +178,12 @@ are not implemented. Calling conventions use LLVM's default C convention.
 From the repository root:
 
 ```sh
-python3 ecosystem/verify.py llvm
+just ecosystem-test llvm
 ```
 
-The verification entry point formats/checks the library and independent registry
-consumer, runs their tests, checks fresh/cached builds, then runs `interop.py`
-and `race.py`. Native tests and GoML tests exercise resource errors and shared
-lifetimes. Interoperability checks use installed LLVM tools and a C compiler to
-verify emitted IR/bitcode and execute linked object code.
+GoML library/consumer tests and native adapter tests cover errors, concurrency
+and resource lifetimes. A GoML consumer test invokes installed LLVM 18 tools and
+cc through `std::process`, verifies emitted IR/bitcode, assembles/disassembles it,
+links unoptimized/optimized objects and assembly, and compares 9,624 native
+function results with independently computed arithmetic expectations. The shared
+verifier handles fresh/cached builds and race-detector execution.
