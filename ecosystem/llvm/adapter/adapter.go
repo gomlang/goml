@@ -53,6 +53,8 @@ type node struct {
 	block   C.LLVMBasicBlockRef
 	closed  bool
 	layout  C.LLVMTargetDataRef
+	before  *node
+	values  map[unsafe.Pointer]*node
 }
 
 const (
@@ -64,6 +66,7 @@ const (
 	blockKind
 	builderKind
 	targetKind
+	positionKind
 )
 
 func NewContext() Handle {
@@ -96,6 +99,9 @@ func enter(handles ...Handle) (*contextState, []*node, string) {
 		}
 		if value.closed {
 			return fail("closed: resource")
+		}
+		if value.kind == positionKind && value.before != nil && value.before.closed {
+			return fail("closed: insertion anchor was erased")
 		}
 		if value.module != nil {
 			if value.module.closed {
@@ -130,6 +136,7 @@ func Close(handle Handle) string {
 		for module := range ctx.modules {
 			C.LLVMDisposeModule(C.LLVMModuleRef(module.raw))
 			module.closed = true
+			clear(module.values)
 		}
 		for target := range ctx.targets {
 			C.LLVMDisposeTargetData(target.layout)
@@ -148,9 +155,11 @@ func Close(handle Handle) string {
 				builder.module = nil
 				builder.owner = nil
 				builder.block = nil
+				builder.before = nil
 			}
 		}
 		C.LLVMDisposeModule(C.LLVMModuleRef(value.raw))
+		clear(value.values)
 		delete(ctx.modules, value)
 	case builderKind:
 		C.LLVMDisposeBuilder(C.LLVMBuilderRef(value.raw))
@@ -174,7 +183,7 @@ func IsClosed(handle Handle) bool {
 	ctx := value.context
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
-	return ctx.raw == nil || value.closed || value.module != nil && (value.module.closed || value.epoch != value.module.epoch)
+	return ctx.raw == nil || value.closed || value.kind == positionKind && value.before != nil && value.before.closed || value.module != nil && (value.module.closed || value.epoch != value.module.epoch)
 }
 
 func text(value string) (*C.char, func(), string) {
@@ -198,14 +207,20 @@ func wrapType(ctx *contextState, raw C.LLVMTypeRef) Handle {
 	return &node{context: ctx, kind: typeKind, raw: unsafe.Pointer(raw)}
 }
 func wrapValue(ctx *contextState, module *node, owner C.LLVMValueRef, raw C.LLVMValueRef) Handle {
+	if module != nil {
+		if existing := module.values[unsafe.Pointer(raw)]; existing != nil {
+			return existing
+		}
+	}
 	result := &node{context: ctx, kind: valueKind, module: module, owner: owner, raw: unsafe.Pointer(raw)}
 	if module != nil {
 		result.epoch = module.epoch
+		module.values[result.raw] = result
 	}
 	return result
 }
 func newModule(ctx *contextState, raw C.LLVMModuleRef) Handle {
-	result := &node{context: ctx, kind: moduleKind, raw: unsafe.Pointer(raw)}
+	result := &node{context: ctx, kind: moduleKind, raw: unsafe.Pointer(raw), values: make(map[unsafe.Pointer]*node)}
 	ctx.modules[result] = true
 	return result
 }
@@ -663,6 +678,7 @@ func Position(builder, block Handle) string {
 		return "argument: expected builder and block"
 	}
 	b.module, b.epoch, b.owner, b.block = target.module, target.epoch, target.owner, C.LLVMBasicBlockRef(target.raw)
+	b.before = nil
 	C.LLVMPositionBuilderAtEnd(C.LLVMBuilderRef(b.raw), b.block)
 	return ""
 }
@@ -671,8 +687,11 @@ func insertion(builder *node) string {
 	if builder.kind != builderKind || builder.module == nil || builder.block == nil {
 		return "argument: builder has no insertion block"
 	}
-	if C.LLVMGetBasicBlockTerminator(builder.block) != nil {
+	if builder.before == nil && C.LLVMGetBasicBlockTerminator(builder.block) != nil {
 		return "argument: block already has a terminator"
+	}
+	if builder.before != nil && C.LLVMIsAPHINode(C.LLVMValueRef(builder.before.raw)) != nil {
+		return "argument: ordinary instruction cannot precede phi instructions"
 	}
 	return ""
 }
@@ -692,9 +711,35 @@ func operand(builder, value *node) string {
 
 func instruction(builder *node, value C.LLVMValueRef) Handle {
 	if C.LLVMIsConstant(value) != 0 {
-		return wrapValue(builder.context, nil, nil, value)
+		if contextConstant(value) {
+			return wrapValue(builder.context, nil, nil, value)
+		}
+		return wrapValue(builder.context, builder.module, nil, value)
 	}
 	return wrapValue(builder.context, builder.module, builder.owner, value)
+}
+
+func contextConstant(value C.LLVMValueRef) bool {
+	pending := []C.LLVMValueRef{value}
+	seen := make(map[C.LLVMValueRef]bool)
+	for len(pending) > 0 {
+		raw := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if seen[raw] {
+			continue
+		}
+		if C.LLVMIsConstant(raw) == 0 || C.LLVMIsAGlobalValue(raw) != nil || C.LLVMIsABlockAddress(raw) != nil || len(seen) >= 65536 {
+			return false
+		}
+		seen[raw] = true
+		for i := 0; i < int(C.LLVMGetNumOperands(raw)); i++ {
+			if len(pending) >= 65536 {
+				return false
+			}
+			pending = append(pending, C.LLVMGetOperand(raw, C.uint(i)))
+		}
+	}
+	return true
 }
 
 func Binary(builder Handle, operation int, left, right Handle, name string) (Handle, string) {
@@ -908,7 +953,7 @@ func Emit(builder Handle, operation int, arguments []Handle, name string) (Handl
 	}
 	defer ctx.mu.Unlock()
 	b := nodes[0]
-	if err := insertion(b); err != "" {
+	if err := insertionFor(b, operation); err != "" {
 		return nil, err
 	}
 	ns := nodes[1:]
@@ -1040,7 +1085,7 @@ func Emit(builder Handle, operation int, arguments []Handle, name string) (Handl
 		if e != "" {
 			return nil, e
 		}
-		for i := C.LLVMGetFirstInstruction(b.block); i != nil; i = C.LLVMGetNextInstruction(i) {
+		for i := C.LLVMGetFirstInstruction(b.block); i != nil && (b.before == nil || i != C.LLVMValueRef(b.before.raw)); i = C.LLVMGetNextInstruction(i) {
 			if C.LLVMIsAPHINode(i) == nil {
 				return nil, "argument: phi must precede non-phi instructions"
 			}
@@ -1094,44 +1139,524 @@ func Call(builder, function Handle, arguments []Handle, name string) (Handle, st
 }
 
 func Incoming(phi Handle, values, blocks []Handle) string {
-	if len(values) != len(blocks) || len(values) == 0 {
-		return "argument: phi requires matching nonempty values and blocks"
+	return EditIncoming(phi, 0, 0, values, blocks)
+}
+
+func insertionFor(b *node, operation int) string {
+	if operation == 8 {
+		if b.kind != builderKind || b.module == nil || b.block == nil {
+			return "argument: builder has no insertion block"
+		}
+		if b.before == nil && C.LLVMGetBasicBlockTerminator(b.block) != nil {
+			return "argument: block already has a terminator"
+		}
+		return ""
 	}
-	ctx, nodes, err := enter(append(append([]Handle{phi}, values...), blocks...)...)
+	if err := insertion(b); err != "" {
+		return err
+	}
+	if (operation <= 3 || operation == 9) && b.before != nil {
+		return "argument: terminator must be inserted at block end"
+	}
+	return ""
+}
+
+func setPosition(b *node, module *node, owner C.LLVMValueRef, block C.LLVMBasicBlockRef, before *node) {
+	b.module, b.owner, b.block, b.before = module, owner, block, before
+	if module == nil {
+		C.LLVMClearInsertionPosition(C.LLVMBuilderRef(b.raw))
+		return
+	}
+	b.epoch = module.epoch
+	if before == nil {
+		C.LLVMPositionBuilderAtEnd(C.LLVMBuilderRef(b.raw), block)
+	} else {
+		C.LLVMPositionBuilderBefore(C.LLVMBuilderRef(b.raw), C.LLVMValueRef(before.raw))
+	}
+}
+
+func PositionBefore(builder, instruction Handle) string {
+	ctx, ns, err := enter(builder, instruction)
 	if err != "" {
 		return err
 	}
 	defer ctx.mu.Unlock()
-	p := nodes[0]
+	b, v := ns[0], ns[1]
+	if b.kind != builderKind || v.kind != valueKind || C.LLVMIsAInstruction(C.LLVMValueRef(v.raw)) == nil {
+		return "argument: expected builder and instruction"
+	}
+	setPosition(b, v.module, v.owner, C.LLVMGetInstructionParent(C.LLVMValueRef(v.raw)), v)
+	return ""
+}
+
+func PositionStart(builder, block Handle) string {
+	ctx, ns, err := enter(builder, block)
+	if err != "" {
+		return err
+	}
+	defer ctx.mu.Unlock()
+	b, target := ns[0], ns[1]
+	if b.kind != builderKind || target.kind != blockKind {
+		return "argument: expected builder and block"
+	}
+	bb := C.LLVMBasicBlockRef(target.raw)
+	var before *node
+	for i := C.LLVMGetFirstInstruction(bb); i != nil; i = C.LLVMGetNextInstruction(i) {
+		if C.LLVMIsAPHINode(i) == nil {
+			before = wrapValue(ctx, target.module, target.owner, i).(*node)
+			break
+		}
+	}
+	setPosition(b, target.module, target.owner, bb, before)
+	return ""
+}
+
+func SavePosition(builder Handle) (Handle, string) {
+	ctx, ns, err := enter(builder)
+	if err != "" {
+		return nil, err
+	}
+	defer ctx.mu.Unlock()
+	b := ns[0]
+	if b.kind != builderKind {
+		return nil, "argument: expected builder"
+	}
+	return &node{context: ctx, kind: positionKind, module: b.module, epoch: b.epoch, owner: b.owner, block: b.block, before: b.before}, ""
+}
+
+func RestorePosition(builder, position Handle) string {
+	ctx, ns, err := enter(builder, position)
+	if err != "" {
+		return err
+	}
+	defer ctx.mu.Unlock()
+	b, p := ns[0], ns[1]
+	if b.kind != builderKind || p.kind != positionKind {
+		return "argument: expected builder and insertion point"
+	}
+	setPosition(b, p.module, p.owner, p.block, p.before)
+	return ""
+}
+
+func ClearPosition(builder Handle) string {
+	ctx, ns, err := enter(builder)
+	if err != "" {
+		return err
+	}
+	defer ctx.mu.Unlock()
+	if ns[0].kind != builderKind {
+		return "argument: expected builder"
+	}
+	setPosition(ns[0], nil, nil, nil, nil)
+	return ""
+}
+
+func wrapBlock(module *node, raw C.LLVMBasicBlockRef) Handle {
+	return &node{context: module.context, kind: blockKind, module: module, epoch: module.epoch, owner: C.LLVMGetBasicBlockParent(raw), raw: unsafe.Pointer(raw)}
+}
+
+func wrapFunction(module *node, raw C.LLVMValueRef) Handle {
+	return &node{context: module.context, kind: functionKind, module: module, epoch: module.epoch, raw: unsafe.Pointer(raw)}
+}
+
+func inspectedValue(module *node, raw C.LLVMValueRef) (Handle, string) {
+	if C.LLVMIsABasicBlock(raw) != nil {
+		return wrapBlock(module, C.LLVMValueAsBasicBlock(raw)), ""
+	}
+	if C.LLVMIsAFunction(raw) != nil {
+		return wrapFunction(module, raw), ""
+	}
+	var owner C.LLVMValueRef
+	if C.LLVMIsAInstruction(raw) != nil {
+		owner = C.LLVMGetBasicBlockParent(C.LLVMGetInstructionParent(raw))
+	} else if C.LLVMIsAArgument(raw) != nil {
+		owner = C.LLVMGetParamParent(raw)
+	} else if C.LLVMIsConstant(raw) == 0 {
+		return nil, "argument: unsupported metadata or special operand"
+	} else if contextConstant(raw) {
+		return wrapValue(module.context, nil, nil, raw), ""
+	}
+	return wrapValue(module.context, module, owner, raw), ""
+}
+
+func ReadIR(handle Handle, query int) ([]Handle, string) {
+	ctx, ns, err := enter(handle)
+	if err != "" {
+		return nil, err
+	}
+	defer ctx.mu.Unlock()
+	n := ns[0]
+	result := []Handle{}
+	switch query {
+	case 0:
+		if n.kind != moduleKind {
+			return nil, "argument: expected module"
+		}
+		for fn := C.LLVMGetFirstFunction(C.LLVMModuleRef(n.raw)); fn != nil; fn = C.LLVMGetNextFunction(fn) {
+			result = append(result, wrapFunction(n, fn))
+		}
+	case 1:
+		if n.kind != functionKind {
+			return nil, "argument: expected function"
+		}
+		for bb := C.LLVMGetFirstBasicBlock(C.LLVMValueRef(n.raw)); bb != nil; bb = C.LLVMGetNextBasicBlock(bb) {
+			result = append(result, wrapBlock(n.module, bb))
+		}
+	case 2, 3, 4, 8:
+		if n.kind != blockKind {
+			return nil, "argument: expected block"
+		}
+		bb := C.LLVMBasicBlockRef(n.raw)
+		switch query {
+		case 2:
+			for i := C.LLVMGetFirstInstruction(bb); i != nil; i = C.LLVMGetNextInstruction(i) {
+				result = append(result, wrapValue(ctx, n.module, n.owner, i))
+			}
+		case 3:
+			if term := C.LLVMGetBasicBlockTerminator(bb); term != nil {
+				for i := C.uint(0); i < C.LLVMGetNumSuccessors(term); i++ {
+					result = append(result, wrapBlock(n.module, C.LLVMGetSuccessor(term, i)))
+				}
+			}
+		case 4:
+			for pred := C.LLVMGetFirstBasicBlock(n.owner); pred != nil; pred = C.LLVMGetNextBasicBlock(pred) {
+				if term := C.LLVMGetBasicBlockTerminator(pred); term != nil {
+					for i := C.uint(0); i < C.LLVMGetNumSuccessors(term); i++ {
+						if C.LLVMGetSuccessor(term, i) == bb {
+							result = append(result, wrapBlock(n.module, pred))
+						}
+					}
+				}
+			}
+		case 8:
+			if term := C.LLVMGetBasicBlockTerminator(bb); term != nil {
+				result = append(result, wrapValue(ctx, n.module, n.owner, term))
+			}
+		}
+	case 5, 6, 7:
+		if n.kind != valueKind || n.module == nil {
+			return nil, "argument: expected module-owned value"
+		}
+		raw := C.LLVMValueRef(n.raw)
+		if query == 5 {
+			if C.LLVMIsAInstruction(raw) == nil {
+				return nil, "argument: expected instruction"
+			}
+			for i := 0; i < int(C.LLVMGetNumOperands(raw)); i++ {
+				v, err := inspectedValue(n.module, C.LLVMGetOperand(raw, C.uint(i)))
+				if err != "" {
+					return nil, err
+				}
+				result = append(result, v)
+			}
+		} else if query == 6 {
+			if C.LLVMIsAInstruction(raw) == nil && C.LLVMIsAArgument(raw) == nil {
+				return nil, "argument: users requires an instruction or parameter"
+			}
+			seen := make(map[C.LLVMValueRef]bool)
+			for use := C.LLVMGetFirstUse(raw); use != nil; use = C.LLVMGetNextUse(use) {
+				user := C.LLVMGetUser(use)
+				if C.LLVMIsAInstruction(user) == nil {
+					return nil, "argument: unsupported non-instruction user"
+				}
+				if !seen[user] {
+					v, err := inspectedValue(n.module, user)
+					if err != "" {
+						return nil, err
+					}
+					result = append(result, v)
+					seen[user] = true
+				}
+			}
+		} else {
+			if C.LLVMIsAPHINode(raw) == nil {
+				return nil, "argument: expected phi instruction"
+			}
+			for i := C.uint(0); i < C.LLVMCountIncoming(raw); i++ {
+				v, err := inspectedValue(n.module, C.LLVMGetIncomingValue(raw, i))
+				if err != "" {
+					return nil, err
+				}
+				if v.(*node).kind == functionKind {
+					v = wrapValue(ctx, n.module, nil, C.LLVMGetIncomingValue(raw, i))
+				}
+				result = append(result, v, wrapBlock(n.module, C.LLVMGetIncomingBlock(raw, i)))
+			}
+		}
+	default:
+		return nil, "argument: unknown IR query"
+	}
+	return result, ""
+}
+
+func HandleKind(handle Handle) (int, string) {
+	ctx, ns, err := enter(handle)
+	if err != "" {
+		return 0, err
+	}
+	defer ctx.mu.Unlock()
+	return ns[0].kind, ""
+}
+
+func HandleEqual(left, right Handle) (bool, string) {
+	ctx, ns, err := enter(left, right)
+	if err != "" {
+		return false, err
+	}
+	defer ctx.mu.Unlock()
+	return ns[0].kind == ns[1].kind && ns[0].raw == ns[1].raw, ""
+}
+
+func ValueName(handle Handle) (string, string) {
+	ctx, ns, err := enter(handle)
+	if err != "" {
+		return "", err
+	}
+	defer ctx.mu.Unlock()
+	n := ns[0]
+	if n.kind != valueKind && n.kind != functionKind && n.kind != blockKind {
+		return "", "argument: expected value, function or block"
+	}
+	raw := C.LLVMValueRef(n.raw)
+	if n.kind == blockKind {
+		raw = C.LLVMBasicBlockAsValue(C.LLVMBasicBlockRef(n.raw))
+	}
+	var size C.size_t
+	name := C.LLVMGetValueName2(raw, &size)
+	return C.GoStringN(name, C.int(size)), ""
+}
+
+func IsPhi(handle Handle) (bool, string) {
+	ctx, ns, err := enter(handle)
+	if err != "" {
+		return false, err
+	}
+	defer ctx.mu.Unlock()
+	if ns[0].kind != valueKind {
+		return false, "argument: expected value"
+	}
+	return C.LLVMIsAPHINode(C.LLVMValueRef(ns[0].raw)) != nil, ""
+}
+
+func EditIncoming(phi Handle, mode, index int, values, blocks []Handle) string {
+	if len(values) != len(blocks) || mode < 0 || mode > 3 || mode == 0 && len(values) == 0 || mode == 2 && len(values) != 1 || mode == 3 && len(values) != 0 {
+		return "argument: invalid phi edit"
+	}
+	ctx, ns, err := enter(append(append([]Handle{phi}, values...), blocks...)...)
+	if err != "" {
+		return err
+	}
+	defer ctx.mu.Unlock()
+	p := ns[0]
 	if p.kind != valueKind || p.module == nil || C.LLVMIsAPHINode(C.LLVMValueRef(p.raw)) == nil {
 		return "argument: expected phi instruction"
 	}
-	raw := C.LLVMValueRef(p.raw)
-	seen := make(map[C.LLVMBasicBlockRef]bool)
-	for i := C.uint(0); i < C.LLVMCountIncoming(raw); i++ {
-		seen[C.LLVMGetIncomingBlock(raw, i)] = true
+	old := C.LLVMValueRef(p.raw)
+	count := int(C.LLVMCountIncoming(old))
+	if (mode == 2 || mode == 3) && (index < 0 || index >= count) {
+		return "argument: phi incoming index out of bounds"
 	}
-	vs := make([]C.LLVMValueRef, len(values))
-	bs := make([]C.LLVMBasicBlockRef, len(blocks))
+	vs := []C.LLVMValueRef{}
+	bs := []C.LLVMBasicBlockRef{}
+	if mode != 1 {
+		for i := 0; i < count; i++ {
+			if mode == 3 && i == index {
+				continue
+			}
+			vs = append(vs, C.LLVMGetIncomingValue(old, C.uint(i)))
+			bs = append(bs, C.LLVMGetIncomingBlock(old, C.uint(i)))
+		}
+	}
 	for i := range values {
-		v, b := nodes[i+1], nodes[len(values)+i+1]
+		v, b := ns[i+1], ns[len(values)+i+1]
 		if err := operand(p, v); err != "" {
 			return err
 		}
 		if b.kind != blockKind || b.module != p.module || b.owner != p.owner {
 			return "argument: incoming block belongs to another function"
 		}
-		vs[i], bs[i] = C.LLVMValueRef(v.raw), C.LLVMBasicBlockRef(b.raw)
-		if C.LLVMTypeOf(vs[i]) != C.LLVMTypeOf(raw) {
+		value, block := C.LLVMValueRef(v.raw), C.LLVMBasicBlockRef(b.raw)
+		if C.LLVMTypeOf(value) != C.LLVMTypeOf(old) {
 			return "argument: phi incoming type mismatch"
 		}
-		if seen[bs[i]] {
-			return "argument: duplicate phi predecessor"
+		if mode == 2 {
+			vs[index], bs[index] = value, block
+		} else {
+			vs, bs = append(vs, value), append(bs, block)
 		}
-		seen[bs[i]] = true
 	}
-	C.LLVMAddIncoming(raw, unsafe.SliceData(vs), unsafe.SliceData(bs), C.uint(len(vs)))
+	seen := make(map[C.LLVMBasicBlockRef]C.LLVMValueRef)
+	for i, block := range bs {
+		if previous := seen[block]; previous != nil && previous != vs[i] {
+			return "argument: parallel phi edges must carry the same value"
+		}
+		seen[block] = vs[i]
+	}
+	if mode == 0 {
+		C.LLVMAddIncoming(old, unsafe.SliceData(vs[count:]), unsafe.SliceData(bs[count:]), C.uint(len(values)))
+		return ""
+	}
+	b := C.LLVMCreateBuilderInContext(ctx.raw)
+	defer C.LLVMDisposeBuilder(b)
+	C.LLVMPositionBuilderBefore(b, old)
+	empty := C.CString("")
+	defer C.free(unsafe.Pointer(empty))
+	replacement := C.LLVMBuildPhi(b, C.LLVMTypeOf(old), empty)
+	if len(vs) > 0 {
+		C.LLVMAddIncoming(replacement, unsafe.SliceData(vs), unsafe.SliceData(bs), C.uint(len(vs)))
+	}
+	var size C.size_t
+	name := C.LLVMGetValueName2(old, &size)
+	savedName := C.GoStringN(name, C.int(size))
+	C.LLVMSetValueName2(old, empty, 0)
+	rawName := C.CString(savedName)
+	C.LLVMSetValueName2(replacement, rawName, C.size_t(len(savedName)))
+	C.free(unsafe.Pointer(rawName))
+	var metadataCount C.size_t
+	metadata := C.LLVMInstructionGetAllMetadataOtherThanDebugLoc(old, &metadataCount)
+	for i := C.uint(0); i < C.uint(metadataCount); i++ {
+		kind := C.LLVMValueMetadataEntriesGetKind(metadata, i)
+		md := C.LLVMValueMetadataEntriesGetMetadata(metadata, i)
+		C.LLVMSetMetadata(replacement, kind, C.LLVMMetadataAsValue(ctx.raw, md))
+	}
+	C.LLVMDisposeValueMetadataEntries(metadata)
+	dbgName := C.CString("dbg")
+	dbgKind := C.LLVMGetMDKindIDInContext(ctx.raw, dbgName, 3)
+	C.free(unsafe.Pointer(dbgName))
+	if dbg := C.LLVMGetMetadata(old, dbgKind); dbg != nil {
+		C.LLVMSetMetadata(replacement, dbgKind, dbg)
+	}
+	if C.LLVMCanValueUseFastMathFlags(old) != 0 {
+		C.LLVMSetFastMathFlags(replacement, C.LLVMGetFastMathFlags(old))
+	}
+	C.LLVMReplaceAllUsesWith(old, replacement)
+	delete(p.module.values, p.raw)
+	p.raw = unsafe.Pointer(replacement)
+	p.module.values[p.raw] = p
+	for builder := range ctx.builders {
+		if builder.before == p {
+			C.LLVMPositionBuilderBefore(C.LLVMBuilderRef(builder.raw), replacement)
+		}
+	}
+	C.LLVMInstructionEraseFromParent(old)
 	return ""
+}
+
+func ReplaceUses(value, replacement Handle) string {
+	ctx, ns, err := enter(value, replacement)
+	if err != "" {
+		return err
+	}
+	defer ctx.mu.Unlock()
+	from, to := ns[0], ns[1]
+	if from.kind != valueKind || from.module == nil || from.owner == nil {
+		return "argument: replacement requires a local instruction or parameter"
+	}
+	if err := operand(from, to); err != "" {
+		return err
+	}
+	old, next := C.LLVMValueRef(from.raw), C.LLVMValueRef(to.raw)
+	if C.LLVMTypeOf(old) != C.LLVMTypeOf(next) || C.LLVMGetTypeKind(C.LLVMTypeOf(old)) == C.LLVMVoidTypeKind {
+		return "argument: replacement type mismatch"
+	}
+	if old != next {
+		C.LLVMReplaceAllUsesWith(old, next)
+	}
+	return ""
+}
+
+func SetOperand(instruction Handle, index int, replacement Handle) string {
+	ctx, ns, err := enter(instruction, replacement)
+	if err != "" {
+		return err
+	}
+	defer ctx.mu.Unlock()
+	n, v := ns[0], ns[1]
+	if n.kind != valueKind || C.LLVMIsAInstruction(C.LLVMValueRef(n.raw)) == nil {
+		return "argument: expected instruction"
+	}
+	if err := operand(n, v); err != "" {
+		return err
+	}
+	raw := C.LLVMValueRef(n.raw)
+	if index < 0 || index >= int(C.LLVMGetNumOperands(raw)) {
+		return "argument: operand index out of bounds"
+	}
+	op := C.LLVMGetInstructionOpcode(raw)
+	supported := op >= C.LLVMAdd && op <= C.LLVMStore || op >= C.LLVMTrunc && op <= C.LLVMFCmp
+	switch op {
+	case C.LLVMRet, C.LLVMSelect, C.LLVMFNeg, C.LLVMFreeze, C.LLVMAddrSpaceCast:
+		supported = true
+	case C.LLVMBr:
+		supported = C.LLVMIsConditional(raw) != 0 && index == 0
+	case C.LLVMCall:
+		supported = index < int(C.LLVMGetNumArgOperands(raw))
+	}
+	if !supported {
+		return "argument: operand edit is unsupported for this instruction or operand"
+	}
+	old := C.LLVMGetOperand(raw, C.uint(index))
+	if C.LLVMTypeOf(old) != C.LLVMTypeOf(C.LLVMValueRef(v.raw)) {
+		return "argument: operand type mismatch"
+	}
+	C.LLVMSetOperand(raw, C.uint(index), C.LLVMValueRef(v.raw))
+	return ""
+}
+
+func EraseInstruction(handle Handle) string {
+	ctx, ns, err := enter(handle)
+	if err != "" {
+		return err
+	}
+	defer ctx.mu.Unlock()
+	n := ns[0]
+	if n.kind != valueKind || C.LLVMIsAInstruction(C.LLVMValueRef(n.raw)) == nil {
+		return "argument: expected instruction"
+	}
+	raw := C.LLVMValueRef(n.raw)
+	if C.LLVMGetFirstUse(raw) != nil {
+		return "argument: instruction still has users"
+	}
+	for b := range ctx.builders {
+		if b.before == n {
+			setPosition(b, nil, nil, nil, nil)
+		}
+	}
+	delete(n.module.values, n.raw)
+	n.closed = true
+	C.LLVMInstructionEraseFromParent(raw)
+	return ""
+}
+
+func EntryAlloca(function, valueType Handle, name string) (Handle, string) {
+	ctx, ns, err := enter(function, valueType)
+	if err != "" {
+		return nil, err
+	}
+	defer ctx.mu.Unlock()
+	f, t := ns[0], ns[1]
+	if f.kind != functionKind || t.kind != typeKind || !firstClass(C.LLVMTypeRef(t.raw)) || C.LLVMTypeIsSized(C.LLVMTypeRef(t.raw)) == 0 {
+		return nil, "argument: expected function and sized first-class type"
+	}
+	entry := C.LLVMGetFirstBasicBlock(C.LLVMValueRef(f.raw))
+	if entry == nil {
+		return nil, "argument: function has no entry block"
+	}
+	rawName, free, err := text(name)
+	if err != "" {
+		return nil, err
+	}
+	defer free()
+	b := C.LLVMCreateBuilderInContext(ctx.raw)
+	defer C.LLVMDisposeBuilder(b)
+	C.LLVMPositionBuilderAtEnd(b, entry)
+	for i := C.LLVMGetFirstInstruction(entry); i != nil; i = C.LLVMGetNextInstruction(i) {
+		if C.LLVMIsAPHINode(i) == nil {
+			C.LLVMPositionBuilderBefore(b, i)
+			break
+		}
+	}
+	return wrapValue(ctx, f.module, C.LLVMValueRef(f.raw), C.LLVMBuildAlloca(b, C.LLVMTypeRef(t.raw), rawName)), ""
 }
 
 func GEP(builder, source, pointer Handle, indices []Handle, inBounds bool, name string) (Handle, string) {
@@ -1244,9 +1769,11 @@ func optimize(ctx *contextState, module *node, pipeline string, target *node) st
 			builder.module = nil
 			builder.owner = nil
 			builder.block = nil
+			builder.before = nil
 		}
 	}
 	module.epoch++
+	clear(module.values)
 	options := C.LLVMCreatePassBuilderOptions()
 	defer C.LLVMDisposePassBuilderOptions(options)
 	failure := C.LLVMRunPasses(C.LLVMModuleRef(module.raw), raw, machine, options)

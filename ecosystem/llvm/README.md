@@ -86,8 +86,12 @@ types and signatures compatible with its ABI.
 | Target discovery | `target_names`, `normalize_triple`, `TargetOptions::new`, `TargetOptions::native` |
 | Target machine | `triple`, `cpu`, `features`, `name`, `data_layout`, `configure`, `optimize`, `run_passes`, file/memory emission, `close`, `is_closed` |
 | ABI layout | `byte_order`, `pointer_bytes`, `pointer_int_type`, `type_layout`, `field_offset` |
-| Function | `signature`, `parameter`, `append_block`, `ir` |
-| Value | `value_type`, `set_name`, `add_incoming`, `ir` |
+| Function | `signature`, `parameter`, `append_block`, `blocks`, `name`, `same_as`, `entry_alloca`, `local`, `ir` |
+| Block | `instructions`, `terminator`, `predecessors`, `successors`, `name`, `same_as` |
+| Value | `value_type`, `name`, `set_name`, `same_as`, `operands`, `users`, `set_operand`, `replace_all_uses_with`, `erase`, `ir` |
+| PHI | `is_phi`, `incoming`, `add_incoming`, `replace_incoming`, `set_incoming`, `remove_incoming` |
+| Insertion points | `position_at_end`, `position_at_start`, `position_before`, `save_position`, `restore_position`, `clear_position` |
+| Local variables | `Local::read`, `Local::write`, `Module::promote_locals` |
 | Builder arithmetic | `binary`, `int_compare`, `float_compare`, `cast`, `select` |
 | Builder control flow | `position_at_end`, `call`, `ret`, `ret_void`, `branch`, `conditional_branch`, `phi`, `unreachable` |
 | Builder memory | `alloca`, `load`, `store`, `gep` |
@@ -110,16 +114,73 @@ signed/unsigned comparisons; `FloatPredicate` includes ordered/unordered
 comparisons. `CastOp` covers integer extension/truncation, numeric floating
 conversions, pointer/integer conversion and checked equal-width bitcasts.
 
-Builders insert at the end of a block. Each block accepts one terminator, and
-phi instructions must precede its non-phi instructions. Add phi predecessors
-through `value.add_incoming(Vec[(Value, Block)])`; this checks matching types,
-function ownership and duplicate predecessors. The module verifier checks the
-finished control-flow graph, SSA dominance and remaining IR invariants.
+Each block accepts one terminator, and phi instructions must precede its non-phi
+instructions. Builders support block-end insertion and explicit insertion points.
+The module verifier checks the finished control-flow graph, SSA dominance and
+remaining IR invariants.
 
 LLVM 18 uses opaque pointers. `load` and `gep` therefore take explicit source
 types. GEP checks aggregate traversal and constant i32 struct indices. The
 caller remains responsible for actual pointer validity, memory layout, bounds,
 alignment, ABI compatibility and LLVM poison/undefined-behavior rules.
+
+## Constructing and editing SSA
+
+`position_at_start(block)` inserts before the first non-PHI instruction, or at
+the end of a block containing only PHIs. It permits adding PHIs after the rest
+of the block has already been constructed. `position_before(instruction)`
+selects an exact anchor. Ordinary instructions cannot be inserted before a PHI;
+terminators can only be inserted at the end of an unterminated block.
+`save_position()` returns an `InsertionPoint`, including an unset position;
+`restore_position(point)` restores it in any builder of the same context.
+
+`incoming()` returns ordered `(Value, Block)` pairs. `add_incoming` appends,
+`replace_incoming` replaces the complete list, `set_incoming(index, value, block)`
+changes one entry, and `remove_incoming(index)` removes one entry. Edits validate
+types and function ownership before changing IR. Parallel edges from the same
+predecessor are supported when they carry the same value. The verifier checks
+edge multiplicity against the completed CFG; edits may temporarily leave an
+incomplete PHI, including an empty list. Replacing or removing entries preserves
+PHI handle identity, users, names, metadata and fast-math flags.
+
+`module.functions()`, `function.blocks()` and `block.instructions()` return
+snapshots in IR order. Predecessors and successors include repeated entries for
+parallel edges. `block.terminator()` returns an optional instruction.
+`value.operands()` distinguishes `Operand::Value`, `Operand::Block` and
+`Operand::Function`; metadata and other special operands return an error.
+`value.users()` accepts local instructions and parameters and returns distinct
+instruction users in LLVM use-list order. `same_as` compares native identity.
+
+`set_operand(index, value)` supports arithmetic, shifts, casts, comparisons,
+alloca/load/store, return, select, freeze, conditional-branch conditions and
+ordinary call arguments. It checks type and ownership. PHIs use their dedicated
+editing methods; GEP indices, branch destinations, callees and other specialized
+operands are not editable through this method. To change a terminator, erase it,
+position the builder at block end and create its replacement, then repair PHIs.
+
+`replace_all_uses_with(value)` rewrites uses of a local instruction or parameter
+with a same-typed value from the same function or an eligible constant.
+`erase()` only removes instructions without users. Erasure is explicit and may
+remove side effects; it is not a dead-code analysis. Every alias of the erased
+instruction becomes closed, builders anchored before it become unpositioned,
+and saved positions anchored before it become closed. Other handles stay live.
+These edits do not automatically repair dominance; call `module.verify()`
+after completing the transformation.
+
+For mutable frontend variables, `function.local(type, name)` allocates storage
+in the entry block without moving existing builders. `local.write(builder, value)`
+checks the variable type and emits a store; `local.read(builder, name)` emits a
+load. Initialize every variable on all paths before reading it. The lower-level
+`entry_alloca(type, name)` returns the storage pointer when address access is
+needed. Entry allocation also works after the entry terminator exists.
+
+`module.promote_locals()` runs `function(sroa,mem2reg)`, allowing LLVM to build
+PHIs for eligible variables across branches and loops. It verifies before and
+after transformation and invalidates module handles just like `run_passes`.
+Reacquire functions, blocks and instructions through the traversal APIs afterward.
+Address escape and unsupported memory uses can prevent promotion. See the
+[LLVM mutable-variable tutorial](https://releases.llvm.org/18.1.8/docs/tutorial/MyFirstLanguageFrontend/LangImpl07.html)
+and the executable [nested-loop example](../consumers/llvm/tests/ssa_execution_test.gom).
 
 ## Resource lifecycle and concurrency
 
@@ -136,7 +197,9 @@ GoML garbage collection does not dispose LLVM contexts. Close the context in a
 - Closing a target machine releases its machine and target-data layout. Closure
   is idempotent; modules and types created through that target remain valid.
 - Types and context-owned constants remain valid until their context closes.
-  Constant-folded builder results may also be context-owned.
+  Pure constant-folded builder results are context-owned. Inspected or folded
+  constants referencing globals or block addresses retain module ownership.
+  Constant graphs exceeding the inspection budget conservatively retain module ownership.
 
 Calls on one context are serialized by a native mutex, including close. Separate
 contexts can run independently. Cross-context operands, cross-module function
@@ -246,8 +309,9 @@ libraries and runtime.
 This binding covers common IR construction and native ahead-of-time compilation.
 It does not expose the full LLVM API: JIT/ORC execution, explicit ABI-name selection,
 debug metadata, globals, named recursive structs, vectors, atomics, exception
-handling, linkage/attribute configuration and arbitrary instruction inspection
-are not implemented. Calling conventions use LLVM's default C convention.
+handling, linkage/attribute configuration, arbitrary instruction mutation,
+dominance/loop analysis, MemorySSA and a sealed-block SSA builder are not
+implemented. Calling conventions use LLVM's default C convention.
 
 From the repository root:
 
@@ -255,7 +319,7 @@ From the repository root:
 just ecosystem-test llvm
 ```
 
-Thirteen GoML library tests, four consumer tests and eight native adapter tests
+Nineteen GoML library tests, five consumer tests and twelve native adapter tests
 cover errors, concurrency and resource lifetimes. A GoML consumer invokes installed LLVM 18 tools and
 cc through `std::process`, verifies emitted IR/bitcode, assembles/disassembles it,
 links unoptimized/optimized objects, assembly and an explicit portable x86-64
@@ -267,6 +331,13 @@ reassemble x86-64, i386, AArch64 and big-endian AArch64 output. Cross-target
 objects are inspected, not executed. Tests also cover target mismatch rejection,
 packed/unpacked ABI layouts, shared target emission, concurrent close, output
 copy limits and the supported code-model/relocation combinations.
+
+SSA regressions cover parallel edges, late PHIs, incoming-list edits, self edges,
+metadata and alias preservation, invalid dominance, rejected edits, insertion
+points, erasure and concurrent close. An additional native workload promotes
+nested loops with multiple backedges, inspects the generated PHIs, and checks
+390 results across original, promoted and optimized objects. It also exercises
+late PHI creation, parallel edges, operand edits, use replacement and erasure.
 
 The APIs follow LLVM 18's [target-machine C interface](https://github.com/llvm/llvm-project/blob/llvmorg-18.1.8/llvm/include/llvm-c/TargetMachine.h),
 [target-data interface](https://github.com/llvm/llvm-project/blob/llvmorg-18.1.8/llvm/include/llvm-c/Target.h)
