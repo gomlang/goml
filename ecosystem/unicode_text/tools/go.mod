@@ -1,3 +1,3 @@
 module example.com/goml-ecosystem/unicode-data
 
-go 1.25.0
+go 1.26.0
