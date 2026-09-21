@@ -13,14 +13,19 @@ package adapter
 #include <llvm-c/Target.h>
 #include <llvm-c/TargetMachine.h>
 #include <llvm-c/Transforms/PassBuilder.h>
-static int initialize_native(void) {
-    return LLVMInitializeNativeTarget() || LLVMInitializeNativeAsmPrinter() || LLVMInitializeNativeAsmParser();
+static void initialize_targets(void) {
+    LLVMInitializeAllTargetInfos();
+    LLVMInitializeAllTargets();
+    LLVMInitializeAllTargetMCs();
+    LLVMInitializeAllAsmPrinters();
+    LLVMInitializeAllAsmParsers();
 }
 */
 import "C"
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"unsafe"
@@ -35,6 +40,7 @@ type contextState struct {
 	raw      C.LLVMContextRef
 	modules  map[*node]bool
 	builders map[*node]bool
+	targets  map[*node]bool
 }
 
 type node struct {
@@ -46,6 +52,7 @@ type node struct {
 	owner   C.LLVMValueRef
 	block   C.LLVMBasicBlockRef
 	closed  bool
+	layout  C.LLVMTargetDataRef
 }
 
 const (
@@ -56,10 +63,11 @@ const (
 	functionKind
 	blockKind
 	builderKind
+	targetKind
 )
 
 func NewContext() Handle {
-	ctx := &contextState{raw: C.LLVMContextCreate(), modules: make(map[*node]bool), builders: make(map[*node]bool)}
+	ctx := &contextState{raw: C.LLVMContextCreate(), modules: make(map[*node]bool), builders: make(map[*node]bool), targets: make(map[*node]bool)}
 	return &node{context: ctx, kind: contextKind}
 }
 
@@ -123,10 +131,16 @@ func Close(handle Handle) string {
 			C.LLVMDisposeModule(C.LLVMModuleRef(module.raw))
 			module.closed = true
 		}
+		for target := range ctx.targets {
+			C.LLVMDisposeTargetData(target.layout)
+			C.LLVMDisposeTargetMachine(C.LLVMTargetMachineRef(target.raw))
+			target.closed = true
+		}
 		C.LLVMContextDispose(ctx.raw)
 		ctx.raw = nil
 		clear(ctx.builders)
 		clear(ctx.modules)
+		clear(ctx.targets)
 	case moduleKind:
 		for builder := range ctx.builders {
 			if builder.module == value {
@@ -141,6 +155,10 @@ func Close(handle Handle) string {
 	case builderKind:
 		C.LLVMDisposeBuilder(C.LLVMBuilderRef(value.raw))
 		delete(ctx.builders, value)
+	case targetKind:
+		C.LLVMDisposeTargetData(value.layout)
+		C.LLVMDisposeTargetMachine(C.LLVMTargetMachineRef(value.raw))
+		delete(ctx.targets, value)
 	default:
 		return "argument: resource is owned by its context or module"
 	}
@@ -1197,6 +1215,10 @@ func Optimize(handle Handle, pipeline string) string {
 	if module.kind != moduleKind {
 		return "argument: expected module"
 	}
+	return optimize(ctx, module, pipeline, nil)
+}
+
+func optimize(ctx *contextState, module *node, pipeline string, target *node) string {
 	if err := verify(module); err != "" {
 		return err
 	}
@@ -1208,6 +1230,14 @@ func Optimize(handle Handle, pipeline string) string {
 		return err
 	}
 	defer free()
+	var machine C.LLVMTargetMachineRef
+	if target != nil {
+		if err := compatibleTarget(module, target); err != "" {
+			return err
+		}
+		applyTarget(C.LLVMModuleRef(module.raw), target)
+		machine = C.LLVMTargetMachineRef(target.raw)
+	}
 	for builder := range ctx.builders {
 		if builder.module == module {
 			C.LLVMClearInsertionPosition(C.LLVMBuilderRef(builder.raw))
@@ -1219,7 +1249,7 @@ func Optimize(handle Handle, pipeline string) string {
 	module.epoch++
 	options := C.LLVMCreatePassBuilderOptions()
 	defer C.LLVMDisposePassBuilderOptions(options)
-	failure := C.LLVMRunPasses(C.LLVMModuleRef(module.raw), raw, nil, options)
+	failure := C.LLVMRunPasses(C.LLVMModuleRef(module.raw), raw, machine, options)
 	if failure != nil {
 		diagnostic := C.LLVMGetErrorMessage(failure)
 		defer C.LLVMDisposeErrorMessage(diagnostic)
@@ -1229,7 +1259,412 @@ func Optimize(handle Handle, pipeline string) string {
 }
 
 var targetOnce sync.Once
-var targetError string
+
+func initializeTargets() {
+	targetOnce.Do(func() { C.initialize_targets() })
+}
+
+func HostTarget() (string, string, string) {
+	return message(C.LLVMGetDefaultTargetTriple()), message(C.LLVMGetHostCPUName()), message(C.LLVMGetHostCPUFeatures())
+}
+
+func TargetNames() []string {
+	initializeTargets()
+	names := []string{}
+	for target := C.LLVMGetFirstTarget(); target != nil; target = C.LLVMGetNextTarget(target) {
+		if C.LLVMTargetHasTargetMachine(target) != 0 && C.LLVMTargetHasAsmBackend(target) != 0 {
+			names = append(names, C.GoString(C.LLVMGetTargetName(target)))
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+func NormalizeTriple(triple string) (string, string) {
+	if triple == "" || len(triple) > 1024 {
+		return "", "argument: target triple must contain 1..1024 bytes"
+	}
+	for _, ch := range triple {
+		if ch > 127 || !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || strings.ContainsRune("-_.", ch)) {
+			return "", "argument: invalid character in target triple"
+		}
+	}
+	raw := C.CString(triple)
+	defer C.free(unsafe.Pointer(raw))
+	return message(C.LLVMNormalizeTargetTriple(raw)), ""
+}
+
+func validTargetName(value string) bool {
+	if len(value) > 1024 {
+		return false
+	}
+	for _, ch := range value {
+		if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || strings.ContainsRune("-_.", ch)) {
+			return false
+		}
+	}
+	return true
+}
+
+func targetModel(name string, model int) bool {
+	if model == int(C.LLVMCodeModelDefault) {
+		return true
+	}
+	switch name {
+	case "x86-64":
+		return model == int(C.LLVMCodeModelSmall) || model == int(C.LLVMCodeModelLarge)
+	case "x86":
+		return model == int(C.LLVMCodeModelSmall)
+	case "aarch64", "aarch64_be":
+		return model == int(C.LLVMCodeModelSmall) || model == int(C.LLVMCodeModelLarge)
+	}
+	return false
+}
+
+func newTarget(ctx *contextState, triple, cpu, features string, level, relocation, model int) (*node, string) {
+	triple, err := NormalizeTriple(triple)
+	if err != "" {
+		return nil, err
+	}
+	if !validTargetName(cpu) || len(features) > 65536 {
+		return nil, "argument: invalid CPU name or feature string length"
+	}
+	if features != "" {
+		for _, feature := range strings.Split(features, ",") {
+			if len(feature) < 2 || feature[0] != '+' && feature[0] != '-' || !validTargetName(feature[1:]) {
+				return nil, "argument: target features must be comma-separated +name or -name entries"
+			}
+		}
+	}
+	if level < 0 || level > 3 || relocation < 0 || relocation > 2 || model < 0 || model > 6 || model == 1 {
+		return nil, "argument: invalid optimization, relocation or code model"
+	}
+	initializeTargets()
+	rawTriple := C.CString(triple)
+	defer C.free(unsafe.Pointer(rawTriple))
+	var target C.LLVMTargetRef
+	var diagnostic *C.char
+	if C.LLVMGetTargetFromTriple(rawTriple, &target, &diagnostic) != 0 {
+		return nil, "llvm: " + message(diagnostic)
+	}
+	if C.LLVMTargetHasTargetMachine(target) == 0 || C.LLVMTargetHasAsmBackend(target) == 0 {
+		return nil, "argument: target does not support machine code emission"
+	}
+	if !targetModel(C.GoString(C.LLVMGetTargetName(target)), model) {
+		return nil, "argument: unsupported code model for this target"
+	}
+	rawCPU := C.CString(cpu)
+	defer C.free(unsafe.Pointer(rawCPU))
+	rawFeatures := C.CString(features)
+	defer C.free(unsafe.Pointer(rawFeatures))
+	machine := C.LLVMCreateTargetMachine(target, rawTriple, rawCPU, rawFeatures, C.LLVMCodeGenOptLevel(level), C.LLVMRelocMode(relocation), C.LLVMCodeModel(model))
+	if machine == nil {
+		return nil, "llvm: target machine creation failed"
+	}
+	value := &node{context: ctx, kind: targetKind, raw: unsafe.Pointer(machine), layout: C.LLVMCreateTargetDataLayout(machine)}
+	ctx.targets[value] = true
+	return value, ""
+}
+
+func NewTarget(handle Handle, triple, cpu, features string, level, relocation, model int) (Handle, string) {
+	ctx, nodes, err := enter(handle)
+	if err != "" {
+		return nil, err
+	}
+	defer ctx.mu.Unlock()
+	if nodes[0].kind != contextKind {
+		return nil, "argument: expected context"
+	}
+	return newTarget(ctx, triple, cpu, features, level, relocation, model)
+}
+
+func TargetText(handle Handle, field int) (string, string) {
+	ctx, nodes, err := enter(handle)
+	if err != "" {
+		return "", err
+	}
+	defer ctx.mu.Unlock()
+	target := nodes[0]
+	if target.kind != targetKind {
+		return "", "argument: expected target machine"
+	}
+	machine := C.LLVMTargetMachineRef(target.raw)
+	switch field {
+	case 0:
+		return message(C.LLVMGetTargetMachineTriple(machine)), ""
+	case 1:
+		return message(C.LLVMGetTargetMachineCPU(machine)), ""
+	case 2:
+		return message(C.LLVMGetTargetMachineFeatureString(machine)), ""
+	case 3:
+		return C.GoString(C.LLVMGetTargetName(C.LLVMGetTargetMachineTarget(machine))), ""
+	case 4:
+		return message(C.LLVMCopyStringRepOfTargetData(target.layout)), ""
+	}
+	return "", "argument: invalid target field"
+}
+
+func ModuleTargetText(handle Handle, layout bool) (string, string) {
+	ctx, nodes, err := enter(handle)
+	if err != "" {
+		return "", err
+	}
+	defer ctx.mu.Unlock()
+	if nodes[0].kind != moduleKind {
+		return "", "argument: expected module"
+	}
+	module := C.LLVMModuleRef(nodes[0].raw)
+	if layout {
+		return C.GoString(C.LLVMGetDataLayoutStr(module)), ""
+	}
+	return C.GoString(C.LLVMGetTarget(module)), ""
+}
+
+func compatibleTarget(module, target *node) string {
+	triple := C.GoString(C.LLVMGetTarget(C.LLVMModuleRef(module.raw)))
+	if triple != "" {
+		normalized, err := NormalizeTriple(triple)
+		if err != "" || normalized != message(C.LLVMGetTargetMachineTriple(C.LLVMTargetMachineRef(target.raw))) {
+			return "argument: module triple differs from target machine"
+		}
+	}
+	layout := C.GoString(C.LLVMGetDataLayoutStr(C.LLVMModuleRef(module.raw)))
+	if layout != "" && layout != message(C.LLVMCopyStringRepOfTargetData(target.layout)) {
+		return "argument: module data layout differs from target machine"
+	}
+	return ""
+}
+
+func applyTarget(module C.LLVMModuleRef, target *node) {
+	triple := C.LLVMGetTargetMachineTriple(C.LLVMTargetMachineRef(target.raw))
+	defer C.LLVMDisposeMessage(triple)
+	C.LLVMSetTarget(module, triple)
+	C.LLVMSetModuleDataLayout(module, target.layout)
+}
+
+func ConfigureTarget(target, module Handle) string {
+	ctx, nodes, err := enter(target, module)
+	if err != "" {
+		return err
+	}
+	defer ctx.mu.Unlock()
+	if nodes[0].kind != targetKind || nodes[1].kind != moduleKind {
+		return "argument: expected target machine and module"
+	}
+	if err := compatibleTarget(nodes[1], nodes[0]); err != "" {
+		return err
+	}
+	applyTarget(C.LLVMModuleRef(nodes[1].raw), nodes[0])
+	return ""
+}
+
+func OptimizeTarget(target, module Handle, pipeline string) string {
+	ctx, nodes, err := enter(target, module)
+	if err != "" {
+		return err
+	}
+	defer ctx.mu.Unlock()
+	if nodes[0].kind != targetKind || nodes[1].kind != moduleKind {
+		return "argument: expected target machine and module"
+	}
+	return optimize(ctx, nodes[1], pipeline, nodes[0])
+}
+
+func TargetPointer(handle Handle, addressSpace int, asType bool) (Handle, uint64, string) {
+	ctx, nodes, err := enter(handle)
+	if err != "" {
+		return nil, 0, err
+	}
+	defer ctx.mu.Unlock()
+	if nodes[0].kind != targetKind || addressSpace < 0 || addressSpace >= 1<<24 {
+		return nil, 0, "argument: expected target machine and 24-bit address space"
+	}
+	layout := nodes[0].layout
+	if asType {
+		return wrapType(ctx, C.LLVMIntPtrTypeForASInContext(ctx.raw, layout, C.unsigned(addressSpace))), 0, ""
+	}
+	return nil, uint64(C.LLVMPointerSizeForAS(layout, C.unsigned(addressSpace))), ""
+}
+
+func TargetLittleEndian(handle Handle) (bool, string) {
+	ctx, nodes, err := enter(handle)
+	if err != "" {
+		return false, err
+	}
+	defer ctx.mu.Unlock()
+	if nodes[0].kind != targetKind {
+		return false, "argument: expected target machine"
+	}
+	return C.LLVMByteOrder(nodes[0].layout) == C.LLVMLittleEndian, ""
+}
+
+func fixedLayout(layout C.LLVMTargetDataRef, ty C.LLVMTypeRef, seen map[C.LLVMTypeRef]int, depth int, work *int) string {
+	*work++
+	if depth > 64 || *work > 65536 {
+		return "argument: type layout complexity limit exceeded"
+	}
+	if height, exists := seen[ty]; exists {
+		if height < 0 {
+			return "argument: recursive unsized type"
+		}
+		if depth+height > 64 {
+			return "argument: type layout complexity limit exceeded"
+		}
+		return ""
+	}
+	seen[ty] = -1
+	height := 0
+	const maxSize = uint64(1 << 40)
+	switch C.LLVMGetTypeKind(ty) {
+	case C.LLVMIntegerTypeKind, C.LLVMPointerTypeKind, C.LLVMHalfTypeKind, C.LLVMBFloatTypeKind, C.LLVMFloatTypeKind, C.LLVMDoubleTypeKind, C.LLVMX86_FP80TypeKind, C.LLVMFP128TypeKind, C.LLVMPPC_FP128TypeKind:
+	case C.LLVMArrayTypeKind, C.LLVMVectorTypeKind:
+		element := C.LLVMGetElementType(ty)
+		if err := fixedLayout(layout, element, seen, depth+1, work); err != "" {
+			return err
+		}
+		height = seen[element] + 1
+		count := uint64(0)
+		if C.LLVMGetTypeKind(ty) == C.LLVMArrayTypeKind {
+			count = uint64(C.LLVMGetArrayLength2(ty))
+		} else {
+			count = uint64(C.LLVMGetVectorSize(ty))
+		}
+		size := uint64(C.LLVMABISizeOfType(layout, element))
+		if size != 0 && count > maxSize/size {
+			return "argument: type layout exceeds 1 TiB"
+		}
+	case C.LLVMStructTypeKind:
+		if C.LLVMIsOpaqueStruct(ty) != 0 || C.LLVMCountStructElementTypes(ty) > 65536 {
+			return "argument: opaque or excessively large struct"
+		}
+		fields := make([]C.LLVMTypeRef, int(C.LLVMCountStructElementTypes(ty)))
+		C.LLVMGetStructElementTypes(ty, unsafe.SliceData(fields))
+		var total uint64
+		for _, field := range fields {
+			if err := fixedLayout(layout, field, seen, depth+1, work); err != "" {
+				return err
+			}
+			if seen[field]+1 > height {
+				height = seen[field] + 1
+			}
+			total += uint64(C.LLVMABISizeOfType(layout, field))
+			if total > maxSize {
+				return "argument: type layout exceeds 1 TiB"
+			}
+		}
+	default:
+		return "argument: layout requires a sized type without scalable vectors"
+	}
+	if C.LLVMTypeIsSized(ty) == 0 || uint64(C.LLVMABISizeOfType(layout, ty)) > maxSize {
+		return "argument: type is unsized or exceeds 1 TiB"
+	}
+	seen[ty] = height
+	return ""
+}
+
+func TargetLayout(target, value Handle, operation, index int) ([]uint64, string) {
+	ctx, nodes, err := enter(target, value)
+	if err != "" {
+		return nil, err
+	}
+	defer ctx.mu.Unlock()
+	if nodes[0].kind != targetKind || nodes[1].kind != typeKind || operation < 0 || operation > 1 {
+		return nil, "argument: expected target machine, type and layout operation"
+	}
+	layout := nodes[0].layout
+	ty := C.LLVMTypeRef(nodes[1].raw)
+	work := 0
+	if err := fixedLayout(layout, ty, make(map[C.LLVMTypeRef]int), 0, &work); err != "" {
+		return nil, err
+	}
+	if operation == 1 {
+		if C.LLVMGetTypeKind(ty) != C.LLVMStructTypeKind || index < 0 || uint64(index) >= uint64(C.LLVMCountStructElementTypes(ty)) {
+			return nil, "argument: invalid struct field index"
+		}
+		return []uint64{uint64(C.LLVMOffsetOfElement(layout, ty, C.unsigned(index)))}, ""
+	}
+	return []uint64{uint64(C.LLVMSizeOfTypeInBits(layout, ty)), uint64(C.LLVMStoreSizeOfType(layout, ty)), uint64(C.LLVMABISizeOfType(layout, ty)), uint64(C.LLVMABIAlignmentOfType(layout, ty)), uint64(C.LLVMPreferredAlignmentOfType(layout, ty))}, ""
+}
+
+func targetClone(module, target *node) (C.LLVMModuleRef, string) {
+	if err := verify(module); err != "" {
+		return nil, err
+	}
+	if err := compatibleTarget(module, target); err != "" {
+		return nil, err
+	}
+	clone := C.LLVMCloneModule(C.LLVMModuleRef(module.raw))
+	applyTarget(clone, target)
+	return clone, ""
+}
+
+func emitTargetFile(module, target *node, path string, assembly bool) string {
+	if path == "" {
+		return "argument: output path is empty"
+	}
+	rawPath, free, err := text(path)
+	if err != "" {
+		return err
+	}
+	defer free()
+	clone, err := targetClone(module, target)
+	if err != "" {
+		return err
+	}
+	defer C.LLVMDisposeModule(clone)
+	format := C.LLVMObjectFile
+	if assembly {
+		format = C.LLVMAssemblyFile
+	}
+	var diagnostic *C.char
+	if C.LLVMTargetMachineEmitToFile(C.LLVMTargetMachineRef(target.raw), clone, rawPath, C.LLVMCodeGenFileType(format), &diagnostic) != 0 {
+		return "llvm: " + message(diagnostic)
+	}
+	return ""
+}
+
+func EmitTargetFile(target, module Handle, path string, assembly bool) string {
+	ctx, nodes, err := enter(target, module)
+	if err != "" {
+		return err
+	}
+	defer ctx.mu.Unlock()
+	if nodes[0].kind != targetKind || nodes[1].kind != moduleKind {
+		return "argument: expected target machine and module"
+	}
+	return emitTargetFile(nodes[1], nodes[0], path, assembly)
+}
+
+func EmitTargetBytes(target, module Handle, assembly bool, limit int) ([]byte, string) {
+	ctx, nodes, err := enter(target, module)
+	if err != "" {
+		return nil, err
+	}
+	defer ctx.mu.Unlock()
+	if nodes[0].kind != targetKind || nodes[1].kind != moduleKind || limit < 1 || limit > 1<<30 {
+		return nil, "argument: expected target machine, module and output limit in 1..1073741824"
+	}
+	clone, err := targetClone(nodes[1], nodes[0])
+	if err != "" {
+		return nil, err
+	}
+	defer C.LLVMDisposeModule(clone)
+	format := C.LLVMObjectFile
+	if assembly {
+		format = C.LLVMAssemblyFile
+	}
+	var diagnostic *C.char
+	var buffer C.LLVMMemoryBufferRef
+	if C.LLVMTargetMachineEmitToMemoryBuffer(C.LLVMTargetMachineRef(nodes[0].raw), clone, C.LLVMCodeGenFileType(format), &diagnostic, &buffer) != 0 {
+		return nil, "llvm: " + message(diagnostic)
+	}
+	defer C.LLVMDisposeMemoryBuffer(buffer)
+	size := C.LLVMGetBufferSize(buffer)
+	if uint64(size) > uint64(limit) {
+		return nil, "argument: emitted output exceeds byte limit"
+	}
+	return C.GoBytes(unsafe.Pointer(C.LLVMGetBufferStart(buffer)), C.int(size)), ""
+}
 
 func EmitFile(handle Handle, path string, assembly bool, level int) string {
 	ctx, nodes, err := enter(handle)
@@ -1241,58 +1676,17 @@ func EmitFile(handle Handle, path string, assembly bool, level int) string {
 	if module.kind != moduleKind {
 		return "argument: expected module"
 	}
-	if level < 0 || level > 3 {
-		return "argument: optimization level must be 0..3"
-	}
-	if path == "" {
-		return "argument: output path is empty"
-	}
-	if err := verify(module); err != "" {
-		return err
-	}
-	rawPath, free, err := text(path)
+	triple, cpu, features := HostTarget()
+	target, err := newTarget(ctx, triple, cpu, features, level, int(C.LLVMRelocPIC), int(C.LLVMCodeModelDefault))
 	if err != "" {
 		return err
 	}
-	defer free()
-	targetOnce.Do(func() {
-		if C.initialize_native() != 0 {
-			targetError = "llvm: native target initialization failed"
-		}
-	})
-	if targetError != "" {
-		return targetError
-	}
-	triple := C.LLVMGetDefaultTargetTriple()
-	defer C.LLVMDisposeMessage(triple)
-	cpu := C.LLVMGetHostCPUName()
-	defer C.LLVMDisposeMessage(cpu)
-	features := C.LLVMGetHostCPUFeatures()
-	defer C.LLVMDisposeMessage(features)
-	var target C.LLVMTargetRef
-	var diagnostic *C.char
-	if C.LLVMGetTargetFromTriple(triple, &target, &diagnostic) != 0 {
-		return "llvm: " + message(diagnostic)
-	}
-	machine := C.LLVMCreateTargetMachine(target, triple, cpu, features, C.LLVMCodeGenOptLevel(level), C.LLVMRelocPIC, C.LLVMCodeModelDefault)
-	if machine == nil {
-		return "llvm: target machine creation failed"
-	}
-	defer C.LLVMDisposeTargetMachine(machine)
-	clone := C.LLVMCloneModule(C.LLVMModuleRef(module.raw))
-	defer C.LLVMDisposeModule(clone)
-	C.LLVMSetTarget(clone, triple)
-	layout := C.LLVMCreateTargetDataLayout(machine)
-	defer C.LLVMDisposeTargetData(layout)
-	C.LLVMSetModuleDataLayout(clone, layout)
-	format := C.LLVMObjectFile
-	if assembly {
-		format = C.LLVMAssemblyFile
-	}
-	if C.LLVMTargetMachineEmitToFile(machine, clone, rawPath, C.LLVMCodeGenFileType(format), &diagnostic) != 0 {
-		return "llvm: " + message(diagnostic)
-	}
-	return ""
+	defer func() {
+		C.LLVMDisposeTargetData(target.layout)
+		C.LLVMDisposeTargetMachine(C.LLVMTargetMachineRef(target.raw))
+		delete(ctx.targets, target)
+	}()
+	return emitTargetFile(module, target, path, assembly)
 }
 
 func Version() string {

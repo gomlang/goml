@@ -2,7 +2,7 @@
 
 `ecosystem::llvm` provides typed GoML bindings to LLVM 18 for constructing,
 parsing, verifying, optimizing and compiling LLVM IR. Its public API uses
-`Context`, `Module`, `Type`, `Value`, `Function`, `Block` and `Builder` handles,
+`Context`, `Module`, `Type`, `Value`, `Function`, `Block`, `Builder` and `TargetMachine` handles,
 operation enums and recoverable `Result` errors. Ordinary Go FFI connects these
 types to a cgo adapter calling the LLVM C API. No compiler hooks or runtime
 externs are added.
@@ -79,10 +79,13 @@ types and signatures compatible with its ABI.
 
 | Area | Operations |
 | --- | --- |
-| Context | `new`, `module`, `builder`, `parse_ir`, `parse_bitcode`, `close`, `is_closed` |
+| Context | `new`, `module`, `builder`, `target_machine`, `parse_ir`, `parse_bitcode`, `close`, `is_closed` |
 | Types | `void_type`, `int_type`, `float_type`, `double_type`, opaque `pointer_type`, `array_type`, literal `struct_type`, `function_type` |
 | Type values | `same_as`, `ir`, `const_int`, `const_signed`, `const_float`, `zero`, `undef`, `const_aggregate` |
-| Module | `add_function`, `function`, `ir`, `verify`, `clone`, `bitcode`, `optimize`, `run_passes`, `emit_object`, `emit_assembly`, `close` |
+| Module | `add_function`, `function`, `ir`, `verify`, `clone`, `bitcode`, `target_triple`, `data_layout`, `optimize`, `run_passes`, `emit_object`, `emit_assembly`, `close` |
+| Target discovery | `target_names`, `normalize_triple`, `TargetOptions::new`, `TargetOptions::native` |
+| Target machine | `triple`, `cpu`, `features`, `name`, `data_layout`, `configure`, `optimize`, `run_passes`, file/memory emission, `close`, `is_closed` |
+| ABI layout | `byte_order`, `pointer_bytes`, `pointer_int_type`, `type_layout`, `field_offset` |
 | Function | `signature`, `parameter`, `append_block`, `ir` |
 | Value | `value_type`, `set_name`, `add_incoming`, `ir` |
 | Builder arithmetic | `binary`, `int_compare`, `float_compare`, `cast`, `select` |
@@ -124,12 +127,14 @@ Handle copies share native state. Native resources require explicit closure;
 GoML garbage collection does not dispose LLVM contexts. Close the context in a
 `defer` block for a scope containing its modules and builders.
 
-- Closing a context disposes its builders and modules, invalidating every handle
+- Closing a context disposes its builders, modules and target machines, invalidating every handle
   associated with that context.
 - Closing a module invalidates its functions, blocks and instruction values.
   Builders positioned in it lose their insertion position but remain reusable.
 - Closing a builder releases the builder alone. Context, module and builder
   closure is idempotent.
+- Closing a target machine releases its machine and target-data layout. Closure
+  is idempotent; modules and types created through that target remain valid.
 - Types and context-owned constants remain valid until their context closes.
   Constant-folded builder results may also be context-owned.
 
@@ -164,13 +169,82 @@ Object and assembly output verify the module, create a native target machine
 with the host CPU/features and PIC relocation, then compile a module clone.
 Emission preserves the original IR and its live handles. Output paths are
 written directly and may overwrite existing files; parent directories must
-exist. Output uses the build host's target and features, so it is not a
-cross-compilation or portable CPU-baseline API.
+exist. These original `Module` convenience methods use the host's target and
+features. They now reject an existing incompatible module triple or data layout
+instead of silently replacing it. Explicit target selection uses `TargetMachine`.
+
+## Explicit targets and ABI layout
+
+```goml
+use ecosystem::llvm::{Context, Module, TargetOptions, OptimizationLevel, LlvmError};
+
+fn compile_arm(context: Context, module: Module, path: string) -> Result[(), LlvmError] {
+    let target = context.target_machine(TargetOptions::new("aarch64-unknown-linux-gnu"))?;
+    defer { let _ = target.close(); };
+    target.optimize(module, OptimizationLevel::Default)?;
+    target.emit_object(module, path)
+}
+```
+
+`TargetOptions::new(triple)` selects the backend's baseline CPU, no additional
+features, default optimization, PIC relocation and the backend's default code
+model. `TargetOptions::native()` explicitly uses the host triple, CPU and feature
+list. Public fields configure `triple`, `cpu`, `features`, `optimization`,
+`relocation` and `code_model`. Code-generation optimization and the IR pass level
+are separate settings. Features use comma-separated `+feature,-feature` syntax.
+
+`target_names()` lists available machine-code backends in sorted order. All
+backends linked into LLVM are initialized once. `normalize_triple` uses LLVM's
+normalization, including missing triple components; it does not check backend
+availability or promise to canonicalize architecture aliases. Machine creation
+checks availability and syntax. LLVM determines the meaning and availability of
+individual CPU/features names, and may report unknown names to stderr.
+
+`Relocation` supports `Default`, `Static` and `Pic`. `CodeModel` supports `Default`,
+`Small` and `Large`; explicit Small/Large are accepted on x86-64 and AArch64,
+and Small on i386. Other backends require Default in this binding. Unsupported
+model/backend combinations return `Argument` before entering LLVM. A valid
+configuration still requires IR, CPU features and operating-system ABI choices
+compatible with that backend; native LLVM is not a process-isolation boundary.
+
+`configure(module)` checks context ownership and existing target metadata,
+then assigns the machine's normalized triple and data layout. Existing nonempty
+triples must normalize to the same string, and existing nonempty layouts must
+match the machine's layout string exactly. A mismatch returns `Argument` without
+changing the module. Configuration alone preserves builders and value handles.
+`TargetMachine::optimize` and `run_passes` verify and configure the module, pass
+the target machine to LLVM's pass manager, and apply the same handle invalidation
+rules as module optimization. Invalid pipeline syntax reported by LLVM can leave
+the module configured and its previous handles stale.
+
+`emit_object(module, path)` and `emit_assembly(module, path)` compile a clone and
+leave source metadata and handles unchanged. One unconfigured module can thus
+be emitted for multiple targets. Explicitly configured modules require a matching
+machine. `object_bytes(module, max_bytes)` returns independent `Bytes`, while
+`assembly_text(module, max_bytes)` validates UTF-8. The maximum copy size must be
+between 1 byte and 1 GiB. It bounds the returned copy; LLVM builds its native
+output buffer before that check, so it does not bound LLVM's working memory.
+
+`type_layout(type)` returns `TypeLayout` with bit size, byte storage size,
+ABI allocation size, ABI alignment and preferred alignment. `field_offset`
+reports a checked struct member offset. `pointer_bytes(address_space)` and
+`pointer_int_type(address_space)` use the selected target, including address
+spaces whose pointer width differs from the default. `byte_order()` returns
+LittleEndian or BigEndian. The returned pointer integer type belongs to the
+context and survives target closure.
+
+Layouts reject void/function/opaque/recursive unsized types, scalable vectors
+including aggregate members, more than 64 nesting levels or 65,536 traversal
+visits, and ABI sizes exceeding 1 TiB. Shared subtypes cannot bypass the nesting
+limit. Layout queries use target ABI rules, so a struct's offsets and alignment
+can differ between 32-bit and 64-bit targets. Cross-compilation emits objects;
+linking or executing them still requires the destination platform's toolchain,
+libraries and runtime.
 
 ## Scope and verification
 
 This binding covers common IR construction and native ahead-of-time compilation.
-It does not expose the full LLVM API: JIT/ORC execution, target selection,
+It does not expose the full LLVM API: JIT/ORC execution, explicit ABI-name selection,
 debug metadata, globals, named recursive structs, vectors, atomics, exception
 handling, linkage/attribute configuration and arbitrary instruction inspection
 are not implemented. Calling conventions use LLVM's default C convention.
@@ -181,9 +255,19 @@ From the repository root:
 just ecosystem-test llvm
 ```
 
-GoML library/consumer tests and native adapter tests cover errors, concurrency
-and resource lifetimes. A GoML consumer test invokes installed LLVM 18 tools and
+Thirteen GoML library tests, four consumer tests and eight native adapter tests
+cover errors, concurrency and resource lifetimes. A GoML consumer invokes installed LLVM 18 tools and
 cc through `std::process`, verifies emitted IR/bitcode, assembles/disassembles it,
-links unoptimized/optimized objects and assembly, and compares 9,624 native
+links unoptimized/optimized objects, assembly and an explicit portable x86-64
+target, and compares 12,030 native
 function results with independently computed arithmetic expectations. The shared
-verifier handles fresh/cached builds and race-detector execution.
+verifier handles fresh/cached builds and race-detector execution. Independent
+`llvm-readobj`, `llvm-objdump` and `llvm-mc` checks identify, disassemble and
+reassemble x86-64, i386, AArch64 and big-endian AArch64 output. Cross-target
+objects are inspected, not executed. Tests also cover target mismatch rejection,
+packed/unpacked ABI layouts, shared target emission, concurrent close, output
+copy limits and the supported code-model/relocation combinations.
+
+The APIs follow LLVM 18's [target-machine C interface](https://github.com/llvm/llvm-project/blob/llvmorg-18.1.8/llvm/include/llvm-c/TargetMachine.h),
+[target-data interface](https://github.com/llvm/llvm-project/blob/llvmorg-18.1.8/llvm/include/llvm-c/Target.h)
+and [object emission tutorial](https://releases.llvm.org/18.1.8/docs/tutorial/MyFirstLanguageFrontend/LangImpl08.html).
