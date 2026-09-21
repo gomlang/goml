@@ -1,0 +1,174 @@
+package go_backend;
+
+use module::anf;
+use module::repr;
+
+struct PointerCallInfo {
+    called: Ref[bool],
+    escaped: Ref[bool],
+    values: Vec[bool],
+}
+
+fn pointer_call_argument(value: anf::Imm) -> bool {
+    match value {
+        Var { name: _, ty: _ } => true,
+        _ => false,
+    }
+}
+
+fn record_pointer_function_escape(infos: HashMap[string, PointerCallInfo], name: string) -> () {
+    if let Some(info) = infos[name] {
+        info.escaped.set(true)
+    }
+}
+
+fn record_pointer_escape(infos: HashMap[string, PointerCallInfo], value: anf::Imm) -> () {
+    if let Some(name) = direct_function_name(value) {
+        record_pointer_function_escape(infos, name)
+    }
+}
+
+fn record_pointer_escapes(infos: HashMap[string, PointerCallInfo], values: Vec[anf::Imm]) -> () {
+    for value in values {
+        record_pointer_escape(infos, value)
+    }
+}
+
+fn collect_pointer_call(infos: HashMap[string, PointerCallInfo], value: anf::Value) -> () {
+    match value {
+        Imm(value) => record_pointer_escape(infos, value),
+        Constr { args, .. } | Tuple { items: args, .. } | Array { items: args, .. } => {
+            record_pointer_escapes(infos, args)
+        },
+        ConstrGet { expr, .. } | Unary { expr, .. } | Cast { expr, .. } | ToDyn { expr, .. } | Proj {
+            tuple: expr,
+            ..,
+        } => record_pointer_escape(infos, expr),
+        Binary { lhs, rhs, .. } => {
+            record_pointer_escape(infos, lhs);
+            record_pointer_escape(infos, rhs)
+        },
+        Assign { value, .. } => record_pointer_escape(infos, value),
+        Call { func, args, .. } => {
+            if let Some(name) = direct_function_name(func) {
+                if let Some(info) = infos[name] {
+                    info.called.set(true);
+                    for index in 0..info.values.len() {
+                        if index >= args.len() || !pointer_call_argument(args[index]) {
+                            info.values[index] = false;
+                        }
+                    }
+                }
+            }
+            record_pointer_escapes(infos, args)
+        },
+        DynCall { receiver, args, .. } => {
+            record_pointer_escape(infos, receiver);
+            record_pointer_escapes(infos, args)
+        },
+        Go { closure, .. } => record_pointer_escape(infos, closure),
+        PackClosure { environment, apply, .. } => {
+            record_pointer_escape(infos, environment);
+            record_pointer_function_escape(infos, apply)
+        },
+    }
+}
+
+fn collect_pointer_calls(infos: HashMap[string, PointerCallInfo], value: anf::Block) -> () {
+    for bind in value.binds {
+        match bind {
+            Let(value) => collect_pointer_call(infos, value.value),
+            Join(value) => collect_pointer_calls(infos, value.body),
+            JoinRec(values) => for value in values {
+                collect_pointer_calls(infos, value.body)
+            },
+        }
+    }
+    match value.term {
+        Return(value) => record_pointer_escape(infos, value),
+        Jump { args, .. } => record_pointer_escapes(infos, args),
+        If { cond, then_, else_, .. } => {
+            record_pointer_escape(infos, cond);
+            collect_pointer_calls(infos, then_);
+            collect_pointer_calls(infos, else_)
+        },
+        Match { scrutinee, arms, default, .. } => {
+            record_pointer_escape(infos, scrutinee);
+            for arm in arms {
+                record_pointer_escape(infos, arm.lhs);
+                collect_pointer_calls(infos, arm.body)
+            }
+            if let Some(body) = default {
+                collect_pointer_calls(infos, body)
+            }
+        },
+        Select { arms, default, .. } => {
+            for arm in arms {
+                match arm {
+                    Receive { channel, guard, body, .. } => {
+                        record_pointer_escape(infos, channel);
+                        if let Some(value) = guard {
+                            record_pointer_escape(infos, value)
+                        }
+                        collect_pointer_calls(infos, body)
+                    },
+                    Send { channel, value, guard, body } => {
+                        record_pointer_escape(infos, channel);
+                        record_pointer_escape(infos, value);
+                        if let Some(value) = guard {
+                            record_pointer_escape(infos, value)
+                        }
+                        collect_pointer_calls(infos, body)
+                    },
+                }
+            }
+            if let Some(body) = default {
+                collect_pointer_calls(infos, body)
+            }
+        },
+        Unreachable { .. } => (),
+    }
+}
+
+fn build_pointer_param_infos(functions: Vec[anf::Function], structs: Vec[repr::StructDef]) -> Vec[
+    PointerParamInfo,
+] {
+    let infos: HashMap[string, PointerCallInfo] = HashMap::new();
+    for function in functions {
+        let values: Vec[bool] = Vec::with_capacity(function.params.len());
+        let mut candidate = false;
+        for parameter in function.params {
+            let enabled = large_named_struct(structs, parameter.1);
+            values.push(enabled);
+            candidate = candidate || enabled;
+        }
+        if candidate {
+            infos[function.name] = PointerCallInfo {
+                called: Ref::new(false),
+                escaped: Ref::new(false),
+                values,
+            };
+        }
+    }
+    if infos.len() > 0 {
+        for function in functions {
+            collect_pointer_calls(infos, function.body)
+        }
+    }
+    let result: Vec[PointerParamInfo] = Vec::with_capacity(functions.len());
+    for function in functions {
+        let info = infos[function.name];
+        let values: Vec[bool] = Vec::with_capacity(function.params.len());
+        let copies: Vec[bool] = Vec::with_capacity(function.params.len());
+        for index in 0..function.params.len() {
+            let enabled = match info {
+                Some(value) => value.called.get() && !value.escaped.get() && value.values[index],
+                None => false,
+            };
+            values.push(enabled);
+            copies.push(enabled && block_assigns_name(function.body, function.params[index].0))
+        }
+        result.push(PointerParamInfo { function: function.name, values, copies })
+    }
+    result
+}
