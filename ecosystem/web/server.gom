@@ -1,0 +1,547 @@
+package web;
+
+use std::bytes::{Bytes};
+use std::context;
+use std::net;
+use std::net::{TcpListener, TcpStream, SocketAddr, WaitOptions};
+use std::time::{Duration, Timer};
+
+struct Connection {
+    id: isize,
+    stream: TcpStream,
+    active: bool,
+    cancel: Option[context::CancelHandle],
+}
+
+struct ServerState {
+    closing: bool,
+    connections: Vec[Connection],
+    next_id: isize,
+    result: Option[Result[(), Error]],
+}
+
+pub struct Server {
+    listener: TcpListener,
+    address_value: string,
+    state: Channel[ServerState],
+    changed: Channel[()],
+    accepted: Channel[()],
+    completed: Channel[()],
+}
+
+fn read_state(channel: Channel[ServerState]) -> ServerState {
+    channel.recv().unwrap_or_else(
+        || ServerState {
+            closing: true,
+            connections: Vec::new(),
+            next_id: 0,
+            result: Option::Some(Result::Err(closed_error())),
+        },
+    )
+}
+
+impl Server {
+    pub fn address(self: Server) -> Result[string, Error] {
+        Result::Ok(self.address_value)
+    }
+
+    pub fn is_closed(self: Server) -> bool {
+        let state = read_state(self.state);
+        let closed = state.closing;
+        self.state.send(state);
+        closed
+    }
+
+    fn release(self: Server, id: isize) -> () {
+        let state = read_state(self.state);
+        let connections = Vec::new();
+        for entry in state.connections {
+            if entry.id != id {
+                connections.push(entry)
+            }
+        }
+        self.state.send(ServerState { connections, ..state });
+        select {
+            send(self.changed,()) => (),
+            default => (),
+        }
+    }
+
+    fn active(self: Server, id: isize, active: bool) -> bool {
+        let state = read_state(self.state);
+        let connections = Vec::new();
+        for entry in state.connections {
+            connections.push(
+                if entry.id == id {
+                    Connection { active, ..entry }
+                } else {
+                    entry
+                },
+            );
+        }
+        let closing = state.closing;
+        self.state.send(ServerState { connections, ..state });
+        !closing
+    }
+
+    fn admit(self: Server, id: isize, maximum: isize) -> bool {
+        let state = read_state(self.state);
+        let mut active = 0;
+        for connection in state.connections {
+            if connection.active {
+                active += 1;
+            }
+        }
+        let accepted = !state.closing && active < maximum;
+        let connections = Vec::new();
+        for entry in state.connections {
+            connections.push(
+                if accepted && entry.id == id {
+                    Connection { active: true, ..entry }
+                } else {
+                    entry
+                },
+            );
+        }
+        self.state.send(ServerState { connections, ..state });
+        accepted
+    }
+
+    fn canceller(self: Server, id: isize, cancel: context::CancelHandle) -> () {
+        let state = read_state(self.state);
+        let connections = Vec::new();
+        for entry in state.connections {
+            connections.push(
+                if entry.id == id {
+                    Connection { cancel: Option::Some(cancel), ..entry }
+                } else {
+                    entry
+                },
+            );
+        }
+        let closing = state.closing;
+        self.state.send(ServerState { connections, ..state });
+        if closing {
+            cancel.cancel();
+        }
+    }
+
+    fn result(self: Server) -> Result[(), Error] {
+        let state = read_state(self.state);
+        let result = state.result.unwrap_or(Result::Ok(()));
+        self.state.send(state);
+        result
+    }
+
+    pub fn shutdown(self: Server, timeout: Duration) -> Result[(), Error] {
+        if timeout.is_zero() {
+            return Result::Err(
+                Error::new(ErrorKind::Configuration, "shutdown requires a positive timeout"),
+            )
+        }
+        let timer = Timer::new(timeout);
+        defer {
+            let _ = timer.stop();
+        };
+        let state = read_state(self.state);
+        let closing = state.closing;
+        let connections = state.connections;
+        self.state.send(ServerState { closing: true, ..state });
+        if closing {
+            return select {
+                recv(self.completed) as _ => self.result(),
+                recv(timer.done()) as _ => Result::Err(
+                    Error::new(ErrorKind::Timeout, "timed out waiting for shutdown"),
+                ),
+            }
+        }
+        let _ = self.listener.close();
+        for connection in connections {
+            if !connection.active {
+                if let Some(cancel) = connection.cancel {
+                    cancel.cancel();
+                }
+                let _ = connection.stream.close();
+            }
+        }
+        let _ = self.accepted.recv();
+        let mut result = Result::Ok(());
+        loop {
+            let state = read_state(self.state);
+            let connections = state.connections;
+            self.state.send(state);
+            if connections.is_empty() {
+                break
+            }
+            let expired = select {
+                recv(self.changed) as _ => false,
+                recv(timer.done()) as _ => true,
+            };
+            if expired {
+                let state = read_state(self.state);
+                let connections = state.connections;
+                self.state.send(state);
+                for entry in connections {
+                    if let Some(cancel) = entry.cancel {
+                        cancel.cancel();
+                    }
+                    let _ = entry.stream.close();
+                }
+                result = Result::Err(Error::new(ErrorKind::Timeout, "server shutdown timed out"));
+                break
+            }
+        }
+        let state = read_state(self.state);
+        self.state.send(ServerState { result: Option::Some(result), ..state });
+        self.completed.close();
+        result
+    }
+}
+
+fn listen_address(address: string) -> Result[SocketAddr, Error] {
+    if let Ok(parsed) = SocketAddr::parse(address) {
+        return Result::Ok(parsed)
+    }
+    let (host, port) = address.split_once(":").ok_or(
+        Error::new(ErrorKind::Configuration, "invalid listen address"),
+    )?;
+    let number = parse_size(port, 10).map_err(
+        |error| Error::new(ErrorKind::Configuration, error.message),
+    )?;
+    if number > 65535 {
+        return Result::Err(Error::new(ErrorKind::Configuration, "invalid listen port"))
+    }
+    if host == "" {
+        return SocketAddr::parse("0.0.0.0:" + port).map_err(transport_error)
+    }
+    let addresses = net::resolve(host, number.to_u16()).map_err(transport_error)?;
+    addresses.get_checked(0).ok_or(
+        Error::new(ErrorKind::Transport, "listen address did not resolve"),
+    )
+}
+
+#[allow(unstructured_go)]
+fn start(router: Router, address: string) -> Result[Server, Error] {
+    let listener = TcpListener::bind(listen_address(address)?).map_err(transport_error)?;
+    let address_value = match listener.local_addr() {
+        Ok(address) => address.to_string(),
+        Err(error) => {
+            let _ = listener.close();
+            return Result::Err(transport_error(error))
+        },
+    };
+    let state = Channel::new(1);
+    state.send(
+        ServerState { closing: false, connections: Vec::new(), next_id: 0, result: Option::None },
+    );
+    let server = Server {
+        listener,
+        address_value,
+        state,
+        changed: Channel::new(1),
+        accepted: Channel::new(0),
+        completed: Channel::new(0),
+    };
+    go || accept_connections(server, router);
+    Result::Ok(server)
+}
+
+#[allow(unstructured_go)]
+fn accept_connections(server: Server, router: Router) -> () {
+    defer server.accepted.close();
+    loop {
+        let (stream, remote) = match server.listener.accept() {
+            Ok(value) => value,
+            Err(_) => break,
+        };
+        let state = read_state(server.state);
+        if state.closing {
+            server.state.send(state);
+            let _ = stream.close();
+            break
+        }
+        let limit = router.limits_value.concurrent_requests;
+        let connection_limit = if limit > 9223372036854775551 {
+            9223372036854775807
+        } else {
+            limit + 256
+        };
+        if state.connections.len() >= connection_limit {
+            server.state.send(state);
+            let _ = stream.write_all_with(
+                Bytes::from_string(
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ).as_slice(),
+                WaitOptions::new().with_timeout(Duration::from_milliseconds(100)),
+            );
+            let _ = stream.close();
+            continue
+        }
+        let id = state.next_id;
+        state.connections.push(Connection { id, stream, active: false, cancel: Option::None });
+        server.state.send(ServerState { next_id: id + 1, ..state });
+        go || {
+            defer server.release(id);
+            defer {
+                let _ = stream.close();
+            };
+            serve_connection(server, id, router, stream, remote.to_string());
+        };
+    }
+}
+
+fn status_text(status: isize) -> string {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        413 => "Content Too Large",
+        415 => "Unsupported Media Type",
+        422 => "Unprocessable Entity",
+        499 => "Client Closed Request",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "Response",
+    }
+}
+
+fn response_head(response: Response, chunked: bool, close: bool) -> Bytes {
+    let mut value = "HTTP/1.1 " + response.status_value.to_string() + " "
+        + status_text(response.status_value)
+        + "\r\n";
+    for entry in response.headers_value.entries() {
+        value = value + entry.0 + ": " + entry.1 + "\r\n";
+    }
+    if response.status_value != 204 && response.status_value != 304 {
+        value = value
+            + if chunked {
+                "transfer-encoding: chunked\r\n"
+            } else if response.stream_value.is_none() {
+                "content-length: " + response.bytes_value.len().to_string() + "\r\n"
+            } else {
+                ""
+            };
+    }
+    Bytes::from_string(
+        value
+            + if close {
+                "connection: close\r\n\r\n"
+            } else {
+                "connection: keep-alive\r\n\r\n"
+            },
+    )
+}
+
+fn send_error(stream: TcpStream, error: Error, head: bool) -> () {
+    let response = error.response();
+    let options = WaitOptions::new().with_timeout(Duration::from_milliseconds(100));
+    if stream.write_all_with(response_head(response, false, true).as_slice(), options).is_ok()
+        && !head {
+        let _ = stream.write_all_with(response.bytes_value.as_slice(), options);
+    }
+}
+
+fn pump(
+    stream: TcpStream,
+    lifetime: Lifetime,
+    cancel: context::CancelHandle,
+    chunks: Channel[Result[Bytes, Error]],
+    stopped: Channel[()],
+) -> () {
+    defer stopped.close();
+    loop {
+        let data = socket_read(stream, lifetime.context);
+        let failed = match data {
+            Err(_) => true,
+            Ok(bytes) => bytes.is_empty(),
+        };
+        if failed {
+            cancel.cancel();
+            return
+        }
+        let sent = select {
+            send(chunks, data) => true,
+            recv(lifetime.ended) as _ => false,
+            recv(lifetime.context.done()) as _ => false,
+        };
+        if !sent {
+            return
+        }
+    }
+}
+
+fn queued_input(
+    chunks: Channel[Result[Bytes, Error]],
+    cursor: Ref[InputCursor],
+    context: context::Context,
+) -> Input {
+    Input {
+        reader: || {
+            context.check().map_err(context_error)?;
+            select {
+                recv(chunks) as value => value.unwrap_or(Result::Err(closed_error())),
+                recv(context.done()) as _ => Result::Err(
+                    context_error(context.error().unwrap_or(context::Error::Cancelled)),
+                ),
+            }
+        },
+        cursor,
+    }
+}
+
+fn serve_request(
+    router: Router,
+    stream: TcpStream,
+    remote: string,
+    head: Head,
+    input: Input,
+    context: context::Context,
+    closing: bool,
+) -> bool {
+    let limits = router.limits_value;
+    let lifetime = Lifetime::new(context);
+    defer lifetime.ended.close();
+    if head.expect {
+        if socket_write(stream, context, Bytes::from_string("HTTP/1.1 100 Continue\r\n\r\n")).is_err() {
+            return false
+        }
+    }
+    let body = BodyState::new(input, lifetime, head.length, head.chunked, limits);
+    let request = make_request(head, body, lifetime, remote, limits);
+    let response = match response_for(router, request) {
+        Ok(response) => response,
+        Err(error) => {
+            send_error(stream, error, head.method == "HEAD");
+            return false
+        },
+    };
+    if let Err(error) = lifetime.check() {
+        send_error(stream, error, head.method == "HEAD");
+        return false
+    }
+    let chunked = response.stream_value.is_some() && head.method != "HEAD" && head.http11;
+    let close = head.close || closing || response.stream_value.is_some() && !head.http11;
+    if socket_write(stream, context, response_head(response, chunked, close)).is_err() {
+        return false
+    }
+    let output = Output {
+        lifetime,
+        gate: gate(),
+        stream: Option::Some(stream),
+        captured: Bytes::new(),
+        limit: 0,
+        chunked,
+    };
+    if emit_body(response, output, head.method == "HEAD").is_err() {
+        return false
+    }
+    if chunked && socket_write(stream, context, Bytes::from_string("0\r\n\r\n")).is_err() {
+        return false
+    }
+    if close {
+        return false
+    }
+    loop {
+        match body.read(16384) {
+            Err(_) => return false,
+            Ok(data) => if data.is_empty() {
+                return true
+            },
+        }
+    }
+}
+
+#[allow(unstructured_go)]
+fn serve_connection(server: Server, id: isize, router: Router, stream: TcpStream, remote: string) -> () {
+    let limits = router.limits_value;
+    context::with_cancel(
+        context::Context::background(),
+        |connection, cancel| {
+            server.canceller(id, cancel);
+            let lifetime = Lifetime::new(connection);
+            let stopped = Channel::new(0);
+            let chunks = Channel::new(1);
+            let cursor = Ref::new(InputCursor { data: Bytes::new(), offset: 0 });
+            go || pump(stream, lifetime, cancel, chunks, stopped);
+            defer {
+                lifetime.ended.close();
+                let _ = stream.close();
+                let _ = stopped.recv();
+            };
+            let mut first = true;
+            loop {
+                if !first && cursor.get().offset == cursor.get().data.len() {
+                    let ready = context::with_timeout(
+                        connection,
+                        Duration::from_seconds(60),
+                        |context, _| {
+                            let input = queued_input(chunks, cursor, context);
+                            (input.reader)().map(|data| cursor.set(InputCursor { data, offset: 0 }))
+                        },
+                    );
+                    if ready.is_err() {
+                        return
+                    }
+                }
+                let result = context::with_timeout(
+                    connection,
+                    limits.header_timeout,
+                    |context, _| {
+                        read_head(queued_input(chunks, cursor, context), limits)
+                    },
+                );
+                let head = match result {
+                    Ok(head) => head,
+                    Err(error) => {
+                        if error.kind != ErrorKind::Cancelled {
+                            send_error(stream, error, false);
+                        }
+                        return
+                    },
+                };
+                if !server.admit(id, limits.concurrent_requests) {
+                    let _ = stream.write_all_with(
+                        Bytes::from_string(
+                            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        ).as_slice(),
+                        WaitOptions::new().with_timeout(Duration::from_milliseconds(100)),
+                    );
+                    return
+                }
+                let keepalive = context::with_timeout(
+                    connection,
+                    limits.request_timeout,
+                    |context, _| {
+                        serve_request(
+                            router,
+                            stream,
+                            remote,
+                            head,
+                            queued_input(chunks, cursor, context),
+                            context,
+                            server.is_closed(),
+                        )
+                    },
+                );
+                let accepting = server.active(id, false);
+                if !keepalive || !accepting {
+                    return
+                }
+                first = false;
+            }
+        },
+    );
+}

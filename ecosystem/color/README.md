@@ -2,8 +2,8 @@
 
 `ecosystem::color` is a checked, allocation-free color math core with CSS input,
 perceptual interpolation, gradients, alpha compositing and accessibility helpers.
-Algorithms are implemented in GoML. Elementary functions use `std::math`; the two
-additional primitive bindings are Go `math.Atan2` and `math.Cbrt`. There are no
+Algorithms, including angle and cube-root calculations, are implemented in GoML.
+Elementary functions use `std::math`. There are no direct Go FFI bindings,
 third-party Go dependencies, terminal I/O, global configuration or shared mutable
 state.
 

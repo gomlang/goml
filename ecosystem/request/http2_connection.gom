@@ -1,0 +1,309 @@
+package request;
+
+use std::bytes::{Bytes, FrozenBytes};
+use std::context;
+use std::time;
+
+enum Http2Failure {
+    Failed(Error),
+    Retry(Error),
+}
+
+struct Http2StreamState {
+    id: isize,
+    method: string,
+    headers: Bytes,
+    body: FrozenBytes,
+    uploaded: isize,
+    headers_sent: bool,
+    send_window: isize,
+    receive_window: isize,
+    consumed: isize,
+    status: isize,
+    response_headers: Headers,
+    content_length: Option[isize],
+    output: Bytes,
+    limit: isize,
+    header_budget: isize,
+    result: Channel[Result[Received, Http2Failure]],
+}
+
+struct Http2ConnectionState {
+    streams: Vec[Http2StreamState],
+    next_id: isize,
+    highest_sent: isize,
+    last_stream: isize,
+    send_window: isize,
+    receive_window: isize,
+    consumed: isize,
+    initial_window: isize,
+    max_streams: isize,
+    ready: bool,
+    draining: bool,
+    closed: bool,
+    cursor: isize,
+    idle_since: time::Instant,
+}
+
+struct Http2Connection {
+    stream: Stream,
+    state: Channel[Http2ConnectionState],
+    controls: Channel[Http2Frame],
+    wake: Channel[()],
+    closed: Channel[()],
+    reader_done: Channel[()],
+    writer_done: Channel[()],
+    idle_done: Channel[()],
+    max_headers: isize,
+    idle_timeout: time::Duration,
+}
+
+struct Http2Request {
+    connection: Http2Connection,
+    id: isize,
+    result: Channel[Result[Received, Http2Failure]],
+}
+
+fn http2_initial_state() -> Http2ConnectionState {
+    Http2ConnectionState {
+        streams: Vec::new(),
+        next_id: 1,
+        highest_sent: 0,
+        last_stream: 0x7fffffff,
+        send_window: 65535,
+        receive_window: 65535,
+        consumed: 0,
+        initial_window: 65535,
+        max_streams: 0x7fffffff,
+        ready: false,
+        draining: false,
+        closed: false,
+        cursor: 0,
+        idle_since: time::Instant::now(),
+    }
+}
+
+fn http2_state(connection: Http2Connection) -> Http2ConnectionState {
+    connection.state.recv().unwrap_or(http2_initial_state())
+}
+
+fn http2_wake(connection: Http2Connection) -> () {
+    select {
+        send(connection.wake,()) => (),
+        default => (),
+    };
+}
+
+fn http2_stream_index(state: Http2ConnectionState, id: isize) -> Option[isize] {
+    for index in 0..state.streams.len() {
+        if state.streams[index].id == id {
+            return Option::Some(index)
+        }
+    }
+    Option::None
+}
+
+fn http2_finish(state: Http2ConnectionState, index: isize, result: Result[Received, Http2Failure]) -> Http2ConnectionState {
+    let stream = state.streams[index];
+    select {
+        send(stream.result, result) => (),
+        default => (),
+    }
+    let retained = Vec::new();
+    for position in 0..state.streams.len() {
+        if position != index {
+            retained.push(state.streams[position]);
+        }
+    }
+    Http2ConnectionState { streams: retained, idle_since: time::Instant::now(), ..state }
+}
+
+fn http2_abort(connection: Http2Connection, error: Error) -> () {
+    let mut state = http2_state(connection);
+    if state.closed {
+        connection.state.send(state);
+        return
+    }
+    state.closed = true;
+    while !state.streams.is_empty() {
+        let failure = if state.streams[0].headers_sent {
+            Http2Failure::Failed(error)
+        } else {
+            Http2Failure::Retry(error)
+        };
+        state = http2_finish(state, 0, Result::Err(failure));
+    }
+    connection.closed.close();
+    connection.state.send(state);
+    connection.stream.close();
+}
+
+fn http2_close(connection: Http2Connection) -> () {
+    http2_abort(connection, Error::new(ErrorKind::Closed, "HTTP/2 connection is closed"));
+    let _ = connection.reader_done.recv();
+    let _ = connection.writer_done.recv();
+    let _ = connection.idle_done.recv();
+}
+
+fn http2_is_closed(connection: Http2Connection) -> bool {
+    select {
+        recv(connection.closed) as _ => true,
+        default => false,
+    }
+}
+
+fn http2_idle(connection: Http2Connection) -> bool {
+    let state = http2_state(connection);
+    let idle = state.streams.is_empty();
+    connection.state.send(state);
+    idle
+}
+
+#[allow(unstructured_go)]
+fn http2_new_connection(
+    stream: Stream,
+    context: context::Context,
+    max_headers: i64,
+    idle_timeout: time::Duration,
+) -> Result[Http2Connection, Error] {
+    stream.write(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_slice(), context)?;
+    http2_write(stream, context, 4, 0, 0, b"\x00\x02\x00\x00\x00\x00".as_slice())?;
+    let state = Channel::new(1);
+    state.send(http2_initial_state());
+    let connection = Http2Connection {
+        stream,
+        state,
+        controls: Channel::new(128),
+        wake: Channel::new(1),
+        closed: Channel::new(0),
+        reader_done: Channel::new(0),
+        writer_done: Channel::new(0),
+        idle_done: Channel::new(0),
+        max_headers: max_headers.to_isize(),
+        idle_timeout,
+    };
+    go || {
+        let result = http2_read_connection(connection);
+        if let Err(error) = result {
+            http2_abort(connection, error);
+        }
+        connection.reader_done.close();
+    };
+    go || {
+        let result = http2_write_connection(connection);
+        if let Err(error) = result {
+            http2_abort(connection, error);
+        }
+        connection.writer_done.close();
+    };
+    go || {
+        loop {
+            let timer = time::Timer::new(idle_timeout);
+            let stopped = select {
+                recv(connection.closed) as _ => true,
+                recv(timer.done()) as _ => false,
+            };
+            let _ = timer.stop();
+            if stopped {
+                break
+            }
+            let mut state = http2_state(connection);
+            let expired = state.streams.is_empty()
+                && state.idle_since.elapsed().compare(idle_timeout) >= 0;
+            if expired {
+                state.draining = true;
+            }
+            connection.state.send(state);
+            if expired {
+                http2_abort(
+                    connection,
+                    Error::new(ErrorKind::Closed, "HTTP/2 idle connection expired"),
+                );
+                break
+            }
+        }
+        connection.idle_done.close();
+    };
+    Result::Ok(connection)
+}
+
+fn http2_register(
+    connection: Http2Connection,
+    method: string,
+    headers: Bytes,
+    body: FrozenBytes,
+    limit: isize,
+) -> Option[Http2Request] {
+    let mut state = http2_state(connection);
+    defer connection.state.send(state);
+    if state.closed || state.draining || state.next_id > 0x7fffffff {
+        return Option::None
+    }
+    if state.streams.is_empty() && state.idle_since.elapsed().compare(connection.idle_timeout) >= 0 {
+        state.draining = true;
+        return Option::None
+    }
+    let id = state.next_id;
+    state.next_id += 2;
+    let result = Channel::new(1);
+    state.streams.push(
+        Http2StreamState {
+            id,
+            method,
+            headers,
+            body,
+            uploaded: 0,
+            headers_sent: false,
+            send_window: state.initial_window,
+            receive_window: 65535,
+            consumed: 0,
+            status: 0,
+            response_headers: Headers::new(),
+            content_length: Option::None,
+            output: Bytes::new(),
+            limit,
+            header_budget: connection.max_headers,
+            result,
+        },
+    );
+    http2_wake(connection);
+    Option::Some(Http2Request { connection, id, result })
+}
+
+fn http2_cancel_request(request: Http2Request, error: Error) -> () {
+    let connection = request.connection;
+    let mut state = http2_state(connection);
+    let mut overflow = false;
+    if let Some(index) = http2_stream_index(state, request.id) {
+        if state.streams[index].headers_sent {
+            overflow = http2_queue(connection.controls, 3, 0, request.id, http2_number(8)).is_err();
+        }
+        state = http2_finish(state, index, Result::Err(Http2Failure::Failed(error)));
+    }
+    let drained = state.draining && state.streams.is_empty();
+    connection.state.send(state);
+    http2_wake(connection);
+    if overflow {
+        http2_abort(connection, transport_error("HTTP/2 control queue exceeds limit"));
+    }
+    if drained {
+        http2_abort(connection, transport_error("HTTP/2 connection drained"));
+    }
+}
+
+fn http2_await(request: Http2Request, context: context::Context) -> Result[Received, Http2Failure] {
+    let result = select {
+        recv(request.result) as value => value.unwrap_or(
+            Result::Err(Http2Failure::Failed(transport_error("HTTP/2 request result is closed"))),
+        ),
+        recv(context.done()) as _ => {
+            let error = context_error(context.error().unwrap_or(context::Error::Cancelled));
+            http2_cancel_request(request, error);
+            Result::Err(Http2Failure::Failed(error))
+        },
+    };
+    match context.check() {
+        Err(error) => Result::Err(Http2Failure::Failed(context_error(error))),
+        Ok(()) => result,
+    }
+}

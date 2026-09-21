@@ -1,0 +1,600 @@
+package request;
+
+use std::net;
+use std::net::tls;
+use std::context;
+use std::time;
+use std::io;
+use std::bytes::{Bytes, FrozenBytes};
+use std::encoding::base64;
+use ecosystem::archive;
+
+enum Stream {
+    Tcp(net::TcpStream),
+    Tls(tls::TlsStream),
+    Tunnel(tls::TlsStream, TunnelRelay),
+}
+
+impl Stream {
+    fn close(self: Stream) -> () {
+        let _ = match self {
+            Tcp(value) => value.close(),
+            Tls(value) => value.close(),
+            Tunnel(value, relay) => {
+                let result = value.close();
+                relay.close();
+                result
+            },
+        };
+    }
+
+    fn read(self: Stream, bytes: MutSlice[byte], context: context::Context) -> Result[isize, Error] {
+        match self {
+            Tcp(value) => value.read_with(bytes, net::WaitOptions::new().with_context(context)),
+            Tls(value) => value.read_with(bytes, context),
+            Tunnel(value, _) => value.read_with(bytes, context),
+        }.map_err(io_error)
+    }
+
+    fn write(self: Stream, bytes: Slice[byte], context: context::Context) -> Result[(), Error] {
+        match self {
+            Tcp(value) => value.write_all_with(bytes, net::WaitOptions::new().with_context(context)),
+            Tls(value) => value.write_all_with(bytes, context),
+            Tunnel(value, _) => value.write_all_with(bytes, context),
+        }.map_err(io_error)
+    }
+
+    fn http2(self: Stream) -> bool {
+        match self {
+            Tls(value) | Tunnel(value, _) => value.connection_info().map(
+                |info| info.negotiated_protocol == "h2",
+            ).unwrap_or(false),
+            Tcp(_) => false,
+        }
+    }
+}
+
+fn io_error(value: io::Error) -> Error {
+    Error::new(
+        match value.kind() {
+            io::ErrorKind::TimedOut => ErrorKind::Timeout,
+            io::ErrorKind::Interrupted => ErrorKind::Cancelled,
+            _ => ErrorKind::Transport,
+        },
+        value.to_string(),
+    )
+}
+
+fn transport_error(message: string) -> Error {
+    Error::new(ErrorKind::Transport, message)
+}
+
+fn body_limit_error() -> Error {
+    Error::new(ErrorKind::BodyLimit, "response body exceeds limit")
+}
+
+struct IdleConnection {
+    origin: string,
+    stream: Stream,
+    idle_since: time::Instant,
+}
+
+struct Cookie {
+    host: string,
+    path: string,
+    name: string,
+    value: string,
+    secure: bool,
+    expires: Option[i64],
+}
+
+struct ClientState {
+    idle: Vec[IdleConnection],
+    cookies: Vec[Cookie],
+}
+
+struct Received {
+    status: isize,
+    headers: Headers,
+    body: FrozenBytes,
+    version: string,
+}
+
+struct Reader {
+    stream: Stream,
+    context: context::Context,
+    buffer: Vec[byte],
+    positions: Vec[isize],
+    started: Ref[bool],
+}
+
+impl Reader {
+    fn new(stream: Stream, context: context::Context) -> Reader {
+        let buffer: Vec[byte] = Vec::with_capacity(8192);
+        for _ in 0..8192 {
+            buffer.push(0)
+        }
+        Reader {
+            stream,
+            context,
+            buffer,
+            positions: Vec::from_array([0, 0]),
+            started: Ref::new(false),
+        }
+    }
+
+    fn byte(self: Reader) -> Result[Option[byte], Error] {
+        if self.positions[0] == self.positions[1] {
+            let count = self.stream.read(self.buffer.as_mut_slice(), self.context)?;
+            self.positions[0] = 0;
+            self.positions[1] = count;
+            if count == 0 {
+                return Result::Ok(Option::None)
+            }
+        }
+        let result = self.buffer[self.positions[0]];
+        self.started.set(true);
+        self.positions[0] += 1;
+        Result::Ok(Option::Some(result))
+    }
+
+    fn exact(self: Reader, count: isize) -> Result[Bytes, Error] {
+        let result = Bytes::with_capacity(count);
+        for _ in 0..count {
+            result.push(self.byte()?.ok_or(transport_error("unexpected end of HTTP message"))?);
+        }
+        Result::Ok(result)
+    }
+
+    fn line(self: Reader, budget: Vec[i64]) -> Result[string, Error] {
+        let result: Vec[byte] = Vec::new();
+        loop {
+            if budget[0] <= 0 {
+                return Result::Err(transport_error("response headers exceed limit"))
+            }
+            budget[0] -= 1;
+            let byte = self.byte()?.ok_or(transport_error("unexpected end of HTTP headers"))?;
+            if byte == b'\n' {
+                if result.pop() != Option::Some(b'\r') {
+                    return Result::Err(transport_error("invalid HTTP line ending"))
+                }
+                let (valid, text) = string_from_utf8(result);
+                return if valid {
+                    Result::Ok(text)
+                } else {
+                    Result::Err(Error::new(ErrorKind::Decode, "invalid UTF-8 in HTTP headers"))
+                }
+            }
+            result.push(byte);
+        }
+    }
+}
+
+fn validate_pem(pem: string, label: string, optional: bool) -> Result[(), Error] {
+    if pem.trim() == "" && optional {
+        return Result::Ok(())
+    }
+    let start = "-----BEGIN " + label + "-----";
+    let end = "-----END " + label + "-----";
+    let (_, rest) = pem.split_once(start).ok_or(
+        Error::new(ErrorKind::Builder, "invalid certificate PEM"),
+    )?;
+    let (body, _) = rest.split_once(end).ok_or(
+        Error::new(ErrorKind::Builder, "invalid certificate PEM"),
+    )?;
+    let encoded = body.replace("\r", "").replace("\n", "").replace(" ", "").replace("\t", "");
+    let data = base64::decode(encoded).map_err(
+        |_| Error::new(ErrorKind::Builder, "invalid certificate PEM"),
+    )?;
+    if data.len() < 4 || data.get(0) != 48 {
+        return Result::Err(Error::new(ErrorKind::Builder, "invalid certificate DER"))
+    }
+    Result::Ok(())
+}
+
+fn connect_stream(client: Client, url: Url, context: context::Context, h2: bool) -> Result[
+    Stream,
+    Error,
+] {
+    context::with_timeout(
+        context,
+        client.options.connect_value,
+        |connecting, _| {
+            if url.secure {
+                let mut config = tls::ClientConfig::new(url.host).with_connect_timeout(
+                    client.options.connect_value,
+                ).with_alpn(
+                    if h2 {
+                        Vec::from_array(["h2", "http/1.1"])
+                    } else {
+                        Vec::from_array(["http/1.1"])
+                    },
+                );
+                if client.options.ca.trim() != "" {
+                    config = config.with_ca_pem(client.options.ca.to_bytes().as_slice());
+                }
+                if client.options.certificate != "" {
+                    config = config.with_client_certificate(
+                        client.options.certificate.to_bytes().as_slice(),
+                        client.options.key.to_bytes().as_slice(),
+                    );
+                }
+                tls::connect_with(url.host, url.port, config, connecting).map(Stream::Tls).map_err(
+                    io_error,
+                )
+            } else {
+                net::TcpStream::connect_host(url.host, url.port, connecting).map(Stream::Tcp).map_err(
+                    io_error,
+                )
+            }
+        },
+    )
+}
+
+fn selected_proxy(client: Client, url: Url) -> Result[Option[Url], Error] {
+    if client.options.proxy_value != "" {
+        return Url::parse(client.options.proxy_value).map(Option::Some)
+    }
+    if !client.options.env_proxy {
+        return Result::Ok(Option::None)
+    }
+    environment_proxy_url(url)
+}
+
+fn take_connection(client: Client, key: string) -> Option[Stream] {
+    let state = client.state.recv().unwrap_or(ClientState { idle: Vec::new(), cookies: Vec::new() });
+    let retained = Vec::new();
+    let expired = Vec::new();
+    let mut result = Option::None;
+    for entry in state.idle {
+        if entry.idle_since.elapsed().compare(client.options.idle_value) >= 0 {
+            expired.push(entry.stream);
+        } else if entry.origin == key && result.is_none() {
+            result = Option::Some(entry.stream);
+        } else {
+            retained.push(entry);
+        }
+    }
+    client.state.send(ClientState { idle: retained, ..state });
+    for stream in expired {
+        stream.close();
+    }
+    result
+}
+
+fn return_connection(client: Client, key: string, stream: Stream) -> () {
+    let state = client.state.recv().unwrap_or(ClientState { idle: Vec::new(), cookies: Vec::new() });
+    let discard = client.is_closed() || state.idle.len() >= client.options.max_idle;
+    if !discard {
+        state.idle.push(IdleConnection { origin: key, stream, idle_since: time::Instant::now() });
+    }
+    client.state.send(state);
+    if discard {
+        stream.close();
+    }
+    http2_pool_trim(client);
+}
+
+fn exchange(
+    client: Client,
+    context: context::Context,
+    method: string,
+    url: Url,
+    headers: Headers,
+    body: FrozenBytes,
+    limit: isize,
+) -> Result[Received, Error] {
+    let mut headers = headers;
+    if !headers.contains("user-agent") {
+        headers = headers.insert("user-agent", "goml-request/1")?;
+    }
+    let decompress = client.options.gzip_value && !headers.contains("accept-encoding")
+        && !headers.contains("range")
+        && method != "HEAD";
+    if decompress {
+        headers = headers.insert("accept-encoding", "gzip")?;
+    }
+    if client.options.cookies {
+        headers = cookie_headers(client, url, headers)?;
+    }
+    let proxy = selected_proxy(client, url)?;
+    let endpoint = proxy.unwrap_or(url);
+    let tunnel = url.secure && proxy.is_some();
+    let key = endpoint.origin + "|" + url.origin
+        + if tunnel {
+            "|" + headers.get("proxy-authorization").unwrap_or("")
+        } else {
+            ""
+        };
+    let origin_headers = if tunnel {
+        headers.remove("proxy-authorization")
+    } else {
+        headers
+    };
+    let wire_limit = compressed_wire_limit(limit, decompress);
+    let mut retries = 0;
+    loop {
+        context.check().map_err(context_error)?;
+        let lease = transport_lease(
+            client,
+            context,
+            key,
+            endpoint,
+            proxy,
+            method,
+            url,
+            headers,
+            body,
+            wire_limit,
+        )?;
+        match lease {
+            ConnectionLease::Http2(request) => {
+                let received = http2_await(request, context);
+                http2_pool_trim(client);
+                match received {
+                    Ok(response) => return finish_response(
+                        client,
+                        context,
+                        url,
+                        response,
+                        decompress,
+                        limit,
+                    ),
+                    Err(Http2Failure::Failed(error)) => return Result::Err(error),
+                    Err(Http2Failure::Retry(error)) => {
+                        if retries >= 2 {
+                            return Result::Err(error)
+                        }
+                        retries += 1;
+                    },
+                }
+            },
+            ConnectionLease::Http1(stream, reused) => {
+                let mut keep = false;
+                defer {
+                    if !keep {
+                        stream.close();
+                    }
+                };
+                let started = Ref::new(false);
+                let attempt = http1_exchange(
+                    stream,
+                    context,
+                    method,
+                    url,
+                    origin_headers,
+                    body,
+                    wire_limit,
+                    client.options.max_headers,
+                    proxy.is_some() && !tunnel,
+                    started,
+                );
+                let (response, reusable) = match attempt {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if reused && !started.get() && error.kind == ErrorKind::Transport
+                            && body.is_empty()
+                            && (method == "GET" || method == "HEAD" || method == "OPTIONS")
+                            && retries == 0 {
+                            stream.close();
+                            retries += 1;
+                            continue
+                        }
+                        return Result::Err(error)
+                    },
+                };
+                if reusable {
+                    return_connection(client, key, stream);
+                    keep = true;
+                }
+                return finish_response(client, context, url, response, decompress, limit)
+            },
+        }
+    }
+}
+
+fn finish_response(
+    client: Client,
+    context: context::Context,
+    url: Url,
+    response: Received,
+    decompress: bool,
+    limit: isize,
+) -> Result[Received, Error] {
+    context.check().map_err(context_error)?;
+    if client.options.cookies {
+        store_cookies(client, url, response.headers);
+    }
+    if decompress
+        && response.headers.get("content-encoding").map(ascii_lower) == Option::Some("gzip") {
+        let decoded = archive::gunzip(response.body.thaw(), limit).map_err(
+            |error| if error.kind == archive::ErrorKind::Limit {
+                body_limit_error()
+            } else {
+                transport_error(error.message)
+            },
+        )?;
+        context.check().map_err(context_error)?;
+        Result::Ok(
+            Received {
+                body: decoded.freeze(),
+                headers: response.headers.remove("content-encoding").remove("content-length"),
+                ..response,
+            },
+        )
+    } else if response.body.len() > limit {
+        Result::Err(body_limit_error())
+    } else {
+        Result::Ok(response)
+    }
+}
+
+fn compressed_wire_limit(limit: isize, decompress: bool) -> isize {
+    if !decompress {
+        return limit
+    }
+    let overhead = limit / 1000 + 65536;
+    if limit > 9223372036854775807 - overhead {
+        9223372036854775807
+    } else {
+        limit + overhead
+    }
+}
+
+fn read_headers(reader: Reader, budget: Vec[i64]) -> Result[Headers, Error] {
+    let mut headers = Headers::new();
+    loop {
+        let line = reader.line(budget)?;
+        if line == "" {
+            return Result::Ok(headers)
+        }
+        let (name, value) = line.split_once(":").ok_or(transport_error("invalid HTTP header"))?;
+        headers = headers.append(name, value.trim()).map_err(|error| transport_error(error.message))?;
+    }
+}
+
+fn decimal(value: string) -> Result[isize, Error] {
+    if value == "" {
+        return Result::Err(transport_error("invalid HTTP decimal"))
+    }
+    let mut result: isize = 0;
+    for byte in value.to_bytes() {
+        if byte < b'0' || byte > b'9'
+            || result > (9223372036854775807 - (byte - b'0').to_isize()) / 10 {
+            return Result::Err(transport_error("invalid HTTP decimal"))
+        }
+        result = result * 10 + (byte - b'0').to_isize();
+    }
+    Result::Ok(result)
+}
+
+fn http1_exchange(
+    stream: Stream,
+    context: context::Context,
+    method: string,
+    url: Url,
+    headers: Headers,
+    body: FrozenBytes,
+    limit: isize,
+    max_headers: i64,
+    proxy: bool,
+    started: Ref[bool],
+) -> Result[(Received, bool), Error] {
+    let mut head = method + " "
+        + if proxy {
+            url.text
+        } else {
+            url.target
+        }
+        + " HTTP/1.1\r\nHost: "
+        + url.authority
+        + "\r\n";
+    for (name, value) in headers.entries() {
+        head += name + ": " + value + "\r\n";
+    }
+    if !body.is_empty() || method == "POST" || method == "PUT" || method == "PATCH" {
+        head += "Content-Length: " + body.len().to_string() + "\r\n";
+    }
+    head += "\r\n";
+    stream.write(head.to_bytes().as_slice(), context)?;
+    stream.write(body.to_vec_copy().as_slice(), context)?;
+    let reader = Reader { started, ..Reader::new(stream, context) };
+    let budget = Vec::from_array([max_headers]);
+    let mut status = 0;
+    let mut version = "";
+    let mut response_headers = Headers::new();
+    loop {
+        let line = reader.line(budget)?;
+        let parts = line.split(" ");
+        if parts.len() < 2 || (parts[0] != "HTTP/1.1" && parts[0] != "HTTP/1.0")
+            || parts[1].byte_len() != 3 {
+            return Result::Err(transport_error("invalid HTTP status line"))
+        }
+        version = parts[0];
+        status = decimal(parts[1])?;
+        if status < 100 || status > 599 {
+            return Result::Err(transport_error("invalid HTTP status"))
+        }
+        response_headers = read_headers(reader, budget)?;
+        if status >= 200 || status == 101 {
+            break
+        }
+    }
+    let payload = Bytes::new();
+    let connection = ascii_lower(response_headers.get_all("connection").join(","));
+    let mut reusable = version == "HTTP/1.1" && status != 101;
+    for item in connection.split(",") {
+        if item.trim() == "close" {
+            reusable = false;
+        }
+    }
+    if method != "HEAD" && status != 204 && status != 304 && status >= 200 {
+        let lengths = response_headers.get_all("content-length");
+        let transfer = ascii_lower(response_headers.get_all("transfer-encoding").join(","));
+        if transfer != "" && transfer != "chunked" {
+            return Result::Err(transport_error("unsupported HTTP transfer encoding"))
+        }
+        if transfer == "chunked" {
+            if !lengths.is_empty() {
+                return Result::Err(transport_error("ambiguous HTTP message framing"))
+            }
+            loop {
+                let size = reader.line(Vec::from_array([8192]))?;
+                let size = size.split_once(";").map(|value| value.0).unwrap_or(size);
+                if size == "" {
+                    return Result::Err(transport_error("invalid HTTP chunk size"))
+                }
+                let mut count = 0;
+                for byte in size.to_bytes() {
+                    let digit = hex_digit(byte);
+                    if digit < 0 || count > (9223372036854775807 - digit) / 16 {
+                        return Result::Err(transport_error("invalid HTTP chunk size"))
+                    }
+                    count = count * 16 + digit;
+                }
+                if count == 0 {
+                    let _ = read_headers(reader, budget)?;
+                    break
+                }
+                if count > limit - payload.len() {
+                    return Result::Err(body_limit_error())
+                }
+                payload.extend_from_slice(reader.exact(count)?.as_slice());
+                if reader.exact(2)?.to_vec() != b"\r\n" {
+                    return Result::Err(transport_error("invalid HTTP chunk terminator"))
+                }
+            }
+            response_headers = response_headers.remove("transfer-encoding");
+        } else if !lengths.is_empty() {
+            let count = decimal(lengths[0])?;
+            for value in lengths {
+                if decimal(value)? != count {
+                    return Result::Err(transport_error("conflicting content lengths"))
+                }
+            }
+            if count > limit {
+                return Result::Err(body_limit_error())
+            }
+            payload.extend_from_slice(reader.exact(count)?.as_slice());
+        } else {
+            reusable = false;
+            loop {
+                match reader.byte()? {
+                    None => break,
+                    Some(byte) => {
+                        if payload.len() >= limit {
+                            return Result::Err(body_limit_error())
+                        }
+                        payload.push(byte);
+                    },
+                }
+            }
+        }
+    }
+    if reader.positions[0] != reader.positions[1] {
+        reusable = false;
+    }
+    Result::Ok(
+        (Received { status, headers: response_headers, body: payload.freeze(), version }, reusable),
+    )
+}

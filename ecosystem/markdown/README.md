@@ -2,9 +2,9 @@
 
 A CommonMark parser, public AST and configurable HTML renderer implemented in
 GoML. The current implementation passes all **652 CommonMark 0.31.2 examples**
-with exact HTML comparison. Parsing and rendering are implemented in this module;
-two small Go standard-library bindings supply Unicode punctuation/symbol
-classification, alongside `std::unicode` whitespace and case folding.
+with exact HTML comparison. Parsing, rendering and Unicode punctuation/symbol
+classification are implemented in GoML, alongside `std::unicode` whitespace and
+case folding. This module has no direct Go FFI bindings or native dependencies.
 
 ```gom
 use ecosystem::markdown;
@@ -109,6 +109,13 @@ limits. Output checking limits emitted HTML; intermediate escaped strings still
 allocate before they are written.
 
 ## Validation and data provenance
+
+`punctuation.gom` contains 338 sorted, disjoint ranges covering the 8,612 Unicode
+15.0.0 scalars in general categories P and S. The table comes from the official
+[UnicodeData.txt](https://www.unicode.org/Public/15.0.0/ucd/UnicodeData.txt), whose
+SHA-256 is `806e9aed65037197f1ec85e12be6e8cd870fc5608b4de0fffd990f689f376a73`.
+It preserves the previous Unicode 15 classification and uses binary search without
+runtime table allocation. The data license is in [LICENSE.unicode.txt](LICENSE.unicode.txt).
 
 Run from the repository root:
 

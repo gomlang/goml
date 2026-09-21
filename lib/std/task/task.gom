@@ -1,6 +1,7 @@
 package task;
 
 use module::internal::task as internal_task;
+use module::panic;
 
 pub struct CancelToken {
     value: internal_task::CancelToken,
@@ -11,7 +12,7 @@ pub struct Scope {
 }
 
 pub struct Task[T] {
-    result: Ref[Option[T]],
+    result: Ref[Option[Result[T, panic::Panic]]],
     ready: Channel[()],
 }
 
@@ -56,9 +57,8 @@ impl ConcurrencyLimit {
     ] {
         match recv_with(cancel, self.slots) {
             WaitResult::Completed(Some(())) => {
-                let value = body(cancel);
-                self.slots.send(());
-                WaitResult::Completed(value)
+                defer self.slots.send(());
+                WaitResult::Completed(body(cancel))
             },
             WaitResult::Completed(None) | WaitResult::Cancelled => WaitResult::Cancelled,
         }
@@ -117,28 +117,36 @@ pub fn active_scope_count() -> isize {
 
 impl Scope {
     pub fn spawn[T](self: Scope, body: (CancelToken) -> T) -> Task[T] {
-        let result: Ref[Option[T]] = Ref::new(Option::None);
+        let result: Ref[Option[Result[T, panic::Panic]]] = Ref::new(Option::None);
         let ready: Channel[()] = Channel::new(0);
         let token = CancelToken { value: internal_task::token(self.handle) };
         internal_task::spawn(
             self.handle,
             || {
-                result.set(Option::Some(body(token)));
-                ready.close()
+                let outcome = panic::catch(|| body(token));
+                result.set(Option::Some(outcome));
+                ready.close();
+                if let Err(info) = outcome {
+                    panic::resume(info);
+                }
             },
         );
         Task { result, ready }
     }
 
     pub fn try_spawn[T](self: Scope, body: (CancelToken) -> T) -> Option[Task[T]] {
-        let result: Ref[Option[T]] = Ref::new(Option::None);
+        let result: Ref[Option[Result[T, panic::Panic]]] = Ref::new(Option::None);
         let ready: Channel[()] = Channel::new(0);
         let token = CancelToken { value: internal_task::token(self.handle) };
         if internal_task::try_spawn(
             self.handle,
             || {
-                result.set(Option::Some(body(token)));
-                ready.close()
+                let outcome = panic::catch(|| body(token));
+                result.set(Option::Some(outcome));
+                ready.close();
+                if let Err(info) = outcome {
+                    panic::resume(info);
+                }
             },
         ) {
             Option::Some(Task { result, ready })
@@ -217,11 +225,11 @@ impl[T] Task[T] {
     }
 
     pub fn join(self: Task[T]) -> T {
-        loop {
-            let _ = self.ready.recv();
-            if let Some(value) = self.result.get() {
-                break value;
-            }
+        let _ = self.ready.recv();
+        match self.result.get() {
+            Some(Ok(value)) => value,
+            Some(Err(info)) => panic::resume(info),
+            None => panic::raise("task completed without a result"),
         }
     }
 }
@@ -277,7 +285,12 @@ fn concurrent_worker[T, E](
 ) -> () {
     loop {
         match recv_with(cancel, work) {
-            WaitResult::Completed(Some(item)) => results.send((item.0, body(cancel, item.1))),
+            WaitResult::Completed(Some(item)) => {
+                let result = body(cancel, item.1);
+                if let WaitResult::Cancelled = send_with(cancel, results, (item.0, result)) {
+                    break;
+                }
+            },
             WaitResult::Completed(None) | WaitResult::Cancelled => break,
         }
     }
@@ -311,6 +324,8 @@ pub fn for_each_concurrent[T, E](
     let results: Channel[(isize, Result[(), E])] = Channel::new(worker_count);
     scope(
         |scope: Scope| {
+            defer work.close();
+            let cancel = scope.token();
             for _ in 0..worker_count {
                 let _ = scope.spawn(
                     |cancel: CancelToken| concurrent_worker(cancel, work, results, body),
@@ -332,14 +347,17 @@ pub fn for_each_concurrent[T, E](
                             record_concurrent_result(ordered, received);
                             completed += 1;
                         },
+                        recv(cancel.done()) as _ => return Result::Ok(()),
                     }
                 } else {
-                    record_concurrent_result(ordered, results.recv());
+                    let received = select {
+                        recv(results) as value => value,
+                        recv(cancel.done()) as _ => return Result::Ok(()),
+                    };
+                    record_concurrent_result(ordered, received);
                     completed += 1;
                 };
             }
-            work.close();
-            results.close();
             let errors: Vec[IndexedError[E]] = Vec::new();
             for index in 0..total {
                 if let Some(error) = ordered[index] {
@@ -373,7 +391,10 @@ pub fn race[T](bodies: Vec[(CancelToken) -> T]) -> Option[T] {
                     },
                 );
             }
-            let value = results.recv();
+            let value = select {
+                recv(results) as value => value,
+                recv(scope.token().done()) as _ => Option::None,
+            };
             scope.cancel();
             value
         },

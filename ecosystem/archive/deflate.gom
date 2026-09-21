@@ -1,0 +1,567 @@
+package archive;
+
+use std::bytes;
+
+const LENGTH_BASE: [isize; 29] = [
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    13,
+    15,
+    17,
+    19,
+    23,
+    27,
+    31,
+    35,
+    43,
+    51,
+    59,
+    67,
+    83,
+    99,
+    115,
+    131,
+    163,
+    195,
+    227,
+    258,
+];
+
+const LENGTH_BITS: [isize; 29] = [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    1,
+    1,
+    1,
+    1,
+    2,
+    2,
+    2,
+    2,
+    3,
+    3,
+    3,
+    3,
+    4,
+    4,
+    4,
+    4,
+    5,
+    5,
+    5,
+    5,
+    0,
+];
+
+const DISTANCE_BASE: [isize; 30] = [
+    1,
+    2,
+    3,
+    4,
+    5,
+    7,
+    9,
+    13,
+    17,
+    25,
+    33,
+    49,
+    65,
+    97,
+    129,
+    193,
+    257,
+    385,
+    513,
+    769,
+    1025,
+    1537,
+    2049,
+    3073,
+    4097,
+    6145,
+    8193,
+    12289,
+    16385,
+    24577,
+];
+
+const DISTANCE_BITS: [isize; 30] = [
+    0,
+    0,
+    0,
+    0,
+    1,
+    1,
+    2,
+    2,
+    3,
+    3,
+    4,
+    4,
+    5,
+    5,
+    6,
+    6,
+    7,
+    7,
+    8,
+    8,
+    9,
+    9,
+    10,
+    10,
+    11,
+    11,
+    12,
+    12,
+    13,
+    13,
+];
+
+struct BitReader {
+    data: bytes::Bytes,
+    offset: Ref[isize],
+    bit: Ref[isize],
+}
+
+impl BitReader {
+    fn read(self: BitReader, count: isize) -> Result[isize, Error] {
+        let mut value = 0;
+        for index in 0..count {
+            let offset = self.offset.get();
+            if offset == self.data.len() {
+                return Result::Err(failure(ErrorKind::Truncated, offset, "truncated DEFLATE bits"))
+            }
+            let bit = self.bit.get();
+            value |= ((self.data.get(offset).to_isize() >> bit) & 1) << index;
+            if bit == 7 {
+                self.offset.set(offset + 1);
+                self.bit.set(0);
+            } else {
+                self.bit.set(bit + 1);
+            }
+        }
+        Result::Ok(value)
+    }
+
+    fn align(self: BitReader) -> () {
+        if self.bit.get() != 0 {
+            self.offset.set(self.offset.get() + 1);
+            self.bit.set(0);
+        }
+    }
+}
+
+fn repeated_numbers(length: isize, value: isize) -> Vec[isize] {
+    let result = Vec::with_capacity(length);
+    for _ in 0..length {
+        result.push(value)
+    }
+    result
+}
+
+struct Huffman {
+    counts: Vec[isize],
+    symbols: Vec[isize],
+}
+
+fn huffman(lengths: Vec[isize], require_complete: bool) -> Result[Huffman, Error] {
+    let counts = repeated_numbers(16, 0);
+    for length in lengths {
+        if length < 0 || length > 15 {
+            return Result::Err(failure(ErrorKind::Invalid, 0, "invalid Huffman code length"))
+        }
+        counts[length] += 1;
+    }
+    let mut available = 1;
+    for length in 1..16 {
+        available = available * 2 - counts[length];
+        if available < 0 {
+            return Result::Err(failure(ErrorKind::Invalid, 0, "oversubscribed Huffman tree"))
+        }
+    }
+    let count = lengths.len() - counts[0];
+    if available != 0 && (require_complete || (count != 0 && !(count == 1 && counts[1] == 1))) {
+        return Result::Err(failure(ErrorKind::Invalid, 0, "incomplete Huffman tree"))
+    }
+    let offsets = repeated_numbers(16, 0);
+    for length in 1..15 {
+        offsets[length + 1] = offsets[length] + counts[length];
+    }
+    let symbols = repeated_numbers(count, 0);
+    for symbol in 0..lengths.len() {
+        let length = lengths[symbol];
+        if length != 0 {
+            symbols[offsets[length]] = symbol;
+            offsets[length] += 1;
+        }
+    }
+    Result::Ok(Huffman { counts, symbols })
+}
+
+impl Huffman {
+    fn decode(self: Huffman, input: BitReader) -> Result[isize, Error] {
+        let mut code = 0;
+        let mut first = 0;
+        let mut index = 0;
+        for length in 1..16 {
+            code |= input.read(1)?;
+            let count = self.counts[length];
+            if code >= first && code - first < count {
+                return Result::Ok(self.symbols[index + code - first])
+            }
+            index += count;
+            first = (first + count) << 1;
+            code <<= 1;
+        }
+        Result::Err(failure(ErrorKind::Invalid, input.offset.get(), "invalid Huffman symbol"))
+    }
+}
+
+fn fixed_trees() -> Result[(Huffman, Huffman), Error] {
+    let lengths = Vec::new();
+    for symbol in 0..288 {
+        lengths.push(
+            if symbol < 144 {
+                8
+            } else if symbol < 256 {
+                9
+            } else if symbol < 280 {
+                7
+            } else {
+                8
+            },
+        );
+    }
+    Result::Ok((huffman(lengths, true)?, huffman(repeated_numbers(32, 5), true)?))
+}
+
+fn dynamic_trees(input: BitReader) -> Result[(Huffman, Huffman), Error] {
+    let literal_count = input.read(5)? + 257;
+    let distance_count = input.read(5)? + 1;
+    let code_count = input.read(4)? + 4;
+    if literal_count > 286 {
+        return Result::Err(
+            failure(ErrorKind::Invalid, input.offset.get(), "reserved DEFLATE length codes"),
+        )
+    }
+    let order = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+    let code_lengths = repeated_numbers(19, 0);
+    for index in 0..code_count {
+        code_lengths[order[index]] = input.read(3)?;
+    }
+    let codes = huffman(code_lengths, true)?;
+    let lengths = Vec::new();
+    let total = literal_count + distance_count;
+    while lengths.len() < total {
+        let symbol = codes.decode(input)?;
+        if symbol < 16 {
+            lengths.push(symbol);
+        } else {
+            let (value, count) = if symbol == 16 {
+                if lengths.is_empty() {
+                    return Result::Err(
+                        failure(
+                            ErrorKind::Invalid,
+                            input.offset.get(),
+                            "Huffman repeat without previous length",
+                        ),
+                    )
+                }
+                let previous = lengths[lengths.len() - 1];
+                (previous, input.read(2)? + 3)
+            } else if symbol == 17 {
+                (0, input.read(3)? + 3)
+            } else {
+                (0, input.read(7)? + 11)
+            };
+            if count > total - lengths.len() {
+                return Result::Err(
+                    failure(ErrorKind::Invalid, input.offset.get(), "Huffman repeat exceeds tree"),
+                )
+            }
+            for _ in 0..count {
+                lengths.push(value)
+            }
+        }
+    }
+    if lengths[256] == 0 {
+        return Result::Err(
+            failure(ErrorKind::Invalid, input.offset.get(), "missing DEFLATE end symbol"),
+        )
+    }
+    Result::Ok(
+        (
+            huffman(lengths.slice(0, literal_count).to_vec(), false)?,
+            huffman(lengths.slice(literal_count, total).to_vec(), false)?,
+        ),
+    )
+}
+
+fn inflate_into(data: bytes::Bytes, offset: isize, output: bytes::Bytes, limit: isize) -> Result[
+    isize,
+    Error,
+] {
+    let input = BitReader { data, offset: Ref::new(offset), bit: Ref::new(0) };
+    let origin = output.len();
+    loop {
+        let final_block = input.read(1)? != 0;
+        let kind = input.read(2)?;
+        if kind == 0 {
+            input.align();
+            let length = input.read(16)?;
+            if length ^ input.read(16)? != 65535 {
+                return Result::Err(
+                    failure(ErrorKind::Invalid, input.offset.get(), "invalid stored DEFLATE length"),
+                )
+            }
+            if length > limit - output.len() {
+                return Result::Err(
+                    failure(ErrorKind::Limit, input.offset.get(), "decompressed data exceeds limit"),
+                )
+            }
+            let start = input.offset.get();
+            if length > data.len() - start {
+                return Result::Err(
+                    failure(ErrorKind::Truncated, start, "truncated stored DEFLATE block"),
+                )
+            }
+            output.extend_from_slice(data.slice(start, start + length));
+            input.offset.set(start + length);
+        } else if kind == 1 || kind == 2 {
+            let (literals, distances) = if kind == 1 {
+                fixed_trees()?
+            } else {
+                dynamic_trees(input)?
+            };
+            loop {
+                let symbol = literals.decode(input)?;
+                if symbol < 256 {
+                    if output.len() == limit {
+                        return Result::Err(
+                            failure(
+                                ErrorKind::Limit,
+                                input.offset.get(),
+                                "decompressed data exceeds limit",
+                            ),
+                        )
+                    }
+                    output.push(symbol.to_u8());
+                } else if symbol == 256 {
+                    break
+                } else {
+                    if symbol > 285 {
+                        return Result::Err(
+                            failure(
+                                ErrorKind::Invalid,
+                                input.offset.get(),
+                                "reserved DEFLATE length symbol",
+                            ),
+                        )
+                    }
+                    let index = symbol - 257;
+                    let length = LENGTH_BASE[index] + input.read(LENGTH_BITS[index])?;
+                    let distance_symbol = distances.decode(input)?;
+                    if distance_symbol > 29 {
+                        return Result::Err(
+                            failure(
+                                ErrorKind::Invalid,
+                                input.offset.get(),
+                                "reserved DEFLATE distance symbol",
+                            ),
+                        )
+                    }
+                    let distance = DISTANCE_BASE[distance_symbol]
+                        + input.read(DISTANCE_BITS[distance_symbol])?;
+                    if distance > output.len() - origin {
+                        return Result::Err(
+                            failure(
+                                ErrorKind::Invalid,
+                                input.offset.get(),
+                                "DEFLATE distance exceeds history",
+                            ),
+                        )
+                    }
+                    if length > limit - output.len() {
+                        return Result::Err(
+                            failure(
+                                ErrorKind::Limit,
+                                input.offset.get(),
+                                "decompressed data exceeds limit",
+                            ),
+                        )
+                    }
+                    for _ in 0..length {
+                        output.push(output.get(output.len() - distance))
+                    }
+                }
+            }
+        } else {
+            return Result::Err(
+                failure(ErrorKind::Invalid, input.offset.get(), "reserved DEFLATE block type"),
+            )
+        }
+        if final_block {
+            input.align();
+            return Result::Ok(input.offset.get())
+        }
+    }
+}
+
+struct BitWriter {
+    data: bytes::Bytes,
+    bits: Ref[isize],
+    count: Ref[isize],
+}
+
+impl BitWriter {
+    fn write(self: BitWriter, value: isize, width: isize) -> () {
+        let mut bits = self.bits.get() | (value << self.count.get());
+        let mut count = self.count.get() + width;
+        while count >= 8 {
+            self.data.push(bits.to_u8());
+            bits >>= 8;
+            count -= 8;
+        }
+        self.bits.set(bits);
+        self.count.set(count);
+    }
+
+    fn code(self: BitWriter, value: isize, width: isize) -> () {
+        let mut reversed = 0;
+        for index in 0..width {
+            reversed = (reversed << 1) | ((value >> index) & 1);
+        }
+        self.write(reversed, width);
+    }
+
+    fn literal(self: BitWriter, symbol: isize) -> () {
+        if symbol < 144 {
+            self.code(symbol + 48, 8);
+        } else if symbol < 256 {
+            self.code(symbol + 256, 9);
+        } else if symbol < 280 {
+            self.code(symbol - 256, 7);
+        } else {
+            self.code(symbol - 88, 8);
+        }
+    }
+}
+
+fn match_hash(data: bytes::Bytes, offset: isize) -> isize {
+    ((data.get(offset).to_isize() * 251 + data.get(offset + 1).to_isize()) * 251
+        + data.get(offset + 2).to_isize())
+        & 32767
+}
+
+fn stored_deflate(data: bytes::Bytes) -> bytes::Bytes {
+    let output = bytes::Bytes::new();
+    let mut offset = 0;
+    loop {
+        let length = if data.len() - offset > 65535 {
+            65535
+        } else {
+            data.len() - offset
+        };
+        let final_block = offset + length == data.len();
+        output.push(
+            if final_block {
+                1
+            } else {
+                0
+            },
+        );
+        put_le(output, length.to_u64(), 2);
+        put_le(output, (length ^ 65535).to_u64(), 2);
+        output.extend_from_slice(data.slice(offset, offset + length));
+        offset += length;
+        if final_block {
+            return output
+        }
+    }
+}
+
+fn deflate(data: bytes::Bytes) -> Result[bytes::Bytes, Error] {
+    let output = BitWriter { data: bytes::Bytes::new(), bits: Ref::new(0), count: Ref::new(0) };
+    output.write(3, 3);
+    let heads = repeated_numbers(32768, -1);
+    let previous = repeated_numbers(32768, -1);
+    let mut offset = 0;
+    while offset < data.len() {
+        let mut length = 0;
+        let mut distance = 0;
+        if data.len() - offset >= 3 {
+            let mut candidate = heads[match_hash(data, offset)];
+            let mut attempts = 0;
+            while candidate >= 0 && offset - candidate <= 32768 && attempts < 64 {
+                let mut matched = 0;
+                while matched < 258 && matched < data.len() - offset
+                    && data.get(candidate + matched) == data.get(offset + matched) {
+                    matched += 1;
+                }
+                if matched > length {
+                    length = matched;
+                    distance = offset - candidate;
+                    if matched == 258 {
+                        break
+                    }
+                }
+                let next = previous[candidate & 32767];
+                if next >= candidate {
+                    break
+                }
+                candidate = next;
+                attempts += 1;
+            }
+        }
+        if length >= 3 {
+            let mut index = 0;
+            while index < 28 && LENGTH_BASE[index + 1] <= length {
+                index += 1;
+            }
+            output.literal(index + 257);
+            output.write(length - LENGTH_BASE[index], LENGTH_BITS[index]);
+            index = 0;
+            while index < 29 && DISTANCE_BASE[index + 1] <= distance {
+                index += 1;
+            }
+            output.code(index, 5);
+            output.write(distance - DISTANCE_BASE[index], DISTANCE_BITS[index]);
+        } else {
+            length = 1;
+            output.literal(data.get(offset).to_isize());
+        }
+        for index in offset..offset + length {
+            if data.len() - index >= 3 {
+                let hash = match_hash(data, index);
+                previous[index & 32767] = heads[hash];
+                heads[hash] = index;
+            }
+        }
+        offset += length;
+    }
+    output.literal(256);
+    if output.count.get() != 0 {
+        output.data.push(output.bits.get().to_u8());
+    }
+    let overhead = (data.len() / 65535 + 1) * 5;
+    if output.data.len() - data.len() > overhead {
+        Result::Ok(stored_deflate(data))
+    } else {
+        Result::Ok(output.data)
+    }
+}

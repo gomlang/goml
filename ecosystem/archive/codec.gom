@@ -1,41 +1,89 @@
 package archive;
 
 use std::bytes;
-use std::ffi;
-
-#[go_ffi("example.com/goml-ecosystem/archive/adapter", "Compress")]
-extern fn native_compress(data: ffi::RawSlice[byte], gzip_format: bool) -> (
-    ffi::RawSlice[byte],
-    ffi::String,
-);
-
-#[go_ffi("example.com/goml-ecosystem/archive/adapter", "Decompress")]
-extern fn native_decompress(data: ffi::RawSlice[byte], gzip_format: bool, limit: isize) -> (
-    ffi::RawSlice[byte],
-    ffi::String,
-);
-
-fn codec_result(result: (ffi::RawSlice[byte], ffi::String)) -> Result[bytes::Bytes, Error] {
-    let (data, error) = result;
-    let message = ffi::string_text(error).unwrap_or("invalid compression error");
-    if message != "" {
-        return Result::Err(failure(ErrorKind::Invalid, 0, message))
-    }
-    Result::Ok(bytes::Bytes::from_vec(ffi::slice_to_vec_copy(data)))
-}
 
 pub fn gzip(data: bytes::Bytes) -> Result[bytes::Bytes, Error] {
-    codec_result(native_compress(ffi::slice_shared(data.to_vec()), true))
+    let output = bytes::Bytes::from_vec(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff");
+    output.extend_from_slice(deflate(data)?.as_slice());
+    put_le(output, crc32(data).to_u64(), 4);
+    put_le(output, data.len().to_u32().to_u64(), 4);
+    Result::Ok(output)
 }
 
 pub fn gunzip(data: bytes::Bytes, limit: isize) -> Result[bytes::Bytes, Error] {
-    codec_result(native_decompress(ffi::slice_shared(data.to_vec()), true, limit))
-}
-
-fn deflate(data: bytes::Bytes) -> Result[bytes::Bytes, Error] {
-    codec_result(native_compress(ffi::slice_shared(data.to_vec()), false))
+    if limit < 0 {
+        return Result::Err(failure(ErrorKind::Limit, 0, "negative decompression limit"))
+    }
+    let output = bytes::Bytes::new();
+    let mut offset = 0;
+    loop {
+        let start = offset;
+        let header = part(data, offset, 10)?;
+        if header.get(0) != 0x1f || header.get(1) != 0x8b || header.get(2) != 8
+            || header.get(3) & 0xe0 != 0 {
+            return Result::Err(failure(ErrorKind::Invalid, offset, "invalid GZIP header"))
+        }
+        let flags = header.get(3);
+        offset += 10;
+        if flags & 4 != 0 {
+            let length = le(data, offset, 2)?.to_isize();
+            offset += 2;
+            if length > data.len() - offset {
+                return Result::Err(
+                    failure(ErrorKind::Truncated, offset, "truncated GZIP extra data"),
+                )
+            }
+            offset += length;
+        }
+        for flag in[8, 16] {
+            if flags.to_isize() & flag != 0 {
+                loop {
+                    if offset == data.len() {
+                        return Result::Err(
+                            failure(ErrorKind::Truncated, offset, "truncated GZIP text"),
+                        )
+                    }
+                    let value = data.get(offset);
+                    offset += 1;
+                    if value == 0 {
+                        break
+                    }
+                }
+            }
+        }
+        if flags & 2 != 0 {
+            if le(data, offset, 2)?.to_u16() != crc32_update(0, data.slice(start, offset)).to_u16() {
+                return Result::Err(
+                    failure(ErrorKind::Checksum, offset, "GZIP header checksum mismatch"),
+                )
+            }
+            offset += 2;
+        }
+        let body_start = output.len();
+        offset = inflate_into(data, offset, output, limit)?;
+        let checksum = le(data, offset, 4)?.to_u32();
+        let length = le(data, offset + 4, 4)?.to_u32();
+        if checksum != crc32_update(0, output.slice(body_start, output.len()))
+            || length != (output.len() - body_start).to_u32() {
+            return Result::Err(
+                failure(ErrorKind::Checksum, offset, "GZIP payload checksum or size mismatch"),
+            )
+        }
+        offset += 8;
+        if offset == data.len() {
+            return Result::Ok(output)
+        }
+    }
 }
 
 fn inflate(data: bytes::Bytes, limit: isize) -> Result[bytes::Bytes, Error] {
-    codec_result(native_decompress(ffi::slice_shared(data.to_vec()), false, limit))
+    if limit < 0 {
+        return Result::Err(failure(ErrorKind::Limit, 0, "negative decompression limit"))
+    }
+    let output = bytes::Bytes::new();
+    let offset = inflate_into(data, 0, output, limit)?;
+    if offset != data.len() {
+        return Result::Err(failure(ErrorKind::Invalid, offset, "trailing compressed data"))
+    }
+    Result::Ok(output)
 }

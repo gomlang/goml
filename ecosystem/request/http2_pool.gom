@@ -1,0 +1,194 @@
+package request;
+
+use std::bytes::{FrozenBytes};
+use std::context;
+
+enum ConnectionLease {
+    Http1(Stream, bool),
+    Http2(Http2Request),
+}
+
+fn http2_pool_attach(
+    client: Client,
+    key: string,
+    method: string,
+    url: Url,
+    headers: Headers,
+    body: FrozenBytes,
+    limit: isize,
+) -> Result[Option[Http2Request], Error] {
+    let entries = client.http2.recv().unwrap_or(Vec::new());
+    defer client.http2.send(entries);
+    for (origin, connection) in entries {
+        if origin == key && !http2_is_closed(connection) {
+            let encoded = http2_request_headers(method, url, headers, body)?;
+            if let Some(request) = http2_register(connection, method, encoded, body, limit) {
+                return Result::Ok(Option::Some(request))
+            }
+        }
+    }
+    Result::Ok(Option::None)
+}
+
+fn http2_pool_trim(client: Client) -> () {
+    let entries = client.http2.recv().unwrap_or(Vec::new());
+    let retained = Vec::new();
+    let removed = Vec::new();
+    let state = client.state.recv().unwrap_or(ClientState { idle: Vec::new(), cookies: Vec::new() });
+    let mut idle = state.idle.len();
+    for (key, connection) in entries {
+        let closed = http2_is_closed(connection);
+        let available = !closed && http2_idle(connection);
+        if available {
+            idle += 1;
+        }
+        if closed || available && idle > client.options.max_idle {
+            removed.push(connection);
+        } else {
+            retained.push((key, connection));
+        }
+    }
+    client.state.send(state);
+    client.http2.send(retained);
+    for connection in removed {
+        http2_close(connection);
+    }
+}
+
+fn http2_pool_close(client: Client, only_idle: bool) -> () {
+    let entries = client.http2.recv().unwrap_or(Vec::new());
+    let retained = Vec::new();
+    let removed = Vec::new();
+    for (key, connection) in entries {
+        if !only_idle || http2_idle(connection) {
+            removed.push(connection);
+        } else {
+            retained.push((key, connection));
+        }
+    }
+    client.http2.send(retained);
+    for connection in removed {
+        http2_close(connection);
+    }
+}
+
+fn dial_gate_register(client: Client, key: string) -> Channel[()] {
+    let entries = client.dial_gate.recv().unwrap_or(Vec::new());
+    defer client.dial_gate.send(entries);
+    for index in 0..entries.len() {
+        let (origin, gate, count) = entries.get(index);
+        if origin == key {
+            entries.set(index, (origin, gate, count + 1));
+            return gate
+        }
+    }
+    let gate = Channel::new(1);
+    gate.send(());
+    entries.push((key, gate, 1));
+    gate
+}
+
+fn dial_gate_release(client: Client, key: string, gate: Channel[()], acquired: bool) -> () {
+    if acquired {
+        gate.send(());
+    }
+    let entries = client.dial_gate.recv().unwrap_or(Vec::new());
+    let retained = Vec::new();
+    for (origin, entry, count) in entries {
+        if origin != key {
+            retained.push((origin, entry, count));
+        } else if count > 1 {
+            retained.push((origin, entry, count - 1));
+        }
+    }
+    client.dial_gate.send(retained);
+}
+
+fn transport_lease(
+    client: Client,
+    context: context::Context,
+    key: string,
+    endpoint: Url,
+    proxy: Option[Url],
+    method: string,
+    url: Url,
+    headers: Headers,
+    body: FrozenBytes,
+    limit: isize,
+) -> Result[ConnectionLease, Error] {
+    let origin_headers = if url.secure && proxy.is_some() {
+        headers.remove("proxy-authorization")
+    } else {
+        headers
+    };
+    if let Some(request) = http2_pool_attach(client, key, method, url, origin_headers, body, limit)? {
+        return Result::Ok(ConnectionLease::Http2(request))
+    }
+    if let Some(stream) = take_connection(client, key) {
+        return Result::Ok(ConnectionLease::Http1(stream, true))
+    }
+    let gate = dial_gate_register(client, key);
+    let acquired = select {
+        recv(gate) as _ => true,
+        recv(context.done()) as _ => false,
+        recv(client.closed) as _ => false,
+    };
+    defer dial_gate_release(client, key, gate, acquired);
+    if !acquired {
+        context.check().map_err(context_error)?;
+        return Result::Err(Error::new(ErrorKind::Closed, "client is closed"))
+    }
+    context.check().map_err(context_error)?;
+    if client.is_closed() {
+        return Result::Err(Error::new(ErrorKind::Closed, "client is closed"))
+    }
+    if let Some(request) = http2_pool_attach(client, key, method, url, origin_headers, body, limit)? {
+        return Result::Ok(ConnectionLease::Http2(request))
+    }
+    if let Some(stream) = take_connection(client, key) {
+        return Result::Ok(ConnectionLease::Http1(stream, true))
+    }
+    let stream = if url.secure && proxy.is_some() {
+        connect_tunnel(client, context, url, headers, proxy.unwrap_or(endpoint))?
+    } else {
+        connect_stream(client, endpoint, context, proxy.is_none())?
+    };
+    if !stream.http2() {
+        return Result::Ok(ConnectionLease::Http1(stream, false))
+    }
+    let connection = match http2_new_connection(
+        stream,
+        context,
+        client.options.max_headers,
+        client.options.idle_value,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            stream.close();
+            return Result::Err(error)
+        },
+    };
+    let encoded = match http2_request_headers(method, url, origin_headers, body) {
+        Ok(value) => value,
+        Err(error) => {
+            http2_close(connection);
+            return Result::Err(error)
+        },
+    };
+    let request = match http2_register(connection, method, encoded, body, limit) {
+        Some(value) => value,
+        None => {
+            http2_close(connection);
+            return Result::Err(transport_error("HTTP/2 connection closed during setup"))
+        },
+    };
+    let entries = client.http2.recv().unwrap_or(Vec::new());
+    if client.is_closed() {
+        client.http2.send(entries);
+        http2_close(connection);
+        return Result::Err(Error::new(ErrorKind::Closed, "client is closed"))
+    }
+    entries.push((key, connection));
+    client.http2.send(entries);
+    Result::Ok(ConnectionLease::Http2(request))
+}

@@ -1,0 +1,404 @@
+package request;
+
+use std::bytes::{Bytes};
+use std::context;
+
+fn http2_complete_stream(connection: Http2Connection, state: Http2ConnectionState, index: isize) -> Result[
+    Http2ConnectionState,
+    Error,
+] {
+    let stream = state.streams[index];
+    if stream.uploaded < stream.body.len() {
+        http2_queue(connection.controls, 3, 0, stream.id, http2_number(0))?;
+    }
+    if stream.method != "HEAD" && stream.status != 204 && stream.status != 304 {
+        if let Some(expected) = stream.content_length {
+            if expected != stream.output.len() {
+                return Result::Ok(
+                    http2_finish(
+                        state,
+                        index,
+                        Result::Err(
+                            Http2Failure::Failed(transport_error("HTTP/2 body length mismatch")),
+                        ),
+                    ),
+                )
+            }
+        }
+    }
+    Result::Ok(
+        http2_finish(
+            state,
+            index,
+            Result::Ok(
+                Received {
+                    status: stream.status,
+                    headers: stream.response_headers,
+                    body: stream.output.freeze(),
+                    version: "HTTP/2.0",
+                },
+            ),
+        ),
+    )
+}
+
+fn http2_reject_stream(
+    connection: Http2Connection,
+    state: Http2ConnectionState,
+    index: isize,
+    code: isize,
+    error: Error,
+) -> Result[Http2ConnectionState, Error] {
+    http2_queue(connection.controls, 3, 0, state.streams[index].id, http2_number(code))?;
+    Result::Ok(http2_finish(state, index, Result::Err(Http2Failure::Failed(error))))
+}
+
+fn http2_settings(connection: Http2Connection, frame: Http2Frame) -> Result[(), Error] {
+    if frame.stream != 0 || frame.payload.len() % 6 != 0
+        || frame.flags & 1 != 0 && !frame.payload.is_empty() {
+        return Result::Err(transport_error("invalid HTTP/2 SETTINGS frame"))
+    }
+    if frame.flags & 1 != 0 {
+        return Result::Ok(())
+    }
+    let mut state = http2_state(connection);
+    defer connection.state.send(state);
+    let mut offset = 0;
+    while offset < frame.payload.len() {
+        let name = http2_integer(frame.payload, offset, 2);
+        let value = http2_integer(frame.payload, offset + 2, 4);
+        if name == 2 && value != 0 {
+            return Result::Err(transport_error("server sent HTTP/2 ENABLE_PUSH"))
+        }
+        if name == 3 {
+            state.max_streams = value;
+        }
+        if name == 4 {
+            if value > 0x7fffffff {
+                return Result::Err(transport_error("invalid HTTP/2 initial window"))
+            }
+            let difference = value - state.initial_window;
+            for index in 0..state.streams.len() {
+                let stream = state.streams[index];
+                if stream.send_window + difference > 0x7fffffff {
+                    return Result::Err(transport_error("HTTP/2 stream window overflow"))
+                }
+                state.streams[index] = Http2StreamState {
+                    send_window: stream.send_window + difference,
+                    ..stream,
+                };
+            }
+            state.initial_window = value;
+        }
+        if name == 5 && (value < 16384 || value > 0xffffff) {
+            return Result::Err(transport_error("invalid HTTP/2 maximum frame size"))
+        }
+        offset += 6;
+    }
+    state.ready = true;
+    http2_queue(connection.controls, 4, 1, 0, Bytes::new())?;
+    http2_wake(connection);
+    Result::Ok(())
+}
+
+fn http2_window_update(connection: Http2Connection, frame: Http2Frame) -> Result[(), Error] {
+    if frame.payload.len() != 4 {
+        return Result::Err(transport_error("invalid HTTP/2 window update"))
+    }
+    let increment = http2_integer(frame.payload, 0, 4) & 0x7fffffff;
+    let mut state = http2_state(connection);
+    defer connection.state.send(state);
+    if frame.stream == 0 {
+        if increment == 0 || state.send_window + increment > 0x7fffffff {
+            return Result::Err(transport_error("invalid HTTP/2 connection window increment"))
+        }
+        state.send_window += increment;
+    } else {
+        if frame.stream > state.highest_sent || frame.stream % 2 == 0 {
+            return Result::Err(transport_error("HTTP/2 window update for idle stream"))
+        }
+        if let Some(index) = http2_stream_index(state, frame.stream) {
+            let stream = state.streams[index];
+            if increment == 0 || stream.send_window + increment > 0x7fffffff {
+                state = http2_reject_stream(
+                    connection,
+                    state,
+                    index,
+                    3,
+                    transport_error("invalid HTTP/2 stream window increment"),
+                )?;
+            } else {
+                state.streams[index] = Http2StreamState {
+                    send_window: stream.send_window + increment,
+                    ..stream,
+                };
+            }
+        }
+    }
+    http2_wake(connection);
+    Result::Ok(())
+}
+
+fn http2_receive_headers(
+    connection: Http2Connection,
+    reader: Reader,
+    decoder: Hpack,
+    frame: Http2Frame,
+) -> Result[(), Error] {
+    let original = http2_state(connection);
+    let allowed = frame.stream > 0 && frame.stream % 2 == 1 && frame.stream <= original.highest_sent;
+    let budget = http2_stream_index(original, frame.stream).map(
+        |index| original.streams[index].header_budget,
+    ).unwrap_or(connection.max_headers);
+    connection.state.send(original);
+    if !allowed {
+        return Result::Err(transport_error("HTTP/2 headers for idle stream"))
+    }
+    let block = http2_header_block(reader, frame, budget)?;
+    let fields = decoder.decode(block, budget)?;
+    let mut state = http2_state(connection);
+    defer connection.state.send(state);
+    let index = match http2_stream_index(state, frame.stream) {
+        Some(index) => index,
+        None => return Result::Ok(()),
+    };
+    let mut stream = state.streams[index];
+    for (name, value) in fields {
+        stream.header_budget -= name.byte_len() + value.byte_len() + 32;
+    }
+    let (code, headers) = match http2_response_headers(fields, stream.status != 0) {
+        Ok(value) => value,
+        Err(error) => {
+            state = http2_reject_stream(connection, state, index, 1, error)?;
+            return Result::Ok(())
+        },
+    };
+    let ended = frame.flags & 1 != 0;
+    if stream.status == 0 && code < 200 {
+        if ended {
+            state = http2_reject_stream(
+                connection,
+                state,
+                index,
+                1,
+                transport_error("informational HTTP/2 response ended stream"),
+            )?;
+        } else {
+            state.streams[index] = stream;
+        }
+        return Result::Ok(())
+    }
+    if stream.status == 0 {
+        stream.status = code;
+        stream.response_headers = headers;
+        for value in headers.get_all("content-length") {
+            let length = match decimal(value) {
+                Ok(length) => length,
+                Err(error) => {
+                    state = http2_reject_stream(connection, state, index, 1, error)?;
+                    return Result::Ok(())
+                },
+            };
+            if let Some(previous) = stream.content_length {
+                if previous != length {
+                    state = http2_reject_stream(
+                        connection,
+                        state,
+                        index,
+                        1,
+                        transport_error("conflicting HTTP/2 content lengths"),
+                    )?;
+                    return Result::Ok(())
+                }
+            }
+            stream.content_length = Option::Some(length);
+        }
+        if stream.method != "HEAD" && code != 304 && code != 204
+            && stream.content_length.unwrap_or(0) > stream.limit {
+            state = http2_reject_stream(connection, state, index, 8, body_limit_error())?;
+            return Result::Ok(())
+        }
+    } else if !ended {
+        state = http2_reject_stream(
+            connection,
+            state,
+            index,
+            1,
+            transport_error("HTTP/2 trailers must end stream"),
+        )?;
+        return Result::Ok(())
+    }
+    state.streams[index] = stream;
+    if ended {
+        state = http2_complete_stream(connection, state, index)?;
+    }
+    http2_wake(connection);
+    Result::Ok(())
+}
+
+fn http2_receive_data(connection: Http2Connection, frame: Http2Frame) -> Result[(), Error] {
+    let data = http2_data(frame)?;
+    let mut state = http2_state(connection);
+    defer connection.state.send(state);
+    if frame.stream == 0 || frame.stream % 2 == 0 || frame.stream > state.highest_sent {
+        return Result::Err(transport_error("HTTP/2 DATA for idle stream"))
+    }
+    let size = frame.payload.len();
+    if size > state.receive_window {
+        return Result::Err(transport_error("HTTP/2 connection receive window exceeded"))
+    }
+    state.receive_window -= size;
+    state.consumed += size;
+    if state.consumed >= 16384 {
+        http2_queue(connection.controls, 8, 0, 0, http2_number(state.consumed))?;
+        state.receive_window += state.consumed;
+        state.consumed = 0;
+    }
+    let index = match http2_stream_index(state, frame.stream) {
+        Some(index) => index,
+        None => return Result::Ok(()),
+    };
+    let mut stream = state.streams[index];
+    let mut problem = Option::None;
+    if stream.status == 0 {
+        problem = Option::Some(transport_error("HTTP/2 DATA before response headers"));
+    }
+    if size > stream.receive_window {
+        problem = Option::Some(transport_error("HTTP/2 stream receive window exceeded"));
+    }
+    if (stream.method == "HEAD" || stream.status == 204 || stream.status == 304) && data.len() != 0 {
+        problem = Option::Some(transport_error("HTTP/2 response forbids a body"));
+    }
+    if data.len() > stream.limit - stream.output.len() {
+        problem = Option::Some(body_limit_error());
+    }
+    if let Some(error) = problem {
+        state = http2_reject_stream(connection, state, index, 8, error)?;
+        return Result::Ok(())
+    }
+    stream.receive_window -= size;
+    stream.consumed += size;
+    stream.output.extend_from_slice(data);
+    let ended = frame.flags & 1 != 0;
+    if stream.consumed >= 16384 && !ended {
+        http2_queue(connection.controls, 8, 0, stream.id, http2_number(stream.consumed))?;
+        stream.receive_window += stream.consumed;
+        stream.consumed = 0;
+    }
+    state.streams[index] = stream;
+    if ended {
+        state = http2_complete_stream(connection, state, index)?;
+    }
+    http2_wake(connection);
+    Result::Ok(())
+}
+
+fn http2_receive_reset(connection: Http2Connection, frame: Http2Frame) -> Result[(), Error] {
+    if frame.stream == 0 || frame.stream % 2 == 0 || frame.payload.len() != 4 {
+        return Result::Err(transport_error("invalid HTTP/2 RST_STREAM"))
+    }
+    let mut state = http2_state(connection);
+    defer connection.state.send(state);
+    if frame.stream > state.highest_sent {
+        return Result::Err(transport_error("HTTP/2 reset for idle stream"))
+    }
+    if let Some(index) = http2_stream_index(state, frame.stream) {
+        let code = http2_integer(frame.payload, 0, 4);
+        let error = transport_error("HTTP/2 peer reset stream: " + code.to_string());
+        let failure = if code == 7 && state.streams[index].status == 0 {
+            Http2Failure::Retry(error)
+        } else {
+            Http2Failure::Failed(error)
+        };
+        state = http2_finish(state, index, Result::Err(failure));
+    }
+    http2_wake(connection);
+    Result::Ok(())
+}
+
+fn http2_receive_goaway(connection: Http2Connection, frame: Http2Frame) -> Result[(), Error] {
+    if frame.stream != 0 || frame.payload.len() < 8 {
+        return Result::Err(transport_error("invalid HTTP/2 GOAWAY"))
+    }
+    let last = http2_integer(frame.payload, 0, 4) & 0x7fffffff;
+    let code = http2_integer(frame.payload, 4, 4);
+    let mut state = http2_state(connection);
+    defer connection.state.send(state);
+    if last > state.last_stream {
+        return Result::Err(transport_error("HTTP/2 GOAWAY increased last stream"))
+    }
+    state.last_stream = last;
+    state.draining = true;
+    let mut index = 0;
+    while index < state.streams.len() {
+        let stream = state.streams[index];
+        if stream.id > last || !stream.headers_sent {
+            let failure = if stream.status != 0 {
+                Http2Failure::Failed(transport_error("HTTP/2 GOAWAY contradicts response headers"))
+            } else {
+                Http2Failure::Retry(transport_error("HTTP/2 GOAWAY rejected stream"))
+            };
+            state = http2_finish(state, index, Result::Err(failure));
+        } else if code != 0 {
+            state = http2_finish(
+                state,
+                index,
+                Result::Err(
+                    Http2Failure::Failed(
+                        transport_error("HTTP/2 GOAWAY error: " + code.to_string()),
+                    ),
+                ),
+            );
+        } else {
+            index += 1;
+        }
+    }
+    http2_wake(connection);
+    Result::Ok(())
+}
+
+fn http2_read_connection(connection: Http2Connection) -> Result[(), Error] {
+    let reader = Reader::new(connection.stream, context::Context::background());
+    let decoder = Hpack::new();
+    let mut first = true;
+    loop {
+        let frame = http2_read(reader)?;
+        if first && (frame.kind != 4 || frame.flags & 1 != 0) {
+            return Result::Err(transport_error("missing HTTP/2 server settings"))
+        }
+        first = false;
+        match frame.kind {
+            4 => http2_settings(connection, frame)?,
+            8 => http2_window_update(connection, frame)?,
+            1 => http2_receive_headers(connection, reader, decoder, frame)?,
+            0 => http2_receive_data(connection, frame)?,
+            3 => http2_receive_reset(connection, frame)?,
+            7 => http2_receive_goaway(connection, frame)?,
+            6 => {
+                if frame.stream != 0 || frame.payload.len() != 8 {
+                    return Result::Err(transport_error("invalid HTTP/2 PING"))
+                }
+                if frame.flags & 1 == 0 {
+                    http2_queue(connection.controls, 6, 1, 0, frame.payload)?;
+                }
+            },
+            2 => if frame.stream == 0 || frame.payload.len() != 5
+                || http2_integer(frame.payload, 0, 4) & 0x7fffffff == frame.stream {
+                return Result::Err(transport_error("invalid HTTP/2 PRIORITY"))
+            },
+            5 => return Result::Err(transport_error("HTTP/2 push is disabled")),
+            9 => return Result::Err(transport_error("unexpected HTTP/2 CONTINUATION")),
+            _ => (),
+        }
+        let state = http2_state(connection);
+        let drained = state.draining && state.streams.is_empty();
+        let closed = state.closed;
+        connection.state.send(state);
+        if closed {
+            return Result::Ok(())
+        }
+        if drained {
+            return Result::Err(transport_error("HTTP/2 connection drained"))
+        }
+    }
+}

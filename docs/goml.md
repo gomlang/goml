@@ -388,6 +388,7 @@ All files in the same package can use private top-level items. The trait impl me
 | Type | Example | Description |
 | --- | --- | --- |
 | empty tuple | `()` | The only value is `()` |
+| never | `never` | No values; a function annotated `-> never` cannot return normally |
 | Boolean | `bool` | `true`, `false` |
 | platform-sized integer | `isize` | Corresponds to the `int` of the target Go platform and is also the default type of integers. |
 | signed integer | `i8`, `i16`, `i32`, `i64` | fixed width |
@@ -415,6 +416,8 @@ let accepts_empty: (()) -> () = |value: ()| value;
 ```
 
 `()` is the empty-tuple type. At the left of `->`, `() -> T` is a zero-parameter function type, while `(()) -> T` is a function taking one `()` parameter.
+
+An expression of type `never` does not produce a value and can appear where another value type is expected. This does not implicitly convert container or function types: `Vec[never]` is not `Vec[isize]`, and `() -> never` is not `() -> isize`. To adapt a non-returning function to a callback with another return type, use a closure with that expected callback type. Ordinary values and normally returning callbacks cannot satisfy `never` annotations.
 
 `(value)` in value and pattern is a group, `(value,)` is a single-element tuple. The current type syntax cannot directly annotate single-element tuples: `(T,)` still normalizes to `T`, so the type of such values must be inferred from the local context.
 
@@ -516,7 +519,7 @@ fn emoji() -> FrozenVec[FrozenVec[u16]] {
 }
 ```
 
-`OnceCell.get_or_init(init)` runs one initializer and caches its result. Concurrent first callers wait for that initializer and receive the same value. Recursive initialization of the same cell terminates with an error that names the static. A cached `Result` is an ordinary cached value. Statics do not run user-observable destruction at process exit.
+`OnceCell.get_or_init(init)` runs one initializer and caches its result. Concurrent first callers wait for that initializer and receive the same value. If the initializer panics, the cell becomes uninitialized again and waiting callers are woken so a later initializer can retry. Recursive initialization of the same cell panics with an error that names the static. A cached `Result` is an ordinary cached value. Statics do not run user-observable destruction at process exit.
 
 Unlike a `const`, a `static` has observable identity. `OnceCell[T]` controls initialization but does not make `T` immutable. Shared caches should therefore expose `FrozenVec` or another immutable value instead of a mutable `Vec`.
 
@@ -773,7 +776,7 @@ fn run() -> () {
 
 `defer expression;` registers a `()` expression to run when the current lexical block is left. Deferred expressions run in last-in-first-out order on normal completion and when `return`, `?`, `break`, or `continue` crosses their block. A return or break value is evaluated before cleanup begins. Each loop-body block has its own cleanup stack, so a deferred expression registered during one iteration runs before that iteration exits.
 
-Unlike Go's `defer`, GoML does not evaluate call arguments when the statement is reached. The complete expression is evaluated at block exit, so reads through `Ref` observe the value at cleanup time. A closure body is a separate control-flow scope. Deferred expressions cannot contain `return`, `break`, `continue`, or `?`, and cleanup during an unrecovered runtime panic is not currently guaranteed. The compiler lowers cleanup to ordinary structured control flow and never emits a Go `defer` statement.
+Unlike Go's `defer`, GoML does not evaluate call arguments when the statement is reached. The complete expression is evaluated at block exit, so reads through `Ref` and captured mutable locals observe the value at cleanup time. A closure body is a separate control-flow scope. Deferred expressions cannot contain `return`, `break`, `continue`, or `?`. Panic unwinding also runs registered cleanup in last-in-first-out order. A cleanup is removed before invocation, so it runs exactly once even if it panics; remaining cleanups still run and the newest panic propagates. The compiler uses a function-local cleanup stack with explicit pops at lexical exits and a Go `defer` guard for unwinding. Loop iterations release their completed entries instead of accumulating deferred calls until function return. Abrupt process termination and fatal runtime failures do not guarantee cleanup.
 
 ```goml
 fn work() -> () {
@@ -2255,7 +2258,7 @@ fn round_trip() -> bool {
 
 Conversions generate typed Go method values that retain the original function and its environment. GoML closures still undergo lambda lifting. Unit and flat tuple results are converted explicitly between GoML storage and Go's zero/multiple results. Raw errors and other supported raw values are preserved. Callback text values must use `ffi::String` or `ffi::Rune`; ordinary GoML `string`/`char`, including in arrays, slices, channels or raw maps, are rejected during adapter validation. Perform checked Unicode conversions inside the callback and choose an explicit failure result shape.
 
-The adapters add no synchronization, global registry, reflection or panic recovery. A panic propagates with its original value along the same goroutine, including through both conversion directions, and Go defers run during stack unwinding. It does not become an error result. Recovery requires an explicit caller-owned Go adapter using defer/recover in that goroutine; it cannot recover a panic in another goroutine or intercept process exit. Go may retain a converted callback after its registering GoML call returns, invoke it on another goroutine, or reenter GoML recursively. Captured state remains reachable through the Go function value. Concurrent mutation needs ordinary synchronization; conversion does not make a `Ref` thread-safe.
+The adapters add no synchronization, global registry, reflection or implicit panic recovery. A panic propagates along the same goroutine, including through both conversion directions, and Go and GoML defers run during stack unwinding. It does not automatically become an error result. Recovery requires an explicit `std::panic::catch` boundary or a caller-owned Go adapter using defer/recover in that goroutine; neither can recover a panic in another goroutine or intercept process exit. `panic::resume` preserves the captured panic's diagnostic information using an internal runtime wrapper; a Go caller recovering after resume observes that wrapper rather than the original payload's dynamic type. Go may retain a converted callback after its registering GoML call returns, invoke it on another goroutine, or reenter GoML recursively. Captured state remains reachable through the Go function value. Concurrent mutation needs ordinary synchronization; conversion does not make a `Ref` thread-safe.
 
 The runnable [callback subscription example](../examples/ffi-callbacks/README.md) provides explicit unregister, gated asynchronous dispatch, concurrent atomic updates, recursive reentry and registration stress coverage. Its callback reference is removed by unregister; already selected invocations may still run, so callers wait for their batches before disposing of captured resources. GC reachability and registration lifetime are separate. The example and its generated Go program are tested with the race detector. GoLibrary function-value exports remain unsupported; the [callback benchmark](../examples/ffi-callback-bench/README.md) measures invocation and escaping construction separately.
 
@@ -2885,6 +2888,7 @@ use std::net::tls;
 use std::num;
 use std::os::linux::syscall;
 use std::path;
+use std::panic;
 use std::process;
 use std::rand;
 use std::serde;
@@ -3112,7 +3116,7 @@ fn run_job() -> Result[isize, resource::ScopeError[string, string]] {
 }
 ```
 
-These helpers do not implement destructors or panic recovery. They guarantee cleanup on normal control flow and `Result` errors; a panic or abrupt process termination can bypass cleanup. A scope that escapes its callback remains closed afterward.
+These helpers do not implement destructors or implicit panic recovery. Cleanup runs on normal control flow, `Result` errors, and panic unwinding. A cleanup that panics does not prevent older registered cleanups from running, and the scope still publishes its closed state to waiting closers. The newest panic propagates instead of becoming a `ScopeError`; ordinary action and cleanup errors retain their existing combined-result behavior. Abrupt process termination and fatal runtime failures can bypass cleanup. A scope that escapes its callback remains closed afterward.
 
 ### Composable I/O
 
@@ -3605,13 +3609,37 @@ Cancellation is cooperative. `Scope::cancel` changes the state observed by `Canc
 
 Channel and sleep operations return `WaitResult::Cancelled` when cancellation wakes them. Process operations instead return `process::Error` with kind `io::ErrorKind::Interrupted`. Process cancellation uses the host command context, so the scope waits for the process operation to return before it exits. Task scopes never close user channels automatically. `active_scope_count()` exposes the number of live runtime scopes for tests and leak diagnostics.
 
-GoML has no lifetime or linear type system, so a `Scope` value can currently escape its body. Calling `spawn` after the scope begins closing is a runtime error. Panic remains a fatal runtime exception and is not converted into `Result`. A panic in the scope body or a child task cancels sibling tasks, waits for them, removes the runtime scope, and is then re-raised in the scope owner.
+GoML has no lifetime or linear type system, so a `Scope` value can currently escape its body. Calling `spawn` after the scope begins closing is a runtime error. Panic is not implicitly converted into `Result`. A panic in the scope body or a child task cancels sibling tasks, waits for them, removes the runtime scope, and is then re-raised in the scope owner. An explicit `std::panic::catch` around the scope can recover that re-raised panic after the scope has finished. A catch inside a child task handles its own panic before the task scope observes it. Cancellation remains cooperative, so an uncooperative sibling can delay scope completion and recovery.
 
 `join_all` returns values in input order. `join_all_results` waits for every task and returns errors in input order, independent of goroutine scheduling.
 
 `join_all_indexed_results` preserves each error's input index. `for_each_concurrent(limit, values, body)` runs at most `limit` calls at once, uses one worker when the limit is non-positive, waits for every value, and returns indexed errors in input order. `ConcurrencyLimit::run` can apply the same cooperative limit to custom task layouts.
 
 `race(bodies)` returns the first completed value, cancels the remaining bodies, and still waits for every losing body to exit. It returns `None` for an empty input. A body that does not cooperate with cancellation can therefore delay the return from `race`.
+
+### Panic boundaries
+
+`std::panic` provides explicit recovery from language and host runtime panics:
+
+```goml
+use std::panic;
+
+fn validate_internal_state(valid: bool) -> () {
+    if !valid {
+        panic::raise("invalid internal state")
+    }
+}
+
+fn guarded() -> Result[(), panic::Panic] {
+    panic::catch(|| validate_internal_state(false))
+}
+```
+
+`raise(message: string) -> never` starts unwinding. `catch[T](body: () -> T) -> Result[T, Panic]` returns `Ok` for a normal callback return, including a callback returning an ordinary `Result::Err`. It returns `Err` only for a panic after all exited blocks have run their registered defers. Bounds errors and other recoverable Go runtime panics, including panics crossing an FFI callback, are caught on the same goroutine. Execution resumes after `catch`, not at the failing expression. This is not a transaction: shared-state mutations and I/O are not rolled back.
+
+`Panic.message()` and `to_string()` return diagnostic text; invalid UTF-8 in host panic diagnostics is replaced with U+FFFD. `stack_trace()` returns the Go stack captured at the first `std::panic::catch` boundary; generated function names may appear. Child task panics are captured before transfer to the scope owner, while a scope-body panic may first be captured after the scope re-raises it. `resume(info: Panic) -> never` rethrows while preserving that diagnostic text and stack in subsequent GoML catches, including across generated Go packages. The original payload remains private and garbage-collected; there is no global panic registry. If a defer panics during cleanup, remaining defers run and the newest panic is delivered to the catch boundary.
+
+An uncaught panic terminates the process. Catch does not intercept another goroutine's panic, `process::exit`, runtime fatal errors, or forced termination. Recovering does not establish that shared application state is still consistent; use boundaries around isolated requests or tasks, and retain `Result` for expected failures. Runtime hooks belong to `lib/builtin`; the public API and consumers are ordinary GoML and need no user Go FFI adapter.
 
 ### Cancellation contexts
 
@@ -3667,7 +3695,7 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | `for i := 0; ...` | `while`, or `for i in start..end` |
 | `switch` | `match` |
 | `null`, `nil` | `Option::None` for optional values; `ffi::null()` for raw Go pointers; `ffi::nil_error()` for Go errors |
-| `throw`, exception | `Result` and `?` |
+| `throw`, exception | `Result` and `?` for expected errors; `std::panic::catch` for an explicit runtime-panic boundary |
 | `float_value.to_i32()` | Import `std::num::TryToInt` and use `float_value.try_to_i32()`; handle nonfinite and range errors |
 | `dyn A + B` | Use one dyn-safe trait; multiple bounds are reserved syntax but not yet supported |
 | `dyn TraitWithAssociatedType` | Bind every associated type, for example `dyn Iterator[Item = isize]` |
@@ -3685,6 +3713,7 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | TCP and UDP networking | `std::net` sockets, DNS resolution, shared epoll readiness, explicit close, and context-aware waits; `std::net::tls` for verified TLS clients |
 | Keep byte snapshots independent | `Bytes::copy` for mutable copies; `Bytes::freeze` and `FrozenBytes` for immutable snapshots |
 | Preserve action and cleanup errors | `std::resource::{with_cleanup, scope, ScopeError}` or `io::with_resource` |
+| Isolate a runtime panic | `std::panic::catch`, with lexical `defer` cleanup; `raise` and `resume` return `never` |
 | Generate public inherent methods | `derive_output_inherent` and `derive_output_add_public_method` |
 | Create and supervise a Linux child | `std::os::linux::process::Command` with runtime-coordinated spawn, stable pidfd signals, and shared wait results |
 | Access mapped memory | `std::os::linux::memory::Mapping` checked copied access with explicit shared unmap state |
@@ -3701,6 +3730,8 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 C bindings and `std::c` use existing structs, constants, `#[comptime]`, extern attributes, imports and calls. They add no C pointer, C layout or `extern "C"` grammar.
 
 Linux syscall buffers, `Pointer` descriptors, `Errno` values, ABI codecs, descriptor/process/memory/IPC wrappers use the ordinary struct, enum, array, slice, and call forms below. Native kernel layouts are encoded into bytes; there is no pointer-cast, native-layout, or `unsafe` grammar.
+
+Panic boundaries use ordinary function calls, closures, `Result`, and the existing `never` type. There is no `try/catch`, `throw`, or bare Go-style `recover()` syntax; panic cleanup extends the semantics of the existing lexical `defer` statement.
 
 I/O traits, cancellation contexts, DNS/TLS, scalar conversion traits, and Serde extension events use the existing imports, generic bounds, enums, methods, and calls. They introduce no new grammar. Explicit generic calls retain the `::[Type]` form even when their type arguments do not appear in the function signature.
 
@@ -3790,7 +3821,7 @@ type          = primitive_type
               | "[" type ";" integer_literal "]"
               | "(" type_list ")"
               | type "->" type
-primitive_type = "()" | "bool" | "isize" | "i8" | "i16" | "i32" | "i64"
+primitive_type = "()" | "never" | "bool" | "isize" | "i8" | "i16" | "i32" | "i64"
                | "usize" | "u8" | "u16" | "u32" | "u64" | "f32" | "f64"
                | "string" | "char"
 type_args     = "[" type_list "]"

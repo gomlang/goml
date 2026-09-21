@@ -1,6 +1,5 @@
 package request;
 
-use std::ffi;
 use std::context;
 use std::time::{Duration};
 use std::task;
@@ -155,26 +154,36 @@ impl ClientBuilder {
             _ => (),
         }
         validate_request_headers(self.headers)?;
-        let (raw, error) = raw_new_client(
-            self.connect_value.as_milliseconds(),
-            self.idle_value.as_milliseconds(),
-            self.max_idle,
-            self.max_headers,
-            self.gzip_value,
-            self.cookies,
-            ffi::string_from_text(self.ca),
-            ffi::string_from_text(self.certificate),
-            ffi::string_from_text(self.key),
-            ffi::string_from_text(self.proxy_value),
-            self.env_proxy,
-        );
-        check(error)?;
-        Result::Ok(Client { raw, options: self })
+        validate_pem(self.ca, "CERTIFICATE", true)?;
+        if self.certificate != "" || self.key != "" {
+            validate_pem(self.certificate, "CERTIFICATE", false)?;
+            if !self.key.contains("PRIVATE KEY-----") {
+                return Result::Err(Error::new(ErrorKind::Builder, "invalid client identity PEM"))
+            }
+        }
+        if self.proxy_value != "" {
+            Url::parse(self.proxy_value)?;
+        }
+        let state = Channel::new(1);
+        state.send(ClientState { idle: Vec::new(), cookies: Vec::new() });
+        let close_gate = Channel::new(1);
+        close_gate.send(());
+        let http2 = Channel::new(1);
+        http2.send(Vec::new());
+        let dial_gate = Channel::new(1);
+        dial_gate.send(Vec::new());
+        Result::Ok(
+            Client { state, http2, dial_gate, closed: Channel::new(0), close_gate, options: self },
+        )
     }
 }
 
 pub struct Client {
-    raw: NativeClient,
+    state: Channel[ClientState],
+    http2: Channel[Vec[(string, Http2Connection)]],
+    dial_gate: Channel[Vec[(string, Channel[()], isize)]],
+    closed: Channel[()],
+    close_gate: Channel[()],
     options: ClientBuilder,
 }
 
@@ -188,15 +197,31 @@ impl Client {
     }
 
     pub fn close(self: Client) -> () {
-        raw_close(self.raw)
+        let _ = self.close_gate.recv();
+        defer self.close_gate.send(());
+        if !self.is_closed() {
+            self.closed.close();
+        }
+        http2_pool_close(self, false);
+        self.close_idle_connections()
     }
 
     pub fn close_idle_connections(self: Client) -> () {
-        raw_close_idle(self.raw)
+        http2_pool_close(self, true);
+        let state = self.state.recv().unwrap_or(
+            ClientState { idle: Vec::new(), cookies: Vec::new() },
+        );
+        self.state.send(ClientState { idle: Vec::new(), ..state });
+        for entry in state.idle {
+            entry.stream.close();
+        }
     }
 
     pub fn is_closed(self: Client) -> bool {
-        raw_is_closed(self.raw)
+        select {
+            recv(self.closed) as _ => true,
+            default => false,
+        }
     }
 
     pub fn request(self: Client, method: string, url: string) -> RequestBuilder {
@@ -254,34 +279,42 @@ impl Client {
         if request.body_value.len() > self.options.request_limit_value {
             return Result::Err(Error::new(ErrorKind::BodyLimit, "request body exceeds limit"))
         }
-        let mut timeout = request.timeout_value;
-        if let Some(remaining) = context.remaining() {
-            if remaining.compare(timeout) < 0 {
-                timeout = remaining;
-            }
-        }
-        let control = raw_new_control(timeout.as_nanoseconds());
-        defer raw_cancel(control);
-        task::scope(
-            |scope| {
-                let done: Channel[()] = Channel::new(0);
-                defer done.close();
-                let _ = scope.spawn(
-                    |_| {
-                        select {
-                            recv(context.done()) as _ => raw_cancel(control),
-                            recv(done) as _ => (),
+        context::with_timeout(
+            context,
+            request.timeout_value,
+            |control, cancel| {
+                task::scope(
+                    |scope| {
+                        let done: Channel[()] = Channel::new(0);
+                        defer done.close();
+                        let _ = scope.spawn(
+                            |_| select {
+                                recv(self.closed) as _ => cancel.cancel(),
+                                recv(done) as _ => (),
+                            },
+                        );
+                        let result = execute_loop(self, request, control);
+                        match result {
+                            Err(error) => if self.is_closed() {
+                                Result::Err(Error::new(ErrorKind::Closed, "client is closed"))
+                            } else {
+                                match control.error() {
+                                    Some(reason) => Result::Err(context_error(reason)),
+                                    None => Result::Err(error),
+                                }
+                            },
+                            Ok(value) => {
+                                control.check().map_err(context_error)?;
+                                if self.is_closed() {
+                                    return Result::Err(
+                                        Error::new(ErrorKind::Closed, "client is closed"),
+                                    )
+                                }
+                                Result::Ok(value)
+                            },
                         }
                     },
-                );
-                let result = execute_loop(self, request, control);
-                match result {
-                    Err(error) => match context.error() {
-                        Some(reason) => Result::Err(context_error(reason)),
-                        None => Result::Err(error),
-                    },
-                    Ok(value) => Result::Ok(value),
-                }
+                )
             },
         )
     }
@@ -297,7 +330,10 @@ fn context_error(error: context::Error) -> Error {
     }
 }
 
-fn execute_loop(client: Client, request: Request, control: NativeControl) -> Result[Response, Error] {
+fn execute_loop(client: Client, request: Request, control: context::Context) -> Result[
+    Response,
+    Error,
+] {
     let mut url = request.url_value;
     let mut method = request.method_value;
     let mut headers = request.headers_value;
@@ -307,36 +343,23 @@ fn execute_loop(client: Client, request: Request, control: NativeControl) -> Res
         if client.options.https && !url.is_https() {
             return Result::Err(Error::new(ErrorKind::Builder, "client requires HTTPS"))
         }
-        let (names, values) = encode_pairs(headers.entries());
-        let (native, error) = raw_do(
-            client.raw,
+        let received = exchange(
+            client,
             control,
-            ffi::string_from_text(method),
-            ffi::string_from_text(url.text),
-            names,
-            values,
-            ffi::slice_from_vec_copy(body.to_vec_copy()),
-            request.body_limit_value.to_i64(),
-        );
-        check(error)?;
-        let status = raw_response_status(native);
-        let response_names = ffi::slice_to_vec_copy(raw_response_names(native));
-        let response_values = ffi::slice_to_vec_copy(raw_response_values(native));
-        let mut response_headers = Headers::new();
-        for index in 0..response_names.len() {
-            response_headers = response_headers.append(
-                native_text(response_names[index])?,
-                native_text(response_values[index])?,
-            )?;
-        }
+            method,
+            url,
+            headers,
+            body,
+            request.body_limit_value,
+        )?;
+        let status = received.status;
+        let response_headers = received.headers;
         let response = Response {
             status_value: StatusCode { value: status },
             headers_value: response_headers,
-            body_value: FrozenBytes::from_vec_copy(
-                ffi::slice_to_vec_copy(raw_response_body(native)),
-            ),
+            body_value: received.body,
             url_value: url,
-            version_value: native_text(raw_response_version(native))?,
+            version_value: received.version,
             history_value: history,
         };
         if status != 301 && status != 302 && status != 303 && status != 307 && status != 308 {

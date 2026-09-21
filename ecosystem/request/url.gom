@@ -1,0 +1,296 @@
+package request;
+
+use std::net;
+
+fn invalid_url() -> Error {
+    Error::new(ErrorKind::Builder, "expected absolute HTTP(S) URL without credentials")
+}
+
+fn hex_digit(value: byte) -> isize {
+    if value >= b'0' && value <= b'9' {
+        (value - b'0').to_isize()
+    } else if value >= b'a' && value <= b'f' {
+        (value - b'a').to_isize() + 10
+    } else if value >= b'A' && value <= b'F' {
+        (value - b'A').to_isize() + 10
+    } else {
+        -1
+    }
+}
+
+fn percent_encode(value: string, query: bool) -> string {
+    let result: Vec[byte] = Vec::new();
+    let hex = b"0123456789ABCDEF";
+    for byte in value.to_bytes() {
+        if byte >= b'a' && byte <= b'z' || byte >= b'A' && byte <= b'Z'
+            || byte >= b'0' && byte <= b'9'
+            || byte == b'-'
+            || byte == b'_'
+            || byte == b'.'
+            || byte == b'~'
+            || !query
+                && (byte == b'/' || byte == b':' || byte == b'@' || byte == b'!' || byte == b'$'
+                    || byte == b'&'
+                    || byte == b'\''
+                    || byte == b'('
+                    || byte == b')'
+                    || byte == b'*'
+                    || byte == b'+'
+                    || byte == b','
+                    || byte == b';'
+                    || byte == b'='
+                    || byte == b'%') {
+            result.push(byte)
+        } else if query && byte == b' ' {
+            result.push(b'+')
+        } else {
+            result.push(b'%');
+            result.push(hex[(byte / 16).to_isize()]);
+            result.push(hex[(byte % 16).to_isize()]);
+        }
+    }
+    string_from_utf8(result).1
+}
+
+fn percent_decode(value: string) -> Result[string, Error] {
+    let bytes = value.to_bytes();
+    let result: Vec[byte] = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let byte = bytes[offset];
+        if byte == b'%' {
+            if offset + 2 >= bytes.len() || hex_digit(bytes[offset + 1]) < 0
+                || hex_digit(bytes[offset + 2]) < 0 {
+                return Result::Err(invalid_url())
+            }
+            result.push((hex_digit(bytes[offset + 1]) * 16 + hex_digit(bytes[offset + 2])).to_u8());
+            offset += 3;
+        } else {
+            result.push(
+                if byte == b'+' {
+                    b' '
+                } else {
+                    byte
+                },
+            );
+            offset += 1;
+        }
+    }
+    let (valid, text) = string_from_utf8(result);
+    if valid {
+        Result::Ok(text)
+    } else {
+        Result::Err(invalid_url())
+    }
+}
+
+fn decode_form(value: string) -> Result[Vec[(string, string)], Error] {
+    let result: Vec[(string, string)] = Vec::new();
+    for part in value.split("&") {
+        if part == "" {
+            continue
+        }
+        if part.contains(";") {
+            return Result::Err(invalid_url())
+        }
+        let (name, value) = part.split_once("=").unwrap_or((part, ""));
+        result.push((percent_decode(name)?, percent_decode(value)?));
+    }
+    Result::Ok(result)
+}
+
+fn encode_form(values: Vec[(string, string)]) -> string {
+    let sorted = values.copy();
+    sorted.stable_sort_by(
+        |left, right| if left.0 < right.0 {
+            -1
+        } else if left.0 > right.0 {
+            1
+        } else {
+            0
+        },
+    );
+    let mut result = "";
+    for pair in sorted {
+        if result != "" {
+            result += "&";
+        }
+        result += percent_encode(pair.0, true) + "=" + percent_encode(pair.1, true);
+    }
+    result
+}
+
+fn normalized_path(path: string) -> string {
+    let components: Vec[string] = Vec::new();
+    for part in path.split("/") {
+        if part == ".." {
+            let _ = components.pop();
+        } else if part != "." {
+            components.push(part)
+        }
+    }
+    let mut result = components.join("/");
+    if !result.starts_with("/") {
+        result = "/" + result;
+    }
+    if (path.ends_with("/.") || path.ends_with("/..")) && !result.ends_with("/") {
+        result += "/";
+    }
+    result
+}
+
+impl Url {
+    fn scheme(self: Url) -> string {
+        if self.secure {
+            "https"
+        } else {
+            "http"
+        }
+    }
+}
+
+fn parse_url(text: string, base: string) -> Result[Url, Error] {
+    for byte in text.to_bytes() {
+        if byte < 32 || byte == 127 || byte == b'\\' {
+            return Result::Err(invalid_url())
+        }
+    }
+    let text = text.split_once("#").map(|pair| pair.0).unwrap_or(text);
+    let mut scheme_prefix = false;
+    for byte in text.to_bytes() {
+        if byte == b'/' || byte == b'?' {
+            break
+        }
+        if byte == b':' {
+            scheme_prefix = true;
+            break
+        }
+    }
+    if !scheme_prefix && base != "" {
+        let parent = Url::parse(base)?;
+        if text.starts_with("//") {
+            return Url::parse(parent.scheme() + ":" + text)
+        }
+        let (base_path, _) = parent.target.split_once("?").unwrap_or((parent.target, ""));
+        let target = if text == "" {
+            parent.target
+        } else if text.starts_with("?") {
+            base_path + text
+        } else if text.starts_with("/") {
+            text
+        } else {
+            let parts = base_path.split("/");
+            let _ = parts.pop();
+            parts.join("/") + "/" + text
+        };
+        let (path, query) = target.split_once("?").unwrap_or((target, ""));
+        return Url::parse(
+            parent.scheme() + "://" + parent.authority + normalized_path(path)
+                + if target.contains("?") {
+                    "?" + query
+                } else {
+                    ""
+                },
+        )
+    }
+    let (scheme, rest) = text.split_once("://").ok_or(invalid_url())?;
+    let scheme = ascii_lower(scheme);
+    if scheme != "http" && scheme != "https" {
+        return Result::Err(invalid_url())
+    }
+    let mut split = rest.byte_len();
+    for index in 0..rest.byte_len() {
+        let byte = rest.to_bytes()[index];
+        if byte == b'/' || byte == b'?' {
+            split = index;
+            break
+        }
+    }
+    let authority = ascii_lower(rest.byte_slice(0, split));
+    if authority == "" || authority.contains("@") || authority.contains(" ")
+        || authority.contains("%") {
+        return Result::Err(invalid_url())
+    }
+    let (host, port_text) = if authority.starts_with("[") {
+        let (host, tail) = authority.byte_slice(1, authority.byte_len()).split_once("]").ok_or(
+            invalid_url(),
+        )?;
+        net::IpAddr::parse(host).map_err(|_| invalid_url())?;
+        if tail != "" && !tail.starts_with(":") {
+            return Result::Err(invalid_url())
+        };
+        (
+            host,
+            if tail == "" {
+                ""
+            } else {
+                tail.byte_slice(1, tail.byte_len())
+            },
+        )
+    } else {
+        if authority.contains("[") || authority.contains("]") {
+            return Result::Err(invalid_url())
+        }
+        authority.split_once(":").unwrap_or((authority, ""))
+    };
+    if host == "" {
+        return Result::Err(invalid_url())
+    }
+    let port = if port_text == "" {
+        if scheme == "https" {
+            443
+        } else {
+            80
+        }
+    } else {
+        let mut value = 0;
+        for byte in port_text.to_bytes() {
+            if byte < b'0' || byte > b'9' || value > 6553 {
+                return Result::Err(invalid_url())
+            }
+            value = value * 10 + (byte - b'0').to_isize();
+        }
+        if value > 65535 || value == 0 {
+            return Result::Err(invalid_url())
+        }
+        value.to_u16()
+    };
+    let mut target = rest.byte_slice(split, rest.byte_len());
+    if target == "" || target.starts_with("?") {
+        target = "/" + target;
+    }
+    let (path, query) = target.split_once("?").unwrap_or((target, ""));
+    let bytes = path.to_bytes();
+    for index in 0..bytes.len() {
+        if bytes[index] == b'%'
+            && (index + 2 >= bytes.len() || hex_digit(bytes[index + 1]) < 0
+                || hex_digit(bytes[index + 2]) < 0) {
+            return Result::Err(invalid_url())
+        }
+    }
+    target = percent_encode(path, false)
+        + if target.contains("?") {
+            "?" + query
+        } else {
+            ""
+        };
+    let origin = scheme + "://"
+        + if host.contains(":") {
+            "[" + host + "]"
+        } else {
+            host
+        }
+        + ":"
+        + port.to_string();
+    Result::Ok(
+        Url {
+            text: scheme + "://" + authority + target,
+            origin,
+            secure: scheme == "https",
+            host,
+            port,
+            authority,
+            target,
+        },
+    )
+}

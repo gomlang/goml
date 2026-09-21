@@ -1,10 +1,9 @@
 # archive
 
-A GoML implementation of USTAR/PAX TAR and classic ZIP archives. Format parsing,
-writing, CRC32, metadata validation, resource budgets, and extraction planning are
-implemented in GoML. The small Go adapter supplies raw DEFLATE/GZIP compression
-and rooted filesystem operations; it does not import `archive/tar` or
-`archive/zip`.
+A pure GoML implementation of USTAR/PAX TAR and classic ZIP archives. Format
+parsing, writing, CRC32, DEFLATE/GZIP compression, metadata validation, resource
+budgets, and extraction are implemented in GoML using the standard library.
+There are no Go adapters or native module dependencies.
 
 ## API
 
@@ -41,6 +40,10 @@ let first_file = indexed.entry(1)?;
 - `open_tar`, `open_tar_gz`, `open_zip`, `read_file`, and `write_file` supply file
   APIs. `write_file` creates a new file exclusively and never overwrites one.
 - `crc32` and incremental `crc32_update` implement IEEE CRC32 in GoML.
+- `gzip` and bounded `gunzip` implement RFC 1952, including optional headers,
+  header checksums, and concatenated members. DEFLATE decoding supports stored,
+  fixed Huffman, and dynamic Huffman blocks. Encoding uses LZ77 matching with
+  fixed Huffman codes and falls back to stored blocks for incompressible input.
 
 Writers handle short writes and interrupted I/O through standard traits. Partial
 I/O failures poison writers, and TAR parsing failures poison readers. `finish`
@@ -76,10 +79,26 @@ absolute paths, Windows drive/colon paths, backslashes, NUL, empty/`.`/`..`
 components, duplicate normalized paths, and file/link parents. Symbolic and hard
 links are rejected by default; `LinkPolicy::Skip` explicitly ignores them.
 Existing files and symlinks are never overwritten. Directory components must be
-real directories, and the Go 1.25 `os.Root` boundary prevents writes escaping the
-opened destination, including through concurrent filesystem changes. The caller
-chooses and creates the trusted destination. Extraction is not transactional:
-a filesystem error can leave earlier completed files behind.
+real directories. Where available, Linux `openat2` resolves paths relative to
+the opened destination with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`. If the kernel
+returns `ENOSYS`, the extraction switches to an `openat` directory-descriptor
+walk. Each intermediate component is opened with `O_DIRECTORY | O_NOFOLLOW`,
+and the final component also uses `O_NOFOLLOW`; file creation uses
+`O_CREAT | O_EXCL`. Absolute paths and `..` are rejected before either backend
+performs an operation. Permission, symlink and other errors do not trigger a
+fallback. All temporary descriptors are closed on success and failure.
+
+Directory creation uses opened parent descriptors and verifies the resulting
+root-relative directory. Replacing an ancestor or leaf with a symlink cannot
+redirect a pending operation to that symlink's target: an operation either uses
+its already opened directory or rejects the replacement. An opened directory
+continues to identify the same object if renamed, including when moved outside
+the destination. This is the directory-handle behavior of Go's `os.Root`, and
+the fallback does not make an entire path walk atomic. The caller chooses and
+creates the trusted destination and must prevent untrusted actors from moving
+opened directories out of it when pathname containment is required. Neither
+backend prohibits traversal of existing mount points. Extraction is not
+transactional: a filesystem error can leave earlier completed files behind.
 
 Permissions default to `0644` for files and `0755` for directories, subject to
 umask. `preserve_permissions` restores only ordinary file permission bits;
@@ -97,8 +116,10 @@ permissions are kept traversable while extracting.
 - The TAR reader materializes each body; ZIP indexing and GZIP convenience APIs
   materialize the bounded archive. They are not constant-memory streaming
   decompressors. `ZipWriter::append_reader` buffers one bounded entry.
-- File convenience APIs currently use the Linux standard file-descriptor API.
-  Format and standard `Read`/`Write` APIs do not assume seekable streams.
+- File convenience APIs use the Linux standard file-descriptor API. Extraction
+  also works on kernels without `openat2`, using `openat`, `mkdirat` and
+  no-follow directory descriptors. Format and standard `Read`/`Write` APIs do
+  not assume seekable streams.
 
 ## Validation
 
@@ -114,14 +135,24 @@ GOFLAGS=-race ../../stage2/bin/goml test --target-dir _artifact/race
 Native GoML tests cover Unicode/PAX metadata, CRC vectors, GZIP corruption,
 truncation boundaries, invalid ZIP directory/local records, data descriptors,
 short/interrupted I/O, resource limits, input snapshot isolation, path/link
-attacks and real extraction. Interoperability tests create archives with GNU
+attacks and real extraction. Internal tests force the `openat` fallback, replace
+ancestors and leaves with symlinks after opening the parent, document the
+rename-outside boundary, and check descriptor cleanup across repeated failures.
+Interoperability tests create archives with GNU
 `tar` and Info-ZIP `zip`, read them in GoML, and have `tar`/`unzip` verify GoML
-output. These three programs must be installed. There are no Python helpers.
+output. The codec tests also exchange fixed, dynamic and stored DEFLATE streams
+with `gzip`, exercise concatenated members and optional headers, and reject
+malformed trees and truncated or over-budget data. These four programs must be
+installed. There are no Python helpers.
 The independent `../consumers/archive` module imports version `0.1.0` through the
 isolated verification registry.
 
 Format references: [PKWARE ZIP APPNOTE](https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT),
 [GNU TAR USTAR description](https://www.gnu.org/software/tar/manual/html_node/Standard.html),
 [POSIX pax](https://pubs.opengroup.org/onlinepubs/9699919799/utilities/pax.html),
-[Go compression primitives](https://pkg.go.dev/compress/flate), and
-[Go rooted filesystem operations](https://pkg.go.dev/os#Root).
+[DEFLATE RFC 1951](https://www.rfc-editor.org/rfc/rfc1951),
+[GZIP RFC 1952](https://www.rfc-editor.org/rfc/rfc1952), and
+[Linux openat2](https://man7.org/linux/man-pages/man2/openat2.2.html).
+The fallback follows the directory-descriptor approach used by
+[Go 1.26 os.Root](https://cs.opensource.google/go/go/+/refs/tags/go1.26.0:src/os/root_openat.go),
+with archive symlinks and parent traversal rejected outright.

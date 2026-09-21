@@ -1,0 +1,284 @@
+package request;
+
+use std::bytes::{Bytes};
+
+static HPACK_TREE: OnceCell[FrozenVec[(isize, isize, isize)]] = OnceCell::new();
+
+fn hpack_tree() -> FrozenVec[(isize, isize, isize)] {
+    HPACK_TREE.get_or_init(
+        || {
+            let nodes = Vec::from_array([(-1, -1, -1)]);
+            for symbol in 0..257 {
+                let mut index = 0;
+                for offset in 0..HPACK_LENGTHS[symbol] {
+                    let bit = (HPACK_CODES[symbol] >> (HPACK_LENGTHS[symbol] - offset - 1)) & 1;
+                    let (left, right, value) = nodes[index];
+                    let mut next = if bit == 0 {
+                        left
+                    } else {
+                        right
+                    };
+                    if next == -1 {
+                        next = nodes.len();
+                        nodes.push((-1, -1, -1));
+                        nodes[index] = if bit == 0 {
+                            (next, right, value)
+                        } else {
+                            (left, next, value)
+                        };
+                    }
+                    index = next;
+                }
+                nodes[index] = (-1, -1, symbol);
+            }
+            nodes.freeze()
+        },
+    )
+}
+
+fn hpack_huffman(input: Slice[byte], limit: isize) -> Result[Vec[byte], Error] {
+    let tree = hpack_tree();
+    let output = Vec::new();
+    let mut node = 0;
+    let mut pending = 0;
+    let mut padding = 0;
+    for byte in input {
+        for shift in 0..8 {
+            let bit = ((byte >> (7 - shift)) & 1).to_isize();
+            pending += 1;
+            padding = (padding << 1) | bit;
+            let (left, right, _) = tree.get(node);
+            node = if bit == 0 {
+                left
+            } else {
+                right
+            };
+            if node < 0 {
+                return Result::Err(transport_error("invalid HPACK Huffman code"))
+            }
+            let (_, _, symbol) = tree.get(node);
+            if symbol == 256 {
+                return Result::Err(transport_error("HPACK Huffman EOS in string"))
+            }
+            if symbol >= 0 {
+                if output.len() >= limit {
+                    return Result::Err(transport_error("HTTP/2 headers exceed limit"))
+                }
+                output.push(symbol.to_u8());
+                node = 0;
+                pending = 0;
+                padding = 0;
+            }
+        }
+    }
+    if pending > 7 || padding != (1 << pending) - 1 {
+        return Result::Err(transport_error("invalid HPACK Huffman padding"))
+    }
+    Result::Ok(output)
+}
+
+struct HpackInput {
+    bytes: Bytes,
+    offset: Ref[isize],
+}
+
+impl HpackInput {
+    fn integer(self: HpackInput, prefix: isize) -> Result[isize, Error] {
+        let first = self.bytes.get_checked(self.offset.get()).ok_or(
+            transport_error("truncated HPACK integer"),
+        )?;
+        self.offset.set(self.offset.get() + 1);
+        let maximum = (1 << prefix) - 1;
+        let mut value = first.to_isize() & maximum;
+        if value < maximum {
+            return Result::Ok(value)
+        }
+        let mut shift = 0;
+        loop {
+            let byte = self.bytes.get_checked(self.offset.get()).ok_or(
+                transport_error("truncated HPACK integer"),
+            )?;
+            self.offset.set(self.offset.get() + 1);
+            let bits = (byte & 127).to_isize();
+            if shift > 56 || bits > (9223372036854775807 - value) >> shift {
+                return Result::Err(transport_error("HPACK integer overflow"))
+            }
+            value += bits << shift;
+            if byte & 128 == 0 {
+                return Result::Ok(value)
+            }
+            shift += 7;
+        }
+    }
+
+    fn text(self: HpackInput, limit: isize) -> Result[string, Error] {
+        let first = self.bytes.get_checked(self.offset.get()).ok_or(
+            transport_error("truncated HPACK string"),
+        )?;
+        let length = self.integer(7)?;
+        let start = self.offset.get();
+        if length > self.bytes.len() - start {
+            return Result::Err(transport_error("truncated HPACK string"))
+        }
+        self.offset.set(start + length);
+        let data = self.bytes.slice(start, start + length);
+        let raw = if first & 128 != 0 {
+            hpack_huffman(data, limit)?
+        } else {
+            if length > limit {
+                return Result::Err(transport_error("HTTP/2 headers exceed limit"))
+            }
+            data.to_vec()
+        };
+        let (valid, value) = string_from_utf8(raw);
+        if !valid {
+            return Result::Err(Error::new(ErrorKind::Decode, "invalid UTF-8 in HTTP/2 headers"))
+        }
+        Result::Ok(value)
+    }
+}
+
+struct Hpack {
+    entries: Vec[(string, string)],
+    sizes: Vec[isize],
+}
+
+impl Hpack {
+    fn new() -> Hpack {
+        Hpack { entries: Vec::new(), sizes: Vec::from_array([0, 4096]) }
+    }
+
+    fn field(self: Hpack, index: isize) -> Result[(string, string), Error] {
+        if index <= 0 {
+            return Result::Err(transport_error("zero HPACK table index"))
+        }
+        if index <= 61 {
+            return Result::Ok(HPACK_STATIC[index - 1])
+        }
+        let offset = index - 62;
+        if offset >= self.entries.len() {
+            return Result::Err(transport_error("invalid HPACK table index"))
+        }
+        Result::Ok(self.entries[self.entries.len() - offset - 1])
+    }
+
+    fn evict(self: Hpack) -> () {
+        let mut count = 0;
+        while self.sizes[0] > self.sizes[1] && count < self.entries.len() {
+            let (name, value) = self.entries[count];
+            self.sizes[0] -= name.byte_len() + value.byte_len() + 32;
+            count += 1;
+        }
+        if count > 0 {
+            let length = self.entries.len() - count;
+            for index in 0..length {
+                self.entries[index] = self.entries[index + count];
+            }
+            self.entries.truncate(length);
+        }
+    }
+
+    fn decode(self: Hpack, bytes: Bytes, limit: isize) -> Result[Vec[(string, string)], Error] {
+        let input = HpackInput { bytes, offset: Ref::new(0) };
+        let output = Vec::new();
+        let mut size = 0;
+        let mut started = false;
+        while input.offset.get() < bytes.len() {
+            let first = bytes.get(input.offset.get());
+            if first & 224 == 32 {
+                if started {
+                    return Result::Err(transport_error("late HPACK table size update"))
+                }
+                let capacity = input.integer(5)?;
+                if capacity > 4096 {
+                    return Result::Err(transport_error("HPACK table size exceeds setting"))
+                }
+                self.sizes[1] = capacity;
+                self.evict();
+                continue
+            }
+            started = true;
+            let field = if first & 128 != 0 {
+                self.field(input.integer(7)?)?
+            } else {
+                let indexed = first & 64 != 0;
+                let index = input.integer(
+                    if indexed {
+                        6
+                    } else {
+                        4
+                    },
+                )?;
+                let name = if index == 0 {
+                    input.text(limit - size)?
+                } else {
+                    self.field(index)?.0
+                };
+                if name.byte_len() > limit - size {
+                    return Result::Err(transport_error("HTTP/2 headers exceed limit"))
+                }
+                let value = input.text(limit - size - name.byte_len())?;
+                if indexed {
+                    self.entries.push((name, value));
+                    self.sizes[0] += name.byte_len() + value.byte_len() + 32;
+                    self.evict();
+                };
+                (name, value)
+            };
+            let length = field.0.byte_len() + field.1.byte_len() + 32;
+            if length > limit - size {
+                return Result::Err(transport_error("HTTP/2 headers exceed limit"))
+            }
+            size += length;
+            output.push(field);
+        }
+        Result::Ok(output)
+    }
+}
+
+fn hpack_integer(output: Bytes, value: isize, prefix: isize, tag: byte) -> () {
+    let maximum = (1 << prefix) - 1;
+    if value < maximum {
+        output.push(tag | value.to_u8());
+        return
+    }
+    output.push(tag | maximum.to_u8());
+    let mut remaining = value - maximum;
+    while remaining >= 128 {
+        output.push((remaining & 127).to_u8() | 128);
+        remaining >>= 7;
+    }
+    output.push(remaining.to_u8());
+}
+
+fn hpack_string(output: Bytes, value: string) -> () {
+    hpack_integer(output, value.byte_len(), 7, 0);
+    output.extend_from_slice(value.to_bytes().as_slice());
+}
+
+fn hpack_encode(fields: Vec[(string, string)]) -> Bytes {
+    let output = Bytes::new();
+    for (name, value) in fields {
+        let mut exact = 0;
+        let mut named = 0;
+        for index in 0..61 {
+            let (key, text) = HPACK_STATIC[index];
+            if key == name {
+                named = index + 1;
+                if text == value {
+                    exact = index + 1;
+                }
+            }
+        }
+        if exact > 0 {
+            hpack_integer(output, exact, 7, 128);
+        } else {
+            hpack_integer(output, named, 4, 16);
+            if named == 0 {
+                hpack_string(output, name);
+            }
+            hpack_string(output, value);
+        }
+    }
+    output
+}

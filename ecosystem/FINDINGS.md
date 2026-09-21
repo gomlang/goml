@@ -114,8 +114,8 @@ They distinguish supported designs from current compiler or API boundaries.
   the race detector cover ownership transfer, symlinks, concurrent creation and
   explicit cleanup without assuming destructors or GC finalizers.
 
-- Request uses an ordinary Go FFI transport with GoML request/response types,
-  redirect policy and scoped cancellation. Native HTTP/HTTPS servers and Python
+- Request implements its HTTP transport, request/response types, redirect policy
+  and scoped cancellation in GoML over standard TCP/TLS. Native HTTP/HTTPS servers and independent
   interoperability exercise certificate validation, HTTP/2, bounded bodies,
   multipart, sensitive-header isolation and connection reuse. Private body
   storage now uses `FrozenBytes`, with shared immutable accessors and explicit
@@ -148,13 +148,16 @@ the race detector; 15,847 queries agree with independent from-scratch evaluation
 Mutable values require an explicit copy policy, and callbacks use their scoped
 `Evaluation` rather than reentering a blocking database operation.
 
-The web framework passes lifted GoML callbacks through ordinary Go FFI into
-concurrent HTTP handlers and streaming producers. Typed form/query decoding
-implements the Serde deserializer protocol in GoML; body and response streams
-implement public I/O traits. Opaque native interfaces keep FFI metadata bounded.
-Cancellation callbacks must finish before connection deadlines are reset, so a
-completed request cannot poison a later keep-alive request. Native tests and a
+The web framework implements HTTP connections, concurrent handlers and streaming
+producers in GoML over standard TCP. Typed form/query decoding implements the
+Serde deserializer protocol; body and response streams implement public I/O
+traits. Request contexts bound body reads and response writes. GoML tests and a
 separate race-built consumer exercise network backpressure and SSE disconnects.
+Handler errors use recoverable results. Explicit GoML panic boundaries isolate
+handler and streaming-producer failures after lexical cleanup. An uncommitted
+response becomes a generic 500; a committed stream is terminated without a
+misleading success terminator. Recovery does not roll back shared application
+state or intercept panics in unrelated goroutines.
 
 Bigint implements signed and unsigned arbitrary-precision arithmetic using
 immutable `FrozenVec[u32]` limbs and `u64` intermediates, including normalized
@@ -435,9 +438,10 @@ delimiter bytes avoids constructing an invalid intermediate string slice.
 
 Standard I/O/context/TCP/TLS APIs are sufficient for a GoML RFC 6455 engine,
 including SHA-1 handshakes, separate read/write gates and recoverable queue
-backpressure. The archive format parsers, CRC32 and extraction planning are
-GoML; a narrow ordinary Go adapter supplies compression and the `os.Root`
-filesystem boundary. These adapters introduce no compiler runtime hooks.
+backpressure. The archive format parsers, CRC32, DEFLATE/GZIP compression and
+extraction planning are GoML. Descriptor-relative Linux filesystem operations
+provide its extraction boundary without a native adapter. These libraries
+introduce no compiler runtime hooks.
 
 Concurrent metric handles use channels to serialize mutation and produce
 consistent detached snapshots; user collection callbacks execute outside the

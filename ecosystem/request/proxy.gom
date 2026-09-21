@@ -1,0 +1,158 @@
+package request;
+
+use std::net;
+use std::net::tls;
+use std::context;
+use std::task;
+
+struct TunnelRelay {
+    stop: Channel[()],
+    done: Channel[()],
+    gate: Channel[()],
+}
+
+impl TunnelRelay {
+    fn close(self: TunnelRelay) -> () {
+        let _ = self.gate.recv();
+        let stopped = select {
+            recv(self.stop) as _ => true,
+            default => false,
+        };
+        if !stopped {
+            self.stop.close();
+        }
+        self.gate.send(());
+        let _ = self.done.recv();
+    }
+}
+
+fn relay(source: Stream, destination: Stream, context: context::Context) -> Result[(), Error] {
+    let buffer: Vec[byte] = Vec::with_capacity(8192);
+    for _ in 0..8192 {
+        buffer.push(0)
+    }
+    loop {
+        let count = source.read(buffer.as_mut_slice(), context)?;
+        if count == 0 {
+            return Result::Ok(())
+        }
+        destination.write(buffer.slice(0, count), context)?;
+    }
+}
+
+#[allow(unstructured_go)]
+fn start_tunnel_relay(listener: net::TcpListener, proxy: Stream) -> TunnelRelay {
+    let gate = Channel::new(1);
+    gate.send(());
+    let relay_control = TunnelRelay { stop: Channel::new(0), done: Channel::new(0), gate };
+    go || {
+        context::with_cancel(
+            context::Context::background(),
+            |relay_context, cancel| {
+                task::scope(
+                    |scope| {
+                        let _ = scope.spawn(
+                            |_| {
+                                let accepted = listener.accept_with(
+                                    net::WaitOptions::new().with_context(relay_context),
+                                );
+                                let _ = listener.close();
+                                if let Ok((socket, _)) = accepted {
+                                    let local = Stream::Tcp(socket);
+                                    defer local.close();
+                                    task::scope(
+                                        |workers| {
+                                            let _ = workers.spawn(
+                                                |_| {
+                                                    let _ = relay(local, proxy, relay_context);
+                                                },
+                                            );
+                                            let _ = relay(proxy, local, relay_context);
+                                            let _ = socket.shutdown(net::Shutdown::Write);
+                                        },
+                                    );
+                                }
+                            },
+                        );
+                        let _ = relay_control.stop.recv();
+                        cancel.cancel();
+                        let _ = listener.close();
+                        proxy.close();
+                    },
+                );
+            },
+        );
+        relay_control.done.close();
+    };
+    relay_control
+}
+
+fn connect_tunnel(client: Client, context: context::Context, url: Url, headers: Headers, proxy: Url) -> Result[
+    Stream,
+    Error,
+] {
+    let proxy_stream = connect_stream(client, proxy, context, false)?;
+    let mut keep = false;
+    defer {
+        if !keep {
+            proxy_stream.close();
+        }
+    };
+    let authority = if url.host.contains(":") {
+        "[" + url.host + "]"
+    } else {
+        url.host
+    }
+        + ":"
+        + url.port.to_string();
+    let mut connect = "CONNECT " + authority + " HTTP/1.1\r\nHost: " + authority + "\r\n";
+    if let Some(value) = headers.get("proxy-authorization") {
+        connect += "Proxy-Authorization: " + value + "\r\n";
+    }
+    connect += "\r\n";
+    proxy_stream.write(connect.to_bytes().as_slice(), context)?;
+    let reader = Reader::new(proxy_stream, context);
+    let budget = Vec::from_array([client.options.max_headers]);
+    let line = reader.line(budget)?;
+    let parts = line.split(" ");
+    if parts.len() < 2 || parts[1] != "200" || (parts[0] != "HTTP/1.1" && parts[0] != "HTTP/1.0") {
+        return Result::Err(transport_error("proxy CONNECT failed: " + line))
+    }
+    let _ = read_headers(reader, budget)?;
+    if reader.positions[0] != reader.positions[1] {
+        return Result::Err(transport_error("unexpected bytes before proxy TLS handshake"))
+    }
+    let listener = net::TcpListener::bind(net::SocketAddr::new(net::IpAddr::V4([127, 0, 0, 1]), 0)).map_err(
+        io_error,
+    )?;
+    let address = match listener.local_addr() {
+        Ok(address) => address,
+        Err(error) => {
+            let _ = listener.close();
+            return Result::Err(io_error(error))
+        },
+    };
+    let control = start_tunnel_relay(listener, proxy_stream);
+    let mut config = tls::ClientConfig::new(url.host).with_connect_timeout(
+        client.options.connect_value,
+    ).with_alpn(Vec::from_array(["h2", "http/1.1"]));
+    if client.options.ca.trim() != "" {
+        config = config.with_ca_pem(client.options.ca.to_bytes().as_slice());
+    }
+    if client.options.certificate != "" {
+        config = config.with_client_certificate(
+            client.options.certificate.to_bytes().as_slice(),
+            client.options.key.to_bytes().as_slice(),
+        );
+    }
+    match tls::connect_with("127.0.0.1", address.port, config, context) {
+        Ok(stream) => {
+            keep = true;
+            Result::Ok(Stream::Tunnel(stream, control))
+        },
+        Err(error) => {
+            control.close();
+            Result::Err(io_error(error))
+        },
+    }
+}

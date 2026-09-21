@@ -1,0 +1,560 @@
+package web;
+
+use std::bytes::{Bytes};
+use std::context;
+use std::io;
+use std::net::{TcpStream, WaitOptions};
+use std::panic;
+
+fn context_error(error: context::Error) -> Error {
+    Error::new(
+        match error {
+            context::Error::Cancelled => ErrorKind::Cancelled,
+            context::Error::DeadlineExceeded => ErrorKind::Timeout,
+        },
+        error.to_string(),
+    )
+}
+
+fn transport_error(error: io::Error) -> Error {
+    Error::new(
+        match error.kind() {
+            io::ErrorKind::TimedOut => ErrorKind::Timeout,
+            io::ErrorKind::Interrupted => ErrorKind::Cancelled,
+            _ => ErrorKind::Transport,
+        },
+        error.to_string(),
+    )
+}
+
+fn bad_request(message: string) -> Error {
+    Error::new(ErrorKind::BadRequest, message)
+}
+
+fn closed_error() -> Error {
+    Error::new(ErrorKind::Closed, "request has finished")
+}
+
+struct Lifetime {
+    context: context::Context,
+    ended: Channel[()],
+}
+
+impl Lifetime {
+    fn new(context: context::Context) -> Lifetime {
+        Lifetime { context, ended: Channel::new(0) }
+    }
+
+    fn check(self: Lifetime) -> Result[(), Error] {
+        select {
+            recv(self.ended) as _ => Result::Err(closed_error()),
+            default => self.context.check().map_err(context_error),
+        }
+    }
+
+    fn acquire(self: Lifetime, gate: Channel[()]) -> Result[(), Error] {
+        self.check()?;
+        select {
+            recv(gate) as _ => Result::Ok(()),
+            recv(self.ended) as _ => Result::Err(closed_error()),
+            recv(self.context.done()) as _ => self.check(),
+        }
+    }
+}
+
+fn gate() -> Channel[()] {
+    let result = Channel::new(1);
+    result.send(());
+    result
+}
+
+struct InputCursor {
+    data: Bytes,
+    offset: isize,
+}
+
+struct Input {
+    reader: () -> Result[Bytes, Error],
+    cursor: Ref[InputCursor],
+}
+
+impl Input {
+    fn new(reader: () -> Result[Bytes, Error]) -> Input {
+        Input { reader, cursor: Ref::new(InputCursor { data: Bytes::new(), offset: 0 }) }
+    }
+
+    fn take(self: Input, maximum: isize) -> Result[Bytes, Error] {
+        let mut cursor = self.cursor.get();
+        if cursor.offset == cursor.data.len() {
+            cursor = InputCursor { data: (self.reader)()?, offset: 0 };
+            if cursor.data.is_empty() {
+                return Result::Err(bad_request("unexpected end of HTTP input"))
+            }
+        }
+        let count = if cursor.data.len() - cursor.offset < maximum {
+            cursor.data.len() - cursor.offset
+        } else {
+            maximum
+        };
+        let result = Bytes::from_slice_copy(cursor.data.slice(cursor.offset, cursor.offset + count));
+        self.cursor.set(InputCursor { data: cursor.data, offset: cursor.offset + count });
+        Result::Ok(result)
+    }
+
+    fn line(self: Input, maximum: isize) -> Result[string, Error] {
+        let data = Vec::new();
+        loop {
+            if data.len() >= maximum {
+                return Result::Err(bad_request("HTTP line exceeds limit"))
+            }
+            let byte = self.take(1)?.get(0);
+            data.push(byte);
+            if byte == b'\n' {
+                if data.len() < 2 || data[data.len() - 2] != b'\r' {
+                    return Result::Err(bad_request("HTTP lines require CRLF"))
+                }
+                data.truncate(data.len() - 2);
+                let (valid, text) = string_from_utf8(data);
+                if !valid {
+                    return Result::Err(bad_request("HTTP line is not UTF-8"))
+                }
+                return Result::Ok(text)
+            }
+        }
+    }
+}
+
+fn socket_read(stream: TcpStream, context: context::Context) -> Result[Bytes, Error] {
+    let data: Vec[byte] = Vec::with_capacity(16384);
+    for _ in 0..16384 {
+        data.push(0);
+    }
+    let count = stream.read_with(data.as_mut_slice(), WaitOptions::new().with_context(context)).map_err(
+        transport_error,
+    )?;
+    data.truncate(count);
+    Result::Ok(Bytes::from_vec(data))
+}
+
+fn socket_write(stream: TcpStream, context: context::Context, data: Bytes) -> Result[(), Error] {
+    stream.write_all_with(data.as_slice(), WaitOptions::new().with_context(context)).map_err(
+        transport_error,
+    )
+}
+
+struct BodyCursor {
+    remaining: isize,
+    chunked: bool,
+    delimiter: bool,
+    done: bool,
+    closed: bool,
+    count: isize,
+}
+
+struct BodyState {
+    input: Input,
+    lifetime: Lifetime,
+    gate: Channel[()],
+    cursor: Ref[BodyCursor],
+    limit: isize,
+    trailer_limit: isize,
+}
+
+impl BodyState {
+    fn new(input: Input, lifetime: Lifetime, length: isize, chunked: bool, limits: Limits) -> BodyState {
+        BodyState {
+            input,
+            lifetime,
+            gate: gate(),
+            cursor: Ref::new(
+                BodyCursor {
+                    remaining: length,
+                    chunked,
+                    delimiter: false,
+                    done: !chunked && length == 0,
+                    closed: false,
+                    count: 0,
+                },
+            ),
+            limit: limits.body_bytes,
+            trailer_limit: limits.header_bytes,
+        }
+    }
+
+    fn read(self: BodyState, maximum: isize) -> Result[Bytes, Error] {
+        if maximum < 1 || maximum > 65536 {
+            return Result::Err(
+                Error::new(ErrorKind::Configuration, "read size must be in 1..65536"),
+            )
+        }
+        self.lifetime.acquire(self.gate)?;
+        defer self.gate.send(());
+        self.lifetime.check()?;
+        let mut cursor = self.cursor.get();
+        if cursor.closed {
+            return Result::Err(closed_error())
+        }
+        if cursor.done {
+            return Result::Ok(Bytes::new())
+        }
+        if cursor.chunked && cursor.remaining == 0 {
+            if cursor.delimiter && self.input.line(2)? != "" {
+                return Result::Err(bad_request("invalid chunk delimiter"))
+            }
+            let line = self.input.line(8192)?;
+            let size = line.split_once(";").map(|pair| pair.0).unwrap_or(line);
+            cursor.remaining = parse_size(size, 16)?;
+            if cursor.remaining > self.limit - cursor.count {
+                return Result::Err(Error::new(ErrorKind::BodyLimit, "request body exceeds limit"))
+            }
+            if cursor.remaining == 0 {
+                let mut remaining = self.trailer_limit;
+                loop {
+                    let trailer = self.input.line(remaining)?;
+                    remaining -= trailer.byte_len() + 2;
+                    if trailer == "" {
+                        break
+                    }
+                    let (name, _) = parse_header(trailer)?;
+                    if name == "content-length" || name == "transfer-encoding" || name == "host"
+                        || name == "trailer" {
+                        return Result::Err(bad_request("forbidden HTTP trailer"))
+                    }
+                }
+                cursor.done = true;
+                self.cursor.set(cursor);
+                return Result::Ok(Bytes::new())
+            }
+        }
+        let count = if cursor.remaining < maximum {
+            cursor.remaining
+        } else {
+            maximum
+        };
+        let data = self.input.take(count)?;
+        cursor.remaining -= data.len();
+        cursor.count += data.len();
+        cursor.delimiter = cursor.remaining == 0;
+        cursor.done = !cursor.chunked && cursor.remaining == 0;
+        self.cursor.set(cursor);
+        self.lifetime.check()?;
+        Result::Ok(data)
+    }
+
+    fn close(self: BodyState) -> Result[(), Error] {
+        self.lifetime.acquire(self.gate)?;
+        defer self.gate.send(());
+        self.cursor.set(BodyCursor { closed: true, ..self.cursor.get() });
+        Result::Ok(())
+    }
+}
+
+fn parse_size(value: string, radix: isize) -> Result[isize, Error] {
+    if value == "" {
+        return Result::Err(bad_request("missing HTTP length"))
+    }
+    let mut result: isize = 0;
+    for byte in value.to_bytes() {
+        let digit = hex_digit(byte).ok_or(bad_request("invalid HTTP length"))?.to_isize();
+        if digit >= radix || result > (9223372036854775807 - digit) / radix {
+            return Result::Err(bad_request("invalid HTTP length"))
+        }
+        result = result * radix + digit;
+    }
+    Result::Ok(result)
+}
+
+fn parse_header(line: string) -> Result[(string, string), Error] {
+    let (name, value) = line.split_once(":").ok_or(bad_request("invalid HTTP header"))?;
+    Headers::new().append(name, value).map_err(|error| bad_request(error.message))?;
+    let mut start = 0;
+    let mut end = value.byte_len();
+    while start < end && (value.byte_get(start) == 32 || value.byte_get(start) == 9) {
+        start += 1;
+    }
+    while end > start && (value.byte_get(end - 1) == 32 || value.byte_get(end - 1) == 9) {
+        end -= 1;
+    }
+    let value = value.byte_slice(start, end);
+    Result::Ok((name.to_ascii_lowercase(), value))
+}
+
+fn target_parts(target: string) -> Result[(string, string), Error] {
+    if !target.starts_with("/") || target.starts_with("//") || target.contains("#") {
+        return Result::Err(
+            Error::new(ErrorKind::Configuration, "target must be an origin-form path"),
+        )
+    }
+    for byte in target.to_bytes() {
+        if byte <= 32 || byte == 127 {
+            return Result::Err(bad_request("invalid request target"))
+        }
+    }
+    Result::Ok(target.split_once("?").unwrap_or((target, "")))
+}
+
+struct Head {
+    method: string,
+    path: string,
+    query: string,
+    host: string,
+    headers: Headers,
+    length: isize,
+    chunked: bool,
+    expect: bool,
+    close: bool,
+    http11: bool,
+}
+
+fn read_head(input: Input, limits: Limits) -> Result[Head, Error] {
+    let line = input.line(limits.header_bytes)?;
+    let mut remaining = limits.header_bytes - line.byte_len() - 2;
+    let parts = line.split(" ");
+    if parts.len() != 3 || !token(parts[0]) || (parts[2] != "HTTP/1.1" && parts[2] != "HTTP/1.0") {
+        return Result::Err(bad_request("invalid HTTP request line"))
+    }
+    let (path, query) = target_parts(parts[1]).map_err(|error| bad_request(error.message))?;
+    let mut headers = Headers::new();
+    loop {
+        let line = input.line(remaining)?;
+        remaining -= line.byte_len() + 2;
+        if line == "" {
+            break
+        }
+        let (name, value) = parse_header(line)?;
+        headers = headers.append(name, value)?;
+    }
+    let hosts = headers.get_all("host");
+    if hosts.len() > 1 || (parts[2] == "HTTP/1.1" && hosts.len() != 1) {
+        return Result::Err(bad_request("HTTP/1.1 requires one Host header"))
+    }
+    let host = headers.get("host").unwrap_or("");
+    if parts[2] == "HTTP/1.1" && host == "" {
+        return Result::Err(bad_request("empty Host header"))
+    }
+    for byte in host.to_bytes() {
+        if byte <= 32 || byte == 127 || byte == b'/' || byte == b'\\' || byte == b'@' {
+            return Result::Err(bad_request("invalid Host header"))
+        }
+    }
+    let lengths = headers.get_all("content-length");
+    let encodings = headers.get_all("transfer-encoding");
+    if lengths.len() > 1 || encodings.len() > 1 || (!lengths.is_empty() && !encodings.is_empty()) {
+        return Result::Err(bad_request("ambiguous request body framing"))
+    }
+    let chunked = !encodings.is_empty();
+    if chunked && (parts[2] != "HTTP/1.1" || !encodings[0].eq_ignore_ascii_case("chunked")) {
+        return Result::Err(bad_request("unsupported transfer encoding"))
+    }
+    let length = if lengths.is_empty() {
+        0
+    } else {
+        parse_size(lengths[0], 10)?
+    };
+    if length > limits.body_bytes {
+        return Result::Err(Error::new(ErrorKind::BodyLimit, "request body exceeds limit"))
+    }
+    let expectation = headers.get("expect").unwrap_or("");
+    if expectation != "" && !expectation.eq_ignore_ascii_case("100-continue") {
+        return Result::Err(bad_request("unsupported HTTP expectation"))
+    }
+    let connection = headers.get_all("connection").join(",").to_ascii_lowercase().split(",");
+    let mut close = parts[2] == "HTTP/1.0";
+    for value in connection {
+        if value.trim() == "keep-alive" && parts[2] == "HTTP/1.0" {
+            close = false;
+        }
+    }
+    for value in connection {
+        if value.trim() == "close" {
+            close = true;
+        }
+    }
+    Result::Ok(
+        Head {
+            method: parts[0],
+            path,
+            query,
+            host,
+            headers: headers.remove("host"),
+            length,
+            chunked,
+            expect: expectation != "" && (chunked || length > 0),
+            close,
+            http11: parts[2] == "HTTP/1.1",
+        },
+    )
+}
+
+fn make_request(head: Head, body: BodyState, lifetime: Lifetime, remote: string, limits: Limits) -> Request {
+    Request {
+        lifetime,
+        body_value: Body { state: body },
+        remote_value: remote,
+        host_value: head.host,
+        method_value: head.method,
+        path_value: head.path,
+        query_value: head.query,
+        headers_value: head.headers,
+        params_value: Pairs::new(),
+        attributes: Pairs::new(),
+        extraction_limit: limits.extraction_bytes,
+        field_limit: limits.form_fields,
+    }
+}
+
+struct Output {
+    lifetime: Lifetime,
+    gate: Channel[()],
+    stream: Option[TcpStream],
+    captured: Bytes,
+    limit: isize,
+    chunked: bool,
+}
+
+fn hex_size(value: isize) -> string {
+    let mut value = value;
+    let mut result = "";
+    loop {
+        let digit = value % 16;
+        result = "0123456789abcdef".byte_slice(digit, digit + 1) + result;
+        value /= 16;
+        if value == 0 {
+            return result
+        }
+    }
+}
+
+impl Output {
+    fn write(self: Output, data: Bytes) -> Result[(), Error] {
+        if data.len() > 65536 {
+            return Result::Err(
+                Error::new(ErrorKind::Configuration, "write chunk exceeds 65536 bytes"),
+            )
+        }
+        self.lifetime.acquire(self.gate)?;
+        defer self.gate.send(());
+        self.lifetime.check()?;
+        if let Some(stream) = self.stream {
+            if data.is_empty() {
+                return Result::Ok(())
+            }
+            if self.chunked {
+                socket_write(
+                    stream,
+                    self.lifetime.context,
+                    Bytes::from_string(hex_size(data.len()) + "\r\n"),
+                )?;
+            }
+            socket_write(stream, self.lifetime.context, data)?;
+            if self.chunked {
+                socket_write(stream, self.lifetime.context, Bytes::from_string("\r\n"))?;
+            }
+        } else {
+            if data.len() > self.limit - self.captured.len() {
+                return Result::Err(
+                    Error::new(ErrorKind::BodyLimit, "response exceeds capture limit"),
+                )
+            }
+            self.captured.extend_from_slice(data.as_slice());
+        }
+        Result::Ok(())
+    }
+}
+
+fn callback_panic() -> Error {
+    Error::new(ErrorKind::Internal, "request callback panicked")
+}
+
+fn response_for(router: Router, request: Request) -> Result[Response, Error] {
+    let handled = panic::catch(|| router.handle(request)).map_err(|_| callback_panic())?;
+    let response = match handled {
+        Ok(response) => response,
+        Err(error) => error.response(),
+    };
+    Result::Ok(
+        match response.validate() {
+            Ok(_) => response,
+            Err(error) => error.response(),
+        },
+    )
+}
+
+fn emit_body(response: Response, output: Output, head: bool) -> Result[(), Error] {
+    output.lifetime.check()?;
+    if head {
+        return Result::Ok(())
+    }
+    if let Some(producer) = response.stream_value {
+        let result = panic::catch(|| producer(StreamWriter { state: output })).map_err(
+            |_| callback_panic(),
+        )?;
+        result?;
+    } else {
+        let mut offset = 0;
+        while offset < response.bytes_value.len() {
+            let end = if response.bytes_value.len() - offset > 65536 {
+                offset + 65536
+            } else {
+                response.bytes_value.len()
+            };
+            output.write(Bytes::from_slice_copy(response.bytes_value.slice(offset, end)))?;
+            offset = end;
+        }
+    }
+    output.lifetime.check()
+}
+
+fn dispatch(router: Router, method: string, target: string, headers: Headers, body: Bytes) -> Result[
+    CapturedResponse,
+    Error,
+] {
+    let (path, query) = target_parts(target)?;
+    let limits = router.limits_value;
+    if body.len() > limits.body_bytes {
+        return Result::Err(Error::new(ErrorKind::BodyLimit, "request body exceeds limit"))
+    }
+    context::with_timeout(
+        context::Context::background(),
+        limits.request_timeout,
+        |context, _| {
+            let lifetime = Lifetime::new(context);
+            defer lifetime.ended.close();
+            let head = Head {
+                method,
+                path,
+                query,
+                host: "dispatch.invalid",
+                headers,
+                length: body.len(),
+                chunked: false,
+                expect: false,
+                close: true,
+                http11: true,
+            };
+            let input = Input {
+                reader: || Result::Ok(Bytes::new()),
+                cursor: Ref::new(InputCursor { data: body.copy(), offset: 0 }),
+            };
+            let state = BodyState::new(input, lifetime, body.len(), false, limits);
+            let request = make_request(head, state, lifetime, "", limits);
+            let response = response_for(router, request)?;
+            let output = Output {
+                lifetime,
+                gate: gate(),
+                stream: Option::None,
+                captured: Bytes::new(),
+                limit: limits.capture_bytes,
+                chunked: false,
+            };
+            emit_body(response, output, method == "HEAD")?;
+            Result::Ok(
+                CapturedResponse {
+                    status: response.status_value,
+                    headers: response.headers_value,
+                    body_value: output.captured.copy(),
+                },
+            )
+        },
+    )
+}

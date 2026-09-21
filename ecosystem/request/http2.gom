@@ -1,0 +1,204 @@
+package request;
+
+use std::context;
+use std::bytes::{Bytes, FrozenBytes};
+
+struct Http2Frame {
+    kind: byte,
+    flags: byte,
+    stream: isize,
+    payload: Bytes,
+}
+
+fn http2_integer(data: Bytes, offset: isize, width: isize) -> isize {
+    let mut result = 0;
+    for index in offset..offset + width {
+        result = (result << 8) | data.get(index).to_isize();
+    }
+    result
+}
+
+fn http2_number(value: isize) -> Bytes {
+    Bytes::from_vec(
+        Vec::from_array(
+            [(value >> 24).to_u8(), (value >> 16).to_u8(), (value >> 8).to_u8(), value.to_u8()],
+        ),
+    )
+}
+
+fn http2_write(
+    stream: Stream,
+    context: context::Context,
+    kind: byte,
+    flags: byte,
+    id: isize,
+    payload: Slice[byte],
+) -> Result[(), Error] {
+    let size = payload.len();
+    let header = Bytes::from_vec(
+        Vec::from_array([(size >> 16).to_u8(), (size >> 8).to_u8(), size.to_u8(), kind, flags]),
+    );
+    header.extend_from_slice(http2_number(id).as_slice());
+    header.extend_from_slice(payload);
+    stream.write(header.as_slice(), context)
+}
+
+fn http2_read(reader: Reader) -> Result[Http2Frame, Error] {
+    let header = reader.exact(9)?;
+    let length = http2_integer(header, 0, 3);
+    if length > 16384 {
+        return Result::Err(transport_error("HTTP/2 frame exceeds receive setting"))
+    }
+    Result::Ok(
+        Http2Frame {
+            kind: header.get(3),
+            flags: header.get(4),
+            stream: http2_integer(header, 5, 4) & 0x7fffffff,
+            payload: reader.exact(length)?,
+        },
+    )
+}
+
+fn http2_data(frame: Http2Frame) -> Result[Slice[byte], Error] {
+    let mut start = 0;
+    let mut end = frame.payload.len();
+    if frame.flags & 8 != 0 {
+        if end == 0 {
+            return Result::Err(transport_error("missing HTTP/2 padding length"))
+        }
+        start = 1;
+        end -= frame.payload.get(0).to_isize();
+    }
+    if end < start {
+        return Result::Err(transport_error("invalid HTTP/2 padding"))
+    }
+    Result::Ok(frame.payload.slice(start, end))
+}
+
+fn http2_header_block(reader: Reader, frame: Http2Frame, limit: isize) -> Result[Bytes, Error] {
+    let data = http2_data(frame)?;
+    let priority = if frame.flags & 32 != 0 {
+        5
+    } else {
+        0
+    };
+    if data.len() < priority {
+        return Result::Err(transport_error("truncated HTTP/2 priority"))
+    }
+    if priority != 0
+        && (http2_integer(Bytes::from_slice_copy(data), 0, 4) & 0x7fffffff) == frame.stream {
+        return Result::Err(transport_error("HTTP/2 stream depends on itself"))
+    }
+    if data.len() - priority > limit {
+        return Result::Err(transport_error("HTTP/2 headers exceed limit"))
+    }
+    let output = Bytes::from_slice_copy(data.sub(priority, data.len()));
+    let mut flags = frame.flags;
+    while flags & 4 == 0 {
+        let next = http2_read(reader)?;
+        if next.kind != 9 || next.stream != frame.stream {
+            return Result::Err(transport_error("expected HTTP/2 header continuation"))
+        }
+        if next.payload.len() > limit - output.len() {
+            return Result::Err(transport_error("HTTP/2 headers exceed limit"))
+        }
+        output.extend_from_slice(next.payload.as_slice());
+        flags = next.flags;
+    }
+    Result::Ok(output)
+}
+
+fn http2_request_headers(method: string, url: Url, headers: Headers, body: FrozenBytes) -> Result[
+    Bytes,
+    Error,
+] {
+    let fields = Vec::from_array(
+        [
+            (":method", method),
+            (":authority", url.authority),
+            (
+                ":scheme",
+                if url.secure {
+                    "https"
+                } else {
+                    "http"
+                },
+            ),
+            (":path", url.target),
+        ],
+    );
+    let connection = headers.get("connection").unwrap_or("");
+    let excluded = Vec::new();
+    for name in connection.split(",") {
+        excluded.push(ascii_lower(name.trim()));
+    }
+    for (name, value) in headers.entries() {
+        let name = ascii_lower(name);
+        if name == "host" || name == "connection" || name == "proxy-connection"
+            || name == "keep-alive"
+            || name == "transfer-encoding"
+            || name == "upgrade"
+            || excluded.contains(name) {
+            continue
+        }
+        if name == "te" && ascii_lower(value.trim()) != "trailers" {
+            return Result::Err(
+                Error::new(ErrorKind::Builder, "HTTP/2 TE must contain only trailers"),
+            )
+        }
+        fields.push((name, http2_trim(value)));
+    }
+    if body.len() > 0 || method == "POST" || method == "PUT" || method == "PATCH" {
+        fields.push(("content-length", body.len().to_string()));
+    }
+    Result::Ok(hpack_encode(fields))
+}
+
+fn http2_response_headers(fields: Vec[(string, string)], trailers: bool) -> Result[
+    (isize, Headers),
+    Error,
+] {
+    let mut status = 0;
+    let mut regular = false;
+    let mut headers = Headers::new();
+    for (name, value) in fields {
+        if name.starts_with(":") {
+            if trailers || regular || name != ":status" || status != 0 || value.byte_len() != 3 {
+                return Result::Err(transport_error("invalid HTTP/2 response pseudo-header"))
+            }
+            status = decimal(value)?;
+            if status < 100 || status > 599 || status == 101 {
+                return Result::Err(transport_error("invalid HTTP/2 status"))
+            }
+        } else {
+            regular = true;
+            if name != ascii_lower(name) || !token(name) || value != http2_trim(value)
+                || name == "connection"
+                || name == "proxy-connection"
+                || name == "keep-alive"
+                || name == "transfer-encoding"
+                || name == "te"
+                || name == "upgrade"
+                || trailers && name == "content-length" {
+                return Result::Err(transport_error("invalid HTTP/2 response header"))
+            }
+            headers = headers.append(name, value).map_err(|error| transport_error(error.message))?;
+        }
+    }
+    if !trailers && status == 0 {
+        return Result::Err(transport_error("missing HTTP/2 status"))
+    }
+    Result::Ok((status, headers))
+}
+
+fn http2_trim(value: string) -> string {
+    let mut start = 0;
+    let mut end = value.byte_len();
+    while start < end && (value.byte_get(start) == 32 || value.byte_get(start) == 9) {
+        start += 1;
+    }
+    while end > start && (value.byte_get(end - 1) == 32 || value.byte_get(end - 1) == 9) {
+        end -= 1;
+    }
+    value.byte_slice(start, end)
+}

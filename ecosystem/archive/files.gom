@@ -1,10 +1,11 @@
 package archive;
 
 use std::bytes;
-use std::ffi;
 use std::io;
 use io::{Read, Write, Close};
+use std::os::linux::abi;
 use std::os::linux::fd;
+use std::os::linux::syscall;
 
 #[derive(Debug, PartialEq)]
 pub enum LinkPolicy {
@@ -28,28 +29,131 @@ impl ExtractOptions {
     }
 }
 
-#[go_type("example.com/goml-ecosystem/archive/adapter", "Root")]
-extern type NativeRoot;
+fn filesystem_error(error: io::Error) -> Error {
+    failure(ErrorKind::Io, 0, error.to_string())
+}
 
-#[go_ffi("example.com/goml-ecosystem/archive/adapter", "OpenRoot")]
-extern fn open_root(path: ffi::String) -> (NativeRoot, ffi::String);
+struct ExtractionRoot {
+    directory: fd::Fd,
+    openat2: Ref[bool],
+}
 
-#[go_ffi("example.com/goml-ecosystem/archive/adapter", "CloseRoot")]
-extern fn close_root(root: NativeRoot) -> ();
-
-#[go_ffi("example.com/goml-ecosystem/archive/adapter", "Mkdir")]
-extern fn root_mkdir(root: NativeRoot, path: ffi::String) -> ffi::String;
-
-#[go_ffi("example.com/goml-ecosystem/archive/adapter", "WriteFile")]
-extern fn root_write(root: NativeRoot, path: ffi::String, data: ffi::RawSlice[byte], mode: u32) -> ffi::String;
-
-fn filesystem_result(value: ffi::String) -> Result[(), Error] {
-    let message = ffi::string_text(value).unwrap_or("invalid filesystem error");
-    if message != "" {
-        Result::Err(failure(ErrorKind::Io, 0, message))
-    } else {
-        Result::Ok(())
+fn root_components(path: string) -> Result[Vec[string], io::Error] {
+    safe_path(path, 9223372036854775807).map_err(
+        |error| io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "resolve archive path",
+            Option::Some(path),
+            Option::None,
+            error.message,
+        ),
+    )?;
+    let components = path.split("/");
+    if components[components.len() - 1] == "" {
+        return Result::Err(
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "resolve archive path",
+                Option::Some(path),
+                Option::None,
+                "expected a normalized archive path",
+            ),
+        )
     }
+    Result::Ok(components)
+}
+
+fn with_root_parent[T](root: fd::Fd, path: string, action: (fd::Fd, string) -> Result[T, io::Error]) -> Result[
+    T,
+    io::Error,
+] {
+    let components = root_components(path)?;
+    let mut directory = root.duplicate()?;
+    defer {
+        let _ = directory.close();
+    };
+    for index in 0..components.len() - 1 {
+        let next = directory.open_at(
+            components[index],
+            fd::O_RDONLY | fd::O_DIRECTORY | fd::O_NOFOLLOW,
+            0,
+        )?;
+        let previous = directory;
+        directory = next;
+        previous.close()?;
+    }
+    action(directory, components[components.len() - 1])
+}
+
+fn root_open(root: ExtractionRoot, path: string, flags: usize, mode: u32) -> Result[
+    fd::Fd,
+    io::Error,
+] {
+    root_components(path)?;
+    if root.openat2.get() {
+        match root.directory.open_at2(
+            path,
+            abi::OpenHow {
+                flags: flags.to_u64(),
+                mode: mode.to_u64(),
+                resolve: (fd::RESOLVE_BENEATH | fd::RESOLVE_NO_SYMLINKS).to_u64(),
+            },
+        ) {
+            Ok(file) => return Result::Ok(file),
+            Err(error) => {
+                if error.raw_os_code() != Option::Some(syscall::ENOSYS.to_isize()) {
+                    return Result::Err(error)
+                }
+                root.openat2.set(false);
+            },
+        }
+    }
+    with_root_parent(
+        root.directory,
+        path,
+        |directory, name| directory.open_at(name, flags | fd::O_NOFOLLOW, mode),
+    )
+}
+
+fn root_mkdir(root: ExtractionRoot, path: string) -> Result[(), Error] {
+    match root_open(root, path, fd::O_RDONLY | fd::O_DIRECTORY, 0) {
+        Result::Ok(directory) => return directory.close().map_err(filesystem_error),
+        Result::Err(error) => {
+            if error.kind() != io::ErrorKind::NotFound {
+                return Result::Err(filesystem_error(error))
+            }
+        },
+    }
+    with_root_parent(
+        root.directory,
+        path,
+        |directory, name| {
+            match directory.with_raw_fd(|raw| fd::mkdir_at(raw.to_isize(), name, 0o755)) {
+                Ok(_) => Result::Ok(()),
+                Err(error) => if error.kind() == io::ErrorKind::AlreadyExists {
+                    Result::Ok(())
+                } else {
+                    Result::Err(error)
+                },
+            }
+        },
+    ).map_err(filesystem_error)?;
+    root_open(root, path, fd::O_RDONLY | fd::O_DIRECTORY, 0).map_err(filesystem_error)?.close().map_err(
+        filesystem_error,
+    )
+}
+
+fn root_write(root: ExtractionRoot, path: string, data: bytes::Bytes, mode: u32) -> Result[
+    (),
+    Error,
+] {
+    let file = root_open(root, path, fd::O_WRONLY | fd::O_CREAT | fd::O_EXCL, mode).map_err(
+        filesystem_error,
+    )?;
+    let written = file.write_all(data.as_slice());
+    let closed = file.close();
+    written.map_err(filesystem_error)?;
+    closed.map_err(filesystem_error)
 }
 
 pub fn safe_path(path: string, limit: isize) -> Result[string, Error] {
@@ -83,6 +187,15 @@ pub fn extract(entries: Vec[Entry], destination: string, options: ExtractOptions
     isize,
     Error,
 ] {
+    extract_with_backend(entries, destination, options, true)
+}
+
+fn extract_with_backend(
+    entries: Vec[Entry],
+    destination: string,
+    options: ExtractOptions,
+    openat2: bool,
+) -> Result[isize, Error] {
     options.limits.validate()?;
     if entries.len() > options.limits.max_entries {
         return Result::Err(failure(ErrorKind::Limit, 0, "extraction entry limit"))
@@ -126,9 +239,13 @@ pub fn extract(entries: Vec[Entry], destination: string, options: ExtractOptions
             }
         }
     }
-    let (root, error) = open_root(ffi::string_from_text(destination));
-    filesystem_result(error)?;
-    defer close_root(root);
+    let directory = fd::open(destination, fd::O_RDONLY | fd::O_DIRECTORY, 0).map_err(
+        filesystem_error,
+    )?;
+    defer {
+        let _ = directory.close();
+    };
+    let root = ExtractionRoot { directory, openat2: Ref::new(openat2) };
     let mut written = 0;
     for index in 0..entries.len() {
         let entry = entries[index];
@@ -148,7 +265,7 @@ pub fn extract(entries: Vec[Entry], destination: string, options: ExtractOptions
                 prefix += "/";
             }
             prefix += components[component_index];
-            filesystem_result(root_mkdir(root, ffi::string_from_text(prefix)))?;
+            root_mkdir(root, prefix)?;
         }
         if entry.header.kind == EntryKind::File {
             let mode = if options.preserve_permissions {
@@ -156,14 +273,7 @@ pub fn extract(entries: Vec[Entry], destination: string, options: ExtractOptions
             } else {
                 0o644
             };
-            filesystem_result(
-                root_write(
-                    root,
-                    ffi::string_from_text(name),
-                    ffi::slice_shared(entry.data.to_vec()),
-                    mode,
-                ),
-            )?;
+            root_write(root, name, entry.data, mode)?;
         }
         written += 1;
     }

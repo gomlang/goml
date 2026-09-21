@@ -6,12 +6,13 @@ It provides reusable concurrent clients, request builders, typed JSON, forms,
 multipart uploads, validated multivalue headers, URL handling, authentication,
 redirect policies, cancellation and bounded response bodies.
 
-GoML owns the public types, builder validation, response conversion, redirect
-loop, origin checks and integration with `std::context`. A normal Go FFI adapter
-uses [Go's net/http transport](https://pkg.go.dev/net/http) for HTTP/1.1, HTTP/2,
-connection pooling, DNS, TLS, compression and proxies. It adds no compiler hooks,
-runtime externs or external Go dependencies. This is a synchronous API; call it
-from `std::task` tasks for concurrent requests.
+The implementation is pure GoML: URL and MIME encoding, HTTP/1.1 framing,
+HTTP/2 and HPACK, connection pooling, cookies, proxies and redirects are ordinary
+GoML code. TCP, DNS, TLS and cancellation use `std::net`, `std::net::tls` and
+`std::context`; gzip uses the pure GoML `ecosystem::archive` implementation.
+There are no production Go adapters, Go FFI declarations or native module
+dependencies. This is a synchronous API; call it from `std::task` tasks for
+concurrent requests.
 
 ## Requests and typed responses
 
@@ -92,7 +93,7 @@ fn upload(client: Client, url: string, bytes: Bytes) -> Result[(), Error] {
 
 ## Responses, limits and lifecycle
 
-`send()` reads the complete response within its limit and closes its native body
+`send()` reads the complete response within its limit and releases its transport
 before returning, on both success and failure. The resulting `Response` owns no
 open connection. It exposes status, headers, final URL, HTTP version, redirect
 history, copied bytes, strict UTF-8 text and generic JSON decoding. Its
@@ -104,8 +105,7 @@ server-error status families. Receiving an HTTP error status is a successful
 transport operation; `error_for_status()` converts 4xx/5xx into an `Error` with
 `ErrorKind::Status` and the status number. Other error kinds distinguish builder,
 transport, timeout, cancellation, body limit, redirect, closed and decoding
-failures. Native failures are converted through an opaque FFI type rather than
-Go's `error` interface graph.
+failures. All protocol and socket errors are recoverable GoML values.
 
 | Default | Value | Configuration |
 | --- | --- | --- |
@@ -125,24 +125,51 @@ The body limit is enforced for declared lengths, chunked messages and
 uncompressed bytes produced by gzip. HEAD ignores the representation's declared
 length because it has no response body. Redirect response bodies have the same
 per-hop limit. An oversized body fails instead of returning a truncated success.
+Automatic gzip permits a bounded wire buffer of the body budget plus 64 KiB
+and 0.1% framing overhead before enforcing the decompressed body budget.
 Request limits are checked before network I/O; ordinary bodies are already
 caller-owned buffers. Zero body limits are valid; zero timeouts, negative limits
 and negative redirect counts are errors.
 
-`close_idle_connections()` releases idle pooled connections. `close()` is
+`close_idle_connections()` releases idle pooled HTTP/1.1 and HTTP/2 connections,
+leaving HTTP/2 connections with active or queued streams open. `close()` is
 idempotent, cancels active operations, closes idle connections and prevents new
 requests. Copies of a `Client` share this lifecycle. Use `defer client.close()`;
 there is no finalizer. The transport and cancellation handles are synchronized,
 and concurrent requests on a shared client are supported. Separate `Bytes`
 buffers should be used if callers mutate bytes from different tasks.
+If an idle HTTP/1.1 connection was closed by its peer, an empty-body GET, HEAD
+or OPTIONS is retried once on a fresh connection only when no response byte
+has been received. Other transport failures are returned directly.
+
+HTTP/2 connections retain their HPACK decoder, stream identifiers and connection
+flow-control windows across requests. Concurrent requests to the same target
+share a connection, including through HTTP and HTTPS CONNECT proxies. A single
+reader dispatches frames to independent streams and a single writer serializes
+frames; uploads use per-stream and connection windows with round-robin DATA
+scheduling. The peer's concurrent-stream limit queues excess requests without
+opening redundant connections. Connection setup is coordinated per target, so
+a slow TLS handshake does not delay requests to unrelated targets.
+
+Cancellation, request deadlines and response-body limits reset only the affected
+HTTP/2 stream. Client closure closes the connection and joins its reader, writer,
+idle timer and any CONNECT relay tasks. Idle expiry prevents subsequent reuse;
+idle timers also reclaim unused connections. `pool_max_idle` bounds the combined
+idle HTTP/1.1 and HTTP/2 pool, not the number of active HTTP/2 streams.
+
+A graceful GOAWAY drains accepted streams while new requests use another
+connection. Buffered requests rejected by GOAWAY, refused before response headers
+with REFUSED_STREAM, or still queued when a connection fails are replayed at most
+twice. Requests that might already have been processed are not automatically
+retried. These protocol retries remain within the original request deadline.
 
 ## Cancellation, redirects and TLS
 
 `send_with(context)` and `execute_with(request, context)` accept
 `std::context::Context`. Its earlier deadline and explicit cancellation apply
 through response-body completion, including all redirect hops. A scoped GoML
-watcher cancels an ordinary native request control; it is joined before the call
-returns. Request timeout, context deadline and client closure also interrupt
+watcher connects client closure to the request context and is joined before
+the call returns. Request timeout, context deadline and client closure interrupt
 DNS, TLS handshakes and body reads.
 
 `RedirectPolicy::None` returns redirect responses unchanged;
@@ -167,8 +194,8 @@ methods instead. Proxy selection is explicit: `proxy(url)`,
 `environment_proxy(true)`, or `no_proxy()`.
 
 The optional cookie store intentionally accepts only host-only Set-Cookie
-values, ignoring every cookie with a Domain attribute. Path, Secure, expiry and
-replacement behavior come from the standard cookie jar. This avoids relying on
+values, ignoring every cookie with a Domain attribute. GoML implements path
+matching, Secure, Max-Age, HTTP-date expiry and replacement. This avoids relying on
 an absent public-suffix database but does not implement browser-wide domain
 cookies. Cookie storage is memory-only.
 
@@ -179,17 +206,25 @@ uploads/responses, async/await APIs, HTTP/3, WebSockets, Brotli/Zstd, a persiste
 cookie jar, public-suffix-aware domain cookies, custom DNS resolution, custom
 TLS backends, automatic application retries and middleware are not implemented.
 Text decoding is strict UTF-8 and does not inspect charset labels. Header values
-are UTF-8 strings rather than arbitrary octets. HTTP/2 over TLS uses ALPN; h2c
-prior knowledge and protocol forcing are not exposed. Client-side file reading
-is separate from multipart byte parts. Proxy handling is delegated to net/http;
-proxy tunnel behavior is not exercised by the local tests.
+are UTF-8 strings rather than arbitrary octets. HTTP/2 over TLS uses ALPN;
+h2c prior knowledge and protocol forcing are not exposed. Server push is
+disabled, request header encoding uses literals without dynamic indexing, and
+priority hints do not alter the round-robin upload scheduler. HTTP/1.1 connections
+are reused and idle age is checked when checking a connection out of the pool. Client-side file
+reading is separate from multipart byte parts. HTTP and HTTPS forward proxies
+and CONNECT tunnels are implemented in GoML. CONNECT uses a lifecycle-managed
+loopback relay so the standard TLS client can verify the original target hostname.
+Proxy credentials use the Proxy-Authorization header; credentials embedded in
+proxy URLs are rejected. Environment proxy bypass supports hosts, suffixes,
+host:port, wildcard and loopback addresses, but not CIDR ranges. Certificate
+PEM framing is checked during building; TLS validates certificate contents
+and identity keys when connecting.
 
-`go.mod` contains only the module path and Go version. The library declares
-`native.go-module` in `goml.toml`; the driver generates requirements and
-replacements pointing at the selected registry copy. The independent consumer
-therefore needs only its own minimal `go.mod`, with no manual replacement. `testserver/` is a local HTTP/HTTPS fixture
-used by tests and the consumer; the library's production API imports only
-`adapter/`.
+`go.mod` belongs solely to the local `testserver/` interoperability fixture;
+the library manifest has no native module declaration. The independent consumer
+and its local HTTP peer are pure GoML and need no `go.mod`.
+The RFC 7541 HPACK table constants were transcribed from Go's vendored
+`x/net/http2/hpack`; its BSD license is retained in `LICENSE.hpack.txt`.
 
 From the repository root:
 
@@ -202,7 +237,11 @@ fresh certificates. Consumer tests check HTTP/1.1, Unicode query/form data,
 duplicate headers, typed JSON, redirects, response limits and chunked bodies.
 Native Go test fixtures provide HTTP/TLS transport; all scenarios and assertions
 run from `#[test]`. Cancellation tests synchronize with server request arrival.
-The shared verifier runs native adapter/test-server tests and GoML-generated
+HTTP/2 wire tests cover persistent HPACK, interleaved streams, flow-control
+isolation, queued cancellation, GOAWAY draining, REFUSED_STREAM and malformed
+frames. HTTPS tests verify shared-socket parallelism, reuse, idle closure and
+per-stream cancellation through direct and proxied connections.
+The shared verifier runs native test-server checks and GoML-generated
 clients under Go's race detector. No external service is required.
 
 Reference API: [Rust reqwest ClientBuilder](https://docs.rs/reqwest/latest/reqwest/blocking/struct.ClientBuilder.html),

@@ -1,0 +1,175 @@
+package request;
+
+use std::bytes::{Bytes};
+use std::context;
+
+enum Http2WriteAction {
+    Headers(isize, Bytes, bool),
+    Data(isize, Bytes, bool),
+    Wait,
+    Closed,
+}
+
+fn http2_next_write(connection: Http2Connection) -> Http2WriteAction {
+    let mut state = http2_state(connection);
+    defer connection.state.send(state);
+    if state.closed {
+        return Http2WriteAction::Closed
+    }
+    let mut active = 0;
+    for stream in state.streams {
+        if stream.headers_sent {
+            active += 1;
+        }
+    }
+    let capacity = if state.ready {
+        state.max_streams
+    } else {
+        1
+    };
+    if active < capacity && !state.draining {
+        for index in 0..state.streams.len() {
+            let stream = state.streams[index];
+            if !stream.headers_sent {
+                state.streams[index] = Http2StreamState { headers_sent: true, ..stream };
+                state.highest_sent = stream.id;
+                return Http2WriteAction::Headers(stream.id, stream.headers, stream.body.is_empty())
+            }
+        }
+    }
+    if !state.ready || state.send_window <= 0 || state.streams.is_empty() {
+        return Http2WriteAction::Wait
+    }
+    let length = state.streams.len();
+    for offset in 0..length {
+        let index = (state.cursor + offset) % length;
+        let stream = state.streams[index];
+        if !stream.headers_sent || stream.send_window <= 0 {
+            continue
+        }
+        let mut count = stream.body.len() - stream.uploaded;
+        if count > 16384 {
+            count = 16384;
+        }
+        if count > state.send_window {
+            count = state.send_window;
+        }
+        if count > stream.send_window {
+            count = stream.send_window;
+        }
+        if count <= 0 {
+            continue
+        }
+        let payload = stream.body.slice_checked(stream.uploaded, stream.uploaded + count).unwrap_or(
+            stream.body,
+        ).thaw();
+        state.send_window -= count;
+        state.streams[index] = Http2StreamState {
+            uploaded: stream.uploaded + count,
+            send_window: stream.send_window - count,
+            ..stream,
+        };
+        state.cursor = (index + 1) % length;
+        return Http2WriteAction::Data(
+            stream.id,
+            payload,
+            stream.uploaded + count == stream.body.len(),
+        )
+    }
+    Http2WriteAction::Wait
+}
+
+fn http2_write_headers(stream: Stream, id: isize, headers: Bytes, empty: bool) -> Result[(), Error] {
+    let context = context::Context::background();
+    let mut offset = 0;
+    while offset < headers.len() {
+        let end = if headers.len() - offset > 16384 {
+            offset + 16384
+        } else {
+            headers.len()
+        };
+        let flags: byte = (if end == headers.len() {
+            4
+        } else {
+            0
+        })
+            | (if empty && offset == 0 {
+                1
+            } else {
+                0
+            });
+        http2_write(
+            stream,
+            context,
+            if offset == 0 {
+                1
+            } else {
+                9
+            },
+            flags,
+            id,
+            headers.slice(offset, end),
+        )?;
+        offset = end;
+    }
+    Result::Ok(())
+}
+
+fn http2_write_connection(connection: Http2Connection) -> Result[(), Error] {
+    let context = context::Context::background();
+    loop {
+        if http2_is_closed(connection) {
+            return Result::Ok(())
+        }
+        let control = select {
+            recv(connection.controls) as frame => frame,
+            default => Option::None,
+        };
+        if let Some(frame) = control {
+            http2_write(
+                connection.stream,
+                context,
+                frame.kind,
+                frame.flags,
+                frame.stream,
+                frame.payload.as_slice(),
+            )?;
+            continue
+        }
+        match http2_next_write(connection) {
+            Http2WriteAction::Headers(id, headers, empty) => http2_write_headers(
+                connection.stream,
+                id,
+                headers,
+                empty,
+            )?,
+            Http2WriteAction::Data(id, data, ended) => http2_write(
+                connection.stream,
+                context,
+                0,
+                if ended {
+                    1
+                } else {
+                    0
+                },
+                id,
+                data.as_slice(),
+            )?,
+            Http2WriteAction::Closed => return Result::Ok(()),
+            Http2WriteAction::Wait => select {
+                recv(connection.closed) as _ => return Result::Ok(()),
+                recv(connection.wake) as _ => (),
+                recv(connection.controls) as frame => if let Some(frame) = frame {
+                    http2_write(
+                        connection.stream,
+                        context,
+                        frame.kind,
+                        frame.flags,
+                        frame.stream,
+                        frame.payload.as_slice(),
+                    )?;
+                },
+            },
+        }
+    }
+}
