@@ -1,114 +1,201 @@
 package native
 
-/*
-#cgo CFLAGS: -std=c11 -I${SRCDIR}/..
-#cgo LDFLAGS: -lsqlite3
-#include <stdlib.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <sqlite3.h>
-_Static_assert(sizeof(int) == 4 && (((int)-1 < (int)0) == 1), "C ABI changed; regenerate GoML bindings");
-typedef int (*goml_c_signature_open)(const char *, sqlite3 **);
-_Static_assert(__builtin_types_compatible_p(__typeof__(&sqlite3_open), goml_c_signature_open), "C signature changed; regenerate GoML bindings");
-_Static_assert(sizeof(int) == 4 && (((int)-1 < (int)0) == 1), "C ABI changed; regenerate GoML bindings");
-typedef int (*goml_c_signature_close)(sqlite3 *);
-_Static_assert(__builtin_types_compatible_p(__typeof__(&sqlite3_close), goml_c_signature_close), "C signature changed; regenerate GoML bindings");
-_Static_assert(sizeof(int) == 4 && (((int)-1 < (int)0) == 1), "C ABI changed; regenerate GoML bindings");
-_Static_assert(sizeof(int) == 4 && (((int)-1 < (int)0) == 1), "C ABI changed; regenerate GoML bindings");
-typedef int (*goml_c_signature_prepare)(sqlite3 *, const char *, int, sqlite3_stmt **, const char **);
-_Static_assert(__builtin_types_compatible_p(__typeof__(&sqlite3_prepare_v2), goml_c_signature_prepare), "C signature changed; regenerate GoML bindings");
-_Static_assert(sizeof(int) == 4 && (((int)-1 < (int)0) == 1), "C ABI changed; regenerate GoML bindings");
-typedef int (*goml_c_signature_step)(sqlite3_stmt *);
-_Static_assert(__builtin_types_compatible_p(__typeof__(&sqlite3_step), goml_c_signature_step), "C signature changed; regenerate GoML bindings");
-_Static_assert(sizeof(sqlite3_int64) == 8 && (((sqlite3_int64)-1 < (sqlite3_int64)0) == 1), "C ABI changed; regenerate GoML bindings");
-_Static_assert(sizeof(int) == 4 && (((int)-1 < (int)0) == 1), "C ABI changed; regenerate GoML bindings");
-typedef sqlite3_int64 (*goml_c_signature_column_int64)(sqlite3_stmt *, int);
-_Static_assert(__builtin_types_compatible_p(__typeof__(&sqlite3_column_int64), goml_c_signature_column_int64), "C signature changed; regenerate GoML bindings");
-_Static_assert(sizeof(int) == 4 && (((int)-1 < (int)0) == 1), "C ABI changed; regenerate GoML bindings");
-typedef int (*goml_c_signature_finalize)(sqlite3_stmt *);
-_Static_assert(__builtin_types_compatible_p(__typeof__(&sqlite3_finalize), goml_c_signature_finalize), "C signature changed; regenerate GoML bindings");
-typedef const char * (*goml_c_signature_error_message)(sqlite3 *);
-_Static_assert(__builtin_types_compatible_p(__typeof__(&sqlite3_errmsg), goml_c_signature_error_message), "C signature changed; regenerate GoML bindings");
-_Static_assert(sizeof(const int) == 4 && (((const int)-1 < (const int)0) == 1), "C ABI changed; regenerate GoML bindings");
-_Static_assert((SQLITE_OK) == (const int)0ULL, "C constant changed; regenerate GoML bindings");
-_Static_assert(sizeof(const int) == 4 && (((const int)-1 < (const int)0) == 1), "C ABI changed; regenerate GoML bindings");
-_Static_assert((SQLITE_ROW) == (const int)100ULL, "C constant changed; regenerate GoML bindings");
-static size_t goml_c_bounded_length(const char *p, size_t limit) { size_t n = 0; while (n < limit && p[n] != 0) { n++; } return n; }
-*/
-import "C"
 import (
 	"fmt"
+	"goml.dev/cabi"
 	"strings"
+	"sync"
 	"unsafe"
 )
 
-type Database struct{ raw *C.sqlite3 }
+var gomlCLibrary = cabi.Library{Names: []string{"libsqlite3.so.0"}}
+var gomlCOnce sync.Once
+var gomlCError error
+var gomlCAddresses [7]uint64
+
+func gomlCLoad() error {
+	gomlCOnce.Do(func() {
+		gomlCAddresses[0], gomlCError = gomlCLibrary.Symbol("sqlite3_close")
+		if gomlCError != nil {
+			return
+		}
+		gomlCAddresses[1], gomlCError = gomlCLibrary.Symbol("sqlite3_column_int64")
+		if gomlCError != nil {
+			return
+		}
+		gomlCAddresses[2], gomlCError = gomlCLibrary.Symbol("sqlite3_errmsg")
+		if gomlCError != nil {
+			return
+		}
+		gomlCAddresses[3], gomlCError = gomlCLibrary.Symbol("sqlite3_finalize")
+		if gomlCError != nil {
+			return
+		}
+		gomlCAddresses[4], gomlCError = gomlCLibrary.Symbol("sqlite3_open")
+		if gomlCError != nil {
+			return
+		}
+		gomlCAddresses[5], gomlCError = gomlCLibrary.Symbol("sqlite3_prepare_v2")
+		if gomlCError != nil {
+			return
+		}
+		gomlCAddresses[6], gomlCError = gomlCLibrary.Symbol("sqlite3_step")
+		if gomlCError != nil {
+			return
+		}
+	})
+	return gomlCError
+}
+func gomlDynamic_sqlite3_close(p0 unsafe.Pointer) int32 {
+	f := cabi.Frame{Function: gomlCAddresses[0], StackCount: 0}
+	f.Integer[0] = uint64(uintptr(p0))
+	f.Call()
+	return int32(f.Result)
+}
+func gomlDynamic_sqlite3_column_int64(p0 unsafe.Pointer, p1 int32) int64 {
+	f := cabi.Frame{Function: gomlCAddresses[1], StackCount: 0}
+	f.Integer[0] = uint64(uintptr(p0))
+	f.Integer[1] = uint64(p1)
+	f.Call()
+	return int64(f.Result)
+}
+func gomlDynamic_sqlite3_errmsg(p0 unsafe.Pointer) unsafe.Pointer {
+	f := cabi.Frame{Function: gomlCAddresses[2], StackCount: 0}
+	f.Integer[0] = uint64(uintptr(p0))
+	f.Call()
+	return cabi.Pointer(f.Result)
+}
+func gomlDynamic_sqlite3_finalize(p0 unsafe.Pointer) int32 {
+	f := cabi.Frame{Function: gomlCAddresses[3], StackCount: 0}
+	f.Integer[0] = uint64(uintptr(p0))
+	f.Call()
+	return int32(f.Result)
+}
+func gomlDynamic_sqlite3_open(p0 unsafe.Pointer, p1 unsafe.Pointer) int32 {
+	f := cabi.Frame{Function: gomlCAddresses[4], StackCount: 0}
+	f.Integer[0] = uint64(uintptr(p0))
+	f.Integer[1] = uint64(uintptr(p1))
+	f.Call()
+	return int32(f.Result)
+}
+func gomlDynamic_sqlite3_prepare_v2(p0 unsafe.Pointer, p1 unsafe.Pointer, p2 int32, p3 unsafe.Pointer, p4 unsafe.Pointer) int32 {
+	f := cabi.Frame{Function: gomlCAddresses[5], StackCount: 0}
+	f.Integer[0] = uint64(uintptr(p0))
+	f.Integer[1] = uint64(uintptr(p1))
+	f.Integer[2] = uint64(p2)
+	f.Integer[3] = uint64(uintptr(p3))
+	f.Integer[4] = uint64(uintptr(p4))
+	f.Call()
+	return int32(f.Result)
+}
+func gomlDynamic_sqlite3_step(p0 unsafe.Pointer) int32 {
+	f := cabi.Frame{Function: gomlCAddresses[6], StackCount: 0}
+	f.Integer[0] = uint64(uintptr(p0))
+	f.Call()
+	return int32(f.Result)
+}
+
+type Database struct{ raw unsafe.Pointer }
 
 func GomlC_NullDatabase() Database                  { return Database{} }
 func GomlC_IsNullDatabase(value Database) bool      { return value.raw == nil }
 func GomlC_EqualDatabase(left, right Database) bool { return left.raw == right.raw }
 
-type Statement struct{ raw *C.sqlite3_stmt }
+type Statement struct{ raw unsafe.Pointer }
 
 func GomlC_NullStatement() Statement                  { return Statement{} }
 func GomlC_IsNullStatement(value Statement) bool      { return value.raw == nil }
 func GomlC_EqualStatement(left, right Statement) bool { return left.raw == right.raw }
 func GomlC_open(a0 string) (int32, Database, error) {
+	if err := gomlCLoad(); err != nil {
+		return 0, Database{}, err
+	}
 	if strings.IndexByte(a0, 0) >= 0 || len(a0) > 67108864 {
 		return 0, Database{}, fmt.Errorf("C string contains NUL or exceeds 64 MiB")
 	}
-	cArg0 := C.CString(a0)
-	defer C.free(unsafe.Pointer(cArg0))
-	var cArg1 *C.sqlite3
-	cResult := C.sqlite3_open(cArg0, &cArg1)
+	cArg0, _ := cabi.Copy([]byte(a0), true)
+	if cArg0 == nil {
+		return 0, Database{}, fmt.Errorf("C allocation failed")
+	}
+	defer cabi.Free(cArg0)
+	cArg1Slot, _ := cabi.Alloc(8)
+	if cArg1Slot == nil {
+		return 0, Database{}, fmt.Errorf("C allocation failed")
+	}
+	defer cabi.Free(cArg1Slot)
+	cResult := gomlDynamic_sqlite3_open(cArg0, cArg1Slot)
+	cArg1 := *(*unsafe.Pointer)(cArg1Slot)
 	return int32(cResult), Database{raw: cArg1}, nil
 }
 func GomlC_close(a0 Database) (int32, error) {
-	cResult := C.sqlite3_close(a0.raw)
+	if err := gomlCLoad(); err != nil {
+		return 0, err
+	}
+	cResult := gomlDynamic_sqlite3_close(a0.raw)
 	return int32(cResult), nil
 }
 func GomlC_prepare(a0 Database, a1 string, a2 int32) (int32, Statement, string, bool, error) {
+	if err := gomlCLoad(); err != nil {
+		return 0, Statement{}, "", false, err
+	}
 	if strings.IndexByte(a1, 0) >= 0 || len(a1) > 67108864 {
 		return 0, Statement{}, "", false, fmt.Errorf("C string contains NUL or exceeds 64 MiB")
 	}
-	cArg1 := C.CString(a1)
-	defer C.free(unsafe.Pointer(cArg1))
-	var cArg3 *C.sqlite3_stmt
-	var cArg4 *C.char
-	cResult := C.sqlite3_prepare_v2(a0.raw, cArg1, C.int(a2), &cArg3, &cArg4)
-	var cArg4Text string
-	if cArg4 != nil {
-		n := C.goml_c_bounded_length(cArg4, 1048577)
-		if n > 1048576 {
-			return 0, Statement{}, "", false, fmt.Errorf("C string exceeds configured copy limit")
-		}
-		cArg4Text = C.GoStringN(cArg4, C.int(n))
+	cArg1, _ := cabi.Copy([]byte(a1), true)
+	if cArg1 == nil {
+		return 0, Statement{}, "", false, fmt.Errorf("C allocation failed")
+	}
+	defer cabi.Free(cArg1)
+	cArg3Slot, _ := cabi.Alloc(8)
+	if cArg3Slot == nil {
+		return 0, Statement{}, "", false, fmt.Errorf("C allocation failed")
+	}
+	defer cabi.Free(cArg3Slot)
+	cArg4Slot, _ := cabi.Alloc(8)
+	if cArg4Slot == nil {
+		return 0, Statement{}, "", false, fmt.Errorf("C allocation failed")
+	}
+	defer cabi.Free(cArg4Slot)
+	cResult := gomlDynamic_sqlite3_prepare_v2(a0.raw, cArg1, int32(a2), cArg3Slot, cArg4Slot)
+	cArg3 := *(*unsafe.Pointer)(cArg3Slot)
+	cArg4 := *(*unsafe.Pointer)(cArg4Slot)
+	cArg4Text, cArg4Error := cabi.String(cArg4, 1048576)
+	if cArg4Error != nil {
+		return 0, Statement{}, "", false, fmt.Errorf("C string exceeds configured copy limit")
 	}
 	return int32(cResult), Statement{raw: cArg3}, cArg4Text, cArg4 != nil, nil
 }
 func GomlC_step(a0 Statement) (int32, error) {
-	cResult := C.sqlite3_step(a0.raw)
+	if err := gomlCLoad(); err != nil {
+		return 0, err
+	}
+	cResult := gomlDynamic_sqlite3_step(a0.raw)
 	return int32(cResult), nil
 }
 func GomlC_column_int64(a0 Statement, a1 int32) (int64, error) {
-	cResult := C.sqlite3_column_int64(a0.raw, C.int(a1))
+	if err := gomlCLoad(); err != nil {
+		return 0, err
+	}
+	cResult := gomlDynamic_sqlite3_column_int64(a0.raw, int32(a1))
 	return int64(cResult), nil
 }
 func GomlC_finalize(a0 Statement) (int32, error) {
-	cResult := C.sqlite3_finalize(a0.raw)
+	if err := gomlCLoad(); err != nil {
+		return 0, err
+	}
+	cResult := gomlDynamic_sqlite3_finalize(a0.raw)
 	return int32(cResult), nil
 }
 func GomlC_error_message(a0 Database) (string, bool, error) {
-	cResult := C.sqlite3_errmsg(a0.raw)
-	var cResultText string
-	if cResult != nil {
-		n := C.goml_c_bounded_length(cResult, 1048577)
-		if n > 1048576 {
-			return "", false, fmt.Errorf("C string exceeds configured copy limit")
-		}
-		cResultText = C.GoStringN(cResult, C.int(n))
+	if err := gomlCLoad(); err != nil {
+		return "", false, err
+	}
+	cResult := gomlDynamic_sqlite3_errmsg(a0.raw)
+	cResultText, cResultError := cabi.String(cResult, 1048576)
+	if cResultError != nil {
+		return "", false, fmt.Errorf("C string exceeds configured copy limit")
 	}
 	return cResultText, cResult != nil, nil
 }
-func GomlC_OK() int32  { return int32(C.SQLITE_OK) }
-func GomlC_ROW() int32 { return int32(C.SQLITE_ROW) }
+func GomlC_OK() int32  { return 0 }
+func GomlC_ROW() int32 { return 100 }
