@@ -2361,6 +2361,18 @@ Native APIs may reside in the output Go package; same-package references do not 
 
 The ownership manifest `<CONFIG>.goml-bind.json` records both generated files. Identical regeneration preserves timestamps; modifications to either source or the manifest prevent overwriting. Put handwritten conversions and wrappers in separate files. Raw strings and errors retain their explicit `std::ffi` boundaries; the generator does not infer error, nullable or record adapters. Dry runs validate configuration, module and output paths and print destinations without writing files; they do not query the selected symbols. See [the configuration contract](ffi/bind-go.md) and [the complete standard-library example](../examples/ffi-bind-go/README.md). This command uses existing extern/type-alias syntax and introduces no grammar changes.
 
+### Calling C libraries
+
+`goml bind-c <CONFIG> [--compiler <COMPILER>] [--dry-run | --check]` generates an explicitly allowlisted C binding using Clang declarations and ABI information. The current Go backend emits cgo bridges internally. An existing module-root `go.mod` is required; `[native]` declares `go-module`, `cgo = "required"`, and `c-bindings = "bindings.json"`. Project commands verify C inputs before compilation, and changed preprocessed header contents invalidate the native cache. Generated GoML and Go files plus their ownership manifest are checked before replacement. See [the configuration and lifetime contract](ffi/bind-c.md).
+
+Supported mappings include opaque typed C handles with `null`, `is_null` and `same_as`, fixed-arity scalar functions, copied strings and byte buffers, checked buffer lengths, scalar/handle output parameters, and explicitly released output strings. Functions return `Result[T, c::Error]` for adapter failures and preserve C status codes as ordinary return values. Handle copying does not copy or retain C resources. Nullability, aliasing, parent lifetimes, thread safety and destruction remain C API contracts; these low-level bindings do not imply memory safety.
+
+`std::c::CString::new(string)`, `from_bytes(Bytes)` and `from_raw(ffi::String)` reject interior NUL. `bytes()` preserves arbitrary bytes and `text()` returns `Result[string, utf8::Utf8Error]`; `as_raw()` exposes the bridge representation. `c::Error` has `InteriorNul` and `Native(string)` variants and supports `Debug`, `PartialEq`, `Eq` and `ToString`. `c::check_error(ffi::Error)` is the generated adapter's error check.
+
+`const NAME: string = c::literal("example");` validates a C string literal with CTFE. The ordinary `CString` constructor still checks runtime values. Allowlisted integer C constants become typed GoML constants usable in `comptime`; their values come from Clang. CTFE cannot inspect headers or allocate C memory. Examples cover [a self-contained C API](../examples/ffi-bind-c/README.md), [SQLite](../examples/ffi-c-sqlite/README.md), and [LLVM](../examples/ffi-c-llvm/README.md).
+
+This version requires the host Go target, cgo and Clang for generation and verification. It does not support callbacks, variadic functions, struct/union values, pointer dereference, C exports, cross compilation or a cgo-free backend. The bindings use existing declarations and calls, without `extern "C"`, native-layout or unsafe syntax.
+
 ### Exporting a Go library
 
 The frontend recognizes `#[go_export("Add")] pub fn add(x: i64, y: i64) -> i64 { x + y }`. It checks that the declaration is an ordinary top-level public function without generics, comptime/derive capability, or test attributes. The Go name starts with an ASCII uppercase letter and contains only ASCII letters, digits, or underscores; names must be unique across the selected GoML package. Duplicate attributes and attributes on methods, externs, types, fields, and other non-function items are rejected.
@@ -3666,6 +3678,7 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | Go external type | `#[go_type("pkg", "Name")] extern type Name[T];` retains Go identity and validates concrete instances across packages and artifacts; `std::ffi::Ptr[T]` and Go pointer aliases preserve nullable pointer values, with explicit `ffi::null()` and `ffi::is_nil`; method bindings use `#[go_method("Method")]`; symbolic instances remain unsupported |
 | Go interface adapter | `#[go_interface(RawType, Wrapper, method = "GoMethod")]` generates a checked native-interface wrapper and trait implementation; `from_trait` explicitly creates a typed Go bridge retaining the supplied dyn object; nil/typed-nil and multiple results are preserved |
 | Go binding generator | `goml bind-go <CONFIG>` selects explicit package/symbol allowlists and finite Go-checked generic arguments; emits raw bindings with protected deterministic output |
+| C binding generator | `goml bind-c <CONFIG>` checks C declarations with Clang and emits typed handles, copied strings/buffers, output adapters and compile-time integer constants; the current backend uses cgo |
 | Go-callable export | Annotate a supported public function with `#[go_export("Name")]` and generate a Go package with `goml export-go` |
 | Traverse a directory tree | `ecosystem::walkdir` dependency for Linux amd64 syscall-backed depth-first iteration with depth bounds, pruning, optional link following, and per-path errors |
 | Watch a directory tree for changes | Use the `ecosystem::notify` dependency and its `watch_recursive` or `WatchSet` on Linux amd64, prune ignored paths through `Options`, consume timed reads or scoped subscriptions, handle `Event.rescan`, and close the handle |
@@ -3684,6 +3697,8 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | Capture a runtime local in `comptime` | Pass a literal or compile-time value to a `#[comptime]` function |
 
 ## Informal Grammar Quick Facts
+
+C bindings and `std::c` use existing structs, constants, `#[comptime]`, extern attributes, imports and calls. They add no C pointer, C layout or `extern "C"` grammar.
 
 Linux syscall buffers, `Pointer` descriptors, `Errno` values, ABI codecs, descriptor/process/memory/IPC wrappers use the ordinary struct, enum, array, slice, and call forms below. Native kernel layouts are encoded into bytes; there is no pointer-cast, native-layout, or `unsafe` grammar.
 

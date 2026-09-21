@@ -188,6 +188,7 @@ install: make-tools
     cp stage2/bin/gomlfmt "${GOML_HOME:-$HOME/.goml}/bin/gomlfmt"
     cp stage2/bin/gomllsp "${GOML_HOME:-$HOME/.goml}/bin/gomllsp"
     cp stage2/bin/goml-go-meta "${GOML_HOME:-$HOME/.goml}/bin/goml-go-meta"
+    cp stage2/bin/goml-c-bind "${GOML_HOME:-$HOME/.goml}/bin/goml-c-bind"
     bash tools/lib/install.sh "${GOML_HOME:-$HOME/.goml}"
     bash tools/lib/finalize-toolchain.sh "${GOML_HOME:-$HOME/.goml}" "${GOML_HOME:-$HOME/.goml}/bin/goml" "${GOML_HOME:-$HOME/.goml}/bin/gomlc"
 

@@ -4,7 +4,7 @@ Releases use strict `vX.Y.Z` tags and currently publish Linux amd64 binaries.
 
 The Go compatibility baseline is Go 1.26. Build and validate releases with Go 1.26.x; users need Go 1.26 or newer to compile generated programs and validate Go FFI. The archives do not bundle a Go toolchain.
 
-The root [VERSION](../VERSION) file is authoritative. `goml`, `gomlc`, `gomlfmt`, `gomllsp`, and the VS Code extension must use the same version. The metadata helper `goml-go-meta` is packaged alongside them.
+The root [VERSION](../VERSION) file is authoritative. `goml`, `gomlc`, `gomlfmt`, `gomllsp`, and the VS Code extension must use the same version. The metadata helper `goml-go-meta` and C binding helper `goml-c-bind` are packaged alongside them. C binding generation and verification additionally require Clang and a native C compiler on the host.
 
 ## Version policy
 
@@ -56,6 +56,7 @@ goml-X.Y.Z-linux-amd64/
 │   ├── gomlc
 │   ├── gomlfmt
 │   ├── goml-go-meta
+│   ├── goml-c-bind
 │   └── gomllsp
 └── lib/
     ├── builtin/
