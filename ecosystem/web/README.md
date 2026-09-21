@@ -88,7 +88,7 @@ just ecosystem-test web
 GoML black-box tests, versioned-consumer tests, cached rebuild checks and native
 adapter tests cover routing, typed payloads, request/body limits and lifecycle.
 The consumer sends 120 generated Unicode query/form requests through
-`ecosystem::reqwest`, exercises concurrent requests and checks real HTTP status
+`ecosystem::request`, exercises concurrent requests and checks real HTTP status
 codes and duplicate headers. GoML `std::process` invokes curl as an independent
 HTTP client for a 200 KiB chunked binary upload and a timed SSE disconnect; it then
 asserts producer cleanup. Streaming events, shared counters and deadline responses

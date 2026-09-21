@@ -114,7 +114,7 @@ They distinguish supported designs from current compiler or API boundaries.
   the race detector cover ownership transfer, symlinks, concurrent creation and
   explicit cleanup without assuming destructors or GC finalizers.
 
-- Reqwest uses an ordinary Go FFI transport with GoML request/response types,
+- Request uses an ordinary Go FFI transport with GoML request/response types,
   redirect policy and scoped cancellation. Native HTTP/HTTPS servers and Python
   interoperability exercise certificate validation, HTTP/2, bounded bodies,
   multipart, sensitive-header isolation and connection reuse. Private body

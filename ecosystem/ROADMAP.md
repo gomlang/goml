@@ -28,7 +28,7 @@ is intentionally deferred.
 | template | Direct standard integer-to-float conversion for numeric coercion |
 | sqlite | Direct standard I/O in the FFI consumer; removed the error-alias transport workaround |
 | tempfile | Standard resource cleanup/error combination with compatible scope results |
-| reqwest | Immutable request/response/multipart byte snapshots and shared snapshot accessors |
+| request | Immutable request/response/multipart byte snapshots and shared snapshot accessors |
 | msgpack | Standard reader/writer integration, direct typed frame decoding, bounded concatenated values and partial-I/O handling |
 | redis | Bundled DNS/TLS connectors, mTLS and standard Context cancellation/deadlines composed with existing operation controls |
 | bitflags | Optional `FlagValues` inherent derive for named flag constructors without trait imports |
@@ -97,7 +97,7 @@ verification includes race checks; no CI workflow was added.
 | bitflags | Associated-constant or operator syntax depends on language support; Serde wrappers support explicit or format-sensitive representations; arbitrary declaration expressions and generic storage newtypes are not generated |
 | logos | Compile-time derive/DFA generation, streaming/byte input, named subpatterns and broader Unicode regex properties; current runtime NFA reports equal-priority ambiguity during matching |
 | tempfile | Platforms beyond Linux amd64, cancellation-aware file operations, crash-durable persistence helpers; cleanup assumes no hostile concurrent filesystem changes |
-| reqwest | Streaming requests/responses, HTTP/3, an adapter to the separate websocket library, full domain-cookie policy, custom DNS, application retries and middleware; the synchronous API buffers within explicit limits |
+| request | Streaming requests/responses, HTTP/3, an adapter to the separate websocket library, full domain-cookie policy, custom DNS, application retries and middleware; the synchronous API buffers within explicit limits |
 | llvm | Dominance/loop analysis, MemorySSA, sealed-block SSA construction, specialized instruction/CFG mutation, JIT execution, debug metadata, globals/named structs, vectors/atomics, exception handling, linkage/attributes and explicit ABI-name selection; implemented SSA traversal/editing, parallel-edge PHIs, insertion points, safe erasure and local-variable promotion alongside LLVM 18 target machines and ABI layouts |
 | incremental | Parallel branch evaluation, immutable database snapshots, persistent caches, durability classes and cycle fixed-point recovery; current root operations serialize and callbacks use scoped Evaluation handles |
 | rope | Grapheme and reverse iterators, search, editing history, optional Unicode newline policies and memory-mapped backing; current storage is persistent UTF-8 with LF/CRLF/CR line semantics |

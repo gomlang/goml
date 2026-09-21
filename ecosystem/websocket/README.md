@@ -132,6 +132,6 @@ handshake using only exported APIs.
 
 This version deliberately has no compression extensions, HTTP/2 extended
 CONNECT, HTTP/3, redirects, proxy negotiation, URL parser or automatic heartbeat
-scheduler. HTTP upgrade integration with `web`/`reqwest` can use the public
+scheduler. HTTP upgrade integration with `web`/`request` can use the public
 handshake helpers and `Connection::upgraded`. Origin policy belongs to the
 server application. Cross-implementation Autobahn certification is not claimed.

@@ -1,6 +1,6 @@
-# Reqwest
+# Request
 
-`ecosystem::reqwest` is a GoML HTTP client inspired by the
+`ecosystem::request` is a GoML HTTP client inspired by the
 [Rust reqwest blocking API](https://docs.rs/reqwest/latest/reqwest/blocking/index.html).
 It provides reusable concurrent clients, request builders, typed JSON, forms,
 multipart uploads, validated multivalue headers, URL handling, authentication,
@@ -16,7 +16,7 @@ from `std::task` tasks for concurrent requests.
 ## Requests and typed responses
 
 ```gom
-use ecosystem::reqwest::{Client, Error};
+use ecosystem::request::{Client, Error};
 use std::serde::{Serialize, Deserialize};
 
 #[derive(Serialize, Deserialize)]
@@ -78,7 +78,7 @@ the `body()` / `bytes()` accessors still return independent mutable copies.
 This does not change the buffered request/response size limits.
 
 ```gom
-use ecosystem::reqwest::{Client, Multipart, Part, Error};
+use ecosystem::request::{Client, Multipart, Part, Error};
 use std::bytes::{Bytes};
 
 fn upload(client: Client, url: string, bytes: Bytes) -> Result[(), Error] {
@@ -194,7 +194,7 @@ used by tests and the consumer; the library's production API imports only
 From the repository root:
 
 ```sh
-just ecosystem-test reqwest
+just ecosystem-test request
 ```
 
 GoML library and consumer tests use local ephemeral HTTP/HTTPS servers and
