@@ -62,12 +62,23 @@ func once_cell_get_or_init__OnceCell__isize(cell *OnceCell__isize, init func() i
         cell.state = 1
         cell.owner = goroutine
         cell.mutex.Unlock()
+        var completed bool = false
+        defer func() {
+            if !completed {
+                cell.mutex.Lock()
+                cell.state = 0
+                cell.owner = 0
+                cell.cond.Broadcast()
+                cell.mutex.Unlock()
+            }
+        }()
         var initialized int = init()
         cell.mutex.Lock()
         cell.value = initialized
         cell.state = 2
         cell.owner = 0
         cell.cond.Broadcast()
+        completed = true
         cell.mutex.Unlock()
         return initialized
     }

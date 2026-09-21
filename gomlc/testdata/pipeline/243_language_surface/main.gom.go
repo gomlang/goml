@@ -4,6 +4,36 @@ import (
     _goml_os "os"
 )
 
+type _goml_defer_state struct {
+    actions []func() struct{}
+}
+
+func _goml_defer_take(stack *_goml_defer_state) func() struct{} {
+    var index int = len(stack.actions) - 1
+    var action func() struct{} = stack.actions[index]
+    stack.actions[index] = nil
+    stack.actions = stack.actions[0:index]
+    return action
+}
+
+func _goml_defer_drain(stack *_goml_defer_state) {
+    if len(stack.actions) != 0 {
+        var action func() struct{} = _goml_defer_take(stack)
+        defer _goml_defer_drain(stack)
+        action()
+    }
+}
+
+func _goml_runtime_core_defer_push(stack *_goml_defer_state, action func() struct{}) struct{} {
+    stack.actions = append(stack.actions, action)
+    return struct{}{}
+}
+
+func _goml_runtime_core_defer_pop(stack *_goml_defer_state) struct{} {
+    var action func() struct{} = _goml_defer_take(stack)
+    return action()
+}
+
 func _goml_runtime_core_string_from_utf8(bytes *_goml_vec_uint8) Tuple2_4bool_6string {
     return Tuple2_4bool_6string{
         _0: true,
@@ -114,7 +144,11 @@ type NumberSource struct {
     value int
 }
 
-type closure_env_increment_0 struct {
+type closure_env_labeled_cleanup_0 struct {}
+
+type closure_env_labeled_cleanup_1 struct {}
+
+type closure_env_increment_2 struct {
     captured_0 *ref_int_x
 }
 
@@ -150,12 +184,20 @@ func _goml_m_trait__impl_i_Source_i_NumberSource_i_get(self__0 NumberSource) int
 }
 
 func labeled_cleanup() struct{} {
-    var inline3 string = "inner cleanup"
-    var inline4 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(inline3)
-    _goml_runtime_core_string_println(inline4)
-    var inline0 string = "outer cleanup"
-    var inline1 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(inline0)
-    _goml_runtime_core_string_println(inline1)
+    var _goml_defer_stack _goml_defer_state
+    defer _goml_defer_drain(&_goml_defer_stack)
+    var t0 closure_env_labeled_cleanup_0 = closure_env_labeled_cleanup_0{}
+    var t1 func() struct{} = func() struct{} {
+        return _goml_m_inherent_i_closure__en_h0223a9befc2ebe8658869638c279e6f5_anup__0_i_apply(t0)
+    }
+    _goml_runtime_core_defer_push(&_goml_defer_stack, t1)
+    var t2 closure_env_labeled_cleanup_1 = closure_env_labeled_cleanup_1{}
+    var t3 func() struct{} = func() struct{} {
+        return _goml_m_inherent_i_closure__en_hba5cfe2d49e8e7932e64c822e4593e98_anup__1_i_apply(t2)
+    }
+    _goml_runtime_core_defer_push(&_goml_defer_stack, t3)
+    _goml_runtime_core_defer_pop(&_goml_defer_stack)
+    _goml_runtime_core_defer_pop(&_goml_defer_stack)
     return struct{}{}
 }
 
@@ -182,11 +224,11 @@ func main0() struct{} {
     _goml_runtime_core_string_println(inline22)
     var x2 int = 3
     var captured__0 *ref_int_x = ref__Ref_3int(x2)
-    var t5 closure_env_increment_0 = closure_env_increment_0{
+    var t5 closure_env_increment_2 = closure_env_increment_2{
         captured_0: captured__0,
     }
     var increment__0 func() struct{} = func() struct{} {
-        return _goml_m_inherent_i_closure__en_hd344b745b40be6f4a908632f0feb9f48_ment__0_i_apply(t5)
+        return _goml_m_inherent_i_closure__en_h79b4a32d6db2ef8c8920b1d54dab278c_ment__2_i_apply(t5)
     }
     increment__0()
     var t6 int = ref_get__Ref_3int(captured__0)
@@ -426,7 +468,21 @@ func decimal_string(value__0 uint64) string {
     }
 }
 
-func _goml_m_inherent_i_closure__en_hd344b745b40be6f4a908632f0feb9f48_ment__0_i_apply(env0 closure_env_increment_0) struct{} {
+func _goml_m_inherent_i_closure__en_h0223a9befc2ebe8658869638c279e6f5_anup__0_i_apply(env0 closure_env_labeled_cleanup_0) struct{} {
+    var inline0 string = "outer cleanup"
+    var inline1 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(inline0)
+    _goml_runtime_core_string_println(inline1)
+    return struct{}{}
+}
+
+func _goml_m_inherent_i_closure__en_hba5cfe2d49e8e7932e64c822e4593e98_anup__1_i_apply(env0 closure_env_labeled_cleanup_1) struct{} {
+    var inline0 string = "inner cleanup"
+    var inline1 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(inline0)
+    _goml_runtime_core_string_println(inline1)
+    return struct{}{}
+}
+
+func _goml_m_inherent_i_closure__en_h79b4a32d6db2ef8c8920b1d54dab278c_ment__2_i_apply(env0 closure_env_increment_2) struct{} {
     var captured__0 *ref_int_x = env0.captured_0
     var compound_old0 int = ref_get__Ref_3int(captured__0)
     var compound_value0 int = 1
