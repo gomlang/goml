@@ -1,0 +1,280 @@
+package tests;
+
+use ecosystem::llvm::{Context, Value, Block, Operand, BinaryOp, IntPredicate, ErrorKind, OptimizationLevel};
+use std::testing;
+
+fn terminator(block: Block) -> Value {
+    testing::expect_some(ok(block.terminator()), "missing terminator")
+}
+
+#[test]
+fn parallel_edges_and_late_phi_edits_preserve_identity_and_users() -> () {
+    let context = Context::new();
+    defer {
+        let _ = context.close();
+    };
+    let (module, integer, function, builder) = setup(context);
+    let entry = ok(function.blocks())[0];
+    let merge = ok(function.append_block("merge"));
+    let parameter = ok(function.parameter(0));
+    let zero = ok(integer.zero());
+    let one = ok(integer.const_signed(1));
+    let condition = ok(builder.int_compare(IntPredicate::Equal, parameter, zero, "condition"));
+    ok(builder.conditional_branch(condition, merge, merge));
+    ok(builder.position_at_end(merge));
+    ok(builder.ret(parameter));
+    let ret = terminator(merge);
+    ok(builder.position_at_start(merge));
+    let phi = ok(builder.phi(integer, "merged"));
+    ok(phi.add_incoming(Vec::from_array([(zero, entry)])));
+    ok(phi.add_incoming(Vec::from_array([(zero, entry)])));
+    ok(ret.set_operand(0, phi));
+    ok(module.verify());
+    testing::assert_eq(ok(entry.successors()).len(), 2);
+    testing::assert_eq(ok(merge.predecessors()).len(), 2);
+    let alias = ok(merge.instructions())[0];
+    testing::assert(ok(alias.same_as(phi)));
+    testing::assert_eq(ok(phi.users()).len(), 1);
+    ok(builder.position_before(phi));
+    let saved = ok(builder.save_position());
+    let before = ok(module.ir());
+    invalid(phi.set_incoming(1, one, entry), ErrorKind::Argument);
+    invalid(phi.set_incoming(-1, zero, entry), ErrorKind::Argument);
+    invalid(phi.remove_incoming(2), ErrorKind::Argument);
+    invalid(phi.add_incoming(Vec::from_array([(zero, entry), (one, entry)])), ErrorKind::Argument);
+    testing::assert_eq(ok(module.ir()), before);
+    ok(phi.replace_incoming(Vec::from_array([(one, entry), (one, entry)])));
+    ok(phi.set_incoming(1, one, entry));
+    testing::assert(ok(alias.same_as(ok(merge.instructions())[0])));
+    testing::assert_eq(ok(alias.name()), "merged");
+    testing::assert(ok(ok(phi.incoming())[0].0.same_as(one)));
+    ok(builder.restore_position(saved));
+    invalid(builder.binary(BinaryOp::Add, parameter, one, "bad_position"), ErrorKind::Argument);
+    ok(module.verify());
+    ok(phi.remove_incoming(0));
+    invalid(module.verify(), ErrorKind::Verification);
+    ok(phi.add_incoming(Vec::from_array([(one, entry)])));
+    ok(module.verify());
+    ok(phi.replace_incoming(Vec::new()));
+    invalid(module.verify(), ErrorKind::Verification);
+    ok(phi.replace_incoming(Vec::from_array([(one, entry), (one, entry)])));
+    ok(module.verify());
+}
+
+#[test]
+fn insertion_points_and_erasure_invalidate_every_alias_safely() -> () {
+    let context = Context::new();
+    defer {
+        let _ = context.close();
+    };
+    let (module, integer, function, builder) = setup(context);
+    let entry = ok(function.blocks())[0];
+    let parameter = ok(function.parameter(0));
+    let sum = ok(builder.binary(BinaryOp::Add, parameter, ok(integer.const_signed(1)), "sum"));
+    ok(builder.ret(sum));
+    invalid(sum.erase(), ErrorKind::Argument);
+    invalid(builder.binary(BinaryOp::Add, parameter, parameter, "after"), ErrorKind::Argument);
+    ok(builder.position_before(sum));
+    let point = ok(builder.save_position());
+    invalid(builder.ret(parameter), ErrorKind::Argument);
+    let earlier = ok(builder.binary(BinaryOp::Mul, parameter, parameter, "earlier"));
+    ok(sum.set_operand(1, earlier));
+    invalid(sum.set_operand(2, parameter), ErrorKind::Argument);
+    invalid(sum.set_operand(0, ok(ok(context.int_type(32)).zero())), ErrorKind::Argument);
+    ok(sum.replace_all_uses_with(earlier));
+    testing::assert_eq(ok(sum.users()).len(), 0);
+    let alias = ok(entry.instructions())[1];
+    testing::assert(ok(alias.same_as(sum)));
+    ok(sum.erase());
+    testing::assert(alias.is_closed());
+    testing::assert(point.is_closed());
+    invalid(alias.ir(), ErrorKind::Closed);
+    invalid(builder.restore_position(point), ErrorKind::Closed);
+    invalid(builder.ret(parameter), ErrorKind::Argument);
+    invalid(parameter.erase(), ErrorKind::Argument);
+    ok(builder.clear_position());
+    let empty = ok(builder.save_position());
+    ok(builder.position_at_start(entry));
+    ok(builder.restore_position(empty));
+    invalid(builder.load(integer, earlier, "unpositioned"), ErrorKind::Argument);
+    ok(module.verify());
+    ok(module.promote_locals());
+    invalid(entry.instructions(), ErrorKind::Stale);
+    testing::assert_eq(ok(ok(module.function("f")).blocks()).len(), 1);
+}
+
+#[test]
+fn traversal_distinguishes_values_functions_blocks_and_phi_edges() -> () {
+    let context = Context::new();
+    defer {
+        let _ = context.close();
+    };
+    let module = ok(
+        context.parse_ir(
+            "declare i64 @callee(i64)\ndefine i64 @f(i64 %x) {\nentry:\n %r = call i64 @callee(i64 %x)\n br label %exit\nexit:\n %p = phi i64 [%r, %entry]\n ret i64 %p\n}\ndefine ptr @choose() {\na: br label %b\nb: %f = phi ptr [@callee, %a]\n ret ptr %f\n}",
+        ),
+    );
+    ok(module.verify());
+    testing::assert_eq(ok(module.functions()).len(), 3);
+    let function = ok(module.function("f"));
+    testing::assert_eq(ok(function.name()), "f");
+    testing::assert(ok(function.same_as(ok(module.functions())[1])));
+    let blocks = ok(function.blocks());
+    testing::assert_eq(ok(blocks[0].name()), "entry");
+    testing::assert(ok(ok(blocks[1].predecessors())[0].same_as(blocks[0])));
+    let instructions = ok(blocks[0].instructions());
+    let operands = ok(instructions[0].operands());
+    testing::assert_eq(operands.len(), 2);
+    match operands[0] {
+        Operand::Value(value) => testing::assert_eq(ok(value.name()), "x"),
+        _ => testing::fail("expected call argument"),
+    }
+    match operands[1] {
+        Operand::Function(value) => testing::assert_eq(ok(value.name()), "callee"),
+        _ => testing::fail("expected call target"),
+    }
+    match ok(instructions[1].operands())[0] {
+        Operand::Block(value) => testing::assert(ok(value.same_as(blocks[1]))),
+        _ => testing::fail("expected branch target"),
+    }
+    invalid(instructions[1].set_operand(0, ok(function.parameter(0))), ErrorKind::Argument);
+    invalid(instructions[0].set_operand(1, ok(function.parameter(0))), ErrorKind::Argument);
+    let phi = ok(blocks[1].instructions())[0];
+    testing::assert(ok(phi.is_phi()));
+    let incoming = ok(phi.incoming());
+    testing::assert(ok(incoming[0].0.same_as(instructions[0])));
+    testing::assert(ok(incoming[0].1.same_as(blocks[0])));
+    let choose = ok(module.function("choose"));
+    let chosen_phi = ok(ok(choose.blocks())[1].instructions())[0];
+    ok(chosen_phi.replace_incoming(ok(chosen_phi.incoming())));
+    ok(module.verify());
+}
+
+#[test]
+fn verifier_reports_dominance_and_incoming_predecessor_errors() -> () {
+    let context = Context::new();
+    defer {
+        let _ = context.close();
+    };
+    let module = ok(
+        context.parse_ir(
+            "define i64 @f(i1 %c, i64 %x) {\nentry: br i1 %c, label %left, label %right\nleft: %v = add i64 %x, 1\n br label %merge\nright: br label %merge\nmerge: ret i64 %v\n}",
+        ),
+    );
+    match module.verify() {
+        Err(error) => {
+            testing::assert_eq(error.kind, ErrorKind::Verification);
+            testing::assert(error.message.contains("dominate"));
+        },
+        Ok(_) => testing::fail("non-dominating value accepted"),
+    }
+    let function = ok(module.function("f"));
+    let blocks = ok(function.blocks());
+    let wrong = ok(blocks[1].instructions())[0];
+    ok(wrong.replace_all_uses_with(ok(function.parameter(1))));
+    ok(wrong.erase());
+    ok(module.verify());
+    let builder = ok(context.builder());
+    ok(builder.position_at_start(blocks[3]));
+    let phi = ok(builder.phi(ok(context.int_type(64)), "bad_predecessor"));
+    ok(phi.add_incoming(Vec::from_array([(ok(function.parameter(1)), blocks[0])])));
+    invalid(module.verify(), ErrorKind::Verification);
+    ok(
+        phi.replace_incoming(
+            Vec::from_array(
+                [(ok(function.parameter(1)), blocks[1]), (ok(function.parameter(1)), blocks[2])],
+            ),
+        ),
+    );
+    ok(module.verify());
+}
+
+#[test]
+fn locals_promote_to_phi_and_can_be_inspected_after_optimization() -> () {
+    let context = Context::new();
+    defer {
+        let _ = context.close();
+    };
+    let (module, integer, function, builder) = setup(context);
+    let entry = ok(function.blocks())[0];
+    let left = ok(function.append_block("left"));
+    let right = ok(function.append_block("right"));
+    let merge = ok(function.append_block("merge"));
+    let parameter = ok(function.parameter(0));
+    let condition = ok(
+        builder.int_compare(IntPredicate::SignedLess, parameter, ok(integer.zero()), "negative"),
+    );
+    ok(builder.conditional_branch(condition, left, right));
+    let local = ok(function.local(integer, "result"));
+    testing::assert(ok(ok(entry.instructions())[0].ir()).contains("alloca"));
+    invalid(local.write(builder, ok(ok(context.int_type(32)).zero())), ErrorKind::Argument);
+    ok(builder.position_at_end(left));
+    ok(
+        local.write(
+            builder,
+            ok(builder.binary(BinaryOp::Sub, ok(integer.zero()), parameter, "negated")),
+        ),
+    );
+    ok(builder.branch(merge));
+    ok(builder.position_at_end(right));
+    ok(local.write(builder, parameter));
+    ok(builder.branch(merge));
+    ok(builder.position_at_end(merge));
+    ok(builder.ret(ok(local.read(builder, "result_value"))));
+    let saved = ok(builder.save_position());
+    ok(module.verify());
+    ok(module.promote_locals());
+    testing::assert(local.is_closed());
+    testing::assert(saved.is_closed());
+    invalid(builder.restore_position(saved), ErrorKind::Stale);
+    invalid(local.read(builder, "old_local"), ErrorKind::Stale);
+    let ir = ok(module.ir());
+    testing::assert(!ir.contains("alloca"));
+    testing::assert(!ir.contains("load "));
+    testing::assert(!ir.contains("store "));
+    let fresh_blocks = ok(ok(module.function("f")).blocks());
+    let phi = ok(fresh_blocks[3].instructions())[0];
+    testing::assert(ok(phi.is_phi()));
+    testing::assert_eq(ok(phi.incoming()).len(), 2);
+    ok(module.optimize(OptimizationLevel::Default));
+    ok(module.verify());
+}
+
+#[test]
+fn ssa_edits_reject_foreign_owners_and_preserve_failed_edits() -> () {
+    let context = Context::new();
+    let other_context = Context::new();
+    defer {
+        let _ = context.close();
+        let _ = other_context.close();
+    };
+    let (module, integer, function, builder) = setup(context);
+    let (other_module, _, other_function, _) = setup(context);
+    let parameter = ok(function.parameter(0));
+    let foreign = ok(other_function.parameter(0));
+    let value = ok(builder.binary(BinaryOp::Add, parameter, parameter, "value"));
+    testing::assert_eq(ok(parameter.users()).len(), 1);
+    ok(builder.ret(value));
+    let before = ok(module.ir());
+    invalid(value.replace_all_uses_with(foreign), ErrorKind::Argument);
+    invalid(value.set_operand(0, foreign), ErrorKind::Argument);
+    invalid(value.replace_all_uses_with(ok(ok(context.int_type(32)).zero())), ErrorKind::Argument);
+    invalid(
+        value.replace_all_uses_with(ok(ok(other_context.int_type(64)).zero())),
+        ErrorKind::Argument,
+    );
+    invalid(function.entry_alloca(ok(other_context.int_type(64)), "foreign"), ErrorKind::Argument);
+    invalid(function.entry_alloca(ok(context.void_type()), "void"), ErrorKind::Argument);
+    testing::assert_eq(ok(module.ir()), before);
+    let sibling = ok(module.add_function("sibling", ok(function.signature())));
+    let sibling_parameter = ok(sibling.parameter(0));
+    invalid(value.replace_all_uses_with(sibling_parameter), ErrorKind::Argument);
+    invalid(value.set_operand(0, sibling_parameter), ErrorKind::Argument);
+    let saved = ok(builder.save_position());
+    ok(module.close());
+    testing::assert(saved.is_closed());
+    invalid(builder.restore_position(saved), ErrorKind::Closed);
+    invalid(value.users(), ErrorKind::Closed);
+    testing::assert(!integer.is_closed());
+    ok(other_module.close());
+}

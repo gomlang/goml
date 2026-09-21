@@ -1,0 +1,179 @@
+package tests;
+
+use ecosystem::llvm::{Context, Module, LlvmError, BinaryOp, IntPredicate, OptimizationLevel};
+use std::testing;
+use std::fs;
+use std::num;
+
+fn build_ssa_workload(context: Context) -> Result[Module, LlvmError] {
+    let module = context.module("ssa_workload")?;
+    let integer = context.int_type(64)?;
+    let signature = context.function_type(integer, Vec::from_array([integer]), false)?;
+    let function = module.add_function("nested", signature)?;
+    let entry = function.append_block("entry")?;
+    let outer = function.append_block("outer")?;
+    let inner_start = function.append_block("inner_start")?;
+    let inner = function.append_block("inner")?;
+    let choose = function.append_block("choose")?;
+    let add = function.append_block("add")?;
+    let subtract = function.append_block("subtract")?;
+    let next_outer = function.append_block("next_outer")?;
+    let exit = function.append_block("exit")?;
+    let builder = context.builder()?;
+    defer {
+        let _ = builder.close();
+    };
+    builder.position_at_end(entry)?;
+    builder.branch(outer)?;
+    let i = function.local(integer, "i")?;
+    let j = function.local(integer, "j")?;
+    let total = function.local(integer, "total")?;
+    let entry_instructions = entry.instructions()?;
+    builder.position_before(entry_instructions[entry_instructions.len() - 1])?;
+    i.write(builder, integer.zero()?)?;
+    total.write(builder, integer.zero()?)?;
+    builder.position_at_end(outer)?;
+    let outer_i = i.read(builder, "outer_i")?;
+    builder.conditional_branch(
+        builder.int_compare(IntPredicate::SignedLess, outer_i, function.parameter(0)?, "outer_test")?,
+        inner_start,
+        exit,
+    )?;
+    builder.position_at_end(inner_start)?;
+    j.write(builder, integer.zero()?)?;
+    builder.branch(inner)?;
+    builder.position_at_end(inner)?;
+    let inner_j = j.read(builder, "inner_j")?;
+    let inner_i = i.read(builder, "inner_i")?;
+    builder.conditional_branch(
+        builder.int_compare(IntPredicate::SignedLess, inner_j, inner_i, "inner_test")?,
+        choose,
+        next_outer,
+    )?;
+    builder.position_at_end(choose)?;
+    let parity = builder.binary(BinaryOp::And, inner_j, integer.const_signed(1)?, "parity")?;
+    builder.conditional_branch(
+        builder.int_compare(IntPredicate::Equal, parity, integer.zero()?, "even")?,
+        add,
+        subtract,
+    )?;
+    for (block, operation) in Vec::from_array([(add, BinaryOp::Add), (subtract, BinaryOp::Sub)]) {
+        builder.position_at_end(block)?;
+        let term = builder.binary(BinaryOp::Add, inner_i, inner_j, "term")?;
+        total.write(
+            builder,
+            builder.binary(operation, total.read(builder, "previous")?, term, "updated")?,
+        )?;
+        j.write(
+            builder,
+            builder.binary(BinaryOp::Add, inner_j, integer.const_signed(1)?, "next_j")?,
+        )?;
+        builder.branch(inner)?;
+    }
+    builder.position_at_end(next_outer)?;
+    i.write(builder, builder.binary(BinaryOp::Add, inner_i, integer.const_signed(1)?, "next_i")?)?;
+    builder.branch(outer)?;
+    builder.position_at_end(exit)?;
+    builder.ret(total.read(builder, "result")?)?;
+    let edited = module.add_function("edited", signature)?;
+    let entry = edited.append_block("entry")?;
+    let merge = edited.append_block("merge")?;
+    let parameter = edited.parameter(0)?;
+    builder.position_at_end(entry)?;
+    let twice = builder.binary(BinaryOp::Mul, parameter, integer.const_signed(2)?, "twice")?;
+    builder.conditional_branch(
+        builder.int_compare(IntPredicate::SignedLess, parameter, integer.zero()?, "negative")?,
+        merge,
+        merge,
+    )?;
+    builder.position_at_end(merge)?;
+    builder.ret(parameter)?;
+    builder.position_at_start(merge)?;
+    let phi = builder.phi(integer, "merged")?;
+    phi.add_incoming(Vec::from_array([(parameter, entry), (parameter, entry)]))?;
+    phi.replace_incoming(Vec::from_array([(twice, entry), (twice, entry)]))?;
+    let ret = merge.instructions()?[1];
+    ret.set_operand(0, phi)?;
+    builder.position_before(twice)?;
+    let triple = builder.binary(BinaryOp::Mul, parameter, integer.const_signed(3)?, "triple")?;
+    twice.replace_all_uses_with(triple)?;
+    twice.erase()?;
+    module.verify()?;
+    Result::Ok(module)
+}
+
+#[test]
+fn native_ssa_edits_and_nested_multi_backedge_loops_match_reference() -> () {
+    let directory = "_artifact/native-ssa-reference";
+    testing::assert_ok(fs::create_dir_all(directory));
+    let context = Context::new();
+    defer {
+        let _ = context.close();
+    };
+    let module = testing::expect_ok(build_ssa_workload(context), "build SSA workload");
+    for phase in 0..3 {
+        if phase == 1 {
+            testing::assert_ok(module.promote_locals());
+            let ir = testing::expect_ok(module.ir(), "promoted IR");
+            testing::assert(!ir.contains("alloca"));
+            testing::assert(!ir.contains("load "));
+            testing::assert(!ir.contains("store "));
+            let function = testing::expect_ok(module.function("nested"), "reacquire nested");
+            let mut phi_count = 0;
+            let mut three_way_phi = false;
+            for block in testing::expect_ok(function.blocks(), "blocks") {
+                for value in testing::expect_ok(block.instructions(), "instructions") {
+                    if testing::expect_ok(value.is_phi(), "is phi") {
+                        phi_count += 1;
+                        if testing::expect_ok(value.incoming(), "incoming").len() == 3 {
+                            three_way_phi = true;
+                        }
+                    }
+                }
+            }
+            testing::assert(phi_count >= 3);
+            testing::assert(three_way_phi);
+        } else if phase == 2 {
+            testing::assert_ok(module.optimize(OptimizationLevel::Aggressive));
+        }
+        let prefix = directory + "/phase-" + phase.to_string();
+        testing::assert_ok(
+            fs::write_file_structured(prefix + ".ll", testing::expect_ok(module.ir(), "IR")),
+        );
+        let _ = native_tool(
+            "/usr/lib/llvm-18/bin/opt",
+            Vec::from_array(["-passes=verify", "-disable-output", prefix + ".ll"]),
+        );
+        testing::assert_ok(module.emit_object(prefix + ".o", OptimizationLevel::None));
+        let _ = native_tool(
+            "cc",
+            Vec::from_array(["-O2", "tests/data/ssa_harness.c", prefix + ".o", "-o", prefix]),
+        );
+        let output = native_tool(prefix, Vec::new());
+        let lines = output.trim().split("\n");
+        testing::assert_eq(lines.len(), 65);
+        for index in 0..65 {
+            let n = index - 16;
+            let mut total = 0;
+            for i in 0..n {
+                for j in 0..i {
+                    if j % 2 == 0 {
+                        total += i + j;
+                    } else {
+                        total -= i + j;
+                    }
+                }
+            }
+            let fields = lines[index].split(" ");
+            testing::assert_eq(fields.len(), 2);
+            testing::assert_eq(
+                testing::expect_ok(num::parse_int_structured(fields[0]), "nested result"),
+                total,
+            );
+            testing::assert_eq(
+                testing::expect_ok(num::parse_int_structured(fields[1]), "edited result"),
+                3 * n,
+            );
+        }
+    }
+}
