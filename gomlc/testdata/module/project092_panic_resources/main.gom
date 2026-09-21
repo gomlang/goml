@@ -1,0 +1,349 @@
+package main;
+
+use std::context;
+use std::io;
+use io::Close;
+use std::os::linux::fd;
+use std::panic;
+use std::resource;
+use std::task;
+use std::testing;
+use std::time::{Duration};
+
+fn expect_panic[T](result: Result[T, panic::Panic], message: string) -> () {
+    testing::assert_eq(testing::expect_err(result, "expected panic").message(), message);
+}
+
+fn panic_value(message: string) -> isize {
+    panic::raise(message)
+}
+
+struct TrackedResource {
+    closed: Ref[isize],
+}
+
+impl Close for TrackedResource {
+    fn close(self: TrackedResource) -> Result[(), io::Error] {
+        self.closed.set(self.closed.get() + 1);
+        Result::Ok(())
+    }
+}
+
+fn cleanup_callbacks() -> () {
+    let order: Vec[string] = Vec::new();
+    let caught: Result[Result[(), resource::ScopeError[string, string]], panic::Panic] = panic::catch(
+        || resource::with_cleanup(
+            || panic::raise("action panic"),
+            || {
+                order.push("cleanup");
+                Result::Err("cleanup error")
+            },
+        ),
+    );
+    expect_panic(caught, "action panic");
+    testing::assert_eq(order.join(","), "cleanup");
+    let result: Result[isize, resource::ScopeError[string, string]] = resource::with_cleanup(
+        || Result::Err("action error"),
+        || Result::Err("cleanup error"),
+    );
+    let error = testing::expect_err(result, "both errors preserved");
+    testing::assert(error.action == Option::Some("action error"));
+    testing::assert(error.cleanup == Vec::from_array(["cleanup error"]));
+    let closed = Ref::new(0);
+    let caught: Result[Result[(), resource::ScopeError[string, io::Error]], panic::Panic] = panic::catch(
+        || io::with_resource(TrackedResource { closed }, |_| panic::raise("resource panic")),
+    );
+    expect_panic(caught, "resource panic");
+    testing::assert_eq(closed.get(), 1);
+    let caught: Result[Result[(), resource::ScopeError[string, string]], panic::Panic] = panic::catch(
+        || resource::with_cleanup(
+            || panic::raise("original panic"),
+            || panic::raise("cleanup panic"),
+        ),
+    );
+    expect_panic(caught, "cleanup panic");
+}
+
+fn resource_scope_unwinds() -> () {
+    let order: Vec[isize] = Vec::new();
+    let escaped: Ref[Option[resource::Scope[string]]] = Ref::new(Option::None);
+    let caught: Result[Result[(), resource::ScopeError[string, string]], panic::Panic] = panic::catch(
+        || resource::scope(
+            |scope| {
+                escaped.set(Option::Some(scope));
+                for index in 0..3 {
+                    testing::assert(
+                        scope.register(
+                            || {
+                                order.push(index);
+                                Result::Err(index.to_string())
+                            },
+                        ),
+                    );
+                }
+                panic::raise("scope action panic")
+            },
+        ),
+    );
+    expect_panic(caught, "scope action panic");
+    testing::assert(order == Vec::from_array([2, 1, 0]));
+    let scope = testing::expect_some(escaped.get(), "escaped resource scope");
+    testing::assert(scope.is_closed());
+    testing::assert(scope.close() == Vec::from_array(["2", "1", "0"]));
+    testing::assert(!scope.register(|| Result::Ok(())));
+}
+
+fn resource_cleanup_panic_wakes_concurrent_closers() -> () {
+    let scope: resource::Scope[string] = resource::Scope::new();
+    let order: Vec[string] = Vec::new();
+    let started = Channel::new(1);
+    let release = Channel::new(1);
+    let second_started = Channel::new(1);
+    testing::assert(
+        scope.register(
+            || {
+                order.push("old");
+                Result::Err("old error")
+            },
+        ),
+    );
+    testing::assert(
+        scope.register(
+            || {
+                order.push("panic");
+                panic::raise("scope cleanup panic")
+            },
+        ),
+    );
+    testing::assert(
+        scope.register(
+            || {
+                order.push("new");
+                started.send(());
+                let _ = release.recv();
+                Result::Err("new error")
+            },
+        ),
+    );
+    task::scope(
+        |tasks| {
+            let first = tasks.spawn(|_| panic::catch(|| scope.close()));
+            let _ = started.recv();
+            let second = tasks.spawn(
+                |_| {
+                    second_started.send(());
+                    scope.close()
+                },
+            );
+            let _ = second_started.recv();
+            release.send(());
+            expect_panic(first.join(), "scope cleanup panic");
+            testing::assert(second.join() == Vec::from_array(["new error", "old error"]));
+        },
+    );
+    testing::assert_eq(order.join(","), "new,panic,old");
+    testing::assert(scope.close() == Vec::from_array(["new error", "old error"]));
+}
+
+fn task_join_preserves_failure() -> () {
+    let saved: Ref[Option[task::Task[isize]]] = Ref::new(Option::None);
+    let caught: Result[isize, panic::Panic] = panic::catch(
+        || task::scope(
+            |scope| {
+                let child = scope.spawn(|_| panic_value("child panic"));
+                saved.set(Option::Some(child));
+                child.join()
+            },
+        ),
+    );
+    expect_panic(caught, "child panic");
+    let child = testing::expect_some(saved.get(), "failed task");
+    let ready = select {
+        recv(child.done()) as _ => true,
+        default => false,
+    };
+    testing::assert(ready);
+    task::scope(
+        |scope| {
+            let joins = Vec::new();
+            for _ in 0..4 {
+                joins.push(scope.spawn(|_| panic::catch(|| child.join())));
+            }
+            for joined in joins {
+                expect_panic(joined.join(), "child panic");
+            }
+        },
+    );
+    let caught: Result[isize, panic::Panic] = panic::catch(
+        || task::scope(
+            |scope| {
+                let child = testing::expect_some(
+                    scope.try_spawn(|_| panic_value("try child panic")),
+                    "spawn accepted",
+                );
+                child.join()
+            },
+        ),
+    );
+    expect_panic(caught, "try child panic");
+}
+
+fn concurrency_slot_is_returned() -> () {
+    let limit = task::ConcurrencyLimit::new(1);
+    task::scope(
+        |scope| {
+            let failed: Result[task::WaitResult[isize], panic::Panic] = panic::catch(
+                || {
+                    limit.run(scope.token(), |_| panic_value("limited panic"))
+                },
+            );
+            expect_panic(failed, "limited panic");
+            match limit.run(scope.token(), |_| 42) {
+                task::WaitResult::Completed(value) => testing::assert_eq(value, 42),
+                task::WaitResult::Cancelled => testing::fail("scope unexpectedly cancelled"),
+            }
+        },
+    );
+}
+
+fn concurrent_helpers_propagate_panics() -> () {
+    let never: Channel[()] = Channel::new(0);
+    for count in Vec::from_array([1, 64]) {
+        let values: Vec[isize] = Vec::new();
+        for index in 0..count {
+            values.push(index);
+        }
+        let caught: Result[Result[(), Vec[task::IndexedError[string]]], panic::Panic] = panic::catch(
+            || {
+                task::for_each_concurrent(
+                    2,
+                    values,
+                    |cancel, index| {
+                        if index == 0 {
+                            panic::raise("worker panic");
+                        }
+                        let _ = task::recv_with(cancel, never);
+                        Result::Ok(())
+                    },
+                )
+            },
+        );
+        expect_panic(caught, "worker panic");
+    }
+    let failure: (task::CancelToken) -> isize = |_| panic::raise("race panic");
+    let waiting: (task::CancelToken) -> isize = |cancel| {
+        let _ = task::recv_with(cancel, never);
+        42
+    };
+    expect_panic(panic::catch(|| task::race(Vec::from_array([failure, waiting]))), "race panic");
+}
+
+fn existing_defer_helpers_release_after_panic() -> () {
+    let descriptor = testing::expect_ok(fd::memfd("panic-resources", 0), "memfd");
+    defer {
+        let _ = descriptor.close();
+    };
+    let borrowed: Result[Result[(), io::Error], panic::Panic] = panic::catch(
+        || {
+            descriptor.with_raw_fd(|_| panic::raise("borrow panic"))
+        },
+    );
+    expect_panic(borrowed, "borrow panic");
+    testing::assert_ok(descriptor.descriptor_flags());
+    let descriptors = Vec::from_array([descriptor, descriptor]);
+    let borrowed: Result[Result[(), io::Error], panic::Panic] = panic::catch(
+        || {
+            fd::with_raw_fds(descriptors.as_slice(), |_| panic::raise("borrow many panic"))
+        },
+    );
+    expect_panic(borrowed, "borrow many panic");
+    testing::assert_ok(descriptor.close());
+    let escaped: Ref[Option[context::Context]] = Ref::new(Option::None);
+    let caught: Result[(), panic::Panic] = panic::catch(
+        || context::with_timeout(
+            context::Context::background(),
+            Duration::from_seconds(30),
+            |context, _| {
+                escaped.set(Option::Some(context));
+                panic::raise("context panic")
+            },
+        ),
+    );
+    expect_panic(caught, "context panic");
+    testing::assert(testing::expect_some(escaped.get(), "escaped context").check().is_err());
+}
+
+fn once_cell_initializer_panic_allows_retry_and_wakes_waiters() -> () {
+    let cell: OnceCell[isize] = OnceCell::new();
+    expect_panic(
+        panic::catch(|| cell.get_or_init(|| panic::raise("initializer panic"))),
+        "initializer panic",
+    );
+    testing::assert_eq(cell.get_or_init(|| 41), 41);
+    testing::assert_eq(cell.get_or_init(|| panic::raise("must remain initialized")), 41);
+    let shared: OnceCell[isize] = OnceCell::new();
+    let entered = Channel::new(1);
+    let release = Channel::new(1);
+    let waiting = Channel::new(0);
+    let initialized = Channel::new(8);
+    task::scope(
+        |scope| {
+            let first = scope.spawn(
+                |_| panic::catch(
+                    || shared.get_or_init(
+                        || {
+                            entered.send(());
+                            let _ = release.recv();
+                            panic::raise("concurrent initializer panic")
+                        },
+                    ),
+                ),
+            );
+            let _ = entered.recv();
+            let waiters = Vec::new();
+            for _ in 0..8 {
+                waiters.push(
+                    scope.spawn(
+                        |_| {
+                            waiting.send(());
+                            shared.get_or_init(
+                                || {
+                                    initialized.send(());
+                                    42
+                                },
+                            )
+                        },
+                    ),
+                );
+            }
+            for _ in 0..8 {
+                let _ = waiting.recv();
+            }
+            release.send(());
+            expect_panic(first.join(), "concurrent initializer panic");
+            for waiter in waiters {
+                testing::assert_eq(waiter.join(), 42);
+            }
+        },
+    );
+    testing::assert(initialized.recv().is_some());
+    let repeated = select {
+        recv(initialized) as _ => true,
+        default => false,
+    };
+    testing::assert(!repeated);
+}
+
+fn main() -> () {
+    let initial = task::active_scope_count();
+    cleanup_callbacks();
+    resource_scope_unwinds();
+    resource_cleanup_panic_wakes_concurrent_closers();
+    task_join_preserves_failure();
+    concurrency_slot_is_returned();
+    concurrent_helpers_propagate_panics();
+    existing_defer_helpers_release_after_panic();
+    once_cell_initializer_panic_allows_retry_and_wakes_waiters();
+    testing::assert_eq(task::active_scope_count(), initial);
+    println("panic resources ok");
+}

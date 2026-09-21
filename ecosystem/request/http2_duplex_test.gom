@@ -1,0 +1,148 @@
+package request;
+
+use std::bytes::{Bytes, FrozenBytes};
+use std::testing;
+use std::time::{Duration};
+
+#[test]
+fn http2_early_response_interrupts_blocked_request_upload() -> () {
+    let response = testing::expect_ok(
+        http2_test_peer(
+            FrozenBytes::from_string("x".repeat(16777216)),
+            1024,
+            |_, stream, context| {
+                http2_write(stream, context, 4, 0, 0, b"\x00\x04\x01\x00\x00\x00".as_slice())?;
+                http2_write(stream, context, 8, 0, 0, http2_number(16777216).as_slice())?;
+                context.sleep(Duration::from_milliseconds(100)).map_err(context_error)?;
+                http2_write(
+                    stream,
+                    context,
+                    1,
+                    5,
+                    1,
+                    hpack_encode(Vec::from_array([(":status", "413"), ("content-length", "0")])).as_slice(),
+                )?;
+                context.sleep(Duration::from_milliseconds(100)).map_err(context_error)
+            },
+        ),
+        "early response while request upload is blocked",
+    );
+    testing::assert_eq(response.status, 413);
+    testing::assert(response.body.is_empty());
+}
+
+#[test]
+fn http2_control_queue_rejects_peer_flood_without_blocking() -> () {
+    let controls: Channel[Http2Frame] = Channel::new(128);
+    for _ in 0..128 {
+        testing::assert_ok(http2_queue(controls, 6, 1, 0, Bytes::from_string("12345678")));
+    }
+    testing::assert_eq(
+        testing::expect_err(
+            http2_queue(controls, 6, 1, 0, Bytes::from_string("12345678")),
+            "bounded control queue",
+        ).kind,
+        ErrorKind::Transport,
+    );
+}
+
+#[test]
+fn http2_server_can_explicitly_disable_push() -> () {
+    let response = testing::expect_ok(
+        http2_test_peer(
+            FrozenBytes::new(),
+            0,
+            |reader, stream, context| {
+                http2_write(stream, context, 4, 0, 0, b"\x00\x02\x00\x00\x00\x00".as_slice())?;
+                let acknowledged = http2_read(reader)?;
+                testing::assert_eq(acknowledged.kind, 4);
+                testing::assert_eq(acknowledged.flags, 1);
+                http2_write(stream, context, 1, 5, 1, b"\x88".as_slice())
+            },
+        ),
+        "server SETTINGS_ENABLE_PUSH=0",
+    );
+    testing::assert_eq(response.status, 200);
+}
+
+#[test]
+fn http2_initial_window_change_cannot_overflow_existing_credit() -> () {
+    let result = http2_test_peer(
+        FrozenBytes::new(),
+        0,
+        |reader, stream, context| {
+            http2_write(stream, context, 4, 0, 0, Bytes::new().as_slice())?;
+            testing::assert_eq(http2_read(reader)?.kind, 4);
+            http2_write(stream, context, 8, 0, 1, http2_number(0x7fffffff - 65535).as_slice())?;
+            http2_write(stream, context, 4, 0, 0, b"\x00\x04\x00\x01\x00\x00".as_slice())
+        },
+    );
+    testing::assert_eq(
+        testing::expect_err(result, "SETTINGS window overflow").kind,
+        ErrorKind::Transport,
+    );
+}
+
+#[test]
+fn http2_trims_outgoing_field_whitespace_and_rejects_malformed_responses() -> () {
+    let headers = testing::expect_ok(Headers::new().append("x-value", " \tvalue\t "), "header");
+    let block = testing::expect_ok(
+        http2_request_headers(
+            "GET",
+            testing::expect_ok(Url::parse("https://example.test/"), "URL"),
+            headers,
+            FrozenBytes::new(),
+        ),
+        "request headers",
+    );
+    let decoded = testing::expect_ok(Hpack::new().decode(block, 8192), "HPACK fields");
+    testing::assert(decoded.contains(("x-value", "value")));
+    for whitespace in[" value", "value ", "\tvalue", "value\t"] {
+        testing::assert_err(
+            http2_response_headers(
+                Vec::from_array([(":status", "200"), ("x-value", whitespace)]),
+                false,
+            ),
+        );
+    }
+    for status in["600", "999"] {
+        testing::assert_err(http2_response_headers(Vec::from_array([(":status", status)]), false));
+    }
+    testing::assert_err(
+        http2_response_headers(Vec::from_array([(":status", "200"), ("te", "trailers")]), false),
+    );
+}
+
+#[test]
+fn http2_tiny_data_frames_do_not_overfill_control_queue() -> () {
+    let response = testing::expect_ok(
+        http2_test_peer(
+            FrozenBytes::new(),
+            1000,
+            |reader, stream, context| {
+                http2_write(stream, context, 4, 0, 0, Bytes::new().as_slice())?;
+                testing::assert_eq(http2_read(reader)?.kind, 4);
+                http2_write(
+                    stream,
+                    context,
+                    1,
+                    4,
+                    1,
+                    hpack_encode(Vec::from_array([(":status", "200"), ("content-length", "1000")])).as_slice(),
+                )?;
+                for index in 0..1000 {
+                    let flags: byte = if index == 999 {
+                        1
+                    } else {
+                        0
+                    };
+                    http2_write(stream, context, 0, flags, 1, b"x".as_slice())?;
+                }
+                Result::Ok(())
+            },
+        ),
+        "many small DATA frames",
+    );
+    testing::assert_eq(response.status, 200);
+    testing::assert(response.body == FrozenBytes::from_string("x".repeat(1000)));
+}

@@ -1,0 +1,123 @@
+package request;
+
+use std::bytes::{Bytes};
+use std::net;
+use std::task;
+use std::testing;
+
+fn retry_pool(client: Client, url: Url, connection: Http2Connection) -> () {
+    let entries = client.http2.recv().unwrap_or(Vec::new());
+    entries.push((url.origin + "|" + url.origin, connection));
+    client.http2.send(entries);
+}
+
+#[test]
+fn http2_client_replays_refused_requests_on_new_streams_with_a_bounded_attempt_count() -> () {
+    for refuse_forever in Vec::from_array([false, true]) {
+        multiplex_peer(
+            |reader, stream, context| {
+                http2_write(stream, context, 4, 0, 0, Bytes::new().as_slice())?;
+                for attempt in 0..3 {
+                    let ids = multiplex_headers(reader, 1)?;
+                    testing::assert_eq(ids.get(0), attempt * 2 + 1);
+                    if attempt == 1 && !refuse_forever {
+                        http2_write(stream, context, 1, 5, ids.get(0), b"\x88".as_slice())?;
+                        return Result::Ok(())
+                    }
+                    http2_write(stream, context, 3, 0, ids.get(0), http2_number(7).as_slice())?;
+                }
+                Result::Ok(())
+            },
+            |connection, context| {
+                let client = testing::expect_ok(
+                    Client::builder().no_proxy().build(),
+                    "retry client",
+                );
+                defer client.close();
+                let url = testing::expect_ok(Url::parse("https://example.test/retry"), "retry URL");
+                retry_pool(client, url, connection);
+                let response = client.post(url.to_string()).send_with(context);
+                if refuse_forever {
+                    testing::assert_eq(
+                        testing::expect_err(response, "bounded retry").kind,
+                        ErrorKind::Transport,
+                    );
+                } else {
+                    testing::assert_eq(
+                        testing::expect_ok(response, "refused retry").status().as_isize(),
+                        200,
+                    );
+                }
+            },
+        );
+    }
+}
+
+#[test]
+fn http2_client_goaway_replays_unprocessed_buffered_post_on_a_new_connection() -> () {
+    let listener = testing::expect_ok(
+        net::TcpListener::bind(net::SocketAddr::new(net::IpAddr::V4([127, 0, 0, 1]), 0)),
+        "retry listener",
+    );
+    defer {
+        let _ = listener.close();
+    };
+    let address = testing::expect_ok(listener.local_addr(), "retry address");
+    let url = testing::expect_ok(
+        Url::parse("http://" + address.to_string() + "/replay"),
+        "retry URL",
+    );
+    multiplex_peer(
+        |reader, stream, context| {
+            http2_write(stream, context, 4, 0, 0, Bytes::new().as_slice())?;
+            testing::assert(multiplex_headers(reader, 1)? == Vec::from_array([1]));
+            let payload = http2_number(0);
+            payload.extend_from_slice(http2_number(0).as_slice());
+            http2_write(stream, context, 7, 0, 0, payload.as_slice())
+        },
+        |connection, context| {
+            let client = testing::expect_ok(Client::builder().no_proxy().build(), "retry client");
+            defer client.close();
+            retry_pool(client, url, connection);
+            task::scope(
+                |scope| {
+                    let peer = scope.spawn(
+                        |_| {
+                            let (socket, _) = listener.accept_with(
+                                net::WaitOptions::new().with_context(context),
+                            ).map_err(io_error)?;
+                            let stream = Stream::Tcp(socket);
+                            defer stream.close();
+                            let reader = Reader::new(stream, context);
+                            let budget = Vec::from_array([8192]);
+                            testing::assert_eq(reader.line(budget)?, "POST /replay HTTP/1.1");
+                            let mut content_length = "";
+                            loop {
+                                let line = reader.line(budget)?;
+                                if line == "" {
+                                    break
+                                }
+                                if ascii_lower(line).starts_with("content-length:") {
+                                    content_length = line.split_once(":").unwrap_or(("", "")).1.trim();
+                                }
+                            }
+                            testing::assert_eq(content_length, "7");
+                            testing::assert(reader.exact(7)?.to_vec() == b"replay!");
+                            stream.write(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".as_slice(),
+                                context,
+                            )
+                        },
+                    );
+                    let response = testing::expect_ok(
+                        client.post(url.to_string()).text("replay!").send_with(context),
+                        "GOAWAY replay",
+                    );
+                    testing::assert_eq(response.version(), "HTTP/1.1");
+                    testing::assert_eq(testing::expect_ok(response.text(), "replayed body"), "ok");
+                    testing::assert_ok(peer.join());
+                },
+            );
+        },
+    );
+}

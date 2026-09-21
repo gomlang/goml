@@ -1,0 +1,229 @@
+package request;
+
+use std::bytes::{Bytes, FrozenBytes};
+use std::context;
+use std::net;
+use std::task;
+use std::testing;
+use std::time::{Duration};
+
+fn http2_exchange(
+    stream: Stream,
+    context: context::Context,
+    method: string,
+    url: Url,
+    headers: Headers,
+    body: FrozenBytes,
+    limit: isize,
+    max_headers: i64,
+) -> Result[Received, Error] {
+    let connection = http2_new_connection(stream, context, max_headers, Duration::from_seconds(90))?;
+    defer http2_close(connection);
+    let encoded = http2_request_headers(method, url, headers, body)?;
+    let request = http2_register(connection, method, encoded, body, limit).ok_or(
+        transport_error("HTTP/2 connection is unavailable"),
+    )?;
+    http2_await(request, context).map_err(
+        |failure| match failure {
+            Http2Failure::Failed(error) | Http2Failure::Retry(error) => error,
+        },
+    )
+}
+
+fn http2_test_peer(
+    body: FrozenBytes,
+    limit: isize,
+    peer: (Reader, Stream, context::Context) -> Result[(), Error],
+) -> Result[Received, Error] {
+    context::with_timeout(
+        context::Context::background(),
+        Duration::from_seconds(5),
+        |context, _| {
+            let listener = testing::expect_ok(
+                net::TcpListener::bind(net::SocketAddr::new(net::IpAddr::V4([127, 0, 0, 1]), 0)),
+                "HTTP/2 listener",
+            );
+            defer {
+                let _ = listener.close();
+            };
+            let address = testing::expect_ok(listener.local_addr(), "address");
+            task::scope(
+                |scope| {
+                    let server = scope.spawn(
+                        |_| {
+                            let (socket, _) = testing::expect_ok(
+                                listener.accept_with(net::WaitOptions::new().with_context(context)),
+                                "HTTP/2 accept",
+                            );
+                            let stream = Stream::Tcp(socket);
+                            defer stream.close();
+                            let reader = Reader::new(stream, context);
+                            testing::assert(
+                                testing::expect_ok(reader.exact(24), "client preface").to_vec()
+                                    == b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+                            );
+                            testing::assert_eq(
+                                testing::expect_ok(http2_read(reader), "client settings").kind,
+                                4,
+                            );
+                            testing::assert_eq(
+                                testing::expect_ok(http2_read(reader), "request headers").kind,
+                                1,
+                            );
+                            peer(reader, stream, context)
+                        },
+                    );
+                    let stream = Stream::Tcp(
+                        testing::expect_ok(
+                            net::TcpStream::connect_with(
+                                address,
+                                net::WaitOptions::new().with_context(context),
+                            ),
+                            "HTTP/2 connect",
+                        ),
+                    );
+                    let response = http2_exchange(
+                        stream,
+                        context,
+                        "POST",
+                        testing::expect_ok(Url::parse("http://" + address.to_string() + "/"), "URL"),
+                        Headers::new(),
+                        body,
+                        limit,
+                        8192,
+                    );
+                    stream.close();
+                    if let Err(error) = server.join() {
+                        testing::fail("HTTP/2 peer: " + error.to_string());
+                    }
+                    response
+                },
+            )
+        },
+    )
+}
+
+#[test]
+fn http2_live_flow_control_continuations_informational_and_trailers() -> () {
+    let response = testing::expect_ok(
+        http2_test_peer(
+            FrozenBytes::from_string("x".repeat(100000)),
+            100000,
+            |reader, stream, context| {
+                http2_write(stream, context, 4, 0, 0, b"\x00\x04\x00\x00\x04\x00".as_slice())?;
+                let mut length = 0;
+                loop {
+                    let frame = http2_read(reader)?;
+                    if frame.kind == 0 {
+                        testing::assert(frame.payload.len() <= 1024);
+                        for byte in frame.payload.as_slice() {
+                            testing::assert_eq(byte, b'x');
+                        }
+                        length += frame.payload.len();
+                        if frame.flags & 1 != 0 {
+                            break
+                        }
+                        let increment = http2_number(frame.payload.len());
+                        http2_write(stream, context, 8, 0, 0, increment.as_slice())?;
+                        http2_write(stream, context, 8, 0, 1, increment.as_slice())?;
+                    } else {
+                        testing::assert_eq(frame.kind, 4);
+                    }
+                }
+                testing::assert_eq(length, 100000);
+                http2_write(stream, context, 6, 0, 0, b"12345678".as_slice())?;
+                http2_write(
+                    stream,
+                    context,
+                    1,
+                    4,
+                    1,
+                    hpack_encode(Vec::from_array([(":status", "103"), ("link", "</asset>")])).as_slice(),
+                )?;
+                let headers = hpack_encode(
+                    Vec::from_array(
+                        [
+                            (":status", "200"),
+                            ("content-length", "70000"),
+                            ("x-many", "one"),
+                            ("x-many", "two"),
+                        ],
+                    ),
+                );
+                http2_write(stream, context, 1, 0, 1, headers.slice(0, 2))?;
+                http2_write(stream, context, 9, 4, 1, headers.slice(2, headers.len()))?;
+                let mut sent = 0;
+                while sent < 70000 {
+                    let count = if 70000 - sent > 16384 {
+                        16384
+                    } else {
+                        70000 - sent
+                    };
+                    http2_write(stream, context, 0, 0, 1, "y".repeat(count).to_bytes().as_slice())?;
+                    let mut updates = 0;
+                    while updates < 2 && sent + count < 70000 {
+                        let frame = http2_read(reader)?;
+                        if frame.kind == 8 {
+                            updates += 1;
+                        } else {
+                            testing::assert_eq(frame.kind, 6);
+                        }
+                    }
+                    sent += count;
+                }
+                http2_write(
+                    stream,
+                    context,
+                    1,
+                    5,
+                    1,
+                    hpack_encode(Vec::from_array([("x-done", "yes")])).as_slice(),
+                )
+            },
+        ),
+        "HTTP/2 exchange",
+    );
+    testing::assert_eq(response.status, 200);
+    testing::assert_eq(response.version, "HTTP/2.0");
+    testing::assert(response.body == FrozenBytes::from_string("y".repeat(70000)));
+    testing::assert(response.headers.get_all("x-many") == Vec::from_array(["one", "two"]));
+}
+
+#[test]
+fn http2_live_rejects_malformed_framing_and_declared_body_lengths() -> () {
+    for scenario in 0..5 {
+        let response = http2_test_peer(
+            FrozenBytes::new(),
+            16,
+            |reader, stream, context| {
+                http2_write(stream, context, 4, 0, 0, Bytes::new().as_slice())?;
+                testing::assert_eq(http2_read(reader)?.kind, 4);
+                if scenario == 0 {
+                    http2_write(stream, context, 0, 1, 1, b"x".as_slice())
+                } else if scenario == 1 {
+                    http2_write(
+                        stream,
+                        context,
+                        1,
+                        4,
+                        1,
+                        hpack_encode(Vec::from_array([(":status", "200"), ("content-length", "4")])).as_slice(),
+                    )?;
+                    http2_write(stream, context, 0, 1, 1, b"xx".as_slice())
+                } else if scenario == 2 {
+                    http2_write(stream, context, 1, 0, 1, b"\x88".as_slice())?;
+                    http2_write(stream, context, 0, 1, 1, b"x".as_slice())
+                } else if scenario == 3 {
+                    http2_write(stream, context, 1, 4, 1, b"\x88".as_slice())?;
+                    http2_write(stream, context, 0, 9, 1, b"\x03x".as_slice())
+                } else {
+                    stream.write(b"\x00\x40\x01\x00\x00\x00\x00\x00\x01".as_slice(), context)
+                }
+            },
+        );
+        testing::assert_eq(
+            testing::expect_err(response, "malformed HTTP/2 response").kind,
+            ErrorKind::Transport,
+        );
+    }
+}

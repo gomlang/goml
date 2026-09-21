@@ -1,0 +1,462 @@
+package tests;
+
+use ecosystem::web;
+use web::{Router, Response, Error, ErrorKind, Limits, Server};
+use std::bytes::{Bytes};
+use std::net::{TcpStream, SocketAddr, WaitOptions};
+use std::task;
+use std::testing;
+use std::time;
+use time::{Duration, Timer};
+
+fn transport_wait() -> WaitOptions {
+    WaitOptions::new().with_timeout(Duration::from_seconds(2))
+}
+
+fn transport_server(router: Router) -> Server {
+    testing::expect_ok(router.serve("127.0.0.1:0"), "serve TCP")
+}
+
+fn transport_connect(server: Server) -> TcpStream {
+    let address = testing::expect_ok(server.address(), "server address");
+    testing::expect_ok(
+        TcpStream::connect_with(
+            testing::expect_ok(SocketAddr::parse(address), "socket address"),
+            transport_wait(),
+        ),
+        "TCP connect",
+    )
+}
+
+fn transport_send(stream: TcpStream, data: string) -> () {
+    testing::assert_ok(stream.write_all_with(data.to_bytes().as_slice(), transport_wait()));
+}
+
+fn transport_exact(stream: TcpStream, length: isize) -> string {
+    let data = Vec::new();
+    for _ in 0..length {
+        data.push(0);
+    }
+    testing::assert_ok(stream.read_exact_with(data.as_mut_slice(), transport_wait()));
+    let (valid, result) = string_from_utf8(data);
+    testing::assert(valid);
+    result
+}
+
+fn transport_line(stream: TcpStream) -> string {
+    let mut result = "";
+    loop {
+        result += transport_exact(stream, 1);
+        testing::assert(result.byte_len() < 8192);
+        if result.ends_with("\r\n") {
+            return result
+        }
+    }
+}
+
+fn transport_head(stream: TcpStream) -> string {
+    let mut result = "";
+    loop {
+        let line = transport_line(stream);
+        result += line;
+        if line == "\r\n" {
+            return result
+        }
+    }
+}
+
+fn transport_closed(stream: TcpStream) -> string {
+    let data = Vec::new();
+    let buffer = Vec::new();
+    for _ in 0..4096 {
+        buffer.push(0);
+    }
+    loop {
+        let count = testing::expect_ok(
+            stream.read_with(buffer.as_mut_slice(), transport_wait()),
+            "read response until close",
+        );
+        if count == 0 {
+            let (valid, result) = string_from_utf8(data);
+            testing::assert(valid);
+            return result
+        }
+        data.extend(buffer.slice(0, count).to_vec());
+        testing::assert(data.len() <= 1048576);
+    }
+}
+
+fn transport_receive[T](channel: Channel[T]) -> T {
+    let timer = Timer::new(Duration::from_seconds(2));
+    defer {
+        let _ = timer.stop();
+    };
+    let value = select {
+        recv(channel) as value => value,
+        recv(timer.done()) as _ => Option::None,
+    };
+    testing::expect_some(value, "transport event within deadline")
+}
+
+fn transport_request(server: Server, request: string) -> string {
+    let stream = transport_connect(server);
+    defer {
+        let _ = stream.close();
+    };
+    transport_send(stream, request);
+    transport_closed(stream)
+}
+
+#[test]
+fn live_tcp_stream_arrives_before_producer_finishes() -> () {
+    let entered = Channel::new(1);
+    let release = Channel::new(1);
+    let finished = Channel::new(1);
+    let server = transport_server(
+        Router::new().get(
+            "/",
+            |_| Result::Ok(
+                Response::stream(
+                    200,
+                    "text/plain",
+                    |writer| {
+                        writer.text("first\n")?;
+                        entered.send(());
+                        let _ = release.recv();
+                        let result = writer.text("second\n");
+                        finished.send(());
+                        result
+                    },
+                ),
+            ),
+        ),
+    );
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(1));
+    };
+    let stream = transport_connect(server);
+    defer {
+        let _ = stream.close();
+    };
+    transport_send(stream, "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let head = transport_head(stream);
+    testing::assert(head.starts_with("HTTP/1.1 200 "));
+    testing::assert(head.to_ascii_lowercase().contains("transfer-encoding: chunked\r\n"));
+    testing::assert_eq(transport_exact(stream, 11), "6\r\nfirst\n\r\n");
+    transport_receive(entered);
+    let complete = select {
+        recv(finished) as _ => true,
+        default => false,
+    };
+    testing::assert(!complete);
+    release.send(());
+    testing::assert_eq(transport_closed(stream), "7\r\nsecond\n\r\n0\r\n\r\n");
+    transport_receive(finished);
+}
+
+#[test]
+fn live_tcp_disconnect_cancels_stream_producer() -> () {
+    let finished: Channel[Result[(), Error]] = Channel::new(1);
+    let router = Router::new().get(
+        "/",
+        |request| Result::Ok(
+            Response::stream(
+                200,
+                "text/plain",
+                |writer| {
+                    writer.text("first\n")?;
+                    let result = request.wait(Duration::from_seconds(5));
+                    finished.send(result);
+                    result
+                },
+            ),
+        ),
+    ).limits(Limits { request_timeout: Duration::from_seconds(10), ..Limits::new() });
+    let server = transport_server(router);
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(1));
+    };
+    let stream = transport_connect(server);
+    transport_send(stream, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    testing::assert(transport_head(stream).starts_with("HTTP/1.1 200 "));
+    testing::assert_eq(transport_exact(stream, 11), "6\r\nfirst\n\r\n");
+    testing::assert_ok(stream.close());
+    testing::assert_eq(
+        testing::expect_err(transport_receive(finished), "disconnect cancellation").kind,
+        ErrorKind::Cancelled,
+    );
+}
+
+#[test]
+fn live_tcp_stream_backpressure_bounds_pending_output() -> () {
+    let produced = Channel::new(1);
+    produced.send(0);
+    let entered = Channel::new(1);
+    let finished = Channel::new(1);
+    let block = Bytes::new();
+    for _ in 0..65536 {
+        block.push(b'x');
+    }
+    let server = transport_server(
+        Router::new().get(
+            "/",
+            |_| Result::Ok(
+                Response::stream(
+                    200,
+                    "application/octet-stream",
+                    |writer| {
+                        for index in 0..32768 {
+                            if let Result::Err(error) = writer.write(block) {
+                                finished.send(());
+                                return Result::Err(error)
+                            }
+                            let count = produced.recv().unwrap_or(0);
+                            produced.send(count + block.len());
+                            if index == 0 {
+                                entered.send(());
+                            }
+                        }
+                        finished.send(());
+                        Result::Ok(())
+                    },
+                ),
+            ),
+        ).limits(Limits { request_timeout: Duration::from_seconds(5), ..Limits::new() }),
+    );
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(1));
+    };
+    let stream = transport_connect(server);
+    transport_send(stream, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    transport_receive(entered);
+    time::sleep(Duration::from_milliseconds(40));
+    let count = transport_receive(produced);
+    produced.send(count);
+    testing::assert(count > 0 && count < 33554432);
+    testing::assert_ok(stream.close());
+    transport_receive(finished);
+}
+
+#[test]
+fn live_tcp_concurrency_limit_and_forced_shutdown() -> () {
+    let entered = Channel::new(1);
+    let finished: Channel[Result[(), Error]] = Channel::new(1);
+    let server = transport_server(
+        Router::new().get(
+            "/",
+            |request| {
+                entered.send(());
+                let result = request.wait(Duration::from_seconds(10));
+                finished.send(result);
+                Result::Ok(Response::text(200, "done"))
+            },
+        ).limits(
+            Limits {
+                concurrent_requests: 1,
+                request_timeout: Duration::from_seconds(20),
+                ..Limits::new(),
+            },
+        ),
+    );
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(1));
+    };
+    let first = transport_connect(server);
+    defer {
+        let _ = first.close();
+    };
+    transport_send(first, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    transport_receive(entered);
+    let second = transport_request(
+        server,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    testing::assert(second.starts_with("HTTP/1.1 503 "));
+    let before = time::Instant::now();
+    testing::assert_eq(
+        testing::expect_err(server.shutdown(Duration::from_milliseconds(30)), "forced shutdown").kind,
+        ErrorKind::Timeout,
+    );
+    testing::assert(before.elapsed().as_milliseconds() < 1000);
+    testing::assert_eq(
+        testing::expect_err(transport_receive(finished), "forced cancellation").kind,
+        ErrorKind::Cancelled,
+    );
+    testing::assert(server.is_closed());
+}
+
+#[test]
+fn live_tcp_concurrent_graceful_shutdown_delivers_inflight_response() -> () {
+    let entered = Channel::new(1);
+    let release = Channel::new(1);
+    let server = transport_server(
+        Router::new().get(
+            "/",
+            |_| {
+                entered.send(());
+                let _ = release.recv();
+                Result::Ok(Response::text(200, "done"))
+            },
+        ),
+    );
+    let stream = transport_connect(server);
+    defer {
+        let _ = stream.close();
+        let _ = server.shutdown(Duration::from_seconds(1));
+    };
+    transport_send(stream, "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    transport_receive(entered);
+    task::scope(
+        |scope| {
+            let finished = Channel::new(4);
+            for _ in 0..4 {
+                let _ = scope.spawn(
+                    |_| {
+                        finished.send(server.shutdown(Duration::from_seconds(1)));
+                    },
+                );
+            }
+            let before = time::Instant::now();
+            while !server.is_closed() && before.elapsed().as_milliseconds() < 500 {
+                time::sleep(Duration::from_milliseconds(1));
+            }
+            testing::assert(server.is_closed());
+            release.send(());
+            let response = transport_closed(stream);
+            testing::assert(response.starts_with("HTTP/1.1 200 "));
+            testing::assert(response.ends_with("\r\n\r\ndone"));
+            for _ in 0..4 {
+                testing::assert_ok(transport_receive(finished));
+            }
+        },
+    );
+}
+
+#[test]
+fn live_tcp_forced_shutdown_cancels_handler_with_unread_body() -> () {
+    let entered = Channel::new(1);
+    let finished: Channel[Result[(), Error]] = Channel::new(1);
+    let server = transport_server(
+        Router::new().post(
+            "/",
+            |request| {
+                entered.send(());
+                let result = request.wait(Duration::from_seconds(10));
+                finished.send(result);
+                Result::Ok(Response::text(200, "done"))
+            },
+        ).limits(Limits { request_timeout: Duration::from_seconds(20), ..Limits::new() }),
+    );
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(1));
+    };
+    let stream = transport_connect(server);
+    defer {
+        let _ = stream.close();
+    };
+    let body = Bytes::new();
+    for _ in 0..262144 {
+        body.push(b'x');
+    }
+    transport_send(stream, "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 262144\r\n\r\n");
+    testing::assert_ok(stream.write_all_with(body.as_slice(), transport_wait()));
+    transport_receive(entered);
+    time::sleep(Duration::from_milliseconds(20));
+    testing::assert_eq(
+        testing::expect_err(
+            server.shutdown(Duration::from_milliseconds(30)),
+            "unread body shutdown",
+        ).kind,
+        ErrorKind::Timeout,
+    );
+    testing::assert_eq(
+        testing::expect_err(transport_receive(finished), "unread body cancellation").kind,
+        ErrorKind::Cancelled,
+    );
+}
+
+#[test]
+fn live_tcp_keepalive_does_not_consume_handler_slots() -> () {
+    let server = transport_server(
+        Router::new().get("/", |_| Result::Ok(Response::text(200, "alive"))).limits(
+            Limits {
+                concurrent_requests: 1,
+                request_timeout: Duration::from_milliseconds(100),
+                ..Limits::new(),
+            },
+        ),
+    );
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(1));
+    };
+    let idle = transport_connect(server);
+    defer {
+        let _ = idle.close();
+    };
+    transport_send(idle, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    testing::assert(transport_head(idle).starts_with("HTTP/1.1 200 "));
+    testing::assert_eq(transport_exact(idle, 5), "alive");
+    let response = transport_request(
+        server,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    testing::assert(response.starts_with("HTTP/1.1 200 "));
+    testing::assert(response.ends_with("\r\n\r\nalive"));
+    time::sleep(Duration::from_milliseconds(120));
+    transport_send(idle, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    testing::assert(transport_head(idle).starts_with("HTTP/1.1 200 "));
+    testing::assert_eq(transport_exact(idle, 5), "alive");
+}
+
+#[test]
+fn live_tcp_chunked_limits_deadlines_and_malformed_framing() -> () {
+    let server = transport_server(
+        Router::new().post("/", |request| Result::Ok(Response::text(200, request.text()?))).limits(
+            Limits {
+                body_bytes: 5,
+                request_timeout: Duration::from_milliseconds(50),
+                header_timeout: Duration::from_milliseconds(100),
+                ..Limits::new(),
+            },
+        ),
+    );
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(1));
+    };
+    let prefix = "POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n";
+    let success = transport_request(
+        server,
+        prefix
+            + "Transfer-Encoding: chunked\r\n\r\n2\r\nab\r\n3;name=value\r\ncde\r\n0\r\nX-Trace: yes\r\n\r\n",
+    );
+    testing::assert(success.starts_with("HTTP/1.1 200 "));
+    testing::assert(success.ends_with("\r\n\r\nabcde"));
+    let oversized = transport_request(
+        server,
+        prefix + "Transfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n",
+    );
+    testing::assert(oversized.starts_with("HTTP/1.1 413 "));
+    let slow = transport_request(server, prefix + "Content-Length: 4\r\n\r\na");
+    testing::assert(slow.starts_with("HTTP/1.1 504 "));
+    for headers in[
+        "Content-Length: 1\r\nContent-Length: 2\r\n\r\nx",
+        "Content-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "Transfer-Encoding: gzip, chunked\r\n\r\n",
+        "Content-Length: -1\r\n\r\n",
+        "Content-Length: 9223372036854775808\r\n\r\n",
+        "Transfer-Encoding: chunked\r\n\r\nX\r\n",
+        "Transfer-Encoding: chunked\r\n\r\n1\r\nx!\r\n0\r\n\r\n",
+        "Transfer-Encoding: chunked\r\n\r\n0\r\nContent-Length: 1\r\n\r\n",
+    ] {
+        let response = transport_request(server, prefix + headers);
+        testing::assert(response.starts_with("HTTP/1.1 400 "));
+    }
+    for malformed in[
+        "GET / HTTP/1.1\r\nConnection: close\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",
+        "GET / HTTP/1.1\nHost: localhost\n\n",
+        "GET / HTTP/9.9\r\nHost: localhost\r\n\r\n",
+    ] {
+        testing::assert(transport_request(server, malformed).starts_with("HTTP/1.1 400 "));
+    }
+}

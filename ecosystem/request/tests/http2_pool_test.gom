@@ -1,0 +1,164 @@
+package tests;
+
+use ecosystem::request::{Client, ErrorKind};
+use std::context;
+use std::task;
+use std::testing;
+use std::time::{Duration};
+
+#[test]
+fn https_idle_expiry_and_combined_pool_capacity_prevent_reuse() -> () {
+    let server = start(true, false);
+    defer close(server);
+    let plain = start(false, false);
+    defer close(plain);
+    for bounded in Vec::from_array([false, true]) {
+        let builder = Client::builder().no_proxy().add_root_certificate(certificate(server));
+        let builder = if bounded {
+            builder.pool_max_idle(1)
+        } else {
+            builder.pool_idle_timeout(Duration::from_milliseconds(40))
+        };
+        let client = testing::expect_ok(builder.build(), "idle client");
+        defer client.close();
+        let initial = testing::expect_ok(client.get(url(server)).send(), "initial connection");
+        if bounded {
+            let _ = testing::expect_ok(client.get(url(plain)).send(), "shared idle capacity");
+        } else {
+            std::time::sleep(Duration::from_milliseconds(100));
+        }
+        let fresh = testing::expect_ok(client.get(url(server)).send(), "fresh connection");
+        testing::assert(initial.headers().get("x-remote") != fresh.headers().get("x-remote"));
+    }
+}
+
+#[test]
+fn https_multiplexes_reuses_and_closes_idle_connections_directly_and_through_proxies() -> () {
+    for mode in 0..3 {
+        let server = start(true, false);
+        defer close(server);
+        defer release_requests(server);
+        let proxy = start_proxy(mode == 2);
+        defer close(proxy);
+        let builder = Client::builder().no_proxy().add_root_certificate(certificate(server));
+        let builder = if mode == 0 {
+            builder
+        } else {
+            builder.proxy(url(proxy)).add_root_certificate(certificate(proxy))
+        };
+        let client = testing::expect_ok(builder.build(), "multiplex client");
+        defer client.close();
+        let remote = task::scope(
+            |scope| {
+                let requests = Vec::new();
+                for _ in 0..8 {
+                    requests.push(scope.spawn(|_| client.get(url(server) + "/held").send()));
+                }
+                for _ in 0..8 {
+                    testing::assert(wait_request(server));
+                }
+                client.close_idle_connections();
+                let quick = testing::expect_ok(client.get(url(server)).send(), "active connection");
+                testing::assert_eq(quick.version(), "HTTP/2.0");
+                let remote = quick.headers().get("x-remote").unwrap_or("");
+                testing::assert(remote != "");
+                release_requests(server);
+                for request in requests {
+                    let response = testing::expect_ok(request.join(), "parallel response");
+                    testing::assert_eq(response.version(), "HTTP/2.0");
+                    testing::assert_eq(response.headers().get("x-remote").unwrap_or(""), remote);
+                    testing::assert_eq(testing::expect_ok(response.text(), "held body"), "released");
+                }
+                remote
+            },
+        );
+        let reused = testing::expect_ok(client.get(url(server)).send(), "idle reuse");
+        testing::assert_eq(reused.headers().get("x-remote").unwrap_or(""), remote);
+        client.close_idle_connections();
+        let fresh = testing::expect_ok(client.get(url(server)).send(), "after idle close");
+        testing::assert(fresh.headers().get("x-remote").unwrap_or("") != remote);
+    }
+}
+
+#[test]
+fn https_stream_cancellation_and_timeout_leave_sibling_and_connection_alive() -> () {
+    let server = start(true, false);
+    defer close(server);
+    defer release_requests(server);
+    let client = testing::expect_ok(
+        Client::builder().no_proxy().add_root_certificate(certificate(server)).build(),
+        "multiplex client",
+    );
+    defer client.close();
+    let initial = testing::expect_ok(client.get(url(server)).send(), "initial");
+    testing::assert(wait_request(server));
+    let remote = initial.headers().get("x-remote").unwrap_or("");
+    context::with_cancel(
+        context::Context::background(),
+        |ctx, cancel| {
+            task::scope(
+                |scope| {
+                    let cancelled = scope.spawn(
+                        |_| client.get(url(server) + "/held").send_with(ctx),
+                    );
+                    let sibling = scope.spawn(|_| client.get(url(server) + "/held").send());
+                    testing::assert(wait_request(server));
+                    testing::assert(wait_request(server));
+                    cancel.cancel();
+                    testing::assert_eq(
+                        testing::expect_err(cancelled.join(), "cancelled stream").kind,
+                        ErrorKind::Cancelled,
+                    );
+                    let timed = client.get(url(server) + "/held").timeout(
+                        Duration::from_milliseconds(100),
+                    ).send();
+                    testing::assert_eq(
+                        testing::expect_err(timed, "timed stream").kind,
+                        ErrorKind::Timeout,
+                    );
+                    let quick = testing::expect_ok(
+                        client.get(url(server)).send(),
+                        "after stream failures",
+                    );
+                    testing::assert_eq(quick.headers().get("x-remote").unwrap_or(""), remote);
+                    release_requests(server);
+                    let response = testing::expect_ok(sibling.join(), "unaffected sibling");
+                    testing::assert_eq(response.headers().get("x-remote").unwrap_or(""), remote);
+                },
+            );
+        },
+    );
+}
+
+#[test]
+fn closing_https_client_cancels_all_streams_and_joins_connection_workers() -> () {
+    let server = start(true, false);
+    defer close(server);
+    defer release_requests(server);
+    let client = testing::expect_ok(
+        Client::builder().no_proxy().add_root_certificate(certificate(server)).build(),
+        "multiplex client",
+    );
+    defer client.close();
+    task::scope(
+        |scope| {
+            let requests = Vec::new();
+            for _ in 0..8 {
+                requests.push(scope.spawn(|_| client.get(url(server) + "/held").send()));
+            }
+            for _ in 0..8 {
+                testing::assert(wait_request(server));
+            }
+            let first = scope.spawn(|_| client.close());
+            let second = scope.spawn(|_| client.close());
+            first.join();
+            second.join();
+            for request in requests {
+                let error = testing::expect_err(request.join(), "closed stream");
+                testing::assert(
+                    error.kind == ErrorKind::Closed || error.kind == ErrorKind::Cancelled,
+                );
+            }
+        },
+    );
+}

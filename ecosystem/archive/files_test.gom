@@ -1,0 +1,300 @@
+package archive;
+
+use std::bytes;
+use std::fs;
+use std::io;
+use std::os::linux::fd;
+use std::testing;
+use std::time;
+
+fn extraction_workspace() -> string {
+    let path = "/tmp/goml-archive-openat-" + time::SystemTime::now().unix_nanoseconds().to_string();
+    testing::assert_ok(fs::create_dir(path));
+    path
+}
+
+fn fallback_root(path: string) -> ExtractionRoot {
+    ExtractionRoot {
+        directory: testing::expect_ok(
+            fd::open(path, fd::O_RDONLY | fd::O_DIRECTORY, 0),
+            "open extraction root",
+        ),
+        openat2: Ref::new(false),
+    }
+}
+
+fn open_descriptor_count(path: string) -> isize {
+    let names = testing::expect_ok(
+        fs::read_dir_names_structured("/proc/self/fd"),
+        "list open descriptors",
+    );
+    let mut count = 0;
+    for name in names {
+        if let Ok(target) = fd::readlink_at(fd::AT_FDCWD, "/proc/self/fd/" + name) {
+            let (valid, target) = string_from_utf8(target);
+            if valid && (target == path || target.starts_with(path + "/")) {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+#[test]
+fn fallback_extracts_nested_files_and_retains_preflight_policy() -> () {
+    let path = extraction_workspace();
+    defer {
+        let _ = fs::remove_dir_all(path);
+    };
+    let data = bytes::Bytes::from_string("portable extraction");
+    let options = ExtractOptions::standard();
+    let entries = Vec::from_array(
+        [Entry::directory("a/"), Entry::directory("a/b/"), Entry::file("a/b/file", data)],
+    );
+    testing::assert_eq(
+        testing::expect_ok(
+            extract_with_backend(entries, path, options, false),
+            "forced fallback extraction",
+        ),
+        3,
+    );
+    testing::assert(
+        testing::expect_ok(read_file(path + "/a/b/file", 100), "extracted file").to_vec()
+            == data.to_vec(),
+    );
+    testing::assert_err(extract_with_backend(entries, path, options, false));
+    testing::assert(
+        testing::expect_ok(read_file(path + "/a/b/file", 100), "unchanged existing file").to_vec()
+            == data.to_vec(),
+    );
+    for name in[
+        "/absolute",
+        "../escape",
+        "a/../../escape",
+        "a/./file",
+        "a//file",
+        "C:/file",
+        "a\\file",
+        "nul\u0000file",
+    ] {
+        testing::assert_err(
+            extract_with_backend(
+                Vec::from_array([Entry::file("first", data), Entry::file(name, data)]),
+                path,
+                options,
+                false,
+            ),
+        );
+        testing::assert(!fs::exists(path + "/first"));
+    }
+    testing::assert_err(
+        extract_with_backend(
+            Vec::from_array([Entry::file("duplicate", data), Entry::file("duplicate", data)]),
+            path,
+            options,
+            false,
+        ),
+    );
+    testing::assert(!fs::exists(path + "/duplicate"));
+    testing::assert_err(
+        extract_with_backend(
+            Vec::from_array([Entry::file("parent", data), Entry::file("parent/child", data)]),
+            path,
+            options,
+            false,
+        ),
+    );
+    testing::assert(!fs::exists(path + "/parent"));
+    testing::assert_err(
+        extract_with_backend(
+            Vec::from_array([Entry::symlink("link", "../outside")]),
+            path,
+            options,
+            false,
+        ),
+    );
+    testing::assert_eq(
+        testing::expect_ok(
+            extract_with_backend(
+                Vec::from_array([Entry::symlink("link", "../outside")]),
+                path,
+                ExtractOptions { links: LinkPolicy::Skip, ..options },
+                false,
+            ),
+            "skip archive link",
+        ),
+        0,
+    );
+}
+
+#[test]
+fn fallback_rejects_directory_leaf_and_dangling_symlinks() -> () {
+    let path = extraction_workspace();
+    defer {
+        let _ = fs::remove_dir_all(path);
+    };
+    testing::assert_ok(fs::create_dir(path + "/out"));
+    testing::assert_ok(fs::create_dir(path + "/outside"));
+    testing::assert_ok(
+        fs::write_bytes_structured(path + "/outside/existing", bytes::Bytes::from_string("retain")),
+    );
+    testing::assert_ok(fs::symbolic_link(path + "/outside", path + "/out/link"));
+    testing::assert_ok(fs::symbolic_link(path + "/outside/existing", path + "/out/leaf"));
+    testing::assert_ok(fs::symbolic_link(path + "/outside/missing", path + "/out/dangling"));
+    let root = fallback_root(path + "/out");
+    defer {
+        let _ = root.directory.close();
+    };
+    for name in["link/file", "leaf", "dangling"] {
+        testing::assert_err(root_write(root, name, bytes::Bytes::from_string("attack"), 0o644));
+    }
+    testing::assert_err(root_mkdir(root, "link"));
+    testing::assert_err(root_mkdir(root, "link/new"));
+    testing::assert(!fs::exists(path + "/outside/file"));
+    testing::assert(!fs::exists(path + "/outside/missing"));
+    testing::assert(!fs::exists(path + "/outside/new"));
+    testing::assert(
+        testing::expect_ok(read_file(path + "/outside/existing", 100), "link target").to_vec()
+            == b"retain",
+    );
+    for name in[".", "..", "../outside", "/outside", "link/../file", "a//b"] {
+        testing::assert_err(root_open(root, name, fd::O_WRONLY | fd::O_CREAT | fd::O_EXCL, 0o644));
+    }
+}
+
+#[test]
+fn fallback_uses_opened_parent_after_ancestor_symlink_replacement() -> () {
+    let path = extraction_workspace();
+    defer {
+        let _ = fs::remove_dir_all(path);
+    };
+    testing::assert_ok(fs::create_dir_all(path + "/out/a/b"));
+    testing::assert_ok(fs::create_dir_all(path + "/target/b"));
+    let root = fallback_root(path + "/out");
+    defer {
+        let _ = root.directory.close();
+    };
+    testing::assert_ok(
+        with_root_parent(
+            root.directory,
+            "a/b/file",
+            |parent, name| {
+                testing::assert_ok(fs::rename(path + "/out/a", path + "/out/moved"));
+                testing::assert_ok(fs::symbolic_link(path + "/target", path + "/out/a"));
+                let file = parent.open_at(
+                    name,
+                    fd::O_WRONLY | fd::O_CREAT | fd::O_EXCL | fd::O_NOFOLLOW,
+                    0o644,
+                )?;
+                defer {
+                    let _ = file.close();
+                };
+                file.write_all(b"anchored".as_slice())
+            },
+        ),
+    );
+    testing::assert(fs::exists(path + "/out/moved/b/file"));
+    testing::assert(!fs::exists(path + "/target/b/file"));
+    testing::assert_err(root_write(root, "a/b/new", bytes::Bytes::new(), 0o644));
+    testing::assert(!fs::exists(path + "/target/b/new"));
+    testing::assert_err(
+        with_root_parent(
+            root.directory,
+            "moved/b/leaf",
+            |parent, name| {
+                testing::assert_ok(
+                    fs::symbolic_link(path + "/target/existing", path + "/out/moved/b/leaf"),
+                );
+                parent.open_at(
+                    name,
+                    fd::O_WRONLY | fd::O_CREAT | fd::O_EXCL | fd::O_NOFOLLOW,
+                    0o644,
+                )
+            },
+        ),
+    );
+    testing::assert(!fs::exists(path + "/target/existing"));
+}
+
+#[test]
+fn fallback_open_directory_handles_follow_renames_without_following_replacements() -> () {
+    let path = extraction_workspace();
+    defer {
+        let _ = fs::remove_dir_all(path);
+    };
+    testing::assert_ok(fs::create_dir_all(path + "/out/a/b"));
+    testing::assert_ok(fs::create_dir_all(path + "/replacement/b"));
+    let root = fallback_root(path + "/out");
+    defer {
+        let _ = root.directory.close();
+    };
+    testing::assert_ok(
+        with_root_parent(
+            root.directory,
+            "a/b/file",
+            |parent, name| {
+                testing::assert_ok(fs::rename(path + "/out/a", path + "/moved-outside"));
+                testing::assert_ok(fs::symbolic_link(path + "/replacement", path + "/out/a"));
+                let file = parent.open_at(
+                    name,
+                    fd::O_WRONLY | fd::O_CREAT | fd::O_EXCL | fd::O_NOFOLLOW,
+                    0o644,
+                )?;
+                file.close()
+            },
+        ),
+    );
+    testing::assert(fs::exists(path + "/moved-outside/b/file"));
+    testing::assert(!fs::exists(path + "/replacement/b/file"));
+    testing::assert_err(root_write(root, "a/b/second", bytes::Bytes::new(), 0o644));
+    testing::assert(!fs::exists(path + "/replacement/b/second"));
+}
+
+#[test]
+fn fallback_closes_parent_descriptors_on_success_and_all_failure_paths() -> () {
+    let path = extraction_workspace();
+    defer {
+        let _ = fs::remove_dir_all(path);
+    };
+    testing::assert_ok(fs::create_dir_all(path + "/a/b/c"));
+    testing::assert_ok(
+        fs::write_bytes_structured(path + "/a/b/file", bytes::Bytes::from_string("existing")),
+    );
+    testing::assert_ok(fs::symbolic_link(path + "/a/b", path + "/a/b/link"));
+    let root = fallback_root(path);
+    defer {
+        let _ = root.directory.close();
+    };
+    testing::assert_ok(root_mkdir(root, "a/b/c"));
+    let baseline = open_descriptor_count(path);
+    testing::assert_eq(baseline, 1);
+    for _ in 0..100 {
+        testing::assert_err(root_open(root, "a/b/missing/file", fd::O_RDONLY, 0));
+        testing::assert_err(root_open(root, "a/b/file/child", fd::O_RDONLY, 0));
+        testing::assert_err(root_open(root, "a/b/link/child", fd::O_RDONLY, 0));
+        testing::assert_err(root_write(root, "a/b/file", bytes::Bytes::new(), 0o644));
+        testing::assert_ok(root_mkdir(root, "a/b/c"));
+        let result: Result[(), io::Error] = with_root_parent(
+            root.directory,
+            "a/b/c/leaf",
+            |_, _| Result::Err(
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    "test parent cleanup",
+                    Option::None,
+                    Option::None,
+                    "injected failure",
+                ),
+            ),
+        );
+        testing::assert_err(result);
+    }
+    testing::assert_eq(open_descriptor_count(path), baseline);
+    testing::assert(!root.directory.is_closed());
+    let file = testing::expect_ok(
+        root_open(root, "a/b/file", fd::O_RDONLY, 0),
+        "open existing regular file",
+    );
+    testing::assert_ok(file.close());
+    testing::assert_eq(open_descriptor_count(path), baseline);
+}

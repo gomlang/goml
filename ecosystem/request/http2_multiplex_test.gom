@@ -1,0 +1,448 @@
+package request;
+
+use std::bytes::{Bytes, FrozenBytes};
+use std::context;
+use std::net;
+use std::task;
+use std::testing;
+use std::time::{Duration};
+
+fn multiplex_peer(
+    peer: (Reader, Stream, context::Context) -> Result[(), Error],
+    client: (Http2Connection, context::Context) -> (),
+) -> () {
+    context::with_timeout(
+        context::Context::background(),
+        Duration::from_seconds(5),
+        |context, _| {
+            let listener = testing::expect_ok(
+                net::TcpListener::bind(net::SocketAddr::new(net::IpAddr::V4([127, 0, 0, 1]), 0)),
+                "multiplex listener",
+            );
+            defer {
+                let _ = listener.close();
+            };
+            let address = testing::expect_ok(listener.local_addr(), "multiplex address");
+            task::scope(
+                |scope| {
+                    let server = scope.spawn(
+                        |_| {
+                            let (socket, _) = testing::expect_ok(
+                                listener.accept_with(net::WaitOptions::new().with_context(context)),
+                                "multiplex accept",
+                            );
+                            let stream = Stream::Tcp(socket);
+                            defer stream.close();
+                            let reader = Reader::new(stream, context);
+                            testing::assert(
+                                testing::expect_ok(reader.exact(24), "multiplex preface").to_vec()
+                                    == b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+                            );
+                            testing::assert_eq(
+                                testing::expect_ok(http2_read(reader), "multiplex settings").kind,
+                                4,
+                            );
+                            peer(reader, stream, context)
+                        },
+                    );
+                    let socket = testing::expect_ok(
+                        net::TcpStream::connect_with(
+                            address,
+                            net::WaitOptions::new().with_context(context),
+                        ),
+                        "multiplex connect",
+                    );
+                    let connection = testing::expect_ok(
+                        http2_new_connection(
+                            Stream::Tcp(socket),
+                            context,
+                            8192,
+                            Duration::from_seconds(30),
+                        ),
+                        "multiplex connection",
+                    );
+                    defer http2_close(connection);
+                    client(connection, context);
+                    http2_close(connection);
+                    if let Err(error) = server.join() {
+                        testing::fail("multiplex peer: " + error.to_string());
+                    }
+                },
+            );
+        },
+    );
+}
+
+fn multiplex_request(connection: Http2Connection, method: string, body: FrozenBytes) -> Http2Request {
+    let headers = testing::expect_ok(
+        http2_request_headers(
+            method,
+            testing::expect_ok(Url::parse("https://example.test/"), "multiplex URL"),
+            Headers::new(),
+            body,
+        ),
+        "multiplex headers",
+    );
+    testing::expect_some(
+        http2_register(connection, method, headers, body, 100000),
+        "multiplex stream",
+    )
+}
+
+fn multiplex_response(request: Http2Request, context: context::Context) -> Received {
+    testing::expect_ok(
+        http2_await(request, context).map_err(
+            |failure| match failure {
+                Http2Failure::Failed(error) | Http2Failure::Retry(error) => error,
+            },
+        ),
+        "multiplex response",
+    )
+}
+
+fn multiplex_signal(signal: Channel[()], context: context::Context) -> Result[(), Error] {
+    select {
+        recv(signal) as _ => Result::Ok(()),
+        recv(context.done()) as _ => Result::Err(
+            context_error(context.error().unwrap_or(context::Error::Cancelled)),
+        ),
+    }
+}
+
+fn multiplex_headers(reader: Reader, count: isize) -> Result[Vec[isize], Error] {
+    let streams = Vec::new();
+    while streams.len() < count {
+        let frame = http2_read(reader)?;
+        if frame.kind == 1 {
+            testing::assert_eq(frame.flags & 4, 4);
+            streams.push(frame.stream);
+        } else {
+            testing::assert_eq(frame.kind, 4);
+            testing::assert_eq(frame.flags, 1);
+        }
+    }
+    Result::Ok(streams)
+}
+
+#[test]
+fn http2_multiplex_interleaves_responses_and_reuses_connection() -> () {
+    multiplex_peer(
+        |reader, stream, context| {
+            http2_write(stream, context, 4, 0, 0, Bytes::new().as_slice())?;
+            testing::assert(multiplex_headers(reader, 2)? == Vec::from_array([1, 3]));
+            http2_write(
+                stream,
+                context,
+                1,
+                4,
+                3,
+                hpack_encode(Vec::from_array([(":status", "201"), ("content-length", "5")])).as_slice(),
+            )?;
+            http2_write(
+                stream,
+                context,
+                1,
+                4,
+                1,
+                hpack_encode(Vec::from_array([(":status", "200"), ("content-length", "4")])).as_slice(),
+            )?;
+            http2_write(stream, context, 0, 0, 3, b"tw".as_slice())?;
+            http2_write(stream, context, 0, 1, 1, b"one!".as_slice())?;
+            http2_write(stream, context, 0, 1, 3, b"o!!".as_slice())?;
+            testing::assert(multiplex_headers(reader, 1)? == Vec::from_array([5]));
+            http2_write(stream, context, 1, 5, 5, b"\x88".as_slice())
+        },
+        |connection, context| {
+            let first = multiplex_request(connection, "GET", FrozenBytes::new());
+            let second = multiplex_request(connection, "GET", FrozenBytes::new());
+            let response = multiplex_response(second, context);
+            testing::assert_eq(response.status, 201);
+            testing::assert(response.body == FrozenBytes::from_string("two!!"));
+            testing::assert(
+                multiplex_response(first, context).body == FrozenBytes::from_string("one!"),
+            );
+            let third = multiplex_request(connection, "GET", FrozenBytes::new());
+            testing::assert_eq(third.id, 5);
+            testing::assert_eq(multiplex_response(third, context).status, 200);
+        },
+    );
+}
+
+#[test]
+fn http2_multiplex_cancel_preserves_other_stream_and_late_hpack_state() -> () {
+    let ready: Channel[()] = Channel::new(0);
+    multiplex_peer(
+        |reader, stream, context| {
+            http2_write(stream, context, 4, 0, 0, Bytes::new().as_slice())?;
+            testing::assert(multiplex_headers(reader, 2)? == Vec::from_array([1, 3]));
+            ready.close();
+            loop {
+                let frame = http2_read(reader)?;
+                if frame.kind == 4 {
+                    continue
+                }
+                testing::assert_eq(frame.kind, 3);
+                testing::assert_eq(frame.stream, 1);
+                testing::assert_eq(http2_integer(frame.payload, 0, 4), 8);
+                break
+            }
+            http2_write(stream, context, 1, 5, 1, b"\x88\x40\x06x-late\x04kept".as_slice())?;
+            http2_write(stream, context, 1, 5, 3, b"\x88\xbe".as_slice())
+        },
+        |connection, context| {
+            let first = multiplex_request(connection, "GET", FrozenBytes::new());
+            let second = multiplex_request(connection, "GET", FrozenBytes::new());
+            testing::assert_ok(multiplex_signal(ready, context));
+            context::with_cancel(
+                context,
+                |cancelled, cancel| {
+                    cancel.cancel();
+                    match http2_await(first, cancelled) {
+                        Err(Http2Failure::Failed(error)) => testing::assert_eq(
+                            error.kind,
+                            ErrorKind::Cancelled,
+                        ),
+                        _ => testing::fail("cancelled stream must fail without retry"),
+                    }
+                },
+            );
+            let response = multiplex_response(second, context);
+            testing::assert(response.headers.get("x-late") == Option::Some("kept"));
+            testing::assert_eq(response.status, 200);
+        },
+    );
+}
+
+#[test]
+fn http2_multiplex_blocked_upload_does_not_block_other_response() -> () {
+    let received: Channel[()] = Channel::new(0);
+    multiplex_peer(
+        |reader, stream, context| {
+            http2_write(stream, context, 4, 0, 0, b"\x00\x04\x00\x00\x00\x00".as_slice())?;
+            testing::assert(multiplex_headers(reader, 2)? == Vec::from_array([1, 3]));
+            http2_write(stream, context, 1, 5, 3, b"\x88".as_slice())?;
+            multiplex_signal(received, context)?;
+            http2_write(stream, context, 6, 0, 0, b"barrier!".as_slice())?;
+            loop {
+                let frame = http2_read(reader)?;
+                if frame.kind == 4 {
+                    continue
+                }
+                testing::assert_eq(frame.kind, 6);
+                testing::assert_eq(frame.flags, 1);
+                break
+            }
+            http2_write(stream, context, 8, 0, 1, http2_number(4).as_slice())?;
+            let data = http2_read(reader)?;
+            testing::assert_eq(data.kind, 0);
+            testing::assert_eq(data.stream, 1);
+            testing::assert_eq(data.flags, 1);
+            testing::assert(data.payload.to_vec() == b"body");
+            http2_write(stream, context, 1, 5, 1, b"\x88".as_slice())
+        },
+        |connection, context| {
+            let upload = multiplex_request(connection, "POST", FrozenBytes::from_string("body"));
+            let second = multiplex_request(connection, "GET", FrozenBytes::new());
+            testing::assert_eq(multiplex_response(second, context).status, 200);
+            received.close();
+            testing::assert_eq(multiplex_response(upload, context).status, 200);
+        },
+    );
+}
+
+#[test]
+fn http2_multiplex_goaway_retries_unprocessed_stream_and_drains_accepted_stream() -> () {
+    multiplex_peer(
+        |reader, stream, context| {
+            http2_write(stream, context, 4, 0, 0, Bytes::new().as_slice())?;
+            testing::assert(multiplex_headers(reader, 2)? == Vec::from_array([1, 3]));
+            let payload = http2_number(1);
+            payload.extend_from_slice(http2_number(0).as_slice());
+            http2_write(stream, context, 7, 0, 0, payload.as_slice())?;
+            http2_write(stream, context, 1, 5, 1, b"\x88".as_slice())
+        },
+        |connection, context| {
+            let first = multiplex_request(connection, "GET", FrozenBytes::new());
+            let second = multiplex_request(connection, "GET", FrozenBytes::new());
+            match http2_await(second, context) {
+                Err(Http2Failure::Retry(_)) => (),
+                _ => testing::fail("GOAWAY must mark unprocessed stream retryable"),
+            }
+            testing::assert(
+                http2_register(connection, "GET", Bytes::from_vec(b"\x82"), FrozenBytes::new(), 0).is_none(),
+            );
+            testing::assert_eq(multiplex_response(first, context).status, 200);
+        },
+    );
+}
+
+#[test]
+fn http2_multiplex_refused_stream_does_not_fail_other_response() -> () {
+    multiplex_peer(
+        |reader, stream, context| {
+            http2_write(stream, context, 4, 0, 0, Bytes::new().as_slice())?;
+            testing::assert(multiplex_headers(reader, 2)? == Vec::from_array([1, 3]));
+            http2_write(stream, context, 3, 0, 1, http2_number(7).as_slice())?;
+            http2_write(stream, context, 1, 5, 3, b"\x88".as_slice())
+        },
+        |connection, context| {
+            let first = multiplex_request(connection, "GET", FrozenBytes::new());
+            let second = multiplex_request(connection, "GET", FrozenBytes::new());
+            match http2_await(first, context) {
+                Err(Http2Failure::Retry(_)) => (),
+                _ => testing::fail("REFUSED_STREAM must be retryable"),
+            }
+            testing::assert_eq(multiplex_response(second, context).status, 200);
+        },
+    );
+}
+
+#[test]
+fn http2_multiplex_queued_cancellation_respects_concurrency_without_idle_reset() -> () {
+    let ready: Channel[()] = Channel::new(0);
+    let cancelled: Channel[()] = Channel::new(0);
+    multiplex_peer(
+        |reader, stream, context| {
+            http2_write(stream, context, 4, 0, 0, b"\x00\x03\x00\x00\x00\x01".as_slice())?;
+            testing::assert(multiplex_headers(reader, 1)? == Vec::from_array([1]));
+            http2_write(stream, context, 6, 0, 0, b"barrier!".as_slice())?;
+            loop {
+                let frame = http2_read(reader)?;
+                if frame.kind == 4 {
+                    continue
+                }
+                testing::assert_eq(frame.kind, 6);
+                testing::assert_eq(frame.flags, 1);
+                break
+            }
+            ready.close();
+            multiplex_signal(cancelled, context)?;
+            http2_write(stream, context, 1, 5, 1, b"\x88".as_slice())?;
+            testing::assert(multiplex_headers(reader, 1)? == Vec::from_array([5]));
+            http2_write(stream, context, 1, 5, 5, b"\x88".as_slice())
+        },
+        |connection, context| {
+            let first = multiplex_request(connection, "GET", FrozenBytes::new());
+            let second = multiplex_request(connection, "GET", FrozenBytes::new());
+            let third = multiplex_request(connection, "GET", FrozenBytes::new());
+            testing::assert_ok(multiplex_signal(ready, context));
+            context::with_cancel(
+                context,
+                |child, cancel| {
+                    cancel.cancel();
+                    match http2_await(second, child) {
+                        Err(Http2Failure::Failed(error)) => testing::assert_eq(
+                            error.kind,
+                            ErrorKind::Cancelled,
+                        ),
+                        _ => testing::fail("queued stream cancellation"),
+                    }
+                },
+            );
+            cancelled.close();
+            testing::assert_eq(multiplex_response(first, context).status, 200);
+            testing::assert_eq(multiplex_response(third, context).status, 200);
+        },
+    );
+}
+
+#[test]
+fn client_dials_independent_origins_while_another_tls_handshake_is_blocked() -> () {
+    context::with_timeout(
+        context::Context::background(),
+        Duration::from_seconds(5),
+        |context, finish| {
+            let stalled = testing::expect_ok(
+                net::TcpListener::bind(net::SocketAddr::new(net::IpAddr::V4([127, 0, 0, 1]), 0)),
+                "stalled TLS listener",
+            );
+            let healthy = testing::expect_ok(
+                net::TcpListener::bind(net::SocketAddr::new(net::IpAddr::V4([127, 0, 0, 1]), 0)),
+                "healthy HTTP listener",
+            );
+            defer {
+                let _ = stalled.close();
+                let _ = healthy.close();
+            };
+            let stalled_url = "https://"
+                + testing::expect_ok(stalled.local_addr(), "stalled address").to_string();
+            let healthy_url = "http://"
+                + testing::expect_ok(healthy.local_addr(), "healthy address").to_string();
+            let ready: Channel[()] = Channel::new(0);
+            let release: Channel[()] = Channel::new(0);
+            let client = testing::expect_ok(Client::new(), "independent origins client");
+            defer client.close();
+            task::scope(
+                |scope| {
+                    let _ = scope.spawn(
+                        |_| {
+                            if let Ok((socket, _)) = stalled.accept_with(
+                                net::WaitOptions::new().with_context(context),
+                            ) {
+                                defer {
+                                    let _ = socket.close();
+                                };
+                                ready.close();
+                                let _ = multiplex_signal(release, context);
+                            }
+                        },
+                    );
+                    let _ = scope.spawn(
+                        |_| {
+                            if let Ok((socket, _)) = healthy.accept_with(
+                                net::WaitOptions::new().with_context(context),
+                            ) {
+                                let stream = Stream::Tcp(socket);
+                                defer stream.close();
+                                let reader = Reader::new(stream, context);
+                                let budget = Vec::from_array([8192]);
+                                loop {
+                                    match reader.line(budget) {
+                                        Ok(line) => if line == "" {
+                                            break
+                                        },
+                                        Err(_) => return,
+                                    }
+                                }
+                                let _ = stream.write(
+                                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".as_slice(),
+                                    context,
+                                );
+                            }
+                        },
+                    );
+                    context::with_cancel(
+                        context,
+                        |blocked, cancel| {
+                            let pending = scope.spawn(
+                                |_| client.get(stalled_url).send_with(blocked),
+                            );
+                            testing::assert_ok(multiplex_signal(ready, context));
+                            let response = client.get(healthy_url).timeout(
+                                Duration::from_seconds(1),
+                            ).send_with(context);
+                            cancel.cancel();
+                            release.close();
+                            let interrupted = pending.join();
+                            finish.cancel();
+                            testing::assert_eq(
+                                testing::expect_err(interrupted, "cancel blocked handshake").kind,
+                                ErrorKind::Cancelled,
+                            );
+                            testing::assert_eq(
+                                testing::expect_ok(
+                                    testing::expect_ok(
+                                        response,
+                                        "unrelated origin must connect while TLS handshake is stalled",
+                                    ).text(),
+                                    "healthy body",
+                                ),
+                                "ok",
+                            );
+                        },
+                    );
+                },
+            );
+        },
+    );
+}

@@ -1,0 +1,330 @@
+package tests;
+
+use ecosystem::request::{Client, ErrorKind, Url, Multipart, Part};
+use std::net;
+use std::task;
+use std::testing;
+use std::bytes::{Bytes};
+use std::time::{Duration};
+use std::json;
+
+fn wire_response(response: string, body: (string) -> ()) -> () {
+    let listener = testing::expect_ok(
+        net::TcpListener::bind(net::SocketAddr::new(net::IpAddr::V4([127, 0, 0, 1]), 0)),
+        "listener",
+    );
+    let address = testing::expect_ok(listener.local_addr(), "address");
+    task::scope(
+        |scope| {
+            defer {
+                let _ = listener.close();
+            };
+            let _ = scope.spawn(
+                |_| {
+                    let (socket, _) = testing::expect_ok(listener.accept(), "accept");
+                    defer {
+                        let _ = socket.close();
+                    };
+                    let input = Bytes::new();
+                    let byte = Vec::from_array([0]);
+                    loop {
+                        if socket.read_exact(byte.as_mut_slice()).is_err() {
+                            return
+                        }
+                        input.push(byte[0]);
+                        let count = input.len();
+                        if count >= 4 && input.get(count - 4) == 13 && input.get(count - 3) == 10
+                            && input.get(count - 2) == 13
+                            && input.get(count - 1) == 10 {
+                            break
+                        }
+                    }
+                    let _ = socket.write_all(response.to_bytes().as_slice());
+                },
+            );
+            body("http://" + address.to_string());
+        },
+    );
+}
+
+#[test]
+fn head_ignores_representation_length_and_accepts_zero_body_limit() -> () {
+    wire_response(
+        "HTTP/1.1 200 OK\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n",
+        |url| {
+            let client = testing::expect_ok(Client::new(), "client");
+            defer client.close();
+            let response = testing::expect_ok(client.head(url).body_limit(0).send(), "HEAD");
+            testing::assert_eq(response.content_length(), 0);
+        },
+    );
+}
+
+#[test]
+fn malformed_response_framing_is_recoverable() -> () {
+    for response in Vec::from_array(
+        [
+            "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nxx",
+            "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: identity\r\n\r\n0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nz\r\nx\r\n0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nx",
+            "HTTP/1.1 200 OK\r\nBad Header: value\r\n\r\n",
+        ],
+    ) {
+        wire_response(
+            response,
+            |url| {
+                let client = testing::expect_ok(Client::new(), "client");
+                defer client.close();
+                testing::assert_eq(
+                    testing::expect_err(client.get(url).send(), "malformed response").kind,
+                    ErrorKind::Transport,
+                );
+            },
+        );
+    }
+}
+
+#[test]
+fn informational_responses_and_header_limits() -> () {
+    wire_response(
+        "HTTP/1.1 103 Early Hints\r\nLink: </asset>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        |url| {
+            let client = testing::expect_ok(Client::new(), "client");
+            defer client.close();
+            testing::assert_eq(
+                testing::expect_ok(
+                    testing::expect_ok(client.get(url).send(), "response").text(),
+                    "text",
+                ),
+                "ok",
+            );
+        },
+    );
+    wire_response(
+        "HTTP/1.1 200 OK\r\nX-Large: " + "x".repeat(100) + "\r\nContent-Length: 0\r\n\r\n",
+        |url| {
+            let client = testing::expect_ok(
+                Client::builder().max_header_bytes(32).build(),
+                "client",
+            );
+            defer client.close();
+            testing::assert_eq(
+                testing::expect_err(client.get(url).send(), "header limit").kind,
+                ErrorKind::Transport,
+            );
+        },
+    );
+}
+
+#[test]
+fn urls_and_multipart_validate_escaping_and_bounded_output() -> () {
+    for url in Vec::from_array(
+        [
+            "/relative",
+            "file:///tmp/file",
+            "http://example.com:65536/",
+            "http://example.com/%xx",
+            "http://user:pass@example.com/",
+        ],
+    ) {
+        testing::assert(Url::parse(url).is_err());
+    }
+    let url = testing::expect_ok(Url::parse("https://EXAMPLE.com/base/file"), "url");
+    testing::assert_eq(
+        testing::expect_ok(url.join("../next"), "join").as_string(),
+        "https://example.com/next",
+    );
+    let client = testing::expect_ok(Client::builder().request_body_limit(20).build(), "client");
+    defer client.close();
+    testing::assert_eq(
+        testing::expect_err(
+            client.post("http://localhost").multipart(Multipart::new().text("field", "x")).build(),
+            "MIME overhead",
+        ).kind,
+        ErrorKind::BodyLimit,
+    );
+    let client = testing::expect_ok(Client::new(), "client");
+    defer client.close();
+    testing::assert(
+        client.post("http://localhost").multipart(Multipart::new().text("", "x")).build().is_err(),
+    );
+    testing::assert(
+        client.post("http://localhost").multipart(
+            Multipart::new().part("field", Part::text("x").mime_type("invalid")),
+        ).build().is_err(),
+    );
+}
+
+#[test]
+fn concurrent_close_and_idle_reaping_share_client_lifecycle() -> () {
+    let server = start(false, false);
+    defer close(server);
+    let client = testing::expect_ok(
+        Client::builder().pool_idle_timeout(Duration::from_milliseconds(1)).build(),
+        "client",
+    );
+    let first = testing::expect_ok(client.get(url(server)).send(), "first");
+    std::time::sleep(Duration::from_milliseconds(5));
+    let second = testing::expect_ok(client.get(url(server)).send(), "second");
+    testing::assert(first.headers().get("x-remote") != second.headers().get("x-remote"));
+    task::scope(
+        |scope| {
+            let tasks = Vec::new();
+            for _ in 0..16 {
+                tasks.push(
+                    scope.spawn(
+                        |_| {
+                            client.close_idle_connections();
+                            client.close();
+                            testing::assert(client.is_closed());
+                            testing::assert_eq(
+                                testing::expect_err(client.get(url(server)).send(), "closed").kind,
+                                ErrorKind::Closed,
+                            );
+                        },
+                    ),
+                );
+            }
+            for task in tasks {
+                task.join();
+            }
+        },
+    );
+}
+
+#[test]
+fn forward_proxies_and_tls_connect_tunnels_preserve_verification() -> () {
+    let plain = start(false, false);
+    let secure = start(true, false);
+    defer close(plain);
+    defer close(secure);
+    for encrypted_proxy in Vec::from_array([false, true]) {
+        let proxy = start_proxy(encrypted_proxy);
+        defer close(proxy);
+        let client = testing::expect_ok(
+            Client::builder().proxy(url(proxy)).add_root_certificate(
+                certificate(secure) + "\n" + certificate(proxy),
+            ).build(),
+            "proxy client",
+        );
+        defer client.close();
+        let response = testing::expect_ok(client.get(url(plain)).send(), "forward proxy");
+        testing::assert_eq(testing::expect_ok(response.text(), "proxy body"), "ok");
+        let response = testing::expect_ok(client.get(url(secure)).send(), "CONNECT TLS");
+        testing::assert_eq(response.version(), "HTTP/2.0");
+        testing::assert_eq(testing::expect_ok(response.text(), "tunnel body"), "ok");
+        let credentials = testing::expect_ok(
+            client.get(url(secure) + "/echo").header("proxy-authorization", "Basic secret").send(),
+            "proxy credentials",
+        );
+        let credentials: json::Value = testing::expect_ok(
+            credentials.json(),
+            "proxy credential echo",
+        );
+        testing::assert_eq(field(credentials, "proxy_authorization"), "");
+        for _ in 0..4 {
+            let response = testing::expect_ok(
+                client.get(url(secure) + "/close").send().map_err(
+                    |error| {
+                        println(error.message);
+                        error
+                    },
+                ),
+                "closing origin through tunnel",
+            );
+            testing::assert_eq(
+                testing::expect_ok(response.text(), "closed tunnel body"),
+                "closed-response",
+            );
+        }
+    }
+    let proxy = start_proxy(false);
+    defer close(proxy);
+    let client = testing::expect_ok(Client::builder().proxy(url(proxy)).build(), "untrusted tunnel");
+    defer client.close();
+    testing::assert(client.get(url(secure)).send().is_err());
+}
+
+#[test]
+fn gzip_framing_does_not_consume_the_decoded_body_budget() -> () {
+    for secure in Vec::from_array([false, true]) {
+        let server = start(secure, false);
+        defer close(server);
+        let client = testing::expect_ok(
+            Client::builder().add_root_certificate(certificate(server)).build(),
+            "client",
+        );
+        defer client.close();
+        let small = testing::expect_ok(
+            client.get(url(server) + "/gzip-small").body_limit(2).send(),
+            "small gzip",
+        );
+        testing::assert_eq(testing::expect_ok(small.text(), "small body"), "ok");
+        testing::assert_eq(
+            testing::expect_ok(
+                client.get(url(server) + "/gzip-empty").body_limit(0).send(),
+                "empty gzip",
+            ).content_length(),
+            0,
+        );
+    }
+    let server = start(false, false);
+    defer close(server);
+    let client = testing::expect_ok(Client::builder().gzip(false).build(), "raw client");
+    defer client.close();
+    let response = testing::expect_ok(client.get(url(server) + "/gzip-small").send(), "raw gzip");
+    testing::assert_eq(response.headers().get("content-encoding").unwrap_or(""), "gzip");
+    testing::assert_eq(response.bytes().get(0), 31);
+}
+
+#[test]
+fn stale_pooled_connection_retries_safe_requests_before_any_response_bytes() -> () {
+    let listener = testing::expect_ok(
+        net::TcpListener::bind(net::SocketAddr::new(net::IpAddr::V4([127, 0, 0, 1]), 0)),
+        "listen",
+    );
+    let address = testing::expect_ok(listener.local_addr(), "address");
+    let first_closed: Channel[()] = Channel::new(1);
+    task::scope(
+        |scope| {
+            defer {
+                let _ = listener.close();
+            };
+            let _ = scope.spawn(
+                |_| {
+                    for index in 0..2 {
+                        let (socket, _) = testing::expect_ok(listener.accept(), "accept retry");
+                        let mut input = "";
+                        let byte = Vec::from_array([0]);
+                        while !input.ends_with("\r\n\r\n") {
+                            testing::expect_ok(
+                                socket.read_exact(byte.as_mut_slice()),
+                                "read request",
+                            );
+                            input += string_from_utf8(byte.copy()).1;
+                        }
+                        testing::expect_ok(
+                            socket.write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".as_slice(),
+                            ),
+                            "reply",
+                        );
+                        testing::expect_ok(socket.close(), "close idle server connection");
+                        if index == 0 {
+                            first_closed.send(());
+                        }
+                    }
+                },
+            );
+            let client = testing::expect_ok(Client::new(), "client");
+            defer client.close();
+            let url = "http://" + address.to_string();
+            testing::expect_ok(client.get(url).send(), "initial response");
+            let _ = first_closed.recv();
+            let response = testing::expect_ok(client.get(url).send(), "stale keepalive retry");
+            testing::assert_eq(testing::expect_ok(response.text(), "retry body"), "ok");
+        },
+    );
+}

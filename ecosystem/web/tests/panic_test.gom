@@ -1,0 +1,351 @@
+package tests;
+
+use ecosystem::web;
+use web::{Router, Headers, Response, Request, StreamWriter, Error, ErrorKind, Limits};
+use std::bytes::{Bytes};
+use std::panic;
+use std::task;
+use std::testing;
+use std::time::{Duration};
+
+fn panic_dispatch_error(router: Router, path: string) -> Error {
+    let error = testing::expect_err(
+        router.dispatch("GET", path, Headers::new(), Bytes::new()),
+        "callback panic is recoverable",
+    );
+    testing::assert_eq(error.kind, ErrorKind::Internal);
+    testing::assert_eq(error.message, "request callback panicked");
+    error
+}
+
+fn panic_handler(_request: Request) -> Result[Response, Error] {
+    panic::raise("private handler panic")
+}
+
+fn panic_bounds(_request: Request) -> Result[Response, Error] {
+    let values: Vec[isize] = Vec::new();
+    Result::Ok(Response::text(200, values[0].to_string()))
+}
+
+#[test]
+fn dispatch_catches_handler_middleware_fallback_and_runtime_panics() -> () {
+    let _ = panic_dispatch_error(Router::new().get("/", panic_handler), "/");
+    let _ = panic_dispatch_error(
+        Router::new().get("/", ok).layer(|_, _| panic::raise("private middleware panic")),
+        "/",
+    );
+    let _ = panic_dispatch_error(Router::new().fallback(panic_handler), "/missing");
+    let _ = panic_dispatch_error(Router::new().get("/", panic_bounds), "/");
+    let _ = panic_dispatch_error(
+        Router::new().nest("/nested", Router::new().get("/", panic_handler)),
+        "/nested/",
+    );
+}
+
+#[test]
+fn dispatch_panic_unwinds_defers_and_expires_request_and_body_aliases() -> () {
+    let cleanup: Vec[string] = Vec::new();
+    let saved: Ref[Option[Request]] = Ref::new(Option::None);
+    let router = Router::new().get(
+        "/",
+        |request| {
+            saved.set(Option::Some(request));
+            defer cleanup.push("handler");
+            panic::raise("private cleanup panic")
+        },
+    ).layer(
+        |request, next| {
+            defer cleanup.push("middleware");
+            next.run(request)
+        },
+    );
+    let _ = panic_dispatch_error(router, "/");
+    testing::assert_eq(cleanup.join(","), "handler,middleware");
+    let request = testing::expect_some(saved.get(), "saved request");
+    testing::assert_eq(
+        testing::expect_err(request.check(), "expired request").kind,
+        ErrorKind::Closed,
+    );
+    testing::assert_eq(
+        testing::expect_err(request.body().read(1), "expired body").kind,
+        ErrorKind::Closed,
+    );
+}
+
+#[test]
+fn dispatch_recovers_cleanup_panic_and_still_runs_outer_defers() -> () {
+    for original_panic in Vec::from_array([false, true]) {
+        let cleanup: Vec[string] = Vec::new();
+        let router = Router::new().get(
+            "/",
+            |_| {
+                defer cleanup.push("outer");
+                defer {
+                    cleanup.push("panicking cleanup");
+                    panic::raise("private deferred panic");
+                };
+                if original_panic {
+                    panic::raise("private original panic");
+                }
+                Result::Ok(Response::text(200, "discarded response"))
+            },
+        );
+        let _ = panic_dispatch_error(router, "/");
+        testing::assert_eq(cleanup.join(","), "panicking cleanup,outer");
+    }
+}
+
+#[test]
+fn dispatch_stream_panic_unwinds_cleanup_and_expires_writer() -> () {
+    let cleanup = Ref::new(false);
+    let saved: Ref[Option[StreamWriter]] = Ref::new(Option::None);
+    let router = Router::new().get(
+        "/",
+        |_| Result::Ok(
+            Response::stream(
+                202,
+                "text/plain",
+                |writer| {
+                    saved.set(Option::Some(writer));
+                    defer cleanup.set(true);
+                    writer.text("partial")?;
+                    panic::raise("private stream panic")
+                },
+            ),
+        ),
+    );
+    let _ = panic_dispatch_error(router, "/");
+    testing::assert(cleanup.get());
+    let writer = testing::expect_some(saved.get(), "saved writer");
+    testing::assert_eq(
+        testing::expect_err(writer.text("late"), "expired writer").kind,
+        ErrorKind::Closed,
+    );
+    let head = call(router, "HEAD", "/");
+    testing::assert_eq(head.status, 202);
+    testing::assert(head.bytes().is_empty());
+}
+
+#[test]
+fn dispatch_preserves_ordinary_result_errors_and_cancellation() -> () {
+    let bad = Router::new().get(
+        "/",
+        |_| Result::Err(Error::new(ErrorKind::BadRequest, "bad input")),
+    );
+    testing::assert_eq(call(bad, "GET", "/").status, 400);
+    testing::assert_eq(text(bad, "GET", "/"), "bad input");
+    let internal = Router::new().get(
+        "/",
+        |_| Result::Err(Error::new(ErrorKind::Internal, "private application error")),
+    );
+    testing::assert_eq(call(internal, "GET", "/").status, 500);
+    testing::assert_eq(text(internal, "GET", "/"), "internal server error");
+    let cancelled = Router::new().get(
+        "/",
+        |_| Result::Ok(
+            Response::stream(
+                200,
+                "text/plain",
+                |_| {
+                    Result::Err(Error::new(ErrorKind::Cancelled, "application cancellation"))
+                },
+            ),
+        ),
+    );
+    let error = testing::expect_err(
+        cancelled.dispatch("GET", "/", Headers::new(), Bytes::new()),
+        "stream cancellation",
+    );
+    testing::assert_eq(error.kind, ErrorKind::Cancelled);
+    testing::assert_eq(error.message, "application cancellation");
+    let failed = Router::new().get(
+        "/",
+        |_| Result::Ok(
+            Response::stream(
+                200,
+                "text/plain",
+                |_| {
+                    Result::Err(Error::new(ErrorKind::Transport, "application transport error"))
+                },
+            ),
+        ),
+    );
+    let error = testing::expect_err(
+        failed.dispatch("GET", "/", Headers::new(), Bytes::new()),
+        "stream error",
+    );
+    testing::assert_eq(error.kind, ErrorKind::Transport);
+    testing::assert_eq(error.message, "application transport error");
+}
+
+#[test]
+fn handler_owned_task_scope_panic_is_recovered_after_sibling_cleanup() -> () {
+    let started = Channel::new(1);
+    let sibling_finished = Channel::new(1);
+    let child_finished = Channel::new(1);
+    let never: Channel[()] = Channel::new(0);
+    let router = Router::new().get(
+        "/",
+        |_| task::scope(
+            |scope| {
+                scope.spawn(
+                    |cancel| {
+                        defer sibling_finished.send(());
+                        started.send(());
+                        let _ = task::recv_with(cancel, never);
+                    },
+                );
+                scope.spawn(
+                    |_| {
+                        defer child_finished.send(());
+                        let _ = started.recv();
+                        panic::raise("private child task panic");
+                    },
+                );
+                Result::Ok(Response::text(200, "unreachable response"))
+            },
+        ),
+    );
+    let _ = panic_dispatch_error(router, "/");
+    transport_receive(sibling_finished);
+    transport_receive(child_finished);
+}
+
+#[test]
+fn live_tcp_handler_panics_send_generic_500_and_release_the_request_slot() -> () {
+    let router = Router::new().get("/handler", panic_handler).get("/bounds", panic_bounds).get(
+        "/healthy",
+        ok,
+    ).fallback(panic_handler).layer(
+        |request, next| {
+            if request.path() == "/middleware" {
+                panic::raise("private middleware panic");
+            }
+            next.run(request)
+        },
+    ).limits(Limits { concurrent_requests: 1, ..Limits::new() });
+    let server = transport_server(router);
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(1));
+    };
+    for path in Vec::from_array(["/handler", "/bounds", "/middleware", "/missing"]) {
+        let response = transport_request(
+            server,
+            "GET " + path + " HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        testing::assert(response.starts_with("HTTP/1.1 500 "));
+        testing::assert(response.contains("connection: close\r\n"));
+        testing::assert(response.ends_with("\r\n\r\ninternal server error"));
+        testing::assert(!response.contains("private"));
+        let healthy = transport_request(
+            server,
+            "GET /healthy HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        testing::assert(healthy.starts_with("HTTP/1.1 200 "));
+        testing::assert(healthy.ends_with("/healthy"));
+    }
+    let head = transport_request(server, "HEAD /handler HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    testing::assert(head.starts_with("HTTP/1.1 500 "));
+    testing::assert(head.contains("content-length: 21\r\n"));
+    testing::assert(head.ends_with("\r\n\r\n"));
+}
+
+#[test]
+fn live_tcp_stream_panics_abort_committed_response_without_terminal_chunk() -> () {
+    let cleanup = Channel::new(2);
+    let router = Router::new().get(
+        "/immediate",
+        |_| Result::Ok(
+            Response::stream(
+                202,
+                "text/plain",
+                |_| {
+                    defer cleanup.send(());
+                    panic::raise("private immediate stream panic")
+                },
+            ),
+        ),
+    ).get(
+        "/partial",
+        |_| Result::Ok(
+            Response::stream(
+                203,
+                "text/plain",
+                |writer| {
+                    defer cleanup.send(());
+                    writer.text("partial")?;
+                    panic::raise("private partial stream panic")
+                },
+            ),
+        ),
+    ).get("/healthy", ok).limits(Limits { concurrent_requests: 1, ..Limits::new() });
+    let server = transport_server(router);
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(1));
+    };
+    let immediate = transport_request(server, "GET /immediate HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    testing::assert(immediate.starts_with("HTTP/1.1 202 "));
+    testing::assert(immediate.ends_with("\r\n\r\n"));
+    testing::assert(!immediate.contains("0\r\n\r\n"));
+    testing::assert(!immediate.contains("private"));
+    transport_receive(cleanup);
+    let partial = transport_request(server, "GET /partial HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    testing::assert(partial.starts_with("HTTP/1.1 203 "));
+    testing::assert(partial.ends_with("\r\n\r\n7\r\npartial\r\n"));
+    testing::assert(!partial.contains("0\r\n\r\n"));
+    testing::assert(!partial.contains("private"));
+    transport_receive(cleanup);
+    let head = transport_request(
+        server,
+        "HEAD /immediate HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    testing::assert(head.starts_with("HTTP/1.1 202 "));
+    testing::assert(head.ends_with("\r\n\r\n"));
+    let invoked = select {
+        recv(cleanup) as _ => true,
+        default => false,
+    };
+    testing::assert(!invoked);
+    let healthy = transport_request(
+        server,
+        "GET /healthy HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    testing::assert(healthy.starts_with("HTTP/1.1 200 "));
+}
+
+#[test]
+fn live_tcp_callback_panic_does_not_cancel_another_active_stream() -> () {
+    let release = Channel::new(1);
+    let router = Router::new().get("/panic", panic_handler).get(
+        "/held",
+        |request| {
+            Result::Ok(
+                Response::stream(
+                    200,
+                    "text/plain",
+                    |writer| {
+                        writer.text("first")?;
+                        let _ = release.recv();
+                        request.check()?;
+                        writer.text("second")
+                    },
+                ),
+            )
+        },
+    );
+    let server = transport_server(router);
+    defer {
+        let _ = server.shutdown(Duration::from_seconds(1));
+    };
+    let stream = transport_connect(server);
+    defer {
+        let _ = stream.close();
+    };
+    transport_send(stream, "GET /held HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    testing::assert(transport_head(stream).starts_with("HTTP/1.1 200 "));
+    testing::assert_eq(transport_exact(stream, 10), "5\r\nfirst\r\n");
+    let failed = transport_request(server, "GET /panic HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    testing::assert(failed.starts_with("HTTP/1.1 500 "));
+    release.send(());
+    testing::assert_eq(transport_closed(stream), "6\r\nsecond\r\n0\r\n\r\n");
+}

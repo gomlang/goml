@@ -1,0 +1,152 @@
+package tests;
+
+use ecosystem::archive;
+use std::bytes;
+use std::process;
+use std::testing;
+
+fn gzip_command(data: bytes::Bytes, argument: string) -> bytes::Bytes {
+    let output = testing::expect_ok(
+        process::Command::new("gzip").arg(argument).input(data).output_structured(),
+        "gzip command",
+    );
+    testing::assert(output.status().success());
+    output.stdout()
+}
+
+fn gzip_envelope(deflated: Vec[byte], expanded: bytes::Bytes) -> bytes::Bytes {
+    let data = bytes::Bytes::from_vec(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff");
+    data.extend_from_slice(deflated.as_slice());
+    let checksum = archive::crc32(expanded);
+    for index in 0..4 {
+        data.push((checksum >> (index * 8).to_u32()).to_u8());
+    }
+    for index in 0..4 {
+        data.push((expanded.len().to_u32() >> (index * 8).to_u32()).to_u8());
+    }
+    data
+}
+
+#[test]
+fn stored_fixed_dynamic_blocks_and_external_gzip() -> () {
+    let empty = bytes::Bytes::new();
+    for deflated in Vec::from_array(
+        [b"\x03\x00", b"\x01\x00\x00\xff\xff", b"\x00\x00\x00\xff\xff\x03\x00"],
+    ) {
+        testing::assert_eq(
+            testing::expect_ok(archive::gunzip(gzip_envelope(deflated, empty), 0), "empty blocks").len(),
+            0,
+        );
+    }
+    let samples = Vec::new();
+    samples.push(empty);
+    samples.push(bytes::Bytes::from_string("fixed block"));
+    let repeated = bytes::Bytes::new();
+    for _ in 0..4096 {
+        repeated.extend_from_slice(
+            b"overlapping overlapping abcdefghijklmnopqrstuvwxyz 0123456789\n".as_slice(),
+        );
+    }
+    samples.push(repeated);
+    let random = bytes::Bytes::new();
+    let mut seed: u32 = 0x12345678;
+    for _ in 0..131073 {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        random.push(seed.to_u8());
+    }
+    samples.push(random);
+    for source in samples {
+        let encoded = testing::expect_ok(archive::gzip(source), "encode");
+        testing::assert(gzip_command(encoded, "-dc").to_vec() == source.to_vec());
+        testing::assert(
+            testing::expect_ok(archive::gunzip(encoded, source.len()), "self decode").to_vec()
+                == source.to_vec(),
+        );
+        for level in["-1c", "-9c"] {
+            let external = gzip_command(source, level);
+            testing::assert(
+                testing::expect_ok(archive::gunzip(external, source.len()), "external decode").to_vec()
+                    == source.to_vec(),
+            );
+            if source.len() > 100000 && source.get(0) == b'o' {
+                testing::assert_eq((external.get(10) >> 1) & 3, 2);
+            }
+            if !source.is_empty() {
+                testing::assert_eq(
+                    testing::expect_err(archive::gunzip(external, source.len() - 1), "limit").kind,
+                    archive::ErrorKind::Limit,
+                );
+            }
+        }
+    }
+    testing::assert(
+        testing::expect_ok(archive::gzip(repeated), "compression").len() < repeated.len() / 10,
+    );
+}
+
+#[test]
+fn gzip_optional_headers_members_checksums_and_truncation() -> () {
+    let source = bytes::Bytes::from_string("GZIP member");
+    let plain = testing::expect_ok(archive::gzip(source), "gzip");
+    let decorated = bytes::Bytes::from_vec(
+        b"\x1f\x8b\x08\x1e\x00\x00\x00\x00\x00\xff\x03\x00abcname\x00comment\x00",
+    );
+    let checksum = archive::crc32(decorated);
+    decorated.push(checksum.to_u8());
+    decorated.push((checksum >> 8).to_u8());
+    decorated.extend_from_slice(plain.slice(10, plain.len()));
+    testing::assert(
+        testing::expect_ok(archive::gunzip(decorated, source.len()), "headers").to_vec()
+            == source.to_vec(),
+    );
+    testing::assert(gzip_command(decorated, "-dc").to_vec() == source.to_vec());
+    for length in 0..decorated.len() {
+        testing::assert_err(
+            archive::gunzip(bytes::Bytes::from_slice_copy(decorated.slice(0, length)), source.len()),
+        );
+    }
+    for offset in[3, 4, 29, decorated.len() - 8, decorated.len() - 4] {
+        let broken = decorated.copy();
+        broken.set(offset, broken.get(offset) ^ 0x80);
+        testing::assert_err(archive::gunzip(broken, 100));
+    }
+    let combined = decorated.copy();
+    combined.extend_from_slice(plain.as_slice());
+    testing::assert_eq(
+        testing::expect_ok(archive::gunzip(combined, source.len() * 2), "members").len(),
+        source.len() * 2,
+    );
+    testing::assert_eq(
+        testing::expect_err(archive::gunzip(combined, source.len() * 2 - 1), "combined budget").kind,
+        archive::ErrorKind::Limit,
+    );
+    combined.push(0);
+    testing::assert_err(archive::gunzip(combined, 100));
+    testing::assert_err(archive::gunzip(plain, -1));
+}
+
+#[test]
+fn malformed_deflate_blocks_are_recoverable() -> () {
+    let empty = bytes::Bytes::new();
+    for deflated in Vec::from_array(
+        [
+            b"\x07",
+            b"\x01\x01\x00\xff\xff",
+            b"\x1b\x03",
+            b"\x03\x02",
+            b"\x05\x00\x00\x00",
+            b"\xfd\x00\x00\x00",
+            b"\x05\x00\x92\x04",
+        ],
+    ) {
+        testing::assert_err(archive::gunzip(gzip_envelope(deflated, empty), 100));
+    }
+    let prior = testing::expect_ok(
+        archive::gzip(bytes::Bytes::from_string("previous member history")),
+        "previous member",
+    );
+    prior.extend_from_slice(gzip_envelope(b"\x03\x02", empty).as_slice());
+    testing::assert_err(archive::gunzip(prior, 100));
+}
