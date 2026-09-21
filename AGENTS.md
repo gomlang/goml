@@ -80,6 +80,7 @@ Run recipes from the repository root; [.justfile](.justfile) is the command refe
 ## Tests and Golden Files
 
 - Prefer fast, deterministic tests and minimal fixtures covering relevant parsing, typing, and runtime edges.
+- Compiler CLI tests that need a package world should use `gomlc/test_support/compiler.gom`'s `compiler_command` to reuse `GOML_TEST_COMPILER_WORLD`, including when changing the child process directory. Use direct commands only when specifically testing source-world construction or commands that do not accept `--world`.
 - Pipeline cases live in `gomlc/testdata/pipeline/NNN[_description]/main.gom`. Add or edit the source, then run `just update-golden` to generate IR snapshots and execution output.
 - Multi-package cases live in `gomlc/testdata/module/projectNNN[_description]/`. Include a root `goml.toml`, explicit package declarations/imports, public cross-package APIs, and a `package main` entry. Generate their `.out` files with `just update-golden`; these cases do not produce IR snapshots.
 - Visibility and package-diagnostic fixtures belong in `gomlc/testdata/module_diagnostics/`.
