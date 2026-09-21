@@ -206,9 +206,9 @@ func (g *generator) release(symbol, pointer string) (string, error) {
 	canonical := g.w.normalize(params[0].Type.Qual)
 	switch canonical {
 	case "char *":
-		return "defer C." + symbol + "(" + pointer + ")\n", nil
+		return "defer " + g.call(symbol) + "(" + pointer + ")\n", nil
 	case "void *":
-		return "defer C." + symbol + "(unsafe.Pointer(" + pointer + "))\n", nil
+		return "defer " + g.call(symbol) + "(unsafe.Pointer(" + pointer + "))\n", nil
 	default:
 		return "", fmt.Errorf("unsupported release parameter %s", canonical)
 	}
@@ -220,7 +220,7 @@ func (g *generator) function(fn Function) error {
 	nativeParameters, publicParameters, rawParameters := []string{}, []string{}, []string{}
 	cArguments, goArguments := []string{}, []string{}
 	outputs := []output{}
-	before, after := strings.Builder{}, strings.Builder{}
+	before, after, outputReads := strings.Builder{}, strings.Builder{}, strings.Builder{}
 	rawCount := 0
 	returnType := resultType(node)
 	retCanonical := g.w.normalize(returnType)
@@ -233,7 +233,7 @@ func (g *generator) function(fn Function) error {
 		outputs = append(outputs, g.stringOutput("cResult", rawCount))
 		rawCount += 2
 	} else if retCanonical != "void" {
-		rep, err := g.w.representation(returnType, fn.Return.Type)
+		rep, err := g.representation(returnType, fn.Return.Type)
 		if err != nil {
 			return fmt.Errorf("%s return: %w", fn.Name, err)
 		}
@@ -261,7 +261,7 @@ func (g *generator) function(fn Function) error {
 		}
 		switch kind {
 		case "value":
-			rep, err := g.w.representation(ty, mapping.Type)
+			rep, err := g.representation(ty, mapping.Type)
 			if err != nil {
 				return fmt.Errorf("%s parameter %s: %w", fn.Name, mapping.Name, err)
 			}
@@ -288,13 +288,17 @@ func (g *generator) function(fn Function) error {
 			rawParameters = append(rawParameters, name+": ffi::String")
 			goArguments = append(goArguments, mapping.Name+".as_raw()")
 			fmt.Fprintf(&before, "if strings.IndexByte(%s, 0) >= 0 || len(%s) > 67108864 { ERROR(%q) }\n", name, name, "C string contains NUL or exceeds 64 MiB")
-			fmt.Fprintf(&before, "%s := C.CString(%s)\ndefer C.free(unsafe.Pointer(%s))\n", cName, name, cName)
+			if g.dynamic() {
+				fmt.Fprintf(&before, "%s, _ := cabi.Copy([]byte(%s), true); if %s == nil { ERROR(%q) }; defer cabi.Free(%s)\n", cName, name, cName, "C allocation failed", cName)
+			} else {
+				fmt.Fprintf(&before, "%s := C.CString(%s)\ndefer C.free(unsafe.Pointer(%s))\n", cName, name, cName)
+			}
 			cArguments = append(cArguments, cName)
 		case "bytes", "inout_bytes":
 			if canonical != "void *" && canonical != "char *" && canonical != "unsigned char *" && canonical != "signed char *" {
 				return fmt.Errorf("%s: bytes requires void or byte pointer", fn.Name)
 			}
-			cty, err := cgoType(ty)
+			cty, err := g.ctype(ty)
 			if err != nil {
 				return err
 			}
@@ -302,14 +306,22 @@ func (g *generator) function(fn Function) error {
 			publicParameters = append(publicParameters, mapping.Name+": Bytes")
 			rawParameters = append(rawParameters, name+": ffi::RawSlice[u8]")
 			goArguments = append(goArguments, "ffi::slice_from_vec_copy("+mapping.Name+".to_vec())")
-			fmt.Fprintf(&before, "if len(%s) > 67108864 { ERROR(%q) }\nvar %s unsafe.Pointer\nif len(%s) > 0 { %s = C.CBytes(%s); defer C.free(%s) }\n", name, "C buffer exceeds 64 MiB", cName, name, cName, name, cName)
+			if g.dynamic() {
+				fmt.Fprintf(&before, "if len(%s) > 67108864 { ERROR(%q) }; %s, _ := cabi.Copy(%s, false); if len(%s) > 0 && %s == nil { ERROR(%q) }; defer cabi.Free(%s)\n", name, "C buffer exceeds 64 MiB", cName, name, name, cName, "C allocation failed", cName)
+			} else {
+				fmt.Fprintf(&before, "if len(%s) > 67108864 { ERROR(%q) }\nvar %s unsafe.Pointer\nif len(%s) > 0 { %s = C.CBytes(%s); defer C.free(%s) }\n", name, "C buffer exceeds 64 MiB", cName, name, cName, name, cName)
+			}
 			cArguments = append(cArguments, "("+cty+")("+cName+")")
 			if kind == "inout_bytes" {
-				outputs = append(outputs, output{goTypes: []string{"[]byte"}, rawTypes: []string{"ffi::RawSlice[u8]"}, gomType: "Bytes", goValues: []string{"C.GoBytes(" + cName + ", C.int(len(" + name + ")))"}, gomValue: fmt.Sprintf("Bytes::from_vec(ffi::slice_to_vec_copy(r%d))", rawCount)})
+				copyBytes := "C.GoBytes(" + cName + ", C.int(len(" + name + ")))"
+				if g.dynamic() {
+					copyBytes = "cabi.Bytes(" + cName + ", len(" + name + "))"
+				}
+				outputs = append(outputs, output{goTypes: []string{"[]byte"}, rawTypes: []string{"ffi::RawSlice[u8]"}, gomType: "Bytes", goValues: []string{copyBytes}, gomValue: fmt.Sprintf("Bytes::from_vec(ffi::slice_to_vec_copy(r%d))", rawCount)})
 				rawCount++
 			}
 		case "length":
-			rep, err := g.w.representation(ty, "")
+			rep, err := g.representation(ty, "")
 			if err != nil || rep.handle != "" || !strings.Contains("iu", rep.gom[:1]) {
 				return fmt.Errorf("%s: length requires an integer parameter", fn.Name)
 			}
@@ -328,7 +340,7 @@ func (g *generator) function(fn Function) error {
 				return fmt.Errorf("%s: out requires a pointer", fn.Name)
 			}
 			pointee := strings.TrimSpace(strings.TrimSuffix(canonical, "*"))
-			rep, err := g.w.representation(pointee, mapping.Type)
+			rep, err := g.representation(pointee, mapping.Type)
 			if err != nil {
 				return fmt.Errorf("%s output %s: %w", fn.Name, mapping.Name, err)
 			}
@@ -336,7 +348,7 @@ func (g *generator) function(fn Function) error {
 			if rep.handle != "" {
 				for _, opaque := range g.w.Project.Config.Types {
 					if opaque.Name == rep.handle {
-						cty, err = cgoType(opaque.CType)
+						cty, err = g.ctype(opaque.CType)
 					}
 				}
 				if err != nil {
@@ -344,16 +356,28 @@ func (g *generator) function(fn Function) error {
 				}
 			}
 			g.abi(pointee, rep)
-			fmt.Fprintf(&before, "var %s %s\n", cName, cty)
-			cArguments = append(cArguments, "&"+cName)
+			if g.dynamic() {
+				fmt.Fprintf(&before, "%sSlot, _ := cabi.Alloc(8); if %sSlot == nil { ERROR(%q) }; defer cabi.Free(%sSlot)\n", cName, cName, "C allocation failed", cName)
+				cArguments = append(cArguments, cName+"Slot")
+				fmt.Fprintf(&outputReads, "%s := *(*%s)(%sSlot)\n", cName, cty, cName)
+			} else {
+				fmt.Fprintf(&before, "var %s %s\n", cName, cty)
+				cArguments = append(cArguments, "&"+cName)
+			}
 			outputs = append(outputs, g.outputValue(rep, cName, rawCount))
 			rawCount++
 		case "out_string":
 			if canonical != "char * *" {
 				return fmt.Errorf("%s: out_string requires char **", fn.Name)
 			}
-			fmt.Fprintf(&before, "var %s *C.char\n", cName)
-			cArguments = append(cArguments, "&"+cName)
+			if g.dynamic() {
+				fmt.Fprintf(&before, "%sSlot, _ := cabi.Alloc(8); if %sSlot == nil { ERROR(%q) }; defer cabi.Free(%sSlot)\n", cName, cName, "C allocation failed", cName)
+				cArguments = append(cArguments, cName+"Slot")
+				fmt.Fprintf(&outputReads, "%s := *(*unsafe.Pointer)(%sSlot)\n", cName, cName)
+			} else {
+				fmt.Fprintf(&before, "var %s *C.char\n", cName)
+				cArguments = append(cArguments, "&"+cName)
+			}
 			outputs = append(outputs, g.stringOutput(cName, rawCount))
 			rawCount += 2
 			copies = append(copies, stringCopy{cName, mapping.Release, mapping.MaxBytes})
@@ -397,11 +421,19 @@ func (g *generator) function(fn Function) error {
 		if limit == 0 {
 			limit = 1 << 20
 		}
-		fmt.Fprintf(&after, "var %sText string\nif %s != nil { n := C.goml_c_bounded_length(%s, %d); if n > %d { %s }; %sText = C.GoStringN(%s, C.int(n)) }\n",
-			copy.expression, copy.expression, copy.expression, limit+1, limit, fail("C string exceeds configured copy limit"), copy.expression, copy.expression)
+		if g.dynamic() {
+			fmt.Fprintf(&after, "%sText, %sError := cabi.String(%s, %d); if %sError != nil { %s }\n", copy.expression, copy.expression, copy.expression, limit, copy.expression, fail("C string exceeds configured copy limit"))
+		} else {
+			fmt.Fprintf(&after, "var %sText string\nif %s != nil { n := C.goml_c_bounded_length(%s, %d); if n > %d { %s }; %sText = C.GoStringN(%s, C.int(n)) }\n",
+				copy.expression, copy.expression, copy.expression, limit+1, limit, fail("C string exceeds configured copy limit"), copy.expression, copy.expression)
+		}
 	}
-	fmt.Fprintf(&g.native, "func GomlC_%s(%s) (%s) {\n%s%sC.%s(%s)\n%sreturn %s\n}\n",
-		fn.Name, strings.Join(nativeParameters, ", "), strings.Join(append(goTypes, "error"), ", "), expandErrors(before.String()), callPrefix, fn.Symbol, strings.Join(cArguments, ", "), after.String(), strings.Join(append(goValues, "nil"), ", "))
+	load := ""
+	if g.dynamic() {
+		load = "if err := gomlCLoad(); err != nil { return " + strings.Join(append(append([]string{}, failure...), "err"), ", ") + " }\n"
+	}
+	fmt.Fprintf(&g.native, "func GomlC_%s(%s) (%s) {\n%s%s%s%s(%s)\n%s%sreturn %s\n}\n",
+		fn.Name, strings.Join(nativeParameters, ", "), strings.Join(append(goTypes, "error"), ", "), load, expandErrors(before.String()), callPrefix, g.call(fn.Symbol), strings.Join(cArguments, ", "), outputReads.String(), after.String(), strings.Join(append(goValues, "nil"), ", "))
 	retSignature := strings.Join(append(rawTypes, "ffi::Error"), ", ")
 	if len(rawTypes) > 0 {
 		retSignature = "(" + retSignature + ")"
@@ -454,7 +486,7 @@ func Generate(w *World) (generated, error) {
 	g := &generator{w: w}
 	fmt.Fprintf(&g.gom, "package %s;\nuse std::ffi;\nuse std::c;\nuse std::bytes::{Bytes};\n", w.Project.Config.Package)
 	for _, ty := range w.Project.Config.Types {
-		cty, err := cgoType(ty.CType)
+		cty, err := g.ctype(ty.CType)
 		if err != nil {
 			return generated{}, err
 		}
@@ -486,10 +518,33 @@ func Generate(w *World) (generated, error) {
 			literal = "(-" + strings.TrimPrefix(value, "-") + "ULL)"
 		}
 		fmt.Fprintf(&g.assertions, "_Static_assert((%s) == (%s)%s, \"C constant changed; regenerate GoML bindings\");\n", constant.Symbol, ty, literal)
-		fmt.Fprintf(&g.native, "func GomlC_%s() %s { return %s(C.%s) }\n", constant.Name, rep.goType, rep.goType, constant.Symbol)
+		if g.dynamic() {
+			fmt.Fprintf(&g.native, "func GomlC_%s() %s { return %s }\n", constant.Name, rep.goType, value)
+		} else {
+			fmt.Fprintf(&g.native, "func GomlC_%s() %s { return %s(C.%s) }\n", constant.Name, rep.goType, rep.goType, constant.Symbol)
+		}
 		fmt.Fprintf(&g.gom, "pub const %s: %s = %s;\n", constant.Name, rep.gom, value)
 	}
 	var source strings.Builder
+	if g.dynamic() {
+		support, err := g.dynamicSupport()
+		if err != nil {
+			return generated{}, err
+		}
+		body := support + g.native.String()
+		fmt.Fprintf(&source, "package %s\nimport (\"goml.dev/cabi\"\n", w.Project.Config.GoPackage)
+		for _, name := range []string{"fmt", "strings", "unsafe", "math", "sync"} {
+			if strings.Contains(body, name+".") {
+				fmt.Fprintf(&source, "%q\n", name)
+			}
+		}
+		source.WriteString(")\n" + body)
+		native, err := format.Source([]byte(source.String()))
+		if err != nil {
+			return generated{}, fmt.Errorf("invalid dynamic Go source: %w", err)
+		}
+		return generated{Goml: []byte(g.gom.String()), Go: native}, nil
+	}
 	fmt.Fprintf(&source, "package %s\n\n/*\n", w.Project.Config.GoPackage)
 	flags := []string{"-std=c11", "-I" + w.Project.Directory}
 	for _, dir := range w.Project.Config.IncludeDirs {

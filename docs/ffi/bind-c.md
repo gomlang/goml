@@ -1,8 +1,36 @@
 # C bindings
 
-`goml bind-c bindings.json` generates GoML declarations and a native bridge from an explicit C allowlist. The Go backend uses cgo internally; binding users write GoML and C configuration without handwritten Go adapters. `gomlc bind-c` exposes the same generator. The packaged `goml-c-bind` helper inspects headers using Clang, formats the sources, and compiles and links a probe without executing it or package initializers.
+`goml bind-c bindings.json` generates GoML declarations and a native bridge from an explicit C allowlist. Choose the default `cgo` backend or the `dynamic` backend, which uses GoML's own C ABI runtime with `CGO_ENABLED=0`. Neither requires handwritten Go adapters. `gomlc bind-c` exposes the same generator. The packaged `goml-c-bind` helper inspects headers using Clang, formats the sources, and compiles and links a probe without executing it or package initializers.
 
-Generation and project checks require the native host target, `CGO_ENABLED=1`, a C compiler, and Clang 15 or newer. `GOML_CLANG` selects Clang; otherwise the tool searches `clang` and versioned executables. This first version supports Linux amd64 as the toolchain's development target. Cross compilation is rejected. Inspection and native compilation default to C11; a configured `-std=` flag overrides it in both. The C compiler and Clang must agree on ABI and preprocessing flags.
+Generation and project checks require the native host target and Clang 15 or newer. The cgo backend additionally requires `CGO_ENABLED=1` and a C compiler. The dynamic backend requires `CGO_ENABLED=0`, Linux amd64, glibc 2.34 or newer, and Go 1.26.x; its Go build needs no C compiler. `GOML_CLANG` selects Clang; otherwise the tool searches `clang` and versioned executables. Cross compilation is rejected. Inspection and cgo native compilation default to C11; a configured `-std=` flag overrides it in both. Headers must describe the ABI of the loaded library.
+
+## Calling C without cgo
+
+Select the backend and library sonames in the binding configuration:
+
+```json
+{
+  "version": 1,
+  "backend": "dynamic",
+  "libraries": ["libsqlite3.so.0"],
+  "package": "sqlite",
+  "output": "sqlite/generated.gom",
+  "go_package": "native",
+  "go_output": "native/generated.go",
+  "headers": ["sqlite3.h"],
+  "functions": [{"name": "version_number", "symbol": "sqlite3_libversion_number"}]
+}
+```
+
+The module manifest needs `native.go-module` and `native.c-bindings`; omit `native.cgo = "required"`. Run generation and project commands with `CGO_ENABLED=0`, for example `CGO_ENABLED=0 goml bind-c bindings.json` and `CGO_ENABLED=0 goml run`. The driver supplies the bundled `goml.dev/cabi` runtime through a temporary Go module file without modifying the project's `go.mod`. No third-party FFI library is used. The same runtime is shared by all binding modules in a dependency graph.
+
+`libraries` accepts one to 64 sonames or absolute paths. Sonames follow the system dynamic loader's search rules, including `LD_LIBRARY_PATH`; relative paths containing `/` are rejected. All listed libraries must load successfully, and symbols are searched in list order. Loading uses `RTLD_NOW | RTLD_LOCAL`. A binding initializes its function addresses once on first use, including configured release functions. Initialization errors are returned as `c::Error::Native` and cached for the process. Loaded libraries remain open for the process lifetime. C library constructors run when the application first loads the library; generation and `--check` do not load it or validate its exported symbols.
+
+The generator determines integer registers, floating-point registers and stack argument slots statically from Clang's types. It emits direct calls through a fixed assembly frame, without reflection. Signed and unsigned enums, including anonymous typedef enums, retain their inspected C representation while the public API uses checked `i64` values. Strings, buffers and output slots use temporary native allocations; C receives no Go-managed data pointers from these adapters. The existing copy limits and release rules apply.
+
+This backend rejects `ldflags`, static functions, static inline functions, variadic signatures and non-System-V calling conventions. Use an exported fixed-signature function in a shared library for such APIs. It does not link static archives or compile header implementations. `include_dirs`, `cflags`, `pkg_config`, `CGO_CPPFLAGS` and `CGO_CFLAGS` still configure header inspection; they do not compile or modify the shared library. Clang remains required for normal project verification. A library replacement must preserve the declared ABI; symbol lookup cannot verify a binary's C signature.
+
+The current runtime supports executable programs and outbound C calls. Callbacks, C exports, alternate libc implementations, other Go minor versions and mixed cgo/dynamic dependency graphs are unsupported. Go's race detector requires cgo and cannot be used with this backend. See [the runtime design and validation](c-abi-runtime.md) for stack, scheduler and pthread integration.
 
 ## Module configuration
 
@@ -26,7 +54,7 @@ go 1.26.0
 
 `native.c-bindings` is one module-relative configuration path. Project check, build, run and test verify bindings in the module and its dependencies before foreign compilation, including configurations containing only constants. Normal builds do not rewrite generated sources. An outdated declaration or a modified generated file produces a diagnostic directing the author to regenerate or restore it. Clang is therefore also required when consuming these configured bindings.
 
-The fingerprint covers configuration, Clang identity, Go target, and preprocessed headers, including transitive headers and their implementation bodies. It is passed into native compilation so changed C header contents invalidate Go's cgo cache even when the generated wrapper stays identical. Ordinary changes to a linked shared library remain the system linker's responsibility; replacing a static archive without changing inputs may require cleaning the Go build cache.
+The fingerprint covers configuration, Clang identity, Go target, and preprocessed headers, including transitive headers and their implementation bodies. For cgo it is passed into native compilation so changed C header contents invalidate Go's cgo cache even when the generated wrapper stays identical. Dynamic bindings execute the installed shared library's implementation. Ordinary changes to a linked shared library remain the system loader's responsibility; replacing a cgo static archive without changing inputs may require cleaning the Go build cache.
 
 ## Binding configuration
 
@@ -65,7 +93,7 @@ Unknown fields, duplicate JSON fields, unsupported signatures, ambiguous type ma
 
 Opaque types name C pointer types, including typedefs such as `LLVMContextRef`. Each becomes a distinct GoML struct with private native storage and `null()`, `is_null()` and `same_as(other)` methods. No pointer-to-integer conversion or dereference is exposed. A copied GoML handle refers to the same C resource. Calling a release function does not invalidate copies, and GC does not release C resources. Callers must obey the C API's nullability, parent lifetime, thread, aliasing and ownership requirements; these low-level bindings do not make arbitrary C APIs memory safe.
 
-Scalar C widths and signedness come from Clang. Supported values are `_Bool`, 8/16/32/64-bit integers, `float`, `double`, and C enums of at most four bytes. Enums use `i64` and checked conversion into the actual C type; this checks representation, not whether a value names an enumerator. `long` and `size_t` follow the host ABI. Generated C assertions verify scalar ABI, function signatures and integer constants against the compiler actually used by cgo.
+Scalar C widths and signedness come from Clang. Supported values are `_Bool`, 8/16/32/64-bit integers, `float`, `double`, and C enums of at most four bytes. Enums use `i64` and checked conversion into the actual C type; this checks representation, not whether a value names an enumerator. `long` and `size_t` follow the host ABI. For cgo, generated C assertions verify scalar ABI, function signatures and integer constants against its C compiler. Dynamic generation verifies the supported LP64 layout and uses Clang's inspected types directly.
 
 Every generated function returns `Result[T, c::Error]`. This error reports adapter failures such as a copy limit or a buffer length that does not fit the C parameter. C status codes remain ordinary values: `sqlite::open` returns `Result[(i32, Database), c::Error]`, preserving the database even when the C status is nonzero. There is no implicit `errno` or status-to-error convention. An adapter failure after a C call does not roll back C side effects; other returned resources may require an API-specific wrapper and cleanup policy.
 
@@ -115,4 +143,4 @@ The generator owns two source files and `<CONFIG>.goml-c-bind.json`, which recor
 
 A module-local lock excludes concurrent generators. Sources are staged, native code is compiled and linked, and output renames publish the validated result. Publication errors retain the staging directory with `previous.json` mapping previous outputs to backup files. No multi-file filesystem transaction is claimed; a process or machine crash during publication can leave a partial set that ownership checks reject. A stale `.goml-bind-c-lock` must be inspected and removed once no generator is active. The generator does not download C libraries or execute their initialization code during validation.
 
-Callbacks, variadic calls, struct/union values, field access, exported C functions, cross-target ABI descriptions and a cgo-free calling backend remain outside this version. An explicit C wrapper can reduce many such APIs to supported fixed signatures. See the [self-contained C example](../../examples/ffi-bind-c/README.md), [SQLite example](../../examples/ffi-c-sqlite/README.md), and [LLVM example](../../examples/ffi-c-llvm/README.md).
+Callbacks, variadic calls, struct/union values, field access, exported C functions and cross-target ABI descriptions remain outside this version. An explicit C wrapper can reduce many such APIs to supported fixed signatures. See the [self-contained cgo example](../../examples/ffi-bind-c/README.md), [dynamic SQLite example](../../examples/ffi-c-sqlite/README.md), and [dynamic LLVM example](../../examples/ffi-c-llvm/README.md).

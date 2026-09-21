@@ -108,7 +108,31 @@ func validateNative(ctx context.Context, p Project, generated generated, tempora
 	if err := os.WriteFile(main, []byte(source.String()), 0600); err != nil {
 		return err
 	}
-	_, err := run(ctx, p.Root, "", "go", "build", "-mod=readonly", "-overlay="+overlay, "-o", filepath.Join(temporary, "probe"), main)
+	arguments := []string{"build", "-mod=readonly", "-overlay=" + overlay, "-o", filepath.Join(temporary, "probe")}
+	if p.Config.Backend == "dynamic" {
+		runtimeDirectory, err := RuntimeDirectory()
+		if err != nil {
+			return err
+		}
+		modfile := filepath.Join(temporary, "go.mod")
+		for _, name := range []string{"go.mod", "go.sum"} {
+			data, err := os.ReadFile(filepath.Join(p.Root, name))
+			if os.IsNotExist(err) && name == "go.sum" {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(filepath.Join(temporary, name), data, 0600); err != nil {
+				return err
+			}
+		}
+		if _, err := run(ctx, p.Root, "", "go", "mod", "edit", "-modfile="+modfile, "-require=goml.dev/cabi@v0.0.0", "-replace=goml.dev/cabi="+runtimeDirectory); err != nil {
+			return err
+		}
+		arguments = append(arguments, "-modfile="+modfile)
+	}
+	_, err := run(ctx, p.Root, "", "go", append(arguments, main)...)
 	if err != nil {
 		return fmt.Errorf("native compile/link validation: %w", err)
 	}
@@ -172,13 +196,21 @@ func publish(p Project, generated generated, previous map[string][]byte, tempora
 }
 
 func Execute(ctx context.Context, args []string, formatter string, output io.Writer) error {
+	if len(args) == 1 && args[0] == "--runtime-dir" {
+		directory, err := RuntimeDirectory()
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(output, directory)
+		return nil
+	}
 	file := ""
 	dry, check, positional := false, false, false
 	for _, arg := range args {
 		if !positional {
 			switch arg {
 			case "--help", "-h":
-				fmt.Fprintln(output, "Usage: goml bind-c <CONFIG> [--dry-run | --check]\n\nGenerate allowlisted C bindings using Clang and cgo.\n\n  --dry-run  validate paths and print outputs without writing\n  --check    verify generated sources and print the C input fingerprint")
+				fmt.Fprintln(output, "Usage: goml bind-c <CONFIG> [--dry-run | --check]\n\nGenerate allowlisted C bindings using Clang and the cgo or dynamic backend.\n\n  --dry-run  validate paths and print outputs without writing\n  --check    verify generated sources and print the C input fingerprint\n  --runtime-dir  print the bundled C ABI runtime directory")
 				return nil
 			case "--":
 				positional = true

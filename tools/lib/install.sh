@@ -18,5 +18,5 @@ rm -f \
     "$prefix/lib/builtin_prelude.gom" \
     "$prefix/lib/builtin_numeric.gom" \
     "$prefix/lib/builtin_derive.gom"
-rm -rf -- "$prefix/lib/std"
+rm -rf -- "$prefix/lib/std" "$prefix/lib/cabi"
 cp -R "$repo_root/lib/." "$prefix/lib/"

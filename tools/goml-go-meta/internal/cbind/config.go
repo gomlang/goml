@@ -47,6 +47,8 @@ type Constant struct {
 
 type Config struct {
 	Version     int        `json:"version"`
+	Backend     string     `json:"backend,omitempty"`
+	Libraries   []string   `json:"libraries,omitempty"`
 	Package     string     `json:"package"`
 	Output      string     `json:"output"`
 	GoPackage   string     `json:"go_package"`
@@ -144,6 +146,21 @@ func uniqueJSONDepth(decoder *json.Decoder, depth int) error {
 }
 
 func validate(c Config) error {
+	if c.Backend != "" && c.Backend != "cgo" && c.Backend != "dynamic" {
+		return fmt.Errorf("backend must be cgo or dynamic")
+	}
+	if c.Backend == "dynamic" {
+		if len(c.Libraries) == 0 || len(c.Libraries) > 64 || len(c.LDFlags) != 0 {
+			return fmt.Errorf("dynamic backend requires libraries and does not accept ldflags")
+		}
+		for _, library := range c.Libraries {
+			if library == "" || strings.ContainsAny(library, "\x00\r\n") || strings.Contains(library, "/") && !filepath.IsAbs(library) {
+				return fmt.Errorf("dynamic library must be a soname or absolute path: %q", library)
+			}
+		}
+	} else if len(c.Libraries) != 0 {
+		return fmt.Errorf("libraries requires the dynamic backend")
+	}
 	if c.Version != 1 || !nameOK(c.Package, false) || !nameOK(c.GoPackage, false) {
 		return fmt.Errorf("expected version 1 and valid package names")
 	}

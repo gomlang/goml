@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -21,15 +22,17 @@ type astType struct {
 }
 
 type astNode struct {
-	Kind     string    `json:"kind"`
-	Name     string    `json:"name"`
-	Type     astType   `json:"type"`
-	Variadic bool      `json:"variadic"`
-	Value    string    `json:"value"`
-	Inner    []astNode `json:"inner"`
+	StorageClass string    `json:"storageClass"`
+	Kind         string    `json:"kind"`
+	Name         string    `json:"name"`
+	Type         astType   `json:"type"`
+	Variadic     bool      `json:"variadic"`
+	Value        string    `json:"value"`
+	Inner        []astNode `json:"inner"`
 }
 
 type World struct {
+	EnumTypes   map[string]string
 	Project     Project
 	Clang       string
 	Aliases     map[string]string
@@ -103,8 +106,18 @@ func Inspect(ctx context.Context, p Project) (*World, error) {
 		return nil, err
 	}
 	expected := runtime.GOOS + "\n" + runtime.GOARCH + "\n1\n"
+	if p.Config.Backend == "dynamic" {
+		expected = "linux\namd64\n0\n"
+		version, versionError := run(ctx, p.Root, "", "go", "env", "GOVERSION")
+		if versionError != nil {
+			return nil, versionError
+		}
+		if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" || !strings.HasPrefix(string(version), "go1.26.") {
+			return nil, fmt.Errorf("dynamic C bindings require a Linux amd64 host and Go 1.26.x")
+		}
+	}
 	if string(goEnvironment) != expected {
-		return nil, fmt.Errorf("C binding generation currently requires the host Go target and CGO_ENABLED=1")
+		return nil, fmt.Errorf("C binding generation requires the host Go target and CGO_ENABLED=%s for this backend", strings.TrimSpace(strings.Split(expected, "\n")[2]))
 	}
 	clang, err := clangProgram()
 	if err != nil {
@@ -210,6 +223,73 @@ func Inspect(ctx context.Context, p Project) (*World, error) {
 	if w.Sizes["char"] != 1 || w.Sizes["float"] != 4 || w.Sizes["double"] != 8 {
 		return nil, fmt.Errorf("unsupported C scalar ABI")
 	}
+	if p.Config.Backend == "dynamic" {
+		if w.Sizes["short"] != 2 || w.Sizes["int"] != 4 || w.Sizes["long"] != 8 || w.Sizes["long_long"] != 8 || w.Sizes["size_t"] != 8 {
+			return nil, fmt.Errorf("dynamic backend requires the Linux amd64 LP64 C ABI")
+		}
+		w.EnumTypes = map[string]string{}
+		usedEnums := map[string]bool{}
+		for _, fn := range p.Config.Functions {
+			node := w.Functions[fn.Symbol]
+			usedEnums[w.normalize(resultType(node))] = true
+			for index, parameter := range parameters(node) {
+				canonical := w.normalize(parameter.Type.Qual)
+				if index < len(fn.Parameters) && fn.Parameters[index].Kind == "out" {
+					canonical = strings.TrimSpace(strings.TrimSuffix(canonical, "*"))
+				}
+				usedEnums[canonical] = true
+			}
+		}
+		spellings := map[string]string{}
+		for _, node := range tree.Inner {
+			if node.Kind == "EnumDecl" && node.Name != "" && usedEnums["enum "+node.Name] {
+				spellings["enum "+node.Name] = "enum " + node.Name
+			}
+			if node.Kind == "TypedefDecl" {
+				canonical := w.normalize(node.Name)
+				if usedEnums[canonical] && strings.HasPrefix(canonical, "enum ") && !strings.ContainsAny(canonical, "*()[]") {
+					spellings[canonical] = node.Name
+				}
+			}
+		}
+		enumNames := []string{}
+		for name := range spellings {
+			enumNames = append(enumNames, name)
+		}
+		sort.Strings(enumNames)
+		var enumProbe strings.Builder
+		enumProbe.WriteString(probe.String())
+		for index, name := range enumNames {
+			fmt.Fprintf(&enumProbe, "enum { goml_c_enum_size_%d = sizeof(%s), goml_c_enum_sign_%d = ((%s)-1 < 0) };\n", index, spellings[name], index, spellings[name])
+		}
+		output, err := run(ctx, p.Directory, enumProbe.String(), clang, args...)
+		if err != nil {
+			return nil, err
+		}
+		var enums astNode
+		if err := json.Unmarshal(output, &enums); err != nil {
+			return nil, err
+		}
+		values := map[string]string{}
+		for _, node := range enums.Inner {
+			if node.Kind == "EnumDecl" {
+				for _, constant := range node.Inner {
+					values[constant.Name] = constantValue(constant)
+				}
+			}
+		}
+		for index, name := range enumNames {
+			size, _ := strconv.Atoi(values[fmt.Sprintf("goml_c_enum_size_%d", index)])
+			if size != 1 && size != 2 && size != 4 {
+				continue
+			}
+			prefix := "uint"
+			if values[fmt.Sprintf("goml_c_enum_sign_%d", index)] == "1" {
+				prefix = "int"
+			}
+			w.EnumTypes[name] = fmt.Sprintf("%s%d", prefix, size*8)
+		}
+	}
 	for index, ty := range p.Config.Types {
 		canonical := w.normalize(w.Aliases[fmt.Sprintf("goml_c_probe_type_%d", index)])
 		if !strings.HasSuffix(canonical, "*") || strings.Contains(canonical, "(") {
@@ -221,6 +301,11 @@ func Inspect(ctx context.Context, p Project) (*World, error) {
 		node, found := w.Functions[fn.Symbol]
 		if !found || node.Variadic || strings.HasSuffix(node.Type.Qual, "()") {
 			return nil, fmt.Errorf("%s must be a declared, non-variadic C function", fn.Symbol)
+		}
+		if p.Config.Backend == "dynamic" {
+			if err := dynamicSignature(node); err != nil {
+				return nil, err
+			}
 		}
 		params := parameters(node)
 		if fn.Parameters == nil {
