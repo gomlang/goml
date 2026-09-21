@@ -150,3 +150,5 @@ if "$smoke_root/$package/bin/goml" bind-go bindings.json > binding-rejected.log 
 fi
 test ! -e go.sum
 test ! -e .goml-bind-go-lock
+"$smoke_root/$package/bin/goml" bind-c --help > "$smoke_root/bind-c-help.txt"
+"$smoke_root/$package/bin/goml-c-bind" --help > "$smoke_root/bind-c-helper-help.txt"
