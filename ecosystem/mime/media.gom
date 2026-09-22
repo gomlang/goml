@@ -1,0 +1,454 @@
+package mime;
+
+use std::bytes;
+use std::utf8;
+
+fn token_byte(value: byte) -> bool {
+    (value >= b'a' && value <= b'z') || (value >= b'A' && value <= b'Z')
+        || (value >= b'0' && value <= b'9')
+        || value == b'!'
+        || value == b'#'
+        || value == b'$'
+        || value == b'%'
+        || value == b'&'
+        || value == b'\''
+        || value == b'*'
+        || value == b'+'
+        || value == b'-'
+        || value == b'.'
+        || value == b'^'
+        || value == b'_'
+        || value == b'`'
+        || value == b'|'
+        || value == b'~'
+}
+
+fn token(value: string) -> bool {
+    if value == "" {
+        return false
+    }
+    for byte in value.to_bytes() {
+        if !token_byte(byte) {
+            return false
+        }
+    }
+    true
+}
+
+fn attribute_byte(value: byte) -> bool {
+    token_byte(value) && value != b'*' && value != b'\'' && value != b'%'
+}
+
+fn hex_digit(value: byte) -> byte {
+    if value < 10 {
+        b'0' + value
+    } else {
+        b'A' + value - 10
+    }
+}
+
+fn hex_value(value: byte) -> Option[byte] {
+    if value >= b'0' && value <= b'9' {
+        Option::Some(value - b'0')
+    } else if value >= b'a' && value <= b'f' {
+        Option::Some(value - b'a' + 10)
+    } else if value >= b'A' && value <= b'F' {
+        Option::Some(value - b'A' + 10)
+    } else {
+        Option::None
+    }
+}
+
+fn decode_percent(value: string, offset: isize, limits: Limits) -> Result[bytes::Bytes, Error] {
+    let output = bytes::Bytes::new();
+    let mut index = 0;
+    while index < value.byte_len() {
+        let byte = value.byte_get(index);
+        if byte == b'%' {
+            if index + 2 >= value.byte_len() {
+                return Result::Err(failure(ErrorKind::Invalid, offset, "short percent escape"))
+            }
+            let high = hex_value(value.byte_get(index + 1)).ok_or(
+                failure(ErrorKind::Invalid, offset, "invalid percent escape"),
+            )?;
+            let low = hex_value(value.byte_get(index + 2)).ok_or(
+                failure(ErrorKind::Invalid, offset, "invalid percent escape"),
+            )?;
+            output.push(high * 16 + low);
+            index += 3;
+        } else {
+            if !attribute_byte(byte) {
+                return Result::Err(failure(ErrorKind::Invalid, offset, "invalid extended byte"))
+            }
+            output.push(byte);
+            index += 1;
+        }
+        if output.len() > limits.max_value_bytes {
+            return Result::Err(failure(ErrorKind::Limit, offset, "parameter exceeds limit"))
+        }
+    }
+    Result::Ok(output)
+}
+
+fn decode_initial(value: string, offset: isize, limits: Limits) -> Result[bytes::Bytes, Error] {
+    let (charset, rest) = value.split_once("'").ok_or(
+        failure(ErrorKind::Invalid, offset, "missing extended charset"),
+    )?;
+    let (_, encoded) = rest.split_once("'").ok_or(
+        failure(ErrorKind::Invalid, offset, "missing extended language"),
+    )?;
+    if charset.to_ascii_lowercase() != "utf-8" {
+        return Result::Err(failure(ErrorKind::Charset, offset, "unsupported extended charset"))
+    }
+    decode_percent(encoded, offset, limits)
+}
+
+fn decode_extended(value: string, offset: isize, limits: Limits) -> Result[string, Error] {
+    let output = decode_initial(value, offset, limits)?;
+    utf8::decode(output.to_vec()).map_err(
+        |error| failure(ErrorKind::Invalid, offset, error.to_string()),
+    )
+}
+
+struct RawParameter {
+    name: string,
+    value: string,
+    offset: isize,
+}
+
+enum ParameterKey {
+    Plain(string),
+    Single(string),
+    Segment(string, isize, bool),
+}
+
+fn classify_key(name: string, offset: isize, limits: Limits) -> Result[ParameterKey, Error] {
+    let Some((base, suffix)) = name.split_once("*") else {
+        return Result::Ok(ParameterKey::Plain(name))
+    };
+    if base == "" {
+        return Result::Err(failure(ErrorKind::Invalid, offset, "empty extended parameter name"))
+    }
+    if suffix == "" {
+        return Result::Ok(ParameterKey::Single(base))
+    }
+    let encoded = suffix.ends_with("*");
+    let digits = if encoded {
+        suffix.byte_slice(0, suffix.byte_len() - 1)
+    } else {
+        suffix
+    };
+    if digits == "" || digits.byte_len() > 1 && digits.byte_get(0) == b'0' {
+        return Result::Err(failure(ErrorKind::Invalid, offset, "invalid continuation index"))
+    }
+    let mut index = 0;
+    for byte in digits.to_bytes() {
+        if byte < b'0' || byte > b'9' || index >= limits.max_parameters {
+            return Result::Err(failure(ErrorKind::Invalid, offset, "invalid continuation index"))
+        }
+        let digit = (byte - b'0').to_isize();
+        if digit >= limits.max_parameters || index > (limits.max_parameters - 1 - digit) / 10 {
+            return Result::Err(
+                failure(ErrorKind::Limit, offset, "continuation index exceeds limit"),
+            )
+        }
+        index = index * 10 + digit;
+        if index >= limits.max_parameters {
+            return Result::Err(
+                failure(ErrorKind::Limit, offset, "continuation index exceeds limit"),
+            )
+        }
+    }
+    Result::Ok(ParameterKey::Segment(base, index, encoded))
+}
+
+fn push_parameter(result: MediaType, name: string, value: string, offset: isize) -> Result[
+    (),
+    Error,
+] {
+    for byte in value.to_bytes() {
+        if byte < 32 && byte != b'\t' || byte == 127 {
+            return Result::Err(failure(ErrorKind::Invalid, offset, "control in parameter value"))
+        }
+    }
+    for previous in result.parameters {
+        if previous.name == name {
+            return Result::Err(failure(ErrorKind::Invalid, offset, "duplicate parameter"))
+        }
+    }
+    result.parameters.push(Parameter { name, value });
+    Result::Ok(())
+}
+
+fn assemble_segments(raw: Vec[RawParameter], base: string, limits: Limits) -> Result[string, Error] {
+    let pieces = bytes::Bytes::new();
+    let mut count = 0;
+    let mut greatest = 0;
+    for parameter in raw {
+        if let ParameterKey::Segment(name, index, _) = classify_key(
+            parameter.name,
+            parameter.offset,
+            limits,
+        )? {
+            if name == base {
+                count += 1;
+                if index > greatest {
+                    greatest = index;
+                }
+            }
+        }
+    }
+    if count == 0 || greatest + 1 != count {
+        return Result::Err(failure(ErrorKind::Invalid, 0, "missing continuation segment"))
+    }
+    for index in 0..count {
+        let mut found = false;
+        for parameter in raw {
+            if let ParameterKey::Segment(name, number, encoded) = classify_key(
+                parameter.name,
+                parameter.offset,
+                limits,
+            )? {
+                if name == base && number == index {
+                    if found {
+                        return Result::Err(
+                            failure(
+                                ErrorKind::Invalid,
+                                parameter.offset,
+                                "duplicate continuation segment",
+                            ),
+                        )
+                    }
+                    found = true;
+                    let segment = if encoded && index == 0 {
+                        decode_initial(parameter.value, parameter.offset, limits)?
+                    } else if encoded {
+                        decode_percent(parameter.value, parameter.offset, limits)?
+                    } else {
+                        bytes::Bytes::from_string(parameter.value)
+                    };
+                    if segment.len() > limits.max_value_bytes - pieces.len() {
+                        return Result::Err(
+                            failure(ErrorKind::Limit, parameter.offset, "parameter exceeds limit"),
+                        )
+                    }
+                    pieces.extend_from_slice(segment.as_slice());
+                }
+            }
+        }
+        if !found {
+            return Result::Err(failure(ErrorKind::Invalid, 0, "missing continuation segment"))
+        }
+    }
+    utf8::decode(pieces.to_vec()).map_err(|error| failure(ErrorKind::Invalid, 0, error.to_string()))
+}
+
+fn horizontal(value: byte) -> bool {
+    value == b' ' || value == b'\t'
+}
+
+fn skip_horizontal(value: string, position: Ref[isize]) -> () {
+    while position.get() < value.byte_len() && horizontal(value.byte_get(position.get())) {
+        position.set(position.get() + 1);
+    }
+}
+
+fn consume_token(value: string, position: Ref[isize]) -> string {
+    let start = position.get();
+    while position.get() < value.byte_len() && token_byte(value.byte_get(position.get())) {
+        position.set(position.get() + 1);
+    }
+    value.byte_slice(start, position.get())
+}
+
+fn consume_value(value: string, position: Ref[isize], limits: Limits) -> Result[string, Error] {
+    if position.get() >= value.byte_len() {
+        return Result::Err(failure(ErrorKind::Invalid, position.get(), "missing parameter value"))
+    }
+    if value.byte_get(position.get()) != b'"' {
+        let result = consume_token(value, position);
+        if result == "" {
+            return Result::Err(
+                failure(ErrorKind::Invalid, position.get(), "invalid parameter value"),
+            )
+        }
+        if result.byte_len() > limits.max_value_bytes {
+            return Result::Err(failure(ErrorKind::Limit, position.get(), "parameter exceeds limit"))
+        }
+        return Result::Ok(result)
+    }
+    position.set(position.get() + 1);
+    let output: Vec[byte] = Vec::new();
+    while position.get() < value.byte_len() {
+        let mut byte = value.byte_get(position.get());
+        position.set(position.get() + 1);
+        if byte == b'"' {
+            return utf8::decode(output).map_err(
+                |error| failure(ErrorKind::Invalid, position.get(), error.to_string()),
+            )
+        }
+        if byte == b'\\' {
+            if position.get() >= value.byte_len() {
+                return Result::Err(
+                    failure(ErrorKind::Invalid, position.get(), "unfinished quoted pair"),
+                )
+            }
+            byte = value.byte_get(position.get());
+            position.set(position.get() + 1);
+        }
+        if byte < 32 && byte != b'\t' || byte == 127 {
+            return Result::Err(
+                failure(ErrorKind::Invalid, position.get() - 1, "invalid quoted byte"),
+            )
+        }
+        if output.len() >= limits.max_value_bytes {
+            return Result::Err(failure(ErrorKind::Limit, position.get(), "parameter exceeds limit"))
+        }
+        output.push(byte);
+    }
+    Result::Err(failure(ErrorKind::Invalid, position.get(), "unterminated quoted value"))
+}
+
+pub fn parse_media_type(value: string, limits: Limits) -> Result[MediaType, Error] {
+    limits.validate()?;
+    if value.byte_len() > limits.max_input_bytes {
+        return Result::Err(failure(ErrorKind::Limit, 0, "media type exceeds input limit"))
+    }
+    let position = Ref::new(0);
+    skip_horizontal(value, position);
+    let major = consume_token(value, position);
+    if major == "" || position.get() >= value.byte_len() || value.byte_get(position.get()) != b'/' {
+        return Result::Err(failure(ErrorKind::Invalid, position.get(), "invalid media type"))
+    }
+    position.set(position.get() + 1);
+    let minor = consume_token(value, position);
+    if minor == "" {
+        return Result::Err(failure(ErrorKind::Invalid, position.get(), "missing media subtype"))
+    }
+    let result = MediaType {
+        essence: major.to_ascii_lowercase() + "/" + minor.to_ascii_lowercase(),
+        parameters: Vec::new(),
+    };
+    let raw: Vec[RawParameter] = Vec::new();
+    skip_horizontal(value, position);
+    while position.get() < value.byte_len() {
+        if value.byte_get(position.get()) != b';' {
+            return Result::Err(
+                failure(ErrorKind::Invalid, position.get(), "unexpected media type data"),
+            )
+        }
+        position.set(position.get() + 1);
+        skip_horizontal(value, position);
+        if raw.len() >= limits.max_parameters {
+            return Result::Err(failure(ErrorKind::Limit, position.get(), "too many parameters"))
+        }
+        let name = consume_token(value, position).to_ascii_lowercase();
+        if name == "" {
+            return Result::Err(
+                failure(ErrorKind::Invalid, position.get(), "missing parameter name"),
+            )
+        }
+        skip_horizontal(value, position);
+        if position.get() >= value.byte_len() || value.byte_get(position.get()) != b'=' {
+            return Result::Err(
+                failure(ErrorKind::Invalid, position.get(), "missing parameter equals"),
+            )
+        }
+        position.set(position.get() + 1);
+        skip_horizontal(value, position);
+        let parameter = consume_value(value, position, limits)?;
+        raw.push(RawParameter { name, value: parameter, offset: position.get() });
+        skip_horizontal(value, position);
+    }
+    let assembled: Vec[string] = Vec::new();
+    for parameter in raw {
+        match classify_key(parameter.name, parameter.offset, limits)? {
+            ParameterKey::Plain(name) => {
+                push_parameter(result, name, parameter.value, parameter.offset)?;
+            },
+            ParameterKey::Single(name) => {
+                let decoded = decode_extended(parameter.value, parameter.offset, limits)?;
+                push_parameter(result, name, decoded, parameter.offset)?;
+            },
+            ParameterKey::Segment(name, _, _) => {
+                if !assembled.contains(name) {
+                    let decoded = assemble_segments(raw, name, limits)?;
+                    push_parameter(result, name, decoded, parameter.offset)?;
+                    assembled.push(name);
+                }
+            },
+        }
+    }
+    Result::Ok(result)
+}
+
+fn encoded_parameter(name: string, value: string) -> Result[string, Error] {
+    let mut extended = false;
+    for byte in value.to_bytes() {
+        if byte < 32 || byte == 127 {
+            return Result::Err(failure(ErrorKind::Invalid, 0, "invalid parameter byte"))
+        }
+        if byte >= 128 {
+            extended = true;
+        }
+    }
+    if extended {
+        let output: Vec[byte] = Vec::new();
+        for byte in value.to_bytes() {
+            if attribute_byte(byte) {
+                output.push(byte);
+            } else {
+                output.push(b'%');
+                output.push(hex_digit(byte / 16));
+                output.push(hex_digit(byte % 16));
+            }
+        }
+        return Result::Ok(name + "*=utf-8''" + string_from_utf8(output).1)
+    }
+    if token(value) {
+        return Result::Ok(name + "=" + value)
+    }
+    let mut quoted = "\"";
+    for byte in value.to_bytes() {
+        if byte == b'"' || byte == b'\\' {
+            quoted += "\\";
+        }
+        quoted += string_from_utf8(Vec::from_array([byte])).1;
+    }
+    Result::Ok(name + "=" + quoted + "\"")
+}
+
+pub fn format_media_type(value: MediaType, limits: Limits) -> Result[string, Error] {
+    limits.validate()?;
+    let parsed = parse_media_type(value.essence, limits)?;
+    if parsed.parameters.len() != 0 {
+        return Result::Err(failure(ErrorKind::Invalid, 0, "media essence has parameters"))
+    }
+    let mut output = parsed.essence;
+    if value.parameters.len() > limits.max_parameters {
+        return Result::Err(failure(ErrorKind::Limit, 0, "too many parameters"))
+    }
+    let seen: Vec[string] = Vec::new();
+    for parameter in value.parameters {
+        let name = parameter.name.to_ascii_lowercase();
+        if !token(name) || name.contains("*") {
+            return Result::Err(failure(ErrorKind::Invalid, 0, "invalid parameter name"))
+        }
+        if seen.contains(name) {
+            return Result::Err(failure(ErrorKind::Invalid, 0, "duplicate parameter"))
+        }
+        seen.push(name);
+        if parameter.value.byte_len() > limits.max_value_bytes {
+            return Result::Err(failure(ErrorKind::Limit, 0, "parameter exceeds limit"))
+        }
+        let encoded = encoded_parameter(name, parameter.value)?;
+        if encoded.byte_len() + 2 > limits.max_output_bytes - output.byte_len() {
+            return Result::Err(failure(ErrorKind::Limit, 0, "media type exceeds output limit"))
+        }
+        output += "; " + encoded;
+    }
+    if output.byte_len() > limits.max_output_bytes {
+        return Result::Err(failure(ErrorKind::Limit, 0, "media type exceeds output limit"))
+    }
+    Result::Ok(output)
+}
