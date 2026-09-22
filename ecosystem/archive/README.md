@@ -45,11 +45,21 @@ let first_file = indexed.entry(1)?;
   fixed Huffman, and dynamic Huffman blocks. Encoding uses LZ77 matching with
   fixed Huffman codes and falls back to stored blocks for incompressible input.
 
-Writers handle short writes and interrupted I/O through standard traits. Partial
-I/O failures poison writers, and TAR parsing failures poison readers. `finish`
+Writers complete short writes through standard traits and propagate write errors,
+including interruptions, without automatic replay. Partial
+output failures poison writers, and TAR parsing failures poison readers. `finish`
 and terminal TAR EOF are idempotent. Callers own and close the underlying stream.
 Instances are intended for one sequential owner; independent instances can run
 concurrently.
+
+Generic reads also propagate interruptions immediately without retry. A failing
+read may already have consumed bytes or modified the destination buffer without
+reporting a count; those bytes do not become a successful archive read. TAR entry
+input errors poison the writer because headers may already have been emitted.
+ZIP `append_reader` reads the entire bounded entry before emitting it: an input
+failure leaves that writer usable, but recovery requires a fresh or explicitly
+repositioned entry source, not blindly resuming the failed one. TAR reader errors
+are terminal; later calls return `Closed` without additional source reads.
 
 ## Metadata and limits
 
