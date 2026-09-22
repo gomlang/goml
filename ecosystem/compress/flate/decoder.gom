@@ -1,0 +1,316 @@
+package flate;
+
+use std::io;
+use std::bytes;
+use ecosystem::compress;
+use compress::{Error, ErrorKind, Limits};
+
+pub struct Decoder[R] {
+    input: BitReader[R],
+    window: Vec[byte],
+    window_limit: isize,
+    position: Ref[isize],
+    history: Ref[isize],
+    blocks: Ref[isize],
+    final_block: Ref[bool],
+    phase: Ref[isize],
+    remaining: Ref[isize],
+    distance: Ref[isize],
+    trees: Ref[Option[(Huffman, Huffman)]],
+}
+
+impl[R: io::Read] Decoder[R] {
+    pub fn new(reader: R, limits: Limits) -> Result[Decoder[R], Error] {
+        let empty: Vec[byte] = Vec::new();
+        Decoder::with_dictionary(reader, limits, empty.as_slice())
+    }
+
+    pub fn with_dictionary(reader: R, limits: Limits, dictionary: Slice[byte]) -> Result[
+        Decoder[R],
+        Error,
+    ] {
+        Decoder::with_window(reader, limits, dictionary, 32768)
+    }
+
+    pub fn with_window(reader: R, limits: Limits, dictionary: Slice[byte], window_limit: isize) -> Result[
+        Decoder[R],
+        Error,
+    ] {
+        limits.validate()?;
+        if window_limit < 256 || window_limit > 32768 || window_limit & (window_limit - 1) != 0 {
+            return Result::Err(Error::new(ErrorKind::Invalid, 0, "invalid DEFLATE window size"))
+        }
+        let session = DecodeSession {
+            failure: Ref::new(Option::None),
+            active: Ref::new(false),
+            input: Ref::new(0),
+            output: Ref::new(0),
+            work: Ref::new(0),
+            limits,
+        };
+        let window = Vec::with_capacity(32768);
+        for _ in 0..32768 {
+            window.push(0.to_u8());
+        }
+        let length = if dictionary.len() > window_limit {
+            window_limit
+        } else {
+            dictionary.len()
+        };
+        for index in 0..length {
+            window[index] = dictionary[dictionary.len() - length + index];
+        }
+        Result::Ok(
+            Decoder {
+                input: BitReader {
+                    reader,
+                    session,
+                    offset: session.input,
+                    buffer: Vec::from_array([0.to_u8()]),
+                    bits: Ref::new(0),
+                    count: Ref::new(0),
+                },
+                window,
+                window_limit,
+                position: Ref::new(length & 32767),
+                history: Ref::new(length),
+                blocks: Ref::new(0),
+                final_block: Ref::new(false),
+                phase: Ref::new(0),
+                remaining: Ref::new(0),
+                distance: Ref::new(0),
+                trees: Ref::new(Option::None),
+            },
+        )
+    }
+
+    pub fn consumed(self: Decoder[R]) -> isize {
+        self.input.session.input.get()
+    }
+
+    pub fn produced(self: Decoder[R]) -> isize {
+        self.input.session.output.get()
+    }
+
+    pub fn blocks_read(self: Decoder[R]) -> isize {
+        self.blocks.get()
+    }
+
+    pub fn work_done(self: Decoder[R]) -> isize {
+        self.input.session.work.get()
+    }
+
+    pub fn error(self: Decoder[R]) -> Option[Error] {
+        self.input.session.failure.get()
+    }
+
+    pub fn is_finished(self: Decoder[R]) -> bool {
+        self.phase.get() == 3 && self.input.session.failure.get().is_none()
+    }
+
+    fn emit(self: Decoder[R], value: byte) -> Result[Option[byte], Error] {
+        let session = self.input.session;
+        if session.output.get() >= session.limits.max_output_bytes {
+            return Result::Err(
+                failure(ErrorKind::Limit, self.consumed(), "DEFLATE output limit exceeded"),
+            )
+        }
+        self.window[self.position.get()] = value;
+        self.position.set((self.position.get() + 1) & 32767);
+        if self.history.get() < self.window_limit {
+            self.history.set(self.history.get() + 1);
+        }
+        session.output.set(session.output.get() + 1);
+        Result::Ok(Option::Some(value))
+    }
+
+    fn end_block(self: Decoder[R]) -> () {
+        self.trees.set(Option::None);
+        if self.final_block.get() {
+            self.input.align();
+            self.phase.set(3);
+        } else {
+            self.phase.set(0);
+        }
+    }
+
+    fn next(self: Decoder[R]) -> Result[Option[byte], Error] {
+        loop {
+            work(self.input.session)?;
+            if self.phase.get() == 3 {
+                return Result::Ok(Option::None)
+            }
+            if self.remaining.get() > 0 {
+                let value = if self.phase.get() == 1 {
+                    self.input.read(8)?.to_u8()
+                } else {
+                    self.window[(self.position.get() - self.distance.get() + 32768) & 32767]
+                };
+                self.remaining.set(self.remaining.get() - 1);
+                return self.emit(value)
+            }
+            if self.phase.get() == 1 {
+                self.end_block();
+            } else if self.phase.get() == 0 {
+                if self.blocks.get() >= self.input.session.limits.max_blocks {
+                    return Result::Err(
+                        failure(ErrorKind::Limit, self.consumed(), "DEFLATE block limit exceeded"),
+                    )
+                }
+                self.blocks.set(self.blocks.get() + 1);
+                self.final_block.set(self.input.read(1)? != 0);
+                let kind = self.input.read(2)?;
+                if kind == 0 {
+                    self.input.align();
+                    let length = self.input.read(16)?;
+                    if length ^ self.input.read(16)? != 65535 {
+                        return Result::Err(
+                            failure(
+                                ErrorKind::Invalid,
+                                self.consumed(),
+                                "invalid stored DEFLATE length",
+                            ),
+                        )
+                    }
+                    self.remaining.set(length);
+                    self.phase.set(1);
+                } else if kind == 1 || kind == 2 {
+                    let trees = if kind == 1 {
+                        fixed_trees()?
+                    } else {
+                        dynamic_trees(self.input)?
+                    };
+                    self.trees.set(Option::Some(trees));
+                    self.phase.set(2);
+                } else {
+                    return Result::Err(
+                        failure(ErrorKind::Invalid, self.consumed(), "reserved DEFLATE block type"),
+                    )
+                }
+            } else {
+                let Some((literals, distances)) = self.trees.get() else {
+                    return Result::Err(
+                        failure(ErrorKind::State, self.consumed(), "missing DEFLATE trees"),
+                    )
+                };
+                let symbol = literals.decode(self.input)?;
+                if symbol < 256 {
+                    return self.emit(symbol.to_u8())
+                }
+                if symbol == 256 {
+                    self.end_block();
+                } else {
+                    if symbol > 285 {
+                        return Result::Err(
+                            failure(
+                                ErrorKind::Invalid,
+                                self.consumed(),
+                                "reserved DEFLATE length symbol",
+                            ),
+                        )
+                    }
+                    let index = symbol - 257;
+                    let length = LENGTH_BASE[index] + self.input.read(LENGTH_BITS[index])?;
+                    let code = distances.decode(self.input)?;
+                    if code > 29 {
+                        return Result::Err(
+                            failure(
+                                ErrorKind::Invalid,
+                                self.consumed(),
+                                "reserved DEFLATE distance symbol",
+                            ),
+                        )
+                    }
+                    let distance = DISTANCE_BASE[code] + self.input.read(DISTANCE_BITS[code])?;
+                    if distance > self.history.get() || distance > self.window_limit {
+                        return Result::Err(
+                            failure(
+                                ErrorKind::Invalid,
+                                self.consumed(),
+                                "DEFLATE distance exceeds history",
+                            ),
+                        )
+                    }
+                    self.distance.set(distance);
+                    self.remaining.set(length);
+                }
+            }
+        }
+    }
+
+    pub fn read_chunk(self: Decoder[R], output: MutSlice[byte]) -> Result[isize, Error] {
+        let session = self.input.session;
+        check(session)?;
+        if session.active.get() {
+            return Result::Err(
+                fail(
+                    session,
+                    failure(ErrorKind::State, self.consumed(), "reentrant DEFLATE decoder"),
+                ),
+            )
+        }
+        if output.len() == 0 || self.phase.get() == 3 {
+            return Result::Ok(0)
+        }
+        session.active.set(true);
+        let completed = Ref::new(false);
+        defer {
+            if !completed.get() {
+                let _ = fail(
+                    session,
+                    failure(ErrorKind::State, self.consumed(), "DEFLATE operation unwound"),
+                );
+            }
+            session.active.set(false);
+        };
+        let mut count = 0;
+        while count < output.len() {
+            match self.next() {
+                Ok(Some(value)) => {
+                    output[count] = value;
+                    count += 1;
+                },
+                Ok(None) => break,
+                Err(error) => {
+                    let error = fail(session, error);
+                    completed.set(true);
+                    if count == 0 {
+                        return Result::Err(error)
+                    }
+                    return Result::Ok(count)
+                },
+            }
+        }
+        completed.set(true);
+        Result::Ok(count)
+    }
+}
+
+impl[R: io::Read] io::Read for Decoder[R] {
+    fn read(self: Decoder[R], output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.read_chunk(output).map_err(|error| error.to_io())
+    }
+}
+
+pub fn decode(data: bytes::Bytes, limits: Limits) -> Result[bytes::Bytes, Error] {
+    let reader = io::Cursor::new(data);
+    let decoder = Decoder::new(reader, limits)?;
+    let output = bytes::Bytes::new();
+    let buffer = bytes::Bytes::new();
+    for _ in 0..4096 {
+        buffer.push(0.to_u8());
+    }
+    loop {
+        let count = decoder.read_chunk(buffer.as_mut_slice())?;
+        if count == 0 {
+            break
+        }
+        output.extend_from_slice(buffer.slice(0, count));
+    }
+    if decoder.consumed() != data.len() {
+        return Result::Err(
+            failure(ErrorKind::Invalid, decoder.consumed(), "trailing DEFLATE input"),
+        )
+    }
+    Result::Ok(output)
+}

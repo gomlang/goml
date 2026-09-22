@@ -1,0 +1,366 @@
+package zlib;
+
+use ecosystem::compress;
+use ecosystem::compress::flate;
+use compress::{Error, ErrorKind, Limits};
+use std::bytes;
+use std::hash::adler32;
+use std::io;
+
+struct ZlibSource[R] {
+    reader: R,
+    failure: Ref[Option[Error]],
+}
+
+impl[R: io::Read] io::Read for ZlibSource[R] {
+    fn read(self: ZlibSource[R], output: MutSlice[byte]) -> Result[isize, io::Error] {
+        match self.failure.get() {
+            Some(error) => Result::Err(error.to_io()),
+            None => self.reader.read(output),
+        }
+    }
+}
+
+pub struct Reader[R] {
+    reader: R,
+    limits: Limits,
+    flate: Ref[Option[flate::Decoder[ZlibSource[R]]]],
+    dictionary_id: Option[u32],
+    dictionary_tail: bytes::Bytes,
+    scratch: Vec[byte],
+    input: Ref[isize],
+    output: Ref[isize],
+    blocks: Ref[isize],
+    work: Ref[isize],
+    checksum: Ref[u32],
+    phase: Ref[isize],
+    active: Ref[bool],
+    failure: Ref[Option[Error]],
+}
+
+impl[R: io::Read] Reader[R] {
+    pub fn new(reader: R, limits: Limits) -> Result[Reader[R], Error] {
+        let empty: Vec[byte] = Vec::new();
+        Reader::create(reader, limits, empty.as_slice(), false)
+    }
+
+    pub fn with_dictionary(reader: R, limits: Limits, dictionary: Slice[byte]) -> Result[
+        Reader[R],
+        Error,
+    ] {
+        Reader::create(reader, limits, dictionary, true)
+    }
+
+    fn create(reader: R, limits: Limits, dictionary: Slice[byte], has_dictionary: bool) -> Result[
+        Reader[R],
+        Error,
+    ] {
+        limits.validate()?;
+        let tail = bytes::Bytes::new();
+        let start = if dictionary.len() > 32768 {
+            dictionary.len() - 32768
+        } else {
+            0
+        };
+        for index in start..dictionary.len() {
+            tail.push(dictionary[index]);
+        }
+        Result::Ok(
+            Reader {
+                reader,
+                limits,
+                flate: Ref::new(Option::None),
+                dictionary_id: if has_dictionary {
+                    Option::Some(adler32::checksum(dictionary))
+                } else {
+                    Option::None
+                },
+                dictionary_tail: tail,
+                scratch: Vec::from_array([0.to_u8()]),
+                input: Ref::new(0),
+                output: Ref::new(0),
+                blocks: Ref::new(0),
+                work: Ref::new(0),
+                checksum: Ref::new(1),
+                phase: Ref::new(0),
+                active: Ref::new(false),
+                failure: Ref::new(Option::None),
+            },
+        )
+    }
+
+    pub fn consumed(self: Reader[R]) -> isize {
+        match self.flate.get() {
+            Some(decoder) => self.input.get() + decoder.consumed(),
+            None => self.input.get(),
+        }
+    }
+
+    pub fn produced(self: Reader[R]) -> isize {
+        self.output.get()
+    }
+
+    pub fn is_finished(self: Reader[R]) -> bool {
+        self.phase.get() == 3 && self.failure.get().is_none()
+    }
+
+    pub fn error(self: Reader[R]) -> Option[Error] {
+        self.failure.get()
+    }
+
+    fn fail(self: Reader[R], error: Error) -> Error {
+        match self.failure.get() {
+            Some(first) => first,
+            None => {
+                self.failure.set(Option::Some(error));
+                error
+            },
+        }
+    }
+
+    fn check(self: Reader[R]) -> Result[(), Error] {
+        match self.failure.get() {
+            Some(error) => Result::Err(error),
+            None => Result::Ok(()),
+        }
+    }
+
+    fn spend(self: Reader[R]) -> Result[(), Error] {
+        if self.work.get() >= self.limits.max_work {
+            return Result::Err(
+                self.fail(Error::new(ErrorKind::Limit, self.consumed(), "ZLIB work limit exceeded")),
+            )
+        }
+        self.work.set(self.work.get() + 1);
+        Result::Ok(())
+    }
+
+    fn byte(self: Reader[R]) -> Result[byte, Error] {
+        self.spend()?;
+        if self.input.get() >= self.limits.max_input_bytes {
+            return Result::Err(
+                self.fail(
+                    Error::new(ErrorKind::Limit, self.input.get(), "ZLIB input limit exceeded"),
+                ),
+            )
+        }
+        let count = match self.reader.read(self.scratch.as_mut_slice()) {
+            Ok(count) => count,
+            Err(cause) => return Result::Err(
+                self.fail(
+                    Error {
+                        kind: ErrorKind::Io,
+                        offset: self.input.get(),
+                        message: "ZLIB reader failed",
+                        cause: Option::Some(cause),
+                    },
+                ),
+            ),
+        };
+        if count < 0 || count > 1 {
+            return Result::Err(
+                self.fail(Error::new(ErrorKind::Io, self.input.get(), "invalid ZLIB reader count")),
+            )
+        }
+        if count == 0 {
+            self.check()?;
+            return Result::Err(
+                self.fail(
+                    Error::new(ErrorKind::Truncated, self.input.get(), "truncated ZLIB stream"),
+                ),
+            )
+        }
+        self.input.set(self.input.get() + 1);
+        self.check()?;
+        Result::Ok(self.scratch[0])
+    }
+
+    fn header(self: Reader[R]) -> Result[(), Error] {
+        let cmf = self.byte()?.to_isize();
+        let flg = self.byte()?.to_isize();
+        if cmf & 15 != 8 || cmf >> 4 > 7 || (cmf * 256 + flg) % 31 != 0 {
+            return Result::Err(self.fail(Error::new(ErrorKind::Invalid, 0, "invalid ZLIB header")))
+        }
+        let mut dictionary = self.dictionary_tail.as_slice();
+        if flg & 0x20 != 0 {
+            let mut id: u32 = 0;
+            for _ in 0..4 {
+                id = (id << 8) | self.byte()?.to_u32();
+            }
+            match self.dictionary_id {
+                Some(expected) => {
+                    if expected != id {
+                        return Result::Err(
+                            self.fail(
+                                Error::new(
+                                    ErrorKind::Dictionary,
+                                    self.input.get() - 4,
+                                    "ZLIB dictionary identifier mismatch",
+                                ),
+                            ),
+                        )
+                    }
+                },
+                None => return Result::Err(
+                    self.fail(
+                        Error::new(
+                            ErrorKind::Dictionary,
+                            self.input.get() - 4,
+                            "ZLIB dictionary required",
+                        ),
+                    ),
+                ),
+            }
+        } else {
+            let empty: Vec[byte] = Vec::new();
+            dictionary = empty.as_slice();
+        }
+        let limits = Limits {
+            max_input_bytes: self.limits.max_input_bytes - self.input.get(),
+            max_output_bytes: self.limits.max_output_bytes - self.output.get(),
+            max_blocks: self.limits.max_blocks - self.blocks.get(),
+            max_work: self.limits.max_work - self.work.get(),
+        };
+        let window_limit = 1 << ((cmf >> 4) + 8);
+        self.flate.set(
+            Option::Some(
+                flate::Decoder::with_window(
+                    ZlibSource { reader: self.reader, failure: self.failure },
+                    limits,
+                    dictionary,
+                    window_limit,
+                )?,
+            ),
+        );
+        self.phase.set(1);
+        Result::Ok(())
+    }
+
+    fn body(self: Reader[R], output: MutSlice[byte]) -> Result[isize, Error] {
+        let Some(decoder) = self.flate.get() else {
+            return Result::Err(
+                self.fail(Error::new(ErrorKind::State, self.consumed(), "missing ZLIB decoder")),
+            )
+        };
+        let count = match decoder.read_chunk(output) {
+            Ok(count) => count,
+            Err(error) => return Result::Err(
+                self.fail(
+                    Error {
+                        kind: error.kind,
+                        offset: self.input.get() + error.offset,
+                        message: error.message,
+                        cause: error.cause,
+                    },
+                ),
+            ),
+        };
+        if count > 0 {
+            self.checksum.set(adler32::update(self.checksum.get(), output.as_slice().sub(0, count)));
+            self.output.set(self.output.get() + count);
+            return Result::Ok(count)
+        }
+        self.input.set(self.input.get() + decoder.consumed());
+        self.blocks.set(self.blocks.get() + decoder.blocks_read());
+        self.work.set(self.work.get() + decoder.work_done());
+        self.flate.set(Option::None);
+        self.phase.set(2);
+        Result::Ok(0)
+    }
+
+    fn trailer(self: Reader[R]) -> Result[(), Error] {
+        let mut expected: u32 = 0;
+        for _ in 0..4 {
+            expected = (expected << 8) | self.byte()?.to_u32();
+        }
+        if expected != self.checksum.get() {
+            return Result::Err(
+                self.fail(
+                    Error::new(ErrorKind::Checksum, self.input.get() - 4, "ZLIB Adler32 mismatch"),
+                ),
+            )
+        }
+        self.phase.set(3);
+        Result::Ok(())
+    }
+
+    pub fn read_chunk(self: Reader[R], output: MutSlice[byte]) -> Result[isize, Error] {
+        self.check()?;
+        if self.active.get() {
+            return Result::Err(
+                self.fail(Error::new(ErrorKind::State, self.consumed(), "reentrant ZLIB reader")),
+            )
+        }
+        if output.len() == 0 || self.phase.get() == 3 {
+            return Result::Ok(0)
+        }
+        self.active.set(true);
+        let completed = Ref::new(false);
+        defer {
+            if !completed.get() {
+                let _ = self.fail(
+                    Error::new(ErrorKind::State, self.consumed(), "ZLIB operation unwound"),
+                );
+            }
+            self.active.set(false);
+        };
+        let result = self.read_active(output);
+        completed.set(true);
+        result
+    }
+
+    fn read_active(self: Reader[R], output: MutSlice[byte]) -> Result[isize, Error] {
+        loop {
+            if self.phase.get() == 0 {
+                self.header()?;
+            } else if self.phase.get() == 1 {
+                let count = self.body(output)?;
+                if count > 0 {
+                    return Result::Ok(count)
+                }
+            } else if self.phase.get() == 2 {
+                self.trailer()?;
+            } else {
+                return Result::Ok(0)
+            }
+        }
+    }
+}
+
+impl[R: io::Read] io::Read for Reader[R] {
+    fn read(self: Reader[R], output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.read_chunk(output).map_err(|error| error.to_io())
+    }
+}
+
+pub fn decode(data: bytes::Bytes, limits: Limits) -> Result[bytes::Bytes, Error] {
+    let reader = Reader::new(io::Cursor::new(data), limits)?;
+    collect(data, reader)
+}
+
+pub fn decode_with_dictionary(data: bytes::Bytes, limits: Limits, dictionary: Slice[byte]) -> Result[
+    bytes::Bytes,
+    Error,
+] {
+    let reader = Reader::with_dictionary(io::Cursor::new(data), limits, dictionary)?;
+    collect(data, reader)
+}
+
+fn collect[R: io::Read](data: bytes::Bytes, reader: Reader[R]) -> Result[bytes::Bytes, Error] {
+    let output = bytes::Bytes::new();
+    let buffer = bytes::Bytes::new();
+    for _ in 0..4096 {
+        buffer.push(0);
+    }
+    loop {
+        let count = reader.read_chunk(buffer.as_mut_slice())?;
+        if count == 0 {
+            break
+        }
+        output.extend_from_slice(buffer.slice(0, count));
+    }
+    if reader.consumed() != data.len() {
+        return Result::Err(Error::new(ErrorKind::Invalid, reader.consumed(), "trailing ZLIB input"))
+    }
+    Result::Ok(output)
+}

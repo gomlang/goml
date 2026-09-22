@@ -1,0 +1,398 @@
+package gzip;
+
+use ecosystem::compress;
+use ecosystem::compress::flate;
+use compress::{Error, ErrorKind, Limits};
+use std::bytes;
+use std::hash::crc32;
+use std::io;
+
+struct GzipSource[R] {
+    reader: R,
+    failure: Ref[Option[Error]],
+}
+
+impl[R: io::Read] io::Read for GzipSource[R] {
+    fn read(self: GzipSource[R], output: MutSlice[byte]) -> Result[isize, io::Error] {
+        match self.failure.get() {
+            Some(error) => Result::Err(error.to_io()),
+            None => self.reader.read(output),
+        }
+    }
+}
+
+pub struct Reader[R] {
+    reader: R,
+    limits: Limits,
+    flate: Ref[Option[flate::Decoder[GzipSource[R]]]],
+    scratch: Vec[byte],
+    table: crc32::Table,
+    input: Ref[isize],
+    output: Ref[isize],
+    blocks: Ref[isize],
+    work: Ref[isize],
+    members: Ref[isize],
+    crc: Ref[u32],
+    size: Ref[u32],
+    phase: Ref[isize],
+    active: Ref[bool],
+    failure: Ref[Option[Error]],
+}
+
+impl[R: io::Read] Reader[R] {
+    pub fn new(reader: R, limits: Limits) -> Result[Reader[R], Error] {
+        limits.validate()?;
+        Result::Ok(
+            Reader {
+                reader,
+                limits,
+                flate: Ref::new(Option::None),
+                scratch: Vec::from_array([0.to_u8()]),
+                table: crc32::Table::new(crc32::IEEE),
+                input: Ref::new(0),
+                output: Ref::new(0),
+                blocks: Ref::new(0),
+                work: Ref::new(0),
+                members: Ref::new(0),
+                crc: Ref::new(0),
+                size: Ref::new(0),
+                phase: Ref::new(0),
+                active: Ref::new(false),
+                failure: Ref::new(Option::None),
+            },
+        )
+    }
+
+    pub fn consumed(self: Reader[R]) -> isize {
+        match self.flate.get() {
+            Some(decoder) => self.input.get() + decoder.consumed(),
+            None => self.input.get(),
+        }
+    }
+
+    pub fn produced(self: Reader[R]) -> isize {
+        self.output.get()
+    }
+
+    pub fn members(self: Reader[R]) -> isize {
+        self.members.get()
+    }
+
+    pub fn is_finished(self: Reader[R]) -> bool {
+        self.phase.get() == 3 && self.failure.get().is_none()
+    }
+
+    pub fn error(self: Reader[R]) -> Option[Error] {
+        self.failure.get()
+    }
+
+    fn fail(self: Reader[R], error: Error) -> Error {
+        match self.failure.get() {
+            Some(first) => first,
+            None => {
+                self.failure.set(Option::Some(error));
+                error
+            },
+        }
+    }
+
+    fn check(self: Reader[R]) -> Result[(), Error] {
+        match self.failure.get() {
+            Some(error) => Result::Err(error),
+            None => Result::Ok(()),
+        }
+    }
+
+    fn spend(self: Reader[R]) -> Result[(), Error] {
+        if self.work.get() >= self.limits.max_work {
+            return Result::Err(
+                self.fail(Error::new(ErrorKind::Limit, self.consumed(), "GZIP work limit exceeded")),
+            )
+        }
+        self.work.set(self.work.get() + 1);
+        Result::Ok(())
+    }
+
+    fn byte(self: Reader[R]) -> Result[Option[byte], Error] {
+        self.spend()?;
+        if self.input.get() >= self.limits.max_input_bytes {
+            return Result::Err(
+                self.fail(
+                    Error::new(ErrorKind::Limit, self.input.get(), "GZIP input limit exceeded"),
+                ),
+            )
+        }
+        let count = match self.reader.read(self.scratch.as_mut_slice()) {
+            Ok(count) => count,
+            Err(cause) => return Result::Err(
+                self.fail(
+                    Error {
+                        kind: ErrorKind::Io,
+                        offset: self.input.get(),
+                        message: "GZIP reader failed",
+                        cause: Option::Some(cause),
+                    },
+                ),
+            ),
+        };
+        if count < 0 || count > 1 {
+            return Result::Err(
+                self.fail(Error::new(ErrorKind::Io, self.input.get(), "invalid GZIP reader count")),
+            )
+        }
+        if count == 0 {
+            self.check()?;
+            return Result::Ok(Option::None)
+        }
+        self.input.set(self.input.get() + 1);
+        self.check()?;
+        Result::Ok(Option::Some(self.scratch[0]))
+    }
+
+    fn required(self: Reader[R]) -> Result[byte, Error] {
+        match self.byte()? {
+            Some(value) => Result::Ok(value),
+            None => Result::Err(
+                self.fail(
+                    Error::new(ErrorKind::Truncated, self.input.get(), "truncated GZIP member"),
+                ),
+            ),
+        }
+    }
+
+    fn header_byte(self: Reader[R], crc: Ref[u32]) -> Result[byte, Error] {
+        let value = self.required()?;
+        self.scratch[0] = value;
+        crc.set(crc32::update(crc.get(), self.table, self.scratch.as_slice()));
+        Result::Ok(value)
+    }
+
+    fn header(self: Reader[R]) -> Result[(), Error] {
+        let first = match self.byte()? {
+            Some(first) => first,
+            None => {
+                if self.members.get() > 0 {
+                    self.phase.set(3);
+                    return Result::Ok(())
+                }
+                return Result::Err(
+                    self.fail(Error::new(ErrorKind::Truncated, 0, "empty GZIP stream")),
+                )
+            },
+        };
+        let header_crc = Ref::new(0.to_u32());
+        self.scratch[0] = first;
+        header_crc.set(crc32::update(0, self.table, self.scratch.as_slice()));
+        if first != 0x1f {
+            return Result::Err(
+                self.fail(
+                    Error::new(ErrorKind::Invalid, self.input.get() - 1, "invalid GZIP header"),
+                ),
+            )
+        }
+        let second = self.header_byte(header_crc)?;
+        let method = self.header_byte(header_crc)?;
+        let flags = self.header_byte(header_crc)?;
+        if second != 0x8b || method != 8 || flags & 0xe0 != 0 {
+            return Result::Err(
+                self.fail(
+                    Error::new(ErrorKind::Invalid, self.input.get() - 3, "invalid GZIP header"),
+                ),
+            )
+        }
+        for _ in 0..6 {
+            let _ = self.header_byte(header_crc)?;
+        }
+        if flags & 4 != 0 {
+            let low = self.header_byte(header_crc)?.to_isize();
+            let high = self.header_byte(header_crc)?.to_isize();
+            let length = low | (high << 8);
+            for _ in 0..length {
+                let _ = self.header_byte(header_crc)?;
+            }
+        }
+        if flags & 8 != 0 {
+            loop {
+                if self.header_byte(header_crc)? == 0 {
+                    break
+                }
+            }
+        }
+        if flags & 16 != 0 {
+            loop {
+                if self.header_byte(header_crc)? == 0 {
+                    break
+                }
+            }
+        }
+        if flags & 2 != 0 {
+            let expected = self.required()?.to_u16() | (self.required()?.to_u16() << 8);
+            if expected != header_crc.get().to_u16() {
+                return Result::Err(
+                    self.fail(
+                        Error::new(
+                            ErrorKind::Checksum,
+                            self.input.get() - 2,
+                            "GZIP header checksum mismatch",
+                        ),
+                    ),
+                )
+            }
+        }
+        let limits = Limits {
+            max_input_bytes: self.limits.max_input_bytes - self.input.get(),
+            max_output_bytes: self.limits.max_output_bytes - self.output.get(),
+            max_blocks: self.limits.max_blocks - self.blocks.get(),
+            max_work: self.limits.max_work - self.work.get(),
+        };
+        self.flate.set(
+            Option::Some(
+                flate::Decoder::new(
+                    GzipSource { reader: self.reader, failure: self.failure },
+                    limits,
+                )?,
+            ),
+        );
+        self.crc.set(0);
+        self.size.set(0);
+        self.phase.set(1);
+        Result::Ok(())
+    }
+
+    fn body(self: Reader[R], output: MutSlice[byte]) -> Result[isize, Error] {
+        let Some(decoder) = self.flate.get() else {
+            return Result::Err(
+                self.fail(Error::new(ErrorKind::State, self.consumed(), "missing GZIP decoder")),
+            )
+        };
+        let count = match decoder.read_chunk(output) {
+            Ok(count) => count,
+            Err(error) => return Result::Err(
+                self.fail(
+                    Error {
+                        kind: error.kind,
+                        offset: self.input.get() + error.offset,
+                        message: error.message,
+                        cause: error.cause,
+                    },
+                ),
+            ),
+        };
+        if count > 0 {
+            self.crc.set(crc32::update(self.crc.get(), self.table, output.as_slice().sub(0, count)));
+            self.size.set(self.size.get() + count.to_u32());
+            self.output.set(self.output.get() + count);
+            return Result::Ok(count)
+        }
+        self.input.set(self.input.get() + decoder.consumed());
+        self.blocks.set(self.blocks.get() + decoder.blocks_read());
+        self.work.set(self.work.get() + decoder.work_done());
+        self.flate.set(Option::None);
+        self.phase.set(2);
+        Result::Ok(0)
+    }
+
+    fn trailer(self: Reader[R]) -> Result[(), Error] {
+        let mut expected_crc: u32 = 0;
+        let mut expected_size: u32 = 0;
+        for index in 0..4 {
+            expected_crc |= self.required()?.to_u32() << (index * 8);
+        }
+        for index in 0..4 {
+            expected_size |= self.required()?.to_u32() << (index * 8);
+        }
+        if expected_crc != self.crc.get() || expected_size != self.size.get() {
+            return Result::Err(
+                self.fail(
+                    Error::new(
+                        ErrorKind::Checksum,
+                        self.input.get() - 8,
+                        "GZIP payload checksum or size mismatch",
+                    ),
+                ),
+            )
+        }
+        self.members.set(self.members.get() + 1);
+        self.phase.set(0);
+        Result::Ok(())
+    }
+
+    pub fn read_chunk(self: Reader[R], output: MutSlice[byte]) -> Result[isize, Error] {
+        self.check()?;
+        if self.active.get() {
+            return Result::Err(
+                self.fail(Error::new(ErrorKind::State, self.consumed(), "reentrant GZIP reader")),
+            )
+        }
+        if output.len() == 0 || self.phase.get() == 3 {
+            return Result::Ok(0)
+        }
+        self.active.set(true);
+        let completed = Ref::new(false);
+        defer {
+            if !completed.get() {
+                let _ = self.fail(
+                    Error::new(ErrorKind::State, self.consumed(), "GZIP operation unwound"),
+                );
+            }
+            self.active.set(false);
+        };
+        let result = self.read_active(output);
+        completed.set(true);
+        result
+    }
+
+    fn read_active(self: Reader[R], output: MutSlice[byte]) -> Result[isize, Error] {
+        loop {
+            if self.phase.get() == 0 {
+                self.header()?;
+            } else if self.phase.get() == 1 {
+                let count = self.body(output)?;
+                if count > 0 {
+                    return Result::Ok(count)
+                }
+            } else if self.phase.get() == 2 {
+                self.trailer()?;
+            } else {
+                return Result::Ok(0)
+            }
+        }
+    }
+}
+
+impl[R: io::Read] io::Read for Reader[R] {
+    fn read(self: Reader[R], output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.read_chunk(output).map_err(|error| error.to_io())
+    }
+}
+
+pub fn decode(data: bytes::Bytes, limits: Limits) -> Result[bytes::Bytes, Error] {
+    limits.validate()?;
+    if data.len() > limits.max_input_bytes {
+        return Result::Err(Error::new(ErrorKind::Limit, 0, "GZIP input limit exceeded"))
+    }
+    let internal = Limits {
+        max_input_bytes: if data.len() < 9223372036854775807 {
+            data.len() + 1
+        } else {
+            data.len()
+        },
+        max_output_bytes: limits.max_output_bytes,
+        max_blocks: limits.max_blocks,
+        max_work: limits.max_work,
+    };
+    let reader = Reader::new(io::Cursor::new(data), internal)?;
+    let output = bytes::Bytes::new();
+    let buffer = bytes::Bytes::new();
+    for _ in 0..4096 {
+        buffer.push(0);
+    }
+    loop {
+        let count = reader.read_chunk(buffer.as_mut_slice())?;
+        if count == 0 {
+            break
+        }
+        output.extend_from_slice(buffer.slice(0, count));
+    }
+    Result::Ok(output)
+}

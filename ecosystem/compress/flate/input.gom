@@ -1,0 +1,151 @@
+package flate;
+
+use std::io;
+use io::Read;
+use ecosystem::compress;
+use compress::{Error, ErrorKind, Limits};
+
+struct DecodeSession {
+    failure: Ref[Option[Error]],
+    active: Ref[bool],
+    input: Ref[isize],
+    output: Ref[isize],
+    work: Ref[isize],
+    limits: Limits,
+}
+
+fn failure(kind: ErrorKind, offset: isize, message: string) -> Error {
+    Error::new(kind, offset, message)
+}
+
+fn fail(session: DecodeSession, error: Error) -> Error {
+    match session.failure.get() {
+        Some(first) => first,
+        None => {
+            session.failure.set(Option::Some(error));
+            error
+        },
+    }
+}
+
+fn check(session: DecodeSession) -> Result[(), Error] {
+    match session.failure.get() {
+        Some(error) => Result::Err(error),
+        None => Result::Ok(()),
+    }
+}
+
+fn work(session: DecodeSession) -> Result[(), Error] {
+    check(session)?;
+    if session.work.get() >= session.limits.max_work {
+        return Result::Err(
+            fail(
+                session,
+                failure(ErrorKind::Limit, session.input.get(), "DEFLATE work limit exceeded"),
+            ),
+        )
+    }
+    session.work.set(session.work.get() + 1);
+    Result::Ok(())
+}
+
+struct BitReader[R] {
+    reader: R,
+    session: DecodeSession,
+    offset: Ref[isize],
+    buffer: Vec[byte],
+    bits: Ref[isize],
+    count: Ref[isize],
+}
+
+impl[R: io::Read] BitReader[R] {
+    fn read(self: BitReader[R], width: isize) -> Result[isize, Error] {
+        work(self.session)?;
+        let mut result = 0;
+        let mut filled = 0;
+        while filled < width {
+            if self.count.get() == 0 {
+                if self.session.input.get() >= self.session.limits.max_input_bytes {
+                    return Result::Err(
+                        fail(
+                            self.session,
+                            failure(
+                                ErrorKind::Limit,
+                                self.offset.get(),
+                                "DEFLATE input limit exceeded",
+                            ),
+                        ),
+                    )
+                }
+                let count = match self.reader.read(self.buffer.as_mut_slice()) {
+                    Ok(count) => count,
+                    Err(cause) => return Result::Err(
+                        fail(
+                            self.session,
+                            Error {
+                                kind: ErrorKind::Io,
+                                offset: self.offset.get(),
+                                message: "DEFLATE reader failed",
+                                cause: Option::Some(cause),
+                            },
+                        ),
+                    ),
+                };
+                if count < 0 || count > 1 {
+                    return Result::Err(
+                        fail(
+                            self.session,
+                            Error {
+                                kind: ErrorKind::Io,
+                                offset: self.offset.get(),
+                                message: "invalid DEFLATE reader count",
+                                cause: Option::Some(
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "read DEFLATE",
+                                        Option::None,
+                                        Option::None,
+                                        "invalid byte count",
+                                    ),
+                                ),
+                            },
+                        ),
+                    )
+                }
+                self.session.input.set(self.session.input.get() + count);
+                self.offset.set(self.session.input.get());
+                check(self.session)?;
+                if count == 0 {
+                    return Result::Err(
+                        fail(
+                            self.session,
+                            failure(
+                                ErrorKind::Truncated,
+                                self.offset.get(),
+                                "truncated DEFLATE bits",
+                            ),
+                        ),
+                    )
+                }
+                self.bits.set(self.buffer[0].to_isize());
+                self.count.set(8);
+            }
+            let available = self.count.get();
+            let take = if width - filled < available {
+                width - filled
+            } else {
+                available
+            };
+            result |= (self.bits.get() & ((1 << take) - 1)) << filled;
+            self.bits.set(self.bits.get() >> take);
+            self.count.set(available - take);
+            filled += take;
+        }
+        Result::Ok(result)
+    }
+
+    fn align(self: BitReader[R]) -> () {
+        self.count.set(0);
+        self.bits.set(0);
+    }
+}

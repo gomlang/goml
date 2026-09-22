@@ -20,6 +20,11 @@ acceptance status. Pure GoML migration does not promote a module into std:
 request, web, archive, color and markdown remain independently versioned here.
 Standard packages must not depend on ecosystem modules.
 
+E1 migration is in progress in [compress](compress/README.md): incremental
+DEFLATE, GZIP, ZLIB and LZW encoding and decoding are exercised by the
+independent compress consumer. Archive compatibility adapters and the other E1
+capabilities remain separate migration work; this is not completion of E1.
+
 | Module | Functional target | Status |
 | --- | --- | --- |
 | [parser](parser/README.md) | Text/binary combinators, recursive grammars, shared work/depth budgets, spans, contextual errors and operator precedence | Implemented; module and consumer tests pass |
@@ -29,6 +34,7 @@ Standard packages must not depend on ecosystem modules.
 | [graph](graph/README.md) | Mutable directed/undirected graphs, stable IDs, traversal, components, topological order, shortest paths and spanning trees | Implemented; independent algorithm checks and consumer tests pass |
 | [template](template/README.md) | Expressions, lexical scopes, conditions, loops, filters, includes, inheritance, escaping and contextual diagnostics | Implemented; 11 library tests, 2 consumer tests and 1,367 Jinja shared-syntax comparisons pass |
 | [html](html/README.md) | Shared bounded escaping and text/attribute character-reference decoding | Shared entity data, explicit quote policies and template/markdown-compatible wrappers; whole-string APIs |
+| [compress](compress/README.md) | Incremental bounded DEFLATE, GZIP, ZLIB and LZW codecs with dictionary, checksum and bit-order contracts | 26 library tests, Go codec interoperability, independent consumer and race checks pass |
 | [redis](redis/README.md) | RESP2/3 codec, typed commands, pipelining, transactions, Pub/Sub, bounded pools, DNS/TLS, injectable transport, context cancellation and total deadlines | Implemented; 29 library tests and race checks, versioned consumers, 2,391 protocol cases, Redis 7.2.5 RESP2/3 interoperability and 15 DNS/TLS cases in normal/race builds pass |
 | [pipeline](pipeline/README.md) | Lazy streams, bounded parallel transforms, filtering, ordering, batching/windows, merge/zip, backpressure and cancellation | Implemented; 21 library tests and race checks, versioned consumer and 1,253 Python oracle cases pass |
 | [ndarray](ndarray/README.md) | Generic shared views, slicing, broadcasting, checked arithmetic, reductions, batched multiplication, LU/Cholesky/QR solves and SIMD | Implemented; 17 library tests, versioned consumer, 2,929 NumPy cases and native/SSE2/scalar builds pass |

@@ -1,0 +1,531 @@
+package flate;
+
+use std::bytes;
+use std::io;
+use ecosystem::compress;
+use compress::{Error, ErrorKind, Limits};
+
+struct EncodeBits {
+    data: bytes::Bytes,
+    bits: Ref[isize],
+    count: Ref[isize],
+}
+
+impl EncodeBits {
+    fn write(self: EncodeBits, value: isize, width: isize) -> () {
+        let mut bits = self.bits.get() | (value << self.count.get());
+        let mut count = self.count.get() + width;
+        while count >= 8 {
+            self.data.push(bits.to_u8());
+            bits >>= 8;
+            count -= 8;
+        }
+        self.bits.set(bits);
+        self.count.set(count);
+    }
+
+    fn code(self: EncodeBits, value: isize, width: isize) -> () {
+        let mut reversed = 0;
+        for index in 0..width {
+            reversed = (reversed << 1) | ((value >> index) & 1);
+        }
+        self.write(reversed, width);
+    }
+
+    fn literal(self: EncodeBits, symbol: isize) -> () {
+        if symbol < 144 {
+            self.code(symbol + 48, 8);
+        } else if symbol < 256 {
+            self.code(symbol + 256, 9);
+        } else if symbol < 280 {
+            self.code(symbol - 256, 7);
+        } else {
+            self.code(symbol - 88, 8);
+        }
+    }
+
+    fn align(self: EncodeBits) -> () {
+        if self.count.get() > 0 {
+            self.data.push(self.bits.get().to_u8());
+            self.bits.set(0);
+            self.count.set(0);
+        }
+    }
+}
+
+fn encode_hash(data: bytes::Bytes, offset: isize) -> isize {
+    ((data.get(offset).to_isize() * 251 + data.get(offset + 1).to_isize()) * 251
+        + data.get(offset + 2).to_isize())
+        & 32767
+}
+
+fn empty_heads() -> Vec[isize] {
+    let heads = Vec::with_capacity(32768);
+    for _ in 0..32768 {
+        heads.push(-1);
+    }
+    heads
+}
+
+pub struct Encoder[W] {
+    writer: W,
+    limits: Limits,
+    level: isize,
+    pending: bytes::Bytes,
+    history: bytes::Bytes,
+    bits: EncodeBits,
+    input: Ref[isize],
+    output: Ref[isize],
+    blocks: Ref[isize],
+    work: Ref[isize],
+    finished: Ref[bool],
+    active: Ref[bool],
+    failure: Ref[Option[Error]],
+}
+
+impl[W: io::Write] Encoder[W] {
+    pub fn new(writer: W, limits: Limits, level: isize) -> Result[Encoder[W], Error] {
+        let empty: Vec[byte] = Vec::new();
+        Encoder::with_dictionary(writer, limits, level, empty.as_slice())
+    }
+
+    pub fn with_dictionary(writer: W, limits: Limits, level: isize, dictionary: Slice[byte]) -> Result[
+        Encoder[W],
+        Error,
+    ] {
+        limits.validate()?;
+        if level < -2 || level > 9 {
+            return Result::Err(Error::new(ErrorKind::Invalid, 0, "invalid DEFLATE level"))
+        }
+        let history = bytes::Bytes::new();
+        let start = if dictionary.len() > 32768 {
+            dictionary.len() - 32768
+        } else {
+            0
+        };
+        for index in start..dictionary.len() {
+            history.push(dictionary[index]);
+        }
+        Result::Ok(
+            Encoder {
+                writer,
+                limits,
+                level: if level == -1 {
+                    6
+                } else {
+                    level
+                },
+                pending: bytes::Bytes::new(),
+                history,
+                bits: EncodeBits {
+                    data: bytes::Bytes::new(),
+                    bits: Ref::new(0),
+                    count: Ref::new(0),
+                },
+                input: Ref::new(0),
+                output: Ref::new(0),
+                blocks: Ref::new(0),
+                work: Ref::new(0),
+                finished: Ref::new(false),
+                active: Ref::new(false),
+                failure: Ref::new(Option::None),
+            },
+        )
+    }
+
+    pub fn accepted(self: Encoder[W]) -> isize {
+        self.input.get()
+    }
+
+    pub fn written(self: Encoder[W]) -> isize {
+        self.output.get()
+    }
+
+    pub fn is_finished(self: Encoder[W]) -> bool {
+        self.finished.get() && self.failure.get().is_none()
+    }
+
+    pub fn error(self: Encoder[W]) -> Option[Error] {
+        self.failure.get()
+    }
+
+    fn fail(self: Encoder[W], error: Error) -> Error {
+        match self.failure.get() {
+            Some(first) => first,
+            None => {
+                self.failure.set(Option::Some(error));
+                error
+            },
+        }
+    }
+
+    fn check(self: Encoder[W]) -> Result[(), Error] {
+        match self.failure.get() {
+            Some(error) => Result::Err(error),
+            None => Result::Ok(()),
+        }
+    }
+
+    fn spend(self: Encoder[W]) -> Result[(), Error] {
+        if self.work.get() >= self.limits.max_work {
+            return Result::Err(
+                self.fail(
+                    Error::new(ErrorKind::Limit, self.input.get(), "DEFLATE work limit exceeded"),
+                ),
+            )
+        }
+        self.work.set(self.work.get() + 1);
+        Result::Ok(())
+    }
+
+    fn drain(self: Encoder[W]) -> Result[(), Error] {
+        let data = self.bits.data;
+        let mut position = 0;
+        while position < data.len() {
+            if self.output.get() >= self.limits.max_output_bytes {
+                return Result::Err(
+                    self.fail(
+                        Error::new(
+                            ErrorKind::Limit,
+                            self.input.get(),
+                            "DEFLATE output limit exceeded",
+                        ),
+                    ),
+                )
+            }
+            let mut size = data.len() - position;
+            if size > 4096 {
+                size = 4096;
+            }
+            if size > self.limits.max_output_bytes - self.output.get() {
+                size = self.limits.max_output_bytes - self.output.get();
+            }
+            let count = match self.writer.write(data.slice(position, position + size)) {
+                Ok(count) => count,
+                Err(cause) => return Result::Err(
+                    self.fail(
+                        Error {
+                            kind: ErrorKind::Io,
+                            offset: self.input.get(),
+                            message: "DEFLATE writer failed",
+                            cause: Option::Some(cause),
+                        },
+                    ),
+                ),
+            };
+            if count <= 0 || count > size {
+                return Result::Err(
+                    self.fail(
+                        Error::new(ErrorKind::Io, self.input.get(), "invalid DEFLATE writer count"),
+                    ),
+                )
+            }
+            position += count;
+            self.output.set(self.output.get() + count);
+            self.check()?;
+        }
+        data.clear();
+        Result::Ok(())
+    }
+
+    fn stored(self: Encoder[W], final_block: bool) -> () {
+        self.bits.write(
+            if final_block {
+                1
+            } else {
+                0
+            },
+            3,
+        );
+        self.bits.align();
+        let length = self.pending.len();
+        self.bits.data.push(length.to_u8());
+        self.bits.data.push((length >> 8).to_u8());
+        self.bits.data.push((length ^ 65535).to_u8());
+        self.bits.data.push(((length ^ 65535) >> 8).to_u8());
+        self.bits.data.extend_from_slice(self.pending.as_slice());
+    }
+
+    fn fixed(self: Encoder[W], bits: EncodeBits, final_block: bool) -> Result[(), Error] {
+        bits.write(
+            if final_block {
+                3
+            } else {
+                2
+            },
+            3,
+        );
+        let source = self.history.copy();
+        source.extend_from_slice(self.pending.as_slice());
+        let heads = empty_heads();
+        let previous = empty_heads();
+        let start = self.history.len();
+        for index in 0..start {
+            if source.len() - index >= 3 {
+                let hash = encode_hash(source, index);
+                previous[index & 32767] = heads[hash];
+                heads[hash] = index;
+            }
+        }
+        let attempts_limit = if self.level <= 1 {
+            4
+        } else {
+            self.level * self.level * 4
+        };
+        let mut offset = start;
+        while offset < source.len() {
+            self.spend()?;
+            let mut length = 0;
+            let mut distance = 0;
+            if self.level != -2 && source.len() - offset >= 3 {
+                let mut candidate = heads[encode_hash(source, offset)];
+                let mut attempts = 0;
+                while candidate >= 0 && offset - candidate <= 32768 && attempts < attempts_limit {
+                    let mut matched = 0;
+                    while matched < 258 && matched < source.len() - offset
+                        && source.get(candidate + matched) == source.get(offset + matched) {
+                        self.spend()?;
+                        matched += 1;
+                    }
+                    if matched > length {
+                        length = matched;
+                        distance = offset - candidate;
+                        if matched == 258 {
+                            break
+                        }
+                    }
+                    let next = previous[candidate & 32767];
+                    if next >= candidate {
+                        break
+                    }
+                    candidate = next;
+                    attempts += 1;
+                }
+            }
+            if length >= 3 {
+                let mut index = 0;
+                while index < 28 && LENGTH_BASE[index + 1] <= length {
+                    index += 1;
+                }
+                bits.literal(index + 257);
+                bits.write(length - LENGTH_BASE[index], LENGTH_BITS[index]);
+                index = 0;
+                while index < 29 && DISTANCE_BASE[index + 1] <= distance {
+                    index += 1;
+                }
+                bits.code(index, 5);
+                bits.write(distance - DISTANCE_BASE[index], DISTANCE_BITS[index]);
+            } else {
+                length = 1;
+                bits.literal(source.get(offset).to_isize());
+            }
+            for index in offset..offset + length {
+                if source.len() - index >= 3 {
+                    let hash = encode_hash(source, index);
+                    previous[index & 32767] = heads[hash];
+                    heads[hash] = index;
+                }
+            }
+            offset += length;
+        }
+        bits.literal(256);
+        if final_block {
+            bits.align();
+        }
+        Result::Ok(())
+    }
+
+    fn block(self: Encoder[W], final_block: bool) -> Result[(), Error] {
+        if self.blocks.get() >= self.limits.max_blocks {
+            return Result::Err(
+                self.fail(
+                    Error::new(ErrorKind::Limit, self.input.get(), "DEFLATE block limit exceeded"),
+                ),
+            )
+        }
+        self.spend()?;
+        self.blocks.set(self.blocks.get() + 1);
+        if self.level == 0 {
+            self.stored(final_block);
+        } else {
+            let candidate = EncodeBits {
+                data: bytes::Bytes::new(),
+                bits: Ref::new(self.bits.bits.get()),
+                count: Ref::new(self.bits.count.get()),
+            };
+            self.fixed(candidate, final_block)?;
+            if candidate.data.len() > self.pending.len() + 6 {
+                self.stored(final_block);
+            } else {
+                self.bits.data.extend_from_slice(candidate.data.as_slice());
+                self.bits.bits.set(candidate.bits.get());
+                self.bits.count.set(candidate.count.get());
+            }
+        }
+        let source = self.history.copy();
+        source.extend_from_slice(self.pending.as_slice());
+        let start = if source.len() > 32768 {
+            source.len() - 32768
+        } else {
+            0
+        };
+        self.history.clear();
+        self.history.extend_from_slice(source.slice(start, source.len()));
+        self.pending.clear();
+        self.drain()
+    }
+
+    pub fn write_chunk(self: Encoder[W], input: Slice[byte]) -> Result[isize, Error] {
+        self.check()?;
+        if self.active.get() || self.finished.get() {
+            return Result::Err(
+                self.fail(
+                    Error::new(ErrorKind::State, self.input.get(), "DEFLATE encoder unavailable"),
+                ),
+            )
+        }
+        if input.len() == 0 {
+            return Result::Ok(0)
+        }
+        self.active.set(true);
+        let completed = Ref::new(false);
+        defer {
+            if !completed.get() {
+                let _ = self.fail(
+                    Error::new(ErrorKind::State, self.input.get(), "DEFLATE operation unwound"),
+                );
+            }
+            self.active.set(false);
+        };
+        let result = self.write_active(input);
+        completed.set(true);
+        result
+    }
+
+    fn write_active(self: Encoder[W], input: Slice[byte]) -> Result[isize, Error] {
+        let mut count = 0;
+        while count < input.len() {
+            if self.pending.len() == 32768 {
+                match self.block(false) {
+                    Ok(()) => (),
+                    Err(error) => {
+                        if count == 0 {
+                            return Result::Err(error)
+                        }
+                        return Result::Ok(count)
+                    },
+                }
+            }
+            if self.input.get() >= self.limits.max_input_bytes {
+                let error = self.fail(
+                    Error::new(ErrorKind::Limit, self.input.get(), "DEFLATE input limit exceeded"),
+                );
+                if count == 0 {
+                    return Result::Err(error)
+                }
+                return Result::Ok(count)
+            }
+            match self.spend() {
+                Ok(()) => (),
+                Err(error) => {
+                    if count == 0 {
+                        return Result::Err(error)
+                    }
+                    return Result::Ok(count)
+                },
+            }
+            self.pending.push(input[count]);
+            self.input.set(self.input.get() + 1);
+            count += 1;
+        }
+        Result::Ok(count)
+    }
+
+    pub fn flush(self: Encoder[W]) -> Result[(), Error] {
+        self.check()?;
+        if self.active.get() || self.finished.get() {
+            return Result::Err(
+                self.fail(
+                    Error::new(ErrorKind::State, self.input.get(), "DEFLATE encoder unavailable"),
+                ),
+            )
+        }
+        self.active.set(true);
+        let completed = Ref::new(false);
+        defer {
+            if !completed.get() {
+                let _ = self.fail(
+                    Error::new(ErrorKind::State, self.input.get(), "DEFLATE operation unwound"),
+                );
+            }
+            self.active.set(false);
+        };
+        let result = self.flush_active();
+        completed.set(true);
+        result
+    }
+
+    fn flush_active(self: Encoder[W]) -> Result[(), Error] {
+        if self.pending.len() > 0 {
+            self.block(false)?;
+        }
+        if self.blocks.get() >= self.limits.max_blocks {
+            return Result::Err(
+                self.fail(
+                    Error::new(ErrorKind::Limit, self.input.get(), "DEFLATE block limit exceeded"),
+                ),
+            )
+        }
+        self.spend()?;
+        self.blocks.set(self.blocks.get() + 1);
+        self.stored(false);
+        self.drain()
+    }
+
+    pub fn finish(self: Encoder[W]) -> Result[(), Error] {
+        self.check()?;
+        if self.active.get() {
+            return Result::Err(
+                self.fail(
+                    Error::new(ErrorKind::State, self.input.get(), "reentrant DEFLATE encoder"),
+                ),
+            )
+        }
+        if self.finished.get() {
+            return Result::Ok(())
+        }
+        self.active.set(true);
+        let completed = Ref::new(false);
+        defer {
+            if !completed.get() {
+                let _ = self.fail(
+                    Error::new(ErrorKind::State, self.input.get(), "DEFLATE operation unwound"),
+                );
+            }
+            self.active.set(false);
+        };
+        let result = self.block(true);
+        completed.set(true);
+        result?;
+        self.finished.set(true);
+        Result::Ok(())
+    }
+}
+
+impl[W: io::Write] io::Write for Encoder[W] {
+    fn write(self: Encoder[W], input: Slice[byte]) -> Result[isize, io::Error] {
+        self.write_chunk(input).map_err(|error| error.to_io())
+    }
+}
+
+pub fn encode(data: bytes::Bytes, limits: Limits, level: isize) -> Result[bytes::Bytes, Error] {
+    let cursor = io::Cursor::new(bytes::Bytes::new());
+    let encoder = Encoder::new(cursor, limits, level)?;
+    let mut offset = 0;
+    while offset < data.len() {
+        let count = encoder.write_chunk(data.slice(offset, data.len()))?;
+        offset += count;
+    }
+    encoder.finish()?;
+    Result::Ok(cursor.bytes())
+}

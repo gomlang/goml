@@ -1,0 +1,378 @@
+package lzw;
+
+use ecosystem::compress;
+use compress::{Error, ErrorKind, Limits};
+use std::bytes;
+use std::io;
+
+pub struct Writer[W] {
+    writer: W,
+    limits: Limits,
+    order: BitOrder,
+    literal_width: isize,
+    clear_code: isize,
+    eof_code: isize,
+    width: Ref[isize],
+    overflow: Ref[isize],
+    hi: Ref[isize],
+    saved: Ref[isize],
+    started: Ref[bool],
+    dictionary: Ref[HashMap[isize, isize]],
+    bits: Ref[isize],
+    bit_count: Ref[isize],
+    pending: bytes::Bytes,
+    accepted: Ref[isize],
+    written: Ref[isize],
+    epochs: Ref[isize],
+    work: Ref[isize],
+    finished: Ref[bool],
+    active: Ref[bool],
+    failure: Ref[Option[Error]],
+}
+
+impl[W: io::Write] Writer[W] {
+    pub fn new(writer: W, limits: Limits, order: BitOrder, literal_width: isize) -> Result[
+        Writer[W],
+        Error,
+    ] {
+        limits.validate()?;
+        validate_width(literal_width)?;
+        let clear_code = 1 << literal_width;
+        let width = literal_width + 1;
+        Result::Ok(
+            Writer {
+                writer,
+                limits,
+                order,
+                literal_width,
+                clear_code,
+                eof_code: clear_code + 1,
+                width: Ref::new(width),
+                overflow: Ref::new(1 << width),
+                hi: Ref::new(clear_code + 1),
+                saved: Ref::new(-1),
+                started: Ref::new(false),
+                dictionary: Ref::new(HashMap::new()),
+                bits: Ref::new(0),
+                bit_count: Ref::new(0),
+                pending: bytes::Bytes::new(),
+                accepted: Ref::new(0),
+                written: Ref::new(0),
+                epochs: Ref::new(0),
+                work: Ref::new(0),
+                finished: Ref::new(false),
+                active: Ref::new(false),
+                failure: Ref::new(Option::None),
+            },
+        )
+    }
+
+    pub fn accepted(self: Writer[W]) -> isize {
+        self.accepted.get()
+    }
+
+    pub fn written(self: Writer[W]) -> isize {
+        self.written.get()
+    }
+
+    pub fn is_finished(self: Writer[W]) -> bool {
+        self.finished.get() && self.failure.get().is_none()
+    }
+
+    pub fn error(self: Writer[W]) -> Option[Error] {
+        self.failure.get()
+    }
+
+    fn fail(self: Writer[W], error: Error) -> Error {
+        match self.failure.get() {
+            Some(first) => first,
+            None => {
+                self.failure.set(Option::Some(error));
+                error
+            },
+        }
+    }
+
+    fn check(self: Writer[W]) -> Result[(), Error] {
+        match self.failure.get() {
+            Some(error) => Result::Err(error),
+            None => Result::Ok(()),
+        }
+    }
+
+    fn spend(self: Writer[W]) -> Result[(), Error] {
+        if self.work.get() >= self.limits.max_work {
+            return Result::Err(
+                self.fail(Error::new(ErrorKind::Limit, self.accepted(), "LZW work limit exceeded")),
+            )
+        }
+        self.work.set(self.work.get() + 1);
+        Result::Ok(())
+    }
+
+    fn drain(self: Writer[W]) -> Result[(), Error] {
+        let mut position = 0;
+        while position < self.pending.len() {
+            if self.written.get() >= self.limits.max_output_bytes {
+                return Result::Err(
+                    self.fail(
+                        Error::new(ErrorKind::Limit, self.accepted(), "LZW output limit exceeded"),
+                    ),
+                )
+            }
+            let remaining = self.limits.max_output_bytes - self.written.get();
+            let size = if self.pending.len() - position < remaining {
+                self.pending.len() - position
+            } else {
+                remaining
+            };
+            let count = match self.writer.write(self.pending.slice(position, position + size)) {
+                Ok(count) => count,
+                Err(cause) => return Result::Err(
+                    self.fail(
+                        Error {
+                            kind: ErrorKind::Io,
+                            offset: self.accepted(),
+                            message: "LZW writer failed",
+                            cause: Option::Some(cause),
+                        },
+                    ),
+                ),
+            };
+            if count <= 0 || count > size {
+                return Result::Err(
+                    self.fail(
+                        Error::new(ErrorKind::Io, self.accepted(), "invalid LZW writer count"),
+                    ),
+                )
+            }
+            position += count;
+            self.written.set(self.written.get() + count);
+            self.check()?;
+        }
+        self.pending.clear();
+        Result::Ok(())
+    }
+
+    fn emit_byte(self: Writer[W], value: byte) -> Result[(), Error] {
+        self.pending.push(value);
+        if self.pending.len() >= 4096 {
+            self.drain()?;
+        }
+        Result::Ok(())
+    }
+
+    fn code(self: Writer[W], code: isize) -> Result[(), Error] {
+        self.spend()?;
+        let width = self.width.get();
+        if self.order == BitOrder::Lsb {
+            let mut bits = self.bits.get() | (code << self.bit_count.get());
+            let mut count = self.bit_count.get() + width;
+            while count >= 8 {
+                self.emit_byte(bits.to_u8())?;
+                bits >>= 8;
+                count -= 8;
+            }
+            self.bits.set(bits);
+            self.bit_count.set(count);
+        } else {
+            let mut count = self.bit_count.get() + width;
+            let mut bits = (self.bits.get() << width) | code;
+            while count >= 8 {
+                self.emit_byte((bits >> (count - 8)).to_u8())?;
+                count -= 8;
+                bits &= (1 << count) - 1;
+            }
+            self.bits.set(bits);
+            self.bit_count.set(count);
+        }
+        Result::Ok(())
+    }
+
+    fn clear(self: Writer[W]) -> Result[(), Error] {
+        if self.epochs.get() >= self.limits.max_blocks {
+            return Result::Err(
+                self.fail(
+                    Error::new(ErrorKind::Limit, self.accepted(), "LZW clear epoch limit exceeded"),
+                ),
+            )
+        }
+        self.code(self.clear_code)?;
+        self.epochs.set(self.epochs.get() + 1);
+        self.width.set(self.literal_width + 1);
+        self.overflow.set(1 << (self.literal_width + 1));
+        self.hi.set(self.eof_code);
+        self.dictionary.set(HashMap::new());
+        Result::Ok(())
+    }
+
+    fn advance(self: Writer[W]) -> Result[bool, Error] {
+        let hi = self.hi.get() + 1;
+        self.hi.set(hi);
+        if hi == self.overflow.get() {
+            self.width.set(self.width.get() + 1);
+            self.overflow.set(self.overflow.get() << 1);
+        }
+        if hi == 4095 {
+            self.clear()?;
+            return Result::Ok(false)
+        }
+        Result::Ok(true)
+    }
+
+    pub fn write_chunk(self: Writer[W], input: Slice[byte]) -> Result[isize, Error] {
+        self.check()?;
+        if self.active.get() || self.finished.get() {
+            return Result::Err(
+                self.fail(Error::new(ErrorKind::State, self.accepted(), "LZW writer unavailable")),
+            )
+        }
+        if input.len() == 0 {
+            return Result::Ok(0)
+        }
+        self.active.set(true);
+        let completed = Ref::new(false);
+        defer {
+            if !completed.get() {
+                let _ = self.fail(
+                    Error::new(ErrorKind::State, self.accepted(), "LZW operation unwound"),
+                );
+            }
+            self.active.set(false);
+        };
+        let result = self.write_active(input);
+        completed.set(true);
+        result
+    }
+
+    fn write_active(self: Writer[W], input: Slice[byte]) -> Result[isize, Error] {
+        let mut count = 0;
+        while count < input.len() {
+            if self.accepted.get() >= self.limits.max_input_bytes {
+                let error = self.fail(
+                    Error::new(ErrorKind::Limit, self.accepted(), "LZW input limit exceeded"),
+                );
+                if count > 0 {
+                    return Result::Ok(count)
+                }
+                return Result::Err(error)
+            }
+            let value = input[count].to_isize();
+            if value >= self.clear_code {
+                let error = self.fail(
+                    Error::new(
+                        ErrorKind::Invalid,
+                        self.accepted(),
+                        "LZW literal exceeds configured width",
+                    ),
+                );
+                if count > 0 {
+                    return Result::Ok(count)
+                }
+                return Result::Err(error)
+            }
+            let result = self.accept_byte(value);
+            if let Err(error) = result {
+                if count > 0 {
+                    return Result::Ok(count)
+                }
+                return Result::Err(error)
+            }
+            count += 1;
+            self.accepted.set(self.accepted.get() + 1);
+        }
+        Result::Ok(count)
+    }
+
+    fn accept_byte(self: Writer[W], value: isize) -> Result[(), Error] {
+        self.spend()?;
+        if !self.started.get() {
+            self.clear()?;
+            self.started.set(true);
+            self.saved.set(value);
+            return Result::Ok(())
+        }
+        let key = (self.saved.get() << 8) | value;
+        match self.dictionary.get().get(key) {
+            Some(code) => {
+                self.saved.set(code);
+                return Result::Ok(())
+            },
+            None => (),
+        }
+        self.code(self.saved.get())?;
+        self.saved.set(value);
+        if self.advance()? {
+            self.dictionary.get().set(key, self.hi.get());
+        }
+        Result::Ok(())
+    }
+
+    pub fn finish(self: Writer[W]) -> Result[(), Error] {
+        self.check()?;
+        if self.active.get() {
+            return Result::Err(
+                self.fail(Error::new(ErrorKind::State, self.accepted(), "reentrant LZW writer")),
+            )
+        }
+        if self.finished.get() {
+            return Result::Ok(())
+        }
+        self.active.set(true);
+        let completed = Ref::new(false);
+        defer {
+            if !completed.get() {
+                let _ = self.fail(
+                    Error::new(ErrorKind::State, self.accepted(), "LZW operation unwound"),
+                );
+            }
+            self.active.set(false);
+        };
+        let result = self.finish_active();
+        completed.set(true);
+        result?;
+        self.finished.set(true);
+        Result::Ok(())
+    }
+
+    fn finish_active(self: Writer[W]) -> Result[(), Error] {
+        if self.started.get() {
+            self.code(self.saved.get())?;
+            let _ = self.advance()?;
+        } else {
+            self.clear()?;
+        }
+        self.code(self.eof_code)?;
+        if self.bit_count.get() > 0 {
+            let value = if self.order == BitOrder::Lsb {
+                self.bits.get().to_u8()
+            } else {
+                (self.bits.get() << (8 - self.bit_count.get())).to_u8()
+            };
+            self.emit_byte(value)?;
+            self.bits.set(0);
+            self.bit_count.set(0);
+        }
+        self.drain()
+    }
+}
+
+impl[W: io::Write] io::Write for Writer[W] {
+    fn write(self: Writer[W], input: Slice[byte]) -> Result[isize, io::Error] {
+        self.write_chunk(input).map_err(|error| error.to_io())
+    }
+}
+
+pub fn encode(data: bytes::Bytes, limits: Limits, order: BitOrder, literal_width: isize) -> Result[
+    bytes::Bytes,
+    Error,
+] {
+    let sink = io::Cursor::new(bytes::Bytes::new());
+    let writer = Writer::new(sink, limits, order, literal_width)?;
+    let mut offset = 0;
+    while offset < data.len() {
+        offset += writer.write_chunk(data.slice(offset, data.len()))?;
+    }
+    writer.finish()?;
+    Result::Ok(sink.bytes())
+}

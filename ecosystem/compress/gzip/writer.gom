@@ -1,0 +1,260 @@
+package gzip;
+
+use ecosystem::compress;
+use ecosystem::compress::flate;
+use compress::{Error, ErrorKind, Limits};
+use std::bytes;
+use std::hash::crc32;
+use std::io;
+
+fn write_all[W: io::Write](
+    writer: W,
+    data: Slice[byte],
+    confirmed: Ref[isize],
+    failure: Ref[Option[Error]],
+    offset: isize,
+) -> Result[(), Error] {
+    let mut position = 0;
+    while position < data.len() {
+        let count = match writer.write(data.sub(position, data.len())) {
+            Ok(count) => count,
+            Err(cause) => return Result::Err(
+                Error {
+                    kind: ErrorKind::Io,
+                    offset,
+                    message: "GZIP writer failed",
+                    cause: Option::Some(cause),
+                },
+            ),
+        };
+        if count <= 0 || count > data.len() - position {
+            return Result::Err(Error::new(ErrorKind::Io, offset, "invalid GZIP writer count"))
+        }
+        position += count;
+        confirmed.set(confirmed.get() + count);
+        match failure.get() {
+            Some(error) => return Result::Err(error),
+            None => (),
+        }
+    }
+    Result::Ok(())
+}
+
+struct GzipSink[W] {
+    writer: W,
+    failure: Ref[Option[Error]],
+}
+
+impl[W: io::Write] io::Write for GzipSink[W] {
+    fn write(self: GzipSink[W], input: Slice[byte]) -> Result[isize, io::Error] {
+        match self.failure.get() {
+            Some(error) => Result::Err(error.to_io()),
+            None => self.writer.write(input),
+        }
+    }
+}
+
+pub struct Writer[W] {
+    writer: W,
+    flate: flate::Encoder[GzipSink[W]],
+    crc: Ref[u32],
+    size: Ref[u32],
+    table: crc32::Table,
+    framing_written: Ref[isize],
+    active: Ref[bool],
+    finished: Ref[bool],
+    failure: Ref[Option[Error]],
+}
+
+impl[W: io::Write] Writer[W] {
+    pub fn new(writer: W, limits: Limits, level: isize) -> Result[Writer[W], Error] {
+        limits.validate()?;
+        if limits.max_output_bytes < 18 {
+            return Result::Err(Error::new(ErrorKind::Limit, 0, "GZIP output limit too small"))
+        }
+        let flate_limits = Limits {
+            max_input_bytes: limits.max_input_bytes,
+            max_output_bytes: limits.max_output_bytes - 18,
+            max_blocks: limits.max_blocks,
+            max_work: limits.max_work,
+        };
+        let failure = Ref::new(Option::None);
+        let flate = flate::Encoder::new(GzipSink { writer, failure }, flate_limits, level)?;
+        let framing_written = Ref::new(0);
+        write_all(
+            writer,
+            b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff".as_slice(),
+            framing_written,
+            failure,
+            0,
+        )?;
+        Result::Ok(
+            Writer {
+                writer,
+                flate,
+                crc: Ref::new(0),
+                size: Ref::new(0),
+                table: crc32::Table::new(crc32::IEEE),
+                framing_written,
+                active: Ref::new(false),
+                finished: Ref::new(false),
+                failure,
+            },
+        )
+    }
+
+    pub fn accepted(self: Writer[W]) -> isize {
+        self.flate.accepted()
+    }
+
+    pub fn written(self: Writer[W]) -> isize {
+        self.framing_written.get() + self.flate.written()
+    }
+
+    pub fn is_finished(self: Writer[W]) -> bool {
+        self.finished.get() && self.failure.get().is_none()
+    }
+
+    pub fn error(self: Writer[W]) -> Option[Error] {
+        self.failure.get()
+    }
+
+    fn fail(self: Writer[W], error: Error) -> Error {
+        match self.failure.get() {
+            Some(first) => first,
+            None => {
+                self.failure.set(Option::Some(error));
+                error
+            },
+        }
+    }
+
+    fn check(self: Writer[W]) -> Result[(), Error] {
+        match self.failure.get() {
+            Some(error) => Result::Err(error),
+            None => Result::Ok(()),
+        }
+    }
+
+    pub fn write_chunk(self: Writer[W], input: Slice[byte]) -> Result[isize, Error] {
+        self.check()?;
+        if self.active.get() || self.finished.get() {
+            return Result::Err(
+                self.fail(Error::new(ErrorKind::State, self.accepted(), "GZIP writer unavailable")),
+            )
+        }
+        if input.len() == 0 {
+            return Result::Ok(0)
+        }
+        self.active.set(true);
+        let completed = Ref::new(false);
+        defer {
+            if !completed.get() {
+                let _ = self.fail(
+                    Error::new(ErrorKind::State, self.accepted(), "GZIP operation unwound"),
+                );
+            }
+            self.active.set(false);
+        };
+        let result = self.write_active(input);
+        completed.set(true);
+        result
+    }
+
+    fn write_active(self: Writer[W], input: Slice[byte]) -> Result[isize, Error] {
+        let count = match self.flate.write_chunk(input) {
+            Ok(count) => count,
+            Err(error) => return Result::Err(self.fail(error)),
+        };
+        self.crc.set(crc32::update(self.crc.get(), self.table, input.sub(0, count)));
+        self.size.set(self.size.get() + count.to_u32());
+        self.check()?;
+        Result::Ok(count)
+    }
+
+    pub fn flush(self: Writer[W]) -> Result[(), Error] {
+        self.check()?;
+        if self.active.get() || self.finished.get() {
+            return Result::Err(
+                self.fail(Error::new(ErrorKind::State, self.accepted(), "GZIP writer unavailable")),
+            )
+        }
+        self.active.set(true);
+        let completed = Ref::new(false);
+        defer {
+            if !completed.get() {
+                let _ = self.fail(
+                    Error::new(ErrorKind::State, self.accepted(), "GZIP operation unwound"),
+                );
+            }
+            self.active.set(false);
+        };
+        let result = self.flate.flush().map_err(|error| self.fail(error));
+        completed.set(true);
+        result
+    }
+
+    pub fn finish(self: Writer[W]) -> Result[(), Error] {
+        self.check()?;
+        if self.active.get() {
+            return Result::Err(
+                self.fail(Error::new(ErrorKind::State, self.accepted(), "reentrant GZIP writer")),
+            )
+        }
+        if self.finished.get() {
+            return Result::Ok(())
+        }
+        self.active.set(true);
+        let completed = Ref::new(false);
+        defer {
+            if !completed.get() {
+                let _ = self.fail(
+                    Error::new(ErrorKind::State, self.accepted(), "GZIP operation unwound"),
+                );
+            }
+            self.active.set(false);
+        };
+        let result = self.finish_active();
+        completed.set(true);
+        result?;
+        self.finished.set(true);
+        Result::Ok(())
+    }
+
+    fn finish_active(self: Writer[W]) -> Result[(), Error] {
+        self.flate.finish().map_err(|error| self.fail(error))?;
+        self.check()?;
+        let trailer = bytes::Bytes::new();
+        for value in[self.crc.get(), self.size.get()] {
+            for index in 0..4 {
+                trailer.push((value >> (index * 8)).to_u8());
+            }
+        }
+        write_all(
+            self.writer,
+            trailer.as_slice(),
+            self.framing_written,
+            self.failure,
+            self.accepted(),
+        ).map_err(|error| self.fail(error))?;
+        self.check()
+    }
+}
+
+impl[W: io::Write] io::Write for Writer[W] {
+    fn write(self: Writer[W], input: Slice[byte]) -> Result[isize, io::Error] {
+        self.write_chunk(input).map_err(|error| error.to_io())
+    }
+}
+
+pub fn encode(data: bytes::Bytes, limits: Limits, level: isize) -> Result[bytes::Bytes, Error] {
+    let sink = io::Cursor::new(bytes::Bytes::new());
+    let writer = Writer::new(sink, limits, level)?;
+    let mut offset = 0;
+    while offset < data.len() {
+        let count = writer.write_chunk(data.slice(offset, data.len()))?;
+        offset += count;
+    }
+    writer.finish()?;
+    Result::Ok(sink.bytes())
+}

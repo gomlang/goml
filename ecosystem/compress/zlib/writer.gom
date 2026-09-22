@@ -1,0 +1,315 @@
+package zlib;
+
+use ecosystem::compress;
+use ecosystem::compress::flate;
+use compress::{Error, ErrorKind, Limits};
+use std::bytes;
+use std::hash::adler32;
+use std::io;
+
+fn send[W: io::Write](
+    writer: W,
+    data: Slice[byte],
+    confirmed: Ref[isize],
+    failure: Ref[Option[Error]],
+    offset: isize,
+) -> Result[(), Error] {
+    let mut position = 0;
+    while position < data.len() {
+        let count = match writer.write(data.sub(position, data.len())) {
+            Ok(count) => count,
+            Err(cause) => return Result::Err(
+                Error {
+                    kind: ErrorKind::Io,
+                    offset,
+                    message: "ZLIB writer failed",
+                    cause: Option::Some(cause),
+                },
+            ),
+        };
+        if count <= 0 || count > data.len() - position {
+            return Result::Err(Error::new(ErrorKind::Io, offset, "invalid ZLIB writer count"))
+        }
+        position += count;
+        confirmed.set(confirmed.get() + count);
+        match failure.get() {
+            Some(error) => return Result::Err(error),
+            None => (),
+        }
+    }
+    Result::Ok(())
+}
+
+struct ZlibSink[W] {
+    writer: W,
+    failure: Ref[Option[Error]],
+}
+
+impl[W: io::Write] io::Write for ZlibSink[W] {
+    fn write(self: ZlibSink[W], input: Slice[byte]) -> Result[isize, io::Error] {
+        match self.failure.get() {
+            Some(error) => Result::Err(error.to_io()),
+            None => self.writer.write(input),
+        }
+    }
+}
+
+pub struct Writer[W] {
+    writer: W,
+    flate: flate::Encoder[ZlibSink[W]],
+    checksum: Ref[u32],
+    framing_written: Ref[isize],
+    active: Ref[bool],
+    finished: Ref[bool],
+    failure: Ref[Option[Error]],
+}
+
+impl[W: io::Write] Writer[W] {
+    pub fn new(writer: W, limits: Limits, level: isize) -> Result[Writer[W], Error] {
+        let empty: Vec[byte] = Vec::new();
+        Writer::create(writer, limits, level, empty.as_slice(), false)
+    }
+
+    pub fn with_dictionary(writer: W, limits: Limits, level: isize, dictionary: Slice[byte]) -> Result[
+        Writer[W],
+        Error,
+    ] {
+        Writer::create(writer, limits, level, dictionary, true)
+    }
+
+    fn create(
+        writer: W,
+        limits: Limits,
+        level: isize,
+        dictionary: Slice[byte],
+        has_dictionary: bool,
+    ) -> Result[Writer[W], Error] {
+        limits.validate()?;
+        let header_length = if has_dictionary {
+            6
+        } else {
+            2
+        };
+        if limits.max_output_bytes < header_length + 4 {
+            return Result::Err(Error::new(ErrorKind::Limit, 0, "ZLIB output limit too small"))
+        }
+        let flate_limits = Limits {
+            max_input_bytes: limits.max_input_bytes,
+            max_output_bytes: limits.max_output_bytes - header_length - 4,
+            max_blocks: limits.max_blocks,
+            max_work: limits.max_work,
+        };
+        let failure = Ref::new(Option::None);
+        let flate = flate::Encoder::with_dictionary(
+            ZlibSink { writer, failure },
+            flate_limits,
+            level,
+            dictionary,
+        )?;
+        let effective_level = if level == -1 {
+            6
+        } else {
+            level
+        };
+        let flevel = if effective_level <= 1 {
+            0
+        } else if effective_level <= 5 {
+            1
+        } else if effective_level <= 6 {
+            2
+        } else {
+            3
+        };
+        let cmf = 0x78;
+        let base = (flevel << 6)
+            | (if has_dictionary {
+                0x20
+            } else {
+                0
+            });
+        let flags = base + ((31 - ((cmf * 256 + base) % 31)) % 31);
+        let header = bytes::Bytes::from_vec(Vec::from_array([cmf.to_u8(), flags.to_u8()]));
+        if has_dictionary {
+            let id = adler32::checksum(dictionary);
+            for index in[24, 16, 8, 0] {
+                header.push((id >> index).to_u8());
+            }
+        }
+        let framing_written = Ref::new(0);
+        send(writer, header.as_slice(), framing_written, failure, 0)?;
+        Result::Ok(
+            Writer {
+                writer,
+                flate,
+                checksum: Ref::new(1),
+                framing_written,
+                active: Ref::new(false),
+                finished: Ref::new(false),
+                failure,
+            },
+        )
+    }
+
+    pub fn accepted(self: Writer[W]) -> isize {
+        self.flate.accepted()
+    }
+
+    pub fn written(self: Writer[W]) -> isize {
+        self.framing_written.get() + self.flate.written()
+    }
+
+    pub fn is_finished(self: Writer[W]) -> bool {
+        self.finished.get() && self.failure.get().is_none()
+    }
+
+    pub fn error(self: Writer[W]) -> Option[Error] {
+        self.failure.get()
+    }
+
+    fn fail(self: Writer[W], error: Error) -> Error {
+        match self.failure.get() {
+            Some(first) => first,
+            None => {
+                self.failure.set(Option::Some(error));
+                error
+            },
+        }
+    }
+
+    fn check(self: Writer[W]) -> Result[(), Error] {
+        match self.failure.get() {
+            Some(error) => Result::Err(error),
+            None => Result::Ok(()),
+        }
+    }
+
+    pub fn write_chunk(self: Writer[W], input: Slice[byte]) -> Result[isize, Error] {
+        self.check()?;
+        if self.active.get() || self.finished.get() {
+            return Result::Err(
+                self.fail(Error::new(ErrorKind::State, self.accepted(), "ZLIB writer unavailable")),
+            )
+        }
+        if input.len() == 0 {
+            return Result::Ok(0)
+        }
+        self.active.set(true);
+        let completed = Ref::new(false);
+        defer {
+            if !completed.get() {
+                let _ = self.fail(
+                    Error::new(ErrorKind::State, self.accepted(), "ZLIB operation unwound"),
+                );
+            }
+            self.active.set(false);
+        };
+        let result = self.write_active(input);
+        completed.set(true);
+        result
+    }
+
+    fn write_active(self: Writer[W], input: Slice[byte]) -> Result[isize, Error] {
+        let count = match self.flate.write_chunk(input) {
+            Ok(count) => count,
+            Err(error) => return Result::Err(self.fail(error)),
+        };
+        self.checksum.set(adler32::update(self.checksum.get(), input.sub(0, count)));
+        self.check()?;
+        Result::Ok(count)
+    }
+
+    pub fn flush(self: Writer[W]) -> Result[(), Error] {
+        self.check()?;
+        if self.active.get() || self.finished.get() {
+            return Result::Err(
+                self.fail(Error::new(ErrorKind::State, self.accepted(), "ZLIB writer unavailable")),
+            )
+        }
+        self.active.set(true);
+        let completed = Ref::new(false);
+        defer {
+            if !completed.get() {
+                let _ = self.fail(
+                    Error::new(ErrorKind::State, self.accepted(), "ZLIB operation unwound"),
+                );
+            }
+            self.active.set(false);
+        };
+        let result = self.flate.flush().map_err(|error| self.fail(error));
+        completed.set(true);
+        result
+    }
+
+    pub fn finish(self: Writer[W]) -> Result[(), Error] {
+        self.check()?;
+        if self.active.get() {
+            return Result::Err(
+                self.fail(Error::new(ErrorKind::State, self.accepted(), "reentrant ZLIB writer")),
+            )
+        }
+        if self.finished.get() {
+            return Result::Ok(())
+        }
+        self.active.set(true);
+        let completed = Ref::new(false);
+        defer {
+            if !completed.get() {
+                let _ = self.fail(
+                    Error::new(ErrorKind::State, self.accepted(), "ZLIB operation unwound"),
+                );
+            }
+            self.active.set(false);
+        };
+        let result = self.finish_active();
+        completed.set(true);
+        result?;
+        self.finished.set(true);
+        Result::Ok(())
+    }
+
+    fn finish_active(self: Writer[W]) -> Result[(), Error] {
+        self.flate.finish().map_err(|error| self.fail(error))?;
+        self.check()?;
+        let trailer = bytes::Bytes::new();
+        for index in[24, 16, 8, 0] {
+            trailer.push((self.checksum.get() >> index).to_u8());
+        }
+        send(self.writer, trailer.as_slice(), self.framing_written, self.failure, self.accepted()).map_err(
+            |error| self.fail(error),
+        )?;
+        self.check()
+    }
+}
+
+impl[W: io::Write] io::Write for Writer[W] {
+    fn write(self: Writer[W], input: Slice[byte]) -> Result[isize, io::Error] {
+        self.write_chunk(input).map_err(|error| error.to_io())
+    }
+}
+
+pub fn encode(data: bytes::Bytes, limits: Limits, level: isize) -> Result[bytes::Bytes, Error] {
+    let sink = io::Cursor::new(bytes::Bytes::new());
+    let writer = Writer::new(sink, limits, level)?;
+    let mut offset = 0;
+    while offset < data.len() {
+        offset += writer.write_chunk(data.slice(offset, data.len()))?;
+    }
+    writer.finish()?;
+    Result::Ok(sink.bytes())
+}
+
+pub fn encode_with_dictionary(
+    data: bytes::Bytes,
+    limits: Limits,
+    level: isize,
+    dictionary: Slice[byte],
+) -> Result[bytes::Bytes, Error] {
+    let sink = io::Cursor::new(bytes::Bytes::new());
+    let writer = Writer::with_dictionary(sink, limits, level, dictionary)?;
+    let mut offset = 0;
+    while offset < data.len() {
+        offset += writer.write_chunk(data.slice(offset, data.len()))?;
+    }
+    writer.finish()?;
+    Result::Ok(sink.bytes())
+}

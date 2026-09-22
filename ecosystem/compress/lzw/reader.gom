@@ -1,0 +1,400 @@
+package lzw;
+
+use ecosystem::compress;
+use compress::{Error, ErrorKind, Limits};
+use std::bytes;
+use std::io;
+
+pub struct Reader[R] {
+    reader: R,
+    limits: Limits,
+    order: BitOrder,
+    literal_width: isize,
+    clear_code: isize,
+    eof_code: isize,
+    width: Ref[isize],
+    overflow: Ref[isize],
+    hi: Ref[isize],
+    previous: Ref[isize],
+    prefix: Vec[isize],
+    suffix: Vec[byte],
+    pending: Vec[byte],
+    pending_index: Ref[isize],
+    scratch: Vec[byte],
+    bits: Ref[isize],
+    bit_count: Ref[isize],
+    input: Ref[isize],
+    output: Ref[isize],
+    epochs: Ref[isize],
+    work: Ref[isize],
+    finished: Ref[bool],
+    active: Ref[bool],
+    failure: Ref[Option[Error]],
+}
+
+impl[R: io::Read] Reader[R] {
+    pub fn new(reader: R, limits: Limits, order: BitOrder, literal_width: isize) -> Result[
+        Reader[R],
+        Error,
+    ] {
+        limits.validate()?;
+        validate_width(literal_width)?;
+        let prefix = Vec::with_capacity(4096);
+        let suffix = Vec::with_capacity(4096);
+        for _ in 0..4096 {
+            prefix.push(-1);
+            suffix.push(0.to_u8());
+        }
+        let clear_code = 1 << literal_width;
+        let width = literal_width + 1;
+        Result::Ok(
+            Reader {
+                reader,
+                limits,
+                order,
+                literal_width,
+                clear_code,
+                eof_code: clear_code + 1,
+                width: Ref::new(width),
+                overflow: Ref::new(1 << width),
+                hi: Ref::new(clear_code + 1),
+                previous: Ref::new(-1),
+                prefix,
+                suffix,
+                pending: Vec::with_capacity(4096),
+                pending_index: Ref::new(-1),
+                scratch: Vec::from_array([0.to_u8()]),
+                bits: Ref::new(0),
+                bit_count: Ref::new(0),
+                input: Ref::new(0),
+                output: Ref::new(0),
+                epochs: Ref::new(0),
+                work: Ref::new(0),
+                finished: Ref::new(false),
+                active: Ref::new(false),
+                failure: Ref::new(Option::None),
+            },
+        )
+    }
+
+    pub fn consumed(self: Reader[R]) -> isize {
+        self.input.get()
+    }
+
+    pub fn produced(self: Reader[R]) -> isize {
+        self.output.get()
+    }
+
+    pub fn is_finished(self: Reader[R]) -> bool {
+        self.finished.get() && self.failure.get().is_none()
+    }
+
+    pub fn error(self: Reader[R]) -> Option[Error] {
+        self.failure.get()
+    }
+
+    fn fail(self: Reader[R], error: Error) -> Error {
+        match self.failure.get() {
+            Some(first) => first,
+            None => {
+                self.failure.set(Option::Some(error));
+                error
+            },
+        }
+    }
+
+    fn check(self: Reader[R]) -> Result[(), Error] {
+        match self.failure.get() {
+            Some(error) => Result::Err(error),
+            None => Result::Ok(()),
+        }
+    }
+
+    fn spend(self: Reader[R]) -> Result[(), Error] {
+        if self.work.get() >= self.limits.max_work {
+            return Result::Err(
+                self.fail(Error::new(ErrorKind::Limit, self.consumed(), "LZW work limit exceeded")),
+            )
+        }
+        self.work.set(self.work.get() + 1);
+        Result::Ok(())
+    }
+
+    fn byte(self: Reader[R]) -> Result[byte, Error] {
+        self.spend()?;
+        if self.input.get() >= self.limits.max_input_bytes {
+            return Result::Err(
+                self.fail(Error::new(ErrorKind::Limit, self.consumed(), "LZW input limit exceeded")),
+            )
+        }
+        let count = match self.reader.read(self.scratch.as_mut_slice()) {
+            Ok(count) => count,
+            Err(cause) => return Result::Err(
+                self.fail(
+                    Error {
+                        kind: ErrorKind::Io,
+                        offset: self.consumed(),
+                        message: "LZW reader failed",
+                        cause: Option::Some(cause),
+                    },
+                ),
+            ),
+        };
+        if count < 0 || count > 1 {
+            return Result::Err(
+                self.fail(Error::new(ErrorKind::Io, self.consumed(), "invalid LZW reader count")),
+            )
+        }
+        if count == 0 {
+            self.check()?;
+            return Result::Err(
+                self.fail(Error::new(ErrorKind::Truncated, self.consumed(), "missing LZW EOF code")),
+            )
+        }
+        self.input.set(self.input.get() + 1);
+        self.check()?;
+        Result::Ok(self.scratch[0])
+    }
+
+    fn code(self: Reader[R]) -> Result[isize, Error] {
+        self.spend()?;
+        let width = self.width.get();
+        let mut bits = self.bits.get();
+        let mut count = self.bit_count.get();
+        if self.order == BitOrder::Lsb {
+            while count < width {
+                bits |= self.byte()?.to_isize() << count;
+                count += 8;
+            }
+            let code = bits & ((1 << width) - 1);
+            self.bits.set(bits >> width);
+            self.bit_count.set(count - width);
+            Result::Ok(code)
+        } else {
+            while count < width {
+                bits = (bits << 8) | self.byte()?.to_isize();
+                count += 8;
+            }
+            let code = (bits >> (count - width)) & ((1 << width) - 1);
+            count -= width;
+            self.bits.set(bits & ((1 << count) - 1));
+            self.bit_count.set(count);
+            Result::Ok(code)
+        }
+    }
+
+    fn clear(self: Reader[R]) -> Result[(), Error] {
+        if self.epochs.get() >= self.limits.max_blocks {
+            return Result::Err(
+                self.fail(
+                    Error::new(ErrorKind::Limit, self.consumed(), "LZW clear epoch limit exceeded"),
+                ),
+            )
+        }
+        self.epochs.set(self.epochs.get() + 1);
+        self.width.set(self.literal_width + 1);
+        self.overflow.set(1 << (self.literal_width + 1));
+        self.hi.set(self.eof_code);
+        self.previous.set(-1);
+        Result::Ok(())
+    }
+
+    fn expand(self: Reader[R], code: isize) -> Result[byte, Error] {
+        let mut current = code;
+        let mut length = self.pending.len();
+        while current >= self.clear_code + 2 {
+            self.spend()?;
+            if current >= self.hi.get() || current >= 4096 || self.prefix[current] < 0
+                || self.prefix[current] >= current
+                || length >= 4096 {
+                return Result::Err(
+                    self.fail(
+                        Error::new(ErrorKind::Invalid, self.consumed(), "invalid LZW prefix chain"),
+                    ),
+                )
+            }
+            self.pending.push(self.suffix[current]);
+            length += 1;
+            current = self.prefix[current];
+        }
+        if current >= self.clear_code || length >= 4096 {
+            return Result::Err(
+                self.fail(
+                    Error::new(ErrorKind::Invalid, self.consumed(), "invalid LZW literal chain"),
+                ),
+            )
+        }
+        self.pending.push(current.to_u8());
+        Result::Ok(current.to_u8())
+    }
+
+    fn next_byte(self: Reader[R]) -> Result[Option[byte], Error] {
+        loop {
+            if self.pending_index.get() >= 0 {
+                if self.output.get() >= self.limits.max_output_bytes {
+                    return Result::Err(
+                        self.fail(
+                            Error::new(
+                                ErrorKind::Limit,
+                                self.consumed(),
+                                "LZW output limit exceeded",
+                            ),
+                        ),
+                    )
+                }
+                let value = self.pending[self.pending_index.get()];
+                self.pending_index.set(self.pending_index.get() - 1);
+                self.output.set(self.output.get() + 1);
+                return Result::Ok(Option::Some(value))
+            }
+            if self.finished.get() {
+                return Result::Ok(Option::None)
+            }
+            let code = self.code()?;
+            if code == self.clear_code {
+                self.clear()?;
+                continue
+            }
+            if code == self.eof_code {
+                self.finished.set(true);
+                return Result::Ok(Option::None)
+            }
+            if self.epochs.get() == 0 {
+                if self.limits.max_blocks == 0 {
+                    return Result::Err(
+                        self.fail(
+                            Error::new(
+                                ErrorKind::Limit,
+                                self.consumed(),
+                                "LZW clear epoch limit exceeded",
+                            ),
+                        ),
+                    )
+                }
+                self.epochs.set(1);
+            }
+            self.pending.clear();
+            let head = if code < self.clear_code {
+                self.pending.push(code.to_u8());
+                code.to_u8()
+            } else if code == self.hi.get() && self.previous.get() >= 0 {
+                let previous = self.previous.get();
+                let mut first = previous;
+                while first >= self.clear_code + 2 {
+                    self.spend()?;
+                    first = self.prefix[first];
+                }
+                if first >= self.clear_code {
+                    return Result::Err(
+                        self.fail(
+                            Error::new(
+                                ErrorKind::Invalid,
+                                self.consumed(),
+                                "invalid LZW special code",
+                            ),
+                        ),
+                    )
+                }
+                self.pending.push(first.to_u8());
+                self.expand(previous)?
+            } else if code < self.hi.get() && code >= self.clear_code + 2 {
+                self.expand(code)?
+            } else {
+                return Result::Err(
+                    self.fail(Error::new(ErrorKind::Invalid, self.consumed(), "invalid LZW code")),
+                )
+            };
+            if self.previous.get() >= 0 && self.hi.get() < 4096 {
+                self.prefix[self.hi.get()] = self.previous.get();
+                self.suffix[self.hi.get()] = head;
+            }
+            self.previous.set(code);
+            let hi = self.hi.get() + 1;
+            self.hi.set(hi);
+            if hi >= self.overflow.get() {
+                if self.width.get() == 12 {
+                    self.previous.set(-1);
+                    self.hi.set(hi - 1);
+                } else {
+                    self.width.set(self.width.get() + 1);
+                    self.overflow.set(self.overflow.get() << 1);
+                }
+            }
+            self.pending_index.set(self.pending.len() - 1);
+        }
+    }
+
+    pub fn read_chunk(self: Reader[R], output: MutSlice[byte]) -> Result[isize, Error] {
+        self.check()?;
+        if self.active.get() {
+            return Result::Err(
+                self.fail(Error::new(ErrorKind::State, self.consumed(), "reentrant LZW reader")),
+            )
+        }
+        if output.len() == 0 || self.finished.get() {
+            return Result::Ok(0)
+        }
+        self.active.set(true);
+        let completed = Ref::new(false);
+        defer {
+            if !completed.get() {
+                let _ = self.fail(
+                    Error::new(ErrorKind::State, self.consumed(), "LZW operation unwound"),
+                );
+            }
+            self.active.set(false);
+        };
+        let result = self.read_active(output);
+        completed.set(true);
+        result
+    }
+
+    fn read_active(self: Reader[R], output: MutSlice[byte]) -> Result[isize, Error] {
+        let mut count = 0;
+        while count < output.len() {
+            match self.next_byte() {
+                Ok(Some(value)) => {
+                    output[count] = value;
+                    count += 1;
+                },
+                Ok(None) => break,
+                Err(error) => {
+                    if count > 0 {
+                        return Result::Ok(count)
+                    }
+                    return Result::Err(error)
+                },
+            }
+        }
+        Result::Ok(count)
+    }
+}
+
+impl[R: io::Read] io::Read for Reader[R] {
+    fn read(self: Reader[R], output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.read_chunk(output).map_err(|error| error.to_io())
+    }
+}
+
+pub fn decode(data: bytes::Bytes, limits: Limits, order: BitOrder, literal_width: isize) -> Result[
+    bytes::Bytes,
+    Error,
+] {
+    let reader = Reader::new(io::Cursor::new(data), limits, order, literal_width)?;
+    let output = bytes::Bytes::new();
+    let buffer = bytes::Bytes::new();
+    for _ in 0..4096 {
+        buffer.push(0);
+    }
+    loop {
+        let count = reader.read_chunk(buffer.as_mut_slice())?;
+        if count == 0 {
+            break
+        }
+        output.extend_from_slice(buffer.slice(0, count));
+    }
+    if reader.consumed() != data.len() {
+        return Result::Err(Error::new(ErrorKind::Invalid, reader.consumed(), "trailing LZW input"))
+    }
+    Result::Ok(output)
+}
