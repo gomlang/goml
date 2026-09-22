@@ -1,0 +1,142 @@
+package json;
+
+use module::io;
+use io::Read;
+use module::bytes;
+
+struct StreamCursor[R] {
+    reader: R,
+    session: StreamSession,
+    scratch: Vec[byte],
+    confirmed: Vec[byte],
+    begin: Ref[isize],
+    end: Ref[isize],
+    eof: Ref[bool],
+    limits: DecodeLimits,
+    root_start: Ref[Option[isize]],
+}
+
+fn stream_cursor[R: io::Read](reader: R, session: StreamSession, limits: DecodeLimits) -> StreamCursor[
+    R,
+] {
+    let scratch: Vec[byte] = Vec::with_capacity(4096);
+    let confirmed: Vec[byte] = Vec::with_capacity(4096);
+    for _ in 0..4096 {
+        scratch.push(0);
+        confirmed.push(0);
+    }
+    StreamCursor {
+        reader,
+        session,
+        scratch,
+        confirmed,
+        begin: Ref::new(0),
+        end: Ref::new(0),
+        eof: Ref::new(false),
+        limits,
+        root_start: Ref::new(Option::None),
+    }
+}
+
+fn cursor_peek[R: io::Read](cursor: StreamCursor[R], lease: StreamLease) -> Result[
+    Option[byte],
+    Error,
+] {
+    stream_check(lease)?;
+    if cursor.begin.get() < cursor.end.get() {
+        return Result::Ok(Option::Some(cursor.confirmed[cursor.begin.get()]))
+    }
+    if cursor.eof.get() {
+        return Result::Ok(Option::None)
+    }
+    let remaining = cursor.limits.max_input_bytes - cursor.session.read.get();
+    if remaining <= 0 {
+        return Result::Err(
+            stream_fail(
+                cursor.session,
+                ErrorKind::Limit(LimitKind::InputBytes),
+                "JSON input byte limit exceeded",
+                Option::None,
+            ),
+        )
+    }
+    let request = if remaining < 4096 {
+        remaining
+    } else {
+        4096
+    };
+    let count = match cursor.reader.read(cursor.scratch.slice_mut(0, request)) {
+        Result::Ok(count) => count,
+        Result::Err(cause) => return Result::Err(
+            stream_fail(cursor.session, ErrorKind::Io, "JSON reader failed", Option::Some(cause)),
+        ),
+    };
+    if count < 0 || count > request {
+        let cause = io::Error::new(
+            io::ErrorKind::InvalidData,
+            "JSON read",
+            Option::None,
+            Option::None,
+            "invalid byte count returned by reader",
+        );
+        return Result::Err(
+            stream_fail(
+                cursor.session,
+                ErrorKind::Io,
+                "invalid JSON reader count",
+                Option::Some(cause),
+            ),
+        )
+    }
+    cursor.session.read.set(cursor.session.read.get() + count);
+    if count == 0 {
+        cursor.eof.set(true);
+        stream_check(lease)?;
+        return Result::Ok(Option::None)
+    }
+    for index in 0..count {
+        cursor.confirmed[index] = cursor.scratch[index];
+    }
+    cursor.begin.set(0);
+    cursor.end.set(count);
+    stream_check(lease)?;
+    Result::Ok(Option::Some(cursor.confirmed[0]))
+}
+
+fn cursor_take[R: io::Read](cursor: StreamCursor[R], lease: StreamLease) -> Result[
+    Option[byte],
+    Error,
+] {
+    let value = cursor_peek(cursor, lease)?;
+    if let Option::Some(_) = value {
+        if let Option::Some(start) = cursor.root_start.get() {
+            if cursor.session.offset.get() - start >= cursor.limits.max_value_bytes {
+                return Result::Err(
+                    stream_fail(
+                        cursor.session,
+                        ErrorKind::Limit(LimitKind::ValueBytes),
+                        "JSON value byte limit exceeded",
+                        Option::None,
+                    ),
+                )
+            }
+        }
+        if cursor.session.offset.get() == 9223372036854775807 {
+            return Result::Err(
+                stream_fail(
+                    cursor.session,
+                    ErrorKind::Limit(LimitKind::InputBytes),
+                    "JSON byte offset overflow",
+                    Option::None,
+                ),
+            )
+        }
+        cursor.begin.set(cursor.begin.get() + 1);
+        cursor.session.offset.set(cursor.session.offset.get() + 1);
+    }
+    Result::Ok(value)
+}
+
+fn cursor_buffered[R](cursor: StreamCursor[R]) -> bytes::Bytes {
+    bytes::Bytes::from_slice_copy(cursor.confirmed.slice(cursor.begin.get(), cursor.end.get()))
+}

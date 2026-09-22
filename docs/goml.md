@@ -1882,7 +1882,130 @@ struct User {
 
 `std::json` supports two deliberately separate modes. The value mode uses `json::Value`, `json::parse`, and `json::encode` for schema-free inspection and editing. JSON numbers remain their exact source text in `Value::Number`. In the typed mode, `json::try_to_string` and `from_string` write and consume JSON directly through the streaming serde traits; neither operation first builds a `json::Value` or `serde::Value` tree. `json::to_value` and `from_value` return `Result` and are the explicit bridge to the dynamic JSON model. Numeric range and destination-width checks happen while deserializing into the requested type.
 
+`json::as_int` returns None for non-integer text or values outside the isize
+range; it does not wrap on overflow. Hand-built Number text may retain leading
+zeros for this accessor, while parse still requires JSON number syntax. Invalid
+literal prefixes containing multibyte characters produce recoverable parse
+errors rather than slicing inside a UTF-8 scalar.
+
 `json` publicly re-exports the shared `Serialize` and `Deserialize` traits and derive handlers, so either `use serde::Serialize` or `use json::Serialize` selects the same implementation identity. The JSON serializer emits struct fields in source order. Direct maps use JSON objects and therefore require keys whose direct representation is a string or char; `try_to_string` returns a recoverable error for other key types. The deserializer accepts any field order, recursively skips unknown values, rejects duplicate and missing fields, and rejects trailing input. Typed errors retain the byte offset and nested struct, sequence, map, or enum path. JSON uses externally tagged enums: a unit variant is a string, a tuple variant is an object whose value is an array, and a struct-like variant is an object whose value is another object.
+
+#### Bounded JSON streaming and typed serde
+
+`json::Decoder[R]::new(reader, limits)` accepts an `io::Read` source and explicit
+DecodeLimits. `next_token()` returns `Result[Option[Token], Error]`; tokens are
+StartArray, EndArray, StartObject, EndObject, Key(string), String(string),
+Number(string), Bool(bool) and Null. The decoder validates grammar incrementally
+and retains only fixed transport buffers, its container stack and bounded scalar
+payloads. Numbers retain their exact spelling. `next_value()` assembles one
+bounded Value tree with an explicit stack, preserving object order and duplicate
+keys. Token payloads and returned trees do not borrow the refill buffer.
+
+Values in a stream must be separated by JSON whitespace: `{} []` is accepted,
+but `{}[]` is rejected. A clean EOF between roots returns None; EOF inside a
+token or container is an error. `next_value()` requires a root boundary and
+cannot resume in the middle of a container started with next_token. Switching
+between token, Value and typed modes at a completed root is supported. `finish()` consumes
+remaining whitespace and requires EOF without parsing a second value. Finishing
+in the middle of a root is a State error.
+
+`decode[T: Deserialize]() -> Result[Option[T], Error]` drives serde directly
+from the same incremental token grammar, without building an intermediate Value.
+Struct fields, tuples, optional values, string/char map keys and externally tagged
+enums follow the existing serde representation. Unknown struct fields are skipped
+iteratively but still checked against syntax and byte/structural limits. Derived
+deserializers reject duplicate or missing required fields. Integer width and float
+range errors are Schema failures. Explicit deserialize_any builds a serde::Value
+with an iterative stack and preserves numeric spelling. Incomplete, out-of-order
+or multiple-root custom serde event sequences fail, including ignored adapter
+errors. Adapters retained by user code expire when their operation returns.
+
+`from_reader[T, R](reader, DecodeLimits)` and
+`from_string_with_limits[T](input, DecodeLimits)` require exactly one typed
+value followed by EOF. `value_from_reader(reader, limits)` and
+`parse_with_limits(input, limits)` provide the corresponding Value operations.
+Empty input is UnexpectedEof for these single-value conveniences.
+
+`offset()` reports logically consumed bytes. `buffered()` returns an independent
+Bytes snapshot of confirmed but unconsumed input; underlying reads can run ahead
+of the logical cursor. Strict JSON escapes, surrogate pairs and UTF-8 inside
+strings are recognized across refill boundaries. Incomplete UTF-8 at EOF is
+UnexpectedEof; invalid UTF-8 bytes in a string are Utf8 errors. Comments, BOMs,
+trailing commas and non-JSON numeric spellings are rejected.
+
+`json::Encoder[W]::new(writer, limits)` accepts `io::Write` and EncodeLimits.
+`encode[T: Serialize](value)` sends typed serde events directly to the writer;
+it does not first create a Value tree or complete output string. `encode_value`
+uses explicit Value traversal rather than recursive conversion through serde::Value.
+Both append LF after each successful root, include LF in their byte budget and
+return this operation's confirmed byte count as usize. `written()` is the
+cumulative confirmed count. Encoding preserves field order, string/char map
+keys and externally tagged enums. Number text must have valid JSON syntax;
+NaN and infinities are rejected. Legacy infallible `encode(Value)` retains its
+existing behavior and signature. `to_writer(value, writer, EncodeLimits)` and
+`encode_to_writer(Value, writer, EncodeLimits)` write a single compact root
+without LF. `to_string_with_limits(value, limits)` and
+`encode_with_limits(Value, limits)` return its bounded string representation.
+Legacy string APIs remain available with their original contracts; they do not
+implicitly acquire the new limits.
+
+DecodeLimits has nonnegative max_input_bytes, max_value_bytes, max_depth,
+max_values, max_string_bytes, max_number_bytes, max_container_entries,
+max_path_bytes, max_serde_frames and max_events. EncodeLimits has the same
+fields except input/value bytes, replaced by max_output_bytes. Constructors
+reject negative limits before any provider call. No implicit unlimited defaults
+are supplied. Input and output byte quotas are lifetime totals; other structural
+quotas reset per root. Events count fallible protocol calls and internal
+dispatch/assembly work per public operation, not elapsed time.
+
+Depth counts physical JSON arrays and objects, with a root scalar at depth zero.
+Values includes the root and nested values, but not object keys. Container entries
+are limited per array or object. String bytes count decoded UTF-8, including
+keys; number bytes count their original ASCII representation. Value bytes count
+the raw root span, including its internal whitespace but not whitespace between
+roots. Protocol frames have a separate bound so nested optional serde events
+cannot evade depth limits. Path bytes charge field/variant name bytes and decimal
+index digits before adding the segment. Errors retain only the permitted prefix
+when a new segment would exceed that budget.
+
+Every read request fits the remaining input allowance. Proving EOF or a number's
+ending boundary may require unused allowance even when all value bytes have
+been read. No extra over-budget probe is issued. Only legal successful provider
+counts are confirmed; a failing call may have unknown side effects. Interrupted
+is not retried, zero writes fail with WriteZero, and invalid counts retain an
+InvalidData I/O cause. Primitive read/write methods are used, not overridable
+whole-stream convenience methods. Neither side flushes or closes its provider.
+Output can contain a partial JSON prefix on any streaming failure, including
+failure to write the final LF; it is not an atomic transaction.
+
+Error accessors are kind(), byte_offset(), path(), message(), cause(),
+confirmed_read() and confirmed_written(). ErrorKind distinguishes InvalidLimit,
+Limit(LimitKind), Syntax, UnexpectedEof, TrailingData, Utf8, Schema, State and Io.
+LimitKind identifies the specific quota. Paths are read-only structured
+Field(string), Index(isize) and Variant(string) segments, not ambiguous dotted
+strings. Offsets are logical input positions or confirmed output byte counts;
+I/O progress accessors are lifetime usize totals. Error supports ToString and
+Debug without requiring callers to parse diagnostic text.
+
+Copies share cursor, budgets and terminal state. After a failure, subsequent
+operations return the first failure and perform no more I/O. Reentrant operations
+through an alias are rejected and make the session terminal. A legal provider
+count returned after a reentrant failure is still included in confirmed progress;
+successfully read bytes remain available through buffered without further parsing.
+User serde/provider panics propagate, while unwinding makes that session unusable.
+User code can allocate or loop independently of these quotas; blocking providers
+cannot be interrupted by a byte limit. Concurrent access is unsupported.
+Callers must keep input Value containers stable during encoding; detected length
+changes fail recoverably, but same-length mutations are not a snapshot protocol.
+Cycles terminate through structural or event limits. These APIs add no grammar.
+The library's token/Value traversal and unknown-field skipping are iterative;
+user-written or derived recursive typed serde code still uses its own call stack.
+Limits are logical work/storage bounds, not an allocation-failure guarantee.
+Unlike Go's permissive string replacement, malformed UTF-8 and unpaired surrogate
+escapes are rejected. Field matching remains exact under GoML serde rules; there
+is no reflection, case-insensitive field fallback or automatic base64 byte-array
+mapping. Object order and duplicate keys are retained by Value/token decoding;
+custom map/struct deserializers determine their own duplicate-field policy.
 
 ```goml
 use std::json;

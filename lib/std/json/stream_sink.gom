@@ -1,0 +1,211 @@
+package json;
+
+use module::io;
+use io::Write;
+
+struct StreamSink[W] {
+    writer: W,
+    session: StreamSession,
+    limits: EncodeLimits,
+}
+
+fn sink_write[W: io::Write](sink: StreamSink[W], lease: StreamLease, input: Slice[byte]) -> Result[
+    (),
+    Error,
+] {
+    stream_check(lease)?;
+    let written = sink.session.written.get();
+    if written > sink.limits.max_output_bytes
+        || input.len() > sink.limits.max_output_bytes - written {
+        return Result::Err(
+            stream_fail(
+                sink.session,
+                ErrorKind::Limit(LimitKind::OutputBytes),
+                "JSON output byte limit exceeded",
+                Option::None,
+            ),
+        )
+    }
+    let mut offset = 0;
+    while offset < input.len() {
+        stream_check(lease)?;
+        let remaining = input.len() - offset;
+        let count = match sink.writer.write(input.sub(offset, input.len())) {
+            Ok(count) => count,
+            Err(error) => return Result::Err(
+                stream_fail(sink.session, ErrorKind::Io, "JSON writer failed", Option::Some(error)),
+            ),
+        };
+        if count < 0 || count > remaining {
+            return Result::Err(
+                stream_fail(
+                    sink.session,
+                    ErrorKind::Io,
+                    "JSON writer returned an invalid byte count",
+                    Option::Some(
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "write JSON",
+                            Option::None,
+                            Option::None,
+                            "invalid byte count returned by writer",
+                        ),
+                    ),
+                ),
+            )
+        }
+        let written = sink.session.written.get();
+        if count > 9223372036854775807 - written {
+            return Result::Err(
+                stream_fail(
+                    sink.session,
+                    ErrorKind::Limit(LimitKind::OutputBytes),
+                    "JSON confirmed output byte count overflow",
+                    Option::None,
+                ),
+            )
+        }
+        sink.session.written.set(written + count);
+        sink.session.offset.set(written + count);
+        offset += count;
+        stream_check(lease)?;
+        if count == 0 {
+            return Result::Err(
+                stream_fail(
+                    sink.session,
+                    ErrorKind::Io,
+                    "JSON writer made no progress",
+                    Option::Some(
+                        io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "write JSON",
+                            Option::None,
+                            Option::None,
+                            "writer made no progress",
+                        ),
+                    ),
+                ),
+            )
+        }
+    }
+    Result::Ok(())
+}
+
+fn sink_flush_chunk[W: io::Write](sink: StreamSink[W], lease: StreamLease, buffer: Vec[byte]) -> Result[
+    (),
+    Error,
+] {
+    sink_write(sink, lease, buffer.as_slice())?;
+    buffer.clear();
+    Result::Ok(())
+}
+
+fn sink_chunk_byte[W: io::Write](
+    sink: StreamSink[W],
+    lease: StreamLease,
+    buffer: Vec[byte],
+    value: byte,
+) -> Result[(), Error] {
+    if buffer.len() == 4096 {
+        sink_flush_chunk(sink, lease, buffer)?;
+    }
+    buffer.push(value);
+    Result::Ok(())
+}
+
+fn sink_emit_text[W: io::Write](sink: StreamSink[W], lease: StreamLease, value: string) -> Result[
+    (),
+    Error,
+] {
+    stream_check(lease)?;
+    let buffer: Vec[byte] = Vec::with_capacity(4096);
+    for index in 0..value.byte_len() {
+        sink_chunk_byte(sink, lease, buffer, value.byte_get(index))?;
+    }
+    sink_flush_chunk(sink, lease, buffer)
+}
+
+fn emit_json_string[W: io::Write](sink: StreamSink[W], lease: StreamLease, value: string) -> Result[
+    (),
+    Error,
+] {
+    stream_check(lease)?;
+    if value.byte_len() > sink.limits.max_string_bytes {
+        return Result::Err(
+            stream_fail(
+                sink.session,
+                ErrorKind::Limit(LimitKind::StringBytes),
+                "JSON string byte limit exceeded",
+                Option::None,
+            ),
+        )
+    }
+    let buffer: Vec[byte] = Vec::with_capacity(4096);
+    sink_chunk_byte(sink, lease, buffer, b'"')?;
+    for index in 0..value.byte_len() {
+        let value = value.byte_get(index);
+        if value == b'"' || value == b'\\' {
+            sink_chunk_byte(sink, lease, buffer, b'\\')?;
+            sink_chunk_byte(sink, lease, buffer, value)?;
+        } else if value == b'\b' || value == b'\f' || value == b'\n' || value == b'\r'
+            || value == b'\t' {
+            let escape = if value == b'\b' {
+                b'b'
+            } else if value == b'\f' {
+                b'f'
+            } else if value == b'\n' {
+                b'n'
+            } else if value == b'\r' {
+                b'r'
+            } else {
+                b't'
+            };
+            sink_chunk_byte(sink, lease, buffer, b'\\')?;
+            sink_chunk_byte(sink, lease, buffer, escape)?;
+        } else if value < 32 {
+            sink_chunk_byte(sink, lease, buffer, b'\\')?;
+            sink_chunk_byte(sink, lease, buffer, b'u')?;
+            sink_chunk_byte(sink, lease, buffer, b'0')?;
+            sink_chunk_byte(sink, lease, buffer, b'0')?;
+            sink_chunk_byte(
+                sink,
+                lease,
+                buffer,
+                "0123456789abcdef".byte_get((value / 16).to_isize()),
+            )?;
+            sink_chunk_byte(
+                sink,
+                lease,
+                buffer,
+                "0123456789abcdef".byte_get((value % 16).to_isize()),
+            )?;
+        } else {
+            sink_chunk_byte(sink, lease, buffer, value)?;
+        }
+    }
+    sink_chunk_byte(sink, lease, buffer, b'"')?;
+    sink_flush_chunk(sink, lease, buffer)
+}
+
+fn emit_number[W: io::Write](sink: StreamSink[W], lease: StreamLease, value: string) -> Result[
+    (),
+    Error,
+] {
+    stream_check(lease)?;
+    if value.byte_len() > sink.limits.max_number_bytes {
+        return Result::Err(
+            stream_fail(
+                sink.session,
+                ErrorKind::Limit(LimitKind::NumberBytes),
+                "JSON number byte limit exceeded",
+                Option::None,
+            ),
+        )
+    }
+    if !stream_valid_number(value) {
+        return Result::Err(
+            stream_fail(sink.session, ErrorKind::Schema, "invalid JSON number text", Option::None),
+        )
+    }
+    sink_emit_text(sink, lease, value)
+}

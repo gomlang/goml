@@ -1,0 +1,144 @@
+package json;
+
+use module::io;
+use module::serde;
+
+fn decode_skip[R: io::Read](value: StreamDeserializer[R]) -> Result[(), Error] {
+    let mut depth = 0;
+    loop {
+        stream_event(value.lease, value.lease.max_events)?;
+        let Some(record) = decode_step(value, false)? else {
+            return Result::Err(decode_schema(value, "expected JSON value to skip"))
+        };
+        match record.record.token {
+            StartArray | StartObject => {
+                depth += 1;
+            },
+            EndArray | EndObject => {
+                if depth == 0 {
+                    return Result::Err(decode_schema(value, "cannot skip a container end"))
+                }
+                depth -= 1;
+                if depth == 0 {
+                    return Result::Ok(())
+                }
+            },
+            Key(_) => {
+                if depth == 0 {
+                    return Result::Err(decode_schema(value, "cannot skip an object key"))
+                }
+            },
+            _ => if depth == 0 {
+                return Result::Ok(())
+            },
+        }
+    }
+}
+
+fn decode_variant[R: io::Read](value: StreamDeserializer[R], variants: isize) -> Result[
+    string,
+    Error,
+] {
+    if variants < 0 {
+        return Result::Err(decode_schema(value, "negative JSON variant count"))
+    }
+    decode_frame_limit(value)?;
+    decode_claim(value)?;
+    let (name, tagged) = match decode_take(value)?.token {
+        String(name) => (name, false),
+        StartObject => {
+            let Token::Key(name) = decode_take(value)?.token else {
+                return Result::Err(decode_schema(value, "expected JSON variant tag"))
+            };
+            let path = value.lease.session.path;
+            if !path.is_empty() {
+                path[path.len() - 1] = PathSegment::Variant(name);
+            }
+            let record = value.context.get();
+            value.context.set(
+                TokenRecord {
+                    token: record.token,
+                    start_offset: record.start_offset,
+                    path: stream_path_snapshot(path),
+                },
+            );
+            (name, true)
+        },
+        _ => return Result::Err(decode_schema(value, "expected JSON enum string or object")),
+    };
+    value.frames.push(decode_new_frame(StreamDeserializeKind::Variant, 0, tagged));
+    Result::Ok(name)
+}
+
+fn decode_variant_fields[R: io::Read](value: StreamDeserializer[R], kind: isize, fields: isize) -> Result[
+    (),
+    Error,
+] {
+    let frame = decode_frame(value, StreamDeserializeKind::Variant)?;
+    if frame.variant_kind.get() != -1 || kind < 0 || kind > 2 || fields < 0 {
+        return Result::Err(decode_schema(value, "invalid JSON variant field declaration"))
+    }
+    if frame.tagged {
+        if kind == 1 {
+            decode_expect(value, Token::StartArray)?;
+        } else if kind == 2 {
+            decode_expect(value, Token::StartObject)?;
+        } else {
+            return Result::Err(decode_schema(value, "expected JSON unit variant string"))
+        }
+    } else {
+        if kind != 0 || fields != 0 {
+            return Result::Err(decode_schema(value, "expected JSON tagged variant object"))
+        }
+        frame.done.set(true);
+    }
+    frame.variant_kind.set(kind);
+    frame.length.set(fields);
+    Result::Ok(())
+}
+
+fn decode_variant_next[R: io::Read](value: StreamDeserializer[R]) -> Result[
+    Option[serde::FieldKey],
+    Error,
+] {
+    let frame = decode_frame(value, StreamDeserializeKind::Variant)?;
+    match frame.variant_kind.get() {
+        0 => Result::Ok(Option::None),
+        1 => {
+            if !decode_next_array(value, frame)? {
+                return Result::Ok(Option::None)
+            }
+            if frame.index.get() >= frame.length.get() {
+                return Result::Err(decode_schema(value, "too many JSON tuple variant fields"))
+            }
+            Result::Ok(Option::Some(serde::FieldKey::Position(frame.index.get())))
+        },
+        2 => decode_next_field(value, frame).map(
+            |name| name.map(|name| serde::FieldKey::Name(name)),
+        ),
+        _ => Result::Err(decode_schema(value, "JSON variant fields have not begun")),
+    }
+}
+
+fn decode_variant_end[R: io::Read](value: StreamDeserializer[R]) -> Result[(), Error] {
+    let frame = decode_frame(value, StreamDeserializeKind::Variant)?;
+    decode_idle(value, frame)?;
+    let kind = frame.variant_kind.get();
+    if kind < 0 || !frame.done.get() || (kind == 1 && frame.index.get() != frame.length.get()) {
+        return Result::Err(decode_schema(value, "incomplete JSON variant"))
+    }
+    if frame.tagged {
+        decode_expect(
+            value,
+            if kind == 1 {
+                Token::EndArray
+            } else {
+                Token::EndObject
+            },
+        )?;
+        decode_expect(value, Token::EndObject)?;
+    }
+    let _ = value.frames.pop();
+    decode_completed(value);
+    Result::Ok(())
+}
