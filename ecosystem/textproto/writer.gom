@@ -1,0 +1,256 @@
+package textproto;
+
+use std::bytes;
+use std::io;
+use io::Write;
+
+pub struct Writer[W] {
+    sink: W,
+    limits: Limits,
+    phase: Ref[isize],
+    broken: Ref[bool],
+    wire: Ref[isize],
+    dot_bytes: Ref[isize],
+    dot_line: Ref[isize],
+    dot_start: Ref[bool],
+    dot_cr: Ref[bool],
+}
+
+impl[W: Write] Writer[W] {
+    pub fn new(sink: W, limits: Limits) -> Result[Writer[W], Error] {
+        limits.validate()?;
+        Result::Ok(
+            Writer {
+                sink,
+                limits,
+                phase: Ref::new(0),
+                broken: Ref::new(false),
+                wire: Ref::new(0),
+                dot_bytes: Ref::new(0),
+                dot_line: Ref::new(0),
+                dot_start: Ref::new(true),
+                dot_cr: Ref::new(false),
+            },
+        )
+    }
+
+    pub fn wire_bytes(self: Writer[W]) -> isize {
+        self.wire.get()
+    }
+
+    fn emit(self: Writer[W], data: bytes::Bytes) -> Result[(), Error] {
+        if data.len() > 9223372036854775807 - self.wire.get() {
+            return Result::Err(
+                failure(ErrorKind::Limit, self.wire.get(), "textproto wire overflow"),
+            )
+        }
+        match self.sink.write_all(data.as_slice()) {
+            Ok(()) => {
+                self.wire.set(self.wire.get() + data.len());
+                Result::Ok(())
+            },
+            Err(error) => {
+                self.broken.set(true);
+                Result::Err(failure(ErrorKind::Io, self.wire.get(), error.to_string()))
+            },
+        }
+    }
+
+    pub fn write_line(self: Writer[W], line: bytes::Bytes) -> Result[(), Error] {
+        if self.broken.get() {
+            return Result::Err(
+                failure(ErrorKind::Closed, self.wire.get(), "textproto writer failed"),
+            )
+        }
+        if self.phase.get() == 1 {
+            return Result::Err(failure(ErrorKind::State, self.wire.get(), "dot block is active"))
+        }
+        if line.len() > self.limits.max_line_bytes {
+            return Result::Err(failure(ErrorKind::Limit, self.wire.get(), "line exceeds limit"))
+        }
+        for byte in line.as_slice() {
+            if byte == 0 || byte == b'\r' || byte == b'\n' {
+                return Result::Err(
+                    failure(ErrorKind::Invalid, self.wire.get(), "invalid line byte"),
+                )
+            }
+        }
+        let encoded = line.copy();
+        encoded.push(b'\r');
+        encoded.push(b'\n');
+        self.emit(encoded)
+    }
+
+    pub fn write_headers(self: Writer[W], headers: Headers) -> Result[(), Error] {
+        if self.broken.get() {
+            return Result::Err(
+                failure(ErrorKind::Closed, self.wire.get(), "textproto writer failed"),
+            )
+        }
+        if self.phase.get() == 1 {
+            return Result::Err(failure(ErrorKind::State, self.wire.get(), "dot block is active"))
+        }
+        if headers.len() > self.limits.max_headers {
+            return Result::Err(
+                failure(ErrorKind::Limit, self.wire.get(), "header count exceeds limit"),
+            )
+        }
+        let encoded = bytes::Bytes::new();
+        for field in headers.fields() {
+            let name = canonical_key(field.name)?;
+            validate_value(field.value)?;
+            if field.value.len() > self.limits.max_value_bytes
+                || name.byte_len() + 2 + field.value.len() > self.limits.max_line_bytes {
+                return Result::Err(
+                    failure(ErrorKind::Limit, self.wire.get(), "header line exceeds limit"),
+                )
+            }
+            let size = name.byte_len() + 2 + field.value.len() + 2;
+            if size > self.limits.max_header_bytes - encoded.len() {
+                return Result::Err(
+                    failure(ErrorKind::Limit, self.wire.get(), "header block exceeds limit"),
+                )
+            }
+            encoded.extend_from_slice(name.to_bytes().as_slice());
+            encoded.push(b':');
+            encoded.push(b' ');
+            encoded.extend_from_slice(field.value.as_slice());
+            encoded.push(b'\r');
+            encoded.push(b'\n');
+        }
+        if 2 > self.limits.max_header_bytes - encoded.len() {
+            return Result::Err(
+                failure(ErrorKind::Limit, self.wire.get(), "header block exceeds limit"),
+            )
+        }
+        encoded.push(b'\r');
+        encoded.push(b'\n');
+        self.emit(encoded)
+    }
+
+    pub fn begin_dot(self: Writer[W]) -> Result[(), Error] {
+        if self.broken.get() {
+            return Result::Err(
+                failure(ErrorKind::Closed, self.wire.get(), "textproto writer failed"),
+            )
+        }
+        if self.phase.get() == 1 {
+            return Result::Err(
+                failure(ErrorKind::State, self.wire.get(), "dot block already active"),
+            )
+        }
+        self.phase.set(1);
+        self.dot_bytes.set(0);
+        self.dot_line.set(0);
+        self.dot_start.set(true);
+        self.dot_cr.set(false);
+        Result::Ok(())
+    }
+
+    pub fn write_dot_chunk(self: Writer[W], input: Slice[byte]) -> Result[isize, Error] {
+        if self.broken.get() {
+            return Result::Err(
+                failure(ErrorKind::Closed, self.wire.get(), "textproto writer failed"),
+            )
+        }
+        if self.phase.get() != 1 {
+            return Result::Err(
+                failure(ErrorKind::State, self.wire.get(), "dot block is not active"),
+            )
+        }
+        if input.len() > self.limits.max_dot_bytes - self.dot_bytes.get() {
+            return Result::Err(
+                failure(ErrorKind::Limit, self.wire.get(), "dot block exceeds limit"),
+            )
+        }
+        let encoded = bytes::Bytes::new();
+        let mut line = self.dot_line.get();
+        let mut start = self.dot_start.get();
+        let mut cr = self.dot_cr.get();
+        for byte in input {
+            if cr {
+                if byte != b'\n' {
+                    return Result::Err(
+                        failure(ErrorKind::Invalid, self.wire.get(), "bare CR in dot block"),
+                    )
+                }
+                encoded.push(b'\r');
+                encoded.push(b'\n');
+                cr = false;
+                start = true;
+                line = 0;
+                continue
+            }
+            if byte == b'\r' {
+                cr = true;
+                continue
+            }
+            if byte == b'\n' {
+                return Result::Err(
+                    failure(ErrorKind::Invalid, self.wire.get(), "bare LF in dot block"),
+                )
+            }
+            if line >= self.limits.max_line_bytes {
+                return Result::Err(
+                    failure(ErrorKind::Limit, self.wire.get(), "dot line exceeds limit"),
+                )
+            }
+            if start && byte == b'.' {
+                encoded.push(b'.');
+            }
+            encoded.push(byte);
+            line += 1;
+            start = false;
+        }
+        self.emit(encoded)?;
+        self.dot_line.set(line);
+        self.dot_start.set(start);
+        self.dot_cr.set(cr);
+        self.dot_bytes.set(self.dot_bytes.get() + input.len());
+        Result::Ok(input.len())
+    }
+
+    pub fn finish_dot(self: Writer[W]) -> Result[(), Error] {
+        if self.broken.get() {
+            return Result::Err(
+                failure(ErrorKind::Closed, self.wire.get(), "textproto writer failed"),
+            )
+        }
+        if self.phase.get() == 2 {
+            return Result::Ok(())
+        }
+        if self.phase.get() != 1 {
+            return Result::Err(
+                failure(ErrorKind::State, self.wire.get(), "dot block is not active"),
+            )
+        }
+        if self.dot_cr.get() {
+            return Result::Err(
+                failure(ErrorKind::Invalid, self.wire.get(), "unterminated CR in dot block"),
+            )
+        }
+        let suffix = if self.dot_start.get() {
+            b".\r\n"
+        } else {
+            b"\r\n.\r\n"
+        };
+        let logical = if self.dot_start.get() {
+            0
+        } else {
+            2
+        };
+        if logical > self.limits.max_dot_bytes - self.dot_bytes.get() {
+            return Result::Err(
+                failure(ErrorKind::Limit, self.wire.get(), "dot block exceeds limit"),
+            )
+        }
+        self.emit(bytes::Bytes::from_vec(suffix))?;
+        self.phase.set(2);
+        self.sink.flush().map_err(
+            |error| {
+                self.broken.set(true);
+                failure(ErrorKind::Io, self.wire.get(), error.to_string())
+            },
+        )
+    }
+}

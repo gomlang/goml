@@ -1,0 +1,261 @@
+package textproto;
+
+use std::bytes;
+use std::io;
+use io::{Read, BufRead};
+
+pub struct Reader[R] {
+    source: io::BufReader[R],
+    limits: Limits,
+    offset: Ref[isize],
+    broken: Ref[bool],
+    dot_active: Ref[bool],
+    dot_done: Ref[bool],
+    dot_pending: bytes::Bytes,
+    dot_position: Ref[isize],
+    dot_total: Ref[isize],
+}
+
+impl[R: Read] Reader[R] {
+    pub fn new(source: R, limits: Limits) -> Result[Reader[R], Error] {
+        limits.validate()?;
+        Result::Ok(
+            Reader {
+                source: io::BufReader::new(source),
+                limits,
+                offset: Ref::new(0),
+                broken: Ref::new(false),
+                dot_active: Ref::new(false),
+                dot_done: Ref::new(false),
+                dot_pending: bytes::Bytes::new(),
+                dot_position: Ref::new(0),
+                dot_total: Ref::new(0),
+            },
+        )
+    }
+
+    pub fn offset(self: Reader[R]) -> isize {
+        self.offset.get()
+    }
+
+    fn line_inner(self: Reader[R]) -> Result[Option[bytes::Bytes], Error] {
+        let line = self.source.read_until(b'\n', self.limits.max_line_bytes + 2).map_err(
+            |error| failure(
+                if error.kind() == io::ErrorKind::InvalidData {
+                    ErrorKind::Limit
+                } else {
+                    ErrorKind::Io
+                },
+                self.offset.get(),
+                error.to_string(),
+            ),
+        )?;
+        if line.len() == 0 {
+            return Result::Ok(Option::None)
+        }
+        if line.get(line.len() - 1) != b'\n' {
+            return Result::Err(failure(ErrorKind::Truncated, self.offset.get(), "line lacks CRLF"))
+        }
+        if line.len() < 2 || line.get(line.len() - 2) != b'\r' {
+            return Result::Err(failure(ErrorKind::Invalid, self.offset.get(), "bare LF in line"))
+        }
+        for index in 0..line.len() - 2 {
+            if line.get(index) == b'\r' {
+                return Result::Err(
+                    failure(ErrorKind::Invalid, self.offset.get(), "bare CR in line"),
+                )
+            }
+        }
+        self.offset.set(self.offset.get() + line.len());
+        Result::Ok(Option::Some(bytes::Bytes::from_slice_copy(line.slice(0, line.len() - 2))))
+    }
+
+    pub fn read_line(self: Reader[R]) -> Result[Option[bytes::Bytes], Error] {
+        if self.broken.get() {
+            return Result::Err(
+                failure(ErrorKind::Closed, self.offset.get(), "textproto reader failed"),
+            )
+        }
+        if self.dot_active.get() {
+            return Result::Err(failure(ErrorKind::State, self.offset.get(), "dot block is active"))
+        }
+        match self.line_inner() {
+            Ok(value) => Result::Ok(value),
+            Err(error) => {
+                self.broken.set(true);
+                Result::Err(error)
+            },
+        }
+    }
+
+    fn headers_inner(self: Reader[R], allow_folded: bool) -> Result[Headers, Error] {
+        let result = Headers::new();
+        let mut total = 0;
+        loop {
+            let Some(line) = self.line_inner()? else {
+                return Result::Err(
+                    failure(ErrorKind::Truncated, self.offset.get(), "missing header terminator"),
+                )
+            };
+            if line.len() + 2 > self.limits.max_header_bytes - total {
+                return Result::Err(
+                    failure(ErrorKind::Limit, self.offset.get(), "header block exceeds limit"),
+                )
+            }
+            total += line.len() + 2;
+            if line.len() == 0 {
+                return Result::Ok(result)
+            }
+            if line.get(0) == b' ' || line.get(0) == b'\t' {
+                if !allow_folded || result.fields_value.len() == 0 {
+                    return Result::Err(
+                        failure(
+                            ErrorKind::Invalid,
+                            self.offset.get(),
+                            "unexpected header continuation",
+                        ),
+                    )
+                }
+                let continuation = trim_horizontal(line);
+                validate_value(continuation)?;
+                let last = result.fields_value.len() - 1;
+                let previous = result.fields_value[last];
+                let combined = previous.value.copy();
+                if combined.len() + 1 + continuation.len() > self.limits.max_value_bytes {
+                    return Result::Err(
+                        failure(ErrorKind::Limit, self.offset.get(), "header value exceeds limit"),
+                    )
+                }
+                combined.push(b' ');
+                combined.extend_from_slice(continuation.as_slice());
+                result.fields_value[last] = Field { value: combined, ..previous };
+                continue
+            }
+            if result.fields_value.len() >= self.limits.max_headers {
+                return Result::Err(
+                    failure(ErrorKind::Limit, self.offset.get(), "header count exceeds limit"),
+                )
+            }
+            let field = parse_header_line(line)?;
+            if field.value.len() > self.limits.max_value_bytes {
+                return Result::Err(
+                    failure(ErrorKind::Limit, self.offset.get(), "header value exceeds limit"),
+                )
+            }
+            result.fields_value.push(field);
+        }
+    }
+
+    pub fn read_headers(self: Reader[R], allow_folded: bool) -> Result[Headers, Error] {
+        if self.broken.get() {
+            return Result::Err(
+                failure(ErrorKind::Closed, self.offset.get(), "textproto reader failed"),
+            )
+        }
+        if self.dot_active.get() {
+            return Result::Err(failure(ErrorKind::State, self.offset.get(), "dot block is active"))
+        }
+        match self.headers_inner(allow_folded) {
+            Ok(value) => Result::Ok(value),
+            Err(error) => {
+                self.broken.set(true);
+                Result::Err(error)
+            },
+        }
+    }
+
+    fn dot_inner(self: Reader[R], output: MutSlice[byte]) -> Result[isize, Error] {
+        if output.len() == 0 || self.dot_done.get() {
+            return Result::Ok(0)
+        }
+        self.dot_active.set(true);
+        if self.dot_position.get() == self.dot_pending.len() {
+            let Some(line) = self.line_inner()? else {
+                return Result::Err(
+                    failure(ErrorKind::Truncated, self.offset.get(), "missing dot terminator"),
+                )
+            };
+            if line.len() == 1 && line.get(0) == b'.' {
+                self.dot_active.set(false);
+                self.dot_done.set(true);
+                return Result::Ok(0)
+            }
+            let start = if line.len() > 0 && line.get(0) == b'.' {
+                if line.len() < 2 || line.get(1) != b'.' {
+                    return Result::Err(
+                        failure(ErrorKind::Invalid, self.offset.get(), "invalid dot escape"),
+                    )
+                }
+                1
+            } else {
+                0
+            };
+            let size = line.len() - start + 2;
+            if size > self.limits.max_dot_bytes - self.dot_total.get() {
+                return Result::Err(
+                    failure(ErrorKind::Limit, self.offset.get(), "dot block exceeds limit"),
+                )
+            }
+            self.dot_total.set(self.dot_total.get() + size);
+            self.dot_pending.clear();
+            self.dot_pending.extend_from_slice(line.slice(start, line.len()));
+            self.dot_pending.push(b'\r');
+            self.dot_pending.push(b'\n');
+            self.dot_position.set(0);
+        }
+        let available = self.dot_pending.len() - self.dot_position.get();
+        let count = if output.len() < available {
+            output.len()
+        } else {
+            available
+        };
+        for index in 0..count {
+            output[index] = self.dot_pending.get(self.dot_position.get() + index);
+        }
+        self.dot_position.set(self.dot_position.get() + count);
+        Result::Ok(count)
+    }
+
+    pub fn read_dot_chunk(self: Reader[R], output: MutSlice[byte]) -> Result[isize, Error] {
+        if self.broken.get() {
+            return Result::Err(
+                failure(ErrorKind::Closed, self.offset.get(), "textproto reader failed"),
+            )
+        }
+        match self.dot_inner(output) {
+            Ok(value) => Result::Ok(value),
+            Err(error) => {
+                self.broken.set(true);
+                Result::Err(error)
+            },
+        }
+    }
+
+    pub fn read_dot_bytes(self: Reader[R]) -> Result[bytes::Bytes, Error] {
+        let result = bytes::Bytes::new();
+        let buffer = bytes::Bytes::with_capacity(8192);
+        for _ in 0..8192 {
+            buffer.push(0);
+        }
+        loop {
+            let count = self.read_dot_chunk(buffer.as_mut_slice())?;
+            if count == 0 {
+                return Result::Ok(result)
+            }
+            result.extend_from_slice(buffer.slice(0, count));
+        }
+    }
+
+    pub fn reset_dot(self: Reader[R]) -> Result[(), Error] {
+        if self.broken.get() || self.dot_active.get() || !self.dot_done.get() {
+            return Result::Err(
+                failure(ErrorKind::State, self.offset.get(), "dot block is not complete"),
+            )
+        }
+        self.dot_done.set(false);
+        self.dot_pending.clear();
+        self.dot_position.set(0);
+        self.dot_total.set(0);
+        Result::Ok(())
+    }
+}
