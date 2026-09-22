@@ -1,5 +1,7 @@
 package request;
 
+use ecosystem::request::cookies;
+use ecosystem::request::trace;
 use std::net;
 use std::net::tls;
 use std::context;
@@ -8,6 +10,7 @@ use std::io;
 use std::bytes::{Bytes, FrozenBytes};
 use std::encoding::base64;
 use ecosystem::archive;
+use ecosystem::textproto;
 
 fn hex_digit(value: byte) -> isize {
     if value >= b'0' && value <= b'9' {
@@ -91,18 +94,9 @@ struct IdleConnection {
     idle_since: time::Instant,
 }
 
-struct Cookie {
-    host: string,
-    path: string,
-    name: string,
-    value: string,
-    secure: bool,
-    expires: Option[i64],
-}
-
 struct ClientState {
     idle: Vec[IdleConnection],
-    cookies: Vec[Cookie],
+    cookies: Option[cookies::Jar],
 }
 
 struct Received {
@@ -204,11 +198,25 @@ fn validate_pem(pem: string, label: string, optional: bool) -> Result[(), Error]
     Result::Ok(())
 }
 
-fn connect_stream(client: Client, url: Url, context: context::Context, h2: bool) -> Result[
-    Stream,
-    Error,
-] {
-    context::with_timeout(
+fn connect_stream(
+    client: Client,
+    url: Url,
+    context: context::Context,
+    h2: bool,
+    trace_id: i64,
+    attempt: isize,
+) -> Result[Stream, Error] {
+    trace_event(
+        client,
+        trace_id,
+        attempt,
+        trace::EventKind::ConnectStart,
+        url.origin,
+        Option::None,
+        false,
+        "",
+    );
+    let result = context::with_timeout(
         context,
         client.options.connect_value,
         |connecting, _| {
@@ -240,7 +248,34 @@ fn connect_stream(client: Client, url: Url, context: context::Context, h2: bool)
                 )
             }
         },
-    )
+    );
+    match result {
+        Ok(stream) => trace_event(
+            client,
+            trace_id,
+            attempt,
+            trace::EventKind::ConnectDone,
+            url.origin,
+            Option::None,
+            false,
+            if stream.http2() {
+                "h2"
+            } else {
+                "http/1.1"
+            },
+        ),
+        Err(error) => trace_event(
+            client,
+            trace_id,
+            attempt,
+            trace::EventKind::ConnectDone,
+            error.message,
+            Option::None,
+            false,
+            "",
+        ),
+    }
+    result
 }
 
 fn selected_proxy(client: Client, url: Url) -> Result[Option[Url], Error] {
@@ -254,7 +289,9 @@ fn selected_proxy(client: Client, url: Url) -> Result[Option[Url], Error] {
 }
 
 fn take_connection(client: Client, key: string) -> Option[Stream] {
-    let state = client.state.recv().unwrap_or(ClientState { idle: Vec::new(), cookies: Vec::new() });
+    let state = client.state.recv().unwrap_or(
+        ClientState { idle: Vec::new(), cookies: Option::None },
+    );
     let retained = Vec::new();
     let expired = Vec::new();
     let mut result = Option::None;
@@ -275,7 +312,9 @@ fn take_connection(client: Client, key: string) -> Option[Stream] {
 }
 
 fn return_connection(client: Client, key: string, stream: Stream) -> () {
-    let state = client.state.recv().unwrap_or(ClientState { idle: Vec::new(), cookies: Vec::new() });
+    let state = client.state.recv().unwrap_or(
+        ClientState { idle: Vec::new(), cookies: Option::None },
+    );
     let discard = client.is_closed() || state.idle.len() >= client.options.max_idle;
     if !discard {
         state.idle.push(IdleConnection { origin: key, stream, idle_since: time::Instant::now() });
@@ -290,6 +329,8 @@ fn return_connection(client: Client, key: string, stream: Stream) -> () {
 fn exchange(
     client: Client,
     context: context::Context,
+    trace_id: i64,
+    attempt: isize,
     method: string,
     url: Url,
     headers: Headers,
@@ -330,6 +371,8 @@ fn exchange(
         let lease = transport_lease(
             client,
             context,
+            trace_id,
+            attempt,
             key,
             endpoint,
             proxy,
@@ -344,19 +387,34 @@ fn exchange(
                 let received = http2_await(request, context);
                 http2_pool_trim(client);
                 match received {
-                    Ok(response) => return finish_response(
-                        client,
-                        context,
-                        url,
-                        response,
-                        decompress,
-                        limit,
-                    ),
+                    Ok(response) => {
+                        trace_event(
+                            client,
+                            trace_id,
+                            attempt,
+                            trace::EventKind::ResponseReceived,
+                            "",
+                            Option::Some(response.status),
+                            false,
+                            response.version,
+                        );
+                        return finish_response(client, context, url, response, decompress, limit)
+                    },
                     Err(Http2Failure::Failed(error)) => return Result::Err(error),
                     Err(Http2Failure::Retry(error)) => {
                         if retries >= 2 {
                             return Result::Err(error)
                         }
+                        trace_event(
+                            client,
+                            trace_id,
+                            attempt,
+                            trace::EventKind::Retry,
+                            error.message,
+                            Option::None,
+                            true,
+                            "h2",
+                        );
                         retries += 1;
                     },
                 }
@@ -369,7 +427,10 @@ fn exchange(
                     }
                 };
                 let started = Ref::new(false);
-                let attempt = http1_exchange(
+                let exchange_result = http1_exchange(
+                    client,
+                    trace_id,
+                    attempt,
                     stream,
                     context,
                     method,
@@ -381,7 +442,7 @@ fn exchange(
                     proxy.is_some() && !tunnel,
                     started,
                 );
-                let (response, reusable) = match attempt {
+                let (response, reusable) = match exchange_result {
                     Ok(value) => value,
                     Err(error) => {
                         if reused && !started.get() && error.kind == ErrorKind::Transport
@@ -389,6 +450,16 @@ fn exchange(
                             && (method == "GET" || method == "HEAD" || method == "OPTIONS")
                             && retries == 0 {
                             stream.close();
+                            trace_event(
+                                client,
+                                trace_id,
+                                attempt,
+                                trace::EventKind::Retry,
+                                error.message,
+                                Option::None,
+                                true,
+                                "http/1.1",
+                            );
                             retries += 1;
                             continue
                         }
@@ -399,6 +470,16 @@ fn exchange(
                     return_connection(client, key, stream);
                     keep = true;
                 }
+                trace_event(
+                    client,
+                    trace_id,
+                    attempt,
+                    trace::EventKind::ResponseReceived,
+                    "",
+                    Option::Some(response.status),
+                    reused,
+                    response.version,
+                );
                 return finish_response(client, context, url, response, decompress, limit)
             },
         }
@@ -460,8 +541,13 @@ fn read_headers(reader: Reader, budget: Vec[i64]) -> Result[Headers, Error] {
         if line == "" {
             return Result::Ok(headers)
         }
-        let (name, value) = line.split_once(":").ok_or(transport_error("invalid HTTP header"))?;
-        headers = headers.append(name, value.trim()).map_err(|error| transport_error(error.message))?;
+        let field = textproto::parse_header_line(Bytes::from_string(line)).map_err(
+            |error| transport_error(error.message),
+        )?;
+        let value = field.value_text().map_err(|error| transport_error(error.message))?;
+        headers = headers.append(field.name, value.trim()).map_err(
+            |error| transport_error(error.message),
+        )?;
     }
 }
 
@@ -481,6 +567,9 @@ fn decimal(value: string) -> Result[isize, Error] {
 }
 
 fn http1_exchange(
+    client: Client,
+    trace_id: i64,
+    attempt: isize,
     stream: Stream,
     context: context::Context,
     method: string,
@@ -510,6 +599,16 @@ fn http1_exchange(
     head += "\r\n";
     stream.write(head.to_bytes().as_slice(), context)?;
     stream.write(body.to_vec_copy().as_slice(), context)?;
+    trace_event(
+        client,
+        trace_id,
+        attempt,
+        trace::EventKind::RequestWritten,
+        body.len().to_string(),
+        Option::None,
+        false,
+        "http/1.1",
+    );
     let reader = Reader { started, ..Reader::new(stream, context) };
     let budget = Vec::from_array([max_headers]);
     let mut status = 0;

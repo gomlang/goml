@@ -1,5 +1,7 @@
 package request;
 
+use ecosystem::request::cookies;
+use ecosystem::request::trace;
 use std::context;
 use std::time::{Duration};
 use std::task;
@@ -17,6 +19,7 @@ pub struct ClientBuilder {
     headers: Headers,
     gzip_value: bool,
     cookies: bool,
+    trace_value: Option[trace::Trace],
     ca: string,
     certificate: string,
     key: string,
@@ -40,6 +43,7 @@ impl ClientBuilder {
             headers: Headers::new(),
             gzip_value: true,
             cookies: false,
+            trace_value: Option::None,
             ca: "",
             certificate: "",
             key: "",
@@ -108,6 +112,10 @@ impl ClientBuilder {
         ClientBuilder { cookies: enabled, ..self }
     }
 
+    pub fn trace(self: ClientBuilder, value: trace::Trace) -> ClientBuilder {
+        ClientBuilder { trace_value: Option::Some(value), ..self }
+    }
+
     pub fn add_root_certificate(self: ClientBuilder, pem: string) -> ClientBuilder {
         ClientBuilder { ca: self.ca + "\n" + pem, ..self }
     }
@@ -164,8 +172,16 @@ impl ClientBuilder {
         if self.proxy_value != "" {
             Url::parse(self.proxy_value)?;
         }
+        let jar = if self.cookies {
+            cookies::Jar::new()
+        } else {
+            Option::None
+        };
+        if self.cookies && jar.is_none() {
+            return Result::Err(Error::new(ErrorKind::Builder, "cookie policy unavailable"))
+        }
         let state = Channel::new(1);
-        state.send(ClientState { idle: Vec::new(), cookies: Vec::new() });
+        state.send(ClientState { idle: Vec::new(), cookies: jar });
         let close_gate = Channel::new(1);
         close_gate.send(());
         let http2 = Channel::new(1);
@@ -209,7 +225,7 @@ impl Client {
     pub fn close_idle_connections(self: Client) -> () {
         http2_pool_close(self, true);
         let state = self.state.recv().unwrap_or(
-            ClientState { idle: Vec::new(), cookies: Vec::new() },
+            ClientState { idle: Vec::new(), cookies: Option::None },
         );
         self.state.send(ClientState { idle: Vec::new(), ..state });
         for entry in state.idle {
@@ -279,7 +295,10 @@ impl Client {
         if request.body_value.len() > self.options.request_limit_value {
             return Result::Err(Error::new(ErrorKind::BodyLimit, "request body exceeds limit"))
         }
-        context::with_timeout(
+        let trace_id = self.options.trace_value.map(
+            |value| value.begin(request.method_value, request.url_value.text),
+        ).unwrap_or(0);
+        let result = context::with_timeout(
             context,
             request.timeout_value,
             |control, cancel| {
@@ -293,7 +312,7 @@ impl Client {
                                 recv(done) as _ => (),
                             },
                         );
-                        let result = execute_loop(self, request, control);
+                        let result = execute_loop(self, request, control, trace_id);
                         match result {
                             Err(error) => if self.is_closed() {
                                 Result::Err(Error::new(ErrorKind::Closed, "client is closed"))
@@ -316,7 +335,30 @@ impl Client {
                     },
                 )
             },
-        )
+        );
+        match result {
+            Ok(response) => trace_event(
+                self,
+                trace_id,
+                response.history_value.len(),
+                trace::EventKind::RequestDone,
+                "",
+                Option::Some(response.status_value.value),
+                false,
+                response.version_value,
+            ),
+            Err(error) => trace_event(
+                self,
+                trace_id,
+                0,
+                trace::EventKind::RequestFailed,
+                error.message,
+                Option::None,
+                false,
+                "",
+            ),
+        }
+        result
     }
 }
 
@@ -330,7 +372,24 @@ fn context_error(error: context::Error) -> Error {
     }
 }
 
-fn execute_loop(client: Client, request: Request, control: context::Context) -> Result[
+fn trace_event(
+    client: Client,
+    request_id: i64,
+    attempt: isize,
+    kind: trace::EventKind,
+    detail: string,
+    status: Option[isize],
+    reused: bool,
+    protocol: string,
+) -> () {
+    if request_id != 0 {
+        if let Some(value) = client.options.trace_value {
+            value.emit(request_id, attempt, kind, detail, status, reused, protocol);
+        }
+    }
+}
+
+fn execute_loop(client: Client, request: Request, control: context::Context, trace_id: i64) -> Result[
     Response,
     Error,
 ] {
@@ -346,6 +405,8 @@ fn execute_loop(client: Client, request: Request, control: context::Context) -> 
         let received = exchange(
             client,
             control,
+            trace_id,
+            history.len(),
             method,
             url,
             headers,
@@ -395,6 +456,16 @@ fn execute_loop(client: Client, request: Request, control: context::Context) -> 
                 "cookie2",
             ).remove("www-authenticate");
         }
+        trace_event(
+            client,
+            trace_id,
+            history.len(),
+            trace::EventKind::Redirect,
+            next.text,
+            Option::Some(status),
+            false,
+            received.version,
+        );
         if ((status == 301 || status == 302) && method == "POST")
             || (status == 303 && method != "HEAD") {
             method = "GET";

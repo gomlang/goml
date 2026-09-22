@@ -1,5 +1,6 @@
 package request;
 
+use ecosystem::request::cookies;
 use std::time;
 
 fn cookie_path(url: Url) -> string {
@@ -25,259 +26,53 @@ fn cookie_path(url: Url) -> string {
     }
 }
 
-fn live_cookies(cookies: Vec[Cookie], now: i64) -> Vec[Cookie] {
-    let result = Vec::new();
-    for cookie in cookies {
-        if cookie.expires.map(|value| value > now).unwrap_or(true) {
-            result.push(cookie);
-        }
-    }
-    result
-}
-
 fn cookie_headers(client: Client, url: Url, headers: Headers) -> Result[Headers, Error] {
-    let state = client.state.recv().unwrap_or(ClientState { idle: Vec::new(), cookies: Vec::new() });
-    let state = ClientState {
-        cookies: live_cookies(state.cookies, time::SystemTime::now().unix_seconds()),
-        ..state,
+    let state = client.state.recv().unwrap_or(
+        ClientState { idle: Vec::new(), cookies: Option::None },
+    );
+    let jar = match state.cookies {
+        Some(jar) => jar,
+        None => {
+            client.state.send(state);
+            return Result::Ok(headers)
+        },
     };
+    let (jar, stored) = jar.header(
+        url.host,
+        cookie_path(url),
+        url.secure,
+        time::SystemTime::now().unix_seconds(),
+    );
+    let state = ClientState { cookies: Option::Some(jar), ..state };
     defer client.state.send(state);
-    let path = cookie_path(url);
-    let candidates: Vec[Cookie] = Vec::new();
-    for cookie in state.cookies {
-        let matches_path = path == cookie.path
-            || path.starts_with(cookie.path)
-                && (cookie.path.ends_with("/")
-                    || path.byte_slice(cookie.path.byte_len(), path.byte_len()).starts_with("/"));
-        if cookie.host == url.host && matches_path && (!cookie.secure || url.secure) {
-            candidates.push(cookie);
-        }
+    if stored == "" {
+        return Result::Ok(headers)
     }
-    candidates.stable_sort_by(|left, right| right.path.byte_len() - left.path.byte_len());
-    let mut value = headers.get("cookie").unwrap_or("");
-    for cookie in candidates {
-        if value != "" {
-            value += "; ";
-        }
-        value += cookie.name + "=" + cookie.value;
-    }
-    if value == "" {
-        Result::Ok(headers)
-    } else {
-        headers.insert("cookie", value)
-    }
-}
-
-fn cookie_date(value: string) -> Option[i64] {
-    let fields = value.replace(",", " ").replace("-", " ").split(" ");
-    let parts: Vec[string] = Vec::new();
-    for field in fields {
-        if field != "" {
-            parts.push(field);
-        }
-    }
-    if parts.len() < 5 {
-        return Option::None
-    }
-    let offset = if decimal(parts[0]).is_ok() {
-        0
-    } else {
-        1
-    };
-    if parts.len() < offset + 4 {
-        return Option::None
-    }
-    let asctime = optional_decimal(parts[offset]).is_none();
-    let day = optional_decimal(
-        parts[offset
-            + if asctime {
-                1
-            } else {
-                0
-            }],
-    )?;
-    let month_name = ascii_lower(
-        parts[offset
-            + if asctime {
-                0
-            } else {
-                1
-            }],
-    );
-    let months = Vec::from_array(
-        ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"],
-    );
-    let mut month = 0;
-    for index in 0..months.len() {
-        if months[index] == month_name {
-            month = index + 1;
-        }
-    }
-    let mut year = optional_decimal(
-        parts[offset
-            + if asctime {
-                3
-            } else {
-                2
-            }],
-    )?;
-    if year < 70 {
-        year += 2000;
-    } else if year < 100 {
-        year += 1900;
-    }
-    let clock = parts[offset
-        + if asctime {
-            2
+    let existing = headers.get("cookie").unwrap_or("");
+    headers.insert(
+        "cookie",
+        if existing == "" {
+            stored
         } else {
-            3
-        }].split(":");
-    if clock.len() != 3 || month == 0 || year < 1601 || year > 9999 || day < 1 || day > 31 {
-        return Option::None
-    }
-    let hour = optional_decimal(clock[0])?;
-    let minute = optional_decimal(clock[1])?;
-    let second = optional_decimal(clock[2])?;
-    if hour > 23 || minute > 59 || second > 59 {
-        return Option::None
-    }
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let lengths = Vec::from_array(
-        [
-            31,
-            if leap {
-                29
-            } else {
-                28
-            },
-            31,
-            30,
-            31,
-            30,
-            31,
-            31,
-            30,
-            31,
-            30,
-            31,
-        ],
-    );
-    if day > lengths[month - 1] {
-        return Option::None
-    }
-    let prior = year - 1;
-    let mut days = (year - 1970) * 365 + prior / 4 - prior / 100 + prior / 400
-        - (1969 / 4 - 1969 / 100 + 1969 / 400);
-    for index in 0..month - 1 {
-        days += lengths[index];
-    }
-    days += day - 1;
-    Option::Some((days * 86400 + hour * 3600 + minute * 60 + second).to_i64())
-}
-
-fn parse_cookie(url: Url, text: string) -> Option[Cookie] {
-    let parts = text.split(";");
-    let (name, value) = parts[0].trim().split_once("=")?;
-    if !token(name) {
-        return Option::None
-    }
-    let value = if value.starts_with("\"") && value.ends_with("\"") && value.byte_len() >= 2 {
-        value.byte_slice(1, value.byte_len() - 1)
-    } else {
-        value
-    };
-    for byte in value.to_bytes() {
-        if byte < 32 || byte >= 127 || byte == b';' || byte == b'\\' || byte == b'"' {
-            return Option::None
-        }
-    }
-    let request_path = cookie_path(url);
-    let directory = request_path.rfind("/").unwrap_or(0);
-    let mut path = if directory == 0 {
-        "/"
-    } else {
-        request_path.byte_slice(0, directory)
-    };
-    let mut secure = false;
-    let mut expires = Option::None;
-    let mut max_age = Option::None;
-    for index in 1..parts.len() {
-        let part = parts[index].trim();
-        let (key, value) = part.split_once("=").unwrap_or((part, ""));
-        match ascii_lower(key.trim()) {
-            "domain" => return Option::None,
-            "path" => if value.starts_with("/") {
-                path = value;
-            },
-            "secure" => {
-                secure = true;
-            },
-            "expires" => {
-                expires = cookie_date(value);
-            },
-            "max-age" => if value.starts_with("-") {
-                max_age = Option::Some(0);
-            } else if let Ok(age) = decimal(value) {
-                let now = time::SystemTime::now().unix_seconds();
-                max_age = Option::Some(
-                    if age == 0 {
-                        0
-                    } else if age.to_i64() > 9223372036854775807 - now {
-                        9223372036854775807
-                    } else {
-                        now + age.to_i64()
-                    },
-                );
-            },
-            _ => (),
-        }
-    }
-    Option::Some(
-        Cookie {
-            host: url.host,
-            path,
-            name,
-            value,
-            secure,
-            expires: if max_age.is_some() {
-                max_age
-            } else {
-                expires
-            },
+            existing + "; " + stored
         },
     )
 }
 
-fn optional_decimal(value: string) -> Option[isize] {
-    match decimal(value) {
-        Ok(value) => Option::Some(value),
-        Err(_) => Option::None,
-    }
-}
-
 fn store_cookies(client: Client, url: Url, headers: Headers) -> () {
-    let mut state = client.state.recv().unwrap_or(
-        ClientState { idle: Vec::new(), cookies: Vec::new() },
+    let state = client.state.recv().unwrap_or(
+        ClientState { idle: Vec::new(), cookies: Option::None },
     );
-    state = ClientState {
-        cookies: live_cookies(state.cookies, time::SystemTime::now().unix_seconds()),
-        ..state,
+    let mut jar = match state.cookies {
+        Some(jar) => jar,
+        None => {
+            client.state.send(state);
+            return
+        },
     };
+    let now = time::SystemTime::now().unix_seconds();
     for text in headers.get_all("set-cookie") {
-        if let Some(cookie) = parse_cookie(url, text) {
-            let values: Vec[Cookie] = Vec::new();
-            for old in state.cookies {
-                if old.host != cookie.host || old.path != cookie.path || old.name != cookie.name {
-                    values.push(old);
-                }
-            }
-            if cookie.expires.map(|value| value > time::SystemTime::now().unix_seconds()).unwrap_or(
-                true,
-            ) {
-                values.push(cookie);
-            }
-            state = ClientState { cookies: values, ..state };
-        }
+        jar = jar.set(url.host, cookie_path(url), text, now);
     }
-    client.state.send(state);
+    client.state.send(ClientState { cookies: Option::Some(jar), ..state });
 }

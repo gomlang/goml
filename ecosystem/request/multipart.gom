@@ -3,6 +3,10 @@ package request;
 use std::bytes::{Bytes, FrozenBytes};
 use std::crypto::rand;
 use std::encoding::hex;
+use std::io;
+use ecosystem::mime;
+use ecosystem::mime::multipart as mime_multipart;
+use ecosystem::textproto;
 
 pub struct Part {
     bytes_value: FrozenBytes,
@@ -91,91 +95,64 @@ fn validate_mime(value: string) -> Result[(), Error] {
     if value == "" {
         return Result::Ok(())
     }
-    let (essence, parameters) = value.split_once(";").unwrap_or((value, ""));
-    let (kind, subtype) = essence.trim().split_once("/").ok_or(invalid)?;
-    if !token(kind) || !token(subtype) {
-        return Result::Err(invalid)
-    }
-    let parts: Vec[string] = Vec::new();
-    let mut quoted = false;
-    let mut escaped = false;
-    let mut start = 0;
-    for index in 0..parameters.byte_len() {
-        let byte = parameters.byte_get(index);
-        if escaped {
-            escaped = false;
-        } else if quoted && byte == b'\\' {
-            escaped = true;
-        } else if byte == b'"' {
-            quoted = !quoted;
-        } else if !quoted && byte == b';' {
-            parts.push(parameters.byte_slice(start, index).trim());
-            start = index + 1;
-        }
-    }
-    if quoted || escaped {
-        return Result::Err(invalid)
-    }
-    if parameters != "" {
-        parts.push(parameters.byte_slice(start, parameters.byte_len()).trim());
-    }
-    let seen: HashMap[string, string] = HashMap::new();
-    for part in parts {
-        let (name, parameter) = part.split_once("=").ok_or(invalid)?;
-        let name = ascii_lower(name.trim());
-        let parameter = parameter.trim();
-        if !token(name) || parameter == ""
-            || !(token(parameter)
-                || parameter.starts_with("\"") && parameter.ends_with("\"")
-                    && parameter.byte_len() >= 2) {
-            return Result::Err(invalid)
-        }
-        if let Some(previous) = seen.get(name) {
-            if previous != parameter {
-                return Result::Err(invalid)
-            }
-        }
-        seen.insert(name, parameter);
-    }
+    let _ = mime::parse_media_type(value, mime::Limits::standard()).map_err(|_| invalid)?;
     Result::Ok(())
+}
+
+fn multipart_error(error: mime_multipart::Error) -> Error {
+    Error::new(
+        if error.kind == mime_multipart::ErrorKind::Limit {
+            ErrorKind::BodyLimit
+        } else {
+            ErrorKind::Builder
+        },
+        error.message,
+    )
 }
 
 fn encode_multipart(value: Multipart, limit: isize) -> Result[(Bytes, string), Error] {
     let boundary = hex::encode(
         rand::bytes(30).map_err(|message| Error::new(ErrorKind::Builder, message))?,
     );
-    let result = Bytes::new();
+    let sink = io::Cursor::new(Bytes::new());
+    let line_limit = if limit > 9223372036854775805 {
+        9223372036854775805
+    } else {
+        limit
+    };
+    let limits = mime_multipart::Limits {
+        max_wire_bytes: limit,
+        max_header_bytes: limit,
+        max_line_bytes: line_limit,
+        max_value_bytes: limit,
+        max_part_bytes: limit,
+        max_total_bytes: limit,
+        max_parts: limit,
+        ..mime_multipart::Limits::standard(),
+    };
+    let writer = mime_multipart::Writer::new(sink, boundary, limits).map_err(multipart_error)?;
     for (name, part) in value.parts {
         if name == "" {
             return Result::Err(Error::new(ErrorKind::Builder, "empty multipart field name"))
         }
-        let mut header = "--" + boundary + "\r\nContent-Disposition: form-data; name=\""
-            + mime_quote(name)?
-            + "\"";
+        let mut disposition = "form-data; name=\"" + mime_quote(name)? + "\"";
         if let Some(filename) = part.filename {
-            header += "; filename=\"" + mime_quote(filename)? + "\"";
+            disposition += "; filename=\"" + mime_quote(filename)? + "\"";
         }
+        let headers = textproto::Headers::new();
+        headers.append("Content-Disposition", Bytes::from_string(disposition)).map_err(
+            |error| Error::new(ErrorKind::Builder, error.message),
+        )?;
         validate_mime(part.content_type)?;
         if part.content_type != "" {
-            header += "\r\nContent-Type: " + part.content_type;
+            headers.append("Content-Type", Bytes::from_string(part.content_type)).map_err(
+                |error| Error::new(ErrorKind::Builder, error.message),
+            )?;
         }
-        header += "\r\n\r\n";
-        if header.byte_len() > limit - result.len()
-            || part.bytes_value.len() > limit - result.len() - header.byte_len() - 2 {
-            return Result::Err(
-                Error::new(ErrorKind::BodyLimit, "multipart output exceeds request limit"),
-            )
-        }
-        result.extend_from_slice(header.to_bytes().as_slice());
-        result.extend_from_slice(part.bytes_value.to_vec_copy().as_slice());
-        result.extend_from_slice(b"\r\n".as_slice());
+        writer.begin_part(headers).map_err(multipart_error)?;
+        let payload = part.bytes_value.to_vec_copy();
+        let _ = writer.write_body_chunk(payload.as_slice()).map_err(multipart_error)?;
     }
-    let final_boundary = "--" + boundary + "--\r\n";
-    if final_boundary.byte_len() > limit - result.len() {
-        return Result::Err(
-            Error::new(ErrorKind::BodyLimit, "multipart output exceeds request limit"),
-        )
-    }
-    result.extend_from_slice(final_boundary.to_bytes().as_slice());
-    Result::Ok((result, "multipart/form-data; boundary=" + boundary))
+    writer.finish().map_err(multipart_error)?;
+    Result::Ok((sink.bytes(), "multipart/form-data; boundary=" + boundary))
 }

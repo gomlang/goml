@@ -120,6 +120,12 @@ transport operation; `error_for_status()` converts 4xx/5xx into an `Error` with
 transport, timeout, cancellation, body limit, redirect, closed and decoding
 failures. All protocol and socket errors are recoverable GoML values.
 
+`Client::builder().trace(record)` enables bounded per-client transport events
+from [`ecosystem::request::trace`](trace/README.md). A trace correlates request
+starts, connection attempts and reuse, writes or HTTP/2 queueing, responses,
+retries, redirects and final outcomes by request ID. It is opt-in and does not
+install a tracing backend.
+
 | Default | Value | Configuration |
 | --- | --- | --- |
 | Whole request timeout | 30 seconds | `timeout(Duration)` |
@@ -206,17 +212,19 @@ rejects plaintext requests. URL credentials are rejected; use authentication
 methods instead. Proxy selection is explicit: `proxy(url)`,
 `environment_proxy(true)`, or `no_proxy()`.
 
-The optional cookie store intentionally accepts only host-only Set-Cookie
-values, ignoring every cookie with a Domain attribute. GoML implements path
-matching, Secure, Max-Age, HTTP-date expiry and replacement. This avoids relying on
-an absent public-suffix database but does not implement browser-wide domain
-cookies. Cookie storage is memory-only.
+The optional cookie store uses the `ecosystem::request::cookies` jar. Host-only
+cookies stay on their exact host; Domain cookies reach matching subdomains only
+when the response host is within that domain and the domain is not a public
+suffix. The bundled public-suffix snapshot includes ICANN and private rules.
+The jar implements path matching, Secure, Max-Age, HTTP-date expiry, replacement
+and stable send order. Cookie storage is memory-only. It does not interpret
+SameSite because this HTTP client has no browser top-level-site context.
 
 ## Scope and verification
 
 This implementation does not claim Rust API or feature parity. Streaming
 uploads/responses, async/await APIs, HTTP/3, WebSockets, Brotli/Zstd, a persistent
-cookie jar, public-suffix-aware domain cookies, custom DNS resolution, custom
+cookie persistence, custom DNS resolution, custom
 TLS backends, automatic application retries and middleware are not implemented.
 Text decoding is strict UTF-8 and does not inspect charset labels. Header values
 are UTF-8 strings rather than arbitrary octets. HTTP/2 over TLS uses ALPN;
