@@ -1,0 +1,394 @@
+package multipart;
+
+use ecosystem::textproto;
+use std::bytes;
+use std::io;
+use io::Read;
+
+fn prefix_bytes(candidate: bytes::Bytes, pattern: bytes::Bytes) -> bool {
+    if candidate.len() > pattern.len() {
+        return false
+    }
+    for index in 0..candidate.len() {
+        if candidate.get(index) != pattern.get(index) {
+            return false
+        }
+    }
+    true
+}
+
+fn equal_bytes(candidate: bytes::Bytes, pattern: bytes::Bytes) -> bool {
+    candidate.len() == pattern.len() && prefix_bytes(candidate, pattern)
+}
+
+pub struct Reader[R] {
+    source: io::BufReader[R],
+    boundary: string,
+    marker: bytes::Bytes,
+    opening: bytes::Bytes,
+    closing: bytes::Bytes,
+    limits: Limits,
+    phase: Ref[isize],
+    next_phase: Ref[isize],
+    broken: Ref[bool],
+    deferred: Ref[Option[Error]],
+    wire: Ref[isize],
+    preamble: Ref[isize],
+    parts: Ref[isize],
+    part_bytes: Ref[isize],
+    total_bytes: Ref[isize],
+    scan: bytes::Bytes,
+    pending: bytes::Bytes,
+    position: Ref[isize],
+}
+
+impl[R: Read] Reader[R] {
+    pub fn new(source: R, boundary: string, limits: Limits) -> Result[Reader[R], Error] {
+        validate_boundary(boundary)?;
+        limits.validate()?;
+        let marker = bytes::Bytes::from_string("\r\n--" + boundary);
+        Result::Ok(
+            Reader {
+                source: io::BufReader::new(source),
+                boundary,
+                marker,
+                opening: bytes::Bytes::from_string("\r\n--" + boundary + "\r\n"),
+                closing: bytes::Bytes::from_string("\r\n--" + boundary + "--\r\n"),
+                limits,
+                phase: Ref::new(0),
+                next_phase: Ref::new(0),
+                broken: Ref::new(false),
+                deferred: Ref::new(Option::None),
+                wire: Ref::new(0),
+                preamble: Ref::new(0),
+                parts: Ref::new(0),
+                part_bytes: Ref::new(0),
+                total_bytes: Ref::new(0),
+                scan: bytes::Bytes::new(),
+                pending: bytes::Bytes::new(),
+                position: Ref::new(0),
+            },
+        )
+    }
+
+    pub fn consumed(self: Reader[R]) -> isize {
+        self.wire.get()
+    }
+
+    pub fn body_bytes(self: Reader[R]) -> isize {
+        self.total_bytes.get()
+    }
+
+    pub fn part_count(self: Reader[R]) -> isize {
+        self.parts.get()
+    }
+
+    fn byte(self: Reader[R]) -> Result[Option[byte], Error] {
+        let next = self.source.read_byte().map_err(
+            |cause| Error {
+                kind: ErrorKind::Io,
+                offset: self.wire.get(),
+                message: "multipart source failed",
+                cause: Option::Some(cause),
+            },
+        )?;
+        if next.is_some() {
+            if self.wire.get() >= self.limits.max_wire_bytes {
+                return Result::Err(failure(ErrorKind::Limit, self.wire.get(), "wire exceeds limit"))
+            }
+            self.wire.set(self.wire.get() + 1);
+        }
+        Result::Ok(next)
+    }
+
+    fn line(self: Reader[R], limit: isize, allow_eof: bool) -> Result[Option[bytes::Bytes], Error] {
+        let line = bytes::Bytes::new();
+        loop {
+            let Some(byte) = self.byte()? else {
+                if line.len() == 0 {
+                    return Result::Ok(Option::None)
+                }
+                if allow_eof {
+                    return Result::Ok(Option::Some(line))
+                }
+                return Result::Err(
+                    failure(ErrorKind::Truncated, self.wire.get(), "line lacks CRLF"),
+                )
+            };
+            line.push(byte);
+            if line.len() > limit + 2 {
+                return Result::Err(failure(ErrorKind::Limit, self.wire.get(), "line exceeds limit"))
+            }
+            if byte == b'\n' {
+                if line.len() < 2 || line.get(line.len() - 2) != b'\r' {
+                    return Result::Err(failure(ErrorKind::Invalid, self.wire.get(), "bare LF"))
+                }
+                for index in 0..line.len() - 2 {
+                    if line.get(index) == b'\r' {
+                        return Result::Err(failure(ErrorKind::Invalid, self.wire.get(), "bare CR"))
+                    }
+                }
+                return Result::Ok(
+                    Option::Some(bytes::Bytes::from_slice_copy(line.slice(0, line.len() - 2))),
+                )
+            }
+        }
+    }
+
+    fn seek_first(self: Reader[R]) -> Result[(), Error] {
+        let first = "--" + self.boundary;
+        let last = first + "--";
+        let mut limit = self.limits.max_preamble_bytes;
+        if limit < last.byte_len() {
+            limit = last.byte_len();
+        }
+        loop {
+            let Some(line) = self.line(limit, true)? else {
+                return Result::Err(
+                    failure(ErrorKind::Truncated, self.wire.get(), "missing first boundary"),
+                )
+            };
+            let (valid, value) = string_from_utf8(line.to_vec());
+            if valid && value == first {
+                self.phase.set(1);
+                return Result::Ok(())
+            }
+            if valid && value == last {
+                self.phase.set(3);
+                return Result::Ok(())
+            }
+            if line.len() + 2 > self.limits.max_preamble_bytes - self.preamble.get() {
+                return Result::Err(
+                    failure(ErrorKind::Limit, self.wire.get(), "preamble exceeds limit"),
+                )
+            }
+            self.preamble.set(self.preamble.get() + line.len() + 2);
+        }
+    }
+
+    fn append_field(self: Reader[R], headers: textproto::Headers, field: textproto::Field) -> Result[
+        (),
+        Error,
+    ] {
+        headers.append(field.name, field.value).map_err(
+            |error| failure(ErrorKind::Invalid, self.wire.get(), error.to_string()),
+        )
+    }
+
+    fn headers(self: Reader[R]) -> Result[textproto::Headers, Error] {
+        let headers = textproto::Headers::new();
+        let mut total = 0;
+        let mut pending: Option[textproto::Field] = Option::None;
+        loop {
+            let Some(line) = self.line(self.limits.max_line_bytes, false)? else {
+                return Result::Err(
+                    failure(ErrorKind::Truncated, self.wire.get(), "missing header terminator"),
+                )
+            };
+            if line.len() + 2 > self.limits.max_header_bytes - total {
+                return Result::Err(
+                    failure(ErrorKind::Limit, self.wire.get(), "headers exceed limit"),
+                )
+            }
+            total += line.len() + 2;
+            if line.len() == 0 {
+                if let Some(field) = pending {
+                    self.append_field(headers, field)?;
+                }
+                return Result::Ok(headers)
+            }
+            if line.get(0) == b' ' || line.get(0) == b'\t' {
+                let Some(field) = pending else {
+                    return Result::Err(
+                        failure(ErrorKind::Invalid, self.wire.get(), "orphan continuation"),
+                    )
+                };
+                let mut start = 0;
+                while start < line.len() && (line.get(start) == b' ' || line.get(start) == b'\t') {
+                    start += 1;
+                }
+                let mut end = line.len();
+                while end > start && (line.get(end - 1) == b' ' || line.get(end - 1) == b'\t') {
+                    end -= 1;
+                }
+                let value = field.value.copy();
+                if end - start + 1 > self.limits.max_value_bytes - value.len() {
+                    return Result::Err(
+                        failure(ErrorKind::Limit, self.wire.get(), "header value exceeds limit"),
+                    )
+                }
+                value.push(b' ');
+                value.extend_from_slice(line.slice(start, end));
+                for byte in value.as_slice() {
+                    if byte == 0 || byte == 127 || byte < 32 && byte != b'\t' {
+                        return Result::Err(
+                            failure(ErrorKind::Invalid, self.wire.get(), "invalid header value"),
+                        )
+                    }
+                }
+                pending = Option::Some(textproto::Field { name: field.name, value });
+                continue
+            }
+            if let Some(field) = pending {
+                self.append_field(headers, field)?;
+            }
+            if headers.len() >= self.limits.max_headers {
+                return Result::Err(failure(ErrorKind::Limit, self.wire.get(), "too many headers"))
+            }
+            let field = textproto::parse_header_line(line).map_err(
+                |error| failure(ErrorKind::Invalid, self.wire.get(), error.to_string()),
+            )?;
+            if field.value.len() > self.limits.max_value_bytes {
+                return Result::Err(
+                    failure(ErrorKind::Limit, self.wire.get(), "header value exceeds limit"),
+                )
+            }
+            pending = Option::Some(field);
+        }
+    }
+
+    pub fn next_part(self: Reader[R]) -> Result[Option[textproto::Headers], Error] {
+        if self.broken.get() {
+            return Result::Err(
+                failure(ErrorKind::Closed, self.wire.get(), "multipart reader failed"),
+            )
+        }
+        if self.phase.get() == 2 {
+            return Result::Err(
+                failure(ErrorKind::State, self.wire.get(), "part body remains active"),
+            )
+        }
+        let outcome = self.next_part_inner();
+        if outcome.is_err() {
+            self.broken.set(true);
+        }
+        outcome
+    }
+
+    fn next_part_inner(self: Reader[R]) -> Result[Option[textproto::Headers], Error] {
+        if self.phase.get() == 0 {
+            self.seek_first()?;
+        }
+        if self.phase.get() == 3 {
+            return Result::Ok(Option::None)
+        }
+        if self.parts.get() >= self.limits.max_parts {
+            return Result::Err(
+                failure(ErrorKind::Limit, self.wire.get(), "part count exceeds limit"),
+            )
+        }
+        let headers = self.headers()?;
+        self.parts.set(self.parts.get() + 1);
+        self.part_bytes.set(0);
+        self.scan.clear();
+        self.pending.clear();
+        self.position.set(0);
+        self.next_phase.set(0);
+        self.phase.set(2);
+        Result::Ok(Option::Some(headers))
+    }
+
+    fn step(self: Reader[R]) -> Result[(), Error] {
+        let Some(byte) = self.byte()? else {
+            let suffix = bytes::Bytes::from_string("\r\n--" + self.boundary + "--");
+            if equal_bytes(self.scan, suffix) {
+                self.scan.clear();
+                self.next_phase.set(3);
+                return Result::Ok(())
+            }
+            return Result::Err(
+                failure(ErrorKind::Truncated, self.wire.get(), "missing closing boundary"),
+            )
+        };
+        self.scan.push(byte);
+        loop {
+            if equal_bytes(self.scan, self.opening) {
+                self.scan.clear();
+                self.next_phase.set(1);
+                return Result::Ok(())
+            }
+            if equal_bytes(self.scan, self.closing) {
+                self.scan.clear();
+                self.next_phase.set(3);
+                return Result::Ok(())
+            }
+            if prefix_bytes(self.scan, self.opening) || prefix_bytes(self.scan, self.closing) {
+                return Result::Ok(())
+            }
+            if self.scan.len() == 0 {
+                return Result::Ok(())
+            }
+            if self.part_bytes.get() >= self.limits.max_part_bytes
+                || self.total_bytes.get() >= self.limits.max_total_bytes {
+                return Result::Err(failure(ErrorKind::Limit, self.wire.get(), "body exceeds limit"))
+            }
+            self.pending.push(self.scan.get(0));
+            self.part_bytes.set(self.part_bytes.get() + 1);
+            self.total_bytes.set(self.total_bytes.get() + 1);
+            let rest = bytes::Bytes::from_slice_copy(self.scan.slice(1, self.scan.len()));
+            self.scan.clear();
+            self.scan.extend_from_slice(rest.as_slice());
+        }
+    }
+
+    pub fn read_body_chunk(self: Reader[R], output: MutSlice[byte]) -> Result[isize, Error] {
+        if self.broken.get() {
+            return Result::Err(
+                failure(ErrorKind::Closed, self.wire.get(), "multipart reader failed"),
+            )
+        }
+        if let Some(error) = self.deferred.get() {
+            self.broken.set(true);
+            return Result::Err(error)
+        }
+        if self.phase.get() != 2 {
+            return Result::Err(failure(ErrorKind::State, self.wire.get(), "no active part body"))
+        }
+        if output.len() == 0 {
+            return Result::Ok(0)
+        }
+        let mut count = 0;
+        loop {
+            let available = self.pending.len() - self.position.get();
+            if available > 0 {
+                let amount = if output.len() - count < available {
+                    output.len() - count
+                } else {
+                    available
+                };
+                for index in 0..amount {
+                    output[count + index] = self.pending.get(self.position.get() + index);
+                }
+                self.position.set(self.position.get() + amount);
+                count += amount;
+                if count == output.len() {
+                    return Result::Ok(count)
+                }
+                continue
+            }
+            if self.pending.len() > 0 {
+                self.pending.clear();
+                self.position.set(0);
+            }
+            if self.next_phase.get() != 0 {
+                if count > 0 {
+                    return Result::Ok(count)
+                }
+                self.phase.set(self.next_phase.get());
+                self.next_phase.set(0);
+                return Result::Ok(0)
+            }
+            match self.step() {
+                Ok(()) => (),
+                Err(error) => {
+                    if count > 0 {
+                        self.deferred.set(Option::Some(error));
+                        return Result::Ok(count)
+                    }
+                    self.broken.set(true);
+                    return Result::Err(error)
+                },
+            }
+        }
+    }
+}

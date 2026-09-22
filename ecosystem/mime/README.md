@@ -20,4 +20,5 @@ email addresses. Applications retain authority over header line folding,
 transport limits and accepted media types.
 
 The `quotedprintable` child package provides streaming transfer encoding and
-strict decoding as a separate byte-oriented contract.
+strict decoding as a separate byte-oriented contract. The `multipart` child
+package streams bounded part headers and binary bodies using textproto fields.

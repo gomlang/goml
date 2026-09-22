@@ -1,0 +1,301 @@
+package multipart;
+
+use ecosystem::textproto;
+use std::bytes;
+use std::io;
+use io::Write;
+
+fn prefix_table(pattern: bytes::Bytes) -> Vec[isize] {
+    let table: Vec[isize] = Vec::new();
+    for _ in 0..pattern.len() {
+        table.push(0);
+    }
+    let mut matched = 0;
+    for index in 1..pattern.len() {
+        while matched > 0 && pattern.get(index) != pattern.get(matched) {
+            matched = table[matched - 1];
+        }
+        if pattern.get(index) == pattern.get(matched) {
+            matched += 1;
+        }
+        table[index] = matched;
+    }
+    table
+}
+
+fn advance_pattern(pattern: bytes::Bytes, table: Vec[isize], state: Ref[isize], value: byte) -> bool {
+    let mut matched = state.get();
+    while matched > 0 && pattern.get(matched) != value {
+        matched = table[matched - 1];
+    }
+    if pattern.get(matched) == value {
+        matched += 1;
+    }
+    if matched == pattern.len() {
+        state.set(table[matched - 1]);
+        true
+    } else {
+        state.set(matched);
+        false
+    }
+}
+
+pub struct Writer[W] {
+    sink: W,
+    boundary: string,
+    marker: bytes::Bytes,
+    opening: bytes::Bytes,
+    closing: bytes::Bytes,
+    marker_table: Vec[isize],
+    opening_table: Vec[isize],
+    closing_table: Vec[isize],
+    marker_state: Ref[isize],
+    opening_state: Ref[isize],
+    closing_state: Ref[isize],
+    tail_marker: Ref[bool],
+    limits: Limits,
+    phase: Ref[isize],
+    broken: Ref[bool],
+    wire: Ref[isize],
+    parts: Ref[isize],
+    part_bytes: Ref[isize],
+    total_bytes: Ref[isize],
+}
+
+impl[W: Write] Writer[W] {
+    pub fn new(sink: W, boundary: string, limits: Limits) -> Result[Writer[W], Error] {
+        validate_boundary(boundary)?;
+        limits.validate()?;
+        let marker = bytes::Bytes::from_string("\r\n--" + boundary);
+        let opening = bytes::Bytes::from_string("\r\n--" + boundary + "\r\n");
+        let closing = bytes::Bytes::from_string("\r\n--" + boundary + "--");
+        Result::Ok(
+            Writer {
+                sink,
+                boundary,
+                marker,
+                opening,
+                closing,
+                marker_table: prefix_table(marker),
+                opening_table: prefix_table(opening),
+                closing_table: prefix_table(closing),
+                marker_state: Ref::new(0),
+                opening_state: Ref::new(0),
+                closing_state: Ref::new(0),
+                tail_marker: Ref::new(false),
+                limits,
+                phase: Ref::new(0),
+                broken: Ref::new(false),
+                wire: Ref::new(0),
+                parts: Ref::new(0),
+                part_bytes: Ref::new(0),
+                total_bytes: Ref::new(0),
+            },
+        )
+    }
+
+    pub fn boundary(self: Writer[W]) -> string {
+        self.boundary
+    }
+
+    pub fn wire_bytes(self: Writer[W]) -> isize {
+        self.wire.get()
+    }
+
+    pub fn body_bytes(self: Writer[W]) -> isize {
+        self.total_bytes.get()
+    }
+
+    fn send(self: Writer[W], data: bytes::Bytes) -> Result[(), Error] {
+        if data.len() > self.limits.max_wire_bytes - self.wire.get() {
+            self.broken.set(true);
+            return Result::Err(
+                failure(ErrorKind::Limit, self.wire.get(), "multipart wire exceeds limit"),
+            )
+        }
+        let mut position = 0;
+        while position < data.len() {
+            let count = match self.sink.write(data.slice(position, data.len())) {
+                Ok(count) => count,
+                Err(cause) => {
+                    self.broken.set(true);
+                    return Result::Err(
+                        Error {
+                            kind: ErrorKind::Io,
+                            offset: self.wire.get(),
+                            message: "multipart sink failed",
+                            cause: Option::Some(cause),
+                        },
+                    )
+                },
+            };
+            if count <= 0 || count > data.len() - position {
+                self.broken.set(true);
+                return Result::Err(failure(ErrorKind::Io, self.wire.get(), "invalid sink count"))
+            }
+            position += count;
+            self.wire.set(self.wire.get() + count);
+        }
+        Result::Ok(())
+    }
+
+    fn header_bytes(self: Writer[W], headers: textproto::Headers) -> Result[bytes::Bytes, Error] {
+        let cursor = io::Cursor::new(bytes::Bytes::new());
+        let limits = textproto::Limits {
+            max_line_bytes: self.limits.max_line_bytes,
+            max_header_bytes: self.limits.max_header_bytes,
+            max_headers: self.limits.max_headers,
+            max_value_bytes: self.limits.max_value_bytes,
+            ..textproto::Limits::standard(),
+        };
+        let writer = textproto::Writer::new(cursor, limits).map_err(
+            |error| failure(ErrorKind::Limit, self.wire.get(), error.to_string()),
+        )?;
+        writer.write_headers(headers).map_err(
+            |error| failure(
+                if error.kind == textproto::ErrorKind::Limit {
+                    ErrorKind::Limit
+                } else {
+                    ErrorKind::Invalid
+                },
+                self.wire.get(),
+                error.to_string(),
+            ),
+        )?;
+        Result::Ok(cursor.bytes())
+    }
+
+    fn check_tail(self: Writer[W]) -> Result[(), Error] {
+        if self.tail_marker.get() {
+            self.broken.set(true);
+            return Result::Err(
+                failure(ErrorKind::Boundary, self.wire.get(), "body ends with boundary marker"),
+            )
+        }
+        Result::Ok(())
+    }
+
+    pub fn begin_part(self: Writer[W], headers: textproto::Headers) -> Result[(), Error] {
+        if self.broken.get() {
+            return Result::Err(
+                failure(ErrorKind::Closed, self.wire.get(), "multipart writer failed"),
+            )
+        }
+        if self.phase.get() == 2 {
+            return Result::Err(
+                failure(ErrorKind::State, self.wire.get(), "multipart writer finished"),
+            )
+        }
+        if self.parts.get() >= self.limits.max_parts {
+            return Result::Err(
+                failure(ErrorKind::Limit, self.wire.get(), "part count exceeds limit"),
+            )
+        }
+        if self.parts.get() > 0 {
+            self.check_tail()?;
+        }
+        let encoded = self.header_bytes(headers)?;
+        let delimiter = if self.parts.get() == 0 {
+            "--" + self.boundary + "\r\n"
+        } else {
+            "\r\n--" + self.boundary + "\r\n"
+        };
+        if delimiter.byte_len() > self.limits.max_wire_bytes - self.wire.get()
+            || encoded.len() > self.limits.max_wire_bytes - self.wire.get() - delimiter.byte_len() {
+            return Result::Err(
+                failure(ErrorKind::Limit, self.wire.get(), "multipart wire exceeds limit"),
+            )
+        }
+        self.send(bytes::Bytes::from_string(delimiter))?;
+        self.send(encoded)?;
+        self.parts.set(self.parts.get() + 1);
+        self.part_bytes.set(0);
+        self.marker_state.set(0);
+        self.opening_state.set(0);
+        self.closing_state.set(0);
+        self.tail_marker.set(false);
+        self.phase.set(1);
+        Result::Ok(())
+    }
+
+    fn boundary_collision(self: Writer[W], input: Slice[byte]) -> Result[(), Error] {
+        for byte in input {
+            self.tail_marker.set(
+                advance_pattern(self.marker, self.marker_table, self.marker_state, byte),
+            );
+            if advance_pattern(self.opening, self.opening_table, self.opening_state, byte)
+                || advance_pattern(self.closing, self.closing_table, self.closing_state, byte) {
+                return Result::Err(
+                    failure(
+                        ErrorKind::Boundary,
+                        self.wire.get(),
+                        "body contains boundary delimiter",
+                    ),
+                )
+            }
+        }
+        Result::Ok(())
+    }
+
+    pub fn write_body_chunk(self: Writer[W], input: Slice[byte]) -> Result[isize, Error] {
+        if self.broken.get() {
+            return Result::Err(
+                failure(ErrorKind::Closed, self.wire.get(), "multipart writer failed"),
+            )
+        }
+        if self.phase.get() != 1 {
+            return Result::Err(
+                failure(ErrorKind::State, self.wire.get(), "no active multipart part"),
+            )
+        }
+        if input.len() > self.limits.max_part_bytes - self.part_bytes.get()
+            || input.len() > self.limits.max_total_bytes - self.total_bytes.get() {
+            return Result::Err(
+                failure(ErrorKind::Limit, self.wire.get(), "multipart body exceeds limit"),
+            )
+        }
+        match self.boundary_collision(input) {
+            Ok(()) => (),
+            Err(error) => {
+                self.broken.set(true);
+                return Result::Err(error)
+            },
+        }
+        self.send(bytes::Bytes::from_slice_copy(input))?;
+        self.part_bytes.set(self.part_bytes.get() + input.len());
+        self.total_bytes.set(self.total_bytes.get() + input.len());
+        Result::Ok(input.len())
+    }
+
+    pub fn finish(self: Writer[W]) -> Result[(), Error] {
+        if self.broken.get() {
+            return Result::Err(
+                failure(ErrorKind::Closed, self.wire.get(), "multipart writer failed"),
+            )
+        }
+        if self.phase.get() == 2 {
+            return Result::Ok(())
+        }
+        if self.parts.get() > 0 {
+            self.check_tail()?;
+        }
+        let delimiter = if self.parts.get() == 0 {
+            "--" + self.boundary + "--\r\n"
+        } else {
+            "\r\n--" + self.boundary + "--\r\n"
+        };
+        self.send(bytes::Bytes::from_string(delimiter))?;
+        self.phase.set(2);
+        self.sink.flush().map_err(
+            |cause| {
+                self.broken.set(true);
+                Error {
+                    kind: ErrorKind::Io,
+                    offset: self.wire.get(),
+                    message: "multipart sink flush failed",
+                    cause: Option::Some(cause),
+                }
+            },
+        )
+    }
+}
