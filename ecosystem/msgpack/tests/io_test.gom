@@ -14,25 +14,27 @@ fn io_problem(kind: io::ErrorKind) -> io::Error {
 struct Fragmented {
     cursor: io::Cursor,
     calls: Ref[isize],
+    interrupt_on: isize,
 }
 
 impl Read for Fragmented {
     fn read(self: Fragmented, buffer: MutSlice[byte]) -> Result[isize, io::Error] {
         let call = self.calls.get();
         self.calls.set(call + 1);
-        if call == 0 {
+        let count = self.cursor.read(
+            buffer.sub(
+                0,
+                if buffer.len() > 1 {
+                    1
+                } else {
+                    buffer.len()
+                },
+            ),
+        )?;
+        if call + 1 == self.interrupt_on {
             Result::Err(io_problem(io::ErrorKind::Interrupted))
         } else {
-            self.cursor.read(
-                buffer.sub(
-                    0,
-                    if buffer.len() > 1 {
-                        1
-                    } else {
-                        buffer.len()
-                    },
-                ),
-            )
+            Result::Ok(count)
         }
     }
 }
@@ -52,6 +54,7 @@ impl Read for InvalidRead {
 struct PartialWriter {
     output: io::Cursor,
     calls: Ref[isize],
+    interrupt: bool,
     fail: bool,
     flushes: Ref[isize],
 }
@@ -60,10 +63,10 @@ impl Write for PartialWriter {
     fn write(self: PartialWriter, buffer: Slice[byte]) -> Result[isize, io::Error] {
         let call = self.calls.get();
         self.calls.set(call + 1);
-        if call == 0 {
+        if call == 0 && self.interrupt {
             return Result::Err(io_problem(io::ErrorKind::Interrupted))
         }
-        if call == 2 && self.fail {
+        if call == 1 && self.fail {
             return Result::Err(io_problem(io::ErrorKind::BrokenPipe))
         }
         self.output.write(
@@ -87,7 +90,13 @@ impl Write for PartialWriter {
 #[test]
 fn standard_streams_handle_partial_transfers_and_multiple_bounded_frames() -> () {
     let output = io::Cursor::new(bytes::Bytes::new());
-    let sink = PartialWriter { output, calls: Ref::new(0), fail: false, flushes: Ref::new(0) };
+    let sink = PartialWriter {
+        output,
+        calls: Ref::new(0),
+        interrupt: false,
+        fail: false,
+        flushes: Ref::new(0),
+    };
     let options = Options {
         limits: Limits { max_bytes: 12, ..Limits::standard() },
         ..Options::standard(),
@@ -103,7 +112,11 @@ fn standard_streams_handle_partial_transfers_and_multiple_bounded_frames() -> ()
     testing::assert(output.bytes().len() > options.limits.max_bytes);
     let reader = testing::expect_ok(
         StreamReader::with_capacity(
-            Fragmented { cursor: io::Cursor::new(output.bytes()), calls: Ref::new(0) },
+            Fragmented {
+                cursor: io::Cursor::new(output.bytes()),
+                calls: Ref::new(0),
+                interrupt_on: -1,
+            },
             5,
             options,
         ),
@@ -122,6 +135,36 @@ fn standard_streams_handle_partial_transfers_and_multiple_bounded_frames() -> ()
     }
     testing::assert(testing::expect_ok(reader.next(), "EOF").is_none());
     testing::assert(testing::expect_ok(reader.next(), "fused EOF").is_none());
+}
+
+#[test]
+fn interrupted_reader_fuses_after_unconfirmed_consumption() -> () {
+    for interrupt_on in[1, 3] {
+        let source = Fragmented {
+            cursor: io::Cursor::new(bytes::Bytes::from_vec(b"\xa3abc")),
+            calls: Ref::new(0),
+            interrupt_on,
+        };
+        let reader = testing::expect_ok(
+            StreamReader::with_capacity(source, 1, Options::standard()),
+            "interrupted reader",
+        );
+        for _ in 0..2 {
+            match testing::expect_err(reader.next(), "read interruption") {
+                StreamError::Io(error) => {
+                    testing::assert_eq(error.kind(), io::ErrorKind::Interrupted);
+                    testing::assert_eq(
+                        error.to_string(),
+                        io_problem(io::ErrorKind::Interrupted).to_string(),
+                    );
+                },
+                _ => testing::fail("expected interrupted reader cause"),
+            }
+            testing::assert_eq(source.calls.get(), interrupt_on);
+            testing::assert_eq(source.cursor.position(), interrupt_on);
+            testing::assert_eq(reader.buffered(), interrupt_on - 1);
+        }
+    }
 }
 
 #[test]
@@ -186,7 +229,7 @@ fn stream_bounds_truncation_and_invalid_reader_counts_are_recoverable() -> () {
 fn writer_validation_is_atomic_and_partial_io_failure_is_terminal() -> () {
     let output = io::Cursor::new(bytes::Bytes::new());
     let calls = Ref::new(0);
-    let sink = PartialWriter { output, calls, fail: true, flushes: Ref::new(0) };
+    let sink = PartialWriter { output, calls, interrupt: false, fail: true, flushes: Ref::new(0) };
     let options = Options {
         limits: Limits { max_bytes: 16, ..Limits::standard() },
         ..Options::standard(),
@@ -196,9 +239,35 @@ fn writer_validation_is_atomic_and_partial_io_failure_is_terminal() -> () {
     testing::assert_eq(calls.get(), 0);
     testing::assert(writer.serialize("truncated").is_err());
     testing::assert_eq(output.bytes().len(), 2);
-    testing::assert_eq(calls.get(), 3);
+    testing::assert_eq(calls.get(), 2);
     testing::assert(writer.serialize(1).is_err());
     testing::assert(writer.flush().is_err());
-    testing::assert_eq(calls.get(), 3);
+    testing::assert_eq(calls.get(), 2);
+    testing::assert_eq(sink.flushes.get(), 0);
+}
+
+#[test]
+fn interrupted_writer_stops_without_automatic_retry() -> () {
+    let output = io::Cursor::new(bytes::Bytes::new());
+    let sink = PartialWriter {
+        output,
+        calls: Ref::new(0),
+        interrupt: true,
+        fail: false,
+        flushes: Ref::new(0),
+    };
+    let writer = testing::expect_ok(
+        StreamWriter::new(sink, Options::standard()),
+        "interrupted writer",
+    );
+    match testing::expect_err(writer.serialize("interrupted"), "write interruption") {
+        StreamError::Io(error) => testing::assert_eq(error.kind(), io::ErrorKind::Interrupted),
+        _ => testing::fail("expected Interrupted I/O error"),
+    }
+    testing::assert_eq(sink.calls.get(), 1);
+    testing::assert_eq(output.bytes().len(), 0);
+    testing::assert(writer.serialize(1).is_err());
+    testing::assert(writer.flush().is_err());
+    testing::assert_eq(sink.calls.get(), 1);
     testing::assert_eq(sink.flushes.get(), 0);
 }
