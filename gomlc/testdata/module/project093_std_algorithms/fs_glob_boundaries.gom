@@ -1,0 +1,320 @@
+package main;
+
+use std::fs;
+use std::io;
+use std::panic;
+use std::path::slash;
+use std::testing;
+
+fn glob_boundary_tree() -> WalkProbeFs {
+    walk_probe_fs(
+        Vec::from_array(
+            [
+                walk_probe_node(
+                    ".",
+                    Vec::from_array(
+                        [
+                            walk_probe_entry("c", fs::FileType::Directory, 0),
+                            walk_probe_entry("a-", fs::FileType::Directory, 1),
+                            walk_probe_entry("a", fs::FileType::Directory, 2),
+                        ],
+                    ),
+                ),
+                walk_probe_node(
+                    "a",
+                    Vec::from_array([walk_probe_entry("x", fs::FileType::File, 3)]),
+                ),
+                walk_probe_node(
+                    "a-",
+                    Vec::from_array([walk_probe_entry("x", fs::FileType::File, 4)]),
+                ),
+                walk_probe_node(
+                    "c",
+                    Vec::from_array([walk_probe_entry("x", fs::FileType::File, 5)]),
+                ),
+            ],
+        ),
+    )
+}
+
+fn check_glob_boundary_global_budgets() -> () {
+    for budget in 0..3 {
+        for exact in[false, true] {
+            let source = glob_boundary_tree();
+            let limits = match budget {
+                0 => fs::GlobLimits {
+                    max_match_calls: if exact {
+                        6
+                    } else {
+                        5
+                    },
+                    ..glob_probe_limits(),
+                },
+                1 => fs::GlobLimits {
+                    max_directories: if exact {
+                        4
+                    } else {
+                        3
+                    },
+                    ..glob_probe_limits(),
+                },
+                _ => fs::GlobLimits {
+                    max_work: if exact {
+                        45
+                    } else {
+                        44
+                    },
+                    ..glob_probe_limits(),
+                },
+            };
+            let result = fs::glob_from(source, "*/*", limits);
+            if exact {
+                assert_equal(
+                    testing::expect_ok(result, "exact global branch budget"),
+                    Vec::from_array(["a-/x", "a/x", "c/x"]),
+                );
+            } else {
+                let error = testing::expect_err(result, "budget shared across sibling branches");
+                glob_probe_hard_limit(error);
+                assert_equal(error.matches().to_vec(), Vec::from_array(["a-/x", "a/x"]));
+            }
+            testing::assert(source.events.contains("open:a"));
+            testing::assert(source.events.contains("open:a-"));
+            assert_equal(source.events.contains("open:c"), exact || budget != 1);
+            assert_equal(source.active.get(), 0);
+        }
+    }
+    for count in[1, 2] {
+        let source = glob_boundary_tree();
+        let error = testing::expect_err(
+            fs::glob_from(
+                source,
+                "*/*",
+                fs::GlobLimits { max_matches: count, ..glob_probe_limits() },
+            ),
+            "match budget selects DFS prefix before final sorting",
+        );
+        glob_probe_hard_limit(error);
+        assert_equal(
+            error.matches().to_vec(),
+            if count == 1 {
+                Vec::from_array(["a/x"])
+            } else {
+                Vec::from_array(["a-/x", "a/x"])
+            },
+        );
+        assert_equal(source.events.contains("open:c"), count == 2);
+        assert_equal(source.active.get(), 0);
+    }
+    let tree = glob_boundary_tree();
+    let source = walk_probe_fs(
+        Vec::from_array(
+            [
+                tree.nodes[0],
+                tree.nodes[1],
+                WalkProbeNode { error_on: 1, ..tree.nodes[2] },
+                tree.nodes[3],
+            ],
+        ),
+    );
+    let error = testing::expect_err(
+        fs::glob_from(source, "*/*", glob_probe_limits()),
+        "later provider error stops remaining branches",
+    );
+    assert_equal(glob_probe_fs_cause(error), walk_probe_error("read directory"));
+    assert_equal(error.matches().to_vec(), Vec::from_array(["a-/x", "a/x"]));
+    testing::assert(!source.events.contains("open:c"));
+    assert_equal(source.active.get(), 0);
+}
+
+fn check_glob_boundary_error_snapshot() -> () {
+    let values = Vec::from_array(["first", "second"]);
+    let cause = walk_probe_error("snapshot cause");
+    let error = fs::GlobError::new(values, fs::GlobCause::FileSystem(cause));
+    values[0] = "changed";
+    values.push("added");
+    assert_equal(error.matches().to_vec(), Vec::from_array(["first", "second"]));
+    assert_equal(glob_probe_fs_cause(error), cause);
+    assert_equal(error.to_string(), cause.to_string());
+    assert_equal(error.debug(), error.to_string());
+    let cause = fs::GlobCause::Pattern(2, slash::MatchError::InvalidPattern(3));
+    let error = fs::GlobError::new(Vec::new(), cause);
+    match error.cause() {
+        Pattern(index, failure) => {
+            assert_equal(index, 2);
+            assert_equal(failure, slash::MatchError::InvalidPattern(3));
+        },
+        _ => testing::fail("pattern cause not preserved"),
+    }
+    assert_equal(error.to_string(), cause.to_string());
+    assert_equal(
+        error.to_string(),
+        "glob component 2: " + slash::MatchError::InvalidPattern(3).to_string(),
+    );
+}
+
+fn check_glob_boundary_literals_and_maximum() -> () {
+    let maximum = 9223372036854775807;
+    let limits = fs::GlobLimits {
+        max_pattern_chars: maximum,
+        max_components: maximum,
+        max_directory_entries: maximum,
+        max_directories: maximum,
+        max_match_calls: maximum,
+        max_matches: maximum,
+        max_work: maximum,
+    };
+    let source = glob_boundary_tree();
+    assert_equal(
+        testing::expect_ok(
+            fs::glob_from(source, "*/*", limits),
+            "maximum glob limits do not overflow",
+        ),
+        Vec::from_array(["a-/x", "a/x", "c/x"]),
+    );
+    assert_equal(source.active.get(), 0);
+    for pair in[("\u0000", "\u0000"), ("a\\\\b", "a\\b"), ("\\界", "界")] {
+        let source = walk_probe_fs(
+            Vec::from_array(
+                [WalkProbeNode { kind: fs::FileType::File, ..walk_probe_node(pair.1, Vec::new()) }],
+            ),
+        );
+        assert_equal(
+            testing::expect_ok(
+                fs::glob_from(source, pair.0, limits),
+                "portable escaped literal glob",
+            ),
+            Vec::from_array([pair.1]),
+        );
+        assert_equal(
+            source.events,
+            Vec::from_array(["open:" + pair.1, "stat:" + pair.1, "close:" + pair.1]),
+        );
+        assert_equal(source.active.get(), 0);
+    }
+    let source = glob_boundary_tree();
+    assert_equal(
+        testing::expect_ok(
+            fs::glob_from(source, "**", glob_probe_limits()),
+            "double star is one component",
+        ),
+        Vec::from_array(["a", "a-", "c"]),
+    );
+    testing::assert(!source.events.contains("open:a"));
+    testing::assert(!source.events.contains("open:a-"));
+    testing::assert(!source.events.contains("open:c"));
+    for entry in source.nodes[0].entries {
+        assert_equal(entry.types.get(), 0);
+    }
+    let source = walk_probe_fs(
+        Vec::from_array(
+            [
+                walk_probe_node(
+                    ".",
+                    Vec::from_array(
+                        [
+                            walk_probe_entry("x", fs::FileType::File, 0),
+                            walk_probe_entry("a", fs::FileType::Directory, 1),
+                        ],
+                    ),
+                ),
+                walk_probe_node(
+                    "a",
+                    Vec::from_array(
+                        [
+                            walk_probe_entry("x", fs::FileType::File, 2),
+                            walk_probe_entry("d", fs::FileType::Directory, 3),
+                        ],
+                    ),
+                ),
+                walk_probe_node(
+                    "a/d",
+                    Vec::from_array([walk_probe_entry("x", fs::FileType::File, 4)]),
+                ),
+            ],
+        ),
+    );
+    assert_equal(
+        testing::expect_ok(
+            fs::glob_from(source, "**/x", glob_probe_limits()),
+            "double star consumes exactly one component",
+        ),
+        Vec::from_array(["a/x"]),
+    );
+    testing::assert(!source.events.contains("open:a/d"));
+}
+
+fn check_glob_boundary_accessor_panics() -> () {
+    for mode in[0, 1] {
+        let source = walk_probe_fs(
+            Vec::from_array(
+                [
+                    walk_probe_node(
+                        ".",
+                        Vec::from_array([walk_probe_entry("d", fs::FileType::Directory, 0)]),
+                    ),
+                ],
+            ),
+        );
+        let owner = WalkCleanupFs { source, mode, active_at_panic: Ref::new(-1) };
+        let caught = testing::expect_err(
+            panic::catch(
+                || fs::glob_from(
+                    owner,
+                    if mode == 0 {
+                        "*"
+                    } else {
+                        "*/*"
+                    },
+                    glob_probe_limits(),
+                ),
+            ),
+            "glob accessor panic cleanup",
+        );
+        assert_equal(
+            caught.message(),
+            if mode == 0 {
+                "walk entry name panic"
+            } else {
+                "walk entry type panic"
+            },
+        );
+        assert_equal(
+            owner.active_at_panic.get(),
+            if mode == 0 {
+                1
+            } else {
+                0
+            },
+        );
+        assert_equal(source.active.get(), 0);
+        assert_equal(walk_cleanup_close_count(source), 1);
+    }
+    let source = walk_probe_fs(
+        Vec::from_array(
+            [
+                walk_probe_node(
+                    ".",
+                    Vec::from_array([walk_probe_entry("d", fs::FileType::Directory, 0)]),
+                ),
+            ],
+        ),
+    );
+    let owner = WalkCleanupFs { source, mode: 1, active_at_panic: Ref::new(-1) };
+    assert_equal(
+        testing::expect_ok(
+            fs::glob_from(owner, "*", glob_probe_limits()),
+            "final matches must not query type",
+        ),
+        Vec::from_array(["d"]),
+    );
+    assert_equal(owner.active_at_panic.get(), -1);
+    assert_equal(source.active.get(), 0);
+}
+
+fn check_fs_glob_boundaries() -> () {
+    check_glob_boundary_global_budgets();
+    check_glob_boundary_error_snapshot();
+    check_glob_boundary_literals_and_maximum();
+    check_glob_boundary_accessor_panics();
+}

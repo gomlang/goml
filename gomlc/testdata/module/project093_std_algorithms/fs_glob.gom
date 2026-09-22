@@ -1,0 +1,516 @@
+package main;
+
+use std::fs;
+use fs::FileSystem;
+use std::io;
+use std::path::slash;
+use std::testing;
+
+fn glob_probe_limits() -> fs::GlobLimits {
+    fs::GlobLimits {
+        max_pattern_chars: 1000,
+        max_components: 100,
+        max_directory_entries: 100,
+        max_directories: 100,
+        max_match_calls: 1000,
+        max_matches: 1000,
+        max_work: 100000,
+    }
+}
+
+fn glob_probe_fs_cause(error: fs::GlobError) -> fs::Error {
+    match error.cause() {
+        FileSystem(cause) => cause,
+        Pattern(_, _) => {
+            testing::fail("expected filesystem glob cause");
+            loop {}
+        },
+    }
+}
+
+fn glob_probe_hard_limit(error: fs::GlobError) -> () {
+    let cause = glob_probe_fs_cause(error);
+    assert_equal(cause.kind(), io::ErrorKind::InvalidData);
+    assert_equal(cause.operation(), "glob");
+}
+
+struct GlobMissingFs {
+    source: WalkProbeFs,
+}
+
+impl FileSystem for GlobMissingFs {
+    type Handle = WalkProbeHandle;
+
+    fn open(self: GlobMissingFs, name: string) -> Result[WalkProbeHandle, fs::Error] {
+        if name == "missing" {
+            self.source.events.push("missing:" + name);
+            Result::Err(
+                fs::Error::new(
+                    io::ErrorKind::NotFound,
+                    "provider lookup",
+                    Option::Some("provider/missing"),
+                    Option::Some(2),
+                    "missing exact path",
+                ),
+            )
+        } else {
+            self.source.open(name)
+        }
+    }
+}
+
+fn glob_probe_tree() -> WalkProbeFs {
+    walk_probe_fs(
+        Vec::from_array(
+            [
+                walk_probe_node(
+                    ".",
+                    Vec::from_array(
+                        [
+                            walk_probe_entry("b", fs::FileType::Directory, 0),
+                            walk_probe_entry("a", fs::FileType::Directory, 1),
+                            walk_probe_entry("m", fs::FileType::Symlink, 2),
+                            walk_probe_entry("x", fs::FileType::File, 3),
+                            walk_probe_entry("o", fs::FileType::Other, 4),
+                        ],
+                    ),
+                ),
+                walk_probe_node(
+                    "a",
+                    Vec::from_array(
+                        [
+                            walk_probe_entry("z.txt", fs::FileType::File, 5),
+                            walk_probe_entry("a.txt", fs::FileType::File, 6),
+                            walk_probe_entry("é.txt", fs::FileType::File, 7),
+                            walk_probe_entry("a.txt", fs::FileType::File, 8),
+                        ],
+                    ),
+                ),
+                walk_probe_node(
+                    "b",
+                    Vec::from_array([walk_probe_entry("q.txt", fs::FileType::File, 9)]),
+                ),
+                walk_probe_node(
+                    "m",
+                    Vec::from_array([walk_probe_entry("link.txt", fs::FileType::File, 10)]),
+                ),
+                WalkProbeNode { kind: fs::FileType::File, ..walk_probe_node("a/a.txt", Vec::new()) },
+                WalkProbeNode {
+                    kind: fs::FileType::File,
+                    ..walk_probe_node("star*.txt", Vec::new()),
+                },
+                WalkProbeNode { kind: fs::FileType::File, ..walk_probe_node("é", Vec::new()) },
+            ],
+        ),
+    )
+}
+
+fn check_glob_probe_literals() -> () {
+    for pair in[(".", "."), ("a/a.txt", "a/a.txt"), ("star\\*.txt", "star*.txt")] {
+        let source = glob_probe_tree();
+        let limits = fs::GlobLimits {
+            max_directories: 0,
+            max_match_calls: 0,
+            max_work: 1,
+            ..glob_probe_limits(),
+        };
+        assert_equal(
+            testing::expect_ok(fs::glob_from(source, pair.0, limits), "literal glob stat"),
+            Vec::from_array([pair.1]),
+        );
+        assert_equal(
+            source.events,
+            Vec::from_array(["open:" + pair.1, "stat:" + pair.1, "close:" + pair.1]),
+        );
+        assert_equal(source.active.get(), 0);
+    }
+    let source = glob_probe_tree();
+    let error = testing::expect_err(
+        fs::glob_from(GlobMissingFs { source }, "missing", glob_probe_limits()),
+        "literal NotFound is not empty match",
+    );
+    let cause = glob_probe_fs_cause(error);
+    assert_equal(cause.kind(), io::ErrorKind::NotFound);
+    assert_equal(cause.operation(), "provider lookup");
+    assert_equal(cause.path(), Option::Some("provider/missing"));
+    assert_equal(cause.raw_os_code(), Option::Some(2));
+    assert_equal(error.matches().len(), 0);
+    assert_equal(source.events, Vec::from_array(["missing:missing"]));
+    let source = glob_probe_tree();
+    assert_equal(
+        testing::expect_ok(
+            fs::glob_from(source, "a/*.txt", glob_probe_limits()),
+            "longest literal prefix",
+        ),
+        Vec::from_array(["a/a.txt", "a/a.txt", "a/z.txt", "a/é.txt"]),
+    );
+    assert_equal(source.events[0], "open:a");
+    testing::assert(!source.events.contains("open:."));
+    testing::assert(!source.events.contains("stat:a"));
+    for entry in source.nodes[1].entries {
+        assert_equal(entry.names.get(), 1);
+        assert_equal(entry.types.get(), 0);
+        assert_equal(entry.metadata_calls.get(), 0);
+    }
+}
+
+fn check_glob_probe_multilevel() -> () {
+    let source = glob_probe_tree();
+    assert_equal(
+        testing::expect_ok(
+            fs::glob_from(source, "*/?.txt", glob_probe_limits()),
+            "multi-component Unicode glob",
+        ),
+        Vec::from_array(["a/a.txt", "a/a.txt", "a/z.txt", "a/é.txt", "b/q.txt"]),
+    );
+    testing::assert(source.events.contains("open:m"));
+    testing::assert(!source.events.contains("open:x"));
+    testing::assert(!source.events.contains("open:o"));
+    for index in 0..4 {
+        for entry in source.nodes[index].entries {
+            assert_equal(entry.names.get(), 1);
+            assert_equal(
+                entry.types.get(),
+                if index == 0 {
+                    1
+                } else {
+                    0
+                },
+            );
+            assert_equal(entry.metadata_calls.get(), 0);
+        }
+    }
+    assert_equal(source.active.get(), 0);
+    let source = glob_probe_tree();
+    assert_equal(
+        testing::expect_ok(
+            fs::glob_from(source, "a/[a-z].txt", glob_probe_limits()),
+            "bracket glob",
+        ),
+        Vec::from_array(["a/a.txt", "a/a.txt", "a/z.txt"]),
+    );
+}
+
+fn check_glob_probe_preflight() -> () {
+    for pattern in["", "/a", "a/", "a//b", "./a", "a/.", "a/..", "..", "\\.", "\\.\\."] {
+        let source = glob_probe_tree();
+        let error = testing::expect_err(
+            fs::glob_from(source, pattern, glob_probe_limits()),
+            "invalid logical glob path",
+        );
+        assert_equal(glob_probe_fs_cause(error).kind(), io::ErrorKind::InvalidInput);
+        assert_equal(source.events.len(), 0);
+    }
+    for pair in[("a/*/[", 2), ("a\\/b", 0), ("[a/]b", 0)] {
+        let source = glob_probe_tree();
+        let error = testing::expect_err(
+            fs::glob_from(source, pair.0, glob_probe_limits()),
+            "all components compile before IO",
+        );
+        match error.cause() {
+            Pattern(index, slash::MatchError::InvalidPattern(_)) => assert_equal(index, pair.1),
+            _ => testing::fail("expected indexed invalid component pattern"),
+        }
+        assert_equal(error.matches().len(), 0);
+        assert_equal(source.events.len(), 0);
+    }
+    for field in 0..7 {
+        let base = glob_probe_limits();
+        let limits = fs::GlobLimits {
+            max_pattern_chars: if field == 0 {
+                -1
+            } else {
+                base.max_pattern_chars
+            },
+            max_components: if field == 1 {
+                -1
+            } else {
+                base.max_components
+            },
+            max_directory_entries: if field == 2 {
+                -1
+            } else {
+                base.max_directory_entries
+            },
+            max_directories: if field == 3 {
+                -1
+            } else {
+                base.max_directories
+            },
+            max_match_calls: if field == 4 {
+                -1
+            } else {
+                base.max_match_calls
+            },
+            max_matches: if field == 5 {
+                -1
+            } else {
+                base.max_matches
+            },
+            max_work: if field == 6 {
+                -1
+            } else {
+                base.max_work
+            },
+        };
+        let source = glob_probe_tree();
+        assert_equal(
+            glob_probe_fs_cause(
+                testing::expect_err(fs::glob_from(source, "*", limits), "negative glob limit"),
+            ).kind(),
+            io::ErrorKind::InvalidInput,
+        );
+        assert_equal(source.events.len(), 0);
+    }
+    for limits in[
+        fs::GlobLimits { max_pattern_chars: 0, ..glob_probe_limits() },
+        fs::GlobLimits { max_components: 0, ..glob_probe_limits() },
+    ] {
+        let source = glob_probe_tree();
+        glob_probe_hard_limit(
+            testing::expect_err(fs::glob_from(source, "*", limits), "preflight glob limit"),
+        );
+        assert_equal(source.events.len(), 0);
+    }
+    let source = glob_probe_tree();
+    assert_equal(
+        testing::expect_ok(
+            fs::glob_from(
+                source,
+                "é",
+                fs::GlobLimits {
+                    max_pattern_chars: 1,
+                    max_components: 1,
+                    max_work: 1,
+                    ..glob_probe_limits(),
+                },
+            ),
+            "pattern counts Unicode characters",
+        ),
+        Vec::from_array(["é"]),
+    );
+}
+
+fn check_glob_probe_partial_errors() -> () {
+    for max_matches in[1, 10] {
+        let entries = Vec::from_array(
+            [
+                walk_probe_entry("z", fs::FileType::File, 0),
+                walk_probe_entry("a", fs::FileType::File, 1),
+                walk_probe_entry("lost", fs::FileType::File, 2),
+            ],
+        );
+        let source = walk_probe_fs(
+            Vec::from_array(
+                [
+                    WalkProbeNode {
+                        chunk: 1,
+                        error_on: 2,
+                        close_mode: 1,
+                        ..walk_probe_node(".", entries),
+                    },
+                ],
+            ),
+        );
+        let error = testing::expect_err(
+            fs::glob_from(source, "*", fs::GlobLimits { max_matches, ..glob_probe_limits() }),
+            "final partial matches retain provider cause",
+        );
+        assert_equal(glob_probe_fs_cause(error), walk_probe_error("read directory"));
+        assert_equal(
+            error.matches().to_vec(),
+            if max_matches == 1 {
+                Vec::from_array(["a"])
+            } else {
+                Vec::from_array(["a", "z"])
+            },
+        );
+        assert_equal(source.events.len(), 4);
+        assert_equal(source.active.get(), 0);
+    }
+    let tree = glob_probe_tree();
+    let source = walk_probe_fs(
+        Vec::from_array(
+            [
+                WalkProbeNode { error_on: 1, ..tree.nodes[0] },
+                tree.nodes[1],
+                tree.nodes[2],
+                tree.nodes[3],
+            ],
+        ),
+    );
+    let error = testing::expect_err(
+        fs::glob_from(source, "*/*", glob_probe_limits()),
+        "intermediate partial error does not descend",
+    );
+    assert_equal(glob_probe_fs_cause(error), walk_probe_error("read directory"));
+    assert_equal(error.matches().len(), 0);
+    assert_equal(source.events.len(), 3);
+    testing::assert(!source.events.contains("open:a"));
+    testing::assert(!source.events.contains("open:b"));
+    let source = walk_probe_fs(
+        Vec::from_array(
+            [
+                WalkProbeNode {
+                    close_mode: 1,
+                    ..walk_probe_node(
+                        ".",
+                        Vec::from_array(
+                            [
+                                walk_probe_entry("z", fs::FileType::File, 0),
+                                walk_probe_entry("a", fs::FileType::File, 1),
+                            ],
+                        ),
+                    ),
+                },
+            ],
+        ),
+    );
+    let error = testing::expect_err(
+        fs::glob_from(source, "*", glob_probe_limits()),
+        "close failure with complete matches",
+    );
+    assert_equal(error.matches().to_vec(), Vec::from_array(["a", "z"]));
+    let cause = glob_probe_fs_cause(error);
+    assert_equal(cause.kind(), io::ErrorKind::BrokenPipe);
+    assert_equal(cause.operation(), "close file");
+    assert_equal(cause.path(), Option::Some("."));
+    assert_equal(cause.raw_os_code(), Option::Some(19));
+    assert_equal(source.active.get(), 0);
+    let source = walk_probe_fs(
+        Vec::from_array(
+            [
+                WalkProbeNode {
+                    error_on: 1,
+                    ..walk_probe_node(
+                        ".",
+                        Vec::from_array([walk_probe_entry("a", fs::FileType::File, 0)]),
+                    ),
+                },
+            ],
+        ),
+    );
+    let error = testing::expect_err(
+        fs::glob_from(source, "*", fs::GlobLimits { max_match_calls: 0, ..glob_probe_limits() }),
+        "provider error precedes match budget",
+    );
+    assert_equal(glob_probe_fs_cause(error), walk_probe_error("read directory"));
+    assert_equal(error.matches().len(), 0);
+}
+
+fn check_glob_probe_budgets() -> () {
+    for budget in 0..4 {
+        let limits = match budget {
+            0 => fs::GlobLimits { max_directory_entries: 0, ..glob_probe_limits() },
+            1 => fs::GlobLimits { max_directories: 0, ..glob_probe_limits() },
+            2 => fs::GlobLimits { max_match_calls: 0, ..glob_probe_limits() },
+            _ => fs::GlobLimits { max_matches: 0, ..glob_probe_limits() },
+        };
+        let source = walk_probe_fs(
+            Vec::from_array(
+                [
+                    walk_probe_node(
+                        ".",
+                        Vec::from_array([walk_probe_entry("a", fs::FileType::File, 0)]),
+                    ),
+                ],
+            ),
+        );
+        let error = testing::expect_err(fs::glob_from(source, "*", limits), "zero glob budget");
+        glob_probe_hard_limit(error);
+        assert_equal(error.matches().len(), 0);
+        assert_equal(source.active.get(), 0);
+    }
+    for work in[0, 7, 8] {
+        let source = walk_probe_fs(
+            Vec::from_array(
+                [
+                    walk_probe_node(
+                        ".",
+                        Vec::from_array([walk_probe_entry("a", fs::FileType::File, 0)]),
+                    ),
+                ],
+            ),
+        );
+        let result = fs::glob_from(
+            source,
+            "*",
+            fs::GlobLimits {
+                max_directory_entries: 1,
+                max_directories: 1,
+                max_match_calls: 1,
+                max_matches: 1,
+                max_work: work,
+                ..glob_probe_limits(),
+            },
+        );
+        if work == 8 {
+            assert_equal(
+                testing::expect_ok(result, "exact kernel and matching work"),
+                Vec::from_array(["a"]),
+            );
+        } else {
+            glob_probe_hard_limit(testing::expect_err(result, "insufficient total glob work"));
+        }
+        assert_equal(source.active.get(), 0);
+        if work == 0 {
+            assert_equal(source.events.len(), 0);
+        }
+    }
+    let source = walk_probe_fs(Vec::from_array([walk_probe_node(".", Vec::new())]));
+    assert_equal(
+        testing::expect_ok(
+            fs::glob_from(
+                source,
+                "*",
+                fs::GlobLimits {
+                    max_directory_entries: 0,
+                    max_match_calls: 0,
+                    max_matches: 0,
+                    max_work: 3,
+                    ..glob_probe_limits(),
+                },
+            ),
+            "empty directory requires no match budget",
+        ).len(),
+        0,
+    );
+}
+
+fn check_glob_probe_subfs() -> () {
+    let source = walk_probe_fs(
+        Vec::from_array(
+            [
+                walk_probe_node(
+                    "outer/inner",
+                    Vec::from_array(
+                        [
+                            walk_probe_entry("z", fs::FileType::File, 0),
+                            walk_probe_entry("a", fs::FileType::File, 1),
+                        ],
+                    ),
+                ),
+            ],
+        ),
+    );
+    let outer = testing::expect_ok(fs::SubFs::new(source, "outer"), "glob outer subfs");
+    let inner = testing::expect_ok(fs::SubFs::new(outer, "inner"), "glob inner subfs");
+    assert_equal(
+        testing::expect_ok(
+            fs::glob_from(inner, "*", glob_probe_limits()),
+            "glob subfs logical results",
+        ),
+        Vec::from_array(["a", "z"]),
+    );
+    assert_equal(source.events[0], "open:outer/inner");
+    assert_equal(source.active.get(), 0);
+}
+
+fn check_fs_glob() -> () {
+    check_glob_probe_literals();
+    check_glob_probe_multilevel();
+    check_glob_probe_preflight();
+    check_glob_probe_partial_errors();
+    check_glob_probe_budgets();
+    check_glob_probe_subfs();
+}

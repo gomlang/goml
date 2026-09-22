@@ -1,0 +1,363 @@
+package main;
+
+use std::io;
+use io::{Read, Close};
+use std::fs;
+use fs::{File, FileSystem};
+use std::bytes;
+use std::testing;
+use std::panic;
+
+struct PortableFs {
+    data: Vec[byte],
+    mode: isize,
+    close_fails: bool,
+    opens: Ref[isize],
+    closes: Ref[isize],
+    reads: Ref[isize],
+    stats: Ref[isize],
+    overrides: Ref[isize],
+    positions: Vec[Ref[isize]],
+    names: Vec[string],
+}
+
+struct PortableFile {
+    owner: PortableFs,
+    position: Ref[isize],
+}
+
+fn portable_fs(data: Vec[byte], mode: isize, close_fails: bool) -> PortableFs {
+    PortableFs {
+        data,
+        mode,
+        close_fails,
+        opens: Ref::new(0),
+        closes: Ref::new(0),
+        reads: Ref::new(0),
+        stats: Ref::new(0),
+        overrides: Ref::new(0),
+        positions: Vec::new(),
+        names: Vec::new(),
+    }
+}
+
+fn portable_fs_error(operation: string) -> fs::Error {
+    fs::Error::new(
+        io::ErrorKind::PermissionDenied,
+        operation,
+        Option::Some("provider path"),
+        Option::Some(31),
+        "provider fs failure",
+    )
+}
+
+fn portable_io_error(kind: io::ErrorKind) -> io::Error {
+    io::Error::new(
+        kind,
+        "provider operation",
+        Option::Some("provider context"),
+        Option::Some(37),
+        "provider io failure",
+    )
+}
+
+impl FileSystem for PortableFs {
+    type Handle = PortableFile;
+
+    fn open(self: PortableFs, name: string) -> Result[PortableFile, fs::Error] {
+        self.opens.set(self.opens.get() + 1);
+        self.names.push(name);
+        if self.mode == 1 {
+            return Result::Err(portable_fs_error("provider open"))
+        }
+        let position = Ref::new(0);
+        self.positions.push(position);
+        Result::Ok(PortableFile { owner: self, position })
+    }
+}
+
+impl Read for PortableFile {
+    fn read_to_end(self: PortableFile, limit: isize) -> Result[bytes::Bytes, io::Error] {
+        self.owner.overrides.set(self.owner.overrides.get() + 1);
+        Result::Ok(
+            bytes::Bytes::from_string(
+                if limit == 0 {
+                    "oversized"
+                } else {
+                    "fake"
+                },
+            ),
+        )
+    }
+
+    fn read(self: PortableFile, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.owner.reads.set(self.owner.reads.get() + 1);
+        if self.owner.mode == 6 || self.owner.mode == 10 {
+            panic::raise("portable read panic")
+        }
+        if (self.owner.mode >= 3 && self.owner.mode <= 5)
+            || (self.owner.mode == 9 && self.owner.reads.get() == 2) {
+            if output.len() > 0 {
+                output[0] = 200;
+                self.position.set(self.position.get() + 1);
+            }
+            return match self.owner.mode {
+                3 | 9 => Result::Err(portable_io_error(io::ErrorKind::Interrupted)),
+                4 => Result::Ok(-1),
+                _ => Result::Ok(output.len() + 1),
+            }
+        }
+        let mut count = self.owner.data.len() - self.position.get();
+        if count > output.len() {
+            count = output.len();
+        }
+        if count > 2 {
+            count = 2;
+        }
+        for index in 0..count {
+            output[index] = self.owner.data[self.position.get() + index];
+        }
+        self.position.set(self.position.get() + count);
+        Result::Ok(count)
+    }
+}
+
+impl Close for PortableFile {
+    fn close(self: PortableFile) -> Result[(), io::Error] {
+        self.owner.closes.set(self.owner.closes.get() + 1);
+        if self.owner.mode == 8 || self.owner.mode == 10 {
+            panic::raise("portable close panic")
+        }
+        if self.owner.close_fails {
+            Result::Err(portable_io_error(io::ErrorKind::BrokenPipe))
+        } else {
+            Result::Ok(())
+        }
+    }
+}
+
+impl File for PortableFile {
+    fn stat(self: PortableFile) -> Result[fs::Metadata, fs::Error] {
+        self.owner.stats.set(self.owner.stats.get() + 1);
+        if self.owner.mode == 7 {
+            panic::raise("portable stat panic")
+        }
+        if self.owner.mode == 2 {
+            return Result::Err(portable_fs_error("provider stat"))
+        }
+        Result::Ok(
+            fs::Metadata::from_parts(fs::FileType::File, self.owner.data.len().to_i64(), 0o640, 123),
+        )
+    }
+}
+
+fn check_portable_mapped(error: fs::Error, kind: io::ErrorKind, operation: string) -> () {
+    assert_equal(error.kind(), kind);
+    assert_equal(error.operation(), operation);
+    assert_equal(error.path(), Option::Some("entry"));
+    assert_equal(error.raw_os_code(), Option::Some(37));
+    assert_equal(error.message(), "provider io failure");
+}
+
+fn check_fs_portable() -> () {
+    let provider = portable_fs(b"abcdef", 9, true);
+    check_portable_mapped(
+        testing::expect_err(
+            fs::read_file_from(provider, "entry", 6),
+            "failure after confirmed prefix",
+        ),
+        io::ErrorKind::Interrupted,
+        "read file",
+    );
+    assert_equal(provider.reads.get(), 2);
+    assert_equal(provider.positions[0].get(), 3);
+    assert_equal(provider.closes.get(), 1);
+    let provider = portable_fs(b"abc", 10, false);
+    let caught = panic::catch(|| fs::read_file_from(provider, "entry", 3));
+    match caught {
+        Err(error) => assert_equal(error.message(), "portable close panic"),
+        Ok(_) => testing::fail("expected cleanup panic"),
+    }
+    assert_equal(provider.closes.get(), 1);
+    for name in[
+        ".",
+        "a",
+        "a/b",
+        "a\\b",
+        "a:b",
+        "\u0000",
+        "a/\u0000",
+        "界/🙂",
+        ".hidden",
+        "...",
+        "a/..b",
+    ] {
+        testing::assert(fs::valid_path(name));
+        let provider = portable_fs(b"x", 0, false);
+        assert_equal(
+            testing::expect_ok(fs::read_file_from(provider, name, 1), "valid portable path").to_vec(),
+            b"x",
+        );
+        assert_equal(provider.names, Vec::from_array([name]));
+        assert_equal(provider.closes.get(), 1);
+    }
+    for name in["", "/", "/a", "a/", "a//b", "a/./b", "a/../b", "..", "./a", "a/."] {
+        testing::assert(!fs::valid_path(name));
+        let provider = portable_fs(b"abc", 0, false);
+        assert_equal(
+            testing::expect_err(fs::read_file_from(provider, name, 10), "invalid read path").kind(),
+            io::ErrorKind::InvalidInput,
+        );
+        assert_equal(
+            testing::expect_err(fs::stat_from(provider, name), "invalid stat path").kind(),
+            io::ErrorKind::InvalidInput,
+        );
+        assert_equal(provider.opens.get(), 0);
+        assert_equal(provider.closes.get(), 0);
+    }
+    for limit in[-1, -9223372036854775807 - 1] {
+        let provider = portable_fs(b"abc", 0, false);
+        assert_equal(
+            testing::expect_err(fs::read_file_from(provider, "entry", limit), "negative read limit").kind(),
+            io::ErrorKind::InvalidInput,
+        );
+        assert_equal(provider.opens.get(), 0);
+        assert_equal(provider.closes.get(), 0);
+    }
+    for length in 0..9 {
+        for limit in 0..10 {
+            let data = Vec::new();
+            for index in 0..length {
+                data.push(index.to_u8());
+            }
+            let provider = portable_fs(data, 0, false);
+            let result = fs::read_file_from(provider, "entry", limit);
+            if length <= limit {
+                assert_equal(testing::expect_ok(result, "bounded portable read").to_vec(), data);
+                assert_equal(provider.positions[0].get(), length);
+            } else {
+                assert_equal(
+                    testing::expect_err(result, "portable read exceeds limit").kind(),
+                    io::ErrorKind::InvalidData,
+                );
+                assert_equal(provider.positions[0].get(), limit + 1);
+            }
+            assert_equal(provider.opens.get(), 1);
+            assert_equal(provider.closes.get(), 1);
+            assert_equal(provider.stats.get(), 0);
+            assert_equal(provider.overrides.get(), 0);
+        }
+    }
+    for close_fails in[false, true] {
+        let provider = portable_fs(b"abc", 1, close_fails);
+        assert_equal(
+            testing::expect_err(fs::read_file_from(provider, "entry", 3), "open failure read"),
+            portable_fs_error("provider open"),
+        );
+        assert_equal(
+            testing::expect_err(fs::stat_from(provider, "entry"), "open failure stat"),
+            portable_fs_error("provider open"),
+        );
+        assert_equal(provider.closes.get(), 0);
+        assert_equal(provider.reads.get(), 0);
+        let provider = portable_fs(b"abc", 2, close_fails);
+        assert_equal(
+            testing::expect_err(fs::stat_from(provider, "entry"), "stat failure priority"),
+            portable_fs_error("provider stat"),
+        );
+        assert_equal(provider.closes.get(), 1);
+        for mode in 3..6 {
+            let provider = portable_fs(b"abc", mode, close_fails);
+            let error = testing::expect_err(
+                fs::read_file_from(provider, "entry", 3),
+                "read failure priority",
+            );
+            if mode == 3 {
+                check_portable_mapped(error, io::ErrorKind::Interrupted, "read file");
+            } else {
+                assert_equal(error.kind(), io::ErrorKind::InvalidData);
+            }
+            assert_equal(provider.reads.get(), 1);
+            assert_equal(provider.positions[0].get(), 1);
+            assert_equal(provider.closes.get(), 1);
+        }
+    }
+    let provider = portable_fs(b"abc", 0, true);
+    check_portable_mapped(
+        testing::expect_err(fs::read_file_from(provider, "entry", 3), "close read failure"),
+        io::ErrorKind::BrokenPipe,
+        "close file",
+    );
+    check_portable_mapped(
+        testing::expect_err(fs::stat_from(provider, "entry"), "close stat failure"),
+        io::ErrorKind::BrokenPipe,
+        "close file",
+    );
+    assert_equal(provider.closes.get(), 2);
+    let provider = portable_fs(b"abc", 0, false);
+    let first = testing::expect_ok(provider.open("first"), "independent first");
+    let second = testing::expect_ok(provider.open("second"), "independent second");
+    let output = b"?";
+    testing::expect_ok(first.read(output.as_mut_slice()), "first read");
+    assert_equal(provider.positions[0].get(), 1);
+    assert_equal(provider.positions[1].get(), 0);
+    testing::expect_ok(second.read(output.as_mut_slice()), "second read");
+    assert_equal(output, b"a");
+    testing::expect_ok(first.close(), "first close");
+    testing::expect_ok(second.close(), "second close");
+    let metadata = testing::expect_ok(fs::stat_from(provider, "entry"), "portable metadata");
+    assert_equal(metadata.len(), 3.to_i64());
+    assert_equal(metadata.file_type(), fs::FileType::File);
+    assert_equal(metadata.permissions().mode(), 0o640.to_u32());
+    assert_equal(provider.closes.get(), 3);
+    for mode in[6, 7] {
+        let provider = portable_fs(b"abc", mode, true);
+        let caught = panic::catch(
+            || {
+                if mode == 6 {
+                    let _ = fs::read_file_from(provider, "entry", 3);
+                } else {
+                    let _ = fs::stat_from(provider, "entry");
+                }
+            },
+        );
+        testing::assert(caught.is_err());
+        assert_equal(provider.opens.get(), 1);
+        assert_equal(provider.closes.get(), 1);
+    }
+    for inspect in[false, true] {
+        let provider = portable_fs(b"abc", 8, false);
+        let caught = panic::catch(
+            || {
+                if inspect {
+                    let _ = fs::stat_from(provider, "entry");
+                } else {
+                    let _ = fs::read_file_from(provider, "entry", 3);
+                }
+            },
+        );
+        match caught {
+            Err(error) => assert_equal(error.message(), "portable close panic"),
+            Ok(_) => testing::fail("expected close panic"),
+        }
+        assert_equal(provider.closes.get(), 1);
+    }
+    let data: Vec[byte] = Vec::new();
+    for index in 0..16385 {
+        data.push((index % 251).to_u8());
+    }
+    for limit in[16384, 16385, 9223372036854775807] {
+        let provider = portable_fs(data, 0, false);
+        let result = fs::read_file_from(provider, "entry", limit);
+        if limit < data.len() {
+            assert_equal(
+                testing::expect_err(result, "large limit exceeded").kind(),
+                io::ErrorKind::InvalidData,
+            );
+        } else {
+            assert_equal(testing::expect_ok(result, "large bounded read").to_vec(), data);
+        }
+        assert_equal(provider.closes.get(), 1);
+        assert_equal(provider.overrides.get(), 0);
+    }
+}

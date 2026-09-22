@@ -1,0 +1,296 @@
+package main;
+
+use std::fs;
+use fs::{DirectoryEntry, File, FileSystem, ReadDirFile};
+use std::io;
+use io::{Close, Read};
+use std::testing;
+
+struct DirectoryItem {
+    label: string,
+    identity: isize,
+    names: Ref[isize],
+    types: Ref[isize],
+    metadata_calls: Ref[isize],
+}
+
+fn directory_item(label: string, identity: isize) -> DirectoryItem {
+    DirectoryItem {
+        label,
+        identity,
+        names: Ref::new(0),
+        types: Ref::new(0),
+        metadata_calls: Ref::new(0),
+    }
+}
+
+fn directory_missing() -> fs::Error {
+    fs::Error::new(
+        io::ErrorKind::NotFound,
+        "entry metadata",
+        Option::Some("missing"),
+        Option::Some(71),
+        "entry disappeared",
+    )
+}
+
+impl DirectoryEntry for DirectoryItem {
+    fn name(self: DirectoryItem) -> string {
+        self.names.set(self.names.get() + 1);
+        self.label
+    }
+
+    fn file_type(self: DirectoryItem) -> fs::FileType {
+        self.types.set(self.types.get() + 1);
+        fs::FileType::Other
+    }
+
+    fn metadata(self: DirectoryItem) -> Result[fs::Metadata, fs::Error] {
+        self.metadata_calls.set(self.metadata_calls.get() + 1);
+        Result::Err(directory_missing())
+    }
+}
+
+struct DirectoryProvider {
+    entries: Vec[DirectoryItem],
+    chunk: isize,
+    opens: Vec[string],
+    closes: Ref[isize],
+    requests: Vec[isize],
+    returned: Vec[isize],
+}
+
+struct DirectoryHandle {
+    provider: DirectoryProvider,
+    position: Ref[isize],
+}
+
+fn directory_provider(entries: Vec[DirectoryItem], chunk: isize) -> DirectoryProvider {
+    DirectoryProvider {
+        entries,
+        chunk,
+        opens: Vec::new(),
+        closes: Ref::new(0),
+        requests: Vec::new(),
+        returned: Vec::new(),
+    }
+}
+
+impl FileSystem for DirectoryProvider {
+    type Handle = DirectoryHandle;
+
+    fn open(self: DirectoryProvider, name: string) -> Result[DirectoryHandle, fs::Error] {
+        self.opens.push(name);
+        Result::Ok(DirectoryHandle { provider: self, position: Ref::new(0) })
+    }
+}
+
+impl Read for DirectoryHandle {
+    fn read(self: DirectoryHandle, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        testing::fail("directory helper must not read bytes");
+        Result::Ok(0)
+    }
+}
+
+impl Close for DirectoryHandle {
+    fn close(self: DirectoryHandle) -> Result[(), io::Error] {
+        self.provider.closes.set(self.provider.closes.get() + 1);
+        Result::Ok(())
+    }
+}
+
+impl File for DirectoryHandle {
+    fn stat(self: DirectoryHandle) -> Result[fs::Metadata, fs::Error] {
+        testing::fail("directory helper must not stat its handle");
+        Result::Ok(fs::Metadata::from_parts(fs::FileType::Directory, 0, 0, 0))
+    }
+}
+
+impl ReadDirFile for DirectoryHandle {
+    type Entry = DirectoryItem;
+
+    fn read_dir(self: DirectoryHandle, amount: isize) -> Result[
+        Vec[DirectoryItem],
+        fs::ReadDirError[DirectoryItem],
+    ] {
+        testing::assert(amount > 0 && amount <= 128);
+        self.provider.requests.push(amount);
+        let remaining = self.provider.entries.len() - self.position.get();
+        let mut count = remaining;
+        if count > amount {
+            count = amount;
+        }
+        if count > self.provider.chunk {
+            count = self.provider.chunk;
+        }
+        let entries = Vec::new();
+        for offset in 0..count {
+            entries.push(self.provider.entries[self.position.get() + offset]);
+        }
+        self.position.set(self.position.get() + count);
+        self.provider.returned.push(count);
+        Result::Ok(entries)
+    }
+}
+
+fn directory_check_requests(provider: DirectoryProvider, limit: isize) -> () {
+    let mut confirmed = 0;
+    for index in 0..provider.requests.len() {
+        let remaining = limit - confirmed;
+        let expected = if remaining >= 127 {
+            128
+        } else {
+            remaining + 1
+        };
+        assert_equal(provider.requests[index], expected);
+        confirmed += provider.returned[index];
+    }
+}
+
+fn directory_check_lazy(entries: Vec[DirectoryItem], expected_names: isize) -> () {
+    for entry in entries {
+        assert_equal(entry.names.get(), expected_names);
+        assert_equal(entry.types.get(), 0);
+        assert_equal(entry.metadata_calls.get(), 0);
+    }
+}
+
+fn check_fs_directory() -> () {
+    for chunk in[1, 2, 128] {
+        for length in[0, 1, 2, 127, 128, 129, 257] {
+            for extra in[0, 1] {
+                let source = Vec::new();
+                for identity in 0..length {
+                    source.push(directory_item("entry", identity));
+                }
+                let provider = directory_provider(source, chunk);
+                let limit = length + extra;
+                let entries = testing::expect_ok(
+                    fs::read_dir_from(provider, ".", limit),
+                    "directory exact or spare limit",
+                );
+                assert_equal(entries.len(), length);
+                for index in 0..length {
+                    assert_equal(entries[index].identity, index);
+                }
+                assert_equal(provider.opens, Vec::from_array(["."]));
+                assert_equal(provider.closes.get(), 1);
+                assert_equal(provider.returned[provider.returned.len() - 1], 0);
+                directory_check_requests(provider, limit);
+                directory_check_lazy(source, 1);
+            }
+        }
+    }
+    let source = Vec::new();
+    for identity in 0..259 {
+        source.push(directory_item("entry", identity));
+    }
+    let provider = directory_provider(source, 128);
+    let entries = testing::expect_ok(
+        fs::read_dir_from(provider, "max", 9223372036854775807),
+        "maximum directory limit",
+    );
+    assert_equal(entries.len(), 259);
+    assert_equal(provider.requests, Vec::from_array([128, 128, 128, 128]));
+    assert_equal(provider.returned, Vec::from_array([128, 128, 3, 0]));
+    assert_equal(provider.closes.get(), 1);
+    directory_check_lazy(source, 1);
+    let source = Vec::new();
+    let labels = Vec::from_array(["界", "z", "é", "a", "🙂", "a", "Z", "界"]);
+    for identity in 0..labels.len() {
+        source.push(directory_item(labels[identity], identity));
+    }
+    let provider = directory_provider(source, 2);
+    let first = testing::expect_ok(fs::SubFs::new(provider, "outer"), "first directory subfs");
+    let second = testing::expect_ok(fs::SubFs::new(first, "middle"), "second directory subfs");
+    let third = testing::expect_ok(fs::SubFs::new(second, "inner"), "third directory subfs");
+    let entries = testing::expect_ok(
+        fs::read_dir_from(third, "children", 8),
+        "nested directory provider",
+    );
+    assert_equal(provider.opens, Vec::from_array(["outer/middle/inner/children"]));
+    assert_equal(provider.closes.get(), 1);
+    let expected = Vec::from_array([6, 3, 5, 1, 2, 0, 7, 4]);
+    for position in 0..expected.len() {
+        assert_equal(entries[position].identity, expected[position]);
+    }
+    directory_check_lazy(source, 1);
+    assert_equal(entries[0].name(), "Z");
+    assert_equal(entries[0].file_type(), fs::FileType::Other);
+    assert_equal(
+        testing::expect_err(entries[0].metadata(), "lazy disappearing entry").kind(),
+        io::ErrorKind::NotFound,
+    );
+    assert_equal(entries[0].metadata_calls.get(), 1);
+    for path in["", "/", "../a", "a/..", "a//b", "a/./b", "a/"] {
+        let provider = directory_provider(Vec::new(), 1);
+        let error = testing::expect_err(
+            fs::read_dir_from(provider, path, 0),
+            "invalid directory path",
+        );
+        assert_equal(error.error().kind(), io::ErrorKind::InvalidInput);
+        assert_equal(error.entries().len(), 0);
+        assert_equal(provider.opens.len(), 0);
+        assert_equal(provider.requests.len(), 0);
+        assert_equal(provider.closes.get(), 0);
+    }
+    for limit in[-1, -9223372036854775807 - 1] {
+        let provider = directory_provider(Vec::new(), 1);
+        let error = testing::expect_err(
+            fs::read_dir_from(provider, ".", limit),
+            "negative directory limit",
+        );
+        assert_equal(error.error().kind(), io::ErrorKind::InvalidInput);
+        assert_equal(provider.opens.len(), 0);
+        assert_equal(provider.requests.len(), 0);
+        assert_equal(provider.closes.get(), 0);
+    }
+    for chunk in[1, 2, 128] {
+        for limit in[0, 1, 127, 128, 129] {
+            let source = Vec::new();
+            for identity in 0..limit + 3 {
+                source.push(directory_item("entry", identity));
+            }
+            let provider = directory_provider(source, chunk);
+            let error = testing::expect_err(
+                fs::read_dir_from(provider, ".", limit),
+                "directory entry limit exceeded",
+            );
+            assert_equal(error.error().kind(), io::ErrorKind::InvalidData);
+            assert_equal(error.entries().len(), limit);
+            for index in 0..limit {
+                assert_equal(error.entries()[index].identity, index);
+            }
+            assert_equal(provider.closes.get(), 1);
+            directory_check_requests(provider, limit);
+            let mut consumed = 0;
+            for count in provider.returned {
+                consumed += count;
+                testing::assert(count > 0);
+            }
+            assert_equal(consumed, limit + 1);
+        }
+    }
+    let provider = directory_provider(
+        Vec::from_array([directory_item("z", 0), directory_item("b", 1), directory_item("a", 2)]),
+        128,
+    );
+    let error = testing::expect_err(fs::read_dir_from(provider, ".", 2), "truncate before sorting");
+    assert_equal(error.entries().len(), 2);
+    assert_equal(error.entries()[0].identity, 1);
+    assert_equal(error.entries()[1].identity, 0);
+    assert_equal(provider.requests, Vec::from_array([3]));
+    assert_equal(provider.closes.get(), 1);
+    let original = Vec::from_array([directory_item("snapshot", 11)]);
+    let error = fs::ReadDirError::new(original, directory_missing());
+    original[0] = directory_item("replacement", 22);
+    original.push(directory_item("extra", 33));
+    assert_equal(error.entries().len(), 1);
+    assert_equal(error.entries()[0].identity, 11);
+    assert_equal(error.error().kind(), io::ErrorKind::NotFound);
+    assert_equal(error.error().operation(), "entry metadata");
+    assert_equal(error.error().path(), Option::Some("missing"));
+    assert_equal(error.error().raw_os_code(), Option::Some(71));
+    assert_equal(error.error().message(), "entry disappeared");
+    testing::assert(error.to_string().contains("entry disappeared"));
+}

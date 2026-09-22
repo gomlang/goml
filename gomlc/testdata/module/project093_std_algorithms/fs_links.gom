@@ -1,0 +1,215 @@
+package main;
+
+use std::fs;
+use fs::{FileSystem, LinkFileSystem};
+use std::io;
+use std::testing;
+
+struct LinkProbeFs {
+    base: WalkProbeFs,
+    attempts: Ref[isize],
+    calls: Vec[string],
+    target: string,
+    fails: bool,
+}
+
+fn link_probe(target: string, fails: bool) -> LinkProbeFs {
+    LinkProbeFs {
+        base: walk_probe_fs(Vec::new()),
+        attempts: Ref::new(0),
+        calls: Vec::new(),
+        target,
+        fails,
+    }
+}
+
+fn link_probe_error() -> fs::Error {
+    fs::Error::new(
+        io::ErrorKind::Interrupted,
+        "provider link",
+        Option::Some("original/provider/path"),
+        Option::Some(47),
+        "original link error",
+    )
+}
+
+fn link_probe_validate(source: LinkProbeFs, operation: string, name: string) -> Result[
+    (),
+    fs::Error,
+] {
+    source.attempts.set(source.attempts.get() + 1);
+    if !fs::valid_path(name) {
+        return Result::Err(
+            fs::Error::new(
+                io::ErrorKind::InvalidInput,
+                operation,
+                Option::Some(name),
+                Option::None,
+                "invalid provider path",
+            ),
+        )
+    }
+    source.calls.push(operation + ":" + name);
+    if source.fails {
+        Result::Err(link_probe_error())
+    } else {
+        Result::Ok(())
+    }
+}
+
+impl FileSystem for LinkProbeFs {
+    type Handle = WalkProbeHandle;
+
+    fn open(self: LinkProbeFs, name: string) -> Result[WalkProbeHandle, fs::Error] {
+        self.base.open(name)
+    }
+}
+
+impl LinkFileSystem for LinkProbeFs {
+    fn read_link(self: LinkProbeFs, name: string) -> Result[string, fs::Error] {
+        link_probe_validate(self, "read link", name)?;
+        Result::Ok(self.target)
+    }
+
+    fn symlink_metadata(self: LinkProbeFs, name: string) -> Result[fs::Metadata, fs::Error] {
+        link_probe_validate(self, "symlink metadata", name)?;
+        Result::Ok(
+            fs::Metadata::from_parts(
+                fs::FileType::Symlink,
+                self.target.byte_len().to_i64(),
+                0o777,
+                123,
+            ),
+        )
+    }
+}
+
+fn link_static_target[F: LinkFileSystem](filesystem: F, name: string) -> Result[string, fs::Error] {
+    filesystem.read_link(name)
+}
+
+fn check_link_input(error: fs::Error, operation: string, name: string) -> () {
+    assert_equal(error.kind(), io::ErrorKind::InvalidInput);
+    assert_equal(error.operation(), operation);
+    assert_equal(error.path(), Option::Some(name));
+    assert_equal(error.raw_os_code(), Option::None);
+}
+
+fn check_fs_links() -> () {
+    for target in["/absolute/target", "../../outside", "a/../b", "", "a\\b", "界/🙂", "\u0000"] {
+        let source = link_probe(target, false);
+        assert_equal(
+            testing::expect_ok(link_static_target(source, "link"), "static link trait"),
+            target,
+        );
+        assert_equal(
+            testing::expect_ok(fs::read_link_from(source, "link"), "read link helper"),
+            target,
+        );
+        let metadata = testing::expect_ok(
+            fs::symlink_metadata_from(source, "link"),
+            "link metadata",
+        );
+        assert_equal(metadata.file_type(), fs::FileType::Symlink);
+        assert_equal(metadata.len(), target.byte_len().to_i64());
+        assert_equal(metadata.permissions().mode(), 0o777.to_u32());
+        assert_equal(metadata.modified_unix_nanoseconds(), 123);
+        assert_equal(source.attempts.get(), 3);
+        assert_equal(source.base.events.len(), 0);
+        assert_equal(source.base.active.get(), 0);
+    }
+    let source = link_probe("../unchanged", false);
+    let outer = testing::expect_ok(fs::SubFs::new(source, "outer"), "link outer");
+    let middle = testing::expect_ok(fs::SubFs::new(outer, "middle"), "link middle");
+    let nested = testing::expect_ok(fs::SubFs::new(middle, "inner"), "link inner");
+    assert_equal(
+        testing::expect_ok(link_static_target(nested, "leaf"), "nested direct link"),
+        "../unchanged",
+    );
+    assert_equal(
+        testing::expect_ok(fs::read_link_from(nested, "."), "nested root link"),
+        "../unchanged",
+    );
+    assert_equal(
+        testing::expect_ok(fs::symlink_metadata_from(nested, "leaf"), "nested metadata").file_type(),
+        fs::FileType::Symlink,
+    );
+    let identity = testing::expect_ok(fs::SubFs::new(nested, "."), "identity link root");
+    testing::expect_ok(identity.symlink_metadata("."), "direct identity metadata");
+    assert_equal(
+        source.calls,
+        Vec::from_array(
+            [
+                "read link:outer/middle/inner/leaf",
+                "read link:outer/middle/inner",
+                "symlink metadata:outer/middle/inner/leaf",
+                "symlink metadata:outer/middle/inner",
+            ],
+        ),
+    );
+    for invalid in["", "/", "/leaf", "..", "./leaf", "a/..", "a//b", "a/", "a/./b"] {
+        let before = source.attempts.get();
+        check_link_input(
+            testing::expect_err(fs::read_link_from(source, invalid), "helper invalid link"),
+            "read link",
+            invalid,
+        );
+        check_link_input(
+            testing::expect_err(
+                fs::symlink_metadata_from(source, invalid),
+                "helper invalid metadata",
+            ),
+            "symlink metadata",
+            invalid,
+        );
+        check_link_input(
+            testing::expect_err(nested.read_link(invalid), "subfs invalid link"),
+            "read link",
+            invalid,
+        );
+        check_link_input(
+            testing::expect_err(nested.symlink_metadata(invalid), "subfs invalid metadata"),
+            "symlink metadata",
+            invalid,
+        );
+        assert_equal(source.attempts.get(), before);
+        check_link_input(
+            testing::expect_err(source.read_link(invalid), "provider direct invalid link"),
+            "read link",
+            invalid,
+        );
+        check_link_input(
+            testing::expect_err(
+                source.symlink_metadata(invalid),
+                "provider direct invalid metadata",
+            ),
+            "symlink metadata",
+            invalid,
+        );
+        assert_equal(source.attempts.get(), before + 2);
+    }
+    assert_equal(source.calls.len(), 4);
+    assert_equal(source.base.events.len(), 0);
+    for name in[".", "a\\b", "C:name", "\u0000", "界/🙂"] {
+        assert_equal(
+            testing::expect_ok(fs::read_link_from(nested, name), "logical link name"),
+            "../unchanged",
+        );
+    }
+    let source = link_probe("unused", true);
+    let nested = testing::expect_ok(fs::SubFs::new(source, "root"), "failing link namespace");
+    assert_equal(
+        testing::expect_err(fs::read_link_from(nested, "leaf"), "original link error"),
+        link_probe_error(),
+    );
+    assert_equal(
+        testing::expect_err(fs::symlink_metadata_from(nested, "leaf"), "original metadata error"),
+        link_probe_error(),
+    );
+    assert_equal(
+        source.calls,
+        Vec::from_array(["read link:root/leaf", "symlink metadata:root/leaf"]),
+    );
+    assert_equal(source.attempts.get(), 2);
+    assert_equal(source.base.events.len(), 0);
+}
