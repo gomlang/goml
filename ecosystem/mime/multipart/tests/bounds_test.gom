@@ -1,0 +1,117 @@
+package tests;
+
+use ecosystem::mime::multipart;
+use multipart::{ErrorKind, Limits, Reader};
+use std::bytes;
+use std::io;
+use io::Read;
+use std::testing;
+
+fn drain[R: Read](reader: Reader[R]) -> Result[bytes::Bytes, multipart::Error] {
+    let output = bytes::Bytes::new();
+    let scratch = bytes::Bytes::from_vec(Vec::from_array([0.to_u8(), 0.to_u8()]));
+    loop {
+        let count = reader.read_body_chunk(scratch.as_mut_slice())?;
+        if count == 0 {
+            return Result::Ok(output)
+        }
+        output.extend_from_slice(scratch.slice(0, count));
+    }
+}
+
+#[test]
+fn multipart_reader_enforces_preamble_header_body_and_part_quotas() -> () {
+    let wire = bytes::Bytes::from_vec(b"pre\r\n--x\r\nA: one\r\n\r\nabc\r\n--x--\r\n");
+    let reader = testing::expect_ok(
+        Reader::new(
+            io::Cursor::new(wire),
+            "x",
+            Limits { max_preamble_bytes: 5, ..Limits::standard() },
+        ),
+        "preamble exact",
+    );
+    testing::assert_some(testing::expect_ok(reader.next_part(), "part"));
+    testing::assert(testing::expect_ok(drain(reader), "body").to_vec() == b"abc");
+    testing::assert_none(testing::expect_ok(reader.next_part(), "done"));
+    for limits in Vec::from_array(
+        [
+            Limits { max_preamble_bytes: 4, ..Limits::standard() },
+            Limits { max_header_bytes: 9, ..Limits::standard() },
+            Limits { max_headers: 0, ..Limits::standard() },
+            Limits { max_line_bytes: 5, ..Limits::standard() },
+            Limits { max_parts: 0, ..Limits::standard() },
+        ],
+    ) {
+        let reader = testing::expect_ok(Reader::new(io::Cursor::new(wire), "x", limits), "reader");
+        testing::assert_eq(testing::expect_err(reader.next_part(), "limit").kind, ErrorKind::Limit);
+    }
+    let reader = testing::expect_ok(
+        Reader::new(io::Cursor::new(wire), "x", Limits { max_part_bytes: 2, ..Limits::standard() }),
+        "body limit reader",
+    );
+    testing::assert_some(testing::expect_ok(reader.next_part(), "part"));
+    testing::assert_eq(testing::expect_err(drain(reader), "body limit").kind, ErrorKind::Limit);
+}
+
+#[test]
+fn multipart_reader_rejects_truncated_and_invalid_framing() -> () {
+    for wire in Vec::from_array(
+        [
+            bytes::Bytes::from_vec(b"--x\r\n\r\nbody"),
+            bytes::Bytes::from_vec(b"--x\r\n\r\nbody\r\n--x"),
+            bytes::Bytes::from_vec(b"--x\r\n\r\nbody\r\n--x--oops"),
+        ],
+    ) {
+        let reader = testing::expect_ok(
+            Reader::new(io::Cursor::new(wire), "x", Limits::standard()),
+            "reader",
+        );
+        testing::assert_some(testing::expect_ok(reader.next_part(), "part"));
+        testing::assert_eq(
+            testing::expect_err(drain(reader), "truncated").kind,
+            ErrorKind::Truncated,
+        );
+    }
+    for wire in Vec::from_array(
+        [
+            bytes::Bytes::from_vec(b"--x\n\r\n"),
+            bytes::Bytes::from_vec(b"--x\r\n bad\r\n\r\n"),
+            bytes::Bytes::from_vec(b"--x\r\nBad Header: value\r\n\r\n"),
+        ],
+    ) {
+        let reader = testing::expect_ok(
+            Reader::new(io::Cursor::new(wire), "x", Limits::standard()),
+            "reader",
+        );
+        testing::assert_eq(
+            testing::expect_err(reader.next_part(), "invalid").kind,
+            ErrorKind::Invalid,
+        );
+        testing::assert_eq(
+            testing::expect_err(reader.next_part(), "terminal").kind,
+            ErrorKind::Closed,
+        );
+    }
+}
+
+struct FailingReader {
+    calls: Ref[isize],
+}
+
+impl Read for FailingReader {
+    fn read(self: FailingReader, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        Result::Err(
+            io::Error::new(io::ErrorKind::Other, "read", Option::None, Option::None, "failed"),
+        )
+    }
+}
+
+#[test]
+fn multipart_reader_provider_failure_is_terminal() -> () {
+    let source = FailingReader { calls: Ref::new(0) };
+    let reader = testing::expect_ok(Reader::new(source, "x", Limits::standard()), "reader");
+    testing::assert_eq(testing::expect_err(reader.next_part(), "fault").kind, ErrorKind::Io);
+    testing::assert_eq(testing::expect_err(reader.next_part(), "terminal").kind, ErrorKind::Closed);
+    testing::assert_eq(source.calls.get(), 1);
+}

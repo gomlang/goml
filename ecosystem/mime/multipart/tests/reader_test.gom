@@ -1,0 +1,138 @@
+package tests;
+
+use ecosystem::mime::multipart;
+use multipart::{Error, ErrorKind, Limits, Reader, Writer};
+use ecosystem::textproto;
+use std::bytes;
+use std::io;
+use io::Read;
+use std::testing;
+
+struct FragmentedReader {
+    data: bytes::Bytes,
+    position: Ref[isize],
+}
+
+impl Read for FragmentedReader {
+    fn read(self: FragmentedReader, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        if self.position.get() == self.data.len() || output.len() == 0 {
+            return Result::Ok(0)
+        }
+        output[0] = self.data.get(self.position.get());
+        self.position.set(self.position.get() + 1);
+        Result::Ok(1)
+    }
+}
+
+fn body[R: Read](reader: Reader[R], width: isize) -> Result[bytes::Bytes, Error] {
+    let result = bytes::Bytes::new();
+    let scratch = bytes::Bytes::new();
+    for _ in 0..width {
+        scratch.push(0);
+    }
+    loop {
+        let count = reader.read_body_chunk(scratch.as_mut_slice())?;
+        if count == 0 {
+            return Result::Ok(result)
+        }
+        result.extend_from_slice(scratch.slice(0, count));
+    }
+}
+
+#[test]
+fn multipart_reader_streams_fragmented_parts_and_preserves_false_delimiters() -> () {
+    let sink = io::Cursor::new(bytes::Bytes::new());
+    let writer = testing::expect_ok(Writer::new(sink, "b", Limits::standard()), "writer");
+    let headers = textproto::Headers::new();
+    testing::assert_ok(headers.append("x-name", bytes::Bytes::from_vec(b"one")));
+    testing::assert_ok(writer.begin_part(headers));
+    let first = bytes::Bytes::from_vec(b"a\r\n--bX\r\nz");
+    for byte in first.as_slice() {
+        testing::assert_ok(writer.write_body_chunk(Vec::from_array([byte]).as_slice()));
+    }
+    testing::assert_ok(writer.begin_part(textproto::Headers::new()));
+    let second = bytes::Bytes::from_vec(Vec::from_array([0.to_u8(), 255.to_u8(), 13.to_u8()]));
+    testing::assert_ok(writer.write_body_chunk(second.as_slice()));
+    testing::assert_ok(writer.finish());
+    for width in Vec::from_array([1, 3, 16]) {
+        let reader = testing::expect_ok(
+            Reader::new(
+                FragmentedReader { data: sink.bytes(), position: Ref::new(0) },
+                "b",
+                Limits::standard(),
+            ),
+            "reader",
+        );
+        let headers = testing::expect_some(testing::expect_ok(reader.next_part(), "first"), "part");
+        testing::assert(headers.values("X-Name")[0].to_vec() == b"one");
+        testing::assert_eq(
+            testing::expect_err(reader.next_part(), "body active").kind,
+            ErrorKind::State,
+        );
+        testing::assert(
+            testing::expect_ok(body(reader, width), "first body").to_vec() == first.to_vec(),
+        );
+        testing::assert_some(testing::expect_ok(reader.next_part(), "second"));
+        testing::assert(
+            testing::expect_ok(body(reader, width), "second body").to_vec() == second.to_vec(),
+        );
+        testing::assert_none(testing::expect_ok(reader.next_part(), "done"));
+        testing::assert_eq(reader.body_bytes(), first.len() + second.len());
+        testing::assert_eq(reader.part_count(), 2);
+    }
+}
+
+#[test]
+fn multipart_reader_accepts_bounded_preamble_and_empty_message() -> () {
+    let wire = bytes::Bytes::from_vec(b"preamble\r\n--x\r\n\r\nhello\r\n--x--\r\nepilogue");
+    let reader = testing::expect_ok(
+        Reader::new(io::Cursor::new(wire), "x", Limits::standard()),
+        "reader",
+    );
+    testing::assert_some(testing::expect_ok(reader.next_part(), "part"));
+    testing::assert(testing::expect_ok(body(reader, 2), "body").to_vec() == b"hello");
+    testing::assert_none(testing::expect_ok(reader.next_part(), "done"));
+    let reader = testing::expect_ok(
+        Reader::new(io::Cursor::new(bytes::Bytes::from_vec(b"--x--\r\n")), "x", Limits::standard()),
+        "empty reader",
+    );
+    testing::assert_none(testing::expect_ok(reader.next_part(), "empty"));
+    let reader = testing::expect_ok(
+        Reader::new(io::Cursor::new(bytes::Bytes::from_vec(b"--x--")), "x", Limits::standard()),
+        "empty EOF reader",
+    );
+    testing::assert_none(testing::expect_ok(reader.next_part(), "empty EOF"));
+}
+
+#[test]
+fn multipart_large_body_streams_with_partial_boundary_prefixes() -> () {
+    let source = bytes::Bytes::new();
+    for _ in 0..2048 {
+        source.extend_from_slice(b"payload\r\n--boundaryX".as_slice());
+    }
+    let sink = io::Cursor::new(bytes::Bytes::new());
+    let writer = testing::expect_ok(Writer::new(sink, "boundary", Limits::standard()), "writer");
+    testing::assert_ok(writer.begin_part(textproto::Headers::new()));
+    testing::assert_ok(writer.write_body_chunk(source.as_slice()));
+    testing::assert_ok(writer.finish());
+    let reader = testing::expect_ok(
+        Reader::new(io::Cursor::new(sink.bytes()), "boundary", Limits::standard()),
+        "reader",
+    );
+    testing::assert_some(testing::expect_ok(reader.next_part(), "part"));
+    testing::assert(testing::expect_ok(body(reader, 8192), "body").to_vec() == source.to_vec());
+    testing::assert_none(testing::expect_ok(reader.next_part(), "done"));
+}
+
+#[test]
+fn multipart_reader_unfolds_headers_and_accepts_closing_eof() -> () {
+    let wire = bytes::Bytes::from_vec(b"--x\r\nX-Note: one\r\n\t two \r\n\r\nhi\r\n--x--");
+    let reader = testing::expect_ok(
+        Reader::new(io::Cursor::new(wire), "x", Limits::standard()),
+        "reader",
+    );
+    let headers = testing::expect_some(testing::expect_ok(reader.next_part(), "part"), "headers");
+    testing::assert(headers.values("x-note")[0].to_vec() == b"one two");
+    testing::assert(testing::expect_ok(body(reader, 1), "body").to_vec() == b"hi");
+    testing::assert_none(testing::expect_ok(reader.next_part(), "done"));
+}
