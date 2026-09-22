@@ -3,7 +3,7 @@ package tests;
 use ecosystem::csv;
 use std::bytes;
 use std::io;
-use io::{Read, Write};
+use io::{Read, Write, WriteAt};
 use std::testing;
 use std::utf8;
 
@@ -30,6 +30,7 @@ struct Chunks {
     fail_after: isize,
     calls: Ref[isize],
     interrupt: Ref[bool],
+    interrupt_after: isize,
 }
 
 fn chunks(input: string, chunk: isize) -> Chunks {
@@ -40,6 +41,7 @@ fn chunks(input: string, chunk: isize) -> Chunks {
         fail_after: -1,
         calls: Ref::new(0),
         interrupt: Ref::new(false),
+        interrupt_after: -1,
     }
 }
 
@@ -56,8 +58,12 @@ fn failure(operation: string) -> io::Error {
 impl Read for Chunks {
     fn read(self: Chunks, output: MutSlice[byte]) -> Result[isize, io::Error] {
         self.calls.set(self.calls.get() + 1);
-        if self.interrupt.get() {
+        if self.interrupt.get() || self.offset.get() == self.interrupt_after {
             self.interrupt.set(false);
+            if self.offset.get() < self.data.len() && output.len() > 0 {
+                output[0] = self.data[self.offset.get()];
+                self.offset.set(self.offset.get() + 1);
+            }
             return Result::Err(
                 io::Error::new(
                     io::ErrorKind::Interrupted,
@@ -96,6 +102,7 @@ struct Sink {
     calls: Ref[isize],
     interrupt: Ref[bool],
     flush_error: bool,
+    flushes: Ref[isize],
 }
 
 fn sink(chunk: isize) -> Sink {
@@ -106,6 +113,7 @@ fn sink(chunk: isize) -> Sink {
         calls: Ref::new(0),
         interrupt: Ref::new(false),
         flush_error: false,
+        flushes: Ref::new(0),
     }
 }
 
@@ -141,6 +149,7 @@ impl Write for Sink {
     }
 
     fn flush(self: Sink) -> Result[(), io::Error] {
+        self.flushes.set(self.flushes.get() + 1);
         if self.flush_error {
             Result::Err(failure("flush"))
         } else {
@@ -393,7 +402,7 @@ fn limits_cover_fields_wire_bytes_columns_records_and_total_input() -> () {
 
 #[test]
 fn stream_errors_preserve_completed_rows_and_partial_error_position_and_are_sticky() -> () {
-    let source = Chunks { fail_after: 6, interrupt: Ref::new(true), ..chunks("one\nsecond", 2) };
+    let source = Chunks { fail_after: 6, ..chunks("one\nsecond", 2) };
     let reader = ok(
         csv::Reader::new(source, csv::ReadOptions { buffer_size: 2, ..csv::ReadOptions::new() }),
     );
@@ -410,6 +419,44 @@ fn stream_errors_preserve_completed_rows_and_partial_error_position_and_are_stic
     let reader = ok(csv::Reader::new(source, csv::ReadOptions::new()));
     testing::assert_eq(one(reader).values()[0], "a");
     kind(reader.next(), csv::ErrorKind::Io);
+}
+
+#[test]
+fn interrupted_reads_stop_after_unconfirmed_source_progress() -> () {
+    for confirmed in[0, 2] {
+        let source = Chunks { interrupt_after: confirmed, ..chunks("abcd\n", 1) };
+        let reader = ok(
+            csv::Reader::new(source, csv::ReadOptions { buffer_size: 1, ..csv::ReadOptions::new() }),
+        );
+        let failure = kind(reader.next(), csv::ErrorKind::Io);
+        let cause = testing::expect_some(failure.cause, "interrupted CSV cause");
+        testing::assert_eq(cause.kind(), io::ErrorKind::Interrupted);
+        testing::assert_eq(failure.position.byte, confirmed);
+        testing::assert_eq(source.offset.get(), confirmed + 1);
+        testing::assert_eq(source.calls.get(), confirmed + 1);
+        let repeated = kind(reader.next(), csv::ErrorKind::Io);
+        testing::assert_eq(repeated.position, failure.position);
+        testing::assert_eq(
+            testing::expect_some(repeated.cause, "saved CSV cause").to_string(),
+            cause.to_string(),
+        );
+        testing::assert_eq(source.calls.get(), confirmed + 1);
+    }
+    let source = Chunks { interrupt_after: 2, ..chunks("a\r\nx", 1) };
+    let reader = ok(
+        csv::Reader::new(source, csv::ReadOptions { buffer_size: 1, ..csv::ReadOptions::new() }),
+    );
+    testing::assert_eq(one(reader).values()[0], "a");
+    let failure = kind(reader.next(), csv::ErrorKind::Io);
+    testing::assert_eq(failure.position.byte, 2);
+    testing::assert_eq(
+        testing::expect_some(failure.cause, "deferred CR interruption").kind(),
+        io::ErrorKind::Interrupted,
+    );
+    testing::assert_eq(source.calls.get(), 3);
+    testing::assert_eq(source.offset.get(), 3);
+    kind(reader.next(), csv::ErrorKind::Io);
+    testing::assert_eq(source.calls.get(), 3);
 }
 
 #[test]
@@ -463,7 +510,7 @@ fn writer_roundtrips_all_quote_newline_unicode_and_dialect_combinations() -> () 
 
 #[test]
 fn writer_partial_io_errors_and_flush_failures_fuse_without_replaying_bytes() -> () {
-    let output = Sink { fail_after: 4, interrupt: Ref::new(true), ..sink(1) };
+    let output = Sink { fail_after: 4, ..sink(1) };
     let writer = ok(csv::Writer::new(output, csv::WriteOptions::new()));
     let invalid = kind(
         writer.write(csv::StringRecord::new(Vec::from_array(["abcdef"]))),
@@ -482,6 +529,96 @@ fn writer_partial_io_errors_and_flush_failures_fuse_without_replaying_bytes() ->
     );
     kind(flushing.flush(), csv::ErrorKind::Io);
     kind(flushing.write(csv::StringRecord::new(Vec::from_array(["a"]))), csv::ErrorKind::Io);
+}
+
+fn check_interrupted_csv[W: Write](writer: csv::Writer[W]) -> () {
+    let failure = kind(
+        writer.write(csv::StringRecord::new(Vec::from_array(["abcdef"]))),
+        csv::ErrorKind::Io,
+    );
+    testing::assert_eq(failure.position.byte, 0);
+    testing::assert_eq(writer.position(), failure.position);
+    testing::assert_eq(
+        testing::expect_some(failure.cause, "interruption cause").kind(),
+        io::ErrorKind::Interrupted,
+    );
+    let repeated = kind(
+        writer.write(csv::StringRecord::new(Vec::from_array(["retry"]))),
+        csv::ErrorKind::Io,
+    );
+    testing::assert_eq(repeated.position, failure.position);
+    testing::assert_eq(
+        testing::expect_some(repeated.cause, "saved interruption").kind(),
+        io::ErrorKind::Interrupted,
+    );
+    let flushed = kind(writer.flush(), csv::ErrorKind::Io);
+    testing::assert_eq(flushed.position, failure.position);
+    testing::assert_eq(
+        testing::expect_some(flushed.cause, "saved flush interruption").kind(),
+        io::ErrorKind::Interrupted,
+    );
+}
+
+struct InterruptedCsvAt {
+    cursor: io::Cursor,
+    calls: Ref[isize],
+}
+
+impl WriteAt for InterruptedCsvAt {
+    fn write_at(self: InterruptedCsvAt, input: Slice[byte], offset: isize) -> Result[
+        isize,
+        io::TransferError,
+    ] {
+        self.calls.set(self.calls.get() + 1);
+        let count = self.cursor.write_at(input.sub(0, 1), offset)?;
+        Result::Err(
+            io::TransferError::new(
+                count.to_usize(),
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "CSV test write",
+                    Option::None,
+                    Option::None,
+                    "interrupted after a side effect",
+                ),
+            ),
+        )
+    }
+}
+
+#[test]
+fn interrupted_writers_fuse_without_replaying_composite_side_effects() -> () {
+    let output = Sink { interrupt: Ref::new(true), ..sink(1) };
+    check_interrupted_csv(ok(csv::Writer::new(output, csv::WriteOptions::new())));
+    testing::assert_eq(output.calls.get(), 1);
+    testing::assert(output.data.is_empty());
+    testing::assert_eq(output.flushes.get(), 0);
+    let first = sink(1024);
+    let second = Sink { interrupt: Ref::new(true), ..sink(1024) };
+    let destinations = Vec::from_array([first, second]);
+    let output = io::MultiWriter::new(destinations.as_slice());
+    check_interrupted_csv(ok(csv::Writer::new(output, csv::WriteOptions::new())));
+    testing::assert_eq(first.calls.get(), 1);
+    testing::assert_eq(second.calls.get(), 1);
+    testing::assert_eq(
+        testing::expect_ok(utf8::decode(first.data), "first destination"),
+        "abcdef\r\n",
+    );
+    testing::assert(second.data.is_empty());
+    testing::assert_eq(first.flushes.get(), 0);
+    testing::assert_eq(second.flushes.get(), 0);
+    let destination = InterruptedCsvAt {
+        cursor: io::Cursor::new(bytes::Bytes::new()),
+        calls: Ref::new(0),
+    };
+    let output = testing::expect_ok(io::OffsetWriter::new(destination, 0), "CSV offset writer");
+    check_interrupted_csv(ok(csv::Writer::new(output, csv::WriteOptions::new())));
+    testing::assert_eq(destination.calls.get(), 1);
+    testing::assert_eq(output.position(), 1);
+    testing::assert_eq(
+        testing::expect_ok(utf8::decode(destination.cursor.bytes().to_vec()), "partial destination"),
+        "a",
+    );
 }
 
 #[test]
