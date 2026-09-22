@@ -1,0 +1,869 @@
+package num;
+
+pub enum FloatNotation {
+    Fixed,
+    Scientific,
+    ScientificUpper,
+    General,
+    GeneralUpper,
+}
+
+fn trim_decimal_digits(digits: Vec[byte]) -> () {
+    while digits.len() > 1 && digits[digits.len() - 1] == 0 {
+        digits.truncate(digits.len() - 1);
+    }
+}
+
+fn next_decimal_digits(digits: Vec[byte], point: isize) -> (Vec[byte], isize) {
+    let mut index = digits.len();
+    while index > 0 {
+        index -= 1;
+        if digits[index] < 9 {
+            digits[index] += 1;
+            return (digits, point)
+        }
+        digits[index] = 0;
+    };
+    (Vec::from_array([1.to_u8()]), point + 1)
+}
+
+fn decimal_candidate_matches(value: string, bits: u64, single: bool) -> bool {
+    if single {
+        let (valid, parsed) = string_parse_float32(value);
+        valid && float32_to_bits(float64_to_float32(parsed)).to_u64() == bits
+    } else {
+        let (valid, parsed) = string_parse_float64(value);
+        valid && float64_to_bits(parsed) == bits
+    }
+}
+
+fn shortest_decimal_digits(exact: Vec[byte], point: isize, negative: bool, bits: u64, single: bool) -> Result[
+    (Vec[byte], isize),
+    FormatFloatError,
+] {
+    let maximum = if single {
+        9
+    } else {
+        17
+    };
+    for count in 1..maximum + 1 {
+        let nearest = fixed_decimal_round(exact.copy(), point, count - point);
+        let keep = if count < exact.len() {
+            count
+        } else {
+            exact.len()
+        };
+        let lower = exact.slice(0, keep).to_vec();
+        let upper = next_decimal_digits(lower.copy(), point);
+        for (digits, candidate_point) in[nearest, (lower, point), upper] {
+            trim_decimal_digits(digits);
+            let candidate = scientific_decimal_format(
+                digits,
+                candidate_point,
+                negative,
+                digits.len() - 1,
+                false,
+                64,
+            )?;
+            if decimal_candidate_matches(candidate, bits, single) {
+                return Result::Ok((digits, candidate_point))
+            }
+        }
+    }
+    Result::Err(FormatFloatError::RoundtripFailure)
+}
+
+fn shortest_float_format(
+    bits: u64,
+    fraction_bits: isize,
+    exponent_bits: isize,
+    bias: isize,
+    notation: FloatNotation,
+    limit: isize,
+) -> Result[string, FormatFloatError] {
+    if limit < 0 {
+        return Result::Err(FormatFloatError::InvalidLimit(limit))
+    }
+    let negative = bits & (1 << (fraction_bits + exponent_bits)) != 0;
+    let mask = (1 << exponent_bits) - 1;
+    let encoded_exponent = (bits >> fraction_bits) & mask;
+    let fraction = bits & ((1 << fraction_bits) - 1);
+    if encoded_exponent == mask {
+        let special = if fraction != 0 {
+            "NaN"
+        } else if negative {
+            "-Inf"
+        } else {
+            "+Inf"
+        };
+        return if special.byte_len() <= limit {
+            Result::Ok(special)
+        } else {
+            Result::Err(FormatFloatError::OutputLimit(limit))
+        }
+    }
+    let mantissa = if encoded_exponent == 0 {
+        fraction
+    } else {
+        fraction | (1 << fraction_bits)
+    };
+    let exponent = if encoded_exponent == 0 {
+        1 - bias - fraction_bits
+    } else {
+        encoded_exponent.to_isize() - bias - fraction_bits
+    };
+    let (exact, point) = fixed_decimal_exact(mantissa, exponent);
+    let (digits, point) = if mantissa == 0 {
+        (exact, point)
+    } else {
+        shortest_decimal_digits(exact, point, negative, bits, fraction_bits == 23)?
+    };
+    let (scientific, uppercase) = match notation {
+        FloatNotation::Fixed => (false, false),
+        FloatNotation::Scientific => (true, false),
+        FloatNotation::ScientificUpper => (true, true),
+        FloatNotation::General => (point - 1 < -4 || point - 1 >= 6, false),
+        FloatNotation::GeneralUpper => (point - 1 < -4 || point - 1 >= 6, true),
+    };
+    if scientific {
+        scientific_decimal_format(digits, point, negative, digits.len() - 1, uppercase, limit)
+    } else {
+        let places = if digits.len() > point {
+            digits.len() - point
+        } else {
+            0
+        };
+        render_fixed_decimal(digits, point, negative, places, limit)
+    }
+}
+
+pub fn format_float64_shortest(value: f64, notation: FloatNotation, max_bytes: isize) -> Result[
+    string,
+    FormatFloatError,
+] {
+    shortest_float_format(float64_to_bits(value), 52, 11, 1023, notation, max_bytes)
+}
+
+pub fn format_float32_shortest(value: f32, notation: FloatNotation, max_bytes: isize) -> Result[
+    string,
+    FormatFloatError,
+] {
+    shortest_float_format(float32_to_bits(value).to_u64(), 23, 8, 127, notation, max_bytes)
+}
+
+enum PowerFormat {
+    Binary,
+    Hex(isize, bool),
+}
+
+fn append_float_text(output: Vec[byte], value: string) -> () {
+    for index in 0..value.byte_len() {
+        output.push(value.byte_get(index));
+    }
+}
+
+fn hexadecimal_float(
+    mantissa: u64,
+    exponent: isize,
+    negative: bool,
+    fraction_bits: isize,
+    precision: isize,
+    uppercase: bool,
+    limit: isize,
+) -> Result[string, FormatFloatError] {
+    let mut normalized = mantissa << (52 - fraction_bits);
+    let mut exponent = if mantissa == 0 {
+        0
+    } else {
+        exponent
+    };
+    while normalized != 0 && normalized & (1 << 52) == 0 {
+        normalized = normalized << 1;
+        exponent -= 1;
+    }
+    if precision >= 0 && precision < 13 {
+        let shift = 52 - precision * 4;
+        let remainder = normalized & ((1 << shift) - 1);
+        let half = 1 << (shift - 1);
+        let mut retained = normalized >> shift;
+        if remainder > half || remainder == half && retained & 1 != 0 {
+            retained += 1;
+        }
+        normalized = retained << shift;
+        if normalized & (1 << 53) != 0 {
+            normalized = normalized >> 1;
+            exponent += 1;
+        }
+    }
+    let fraction = normalized & ((1 << 52) - 1);
+    let digits = if precision < 0 {
+        let mut count = 13;
+        let mut rest = fraction;
+        while count > 0 && rest & 15 == 0 {
+            count -= 1;
+            rest = rest >> 4;
+        }
+        count
+    } else {
+        precision
+    };
+    let exponent_text = (if exponent < 0 {
+        0 - exponent
+    } else {
+        exponent
+    }).to_string();
+    let exponent_width = if exponent_text.byte_len() < 2 {
+        2
+    } else {
+        exponent_text.byte_len()
+    };
+    let mut length = 5 + exponent_width
+        + if negative {
+            1
+        } else {
+            0
+        };
+    if length > limit {
+        return Result::Err(FormatFloatError::OutputLimit(limit))
+    }
+    if digits > 0 {
+        if digits >= limit - length {
+            return Result::Err(FormatFloatError::OutputLimit(limit))
+        }
+        length += digits + 1;
+    }
+    let output: Vec[byte] = Vec::with_capacity(length);
+    if negative {
+        output.push(b'-');
+    }
+    append_float_text(
+        output,
+        if uppercase {
+            "0X"
+        } else {
+            "0x"
+        },
+    );
+    output.push(
+        if normalized == 0 {
+            b'0'
+        } else {
+            b'1'
+        },
+    );
+    if digits > 0 {
+        output.push(b'.');
+        let alphabet = if uppercase {
+            "0123456789ABCDEF"
+        } else {
+            "0123456789abcdef"
+        };
+        for index in 0..digits {
+            let digit = if index < 13 {
+                ((fraction >> (48 - index * 4)) & 15).to_isize()
+            } else {
+                0
+            };
+            output.push(alphabet.byte_get(digit));
+        }
+    }
+    output.push(
+        if uppercase {
+            b'P'
+        } else {
+            b'p'
+        },
+    );
+    output.push(
+        if exponent < 0 {
+            b'-'
+        } else {
+            b'+'
+        },
+    );
+    if exponent_text.byte_len() < 2 {
+        output.push(b'0');
+    }
+    append_float_text(output, exponent_text);
+    let (_, result) = string_from_utf8(output);
+    Result::Ok(result)
+}
+
+fn power_float_format(
+    bits: u64,
+    fraction_bits: isize,
+    exponent_bits: isize,
+    bias: isize,
+    style: PowerFormat,
+    limit: isize,
+) -> Result[string, FormatFloatError] {
+    if limit < 0 {
+        return Result::Err(FormatFloatError::InvalidLimit(limit))
+    }
+    if let PowerFormat::Hex(precision, _) = style {
+        if precision < -1 {
+            return Result::Err(FormatFloatError::InvalidPrecision(precision))
+        }
+    }
+    let negative = bits & (1 << (fraction_bits + exponent_bits)) != 0;
+    let mask = (1 << exponent_bits) - 1;
+    let encoded_exponent = (bits >> fraction_bits) & mask;
+    let fraction = bits & ((1 << fraction_bits) - 1);
+    if encoded_exponent == mask {
+        let special = if fraction != 0 {
+            "NaN"
+        } else if negative {
+            "-Inf"
+        } else {
+            "+Inf"
+        };
+        return if special.byte_len() <= limit {
+            Result::Ok(special)
+        } else {
+            Result::Err(FormatFloatError::OutputLimit(limit))
+        }
+    }
+    let mantissa = if encoded_exponent == 0 {
+        fraction
+    } else {
+        fraction | (1 << fraction_bits)
+    };
+    let exponent = if encoded_exponent == 0 {
+        1 - bias
+    } else {
+        encoded_exponent.to_isize() - bias
+    };
+    match style {
+        PowerFormat::Hex(precision, uppercase) => hexadecimal_float(
+            mantissa,
+            exponent,
+            negative,
+            fraction_bits,
+            precision,
+            uppercase,
+            limit,
+        ),
+        PowerFormat::Binary => {
+            let mantissa_text = mantissa.to_string();
+            let exponent = exponent - fraction_bits;
+            let exponent_text = if exponent >= 0 {
+                "+" + exponent.to_string()
+            } else {
+                exponent.to_string()
+            };
+            let sign = if negative {
+                "-"
+            } else {
+                ""
+            };
+            let length = sign.byte_len() + mantissa_text.byte_len() + 1 + exponent_text.byte_len();
+            if length > limit {
+                Result::Err(FormatFloatError::OutputLimit(limit))
+            } else {
+                Result::Ok(sign + mantissa_text + "p" + exponent_text)
+            }
+        },
+    }
+}
+
+pub fn format_float64_binary(value: f64, max_bytes: isize) -> Result[string, FormatFloatError] {
+    power_float_format(float64_to_bits(value), 52, 11, 1023, PowerFormat::Binary, max_bytes)
+}
+
+pub fn format_float32_binary(value: f32, max_bytes: isize) -> Result[string, FormatFloatError] {
+    power_float_format(float32_to_bits(value).to_u64(), 23, 8, 127, PowerFormat::Binary, max_bytes)
+}
+
+pub fn format_float64_hex(value: f64, fractional_digits: isize, uppercase: bool, max_bytes: isize) -> Result[
+    string,
+    FormatFloatError,
+] {
+    power_float_format(
+        float64_to_bits(value),
+        52,
+        11,
+        1023,
+        PowerFormat::Hex(fractional_digits, uppercase),
+        max_bytes,
+    )
+}
+
+pub fn format_float32_hex(value: f32, fractional_digits: isize, uppercase: bool, max_bytes: isize) -> Result[
+    string,
+    FormatFloatError,
+] {
+    power_float_format(
+        float32_to_bits(value).to_u64(),
+        23,
+        8,
+        127,
+        PowerFormat::Hex(fractional_digits, uppercase),
+        max_bytes,
+    )
+}
+
+pub enum FormatFloatError {
+    InvalidPrecision(isize),
+    InvalidLimit(isize),
+    OutputLimit(isize),
+    RoundtripFailure,
+}
+
+impl ToString for FormatFloatError {
+    fn to_string(self: FormatFloatError) -> string {
+        match self {
+            InvalidPrecision(value) => f"invalid floating-point precision {value}",
+            InvalidLimit(value) => f"negative floating-point output limit {value}",
+            OutputLimit(value) => f"floating-point output exceeds byte limit {value}",
+            RoundtripFailure => "floating-point shortest conversion did not roundtrip",
+        }
+    }
+}
+
+impl Debug for FormatFloatError {
+    fn debug(self: FormatFloatError) -> string {
+        self.to_string()
+    }
+}
+
+fn fixed_decimal_multiply(digits: Vec[byte], factor: u32) -> () {
+    let mut carry: u32 = 0;
+    for index in 0..digits.len() {
+        let product = digits[index].to_u32() * factor + carry;
+        digits[index] = (product % 10).to_u8();
+        carry = product / 10;
+    }
+    while carry > 0 {
+        digits.push((carry % 10).to_u8());
+        carry /= 10;
+    }
+}
+
+fn fixed_decimal_exact(mantissa: u64, exponent: isize) -> (Vec[byte], isize) {
+    if mantissa == 0 {
+        return (Vec::from_array([0.to_u8()]), 1)
+    }
+    let reversed: Vec[byte] = Vec::new();
+    let mut value = mantissa;
+    while value > 0 {
+        reversed.push((value % 10).to_u8());
+        value /= 10;
+    }
+    let count = if exponent < 0 {
+        0 - exponent
+    } else {
+        exponent
+    };
+    let factor: u32 = if exponent < 0 {
+        5
+    } else {
+        2
+    };
+    for _ in 0..count {
+        fixed_decimal_multiply(reversed, factor);
+    }
+    let digits: Vec[byte] = Vec::with_capacity(reversed.len());
+    let mut index = reversed.len();
+    while index > 0 {
+        index -= 1;
+        digits.push(reversed[index]);
+    }
+    let point = digits.len()
+        + if exponent < 0 {
+            exponent
+        } else {
+            0
+        };
+    (digits, point)
+}
+
+fn fixed_decimal_round(digits: Vec[byte], point: isize, places: isize) -> (Vec[byte], isize) {
+    if places >= digits.len() - point {
+        return (digits, point)
+    }
+    let keep = point + places;
+    if keep < 0 {
+        return (Vec::from_array([0.to_u8()]), 1)
+    }
+    let mut trailing = false;
+    for index in keep + 1..digits.len() {
+        trailing = trailing || digits[index] != 0;
+    }
+    let odd = keep > 0 && digits[keep - 1] % 2 == 1;
+    let up = digits[keep] > 5 || digits[keep] == 5 && (trailing || odd);
+    if keep == 0 {
+        return if up {
+            (Vec::from_array([1.to_u8()]), point + 1)
+        } else {
+            (Vec::from_array([0.to_u8()]), 1)
+        }
+    }
+    digits.truncate(keep);
+    if up {
+        let mut index = keep;
+        while index > 0 {
+            index -= 1;
+            if digits[index] < 9 {
+                digits[index] += 1;
+                return (digits, point)
+            }
+            digits[index] = 0;
+        }
+        return (Vec::from_array([1.to_u8()]), point + 1)
+    };
+    (digits, point)
+}
+
+fn scientific_decimal_format(
+    exact: Vec[byte],
+    point: isize,
+    negative: bool,
+    places: isize,
+    uppercase: bool,
+    limit: isize,
+) -> Result[string, FormatFloatError] {
+    let (digits, point) = if places < exact.len() - 1 {
+        fixed_decimal_round(exact, point, places + 1 - point)
+    } else {
+        (exact, point)
+    };
+    let exponent = point - 1;
+    let magnitude = if exponent < 0 {
+        0 - exponent
+    } else {
+        exponent
+    };
+    let exponent_digits = magnitude.to_string();
+    let exponent_length = if exponent_digits.byte_len() < 2 {
+        2
+    } else {
+        exponent_digits.byte_len()
+    };
+    let mut length = 3 + exponent_length
+        + if negative {
+            1
+        } else {
+            0
+        };
+    if length > limit {
+        return Result::Err(FormatFloatError::OutputLimit(limit))
+    }
+    if places > 0 {
+        if places >= limit - length {
+            return Result::Err(FormatFloatError::OutputLimit(limit))
+        }
+        length += places + 1;
+    }
+    let output: Vec[byte] = Vec::with_capacity(length);
+    if negative {
+        output.push(b'-');
+    }
+    output.push(b'0' + digits[0]);
+    if places > 0 {
+        output.push(b'.');
+        for index in 0..places {
+            output.push(
+                b'0'
+                    + if index < digits.len() - 1 {
+                        digits[index + 1]
+                    } else {
+                        0
+                    },
+            );
+        }
+    }
+    output.push(
+        if uppercase {
+            b'E'
+        } else {
+            b'e'
+        },
+    );
+    output.push(
+        if exponent < 0 {
+            b'-'
+        } else {
+            b'+'
+        },
+    );
+    if exponent_digits.byte_len() < 2 {
+        output.push(b'0');
+    }
+    for index in 0..exponent_digits.byte_len() {
+        output.push(exponent_digits.byte_get(index));
+    }
+    let (_, result) = string_from_utf8(output);
+    Result::Ok(result)
+}
+
+enum DecimalStyle {
+    Fixed,
+    Scientific(bool),
+    General(bool),
+}
+
+fn general_decimal_format(
+    exact: Vec[byte],
+    point: isize,
+    negative: bool,
+    precision: isize,
+    uppercase: bool,
+    limit: isize,
+) -> Result[string, FormatFloatError] {
+    let precision = if precision == 0 {
+        1
+    } else {
+        precision
+    };
+    let (digits, point) = if precision < exact.len() {
+        fixed_decimal_round(exact, point, precision - point)
+    } else {
+        (exact, point)
+    };
+    while digits.len() > 1 && digits[digits.len() - 1] == 0 {
+        digits.truncate(digits.len() - 1);
+    }
+    let exponent = point - 1;
+    if exponent < -4 || exponent >= precision {
+        scientific_decimal_format(digits, point, negative, digits.len() - 1, uppercase, limit)
+    } else {
+        let places = if digits.len() > point {
+            digits.len() - point
+        } else {
+            0
+        };
+        render_fixed_decimal(digits, point, negative, places, limit)
+    }
+}
+
+fn decimal_float_format(
+    bits: u64,
+    fraction_bits: isize,
+    exponent_bits: isize,
+    bias: isize,
+    places: isize,
+    style: DecimalStyle,
+    limit: isize,
+) -> Result[string, FormatFloatError] {
+    if limit < 0 {
+        return Result::Err(FormatFloatError::InvalidLimit(limit))
+    }
+    if places < 0 {
+        return Result::Err(FormatFloatError::InvalidPrecision(places))
+    }
+    let negative = bits & (1 << (fraction_bits + exponent_bits)) != 0;
+    let mask = (1 << exponent_bits) - 1;
+    let encoded_exponent = (bits >> fraction_bits) & mask;
+    let fraction = bits & ((1 << fraction_bits) - 1);
+    if encoded_exponent == mask {
+        let special = if fraction != 0 {
+            "NaN"
+        } else if negative {
+            "-Inf"
+        } else {
+            "+Inf"
+        };
+        return if special.byte_len() > limit {
+            Result::Err(FormatFloatError::OutputLimit(limit))
+        } else {
+            Result::Ok(special)
+        }
+    }
+    let general = match style {
+        DecimalStyle::General(_) => true,
+        _ => false,
+    };
+    if !general && places > 0 && places >= limit - 1 {
+        return Result::Err(FormatFloatError::OutputLimit(limit))
+    }
+    let mantissa = if encoded_exponent == 0 {
+        fraction
+    } else {
+        fraction | (1 << fraction_bits)
+    };
+    let exponent = if encoded_exponent == 0 {
+        1 - bias - fraction_bits
+    } else {
+        encoded_exponent.to_isize() - bias - fraction_bits
+    };
+    let (exact, point) = fixed_decimal_exact(mantissa, exponent);
+    match style {
+        DecimalStyle::Scientific(uppercase) => scientific_decimal_format(
+            exact,
+            point,
+            negative,
+            places,
+            uppercase,
+            limit,
+        ),
+        DecimalStyle::General(uppercase) => general_decimal_format(
+            exact,
+            point,
+            negative,
+            places,
+            uppercase,
+            limit,
+        ),
+        DecimalStyle::Fixed => {
+            let (digits, point) = fixed_decimal_round(exact, point, places);
+            render_fixed_decimal(digits, point, negative, places, limit)
+        },
+    }
+}
+
+fn render_fixed_decimal(
+    digits: Vec[byte],
+    point: isize,
+    negative: bool,
+    places: isize,
+    limit: isize,
+) -> Result[string, FormatFloatError] {
+    let integers = if point > 0 {
+        point
+    } else {
+        1
+    };
+    let sign = if negative {
+        1
+    } else {
+        0
+    };
+    if integers > limit - sign {
+        return Result::Err(FormatFloatError::OutputLimit(limit))
+    }
+    let mut length = integers + sign;
+    if places > 0 {
+        if places >= limit - length {
+            return Result::Err(FormatFloatError::OutputLimit(limit))
+        }
+        length += places + 1;
+    }
+    let output: Vec[byte] = Vec::with_capacity(length);
+    if negative {
+        output.push(b'-');
+    }
+    for index in 0..integers {
+        output.push(
+            b'0'
+                + if point > 0 && index < digits.len() {
+                    digits[index]
+                } else {
+                    0
+                },
+        );
+    }
+    if places > 0 {
+        output.push(b'.');
+        for index in 0..places {
+            let source = point + index;
+            output.push(
+                b'0'
+                    + if source >= 0 && source < digits.len() {
+                        digits[source]
+                    } else {
+                        0
+                    },
+            );
+        }
+    }
+    let (_, result) = string_from_utf8(output);
+    Result::Ok(result)
+}
+
+pub fn format_float64_fixed(value: f64, decimal_places: isize, max_bytes: isize) -> Result[
+    string,
+    FormatFloatError,
+] {
+    decimal_float_format(
+        float64_to_bits(value),
+        52,
+        11,
+        1023,
+        decimal_places,
+        DecimalStyle::Fixed,
+        max_bytes,
+    )
+}
+
+pub fn format_float32_fixed(value: f32, decimal_places: isize, max_bytes: isize) -> Result[
+    string,
+    FormatFloatError,
+] {
+    decimal_float_format(
+        float32_to_bits(value).to_u64(),
+        23,
+        8,
+        127,
+        decimal_places,
+        DecimalStyle::Fixed,
+        max_bytes,
+    )
+}
+
+pub fn format_float64_scientific(
+    value: f64,
+    decimal_places: isize,
+    uppercase: bool,
+    max_bytes: isize,
+) -> Result[string, FormatFloatError] {
+    decimal_float_format(
+        float64_to_bits(value),
+        52,
+        11,
+        1023,
+        decimal_places,
+        DecimalStyle::Scientific(uppercase),
+        max_bytes,
+    )
+}
+
+pub fn format_float32_scientific(
+    value: f32,
+    decimal_places: isize,
+    uppercase: bool,
+    max_bytes: isize,
+) -> Result[string, FormatFloatError] {
+    decimal_float_format(
+        float32_to_bits(value).to_u64(),
+        23,
+        8,
+        127,
+        decimal_places,
+        DecimalStyle::Scientific(uppercase),
+        max_bytes,
+    )
+}
+
+pub fn format_float64_general(
+    value: f64,
+    significant_digits: isize,
+    uppercase: bool,
+    max_bytes: isize,
+) -> Result[string, FormatFloatError] {
+    decimal_float_format(
+        float64_to_bits(value),
+        52,
+        11,
+        1023,
+        significant_digits,
+        DecimalStyle::General(uppercase),
+        max_bytes,
+    )
+}
+
+pub fn format_float32_general(
+    value: f32,
+    significant_digits: isize,
+    uppercase: bool,
+    max_bytes: isize,
+) -> Result[string, FormatFloatError] {
+    decimal_float_format(
+        float32_to_bits(value).to_u64(),
+        23,
+        8,
+        127,
+        significant_digits,
+        DecimalStyle::General(uppercase),
+        max_bytes,
+    )
+}
