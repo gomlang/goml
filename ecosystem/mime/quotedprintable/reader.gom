@@ -1,0 +1,181 @@
+package quotedprintable;
+
+use std::bytes;
+use std::io;
+use io::{Read, BufRead};
+
+pub struct Reader[R] {
+    source: io::BufReader[R],
+    limits: Limits,
+    pending: bytes::Bytes,
+    position: Ref[isize],
+    input: Ref[isize],
+    output: Ref[isize],
+    lines: Ref[isize],
+    done: Ref[bool],
+    broken: Ref[bool],
+}
+
+impl[R: Read] Reader[R] {
+    pub fn new(source: R, limits: Limits) -> Result[Reader[R], Error] {
+        limits.validate()?;
+        Result::Ok(
+            Reader {
+                source: io::BufReader::new(source),
+                limits,
+                pending: bytes::Bytes::new(),
+                position: Ref::new(0),
+                input: Ref::new(0),
+                output: Ref::new(0),
+                lines: Ref::new(0),
+                done: Ref::new(false),
+                broken: Ref::new(false),
+            },
+        )
+    }
+
+    pub fn consumed(self: Reader[R]) -> isize {
+        self.input.get()
+    }
+
+    pub fn produced(self: Reader[R]) -> isize {
+        self.output.get()
+    }
+
+    fn refill(self: Reader[R]) -> Result[(), Error] {
+        let remaining = self.limits.max_input_bytes - self.input.get();
+        let cap = if remaining >= 77 {
+            78
+        } else {
+            remaining + 1
+        };
+        let wire = self.source.read_until(b'\n', cap).map_err(
+            |error| Error {
+                kind: if error.kind() == io::ErrorKind::InvalidData {
+                    ErrorKind::Limit
+                } else {
+                    ErrorKind::Io
+                },
+                offset: self.input.get(),
+                message: error.to_string(),
+                cause: Option::Some(error),
+            },
+        )?;
+        if wire.len() == 0 {
+            self.done.set(true);
+            return Result::Ok(())
+        }
+        if wire.len() > remaining {
+            return Result::Err(failure(ErrorKind::Limit, self.input.get(), "input exceeds limit"))
+        }
+        if self.lines.get() >= self.limits.max_lines {
+            return Result::Err(
+                failure(ErrorKind::Limit, self.input.get(), "line count exceeds limit"),
+            )
+        }
+        self.lines.set(self.lines.get() + 1);
+        self.input.set(self.input.get() + wire.len());
+        let terminated = wire.get(wire.len() - 1) == b'\n';
+        if terminated && (wire.len() < 2 || wire.get(wire.len() - 2) != b'\r') {
+            return Result::Err(failure(ErrorKind::Invalid, self.input.get(), "bare LF"))
+        }
+        let end = if terminated {
+            wire.len() - 2
+        } else {
+            wire.len()
+        };
+        if end > 76 {
+            return Result::Err(
+                failure(ErrorKind::Limit, self.input.get(), "encoded line exceeds 76 bytes"),
+            )
+        }
+        let soft = end > 0 && wire.get(end - 1) == b'=';
+        if soft && !terminated {
+            return Result::Err(
+                failure(ErrorKind::Invalid, self.input.get(), "truncated soft break"),
+            )
+        }
+        let body_end = if soft {
+            end - 1
+        } else {
+            end
+        };
+        if !soft && body_end > 0
+            && (wire.get(body_end - 1) == b' ' || wire.get(body_end - 1) == b'\t') {
+            return Result::Err(failure(ErrorKind::Invalid, self.input.get(), "trailing whitespace"))
+        }
+        let decoded = bytes::Bytes::new();
+        let mut index = 0;
+        while index < body_end {
+            let byte = wire.get(index);
+            if byte == b'=' {
+                if index + 2 >= body_end {
+                    return Result::Err(
+                        failure(ErrorKind::Invalid, self.input.get(), "short hex escape"),
+                    )
+                }
+                let high = hex_value(wire.get(index + 1)).ok_or(
+                    failure(ErrorKind::Invalid, self.input.get(), "invalid hex escape"),
+                )?;
+                let low = hex_value(wire.get(index + 2)).ok_or(
+                    failure(ErrorKind::Invalid, self.input.get(), "invalid hex escape"),
+                )?;
+                decoded.push(high * 16 + low);
+                index += 3;
+            } else if byte == b' ' || byte == b'\t' || byte >= 33 && byte <= 126 {
+                decoded.push(byte);
+                index += 1;
+            } else {
+                return Result::Err(
+                    failure(ErrorKind::Invalid, self.input.get(), "invalid raw byte"),
+                )
+            }
+        }
+        if terminated && !soft {
+            decoded.push(b'\r');
+            decoded.push(b'\n');
+        }
+        if decoded.len() > self.limits.max_output_bytes - self.output.get() {
+            return Result::Err(failure(ErrorKind::Limit, self.input.get(), "output exceeds limit"))
+        }
+        self.output.set(self.output.get() + decoded.len());
+        self.pending.clear();
+        self.pending.extend_from_slice(decoded.as_slice());
+        self.position.set(0);
+        Result::Ok(())
+    }
+
+    pub fn read_chunk(self: Reader[R], output: MutSlice[byte]) -> Result[isize, Error] {
+        if self.broken.get() {
+            return Result::Err(failure(ErrorKind::Closed, self.input.get(), "decoder failed"))
+        }
+        if output.len() == 0 {
+            return Result::Ok(0)
+        }
+        loop {
+            let available = self.pending.len() - self.position.get();
+            if available > 0 {
+                let count = if output.len() < available {
+                    output.len()
+                } else {
+                    available
+                };
+                for index in 0..count {
+                    output[index] = self.pending.get(self.position.get() + index);
+                }
+                self.position.set(self.position.get() + count);
+                return Result::Ok(count)
+            }
+            if self.done.get() {
+                return Result::Ok(0)
+            }
+            match self.refill() {
+                Ok(()) => (),
+                Err(error) => {
+                    self.broken.set(true);
+                    return Result::Err(error)
+                },
+            }
+        }
+    }
+}

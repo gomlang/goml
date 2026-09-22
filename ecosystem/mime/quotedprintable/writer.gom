@@ -1,0 +1,215 @@
+package quotedprintable;
+
+use std::bytes;
+use std::io;
+use io::Write;
+
+pub struct Writer[W] {
+    sink: W,
+    limits: Limits,
+    mode: Mode,
+    line: bytes::Bytes,
+    input: Ref[isize],
+    output: Ref[isize],
+    lines: Ref[isize],
+    pending_space: Ref[Option[byte]],
+    pending_cr: Ref[bool],
+    finished: Ref[bool],
+    broken: Ref[bool],
+}
+
+impl[W: Write] Writer[W] {
+    pub fn new(sink: W, limits: Limits) -> Result[Writer[W], Error] {
+        Writer::with_mode(sink, limits, Mode::Text)
+    }
+
+    pub fn with_mode(sink: W, limits: Limits, mode: Mode) -> Result[Writer[W], Error] {
+        limits.validate()?;
+        Result::Ok(
+            Writer {
+                sink,
+                limits,
+                mode,
+                line: bytes::Bytes::new(),
+                input: Ref::new(0),
+                output: Ref::new(0),
+                lines: Ref::new(0),
+                pending_space: Ref::new(Option::None),
+                pending_cr: Ref::new(false),
+                finished: Ref::new(false),
+                broken: Ref::new(false),
+            },
+        )
+    }
+
+    pub fn consumed(self: Writer[W]) -> isize {
+        self.input.get()
+    }
+
+    pub fn produced(self: Writer[W]) -> isize {
+        self.output.get()
+    }
+
+    fn send(self: Writer[W], data: bytes::Bytes) -> Result[(), Error] {
+        if data.len() > self.limits.max_output_bytes - self.output.get() {
+            self.broken.set(true);
+            return Result::Err(failure(ErrorKind::Limit, self.input.get(), "output exceeds limit"))
+        }
+        let mut position = 0;
+        while position < data.len() {
+            let count = match self.sink.write(data.slice(position, data.len())) {
+                Ok(count) => count,
+                Err(cause) => {
+                    self.broken.set(true);
+                    return Result::Err(
+                        Error {
+                            kind: ErrorKind::Io,
+                            offset: self.input.get(),
+                            message: "sink write failed",
+                            cause: Option::Some(cause),
+                        },
+                    )
+                },
+            };
+            if count <= 0 || count > data.len() - position {
+                self.broken.set(true);
+                return Result::Err(failure(ErrorKind::Io, self.input.get(), "invalid sink count"))
+            }
+            position += count;
+            self.output.set(self.output.get() + count);
+        }
+        Result::Ok(())
+    }
+
+    fn send_line(self: Writer[W], soft: bool) -> Result[(), Error] {
+        if self.lines.get() >= self.limits.max_lines {
+            self.broken.set(true);
+            return Result::Err(
+                failure(ErrorKind::Limit, self.input.get(), "line count exceeds limit"),
+            )
+        }
+        let data = self.line.copy();
+        if soft {
+            data.push(b'=');
+        }
+        data.push(b'\r');
+        data.push(b'\n');
+        self.send(data)?;
+        self.line.clear();
+        self.lines.set(self.lines.get() + 1);
+        Result::Ok(())
+    }
+
+    fn atom(self: Writer[W], data: Slice[byte]) -> Result[(), Error] {
+        if self.line.len() + data.len() > 75 {
+            self.send_line(true)?;
+        }
+        self.line.extend_from_slice(data);
+        Result::Ok(())
+    }
+
+    fn escape(self: Writer[W], value: byte) -> Result[(), Error] {
+        self.atom(Vec::from_array([b'=', hex_digit(value / 16), hex_digit(value % 16)]).as_slice())
+    }
+
+    fn space(self: Writer[W], encoded: bool) -> Result[(), Error] {
+        if let Some(value) = self.pending_space.get() {
+            if encoded || self.line.len() >= 72 {
+                self.escape(value)?;
+            } else {
+                self.atom(Vec::from_array([value]).as_slice())?;
+            }
+            self.pending_space.set(Option::None);
+        }
+        Result::Ok(())
+    }
+
+    pub fn write_chunk(self: Writer[W], input: Slice[byte]) -> Result[isize, Error] {
+        if self.broken.get() {
+            return Result::Err(failure(ErrorKind::Closed, self.input.get(), "encoder failed"))
+        }
+        if self.finished.get() {
+            return Result::Err(failure(ErrorKind::State, self.input.get(), "encoder finished"))
+        }
+        if input.len() > self.limits.max_input_bytes - self.input.get() {
+            return Result::Err(failure(ErrorKind::Limit, self.input.get(), "input exceeds limit"))
+        }
+        for byte in input {
+            if self.mode == Mode::Binary && (byte == b'\r' || byte == b'\n') {
+                self.space(false)?;
+                self.escape(byte)?;
+                self.input.set(self.input.get() + 1);
+                continue
+            }
+            if self.pending_cr.get() {
+                self.pending_cr.set(false);
+                if byte == b'\n' {
+                    self.space(true)?;
+                    self.send_line(false)?;
+                    self.input.set(self.input.get() + 1);
+                    continue
+                }
+                self.space(false)?;
+                self.escape(b'\r')?;
+            }
+            if byte == b'\r' {
+                self.pending_cr.set(true);
+            } else if byte == b' ' || byte == b'\t' {
+                self.space(false)?;
+                self.pending_space.set(Option::Some(byte));
+            } else {
+                self.space(false)?;
+                if byte >= 33 && byte <= 126 && byte != b'=' {
+                    self.atom(Vec::from_array([byte]).as_slice())?;
+                } else {
+                    self.escape(byte)?;
+                }
+            }
+            self.input.set(self.input.get() + 1);
+        }
+        Result::Ok(input.len())
+    }
+
+    pub fn finish(self: Writer[W]) -> Result[(), Error] {
+        if self.broken.get() {
+            return Result::Err(failure(ErrorKind::Closed, self.input.get(), "encoder failed"))
+        }
+        if self.finished.get() {
+            return Result::Ok(())
+        }
+        if self.pending_cr.get() {
+            self.space(false)?;
+            self.escape(b'\r')?;
+            self.pending_cr.set(false);
+        }
+        self.space(true)?;
+        if self.line.len() > 0 {
+            if self.lines.get() >= self.limits.max_lines {
+                self.broken.set(true);
+                return Result::Err(
+                    failure(ErrorKind::Limit, self.input.get(), "line count exceeds limit"),
+                )
+            }
+            self.send(self.line.copy())?;
+            self.line.clear();
+            self.lines.set(self.lines.get() + 1);
+        }
+        match self.sink.flush() {
+            Ok(()) => {
+                self.finished.set(true);
+                Result::Ok(())
+            },
+            Err(cause) => {
+                self.broken.set(true);
+                Result::Err(
+                    Error {
+                        kind: ErrorKind::Io,
+                        offset: self.input.get(),
+                        message: "sink flush failed",
+                        cause: Option::Some(cause),
+                    },
+                )
+            },
+        }
+    }
+}
