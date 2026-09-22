@@ -1,0 +1,252 @@
+package tests;
+
+use ecosystem::archive;
+use archive::{Compression, Entry, Limits, ZipArchive, ZipSource, ZipWriter};
+use std::bytes;
+use std::io;
+use io::ReadAt;
+use std::testing;
+
+fn zip64_put(data: bytes::Bytes, value: u64, width: isize) -> () {
+    for index in 0..width {
+        data.push((value >> (index * 8).to_u64()).to_u8())
+    }
+}
+
+fn zip64_set(data: bytes::Bytes, offset: isize, value: u64, width: isize) -> () {
+    for index in 0..width {
+        data.set(offset + index, (value >> (index * 8).to_u64()).to_u8())
+    }
+}
+
+fn zip64_get(data: bytes::Bytes, offset: isize, width: isize) -> u64 {
+    let mut value: u64 = 0;
+    for index in 0..width {
+        value |= data.get(offset + index).to_u64() << (index * 8).to_u64();
+    }
+    value
+}
+
+fn zip64_directory_fixture() -> bytes::Bytes {
+    let source = testing::expect_ok(
+        archive::encode_zip(
+            Vec::from_array([Entry::file("sample", bytes::Bytes::from_vec(b"value"))]),
+            Compression::Stored,
+            Limits::standard(),
+        ),
+        "classic fixture",
+    );
+    let end = source.len() - 22;
+    let directory_size = zip64_get(source, end + 12, 4);
+    let directory_offset = zip64_get(source, end + 16, 4);
+    let result = bytes::Bytes::from_slice_copy(source.slice(0, end));
+    zip64_put(result, 0x06064b50, 4);
+    zip64_put(result, 44, 8);
+    zip64_put(result, 45, 2);
+    zip64_put(result, 45, 2);
+    zip64_put(result, 0, 4);
+    zip64_put(result, 0, 4);
+    zip64_put(result, 1, 8);
+    zip64_put(result, 1, 8);
+    zip64_put(result, directory_size, 8);
+    zip64_put(result, directory_offset, 8);
+    zip64_put(result, 0x07064b50, 4);
+    zip64_put(result, 0, 4);
+    zip64_put(result, end.to_u64(), 8);
+    zip64_put(result, 1, 4);
+    let classic_end = bytes::Bytes::from_slice_copy(source.slice(end, source.len()));
+    zip64_set(classic_end, 8, 65535, 2);
+    zip64_set(classic_end, 10, 65535, 2);
+    zip64_set(classic_end, 12, 4294967295, 4);
+    zip64_set(classic_end, 16, 4294967295, 4);
+    result.extend_from_slice(classic_end.as_slice());
+    result
+}
+
+fn zip64_central_fixture() -> bytes::Bytes {
+    let source = testing::expect_ok(
+        archive::encode_zip(
+            Vec::from_array([Entry::file("sample", bytes::Bytes::from_vec(b"value"))]),
+            Compression::Stored,
+            Limits::standard(),
+        ),
+        "classic fixture",
+    );
+    let end = source.len() - 22;
+    let central = zip64_get(source, end + 16, 4).to_isize();
+    let name_len = zip64_get(source, central + 28, 2).to_isize();
+    let extra_len = zip64_get(source, central + 30, 2).to_isize();
+    let first_extra = central + 46 + name_len;
+    let result = bytes::Bytes::from_slice_copy(source.slice(0, first_extra));
+    zip64_set(result, 4, 45, 2);
+    zip64_set(result, central + 6, 45, 2);
+    zip64_set(result, central + 20, 4294967295, 4);
+    zip64_set(result, central + 24, 4294967295, 4);
+    zip64_set(result, central + 30, (extra_len + 28).to_u64(), 2);
+    zip64_set(result, central + 42, 4294967295, 4);
+    zip64_put(result, 1, 2);
+    zip64_put(result, 24, 2);
+    zip64_put(result, 5, 8);
+    zip64_put(result, 5, 8);
+    zip64_put(result, 0, 8);
+    result.extend_from_slice(source.slice(first_extra, end));
+    let final_record = bytes::Bytes::from_slice_copy(source.slice(end, source.len()));
+    zip64_set(final_record, 12, zip64_get(source, end + 12, 4) + 28, 4);
+    result.extend_from_slice(final_record.as_slice());
+    result
+}
+
+#[test]
+fn zip64_end_directory_is_checked_and_indexed() -> () {
+    let fixture = zip64_directory_fixture();
+    let archive_value = testing::expect_ok(ZipArchive::open(fixture, Limits::standard()), "ZIP64");
+    testing::assert_eq(archive_value.len(), 1);
+    testing::assert(testing::expect_ok(archive_value.entry(0), "entry").data.to_vec() == b"value");
+    let missing_locator = fixture.copy();
+    missing_locator.set(missing_locator.len() - 42, 0);
+    testing::assert(ZipArchive::open(missing_locator, Limits::standard()).is_err());
+    testing::assert(
+        ZipSource::open(io::Cursor::new(missing_locator), missing_locator.len(), Limits::standard()).is_err(),
+    );
+    let bad_size = fixture.copy();
+    zip64_set(bad_size, bad_size.len() - 98 + 4, 45, 8);
+    testing::assert(ZipArchive::open(bad_size, Limits::standard()).is_err());
+    testing::assert(
+        ZipSource::open(io::Cursor::new(bad_size), bad_size.len(), Limits::standard()).is_err(),
+    );
+}
+
+#[test]
+fn zip64_central_extra_fields_are_checked() -> () {
+    let fixture = zip64_central_fixture();
+    let value = testing::expect_ok(ZipArchive::open(fixture, Limits::standard()), "ZIP64 extra");
+    testing::assert_eq(value.len(), 1);
+    testing::assert(testing::expect_ok(value.entry(0), "entry").data.to_vec() == b"value");
+    let end = fixture.len() - 22;
+    let central = zip64_get(fixture, end + 16, 4).to_isize();
+    let extra = central + 46 + zip64_get(fixture, central + 28, 2).to_isize();
+    let missing = fixture.copy();
+    zip64_set(missing, extra, 2, 2);
+    testing::assert(ZipArchive::open(missing, Limits::standard()).is_err());
+    testing::assert(
+        ZipSource::open(io::Cursor::new(missing), missing.len(), Limits::standard()).is_err(),
+    );
+    let huge = fixture.copy();
+    zip64_set(huge, extra + 4, 9223372036854775807, 8);
+    testing::assert(ZipArchive::open(huge, Limits::standard()).is_err());
+    testing::assert(ZipSource::open(io::Cursor::new(huge), huge.len(), Limits::standard()).is_err());
+}
+
+#[test]
+fn zip_copy_entry_streams_and_checks_expanded_bytes() -> () {
+    let data = bytes::Bytes::new();
+    for index in 0..150000 {
+        data.push((index % 251).to_u8());
+    }
+    for method in Vec::from_array([Compression::Stored, Compression::Deflate]) {
+        let packed = testing::expect_ok(
+            archive::encode_zip(
+                Vec::from_array([Entry::file("sample", data)]),
+                method,
+                Limits::standard(),
+            ),
+            "ZIP fixture",
+        );
+        let indexed = testing::expect_ok(ZipArchive::open(packed, Limits::standard()), "ZIP index");
+        let output = io::Cursor::new(bytes::Bytes::new());
+        testing::assert_ok(indexed.copy_entry(0, output));
+        testing::assert(output.bytes().to_vec() == data.to_vec());
+        let source = testing::expect_ok(
+            ZipSource::open(io::Cursor::new(packed), packed.len(), Limits::standard()),
+            "ZIP source",
+        );
+        let output = io::Cursor::new(bytes::Bytes::new());
+        testing::assert_ok(source.copy_entry(0, output));
+        testing::assert(output.bytes().to_vec() == data.to_vec());
+    }
+    let packed = testing::expect_ok(
+        archive::encode_zip(
+            Vec::from_array([Entry::file("sample", bytes::Bytes::from_vec(b"value"))]),
+            Compression::Stored,
+            Limits::standard(),
+        ),
+        "stored fixture",
+    );
+    packed.set(45, packed.get(45) ^ 1);
+    let indexed = testing::expect_ok(ZipArchive::open(packed, Limits::standard()), "ZIP index");
+    let output = io::Cursor::new(bytes::Bytes::new());
+    testing::assert_eq(
+        testing::expect_err(indexed.copy_entry(0, output), "CRC failure").kind,
+        archive::ErrorKind::Checksum,
+    );
+}
+
+struct CountingAt {
+    inner: io::Cursor,
+    calls: Ref[isize],
+    requested: Ref[isize],
+}
+
+impl ReadAt for CountingAt {
+    fn read_at(self: CountingAt, output: MutSlice[byte], offset: isize) -> Result[
+        isize,
+        io::TransferError,
+    ] {
+        self.calls.set(self.calls.get() + 1);
+        self.requested.set(self.requested.get() + output.len());
+        self.inner.read_at(output, offset)
+    }
+}
+
+#[test]
+fn zip_source_indexes_without_reading_entry_bodies() -> () {
+    let payload = bytes::Bytes::new();
+    for index in 0..160000 {
+        payload.push((index % 251).to_u8());
+    }
+    let output = io::Cursor::new(bytes::Bytes::new());
+    let writer = testing::expect_ok(ZipWriter::new(output, Limits::standard()), "ZIP writer");
+    testing::assert_ok(writer.append(Entry::file("first", payload), Compression::Stored));
+    testing::assert_ok(writer.append(Entry::file("second", payload), Compression::Stored));
+    testing::assert_ok(writer.finish(""));
+    let packed = output.bytes();
+    let source = CountingAt {
+        inner: io::Cursor::new(packed),
+        calls: Ref::new(0),
+        requested: Ref::new(0),
+    };
+    let indexed = testing::expect_ok(
+        ZipSource::open(source, packed.len(), Limits::standard()),
+        "ZIP source",
+    );
+    testing::assert_eq(indexed.len(), 2);
+    testing::assert(source.requested.get() < packed.len() / 2);
+    let indexed_bytes = source.requested.get();
+    testing::assert(
+        testing::expect_ok(indexed.entry(1), "second entry").data.to_vec() == payload.to_vec(),
+    );
+    testing::assert_eq(source.requested.get(), indexed_bytes + payload.len());
+}
+
+#[test]
+fn zip_writer_switches_to_zip64_at_entry_count_boundary() -> () {
+    let limits = Limits {
+        max_entries: 65535,
+        max_entry_bytes: 0,
+        max_total_bytes: 0,
+        max_archive_bytes: 10000000,
+        max_path_bytes: 1,
+        max_metadata_bytes: 5000000,
+    };
+    let output = io::Cursor::new(bytes::Bytes::new());
+    let writer = testing::expect_ok(ZipWriter::new(output, limits), "ZIP writer");
+    for _ in 0..65535 {
+        testing::assert_ok(
+            writer.append(Entry::file("x", bytes::Bytes::new()), Compression::Stored),
+        );
+    }
+    testing::assert_ok(writer.finish(""));
+    let packed = output.bytes();
+    let indexed = testing::expect_ok(ZipArchive::open(packed, limits), "ZIP64 entry count");
+    testing::assert_eq(indexed.len(), 65535);
+}

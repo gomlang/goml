@@ -1,0 +1,108 @@
+package tests;
+
+use ecosystem::archive;
+use archive::{Entry, Header, Limits, TarReader, ErrorKind};
+use std::bytes;
+use std::io;
+use io::Read;
+use std::testing;
+
+#[test]
+fn tar_reader_exposes_bounded_body_chunks_and_skips_unread_remainder() -> () {
+    let large = bytes::Bytes::new();
+    for index in 0..20000 {
+        large.push((index % 251).to_u8());
+    }
+    let entries = Vec::from_array(
+        [Entry::file("first", large), Entry::file("second", bytes::Bytes::from_vec(b"done"))],
+    );
+    let packed = testing::expect_ok(archive::encode_tar(entries, Limits::standard()), "tar fixture");
+    let source = io::Cursor::new(packed);
+    let reader = testing::expect_ok(TarReader::new(source, Limits::standard()), "streaming tar");
+    let (header, size) = testing::expect_some(
+        testing::expect_ok(reader.next_header(), "first header"),
+        "first entry",
+    );
+    testing::assert_eq(header.path, "first");
+    testing::assert_eq(size, large.len());
+    testing::assert_eq(source.position(), 512);
+    let chunk = bytes::Bytes::from_vec(b".......");
+    let collected = bytes::Bytes::new();
+    for _ in 0..13 {
+        let count = testing::expect_ok(reader.read_body_chunk(chunk.as_mut_slice()), "body chunk");
+        collected.extend_from_slice(chunk.slice(0, count));
+    }
+    testing::assert(
+        collected.to_vec()
+            == bytes::Bytes::from_slice_copy(large.slice(0, collected.len())).to_vec(),
+    );
+    testing::assert_eq(source.position(), 512 + collected.len());
+    let second = testing::expect_some(testing::expect_ok(reader.next(), "second entry"), "second");
+    testing::assert_eq(second.header.path, "second");
+    testing::assert(second.data.to_vec() == b"done");
+    testing::assert_eq(source.position(), 512 + 20480 + 512 + 512);
+    testing::assert(testing::expect_ok(reader.next_header(), "end marker").is_none());
+    testing::assert(testing::expect_ok(reader.next_header(), "repeat end marker").is_none());
+}
+
+struct GateReader {
+    source: io::Cursor,
+    blocked: Ref[bool],
+    calls: Ref[isize],
+}
+
+impl Read for GateReader {
+    fn read(self: GateReader, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        if self.blocked.get() {
+            return Result::Err(
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "gate",
+                    Option::None,
+                    Option::None,
+                    "blocked",
+                ),
+            )
+        }
+        self.source.read(output)
+    }
+}
+
+#[test]
+fn tar_body_provider_error_is_terminal_without_retry() -> () {
+    let packed = testing::expect_ok(
+        archive::encode_tar(
+            Vec::from_array([Entry::file("first", bytes::Bytes::from_vec(b"abc"))]),
+            Limits::standard(),
+        ),
+        "tar fixture",
+    );
+    let source = GateReader {
+        source: io::Cursor::new(packed),
+        blocked: Ref::new(false),
+        calls: Ref::new(0),
+    };
+    let reader = testing::expect_ok(TarReader::new(source, Limits::standard()), "stream reader");
+    let (header, size) = testing::expect_some(
+        testing::expect_ok(reader.next_header(), "entry header"),
+        "entry",
+    );
+    testing::assert_eq(header.path, "first");
+    testing::assert_eq(size, 3);
+    source.blocked.set(true);
+    let calls = source.calls.get();
+    testing::assert_eq(
+        testing::expect_err(
+            reader.read_body_chunk(bytes::Bytes::from_vec(b"...").as_mut_slice()),
+            "body fault",
+        ).kind,
+        ErrorKind::Io,
+    );
+    testing::assert_eq(source.calls.get(), calls + 1);
+    testing::assert_eq(
+        testing::expect_err(reader.next_header(), "terminal reader").kind,
+        ErrorKind::Closed,
+    );
+    testing::assert_eq(source.calls.get(), calls + 1);
+}

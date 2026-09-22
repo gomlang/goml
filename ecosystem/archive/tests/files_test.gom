@@ -1,9 +1,10 @@
 package tests;
 
 use ecosystem::archive;
-use archive::{Entry, Limits, Compression, ExtractOptions, LinkPolicy};
+use archive::{Entry, Limits, Compression, ExtractOptions, LinkPolicy, ErrorKind, ZipWriter};
 use std::bytes;
 use std::fs;
+use std::io;
 use std::process;
 use std::testing;
 use std::time;
@@ -76,6 +77,135 @@ fn external_tar_zip_gzip_interoperability_and_extraction() -> () {
             == data.to_vec(),
     );
     testing::assert(archive::extract(entries, root + "/out", ExtractOptions::standard()).is_err());
+}
+
+#[test]
+fn gnu_tar_long_names_links_and_binary_numbers() -> () {
+    let root = temporary();
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    let mut name = "";
+    for _ in 0..140 {
+        name += "n";
+    }
+    let data = bytes::Bytes::from_string("GNU tar entry");
+    testing::assert_ok(fs::write_bytes_structured(root + "/" + name, data));
+    testing::assert_ok(fs::symbolic_link(name, root + "/link"));
+    command(
+        "tar",
+        Vec::from_array(
+            [
+                "--format=gnu",
+                "--owner=3000000",
+                "--group=4000000",
+                "--mtime=@-1",
+                "-cf",
+                "gnu.tar",
+                name,
+                "link",
+            ],
+        ),
+        root,
+    );
+    let entries = testing::expect_ok(
+        archive::open_tar(root + "/gnu.tar", Limits::standard()),
+        "GNU tar",
+    );
+    testing::assert_eq(entries.len(), 2);
+    testing::assert_eq(entries[0].header.path, name);
+    testing::assert(entries[0].data.to_vec() == data.to_vec());
+    testing::assert_eq(entries[0].header.uid, 3000000);
+    testing::assert_eq(entries[0].header.gid, 4000000);
+    testing::assert_eq(entries[0].header.modified, -1);
+    testing::assert_eq(entries[1].header.path, "link");
+    testing::assert_eq(entries[1].header.link, name);
+    let raw = testing::expect_ok(fs::read_bytes_structured(root + "/gnu.tar"), "GNU bytes");
+    let narrow = Limits { max_path_bytes: 100, ..Limits::standard() };
+    testing::assert(archive::decode_tar(raw, narrow).is_err());
+    let malformed = raw.copy();
+    malformed.set(512 + name.to_bytes().len(), b'x');
+    testing::assert(archive::decode_tar(malformed, Limits::standard()).is_err());
+    testing::assert(
+        archive::decode_tar(bytes::Bytes::from_slice_copy(raw.slice(0, 700)), Limits::standard()).is_err(),
+    );
+}
+
+#[test]
+fn info_zip_streaming_zip64_interoperability() -> () {
+    let root = temporary();
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    let data = bytes::Bytes::from_string("ZIP64 streaming input\n");
+    let result = testing::expect_ok(
+        process::Command::new("zip").args(Vec::from_array(["-q", "-", "-"])).current_dir(root).input(
+            data,
+        ).output_structured(),
+        "streaming zip command",
+    );
+    testing::assert(result.status().success());
+    let packed = result.stdout();
+    testing::assert_eq(
+        testing::expect_err(archive::ZipArchive::open(packed, Limits::standard()), "FIFO boundary").kind,
+        ErrorKind::Unsupported,
+    );
+    let mut central = 0;
+    while central + 46 < packed.len() {
+        if packed.get(central) == b'P' && packed.get(central + 1) == b'K'
+            && packed.get(central + 2) == 1
+            && packed.get(central + 3) == 2 {
+            break
+        }
+        central += 1;
+    }
+    testing::assert(central + 46 < packed.len());
+    packed.set(central + 40, (0o100644 & 255).to_u8());
+    packed.set(central + 41, (0o100644 >> 8).to_u8());
+    let opened = archive::ZipArchive::open(packed, Limits::standard());
+    if let Err(error) = opened {
+        testing::fail(error.to_string());
+    }
+    let zipped = testing::expect_ok(opened, "stream ZIP64");
+    testing::assert_eq(zipped.len(), 1);
+    testing::assert(testing::expect_ok(zipped.entry(0), "entry").data.to_vec() == data.to_vec());
+    let copied = io::Cursor::new(bytes::Bytes::new());
+    testing::assert_ok(zipped.copy_entry(0, copied));
+    testing::assert(copied.bytes().to_vec() == data.to_vec());
+}
+
+#[test]
+fn forced_zip64_writer_is_readable_by_external_unzip() -> () {
+    let root = temporary();
+    defer {
+        let _ = fs::remove_dir_all(root);
+    };
+    let output = io::Cursor::new(bytes::Bytes::new());
+    let writer = testing::expect_ok(
+        ZipWriter::with_zip64(output, Limits::standard(), true),
+        "ZIP64 writer",
+    );
+    let payload = bytes::Bytes::from_string("forced ZIP64 entry");
+    testing::assert_ok(writer.append(Entry::file("sample", payload), Compression::Deflate));
+    testing::assert_ok(writer.finish("ZIP64 comment"));
+    let packed = output.bytes();
+    let indexed = testing::expect_ok(
+        archive::ZipArchive::open(packed, Limits::standard()),
+        "ZIP64 read",
+    );
+    testing::assert_eq(indexed.comment(), "ZIP64 comment");
+    testing::assert(testing::expect_ok(indexed.entry(0), "entry").data.to_vec() == payload.to_vec());
+    testing::assert_ok(archive::write_file(root + "/forced.zip", packed));
+    command("unzip", Vec::from_array(["-t", "forced.zip"]), root);
+    let sourced = testing::expect_ok(
+        archive::open_zip_source(root + "/forced.zip", Limits::standard()),
+        "file-backed ZIP64",
+    );
+    testing::assert_eq(sourced.comment(), "ZIP64 comment");
+    let copied = io::Cursor::new(bytes::Bytes::new());
+    testing::assert_ok(sourced.copy_entry(0, copied));
+    testing::assert(copied.bytes().to_vec() == payload.to_vec());
+    testing::assert_ok(sourced.close());
 }
 
 #[test]
