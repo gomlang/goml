@@ -1,0 +1,112 @@
+package proxy;
+
+use ecosystem::http;
+use ecosystem::request;
+use ecosystem::web;
+use std::net;
+
+pub struct Proxy {
+    client: request::Client,
+    upstream: string,
+    request_limit: isize,
+    response_limit: isize,
+}
+
+impl Proxy {
+    pub fn new(target: string, client: request::Client, request_limit: isize, response_limit: isize) -> Result[
+        Proxy,
+        web::Error,
+    ] {
+        if request_limit < 0 || response_limit < 0 || target.contains("?") || target.contains("#") {
+            return Result::Err(
+                web::Error::new(
+                    web::ErrorKind::Configuration,
+                    "invalid reverse proxy target or limit",
+                ),
+            )
+        }
+        let url = request::Url::parse(target).map_err(
+            |_| web::Error::new(web::ErrorKind::Configuration, "invalid reverse proxy target"),
+        )?;
+        let target = url.as_string();
+        Result::Ok(
+            Proxy {
+                client,
+                upstream: if target.ends_with("/") {
+                    target.byte_slice(0, target.byte_len() - 1)
+                } else {
+                    target
+                },
+                request_limit,
+                response_limit,
+            },
+        )
+    }
+
+    pub fn handler(self: Proxy) -> web::Handler {
+        |incoming| self.forward(incoming)
+    }
+
+    pub fn forward(self: Proxy, incoming: web::Request) -> Result[web::Response, web::Error] {
+        incoming.check()?;
+        let path = incoming.path();
+        if !path.starts_with("/") {
+            return Result::Err(
+                web::Error::new(web::ErrorKind::BadRequest, "invalid proxy request target"),
+            )
+        }
+        let query = incoming.raw_query();
+        let target = self.upstream + path
+            + if query == "" {
+                ""
+            } else {
+                "?" + query
+            };
+        let body = incoming.body().collect(self.request_limit)?;
+        let clean = http::strip_hop_headers(incoming.headers().entries()).map_err(
+            |error| web::Error::new(web::ErrorKind::BadRequest, error.message),
+        )?;
+        let mut outbound = self.client.request(incoming.method(), target).redirect(
+            request::RedirectPolicy::None,
+        ).body_limit(self.response_limit).body(body);
+        for (name, value) in clean {
+            if name != "host" && name != "content-length" && name != "forwarded"
+                && name != "x-forwarded-for"
+                && name != "x-forwarded-host"
+                && name != "x-forwarded-proto" {
+                outbound = outbound.append_header(name, value);
+            }
+        }
+        let remote = net::SocketAddr::parse(incoming.remote_address()?).map_err(
+            |_| web::Error::new(web::ErrorKind::Internal, "invalid peer address"),
+        )?;
+        outbound = outbound.header("x-forwarded-for", remote.ip.to_string()).header(
+            "x-forwarded-host",
+            incoming.host()?,
+        ).header("x-forwarded-proto", "http");
+        let received = match outbound.send_with(incoming.context()) {
+            Ok(value) => value,
+            Err(error) => return Result::Ok(
+                web::Response::text(
+                    if error.kind == request::ErrorKind::Timeout {
+                        504
+                    } else {
+                        502
+                    },
+                    "bad gateway",
+                ),
+            ),
+        };
+        let clean = http::strip_hop_headers(received.headers().entries()).map_err(
+            |_| web::Error::new(web::ErrorKind::Internal, "invalid upstream header"),
+        )?;
+        let mut response = web::Response::new(received.status().as_isize()).body(received.bytes());
+        for (name, value) in clean {
+            if name != "content-length" {
+                response = response.append_header(name, value);
+            }
+        }
+        response.validate()?;
+        Result::Ok(response)
+    }
+}
