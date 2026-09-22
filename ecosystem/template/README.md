@@ -48,6 +48,10 @@ fn page() -> Result[string, template::Error] {
 | `set_loader(Loader)` | Register `(string) -> Result[Option[string], string]` for cache misses |
 | `escape_html(string)` | Escape an individual string under the standard output limit |
 
+HTML escaping mechanics are supplied by `ecosystem::html`. The existing wrapper
+retains numeric quote references, byte limits and source-aware template errors;
+this dependency does not add contextual JavaScript/CSS/URL safety analysis.
+
 A loader returns `None` for a missing template and `Err` for an actual loading
 failure. Successfully compiled loads are cached by name. Invalidate them with
 `remove` or replace them with `add` after a source change. Loading is supplied by
