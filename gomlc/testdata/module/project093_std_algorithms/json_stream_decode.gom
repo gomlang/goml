@@ -1,0 +1,412 @@
+package main;
+
+use std::json;
+use std::io;
+use io::Read;
+use std::testing;
+
+struct JsonDecodeProbe {
+    data: Vec[byte],
+    position: Ref[isize],
+    calls: Ref[isize],
+    requests: Vec[isize],
+    step: isize,
+    fail_at: isize,
+    mode: isize,
+}
+
+fn json_decode_probe(data: Vec[byte], step: isize, fail_at: isize, mode: isize) -> JsonDecodeProbe {
+    JsonDecodeProbe {
+        data,
+        position: Ref::new(0),
+        calls: Ref::new(0),
+        requests: Vec::new(),
+        step,
+        fail_at,
+        mode,
+    }
+}
+
+impl Read for JsonDecodeProbe {
+    fn read(self: JsonDecodeProbe, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        self.requests.push(output.len());
+        if self.fail_at > 0 && self.calls.get() >= self.fail_at {
+            if output.len() > 0 {
+                output[0] = b'X';
+                self.position.set(self.position.get() + 1);
+            }
+            if self.calls.get() == self.fail_at {
+                if self.mode == 1 {
+                    return Result::Ok(-1)
+                }
+                if self.mode == 2 {
+                    return Result::Ok(output.len() + 1)
+                }
+            }
+            return Result::Err(
+                io::Error::new(
+                    if self.mode == 3 {
+                        io::ErrorKind::Interrupted
+                    } else {
+                        io::ErrorKind::PermissionDenied
+                    },
+                    "json decode probe",
+                    Option::Some("source"),
+                    Option::Some(73),
+                    "failed read consumed a byte",
+                ),
+            )
+        }
+        let mut count = self.data.len() - self.position.get();
+        if count > self.step {
+            count = self.step;
+        }
+        if count > output.len() {
+            count = output.len();
+        }
+        for index in 0..count {
+            output[index] = self.data[self.position.get() + index];
+        }
+        self.position.set(self.position.get() + count);
+        Result::Ok(count)
+    }
+}
+
+fn json_decode_limits() -> json::DecodeLimits {
+    json::DecodeLimits {
+        max_input_bytes: 10000,
+        max_value_bytes: 10000,
+        max_depth: 64,
+        max_values: 1000,
+        max_string_bytes: 1000,
+        max_number_bytes: 1000,
+        max_container_entries: 1000,
+        max_path_bytes: 1000,
+        max_serde_frames: 100,
+        max_events: 10000,
+    }
+}
+
+fn json_decode_new(source: JsonDecodeProbe, limits: json::DecodeLimits) -> json::Decoder[
+    JsonDecodeProbe,
+] {
+    testing::expect_ok(json::Decoder::new(source, limits), "JSON decoder construction")
+}
+
+fn json_decode_failure(input: string, limits: json::DecodeLimits, kind: json::ErrorKind) -> json::Error {
+    let source = json_decode_probe(input.to_bytes(), 1, 0, 0);
+    let decoder = json_decode_new(source, limits);
+    let error = testing::expect_err(decoder.next_value(), "JSON value rejection");
+    assert_equal(error.kind(), kind);
+    let calls = source.calls.get();
+    let again = testing::expect_err(decoder.next_token(), "terminal JSON decoder");
+    assert_equal(again.kind(), error.kind());
+    assert_equal(again.byte_offset(), error.byte_offset());
+    assert_equal(again.confirmed_read(), error.confirmed_read());
+    assert_equal(source.calls.get(), calls);
+    error
+}
+
+fn json_decode_tokens() -> () {
+    let input = "{\"é\":[\"中😀\",\"\\ud83d\\ude00\",-0.1200E+03,true,false,null]} \"next\"";
+    let expected = [
+        json::Token::StartObject,
+        json::Token::Key("é"),
+        json::Token::StartArray,
+        json::Token::String("中😀"),
+        json::Token::String("😀"),
+        json::Token::Number("-0.1200E+03"),
+        json::Token::Bool(true),
+        json::Token::Bool(false),
+        json::Token::Null,
+        json::Token::EndArray,
+        json::Token::EndObject,
+        json::Token::String("next"),
+    ];
+    for step in 1..=input.byte_len() {
+        let source = json_decode_probe(input.to_bytes(), step, 0, 0);
+        let decoder = json_decode_new(source, json_decode_limits());
+        for token in expected {
+            assert_equal(
+                testing::expect_ok(decoder.next_token(), "chunked JSON token"),
+                Option::Some(token),
+            );
+        }
+        assert_equal(testing::expect_ok(decoder.next_token(), "JSON stream EOF"), Option::None);
+        let calls = source.calls.get();
+        assert_equal(testing::expect_ok(decoder.next_token(), "cached JSON EOF"), Option::None);
+        testing::expect_ok(decoder.finish(), "finished JSON token stream");
+        assert_equal(source.calls.get(), calls);
+        assert_equal(decoder.offset(), input.byte_len());
+    }
+    let input = "{\"k\":1,\"k\":2,\"n\":-0.1200E+03}";
+    let decoder = json_decode_new(
+        json_decode_probe(input.to_bytes(), 1, 0, 0),
+        json_decode_limits(),
+    );
+    let value = testing::expect_some(
+        testing::expect_ok(decoder.next_value(), "duplicate-preserving value"),
+        "JSON root value",
+    );
+    assert_equal(json::encode(value), input);
+    assert_equal(
+        json::as_int(testing::expect_some(json::field(value, "k"), "first duplicate")),
+        Option::Some(1),
+    );
+    testing::expect_ok(decoder.finish(), "value finish");
+}
+
+fn json_decode_state() -> () {
+    for input in["", " \r\n\t"] {
+        let decoder = json_decode_new(
+            json_decode_probe(input.to_bytes(), 1, 0, 0),
+            json_decode_limits(),
+        );
+        match testing::expect_ok(decoder.next_value(), "clean empty stream") {
+            Option::None => (),
+            Option::Some(_) => testing::fail("unexpected root at EOF"),
+        }
+    }
+    let source = json_decode_probe("[] true".to_bytes(), 4096, 0, 0);
+    let decoder = json_decode_new(source, json_decode_limits());
+    let alias = decoder;
+    let _ = testing::expect_ok(decoder.next_value(), "first complete root");
+    assert_equal(decoder.offset(), 2);
+    let snapshot = decoder.buffered();
+    assert_equal(snapshot.len(), 5);
+    let error = testing::expect_err(alias.finish(), "finish rejects second root");
+    assert_equal(error.kind(), json::ErrorKind::TrailingData);
+    assert_equal(error.byte_offset(), 3);
+    assert_equal(snapshot.len(), 5);
+    assert_equal(snapshot.get(0), b' ');
+    let calls = source.calls.get();
+    let _ = testing::expect_err(decoder.next_value(), "alias shares terminal failure");
+    assert_equal(source.calls.get(), calls);
+    let decoder = json_decode_new(
+        json_decode_probe("[1]".to_bytes(), 1, 0, 0),
+        json_decode_limits(),
+    );
+    assert_equal(
+        testing::expect_ok(decoder.next_token(), "begin partial root"),
+        Option::Some(json::Token::StartArray),
+    );
+    assert_equal(
+        testing::expect_err(decoder.next_value(), "cannot switch midroot").kind(),
+        json::ErrorKind::State,
+    );
+    for input in["{}[]", "\"x\"true"] {
+        let decoder = json_decode_new(
+            json_decode_probe(input.to_bytes(), 1, 0, 0),
+            json_decode_limits(),
+        );
+        let _ = testing::expect_ok(decoder.next_value(), "closed root without lookahead");
+        assert_equal(
+            testing::expect_err(decoder.next_value(), "root separator required").kind(),
+            json::ErrorKind::Syntax,
+        );
+    }
+    for input in[
+        "01",
+        "truefalse",
+        "1e+",
+        "[1,]",
+        "{\"a\":}",
+        "t😀",
+        "\"\\ud800x\"",
+        "\"\\udc00\"",
+        "\"\\ud800\\u0041\"",
+    ] {
+        let kind = if input == "1e+" {
+            json::ErrorKind::UnexpectedEof
+        } else {
+            json::ErrorKind::Syntax
+        };
+        let _ = json_decode_failure(input, json_decode_limits(), kind);
+    }
+    for input in["[", "{", "\"", "\"\\u12", "tru", "-"] {
+        let _ = json_decode_failure(input, json_decode_limits(), json::ErrorKind::UnexpectedEof);
+    }
+    let error = json_decode_failure("{\"a\":[0,?]}", json_decode_limits(), json::ErrorKind::Syntax);
+    assert_equal(error.path().len(), 2);
+    assert_equal(error.path()[0], json::PathSegment::Field("a"));
+    assert_equal(error.path()[1], json::PathSegment::Index(1));
+    assert_equal(
+        json_decode_failure("\"\\udc00\"", json_decode_limits(), json::ErrorKind::Syntax).byte_offset(),
+        3,
+    );
+    assert_equal(
+        json_decode_failure("\"\\ud800\\u0041\"", json_decode_limits(), json::ErrorKind::Syntax).byte_offset(),
+        9,
+    );
+}
+
+fn json_decode_faults() -> () {
+    for mode in[0, 1, 2, 3] {
+        let source = json_decode_probe("\"abc\"".to_bytes(), 1, 3, mode);
+        let decoder = json_decode_new(source, json_decode_limits());
+        let error = testing::expect_err(decoder.next_value(), "reader fault");
+        assert_equal(error.kind(), json::ErrorKind::Io);
+        assert_equal(error.confirmed_read(), 2.to_usize());
+        assert_equal(error.byte_offset(), 2);
+        assert_equal(source.calls.get(), 3);
+        assert_equal(source.position.get(), 3);
+        assert_equal(decoder.buffered().len(), 0);
+        let cause = testing::expect_some(error.cause(), "reader cause");
+        assert_equal(
+            cause.kind(),
+            if mode == 1 || mode == 2 {
+                io::ErrorKind::InvalidData
+            } else if mode == 3 {
+                io::ErrorKind::Interrupted
+            } else {
+                io::ErrorKind::PermissionDenied
+            },
+        );
+        if mode == 0 || mode == 3 {
+            assert_equal(cause.raw_os_code(), Option::Some(73));
+            assert_equal(cause.message(), "failed read consumed a byte");
+        }
+        let _ = testing::expect_err(decoder.next_value(), "no retry after reader fault");
+        assert_equal(source.calls.get(), 3);
+    }
+    for data in[
+        Vec::from_array([b'"', 0xff, b'"']),
+        Vec::from_array([b'"', 0xc0, 0x80, b'"']),
+        Vec::from_array([b'"', 0xed, 0xa0, 0x80, b'"']),
+    ] {
+        let decoder = json_decode_new(json_decode_probe(data, 1, 0, 0), json_decode_limits());
+        assert_equal(
+            testing::expect_err(decoder.next_value(), "strict UTF8").kind(),
+            json::ErrorKind::Utf8,
+        );
+    }
+    let decoder = json_decode_new(
+        json_decode_probe(Vec::from_array([b'"', 0xf0, 0x9f]), 1, 0, 0),
+        json_decode_limits(),
+    );
+    assert_equal(
+        testing::expect_err(decoder.next_value(), "incomplete UTF8 EOF").kind(),
+        json::ErrorKind::UnexpectedEof,
+    );
+}
+
+fn json_decode_budget() -> () {
+    let base = json_decode_limits();
+    for limits in[
+        json::DecodeLimits { max_input_bytes: -1, ..base },
+        json::DecodeLimits { max_value_bytes: -1, ..base },
+        json::DecodeLimits { max_depth: -1, ..base },
+        json::DecodeLimits { max_values: -1, ..base },
+        json::DecodeLimits { max_string_bytes: -1, ..base },
+        json::DecodeLimits { max_number_bytes: -1, ..base },
+        json::DecodeLimits { max_container_entries: -1, ..base },
+        json::DecodeLimits { max_path_bytes: -1, ..base },
+        json::DecodeLimits { max_serde_frames: -1, ..base },
+        json::DecodeLimits { max_events: -9223372036854775807 - 1, ..base },
+    ] {
+        let source = json_decode_probe("null".to_bytes(), 1, 0, 0);
+        match json::Decoder::new(source, limits) {
+            Result::Err(error) => assert_equal(error.kind(), json::ErrorKind::InvalidLimit),
+            Result::Ok(_) => testing::fail("negative JSON limit accepted"),
+        }
+        assert_equal(source.calls.get(), 0);
+    }
+    for (input, limits, kind) in[
+        ("null", json::DecodeLimits { max_input_bytes: 0, ..base }, json::LimitKind::InputBytes),
+        ("null", json::DecodeLimits { max_value_bytes: 0, ..base }, json::LimitKind::ValueBytes),
+        ("[]", json::DecodeLimits { max_depth: 0, ..base }, json::LimitKind::Depth),
+        ("null", json::DecodeLimits { max_values: 0, ..base }, json::LimitKind::Values),
+        ("\"x\"", json::DecodeLimits { max_string_bytes: 0, ..base }, json::LimitKind::StringBytes),
+        ("1 ", json::DecodeLimits { max_number_bytes: 0, ..base }, json::LimitKind::NumberBytes),
+        (
+            "[0]",
+            json::DecodeLimits { max_container_entries: 0, ..base },
+            json::LimitKind::ContainerEntries,
+        ),
+        ("{\"x\":0}", json::DecodeLimits { max_path_bytes: 0, ..base }, json::LimitKind::PathBytes),
+        ("null", json::DecodeLimits { max_events: 0, ..base }, json::LimitKind::Events),
+    ] {
+        let _ = json_decode_failure(input, limits, json::ErrorKind::Limit(kind));
+    }
+    let _ = json_decode_failure(
+        "1",
+        json::DecodeLimits { max_input_bytes: 1, ..base },
+        json::ErrorKind::Limit(json::LimitKind::InputBytes),
+    );
+    for input in["\"\"", "[]", "{}"] {
+        let decoder = json_decode_new(
+            json_decode_probe(input.to_bytes(), 1, 0, 0),
+            json::DecodeLimits {
+                max_string_bytes: 0,
+                max_container_entries: 0,
+                max_serde_frames: 0,
+                ..base,
+            },
+        );
+        let _ = testing::expect_ok(
+            decoder.next_value(),
+            "empty values need no payload or serde frames",
+        );
+    }
+    let decoder = json_decode_new(
+        json_decode_probe("0 1 ".to_bytes(), 1, 0, 0),
+        json::DecodeLimits {
+            max_value_bytes: 1,
+            max_values: 1,
+            max_number_bytes: 1,
+            max_depth: 0,
+            ..base,
+        },
+    );
+    for expected in["0", "1"] {
+        let value = testing::expect_some(
+            testing::expect_ok(decoder.next_value(), "per-root counters reset"),
+            "root scalar",
+        );
+        assert_equal(json::encode(value), expected);
+    }
+    let error = json_decode_failure(
+        "\"é\"",
+        json::DecodeLimits { max_string_bytes: 1, ..base },
+        json::ErrorKind::Limit(json::LimitKind::StringBytes),
+    );
+    assert_equal(error.byte_offset(), 1);
+    let decoder = json_decode_new(
+        json_decode_probe("\"é\"".to_bytes(), 1, 0, 0),
+        json::DecodeLimits { max_input_bytes: 4, max_value_bytes: 4, max_string_bytes: 2, ..base },
+    );
+    let _ = testing::expect_ok(
+        decoder.next_value(),
+        "closed scalar exact input/value/string budget",
+    );
+    assert_equal(decoder.offset(), 4);
+    let source = json_decode_probe("[] ".to_bytes(), 4096, 0, 0);
+    let decoder = json_decode_new(source, json::DecodeLimits { max_input_bytes: 2, ..base });
+    let _ = testing::expect_ok(decoder.next_value(), "bounded read request");
+    assert_equal(source.requests[0], 2);
+    let decoder = json_decode_new(
+        json_decode_probe("0 ".to_bytes(), 1, 0, 0),
+        json::DecodeLimits {
+            max_input_bytes: 9223372036854775807,
+            max_value_bytes: 9223372036854775807,
+            max_depth: 9223372036854775807,
+            max_values: 9223372036854775807,
+            max_string_bytes: 9223372036854775807,
+            max_number_bytes: 9223372036854775807,
+            max_container_entries: 9223372036854775807,
+            max_path_bytes: 9223372036854775807,
+            max_serde_frames: 9223372036854775807,
+            max_events: 9223372036854775807,
+        },
+    );
+    let _ = testing::expect_ok(decoder.next_value(), "MAX limits avoid overflow");
+    testing::expect_ok(decoder.finish(), "MAX limits finish");
+}
+
+pub fn test_json_stream_decode() -> () {
+    json_decode_tokens();
+    json_decode_state();
+    json_decode_faults();
+    json_decode_budget();
+}

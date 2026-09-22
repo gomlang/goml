@@ -1,0 +1,167 @@
+package main;
+
+use std::json;
+use std::io;
+use io::{Read, Write};
+use std::serde;
+use serde::{Serialize, Deserialize, Serializer, Deserializer};
+use std::testing;
+use std::panic;
+
+struct JsonCallbackReader {
+    call: Ref[() -> ()],
+    calls: Ref[isize],
+}
+
+impl Read for JsonCallbackReader {
+    fn read(self: JsonCallbackReader, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        (self.call.get())();
+        output[0] = b'1';
+        Result::Ok(1)
+    }
+}
+
+struct JsonCallbackWriter {
+    call: Ref[() -> ()],
+    calls: Ref[isize],
+}
+
+impl Write for JsonCallbackWriter {
+    fn write(self: JsonCallbackWriter, input: Slice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        (self.call.get())();
+        Result::Ok(input.len())
+    }
+}
+
+struct JsonPanicSerialize {}
+
+impl Serialize for JsonPanicSerialize {
+    fn serialize[S: Serializer](self: JsonPanicSerialize, serializer: S) -> Result[(), string] {
+        serializer.begin_sequence(1)?;
+        panic::raise("JSON serialize panic")
+    }
+}
+
+struct JsonPanicDeserialize {}
+
+impl Deserialize for JsonPanicDeserialize {
+    fn deserialize[D: Deserializer](deserializer: D) -> Result[JsonPanicDeserialize, string] {
+        let _ = deserializer.begin_sequence()?;
+        panic::raise("JSON deserialize panic")
+    }
+}
+
+fn test_json_stream_state() -> () {
+    let callback: Ref[() -> ()] = Ref::new(|| {});
+    let reader = JsonCallbackReader { call: callback, calls: Ref::new(0) };
+    let decoder = testing::expect_ok(
+        json::Decoder::new(reader, json_decode_limits()),
+        "reentrant decoder",
+    );
+    callback.set(
+        || {
+            let _ = decoder.next_token();
+        },
+    );
+    let error = testing::expect_err(decoder.next_value(), "reader reentry");
+    testing::assert_eq(error.kind(), json::ErrorKind::State);
+    testing::assert_eq(error.confirmed_read(), 1.to_usize());
+    testing::assert_eq(decoder.offset(), 0);
+    testing::assert_eq(decoder.buffered().get(0), b'1');
+    testing::assert_err(decoder.next_value());
+    testing::assert_eq(reader.calls.get(), 1);
+    let callback: Ref[() -> ()] = Ref::new(|| {});
+    let writer = JsonCallbackWriter { call: callback, calls: Ref::new(0) };
+    let encoder = testing::expect_ok(
+        json::Encoder::new(writer, json_encode_limits()),
+        "reentrant encoder",
+    );
+    callback.set(
+        || {
+            let _ = encoder.encode(2);
+        },
+    );
+    let error = testing::expect_err(encoder.encode(true), "writer reentry");
+    testing::assert_eq(error.kind(), json::ErrorKind::State);
+    testing::assert_eq(error.confirmed_written(), 4.to_usize());
+    testing::assert_eq(error.byte_offset(), 4);
+    testing::assert_err(encoder.encode(1));
+    testing::assert_eq(writer.calls.get(), 1);
+    let decoder = json_decode_new(json_decode_probe("[]".to_bytes(), 1, 0, 0), json_decode_limits());
+    testing::assert_err(
+        panic::catch(
+            || {
+                let result: Result[Option[JsonPanicDeserialize], json::Error] = decoder.decode();
+                result
+            },
+        ),
+    );
+    testing::assert_eq(
+        testing::expect_err(decoder.next_token(), "panic poisons decoder").kind(),
+        json::ErrorKind::State,
+    );
+    let encoder = testing::expect_ok(
+        json::Encoder::new(json_write_probe(4, 0, 0), json_encode_limits()),
+        "panic encoder",
+    );
+    testing::assert_err(panic::catch(|| encoder.encode(JsonPanicSerialize {})));
+    testing::assert_eq(
+        testing::expect_err(encoder.encode(1), "panic poisons encoder").kind(),
+        json::ErrorKind::State,
+    );
+    let mut limits = json_decode_limits();
+    limits.max_serde_frames = 1;
+    let result: Result[Option[Option[isize]], json::Error] = json::from_string_with_limits(
+        "1",
+        limits,
+    );
+    testing::assert_eq(
+        testing::expect_err(result, "optional decode frames").kind(),
+        json::ErrorKind::Limit(json::LimitKind::SerdeFrames),
+    );
+    let mut limits = json_encode_limits();
+    limits.max_serde_frames = 1;
+    testing::assert_eq(
+        testing::expect_err(
+            json::to_string_with_limits(Option::Some(Option::Some(1)), limits),
+            "optional encode frames",
+        ).kind(),
+        json::ErrorKind::Limit(json::LimitKind::SerdeFrames),
+    );
+    let error = json_typed_reject::[JsonStreamPerson](
+        "{\"name\":\"x\",\"age\":256,\"tags\":[],\"extra\":null}",
+        json::ErrorKind::Schema,
+    );
+    testing::assert_eq(error.byte_offset(), 18);
+    testing::assert_eq(error.path().len(), 1);
+    testing::assert_eq(error.path()[0], json::PathSegment::Field("age"));
+    let error = json_typed_reject::[JsonStreamEvent](
+        "{\"Pair\":[256,\"x\"]}",
+        json::ErrorKind::Schema,
+    );
+    testing::assert_eq(error.path().len(), 2);
+    testing::assert_eq(error.path()[0], json::PathSegment::Variant("Pair"));
+    testing::assert_eq(error.path()[1], json::PathSegment::Index(0));
+    let mut limits = json_decode_limits();
+    limits.max_depth = 1;
+    let result: Result[JsonStreamPerson, json::Error] = json::from_string_with_limits(
+        "{\"ignored\":[[]]}",
+        limits,
+    );
+    testing::assert_eq(
+        testing::expect_err(result, "skipped depth").kind(),
+        json::ErrorKind::Limit(json::LimitKind::Depth),
+    );
+    let mut limits = json_decode_limits();
+    limits.max_string_bytes = 8;
+    let result: Result[JsonStreamPerson, json::Error] = json::from_string_with_limits(
+        "{\"ignored\":\"123456789\"}",
+        limits,
+    );
+    testing::assert_eq(
+        testing::expect_err(result, "skipped string bytes").kind(),
+        json::ErrorKind::Limit(json::LimitKind::StringBytes),
+    );
+}
