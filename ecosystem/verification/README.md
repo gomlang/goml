@@ -15,7 +15,7 @@ just ecosystem-test --goml /path/to/goml lsp
 just ecosystem-test --list
 ```
 
-No module arguments selects all 39 libraries and their separate consumers,
+No module arguments selects all libraries registered in `modules()` and their separate consumers,
 `goml_stats`, Explorer and four compiler regression projects. Each selected
 module must exist. The runner checks formatting, builds consumers before tests,
 runs library and consumer `#[test]` suites, verifies cached build fingerprints

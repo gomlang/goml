@@ -14,6 +14,12 @@ consumers and executable verification. The table records their implemented scope
 individual READMEs describe API semantics and limits. [ROADMAP.md](ROADMAP.md)
 tracks completed improvements and the remaining functional gaps.
 
+The [standard-library migration ownership map](../docs/stdlib-migration.md)
+assigns each A/B capability to std or ecosystem and records dependency order and
+acceptance status. Pure GoML migration does not promote a module into std:
+request, web, archive, color and markdown remain independently versioned here.
+Standard packages must not depend on ecosystem modules.
+
 | Module | Functional target | Status |
 | --- | --- | --- |
 | [parser](parser/README.md) | Text/binary combinators, recursive grammars, shared work/depth budgets, spans, contextual errors and operator precedence | Implemented; module and consumer tests pass |
@@ -22,6 +28,7 @@ tracks completed improvements and the remaining functional gaps.
 | [msgpack](msgpack/README.md) | MessagePack wire types, direct Serde and standard stream integration, typed/dynamic frames, malformed-input limits and interoperability | Implemented; 20 library tests, consumer checks and 2,490 reference interoperability cases pass |
 | [graph](graph/README.md) | Mutable directed/undirected graphs, stable IDs, traversal, components, topological order, shortest paths and spanning trees | Implemented; independent algorithm checks and consumer tests pass |
 | [template](template/README.md) | Expressions, lexical scopes, conditions, loops, filters, includes, inheritance, escaping and contextual diagnostics | Implemented; 11 library tests, 2 consumer tests and 1,367 Jinja shared-syntax comparisons pass |
+| [html](html/README.md) | Shared bounded escaping and text/attribute character-reference decoding | Shared entity data, explicit quote policies and template/markdown-compatible wrappers; whole-string APIs |
 | [redis](redis/README.md) | RESP2/3 codec, typed commands, pipelining, transactions, Pub/Sub, bounded pools, DNS/TLS, injectable transport, context cancellation and total deadlines | Implemented; 29 library tests and race checks, versioned consumers, 2,391 protocol cases, Redis 7.2.5 RESP2/3 interoperability and 15 DNS/TLS cases in normal/race builds pass |
 | [pipeline](pipeline/README.md) | Lazy streams, bounded parallel transforms, filtering, ordering, batching/windows, merge/zip, backpressure and cancellation | Implemented; 21 library tests and race checks, versioned consumer and 1,253 Python oracle cases pass |
 | [ndarray](ndarray/README.md) | Generic shared views, slicing, broadcasting, checked arithmetic, reductions, batched multiplication, LU/Cholesky/QR solves and SIMD | Implemented; 17 library tests, versioned consumer, 2,929 NumPy cases and native/SSE2/scalar builds pass |
