@@ -82,6 +82,9 @@ The default renderer escapes raw HTML and permits relative URLs plus `http`,
 `https`, `mailto` and `ftp` schemes. Other schemes produce empty link/image
 destinations. Scheme checking accounts for whitespace/control characters after
 Markdown entity decoding. `escape_html` and `safe_url` are also public helpers.
+The escape helper now uses `ecosystem::html` while retaining named double-quote
+references and unchanged apostrophes. Entity parsing still follows Markdown's
+existing rules and has not been replaced with permissive HTML decoding.
 
 `RenderOptions::commonmark()` preserves raw HTML and arbitrary URI schemes to
 match the reference corpus. Applications select that policy explicitly. Render
@@ -133,6 +136,12 @@ imports only public APIs and also offers stdin conversion through `--safe`,
 
 The consumer’s native `tests/reference_test.gom` checks all 652 examples from the [CommonMark 0.31.2 reference corpus](https://spec.commonmark.org/0.31.2/spec.json), together with all 2,125 named entities. The checked-in independent corpus records the original CommonMark SHA-256 digest `d431b29d97b6f73e69d547109cf5081578fac931e72afe95639ebe766c1b2a20`; running the tests needs no Python or network access. The CommonMark specification and examples are by John MacFarlane, licensed under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/).
 
-`entities.gom` is generated from the independently sourced HTML5 entity data retained in [tools/data/entities.json](tools/data/entities.json). The source is CPython 3.12.3 `html.entities.html5`, restricted to semicolon-ended names. Its license is retained in [LICENSE.entities.txt](LICENSE.entities.txt). The native GoML generator validates the data checksum and 2,125-entry count, then emits the same lookup functions deterministically. Its ordinary native test verifies the exact generated file on each `just ecosystem-test markdown` run.
+`entities.gom` is now a generated compatibility wrapper over ecosystem::html's
+shared lookup. The independently sourced [HTML entity data](../html/data/entities.json)
+comes from CPython 3.12.3 `html.entities.html5`, restricted to semicolon-ended names.
+Its license remains in [LICENSE.entities.txt](LICENSE.entities.txt) and the HTML
+module. The native GoML generator validates the checksum and 2,125-entry count,
+then generates the shared lookup and wrapper deterministically. Its ordinary
+native test verifies both files on each `just ecosystem-test markdown` run.
 
 To regenerate, run `../../../stage2/bin/goml build` from `ecosystem/markdown/tools`, then `_artifact/bin/markdown_entities generate ..`. `check` verifies the file without writing. The data and generator need no Python installation.
