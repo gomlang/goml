@@ -149,12 +149,23 @@ allows processing the following row. EOF remains `None` without further reads.
 In `Any` mode, a completed CR-terminated row is returned before an I/O error from
 looking ahead for its optional LF; the saved error is returned on the next call.
 
-Short reads and writes are supported, and interrupted transfers are retried.
-Invalid transfer counts become errors. A successful zero-byte read is EOF; a
-zero-byte write is an error. Bytes successfully written before an I/O error remain
-written, and subsequent writer calls return the saved error rather than replaying
-the row. Validation errors before output do not poison the writer, so a caller
-may correct the row and try again. Flush failures also fuse the writer.
+Short reads and writes are supported. Every read or write error, including
+`Interrupted`, stops the operation without automatic retry and fuses that wrapper. Invalid
+transfer counts become errors. A successful zero-byte read is EOF; a zero-byte
+write is an error. Writer positions track only bytes confirmed by successful
+write calls. A failed call may already have produced side effects, particularly
+through `MultiWriter` or `OffsetWriter`; the saved position is not a safe retry
+offset or a guarantee that the remaining bytes were never written. Subsequent
+writer calls return the saved error without replaying the row or forwarding
+flush. Validation errors before output do not poison the writer, so a caller may
+correct the row and try again. Flush failures also fuse the writer.
+
+A failed read may already have consumed source bytes or modified its destination
+buffer without reporting a count. Those bytes are not parsed, and the saved
+reader position reflects only confirmed input, not a safe transport restart
+offset. The completed-CR-row lookahead rule above still delivers that row before
+returning the saved error. Recovery requires caller-owned transport knowledge;
+constructing another reader does not restore consumed input.
 
 Reader and writer aliases serialize operations through an internal gate, including
 short transfers, so concurrent calls do not interleave records. The caller owns
