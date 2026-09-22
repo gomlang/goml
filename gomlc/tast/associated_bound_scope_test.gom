@@ -1,0 +1,128 @@
+package tast;
+
+use std::testing;
+use module::ast;
+use module::hir;
+use module::parser;
+
+fn check_associated_bound_scope(predicates: Vec[TypePredicate]) -> () {
+    let mut found = false;
+    for predicate in predicates {
+        if let TypePredicate::Trait { for_ty: _, trait_ref } = predicate {
+            testing::assert(trait_ref.name != "File");
+            if trait_ref.name == "example::portable::File" {
+                found = true;
+            }
+        }
+    }
+    testing::assert(found);
+}
+
+#[test]
+fn canonicalizes_implied_associated_bounds_in_function_and_impl_predicates() -> () {
+    let source = "package portable; pub trait File { fn size(self: Self) -> i32; } pub trait FileSystem { type Handle: File; fn open(self: Self) -> Self::Handle; } pub struct SubFs[F] { inner: F } impl[F: FileSystem] FileSystem for SubFs[F] { type Handle = F::Handle; fn open(self: SubFs[F]) -> F::Handle { self.inner.open() } } pub fn inspect[F: FileSystem](filesystem: F) -> i32 { filesystem.open().size() }";
+    let checked = check_for_link_with_dependencies(
+        hir::lower_package(ast::lower(parser::parse(source)), "portable.gom", "example::portable"),
+        Vec::new(),
+    );
+    testing::assert_eq(checked.diagnostics.len(), 0);
+    let Some(file) = checked.tast else {
+        testing::fail("expected portable package TAST");
+        return
+    };
+    let mut functions = 0;
+    let mut implementations = 0;
+    for item in file.items {
+        match item {
+            Function(value) => {
+                if value.name == "example::portable::inspect" {
+                    check_associated_bound_scope(value.predicates);
+                    functions += 1;
+                }
+            },
+            ImplBlock(value) => {
+                if let Some(reference) = value.trait_ref {
+                    if reference.name == "example::portable::FileSystem" {
+                        check_associated_bound_scope(value.predicates);
+                        implementations += 1;
+                    }
+                }
+            },
+            _ => (),
+        }
+    }
+    testing::assert_eq(functions, 1);
+    testing::assert_eq(implementations, 1);
+}
+
+#[test]
+fn resolves_inherited_associated_type_in_where_predicate() -> () {
+    let source = "trait Mark {} trait Parent { type Handle; fn get(self: Self) -> Self::Handle; } trait Child: Parent {} fn inspect[F: Child](value: F) -> F::Handle where F::Handle: Mark { value.get() }";
+    let _ = checked_file(source);
+    let packaged = "package portable; pub trait File {} pub trait ReadDirectory {} pub trait FileSystem { type Handle: File; } pub trait LinkFileSystem: FileSystem {} pub fn inspect[F: LinkFileSystem](value: F) -> () where F::Handle: ReadDirectory {}";
+    let checked = check_for_link_with_dependencies(
+        hir::lower_package(ast::lower(parser::parse(packaged)), "portable.gom", "example::portable"),
+        Vec::new(),
+    );
+    testing::assert_eq(checked.diagnostics.len(), 0);
+}
+
+#[test]
+fn deduplicates_parent_and_diamond_associated_candidates() -> () {
+    let prefix = "trait Mark {} trait Parent[T] { type Handle; fn get(self: Self) -> Self::Handle; } trait Left[T]: Parent[T] {} trait Right[T]: Parent[T] {} trait Diamond[T]: Left[T] + Right[T] {} ";
+    for bounds in[
+        "Left[i32] + Parent[i32]",
+        "Parent[i32] + Left[i32]",
+        "Diamond[i32]",
+        "Diamond[i32] + Parent[i32] + Left[i32] + Right[i32]",
+    ] {
+        let _ = checked_file(
+            prefix + "fn inspect[F: " + bounds
+                + "](value: F) -> F::Handle where F::Handle: Mark { value.get() }",
+        );
+    }
+}
+
+#[test]
+fn substitutes_generic_supertraits_for_associated_where_bounds() -> () {
+    let file = checked_file(
+        "trait Mark {} trait Parent[T] { type Handle; fn get(self: Self) -> Self::Handle; } trait Middle[U]: Parent[Vec[U]] {} trait Child[V]: Middle[V] {} fn inspect[F: Child[i32]](value: F) -> F::Handle where F::Handle: Mark { value.get() }",
+    );
+    let mut found = false;
+    for item in file.items {
+        if let Function(function) = item {
+            for predicate in function.predicates {
+                if let TypePredicate::Trait { for_ty, trait_ref } = predicate {
+                    if trait_ref.name == "Mark" {
+                        if let Type::Projection { for_ty: _, name, trait_ref: Some(reference) } = for_ty {
+                            testing::assert_eq(name, "Handle");
+                            testing::assert_eq(reference.name, "Parent");
+                            testing::assert_eq(reference.args.len(), 1);
+                            testing::assert(
+                                types_equal(reference.args[0], Type::VecType { elem: Type::Int32 }),
+                            );
+                            found = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    testing::assert(found);
+}
+
+#[test]
+fn preserves_distinct_associated_sources_in_where_predicates() -> () {
+    let different_traits = checked_diagnostics(
+        "trait Mark {} trait Left { type Handle; } trait Right { type Handle; } trait Child: Left + Right {} fn inspect[F: Child](value: F) -> () where F::Handle: Mark {}",
+    );
+    testing::assert(
+        has_diagnostic_containing(different_traits, "Associated type F::Handle is ambiguous"),
+    );
+    let different_arguments = checked_diagnostics(
+        "trait Mark {} trait Parent[T] { type Handle; } trait Child: Parent[i32] + Parent[string] {} fn inspect[F: Child](value: F) -> () where F::Handle: Mark {}",
+    );
+    testing::assert(
+        has_diagnostic_containing(different_arguments, "Associated type F::Handle is ambiguous"),
+    );
+}
