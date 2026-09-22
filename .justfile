@@ -122,6 +122,8 @@ bootstrap:
     just _bootstrap-stage3
 
 _ci-scripts:
+    go run tools/generate_unicode_tables.go --check
+    python3 tools/generate_unicode_casefold.py --check
     python3 tools/syscall/generate.py --check
     python3 tools/syscall/layouts.py --check --verify-headers
     bash -n tools/release/release.sh tools/release/test.sh tools/release/package.sh tools/release/smoke.sh tools/release/lsp_smoke.sh
