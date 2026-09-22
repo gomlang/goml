@@ -1,0 +1,287 @@
+package main;
+
+use std::bytes;
+use std::fs;
+use fs::{File, FileSystem, ReadDirFile};
+use std::io;
+use io::{Read, Seek, Close};
+use std::testing;
+use std::testing::fs as memory;
+
+struct CheckSeekProbe {
+    source: memory::MemoryFS,
+    mode: isize,
+    opens: Ref[isize],
+    closes: Ref[isize],
+    duplicate_closes: Ref[isize],
+    seeks: Ref[isize],
+    failed_mutations: Ref[isize],
+}
+
+struct CheckSeekProbeHandle {
+    source: memory::MemoryHandle,
+    owner: CheckSeekProbe,
+    closed: Ref[bool],
+}
+
+fn check_seek_probe(mode: isize, content: string) -> CheckSeekProbe {
+    let source = testing::expect_ok(
+        memory::MemoryFS::new(
+            Vec::from_array([memory::MemoryNode::file("data", bytes::Bytes::from_string(content))]),
+            memory::MemoryLimits {
+                max_nodes: 10,
+                max_data_bytes: 1000,
+                max_path_bytes: 100,
+                max_depth: 10,
+                max_link_hops: 10,
+                max_resolve_work: 1000,
+            },
+        ),
+        "seek checker memory source",
+    );
+    CheckSeekProbe {
+        source,
+        mode,
+        opens: Ref::new(0),
+        closes: Ref::new(0),
+        duplicate_closes: Ref::new(0),
+        seeks: Ref::new(0),
+        failed_mutations: Ref::new(0),
+    }
+}
+
+impl FileSystem for CheckSeekProbe {
+    type Handle = CheckSeekProbeHandle;
+
+    fn open(self: CheckSeekProbe, path: string) -> Result[CheckSeekProbeHandle, fs::Error] {
+        let source = self.source.open(path)?;
+        self.opens.set(self.opens.get() + 1);
+        Result::Ok(CheckSeekProbeHandle { source, owner: self, closed: Ref::new(false) })
+    }
+}
+
+impl Close for CheckSeekProbeHandle {
+    fn close(self: CheckSeekProbeHandle) -> Result[(), io::Error] {
+        self.owner.closes.set(self.owner.closes.get() + 1);
+        if self.closed.get() {
+            self.owner.duplicate_closes.set(self.owner.duplicate_closes.get() + 1);
+        }
+        self.closed.set(true);
+        self.source.close()
+    }
+}
+
+impl Read for CheckSeekProbeHandle {
+    fn read(self: CheckSeekProbeHandle, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.source.read(output)
+    }
+}
+
+impl File for CheckSeekProbeHandle {
+    fn stat(self: CheckSeekProbeHandle) -> Result[fs::Metadata, fs::Error] {
+        self.source.stat()
+    }
+}
+
+impl ReadDirFile for CheckSeekProbeHandle {
+    type Entry = fs::SnapshotEntry;
+
+    fn read_dir(self: CheckSeekProbeHandle, amount: isize) -> Result[
+        Vec[fs::SnapshotEntry],
+        fs::ReadDirError[fs::SnapshotEntry],
+    ] {
+        self.source.read_dir(amount)
+    }
+}
+
+impl Seek for CheckSeekProbeHandle {
+    fn seek(self: CheckSeekProbeHandle, from: io::SeekFrom) -> Result[isize, io::Error] {
+        self.owner.seeks.set(self.owner.seeks.get() + 1);
+        if self.owner.mode == 3 {
+            if let io::SeekFrom::Start(offset) = from {
+                if offset < 0 {
+                    return Result::Ok(0)
+                }
+            }
+        }
+        if self.owner.mode == 4 {
+            if let io::SeekFrom::Current(offset) = from {
+                if offset == 9223372036854775807 {
+                    return Result::Ok(0)
+                }
+            }
+        }
+        if self.owner.mode == 5 {
+            if let io::SeekFrom::End(_) = from {
+                return Result::Err(
+                    io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "seek probe",
+                        Option::Some("data"),
+                        Option::Some(71),
+                        "end position is unavailable",
+                    ),
+                )
+            }
+        }
+        if self.owner.mode == 2 {
+            let current = self.source.seek(io::SeekFrom::Current(0))?;
+            return Result::Ok(
+                match from {
+                    Start(offset) => offset,
+                    Current(offset) => current + offset,
+                    End(offset) => 6 + offset,
+                },
+            )
+        }
+        let result = self.source.seek(from);
+        if self.owner.mode == 1 {
+            return result.map(|position| position + 1)
+        }
+        if self.owner.mode == 6 {
+            if let Err(error) = result {
+                if error.kind() == io::ErrorKind::InvalidInput {
+                    let _ = self.source.seek(io::SeekFrom::Start(2))?;
+                    self.owner.failed_mutations.set(self.owner.failed_mutations.get() + 1);
+                }
+            }
+        }
+        result
+    }
+}
+
+fn check_seek_probe_run(source: CheckSeekProbe, limits: memory::CheckLimits) -> memory::CheckReport {
+    let report = testing::expect_ok(
+        memory::check_seek(
+            source,
+            memory::ExpectedTree::Contains(Vec::from_array(["data"])),
+            limits,
+        ),
+        "seek checker report",
+    );
+    assert_equal(source.opens.get(), source.closes.get());
+    assert_equal(source.duplicate_closes.get(), 0);
+    assert_equal(report.cleanup_calls(), source.closes.get());
+    report
+}
+
+fn check_seek_probe_has(report: memory::CheckReport, kind: isize) -> bool {
+    for issue in report.issues() {
+        let actual = match issue.kind {
+            ContractViolation(_) => 0,
+            InconsistentSnapshot(_) => 1,
+            ProviderError(_) => 2,
+            ProviderPanic(_) => 3,
+        };
+        if actual == kind && issue.path == "data" {
+            return true
+        }
+    }
+    false
+}
+
+fn check_seek_probe_contracts() -> () {
+    let empty_tree = testing::expect_ok(
+        memory::check_seek(
+            check_public_source(true),
+            memory::ExpectedTree::Empty,
+            check_public_limits(),
+        ),
+        "empty tree seek checker",
+    );
+    testing::assert(empty_tree.passed());
+    for content in["", "abcdef"] {
+        let source = check_seek_probe(0, content);
+        let report = check_seek_probe_run(source, check_public_limits());
+        testing::assert(report.passed());
+        testing::assert(report.complete());
+        assert_equal(report.issues().len(), 0);
+        testing::assert(source.seeks.get() > 0);
+    }
+    for mode in[1, 2, 3, 4] {
+        let source = check_seek_probe(mode, "abcdef");
+        let report = check_seek_probe_run(source, check_public_limits());
+        testing::assert(!report.passed());
+        testing::assert(!report.complete());
+        testing::assert(
+            check_seek_probe_has(
+                report,
+                if mode == 2 {
+                    1
+                } else {
+                    0
+                },
+            ),
+        );
+        testing::assert(!check_seek_probe_has(report, 2));
+        testing::assert(!check_seek_probe_has(report, 3));
+        testing::assert(report.stop_reason().is_none());
+    }
+    let source = check_seek_probe(5, "abcdef");
+    let report = check_seek_probe_run(source, check_public_limits());
+    testing::assert(!report.passed());
+    testing::assert(check_seek_probe_has(report, 2));
+    testing::assert(!check_seek_probe_has(report, 0));
+    testing::assert(!check_seek_probe_has(report, 1));
+    testing::assert(!check_seek_probe_has(report, 3));
+    testing::assert(report.stop_reason().is_none());
+    for issue in report.issues() {
+        if let memory::CheckIssueKind::ProviderError(error) = issue.kind {
+            assert_equal(error.kind(), io::ErrorKind::Unsupported);
+            assert_equal(error.operation(), "seek probe");
+            assert_equal(error.path(), Option::Some("data"));
+            assert_equal(error.raw_os_code(), Option::Some(71));
+        }
+    }
+    let source = check_seek_probe(6, "abcdef");
+    let report = check_seek_probe_run(source, check_public_limits());
+    testing::assert(report.passed());
+    testing::assert(source.failed_mutations.get() > 0);
+    assert_equal(report.issues().len(), 0);
+}
+
+fn check_seek_probe_budgets() -> () {
+    let source = check_seek_probe(0, "abcdef");
+    let report = check_seek_probe_run(
+        source,
+        memory::CheckLimits { max_total_read_bytes: 19, ..check_public_limits() },
+    );
+    testing::assert(!report.passed());
+    assert_equal(report.read_bytes(), 19);
+    assert_equal(report.issues().len(), 0);
+    testing::assert(source.seeks.get() > 0);
+    match report.stop_reason() {
+        Some(memory::CheckStop::Budget(path, memory::CheckBudget::TotalReadBytes)) => assert_equal(
+            path,
+            "data",
+        ),
+        _ => testing::fail("seek reads must share the total read budget"),
+    }
+    let baseline = check_seek_probe_run(check_seek_probe(0, "abcdef"), check_public_limits());
+    testing::assert(baseline.passed());
+    for less in[0, 1] {
+        let source = check_seek_probe(0, "abcdef");
+        let limit = baseline.provider_calls() - less;
+        let report = check_seek_probe_run(
+            source,
+            memory::CheckLimits { max_provider_calls: limit, ..check_public_limits() },
+        );
+        assert_equal(report.provider_calls(), limit);
+        assert_equal(report.issues().len(), 0);
+        testing::assert(source.seeks.get() > 0);
+        if less == 0 {
+            testing::assert(report.passed());
+        } else {
+            testing::assert(!report.passed());
+            match report.stop_reason() {
+                Some(memory::CheckStop::Budget(_, memory::CheckBudget::ProviderCalls)) => (),
+                _ => testing::fail("seek calls must share the provider call budget"),
+            }
+        }
+    }
+}
+
+pub fn test_fs_check_seek() -> () {
+    check_seek_probe_contracts();
+    check_seek_probe_budgets();
+}

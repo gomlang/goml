@@ -1,0 +1,425 @@
+package main;
+
+use std::testing::fs as memory;
+use std::fs;
+use fs::{FileSystem, File, ReadDirFile};
+use std::bytes;
+use std::io;
+use io::{Read, Close};
+use std::panic;
+use std::testing;
+
+fn check_public_limits() -> memory::CheckLimits {
+    memory::CheckLimits {
+        max_nodes: 100,
+        max_depth: 100,
+        max_directory_entries: 100,
+        max_file_bytes: 1000,
+        max_total_read_bytes: 100000,
+        max_provider_calls: 100000,
+        max_issues: 100,
+        max_path_bytes: 10000,
+    }
+}
+
+fn check_public_source(empty: bool) -> memory::MemoryFS {
+    let nodes = Vec::new();
+    if !empty {
+        nodes.push(memory::MemoryNode::file("file", bytes::Bytes::from_string("contents")));
+        nodes.push(memory::MemoryNode::file("dir/child", bytes::Bytes::from_string("child")));
+        nodes.push(memory::MemoryNode::link("link", "file"));
+        nodes.push(memory::MemoryNode::link("dangling", "absent"));
+    }
+    testing::expect_ok(
+        memory::MemoryFS::new(
+            nodes,
+            memory::MemoryLimits {
+                max_nodes: 100,
+                max_data_bytes: 1000,
+                max_path_bytes: 1000,
+                max_depth: 100,
+                max_link_hops: 100,
+                max_resolve_work: 10000,
+            },
+        ),
+        "checker memory fixture",
+    )
+}
+
+struct CheckPublicProbe {
+    source: memory::MemoryFS,
+    mode: isize,
+    attempts: Ref[isize],
+    acquired: Ref[isize],
+    closes: Ref[isize],
+    reads: Ref[isize],
+}
+
+struct CheckPublicHandle {
+    source: memory::MemoryHandle,
+    owner: CheckPublicProbe,
+    path: string,
+    read_seen: Ref[bool],
+    closed: Ref[bool],
+}
+
+fn check_public_probe(mode: isize) -> CheckPublicProbe {
+    CheckPublicProbe {
+        source: check_public_source(false),
+        mode,
+        attempts: Ref::new(0),
+        acquired: Ref::new(0),
+        closes: Ref::new(0),
+        reads: Ref::new(0),
+    }
+}
+
+impl FileSystem for CheckPublicProbe {
+    type Handle = CheckPublicHandle;
+
+    fn open(self: CheckPublicProbe, path: string) -> Result[CheckPublicHandle, fs::Error] {
+        self.attempts.set(self.attempts.get() + 1);
+        if self.mode == 1 && fs::valid_path(path) {
+            return Result::Err(
+                fs::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "probe open",
+                    Option::Some(path),
+                    Option::Some(77),
+                    "normal denied access",
+                ),
+            )
+        }
+        let actual = if self.mode == 3 && !fs::valid_path(path) {
+            "."
+        } else {
+            path
+        };
+        let source = self.source.open(actual)?;
+        self.acquired.set(self.acquired.get() + 1);
+        Result::Ok(
+            CheckPublicHandle {
+                source,
+                owner: self,
+                path,
+                read_seen: Ref::new(false),
+                closed: Ref::new(false),
+            },
+        )
+    }
+}
+
+impl File for CheckPublicHandle {
+    fn stat(self: CheckPublicHandle) -> Result[fs::Metadata, fs::Error] {
+        self.source.stat()
+    }
+}
+
+impl ReadDirFile for CheckPublicHandle {
+    type Entry = fs::SnapshotEntry;
+
+    fn read_dir(self: CheckPublicHandle, amount: isize) -> Result[
+        Vec[fs::SnapshotEntry],
+        fs::ReadDirError[fs::SnapshotEntry],
+    ] {
+        self.source.read_dir(amount)
+    }
+}
+
+impl Read for CheckPublicHandle {
+    fn read(self: CheckPublicHandle, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.owner.reads.set(self.owner.reads.get() + 1);
+        self.read_seen.set(true);
+        if self.owner.mode == 4 || self.owner.mode == 7 {
+            panic::raise("checker read panic")
+        }
+        if self.owner.mode == 2 || self.owner.mode == 6 {
+            return Result::Ok(output.len() + 1)
+        }
+        self.source.read(output)
+    }
+}
+
+impl Close for CheckPublicHandle {
+    fn close(self: CheckPublicHandle) -> Result[(), io::Error] {
+        testing::assert(!self.closed.get());
+        self.closed.set(true);
+        self.owner.closes.set(self.owner.closes.get() + 1);
+        self.source.close()?;
+        if (self.owner.mode == 5 && self.path == "file")
+            || ((self.owner.mode == 6 || self.owner.mode == 7) && self.read_seen.get()) {
+            panic::raise("checker close panic")
+        }
+        Result::Ok(())
+    }
+}
+
+fn check_public_cleanup(source: CheckPublicProbe, report: memory::CheckReport) -> () {
+    assert_equal(source.acquired.get(), source.closes.get());
+    assert_equal(report.cleanup_calls(), source.closes.get());
+}
+
+fn check_public_has_violation(report: memory::CheckReport) -> bool {
+    for issue in report.issues() {
+        if let memory::CheckIssueKind::ContractViolation(_) = issue.kind {
+            return true
+        }
+    }
+    false
+}
+
+pub fn test_fs_check() -> () {
+    let limits = check_public_limits();
+    let report = testing::expect_ok(
+        memory::check_fs(check_public_source(true), memory::ExpectedTree::Empty, limits),
+        "empty checker baseline",
+    );
+    testing::assert(report.passed());
+    testing::assert(report.complete());
+    testing::assert(report.stop_reason().is_none());
+    assert_equal(report.issues().len(), 0);
+    assert_equal(report.discovered_nodes(), 1);
+    assert_equal(report.path_bytes(), 1);
+    assert_equal(report.read_bytes(), 0);
+    for expected in[
+        memory::ExpectedTree::Contains(Vec::new()),
+        memory::ExpectedTree::Contains(
+            Vec::from_array(["file", "file", "link", "dangling", "dir/child"]),
+        ),
+    ] {
+        let report = testing::expect_ok(
+            memory::check_fs(check_public_source(false), expected, limits),
+            "files directories and dangling links accepted",
+        );
+        testing::assert(report.passed());
+        assert_equal(report.discovered_nodes(), 6);
+        testing::assert(report.read_bytes() > 0);
+        testing::assert(report.cleanup_calls() > 0);
+        testing::assert(report.provider_calls() > report.cleanup_calls());
+    }
+    let source = check_public_probe(0);
+    let report = testing::expect_ok(
+        memory::check_fs(source, memory::ExpectedTree::Empty, limits),
+        "empty expectation is checked",
+    );
+    testing::assert(!report.passed());
+    testing::assert(!report.complete());
+    testing::assert(!check_public_has_violation(report));
+    testing::assert(report.stop_reason().is_none());
+    let mut inconsistent = false;
+    for issue in report.issues() {
+        if let memory::CheckIssueKind::InconsistentSnapshot(_) = issue.kind {
+            inconsistent = true;
+        }
+    }
+    testing::assert(inconsistent);
+    check_public_cleanup(source, report);
+    for path in["", "/", "a/..", "./a", "a//b"] {
+        let source = check_public_probe(0);
+        let error = testing::expect_err(
+            memory::check_fs(
+                source,
+                memory::ExpectedTree::Contains(Vec::from_array([path])),
+                limits,
+            ),
+            "invalid expected input",
+        );
+        assert_equal(error.kind(), io::ErrorKind::InvalidInput);
+        assert_equal(source.attempts.get(), 0);
+        assert_equal(source.closes.get(), 0);
+    }
+    for field in 0..8 {
+        let source = check_public_probe(0);
+        let invalid = memory::CheckLimits {
+            max_nodes: if field == 0 {
+                -1
+            } else {
+                limits.max_nodes
+            },
+            max_depth: if field == 1 {
+                -1
+            } else {
+                limits.max_depth
+            },
+            max_directory_entries: if field == 2 {
+                -1
+            } else {
+                limits.max_directory_entries
+            },
+            max_file_bytes: if field == 3 {
+                -1
+            } else {
+                limits.max_file_bytes
+            },
+            max_total_read_bytes: if field == 4 {
+                -1
+            } else {
+                limits.max_total_read_bytes
+            },
+            max_provider_calls: if field == 5 {
+                -1
+            } else {
+                limits.max_provider_calls
+            },
+            max_issues: if field == 6 {
+                -1
+            } else {
+                limits.max_issues
+            },
+            max_path_bytes: if field == 7 {
+                -1
+            } else {
+                limits.max_path_bytes
+            },
+        };
+        assert_equal(
+            testing::expect_err(
+                memory::check_fs(source, memory::ExpectedTree::Empty, invalid),
+                "negative checker limit",
+            ).kind(),
+            io::ErrorKind::InvalidInput,
+        );
+        assert_equal(source.attempts.get(), 0);
+    }
+    for field in 0..7 {
+        let source = check_public_probe(0);
+        let bounded = memory::CheckLimits {
+            max_nodes: if field == 0 {
+                0
+            } else {
+                limits.max_nodes
+            },
+            max_depth: if field == 1 {
+                0
+            } else {
+                limits.max_depth
+            },
+            max_directory_entries: if field == 2 {
+                0
+            } else {
+                limits.max_directory_entries
+            },
+            max_file_bytes: if field == 3 {
+                0
+            } else {
+                limits.max_file_bytes
+            },
+            max_total_read_bytes: if field == 4 {
+                0
+            } else {
+                limits.max_total_read_bytes
+            },
+            max_provider_calls: if field == 5 {
+                0
+            } else {
+                limits.max_provider_calls
+            },
+            max_path_bytes: if field == 6 {
+                0
+            } else {
+                limits.max_path_bytes
+            },
+            ..limits,
+        };
+        let report = testing::expect_ok(
+            memory::check_fs(source, memory::ExpectedTree::Contains(Vec::new()), bounded),
+            "bounded checker stop",
+        );
+        testing::assert(!report.passed());
+        testing::assert(!report.complete());
+        let correct = match testing::expect_some(report.stop_reason(), "budget stop reason") {
+            memory::CheckStop::Budget(_, budget) => match (field, budget) {
+                (0, memory::CheckBudget::Nodes) | (1, memory::CheckBudget::Depth) | (
+                    2,
+                    memory::CheckBudget::DirectoryEntries,
+                ) | (3, memory::CheckBudget::FileBytes) | (4, memory::CheckBudget::TotalReadBytes) | (
+                    5,
+                    memory::CheckBudget::ProviderCalls,
+                ) | (6, memory::CheckBudget::PathBytes) => true,
+                _ => false,
+            },
+            _ => false,
+        };
+        testing::assert(correct);
+        testing::assert(!check_public_has_violation(report));
+        check_public_cleanup(source, report);
+    }
+    let source = check_public_probe(1);
+    let report = testing::expect_ok(
+        memory::check_fs(
+            source,
+            memory::ExpectedTree::Contains(Vec::from_array(["missing"])),
+            limits,
+        ),
+        "provider denial is recoverable",
+    );
+    testing::assert(!report.passed());
+    testing::assert(!report.complete());
+    testing::assert(report.stop_reason().is_none());
+    assert_equal(report.issues().len(), 1);
+    match report.issues()[0].kind {
+        memory::CheckIssueKind::ProviderError(error) => {
+            assert_equal(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_equal(error.raw_os_code(), Option::Some(77));
+            assert_equal(error.message(), "normal denied access");
+        },
+        _ => testing::fail("provider denial mislabeled as violation"),
+    }
+    check_public_cleanup(source, report);
+    for mode in[2, 3] {
+        let source = check_public_probe(mode);
+        let report = testing::expect_ok(
+            memory::check_fs(source, memory::ExpectedTree::Contains(Vec::new()), limits),
+            "invalid provider contract",
+        );
+        testing::assert(!report.passed());
+        testing::assert(check_public_has_violation(report));
+        check_public_cleanup(source, report);
+    }
+    for mode in[4, 5, 6, 7] {
+        let source = check_public_probe(mode);
+        let report = testing::expect_ok(
+            memory::check_fs(source, memory::ExpectedTree::Contains(Vec::new()), limits),
+            "provider panic is recovered",
+        );
+        testing::assert(!report.passed());
+        match report.stop_reason() {
+            Option::Some(memory::CheckStop::ProviderPanic) => (),
+            _ => testing::fail("expected panic stop"),
+        }
+        let mut read_panic = false;
+        let mut close_panic = false;
+        for issue in report.issues() {
+            if let memory::CheckIssueKind::ProviderPanic(error) = issue.kind {
+                if error.message() == "checker read panic" {
+                    read_panic = true;
+                }
+                if error.message() == "checker close panic" {
+                    close_panic = true;
+                }
+            }
+        }
+        assert_equal(read_panic, mode == 4 || mode == 7);
+        assert_equal(close_panic, mode == 5 || mode == 6 || mode == 7);
+        assert_equal(check_public_has_violation(report), mode == 6);
+        check_public_cleanup(source, report);
+    }
+    for capacity in[0, 1] {
+        let source = check_public_probe(3);
+        let report = testing::expect_ok(
+            memory::check_fs(
+                source,
+                memory::ExpectedTree::Empty,
+                memory::CheckLimits { max_issues: capacity, ..limits },
+            ),
+            "bounded issue retention",
+        );
+        assert_equal(report.issues().len(), capacity);
+        testing::assert(!report.passed());
+        match report.stop_reason() {
+            Option::Some(memory::CheckStop::IssueLimit) => (),
+            _ => testing::fail("expected issue limit stop"),
+        }
+        check_public_cleanup(source, report);
+    }
+}

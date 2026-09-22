@@ -1,0 +1,226 @@
+package main;
+
+use std::fs;
+use fs::{FileSystem, File, DirectoryEntry, ReadDirFile};
+use std::io;
+use io::{Read, Close};
+use std::panic;
+use std::testing;
+use std::testing::fs as memory;
+
+struct CheckHelperExtraFs {
+    source: CheckHelperProbe,
+    mode: isize,
+    last_page: Ref[isize],
+    partial_errors: Ref[isize],
+    cleanup_panics: Ref[isize],
+}
+
+struct CheckHelperExtraHandle {
+    source: CheckHelperHandle,
+    owner: CheckHelperExtraFs,
+}
+
+fn check_helper_extra(mode: isize, threshold: isize) -> CheckHelperExtraFs {
+    CheckHelperExtraFs {
+        source: check_helper_probe(
+            if mode == 1 {
+                1
+            } else if mode == 2 || mode == 3 {
+                3
+            } else {
+                0
+            },
+            threshold,
+        ),
+        mode,
+        last_page: Ref::new(0),
+        partial_errors: Ref::new(0),
+        cleanup_panics: Ref::new(0),
+    }
+}
+
+impl FileSystem for CheckHelperExtraFs {
+    type Handle = CheckHelperExtraHandle;
+
+    fn open(self: CheckHelperExtraFs, name: string) -> Result[CheckHelperExtraHandle, fs::Error] {
+        Result::Ok(CheckHelperExtraHandle { source: self.source.open(name)?, owner: self })
+    }
+}
+
+impl File for CheckHelperExtraHandle {
+    fn stat(self: CheckHelperExtraHandle) -> Result[fs::Metadata, fs::Error] {
+        self.source.stat()
+    }
+}
+
+impl Read for CheckHelperExtraHandle {
+    fn read(self: CheckHelperExtraHandle, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.source.read(output)
+    }
+}
+
+impl Close for CheckHelperExtraHandle {
+    fn close(self: CheckHelperExtraHandle) -> Result[(), io::Error] {
+        let result = self.source.close();
+        let should_panic = if self.owner.mode == 1 || self.owner.mode == 2 {
+            self.owner.source.triggered.get()
+        } else if self.owner.mode == 4 {
+            check_helper_ready(self.owner.source)
+        } else {
+            false
+        };
+        if should_panic {
+            self.owner.source.triggered.set(true);
+            self.owner.cleanup_panics.set(self.owner.cleanup_panics.get() + 1);
+            panic::raise("helper extra cleanup panic")
+        }
+        result
+    }
+}
+
+impl ReadDirFile for CheckHelperExtraHandle {
+    type Entry = CheckHelperEntry;
+
+    fn read_dir(self: CheckHelperExtraHandle, amount: isize) -> Result[
+        Vec[CheckHelperEntry],
+        fs::ReadDirError[CheckHelperEntry],
+    ] {
+        match self.source.read_dir(amount) {
+            Ok(entries) => {
+                if !entries.is_empty() {
+                    self.owner.last_page.set(self.owner.source.calls.get());
+                    if self.owner.mode == 3 && check_helper_ready(self.owner.source) {
+                        self.owner.partial_errors.set(self.owner.partial_errors.get() + 1);
+                        return Result::Err(
+                            fs::ReadDirError::new(
+                                entries,
+                                fs::Error::new(
+                                    io::ErrorKind::Interrupted,
+                                    "helper partial page",
+                                    Option::Some("original partial path"),
+                                    Option::Some(303),
+                                    "helper partial page cause",
+                                ),
+                            ),
+                        )
+                    }
+                }
+                Result::Ok(entries)
+            },
+            Err(error) => Result::Err(error),
+        }
+    }
+}
+
+fn check_helper_extra_report(source: CheckHelperExtraFs, limits: memory::CheckLimits) -> memory::CheckReport {
+    let report = testing::expect_ok(
+        memory::check_helpers(source, check_helper_expected(), limits),
+        "helper compound failure report",
+    );
+    check_helper_cleanup(source.source, report);
+    report
+}
+
+pub fn test_fs_check_helpers_extra() -> () {
+    let baseline = check_helper_extra(0, 0);
+    let full = check_helper_extra_report(baseline, check_public_limits());
+    testing::assert(full.passed());
+    for mode in[1, 2, 3, 4] {
+        let threshold = if mode == 1 {
+            baseline.source.last_read.get() - 1
+        } else if mode == 2 {
+            baseline.source.last_name.get() - 1
+        } else if mode == 3 {
+            baseline.last_page.get() - 1
+        } else {
+            baseline.source.last_close.get() - 2
+        };
+        testing::assert(threshold >= 0);
+        let source = check_helper_extra(mode, threshold);
+        let mut limits = check_public_limits();
+        if mode == 4 {
+            limits.max_provider_calls = full.provider_calls() - 1;
+        }
+        let report = check_helper_extra_report(source, limits);
+        testing::assert(!report.passed());
+        testing::assert(source.source.triggered.get());
+        let mut normal = 0;
+        let mut panics = 0;
+        for issue in report.issues() {
+            match issue.kind {
+                memory::CheckIssueKind::ProviderError(error) => {
+                    normal += 1;
+                    testing::assert_eq(error.kind(), io::ErrorKind::Interrupted);
+                    assert_equal(
+                        error.raw_os_code(),
+                        Option::Some(
+                            if mode == 1 {
+                                101
+                            } else {
+                                303
+                            },
+                        ),
+                    );
+                    if mode == 3 {
+                        testing::assert_eq(error.operation(), "helper partial page");
+                        assert_equal(error.path(), Option::Some("original partial path"));
+                    }
+                },
+                memory::CheckIssueKind::ProviderPanic(_) => {
+                    panics += 1;
+                },
+                _ => testing::fail("compound helper failure misclassified"),
+            }
+        }
+        testing::assert_eq(
+            normal,
+            if mode == 1 || mode == 3 {
+                1
+            } else {
+                0
+            },
+        );
+        testing::assert_eq(
+            panics,
+            if mode == 2 {
+                2
+            } else {
+                1
+            },
+        );
+        testing::assert_eq(
+            source.partial_errors.get(),
+            if mode == 3 {
+                1
+            } else {
+                0
+            },
+        );
+        testing::assert_eq(
+            source.cleanup_panics.get(),
+            if mode == 3 {
+                0
+            } else {
+                1
+            },
+        );
+        if mode == 1 || mode == 3 {
+            match report.issues()[0].kind {
+                memory::CheckIssueKind::ProviderError(_) => (),
+                _ => testing::fail("known primary error must precede the later panic"),
+            }
+        }
+        if mode == 4 {
+            match report.stop_reason() {
+                Some(memory::CheckStop::Budget(_, memory::CheckBudget::ProviderCalls)) => (),
+                _ => testing::fail("cleanup panic must preserve the first budget stop"),
+            }
+        } else {
+            match report.stop_reason() {
+                Some(memory::CheckStop::ProviderPanic) => (),
+                _ => testing::fail("provider panic must stop compound helper check"),
+            }
+        }
+    }
+}

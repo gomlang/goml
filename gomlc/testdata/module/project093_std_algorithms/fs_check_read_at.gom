@@ -1,0 +1,295 @@
+package main;
+
+use std::testing::fs as memory;
+use std::fs;
+use fs::{FileSystem, File, ReadDirFile};
+use std::io;
+use io::{Read, ReadAt, Seek, Close};
+use std::bytes;
+use std::testing;
+
+struct CheckAtProbe {
+    source: memory::MemoryFS,
+    mode: isize,
+    opens: Ref[isize],
+    closes: Ref[isize],
+    sequential_bytes: Ref[isize],
+    positional_bytes: Ref[isize],
+    positional_calls: Ref[isize],
+}
+
+struct CheckAtHandle {
+    source: memory::MemoryHandle,
+    owner: CheckAtProbe,
+    closed: Ref[bool],
+}
+
+fn check_at_probe(mode: isize, content: string) -> CheckAtProbe {
+    let source = testing::expect_ok(
+        memory::MemoryFS::new(
+            Vec::from_array([memory::MemoryNode::file("file", bytes::Bytes::from_string(content))]),
+            memory::MemoryLimits {
+                max_nodes: 10,
+                max_data_bytes: 1000,
+                max_path_bytes: 100,
+                max_depth: 10,
+                max_link_hops: 10,
+                max_resolve_work: 1000,
+            },
+        ),
+        "ReadAt checker provider",
+    );
+    CheckAtProbe {
+        source,
+        mode,
+        opens: Ref::new(0),
+        closes: Ref::new(0),
+        sequential_bytes: Ref::new(0),
+        positional_bytes: Ref::new(0),
+        positional_calls: Ref::new(0),
+    }
+}
+
+fn check_at_error(kind: io::ErrorKind) -> io::Error {
+    io::Error::new(
+        kind,
+        "probe read_at",
+        Option::Some("file"),
+        Option::Some(83),
+        "ordinary positional cause",
+    )
+}
+
+impl FileSystem for CheckAtProbe {
+    type Handle = CheckAtHandle;
+
+    fn open(self: CheckAtProbe, path: string) -> Result[CheckAtHandle, fs::Error] {
+        let source = self.source.open(path)?;
+        self.opens.set(self.opens.get() + 1);
+        Result::Ok(CheckAtHandle { source, owner: self, closed: Ref::new(false) })
+    }
+}
+
+impl File for CheckAtHandle {
+    fn stat(self: CheckAtHandle) -> Result[fs::Metadata, fs::Error] {
+        self.source.stat()
+    }
+}
+
+impl ReadDirFile for CheckAtHandle {
+    type Entry = fs::SnapshotEntry;
+
+    fn read_dir(self: CheckAtHandle, amount: isize) -> Result[
+        Vec[fs::SnapshotEntry],
+        fs::ReadDirError[fs::SnapshotEntry],
+    ] {
+        self.source.read_dir(amount)
+    }
+}
+
+impl Read for CheckAtHandle {
+    fn read(self: CheckAtHandle, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        let count = self.source.read(output)?;
+        self.owner.sequential_bytes.set(self.owner.sequential_bytes.get() + count);
+        Result::Ok(count)
+    }
+}
+
+impl Close for CheckAtHandle {
+    fn close(self: CheckAtHandle) -> Result[(), io::Error] {
+        testing::assert(!self.closed.get());
+        self.closed.set(true);
+        self.owner.closes.set(self.owner.closes.get() + 1);
+        self.source.close()
+    }
+}
+
+impl ReadAt for CheckAtHandle {
+    fn read_at(self: CheckAtHandle, output: MutSlice[byte], offset: isize) -> Result[
+        isize,
+        io::TransferError,
+    ] {
+        self.owner.positional_calls.set(self.owner.positional_calls.get() + 1);
+        let invalid = offset < 0 || offset > 9223372036854775807 - output.len();
+        if invalid {
+            if self.owner.mode == 14 {
+                return Result::Err(
+                    io::TransferError::new(0, check_at_error(io::ErrorKind::Interrupted)),
+                )
+            }
+            if self.owner.mode == 5 {
+                return Result::Ok(output.len())
+            }
+            if self.owner.mode == 6 && output.len() > 0 {
+                return Result::Err(
+                    io::TransferError::new(1, check_at_error(io::ErrorKind::InvalidInput)),
+                )
+            }
+            return self.source.read_at(output, offset)
+        }
+        if output.len() > 0 {
+            match self.owner.mode {
+                1 => return Result::Ok(0),
+                2 => return Result::Ok(-1),
+                3 => return Result::Ok(output.len() + 1),
+                4 => return Result::Err(
+                    io::TransferError::new(
+                        (output.len() + 1).to_usize(),
+                        check_at_error(io::ErrorKind::Interrupted),
+                    ),
+                ),
+                _ => (),
+            }
+        } else if self.owner.mode == 12 {
+            return Result::Err(io::TransferError::new(0, check_at_error(io::ErrorKind::WouldBlock)))
+        }
+        if self.owner.mode == 13 && output.len() == 0 {
+            let _ = self.source.seek(io::SeekFrom::Current(1));
+        }
+        let result = self.source.read_at(output, offset);
+        let (count, success) = match result {
+            Ok(count) => (count, true),
+            Err(error) => (error.transferred().to_isize(), false),
+        };
+        self.owner.positional_bytes.set(self.owner.positional_bytes.get() + count);
+        if self.owner.mode == 7 && success && count > 0 {
+            let _ = self.source.seek(io::SeekFrom::Start(offset + count));
+        }
+        if self.owner.mode == 8 && !success && count > 0 {
+            let _ = self.source.seek(io::SeekFrom::Start(offset + count));
+        }
+        if self.owner.mode == 9 && count > 0 {
+            output[0] = output[0] ^ 0xff;
+        }
+        if self.owner.mode == 10 && success && count > 0 {
+            return Result::Err(
+                io::TransferError::new(count.to_usize(), check_at_error(io::ErrorKind::Interrupted)),
+            )
+        }
+        if self.owner.mode == 11 && output.len() > 1 && !success {
+            return Result::Err(
+                io::TransferError::new(
+                    count.to_usize(),
+                    check_at_error(io::ErrorKind::PermissionDenied),
+                ),
+            )
+        }
+        result
+    }
+}
+
+fn check_at_run(source: CheckAtProbe, limits: memory::CheckLimits) -> memory::CheckReport {
+    let report = testing::expect_ok(
+        memory::check_read_at(
+            source,
+            memory::ExpectedTree::Contains(Vec::from_array(["file"])),
+            limits,
+        ),
+        "ReadAt checker report",
+    );
+    assert_equal(source.opens.get(), source.closes.get());
+    assert_equal(report.cleanup_calls(), source.closes.get());
+    report
+}
+
+pub fn test_fs_check_read_at() -> () {
+    let limits = check_public_limits();
+    for content in["", "x", "abcdef", "abcdefghijklmnopqrstuvwxyz0123456789"] {
+        let source = check_at_probe(0, content);
+        let report = check_at_run(source, limits);
+        testing::assert(report.passed());
+        assert_equal(
+            report.read_bytes(),
+            source.sequential_bytes.get() + source.positional_bytes.get(),
+        );
+        testing::assert(source.positional_calls.get() > 0);
+    }
+    for mode in 1..7 {
+        let source = check_at_probe(mode, "abcdef");
+        let report = check_at_run(source, limits);
+        testing::assert(!report.passed());
+        testing::assert(check_public_has_violation(report));
+        testing::assert(report.stop_reason().is_none());
+    }
+    for mode in[7, 8, 9, 13] {
+        for content in["x", "abcdef"] {
+            let source = check_at_probe(mode, content);
+            let report = check_at_run(source, limits);
+            testing::assert(!report.passed());
+            testing::assert(!check_public_has_violation(report));
+            let mut inconsistent = false;
+            for issue in report.issues() {
+                if let memory::CheckIssueKind::InconsistentSnapshot(_) = issue.kind {
+                    inconsistent = true;
+                }
+            }
+            testing::assert(inconsistent);
+        }
+    }
+    for mode in[10, 11, 12, 14] {
+        let source = check_at_probe(mode, "abcdef");
+        let report = check_at_run(source, limits);
+        testing::assert(!report.passed());
+        testing::assert(!check_public_has_violation(report));
+        testing::assert(report.stop_reason().is_none());
+        let mut errors = 0;
+        for issue in report.issues() {
+            match issue.kind {
+                memory::CheckIssueKind::ProviderError(error) => {
+                    assert_equal(error.raw_os_code(), Option::Some(83));
+                    assert_equal(error.operation(), "probe read_at");
+                    assert_equal(error.message(), "ordinary positional cause");
+                    assert_equal(
+                        error.kind(),
+                        match mode {
+                            10 | 14 => io::ErrorKind::Interrupted,
+                            11 => io::ErrorKind::PermissionDenied,
+                            _ => io::ErrorKind::WouldBlock,
+                        },
+                    );
+                    errors += 1;
+                },
+                _ => testing::fail("ordinary positional error misclassified"),
+            }
+        }
+        testing::assert(errors > 0);
+        assert_equal(
+            report.read_bytes(),
+            source.sequential_bytes.get() + source.positional_bytes.get(),
+        );
+        if mode != 12 {
+            testing::assert(source.positional_bytes.get() > 0);
+        }
+    }
+    let source = check_at_probe(0, "abcdef");
+    let complete = check_at_run(source, limits);
+    let exact_bytes = complete.read_bytes();
+    for budget in[0, 1, exact_bytes - 1] {
+        let source = check_at_probe(0, "abcdef");
+        let report = check_at_run(
+            source,
+            memory::CheckLimits { max_total_read_bytes: budget, ..limits },
+        );
+        testing::assert(!report.passed());
+        testing::assert(report.read_bytes() <= budget);
+        assert_equal(
+            report.read_bytes(),
+            source.sequential_bytes.get() + source.positional_bytes.get(),
+        );
+        match report.stop_reason() {
+            Option::Some(memory::CheckStop::Budget(_, memory::CheckBudget::TotalReadBytes)) => (),
+            _ => testing::fail("expected shared read budget stop"),
+        }
+    }
+    let source = check_at_probe(0, "abcdef");
+    let report = check_at_run(
+        source,
+        memory::CheckLimits {
+            max_provider_calls: complete.provider_calls(),
+            max_total_read_bytes: exact_bytes + 1,
+            ..limits,
+        },
+    );
+    testing::assert(report.passed());
+    assert_equal(report.read_bytes(), exact_bytes);
+}
