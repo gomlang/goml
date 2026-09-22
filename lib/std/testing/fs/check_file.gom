@@ -1,0 +1,281 @@
+package fs;
+
+use module::fs as filesystem;
+use filesystem::File;
+use module::io;
+use io::Read;
+
+fn check_file_buffer(length: isize) -> Vec[byte] {
+    let buffer = Vec::with_capacity(length);
+    for _ in 0..length {
+        buffer.push(0);
+    }
+    buffer
+}
+
+fn check_file_read[R: io::Read](state: CheckState, file: R, path: string, buffer: MutSlice[byte]) -> Option[
+    isize,
+] {
+    if check_stopped(state) {
+        return Option::None
+    }
+    let counters = state.counters.get();
+    let remaining = state.limits.max_total_read_bytes - counters.read_bytes;
+    if buffer.len() > remaining {
+        check_budget(state, path, CheckBudget::TotalReadBytes);
+        return Option::None
+    }
+    let count = check_call(state, path, "read file", || file.read(buffer).map_err(check_io_error))?;
+    if count < 0 || count > buffer.len() {
+        check_violation(
+            state,
+            path,
+            "read file",
+            "reader returned a count outside the requested buffer",
+        );
+        return Option::None
+    }
+    if count > 0 {
+        let counters = state.counters.get();
+        state.counters.set(CheckCounters { read_bytes: counters.read_bytes + count, ..counters });
+    }
+    Option::Some(count)
+}
+
+fn check_read_snapshot[H: filesystem::File](state: CheckState, handle: H, path: string) -> Option[
+    Vec[byte],
+] {
+    let result: Vec[byte] = Vec::new();
+    let buffer = check_file_buffer(4096);
+    loop {
+        let remaining = state.limits.max_file_bytes - result.len();
+        let desired = if remaining < buffer.len() {
+            remaining + 1
+        } else {
+            buffer.len()
+        };
+        let amount = check_file_request(state, path, desired)?;
+        let count = check_file_read(state, handle, path, buffer.slice_mut(0, amount))?;
+        if count > remaining {
+            check_budget(state, path, CheckBudget::FileBytes);
+            return Option::None
+        }
+        if count == 0 {
+            return Option::Some(result)
+        }
+        for index in 0..count {
+            result.push(buffer[index]);
+        }
+    }
+}
+
+fn check_file_request(state: CheckState, path: string, desired: isize) -> Option[isize] {
+    if check_stopped(state) {
+        return Option::None
+    }
+    let available = state.limits.max_total_read_bytes - state.counters.get().read_bytes;
+    if available == 0 {
+        check_budget(state, path, CheckBudget::TotalReadBytes);
+        Option::None
+    } else {
+        Option::Some(
+            if desired < available {
+                desired
+            } else {
+                available
+            },
+        )
+    }
+}
+
+fn check_file_metadata[H: filesystem::File](
+    state: CheckState,
+    file: H,
+    path: string,
+    expected: filesystem::Metadata,
+) -> bool {
+    let Some(actual) = check_call(state, path, "stat file", || file.stat()) else {
+        return false
+    };
+    if !check_metadata_equal(actual, expected) {
+        check_inconsistent(
+            state,
+            path,
+            "stat file",
+            "opened file metadata differs from the stable snapshot",
+        );
+        false
+    } else {
+        true
+    }
+}
+
+fn check_file_empty[R: io::Read](state: CheckState, file: R, path: string) -> bool {
+    let empty: Vec[byte] = Vec::new();
+    check_file_read(state, file, path, empty.as_mut_slice()).is_some()
+}
+
+fn check_file_eof[R: io::Read](state: CheckState, file: R, path: string, length: isize) -> bool {
+    let Some(amount) = check_file_request(state, path, 1) else {
+        return false
+    };
+    let buffer = check_file_buffer(amount);
+    let Some(count) = check_file_read(state, file, path, buffer.as_mut_slice()) else {
+        return false
+    };
+    if count == 0 {
+        true
+    } else if length >= state.limits.max_file_bytes {
+        check_budget(state, path, CheckBudget::FileBytes);
+        false
+    } else {
+        check_inconsistent(
+            state,
+            path,
+            "read file",
+            "file produced additional bytes after the confirmed end",
+        );
+        false
+    }
+}
+
+fn check_file_pair[H: filesystem::File](
+    state: CheckState,
+    first: H,
+    second: H,
+    path: string,
+    metadata: filesystem::Metadata,
+) -> () {
+    if !check_file_metadata(state, first, path, metadata)
+        || !check_file_metadata(state, second, path, metadata)
+        || !check_file_empty(state, first, path)
+        || !check_file_empty(state, second, path) {
+        return
+    }
+    let baseline: Vec[byte] = Vec::new();
+    let first_buffer = check_file_buffer(4096);
+    let second_buffer = check_file_buffer(17);
+    let mut compared = 0;
+    loop {
+        if check_stopped(state) {
+            return
+        }
+        let available = state.limits.max_file_bytes - baseline.len();
+        let desired = if available < first_buffer.len() {
+            available + 1
+        } else {
+            first_buffer.len()
+        };
+        let Some(amount) = check_file_request(state, path, desired) else {
+            return
+        };
+        let Some(count) = check_file_read(state, first, path, first_buffer.slice_mut(0, amount)) else {
+            return
+        };
+        if count > available {
+            check_budget(state, path, CheckBudget::FileBytes);
+            return
+        }
+        if count == 0 {
+            break
+        }
+        for index in 0..count {
+            baseline.push(first_buffer[index]);
+        }
+        if !check_file_metadata(state, first, path, metadata) {
+            return
+        }
+        if !check_file_empty(state, second, path) {
+            return
+        }
+        while compared < baseline.len() {
+            let needed = baseline.len() - compared;
+            let desired = if needed < second_buffer.len() {
+                needed
+            } else {
+                second_buffer.len()
+            };
+            let Some(amount) = check_file_request(state, path, desired) else {
+                return
+            };
+            let Some(count) = check_file_read(
+                state,
+                second,
+                path,
+                second_buffer.slice_mut(0, amount),
+            ) else {
+                return
+            };
+            if count == 0 {
+                check_inconsistent(
+                    state,
+                    path,
+                    "read file",
+                    "independent file open reached the end before the confirmed prefix",
+                );
+                return
+            }
+            for index in 0..count {
+                if second_buffer[index] != baseline[compared + index] {
+                    check_inconsistent(
+                        state,
+                        path,
+                        "read file",
+                        "independent opens or different read chunk sizes produced different bytes",
+                    );
+                    return
+                }
+            }
+            compared += count;
+            if !check_file_metadata(state, second, path, metadata) {
+                return
+            }
+        }
+    }
+    if metadata.len() != baseline.len().to_i64() {
+        check_inconsistent(
+            state,
+            path,
+            "read file",
+            "confirmed file length differs from snapshot metadata",
+        );
+        return
+    }
+    if !check_file_eof(state, first, path, baseline.len())
+        || !check_file_eof(state, second, path, baseline.len())
+        || !check_file_eof(state, second, path, baseline.len())
+        || !check_file_empty(state, first, path)
+        || !check_file_empty(state, second, path) {
+        return
+    }
+    let _ = check_file_metadata(state, first, path, metadata);
+    if !check_stopped(state) {
+        let _ = check_file_metadata(state, second, path, metadata);
+    }
+}
+
+fn check_file[F: filesystem::FileSystem](
+    state: CheckState,
+    source: F,
+    path: string,
+    metadata: filesystem::Metadata,
+) -> () {
+    let _ = check_with_handle(
+        state,
+        source,
+        path,
+        |first| {
+            if check_stopped(state) {
+                return
+            }
+            let _ = check_with_handle(
+                state,
+                source,
+                path,
+                |second| {
+                    check_file_pair(state, first, second, path, metadata)
+                },
+            );
+        },
+    );
+}

@@ -1,0 +1,453 @@
+package fs;
+
+use module::fs as filesystem;
+use filesystem::{FileSystem, File, ReadDirFile, DirectoryEntry};
+use module::io;
+use io::{Read, Close};
+use module::panic;
+
+struct ObservedError {
+    path: string,
+    operation: string,
+    error: filesystem::Error,
+    cleanup: bool,
+    reported: Ref[bool],
+}
+
+struct ObservationRun {
+    state: CheckState,
+    aborted: Ref[bool],
+    errors: Vec[ObservedError],
+    cleanups: Vec[() -> ()],
+}
+
+struct ObservedFs[F] {
+    source: F,
+    run: ObservationRun,
+}
+
+struct ObservedHandle[H] {
+    source: H,
+    run: ObservationRun,
+    path: string,
+    attempted: Ref[bool],
+}
+
+struct ObservedEntry[E] {
+    source: E,
+    run: ObservationRun,
+    path: string,
+    name_cache: Ref[Option[string]],
+    type_cache: Ref[Option[filesystem::FileType]],
+    metadata_cache: Ref[Option[Result[filesystem::Metadata, filesystem::Error]]],
+}
+
+fn observed_synthetic(path: string) -> filesystem::Error {
+    memory_error(
+        io::ErrorKind::Other,
+        "observed helper stopped",
+        Option::Some(path),
+        "observation did not complete",
+    )
+}
+
+fn observed_io(error: filesystem::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        error.operation(),
+        error.path(),
+        error.raw_os_code(),
+        error.message(),
+    )
+}
+
+fn observed_error(
+    run: ObservationRun,
+    path: string,
+    operation: string,
+    error: filesystem::Error,
+    cleanup: bool,
+) -> () {
+    run.errors.push(ObservedError { path, operation, error, cleanup, reported: Ref::new(false) });
+}
+
+fn observed_flush(run: ObservationRun) -> () {
+    for event in run.errors {
+        if !event.reported.get() {
+            event.reported.set(true);
+            check_issue(
+                run.state,
+                CheckIssue {
+                    path: event.path,
+                    operation: event.operation,
+                    kind: CheckIssueKind::ProviderError(event.error),
+                },
+            );
+        }
+    }
+}
+
+fn observed_panic(run: ObservationRun, path: string, operation: string, error: panic::Panic) -> () {
+    run.aborted.set(true);
+    if !check_stopped(run.state) {
+        run.state.stop.set(Option::Some(CheckStop::ProviderPanic));
+    }
+    observed_flush(run);
+    check_provider_panic(run.state, path, operation, error);
+}
+
+fn observed_violation(run: ObservationRun, path: string, operation: string, message: string) -> () {
+    run.aborted.set(true);
+    check_violation(run.state, path, operation, message);
+}
+
+fn observed_call[T](
+    run: ObservationRun,
+    path: string,
+    operation: string,
+    action: () -> Result[T, filesystem::Error],
+) -> Result[T, filesystem::Error] {
+    if run.aborted.get() || check_stopped(run.state) {
+        run.aborted.set(true);
+        return Result::Err(observed_synthetic(path))
+    }
+    let counters = run.state.counters.get();
+    if counters.provider_calls >= run.state.limits.max_provider_calls {
+        run.aborted.set(true);
+        check_budget(run.state, path, CheckBudget::ProviderCalls);
+        return Result::Err(observed_synthetic(path))
+    }
+    run.state.counters.set(
+        CheckCounters { provider_calls: counters.provider_calls + 1, ..counters },
+    );
+    match panic::catch(action) {
+        Ok(result) => {
+            if let Err(error) = result {
+                observed_error(run, path, operation, error, false);
+            }
+            result
+        },
+        Err(error) => {
+            observed_panic(run, path, operation, error);
+            Result::Err(observed_synthetic(path))
+        },
+    }
+}
+
+fn observed_close[H: io::Close](handle: ObservedHandle[H]) -> Result[(), io::Error] {
+    if handle.attempted.get() {
+        return Result::Ok(())
+    }
+    handle.attempted.set(true);
+    let counters = handle.run.state.counters.get();
+    let count = if counters.cleanup_calls < 9223372036854775807 {
+        counters.cleanup_calls + 1
+    } else {
+        counters.cleanup_calls
+    };
+    handle.run.state.counters.set(CheckCounters { cleanup_calls: count, ..counters });
+    match panic::catch(|| handle.source.close()) {
+        Ok(result) => {
+            if let Err(error) = result {
+                observed_error(handle.run, handle.path, "close", check_io_error(error), true);
+            }
+            result
+        },
+        Err(error) => {
+            observed_panic(handle.run, handle.path, "close", error);
+            Result::Err(observed_io(observed_synthetic(handle.path)))
+        },
+    }
+}
+
+fn observed_cleanup(run: ObservationRun) -> () {
+    while let Some(cleanup) = run.cleanups.pop() {
+        cleanup();
+    }
+}
+
+impl[F: filesystem::FileSystem] filesystem::FileSystem for ObservedFs[F] {
+    type Handle = ObservedHandle[F::Handle];
+
+    fn open(self: ObservedFs[F], path: string) -> Result[
+        ObservedHandle[F::Handle],
+        filesystem::Error,
+    ] {
+        let source = observed_call(self.run, path, "open", || self.source.open(path))?;
+        let handle = ObservedHandle { source, run: self.run, path, attempted: Ref::new(false) };
+        self.run.cleanups.push(
+            || {
+                let _ = observed_close(handle);
+            },
+        );
+        Result::Ok(handle)
+    }
+}
+
+impl[H: filesystem::File] filesystem::File for ObservedHandle[H] {
+    fn stat(self: ObservedHandle[H]) -> Result[filesystem::Metadata, filesystem::Error] {
+        observed_call(self.run, self.path, "stat", || self.source.stat())
+    }
+}
+
+impl[H: io::Close] io::Close for ObservedHandle[H] {
+    fn close(self: ObservedHandle[H]) -> Result[(), io::Error] {
+        observed_close(self)
+    }
+}
+
+impl[H: io::Read] io::Read for ObservedHandle[H] {
+    fn read(self: ObservedHandle[H], buffer: MutSlice[byte]) -> Result[isize, io::Error] {
+        if self.run.aborted.get() || check_stopped(self.run.state) {
+            self.run.aborted.set(true);
+            return Result::Err(observed_io(observed_synthetic(self.path)))
+        }
+        let remaining = self.run.state.limits.max_total_read_bytes
+            - self.run.state.counters.get().read_bytes;
+        if buffer.len() > 0 && remaining == 0 {
+            self.run.aborted.set(true);
+            check_budget(self.run.state, self.path, CheckBudget::TotalReadBytes);
+            return Result::Err(observed_io(observed_synthetic(self.path)))
+        }
+        let amount = if buffer.len() < remaining {
+            buffer.len()
+        } else {
+            remaining
+        };
+        let count = observed_call(
+            self.run,
+            self.path,
+            "read",
+            || self.source.read(buffer.sub(0, amount)).map_err(check_io_error),
+        ).map_err(observed_io)?;
+        if count < 0 || count > amount {
+            observed_violation(
+                self.run,
+                self.path,
+                "read",
+                "reader returned a count outside the supplied buffer",
+            );
+            return Result::Err(observed_io(observed_synthetic(self.path)))
+        }
+        let counters = self.run.state.counters.get();
+        self.run.state.counters.set(
+            CheckCounters { read_bytes: counters.read_bytes + count, ..counters },
+        );
+        Result::Ok(count)
+    }
+}
+
+fn observed_entry[E](source: E, run: ObservationRun, path: string) -> ObservedEntry[E] {
+    ObservedEntry {
+        source,
+        run,
+        path,
+        name_cache: Ref::new(Option::None),
+        type_cache: Ref::new(Option::None),
+        metadata_cache: Ref::new(Option::None),
+    }
+}
+
+impl[H: filesystem::ReadDirFile] filesystem::ReadDirFile for ObservedHandle[H] {
+    type Entry = ObservedEntry[H::Entry];
+
+    fn read_dir(self: ObservedHandle[H], amount: isize) -> Result[
+        Vec[ObservedEntry[H::Entry]],
+        filesystem::ReadDirError[ObservedEntry[H::Entry]],
+    ] {
+        let response = match observed_call(
+            self.run,
+            self.path,
+            "read directory",
+            || Result::Ok(self.source.read_dir(amount)),
+        ) {
+            Ok(response) => response,
+            Err(error) => return Result::Err(filesystem::ReadDirError::new(Vec::new(), error)),
+        };
+        let (entries, cause) = match response {
+            Ok(entries) => (entries.as_slice(), Option::None),
+            Err(error) => {
+                observed_error(self.run, self.path, "read directory", error.error(), false);
+                (error.entries(), Option::Some(error.error()))
+            },
+        };
+        if (amount > 0 && entries.len() > amount)
+            || (amount <= 0 && (cause.is_none() || entries.len() != 0)) {
+            observed_violation(
+                self.run,
+                self.path,
+                "read directory",
+                "directory page exceeds the positive request contract",
+            );
+            return Result::Err(
+                filesystem::ReadDirError::new(Vec::new(), observed_synthetic(self.path)),
+            )
+        }
+        let result = Vec::with_capacity(entries.len());
+        for entry in entries {
+            result.push(observed_entry(entry, self.run, self.path));
+        }
+        match cause {
+            Some(error) => Result::Err(filesystem::ReadDirError::new(result, error)),
+            None => Result::Ok(result),
+        }
+    }
+}
+
+impl[E: filesystem::DirectoryEntry] filesystem::DirectoryEntry for ObservedEntry[E] {
+    fn name(self: ObservedEntry[E]) -> string {
+        if self.run.aborted.get() || check_stopped(self.run.state) {
+            self.run.aborted.set(true);
+            return ""
+        }
+        if let Some(value) = self.name_cache.get() {
+            return value
+        }
+        match observed_call(self.run, self.path, "entry name", || Result::Ok(self.source.name())) {
+            Ok(value) => {
+                if value == "." || !filesystem::valid_path(value) || value.contains("/") {
+                    observed_violation(
+                        self.run,
+                        self.path,
+                        "entry name",
+                        "entry name is not a valid directory component",
+                    );
+                    return ""
+                }
+                self.name_cache.set(Option::Some(value));
+                value
+            },
+            Err(_) => "",
+        }
+    }
+
+    fn file_type(self: ObservedEntry[E]) -> filesystem::FileType {
+        if self.run.aborted.get() || check_stopped(self.run.state) {
+            self.run.aborted.set(true);
+            return filesystem::FileType::Other
+        }
+        if let Some(value) = self.type_cache.get() {
+            return value
+        }
+        match observed_call(
+            self.run,
+            self.path,
+            "entry type",
+            || Result::Ok(self.source.file_type()),
+        ) {
+            Ok(value) => {
+                self.type_cache.set(Option::Some(value));
+                value
+            },
+            Err(_) => filesystem::FileType::Other,
+        }
+    }
+
+    fn metadata(self: ObservedEntry[E]) -> Result[filesystem::Metadata, filesystem::Error] {
+        if self.run.aborted.get() || check_stopped(self.run.state) {
+            self.run.aborted.set(true);
+            return Result::Err(observed_synthetic(self.path))
+        }
+        if let Some(value) = self.metadata_cache.get() {
+            return value
+        }
+        let value = observed_call(self.run, self.path, "entry metadata", || self.source.metadata());
+        self.metadata_cache.set(Option::Some(value));
+        value
+    }
+}
+
+fn check_observed_entry[E: filesystem::DirectoryEntry](entry: ObservedEntry[E]) -> Option[
+    CheckedEntry,
+] {
+    let name = entry.name();
+    if entry.run.aborted.get() || check_stopped(entry.run.state) {
+        return Option::None
+    }
+    let file_type = entry.file_type();
+    if entry.run.aborted.get() || check_stopped(entry.run.state) {
+        return Option::None
+    }
+    let metadata = match entry.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return Option::None,
+    };
+    if entry.run.aborted.get() || check_stopped(entry.run.state) {
+        return Option::None
+    }
+    if metadata.file_type() != file_type {
+        check_inconsistent(
+            entry.run.state,
+            entry.path,
+            "entry metadata",
+            "metadata type differs from directory entry type",
+        );
+        return Option::None
+    }
+    Option::Some(CheckedEntry { name, file_type, metadata: Option::Some(metadata) })
+}
+
+fn check_observed_helper[F: filesystem::FileSystem, T](
+    state: CheckState,
+    source: F,
+    path: string,
+    operation: string,
+    action: (ObservedFs[F]) -> Result[T, filesystem::Error],
+) -> Option[T] {
+    if check_stopped(state) {
+        return Option::None
+    }
+    let run = ObservationRun {
+        state,
+        aborted: Ref::new(false),
+        errors: Vec::new(),
+        cleanups: Vec::new(),
+    };
+    defer {
+        observed_cleanup(run);
+        observed_flush(run);
+    };
+    let outcome = panic::catch(|| action(ObservedFs { source, run }));
+    let result = match outcome {
+        Ok(result) => result,
+        Err(error) => {
+            observed_panic(run, path, operation, error);
+            return Option::None
+        },
+    };
+    observed_cleanup(run);
+    if run.aborted.get() || check_stopped(state) {
+        return Option::None
+    }
+    match result {
+        Ok(value) => {
+            if !run.errors.is_empty() {
+                return Option::None
+            }
+            Option::Some(value)
+        },
+        Err(error) => {
+            let mut chosen = Option::None;
+            for event in run.errors {
+                if !event.cleanup && !event.reported.get() && chosen.is_none() {
+                    chosen = Option::Some(event);
+                }
+            }
+            if chosen.is_none() {
+                for event in run.errors {
+                    if !event.reported.get() && chosen.is_none() {
+                        chosen = Option::Some(event);
+                    }
+                }
+            }
+            if let Some(event) = chosen {
+                event.reported.set(true);
+            }
+            check_issue(
+                state,
+                CheckIssue { path, operation, kind: CheckIssueKind::ProviderError(error) },
+            );
+            Option::None
+        },
+    }
+}

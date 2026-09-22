@@ -1,0 +1,145 @@
+package fs;
+
+use module::fs as filesystem;
+use filesystem::FileSystem;
+use module::io;
+use io::Close;
+use module::panic;
+
+fn check_stopped(state: CheckState) -> bool {
+    state.stop.get().is_some()
+}
+
+fn check_budget(state: CheckState, path: string, budget: CheckBudget) -> () {
+    state.incomplete.set(true);
+    if !check_stopped(state) {
+        state.stop.set(Option::Some(CheckStop::Budget(path, budget)));
+    }
+}
+
+fn check_issue(state: CheckState, issue: CheckIssue) -> () {
+    state.incomplete.set(true);
+    if state.issues.len() >= state.limits.max_issues {
+        if !check_stopped(state) {
+            state.stop.set(Option::Some(CheckStop::IssueLimit));
+        }
+    } else {
+        state.issues.push(issue);
+    }
+}
+
+fn check_violation(state: CheckState, path: string, operation: string, message: string) -> () {
+    check_issue(
+        state,
+        CheckIssue { path, operation, kind: CheckIssueKind::ContractViolation(message) },
+    );
+}
+
+fn check_inconsistent(state: CheckState, path: string, operation: string, message: string) -> () {
+    check_issue(
+        state,
+        CheckIssue { path, operation, kind: CheckIssueKind::InconsistentSnapshot(message) },
+    );
+}
+
+fn check_provider_panic(state: CheckState, path: string, operation: string, error: panic::Panic) -> () {
+    state.incomplete.set(true);
+    if !check_stopped(state) {
+        state.stop.set(Option::Some(CheckStop::ProviderPanic));
+    }
+    check_issue(state, CheckIssue { path, operation, kind: CheckIssueKind::ProviderPanic(error) });
+}
+
+fn check_call[T](
+    state: CheckState,
+    path: string,
+    operation: string,
+    action: () -> Result[T, filesystem::Error],
+) -> Option[T] {
+    if check_stopped(state) {
+        return Option::None
+    }
+    let counters = state.counters.get();
+    if counters.provider_calls >= state.limits.max_provider_calls {
+        check_budget(state, path, CheckBudget::ProviderCalls);
+        return Option::None
+    }
+    state.counters.set(CheckCounters { provider_calls: counters.provider_calls + 1, ..counters });
+    match panic::catch(action) {
+        Ok(result) => match result {
+            Ok(value) => Option::Some(value),
+            Err(error) => {
+                check_issue(
+                    state,
+                    CheckIssue { path, operation, kind: CheckIssueKind::ProviderError(error) },
+                );
+                Option::None
+            },
+        },
+        Err(error) => {
+            check_provider_panic(state, path, operation, error);
+            Option::None
+        },
+    }
+}
+
+fn check_io_error(error: io::Error) -> filesystem::Error {
+    filesystem::Error::new(
+        error.kind(),
+        error.operation(),
+        error.context(),
+        error.raw_os_code(),
+        error.message(),
+    )
+}
+
+fn check_close_once[H: io::Close](state: CheckState, path: string, handle: H, attempted: Ref[bool]) -> () {
+    if attempted.get() {
+        return
+    }
+    attempted.set(true);
+    let counters = state.counters.get();
+    let calls = if counters.cleanup_calls < 9223372036854775807 {
+        counters.cleanup_calls + 1
+    } else {
+        counters.cleanup_calls
+    };
+    state.counters.set(CheckCounters { cleanup_calls: calls, ..counters });
+    match panic::catch(|| handle.close()) {
+        Ok(result) => match result {
+            Ok(_) => (),
+            Err(error) => check_issue(
+                state,
+                CheckIssue {
+                    path,
+                    operation: "close",
+                    kind: CheckIssueKind::ProviderError(check_io_error(error)),
+                },
+            ),
+        },
+        Err(error) => check_provider_panic(state, path, "close", error),
+    }
+}
+
+fn check_with_handle[F: filesystem::FileSystem, T](
+    state: CheckState,
+    source: F,
+    path: string,
+    action: (F::Handle) -> T,
+) -> Option[T] {
+    let handle = match check_call(state, path, "open", || source.open(path)) {
+        Some(handle) => handle,
+        None => return Option::None,
+    };
+    let attempted = Ref::new(false);
+    defer {
+        check_close_once(state, path, handle, attempted);
+    };
+    match panic::catch(|| action(handle)) {
+        Ok(value) => Option::Some(value),
+        Err(error) => {
+            check_provider_panic(state, path, "handle action", error);
+            Option::None
+        },
+    }
+}

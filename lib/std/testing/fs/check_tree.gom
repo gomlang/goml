@@ -1,0 +1,256 @@
+package fs;
+
+use module::fs as filesystem;
+use filesystem::{FileSystem, File, ReadDirFile};
+
+struct CheckNode {
+    path: string,
+    depth: isize,
+    metadata: Option[filesystem::Metadata],
+    file_type: Option[filesystem::FileType],
+}
+
+fn check_invalid_paths[F: filesystem::FileSystem](state: CheckState, source: F) -> () {
+    for path in["", "/", "/a", "a/", "a//b", "./a", "..", "a/../b"] {
+        let response = check_call(
+            state,
+            path,
+            "open invalid path",
+            || Result::Ok(source.open(path)),
+        );
+        match response {
+            Some(result) => match result {
+                Ok(handle) => {
+                    check_violation(
+                        state,
+                        path,
+                        "open invalid path",
+                        "provider accepted an invalid logical path",
+                    );
+                    check_close_once(state, path, handle, Ref::new(false));
+                },
+                Err(_) => (),
+            },
+            None => return,
+        }
+    }
+}
+
+fn check_reserve_path(state: CheckState, parent: string, name: string, depth: isize) -> Option[
+    string,
+] {
+    if check_stopped(state) {
+        return Option::None
+    }
+    if depth > state.limits.max_depth {
+        check_budget(state, parent, CheckBudget::Depth);
+        return Option::None
+    }
+    let counters = state.counters.get();
+    if counters.nodes >= state.limits.max_nodes {
+        check_budget(state, parent, CheckBudget::Nodes);
+        return Option::None
+    }
+    let available = state.limits.max_path_bytes - counters.path_bytes;
+    let prefix = if parent == "." || parent == "" {
+        0
+    } else {
+        parent.byte_len()
+    };
+    let separator = if prefix == 0 {
+        0
+    } else {
+        1
+    };
+    if name.byte_len() > available || prefix > available - name.byte_len()
+        || separator > available - name.byte_len() - prefix {
+        check_budget(state, parent, CheckBudget::PathBytes);
+        return Option::None
+    }
+    let path = if prefix == 0 {
+        name
+    } else {
+        parent + "/" + name
+    };
+    state.counters.set(
+        CheckCounters {
+            nodes: counters.nodes + 1,
+            path_bytes: counters.path_bytes + path.byte_len(),
+            ..counters,
+        },
+    );
+    Option::Some(path)
+}
+
+fn check_tree[F: filesystem::FileSystem](
+    state: CheckState,
+    source: F,
+    expected: ExpectedTree,
+    file_action: (F, string, filesystem::Metadata) -> (),
+    link_action: (F, string, Option[filesystem::Metadata]) -> (),
+    directory_action: (F, string, filesystem::Metadata, Vec[CheckedEntry]) -> (),
+) -> () where F::Handle: filesystem::ReadDirFile {
+    let root = match check_reserve_path(state, "", ".", 0) {
+        Some(root) => root,
+        None => return,
+    };
+    let seen = Vec::from_array([root]);
+    let pending = Vec::from_array(
+        [CheckNode { path: root, depth: 0, metadata: Option::None, file_type: Option::None }],
+    );
+    while let Some(node) = pending.pop() {
+        if check_stopped(state) {
+            return
+        }
+        let inspected = check_with_handle(
+            state,
+            source,
+            node.path,
+            |handle| {
+                check_call(state, node.path, "stat", || handle.stat())
+            },
+        );
+        let metadata = match inspected {
+            Some(Some(metadata)) => metadata,
+            _ => continue,
+        };
+        if let Some(entry_type) = node.file_type {
+            if entry_type != metadata.file_type() {
+                check_inconsistent(
+                    state,
+                    node.path,
+                    "entry/stat",
+                    "entry and opened handle disagree on file type",
+                );
+            }
+        }
+        if let Some(entry_metadata) = node.metadata {
+            if !check_metadata_equal(entry_metadata, metadata) {
+                check_inconsistent(
+                    state,
+                    node.path,
+                    "entry/stat",
+                    "entry and opened handle disagree on metadata",
+                );
+            }
+        }
+        match metadata.file_type() {
+            File => file_action(source, node.path, metadata),
+            Directory => {
+                let issue_count = state.issues.len();
+                if let Some(entries) = check_directory(state, source, node.path) {
+                    if !check_stopped(state) && state.issues.len() == issue_count {
+                        directory_action(source, node.path, metadata, entries);
+                    }
+                    if check_stopped(state) {
+                        return
+                    }
+                    if !entries.is_empty() && node.depth >= state.limits.max_depth {
+                        check_budget(state, node.path, CheckBudget::Depth);
+                        return
+                    }
+                    for entry in entries {
+                        let child = match check_reserve_path(
+                            state,
+                            node.path,
+                            entry.name,
+                            node.depth + 1,
+                        ) {
+                            Some(child) => child,
+                            None => return,
+                        };
+                        seen.push(child);
+                        if entry.file_type == filesystem::FileType::Symlink {
+                            link_action(source, child, entry.metadata);
+                        } else {
+                            pending.push(
+                                CheckNode {
+                                    path: child,
+                                    depth: node.depth + 1,
+                                    metadata: entry.metadata,
+                                    file_type: Option::Some(entry.file_type),
+                                },
+                            );
+                        }
+                    }
+                }
+            },
+            Symlink | Other => (),
+        }
+    }
+    if state.incomplete.get() || check_stopped(state) {
+        return
+    }
+    match expected {
+        Contains(paths) => {
+            for path in paths {
+                if !seen.contains(path) {
+                    check_inconsistent(
+                        state,
+                        path,
+                        "expected tree",
+                        "expected path was not enumerated",
+                    );
+                }
+            }
+        },
+        Empty => {
+            if seen.len() != 1 {
+                check_inconsistent(
+                    state,
+                    ".",
+                    "expected tree",
+                    "expected no entries below the root",
+                );
+            }
+        },
+    }
+}
+
+fn check_prepare(expected: ExpectedTree, limits: CheckLimits) -> Result[
+    (CheckState, ExpectedTree),
+    filesystem::Error,
+] {
+    let expected = match expected {
+        Contains(paths) => {
+            let snapshot = Vec::with_capacity(paths.len());
+            for path in paths {
+                if !snapshot.contains(path) {
+                    snapshot.push(path);
+                }
+            }
+            ExpectedTree::Contains(snapshot)
+        },
+        Empty => ExpectedTree::Empty,
+    };
+    let state = check_initial_state(limits, expected)?;
+    Result::Ok((state, expected))
+}
+
+fn check_run[F: filesystem::FileSystem](
+    state: CheckState,
+    source: F,
+    expected: ExpectedTree,
+    file_action: (F, string, filesystem::Metadata) -> (),
+    link_action: (F, string, Option[filesystem::Metadata]) -> (),
+    directory_action: (F, string, filesystem::Metadata, Vec[CheckedEntry]) -> (),
+) -> () where F::Handle: filesystem::ReadDirFile {
+    check_invalid_paths(state, source);
+    check_tree(state, source, expected, file_action, link_action, directory_action);
+}
+
+pub fn check_fs[F: filesystem::FileSystem](source: F, expected: ExpectedTree, limits: CheckLimits) -> Result[
+    CheckReport,
+    filesystem::Error,
+] where F::Handle: filesystem::ReadDirFile {
+    let (state, expected) = check_prepare(expected, limits)?;
+    check_run(
+        state,
+        source,
+        expected,
+        |value, path, metadata| check_file(state, value, path, metadata),
+        |_, _, _| (),
+        |_, _, _, _| (),
+    );
+    Result::Ok(check_report(state))
+}
