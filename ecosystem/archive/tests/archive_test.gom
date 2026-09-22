@@ -116,12 +116,23 @@ fn pax_long_paths_large_ids_custom_keys_and_links() -> () {
 struct Fragmented {
     reader: io::Cursor,
     calls: Ref[isize],
+    interrupt_on: isize,
 }
 
 impl Read for Fragmented {
     fn read(self: Fragmented, buffer: MutSlice[byte]) -> Result[isize, io::Error] {
         self.calls.set(self.calls.get() + 1);
-        if self.calls.get() % 5 == 1 {
+        if self.calls.get() == self.interrupt_on {
+            self.reader.read(
+                buffer.sub(
+                    0,
+                    if buffer.len() > 0 {
+                        1
+                    } else {
+                        0
+                    },
+                ),
+            )?;
             return Result::Err(
                 io::Error::new(
                     io::ErrorKind::Interrupted,
@@ -179,7 +190,7 @@ impl Write for ShortWriter {
 }
 
 #[test]
-fn streaming_short_io_interrupts_and_sticky_failure() -> () {
+fn streaming_short_io_and_sticky_failure() -> () {
     let output = io::Cursor::new(bytes::Bytes::new());
     let writer = must(
         TarWriter::new(ShortWriter { output, fail_at: 0, calls: Ref::new(0) }, Limits::standard()),
@@ -189,7 +200,7 @@ fn streaming_short_io_interrupts_and_sticky_failure() -> () {
         writer.append_reader(
             Header::file("stream"),
             data.len(),
-            Fragmented { reader: io::Cursor::new(data), calls: Ref::new(0) },
+            Fragmented { reader: io::Cursor::new(data), calls: Ref::new(0), interrupt_on: -1 },
         ),
     );
     must(writer.finish());
@@ -197,7 +208,11 @@ fn streaming_short_io_interrupts_and_sticky_failure() -> () {
     testing::assert(writer.append(Entry::directory("late")).is_err());
     let reader = must(
         TarReader::new(
-            Fragmented { reader: io::Cursor::new(output.bytes()), calls: Ref::new(0) },
+            Fragmented {
+                reader: io::Cursor::new(output.bytes()),
+                calls: Ref::new(0),
+                interrupt_on: -1,
+            },
             Limits::standard(),
         ),
     );
@@ -233,12 +248,90 @@ fn streaming_short_io_interrupts_and_sticky_failure() -> () {
     must(zip_writer.finish("archive comment"));
     let zip = must(
         ZipArchive::read(
-            Fragmented { reader: io::Cursor::new(zip_output.bytes()), calls: Ref::new(0) },
+            Fragmented {
+                reader: io::Cursor::new(zip_output.bytes()),
+                calls: Ref::new(0),
+                interrupt_on: -1,
+            },
             Limits::standard(),
         ),
     );
     testing::assert_eq(zip.comment(), "archive comment");
     testing::assert(must(zip.entry(0)).data.to_vec() == data.to_vec());
+}
+
+fn interrupted_archive_error[T](result: Result[T, archive::Error]) -> () {
+    let error = testing::expect_err(result, "interrupted archive input");
+    testing::assert_eq(error.kind, ErrorKind::Io);
+    testing::assert_eq(
+        error.message,
+        io::Error::new(
+            io::ErrorKind::Interrupted,
+            "fragmented",
+            Option::None,
+            Option::None,
+            "retry",
+        ).to_string(),
+    );
+}
+
+#[test]
+fn interrupted_reads_preserve_unconfirmed_consumption_without_retry() -> () {
+    let limits = Limits::standard();
+    let data = bytes::Bytes::from_string("abcdefghijklmnopqrstuvwxyz");
+    let entries = Vec::from_array([Entry::file("file", data)]);
+    let tar = must(archive::encode_tar(entries, limits));
+    let zip = must(archive::encode_zip(entries, Compression::Stored, limits));
+    for interrupt_on in[1, 3] {
+        let source = Fragmented { reader: io::Cursor::new(tar), calls: Ref::new(0), interrupt_on };
+        let reader = must(TarReader::new(source, limits));
+        interrupted_archive_error(reader.next());
+        testing::assert_eq(source.calls.get(), interrupt_on);
+        testing::assert_eq(source.reader.position(), (interrupt_on - 1) * 7 + 1);
+        testing::assert_eq(
+            testing::expect_err(reader.next(), "failed TAR reader").kind,
+            ErrorKind::Closed,
+        );
+        testing::assert_eq(source.calls.get(), interrupt_on);
+        let source = Fragmented { reader: io::Cursor::new(zip), calls: Ref::new(0), interrupt_on };
+        interrupted_archive_error(ZipArchive::read(source, limits));
+        testing::assert_eq(source.calls.get(), interrupt_on);
+        testing::assert_eq(source.reader.position(), (interrupt_on - 1) * 7 + 1);
+        let source = Fragmented { reader: io::Cursor::new(data), calls: Ref::new(0), interrupt_on };
+        let output = io::Cursor::new(bytes::Bytes::new());
+        let writer = must(TarWriter::new(output, limits));
+        interrupted_archive_error(writer.append_reader(Header::file("file"), data.len(), source));
+        let written = output.bytes();
+        testing::assert(written.len() > 0);
+        testing::assert_eq(source.calls.get(), interrupt_on);
+        testing::assert_eq(source.reader.position(), (interrupt_on - 1) * 7 + 1);
+        testing::assert_eq(
+            testing::expect_err(writer.finish(), "failed TAR writer").kind,
+            ErrorKind::Closed,
+        );
+        testing::assert(output.bytes().to_vec() == written.to_vec());
+        let source = Fragmented { reader: io::Cursor::new(data), calls: Ref::new(0), interrupt_on };
+        let output = io::Cursor::new(bytes::Bytes::new());
+        let writer = must(ZipWriter::new(output, limits));
+        interrupted_archive_error(
+            writer.append_reader(Header::file("file"), data.len(), source, Compression::Stored),
+        );
+        testing::assert_eq(source.calls.get(), interrupt_on);
+        testing::assert_eq(source.reader.position(), (interrupt_on - 1) * 7 + 1);
+        testing::assert_eq(output.bytes().len(), 0);
+        must(
+            writer.append_reader(
+                Header::file("fresh"),
+                data.len(),
+                io::Cursor::new(data),
+                Compression::Stored,
+            ),
+        );
+        must(writer.finish(""));
+        testing::assert_eq(source.calls.get(), interrupt_on);
+        let recovered = must(ZipArchive::open(output.bytes(), limits));
+        testing::assert(must(recovered.entry(0)).data.to_vec() == data.to_vec());
+    }
 }
 
 #[test]
