@@ -1,0 +1,196 @@
+package io;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum FragmentEnd {
+    Delimiter,
+    BufferFull,
+    Eof,
+}
+
+impl ToString for FragmentEnd {
+    fn to_string(self: FragmentEnd) -> string {
+        match self {
+            Delimiter => "Delimiter",
+            BufferFull => "BufferFull",
+            Eof => "Eof",
+        }
+    }
+}
+
+pub struct ReadFragment {
+    bytes_value: Slice[byte],
+    end_value: FragmentEnd,
+    consumed_value: isize,
+}
+
+impl ReadFragment {
+    pub fn bytes(self: ReadFragment) -> Slice[byte] {
+        self.bytes_value
+    }
+
+    pub fn end(self: ReadFragment) -> FragmentEnd {
+        self.end_value
+    }
+
+    pub fn consumed(self: ReadFragment) -> isize {
+        self.consumed_value
+    }
+}
+
+impl Debug for ReadFragment {
+    fn debug(self: ReadFragment) -> string {
+        f"ReadFragment({self.end_value.to_string()}, {self.bytes_value.len()} bytes, {self.consumed_value} consumed)"
+    }
+}
+
+pub struct FragmentError {
+    bytes_value: Slice[byte],
+    error_value: Error,
+}
+
+impl FragmentError {
+    pub fn bytes(self: FragmentError) -> Slice[byte] {
+        self.bytes_value
+    }
+
+    pub fn error(self: FragmentError) -> Error {
+        self.error_value
+    }
+
+    pub fn consumed(self: FragmentError) -> isize {
+        self.bytes_value.len()
+    }
+}
+
+impl ToString for FragmentError {
+    fn to_string(self: FragmentError) -> string {
+        self.error_value.to_string()
+    }
+}
+
+impl Debug for FragmentError {
+    fn debug(self: FragmentError) -> string {
+        self.to_string()
+    }
+}
+
+impl[R: Read] BufReader[R] {
+    fn finish_fragment(self: BufReader[R], count: isize, end: FragmentEnd) -> ReadFragment {
+        let start = self.offset.get();
+        let bytes_value = self.buffer.slice(start, start + count);
+        self.offset.set(start + count);
+        ReadFragment { bytes_value, end_value: end, consumed_value: count }
+    }
+
+    fn fail_fragment(self: BufReader[R], error: Error) -> FragmentError {
+        let bytes_value = self.buffer.slice(self.offset.get(), self.length.get());
+        self.offset.set(self.length.get());
+        FragmentError { bytes_value, error_value: error }
+    }
+
+    pub fn read_fragment(self: BufReader[R], delimiter: byte) -> Result[ReadFragment, FragmentError] {
+        self.invalidate_unread();
+        let mut scanned = 0;
+        loop {
+            let available = if self.buffered_len() < self.capacity() {
+                self.buffered_len()
+            } else {
+                self.capacity()
+            };
+            while scanned < available {
+                if self.buffer.get(self.offset.get() + scanned) == delimiter {
+                    return Result::Ok(self.finish_fragment(scanned + 1, FragmentEnd::Delimiter))
+                }
+                scanned += 1;
+            }
+            if available == self.capacity() {
+                return Result::Ok(self.finish_fragment(available, FragmentEnd::BufferFull))
+            }
+            self.compact();
+            let start = self.length.get();
+            let count = match self.reader.get().read(self.buffer.slice_mut(start, self.capacity())) {
+                Ok(count) => match valid_count(
+                    count,
+                    self.capacity() - start,
+                    "read buffer fragment",
+                ) {
+                    Ok(count) => count,
+                    Err(error) => return Result::Err(self.fail_fragment(error)),
+                },
+                Err(error) => return Result::Err(self.fail_fragment(error)),
+            };
+            self.length.set(start + count);
+            if count == 0 {
+                return Result::Ok(self.finish_fragment(start, FragmentEnd::Eof))
+            }
+        }
+    }
+
+    fn read_single_capacity_cr(self: BufReader[R]) -> Result[ReadFragment, FragmentError] {
+        self.offset.set(self.offset.get() - 1);
+        self.compact();
+        if self.length.get() < 2 {
+            let start = self.length.get();
+            let count = match self.reader.get().read(self.buffer.slice_mut(start, start + 1)) {
+                Ok(count) => match valid_count(count, 1, "read line fragment") {
+                    Ok(count) => count,
+                    Err(error) => return Result::Err(self.fail_fragment(error)),
+                },
+                Err(error) => return Result::Err(self.fail_fragment(error)),
+            };
+            self.length.set(start + count);
+            if count == 0 {
+                return Result::Ok(self.finish_fragment(1, FragmentEnd::Eof))
+            }
+        }
+        if self.buffer.get(1) == b'\n' {
+            self.offset.set(2);
+            Result::Ok(
+                ReadFragment {
+                    bytes_value: self.buffer.slice(0, 0),
+                    end_value: FragmentEnd::Delimiter,
+                    consumed_value: 2,
+                },
+            )
+        } else {
+            Result::Ok(self.finish_fragment(1, FragmentEnd::BufferFull))
+        }
+    }
+
+    pub fn read_line_fragment(self: BufReader[R]) -> Result[ReadFragment, FragmentError] {
+        let fragment = self.read_fragment(b'\n')?;
+        let bytes = fragment.bytes();
+        match fragment.end() {
+            FragmentEnd::Delimiter => {
+                let mut end = bytes.len() - 1;
+                if end > 0 && bytes[end - 1] == b'\r' {
+                    end -= 1;
+                }
+                Result::Ok(
+                    ReadFragment {
+                        bytes_value: bytes.sub(0, end),
+                        end_value: FragmentEnd::Delimiter,
+                        consumed_value: fragment.consumed(),
+                    },
+                )
+            },
+            FragmentEnd::BufferFull => {
+                if bytes[bytes.len() - 1] != b'\r' {
+                    return Result::Ok(fragment)
+                }
+                if self.capacity() == 1 {
+                    return self.read_single_capacity_cr()
+                }
+                self.offset.set(self.offset.get() - 1);
+                Result::Ok(
+                    ReadFragment {
+                        bytes_value: bytes.sub(0, bytes.len() - 1),
+                        end_value: FragmentEnd::BufferFull,
+                        consumed_value: fragment.consumed() - 1,
+                    },
+                )
+            },
+            FragmentEnd::Eof => Result::Ok(fragment),
+        }
+    }
+}
