@@ -132,11 +132,17 @@ that streams individual fields to a callback.
 `StreamReader::new(reader, options)` accepts any `std::io::Read` implementation.
 `with_capacity(reader, capacity, options)` controls its positive read chunk size.
 `next()` reads a dynamic value; `decode_next()` reads a typed value. Both return
-`None` only at a clean, drained EOF. Short reads and interrupted calls are handled
-internally; truncated input, malformed byte counts and exceeded limits return
+`None` only at a clean, drained EOF. Short reads are handled internally; every
+read error, including `Interrupted`, returns immediately without automatic retry.
+Truncated input, malformed byte counts and exceeded limits return
 `StreamError::{Io, Codec}`, retaining the structured underlying error.
 Transport/framing failures are terminal. A typed mismatch retains its current
 frame, allowing another typed decode or dynamic `next()` before continuing.
+An unsuccessful read can have consumed input or modified scratch storage without
+reporting a count. Only bytes from successful reads enter the frame buffer;
+`buffered()` is not a safe restart offset. After an I/O failure, later calls return
+the saved error without reading again. Creating a new wrapper does not restore
+consumed source bytes.
 
 `StreamWriter::new(writer, options)` accepts any `std::io::Write` implementation.
 `write(Value)` and `serialize(value)` validate and encode one bounded frame before
