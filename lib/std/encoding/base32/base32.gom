@@ -1,0 +1,675 @@
+package base32;
+
+use module::bytes;
+use module::text;
+
+pub enum Variant {
+    Standard,
+    StandardNoPadding,
+    Hex,
+    HexNoPadding,
+}
+
+pub enum ConfigError {
+    InvalidAlphabetLength,
+    InvalidSymbol(isize),
+    DuplicateSymbol(isize),
+    InvalidPadding,
+}
+
+impl ToString for ConfigError {
+    fn to_string(self: ConfigError) -> string {
+        match self {
+            ConfigError::InvalidAlphabetLength => "base32 alphabet must contain 32 ASCII bytes",
+            ConfigError::InvalidSymbol(index) => f"invalid base32 alphabet byte at {index}",
+            ConfigError::DuplicateSymbol(index) => f"duplicate base32 alphabet byte at {index}",
+            ConfigError::InvalidPadding => "invalid base32 padding byte",
+        }
+    }
+}
+
+impl Debug for ConfigError {
+    fn debug(self: ConfigError) -> string {
+        self.to_string()
+    }
+}
+
+pub struct Encoding {
+    symbols: string,
+    padding_value: Option[byte],
+    decode_map: Vec[isize],
+}
+
+pub enum OutputError {
+    InvalidLength(isize),
+    InvalidLimit(isize),
+    LengthOverflow,
+    LimitExceeded(isize),
+    Decode(DecodeError),
+}
+
+impl ToString for OutputError {
+    fn to_string(self: OutputError) -> string {
+        match self {
+            OutputError::InvalidLength(length) => f"negative base32 input length {length}",
+            OutputError::InvalidLimit(limit) => f"negative base32 output limit {limit}",
+            OutputError::LengthOverflow => "base32 encoded length overflow",
+            OutputError::LimitExceeded(limit) => f"base32 output exceeds {limit} bytes",
+            OutputError::Decode(error) => error.to_string(),
+        }
+    }
+}
+
+impl Debug for OutputError {
+    fn debug(self: OutputError) -> string {
+        self.to_string()
+    }
+}
+
+fn make_encoding(symbols: string, padding: Option[byte]) -> Encoding {
+    let table = Vec::new();
+    for _ in 0..128 {
+        table.push(-1);
+    }
+    for index in 0..32 {
+        table[symbols.byte_get(index).to_isize()] = index;
+    }
+    Encoding { symbols, padding_value: padding, decode_map: table }
+}
+
+impl Encoding {
+    pub fn new(symbols: string, padding: Option[byte]) -> Result[Encoding, ConfigError] {
+        if symbols.byte_len() != 32 {
+            return Result::Err(ConfigError::InvalidAlphabetLength)
+        }
+        for index in 0..32 {
+            let value = symbols.byte_get(index);
+            if value >= 128 || value == 10 || value == 13 {
+                return Result::Err(ConfigError::InvalidSymbol(index))
+            }
+            for previous in 0..index {
+                if symbols.byte_get(previous) == value {
+                    return Result::Err(ConfigError::DuplicateSymbol(index))
+                }
+            }
+        }
+        match padding {
+            Some(value) => {
+                if value >= 128 || value == 10 || value == 13 {
+                    return Result::Err(ConfigError::InvalidPadding)
+                }
+                for index in 0..32 {
+                    if symbols.byte_get(index) == value {
+                        return Result::Err(ConfigError::InvalidPadding)
+                    }
+                }
+            },
+            None => (),
+        }
+        Result::Ok(make_encoding(symbols, padding))
+    }
+
+    pub fn from_variant(variant: Variant) -> Encoding {
+        make_encoding(
+            alphabet(variant),
+            if padded(variant) {
+                Option::Some(b'=')
+            } else {
+                Option::None
+            },
+        )
+    }
+
+    pub fn alphabet(self: Encoding) -> string {
+        self.symbols
+    }
+
+    pub fn padding(self: Encoding) -> Option[byte] {
+        self.padding_value
+    }
+
+    pub fn with_padding(self: Encoding, padding: Option[byte]) -> Result[Encoding, ConfigError] {
+        Encoding::new(self.symbols, padding)
+    }
+
+    pub fn encode(self: Encoding, input: bytes::Bytes) -> string {
+        encode_config(input, self)
+    }
+
+    pub fn decode(self: Encoding, input: string) -> Result[bytes::Bytes, DecodeError] {
+        decode_config(input, self)
+    }
+
+    pub fn encoded_len(self: Encoding, input_length: isize) -> Result[isize, OutputError] {
+        if input_length < 0 {
+            return Result::Err(OutputError::InvalidLength(input_length))
+        }
+        let groups = input_length / 5;
+        let remainder = input_length % 5;
+        let tail = if remainder == 0 {
+            0
+        } else if self.padding_value.is_some() {
+            8
+        } else {
+            (remainder * 8 + 4) / 5
+        };
+        if groups > (9223372036854775807 - tail) / 8 {
+            return Result::Err(OutputError::LengthOverflow)
+        }
+        Result::Ok(groups * 8 + tail)
+    }
+
+    pub fn encode_checked(self: Encoding, input: bytes::Bytes, max_bytes: isize) -> Result[
+        string,
+        OutputError,
+    ] {
+        if max_bytes < 0 {
+            return Result::Err(OutputError::InvalidLimit(max_bytes))
+        }
+        if self.encoded_len(input.len())? > max_bytes {
+            return Result::Err(OutputError::LimitExceeded(max_bytes))
+        }
+        Result::Ok(self.encode(input))
+    }
+
+    pub fn decode_checked(self: Encoding, input: string, max_bytes: isize) -> Result[
+        bytes::Bytes,
+        OutputError,
+    ] {
+        if max_bytes < 0 {
+            return Result::Err(OutputError::InvalidLimit(max_bytes))
+        }
+        let (data_length, remainder) = decode_shape(input, self).map_err(
+            |error: DecodeError| OutputError::Decode(error),
+        )?;
+        let length = (data_length / 8) * 5 + (remainder * 5) / 8;
+        if length > max_bytes {
+            return Result::Err(OutputError::LimitExceeded(max_bytes))
+        }
+        decode_data(input, self, data_length, remainder).map_err(
+            |error: DecodeError| OutputError::Decode(error),
+        )
+    }
+}
+
+fn is_padding(value: byte, encoding: Encoding) -> bool {
+    match encoding.padding_value {
+        Some(padding) => value == padding,
+        None => value == b'=' && encoding.decode_map[61] < 0,
+    }
+}
+
+pub enum DecodeErrorKind {
+    InvalidLength,
+    InvalidByte,
+    InvalidPadding,
+    NonCanonical,
+}
+
+pub enum StreamError {
+    Output(OutputError),
+    Closed,
+}
+
+impl ToString for StreamError {
+    fn to_string(self: StreamError) -> string {
+        match self {
+            StreamError::Output(error) => error.to_string(),
+            StreamError::Closed => "base32 stream is already finished",
+        }
+    }
+}
+
+impl Debug for StreamError {
+    fn debug(self: StreamError) -> string {
+        self.to_string()
+    }
+}
+
+pub struct Encoder {
+    encoding: Encoding,
+    max_bytes: isize,
+    input_count: Ref[isize],
+    output_count: Ref[isize],
+    pending: Ref[u32],
+    bits: Ref[isize],
+    closed: Ref[bool],
+}
+
+pub struct Decoder {
+    encoding: Encoding,
+    max_bytes: isize,
+    input_count: Ref[isize],
+    output_count: Ref[isize],
+    pending: Ref[string],
+    terminal: Ref[bool],
+    closed: Ref[bool],
+}
+
+fn stream_decode_error(offset: isize, error_value: DecodeError) -> StreamError {
+    StreamError::Output(
+        OutputError::Decode(error(offset + error_value.index(), error_value.kind())),
+    )
+}
+
+impl Decoder {
+    pub fn new(encoding: Encoding, max_bytes: isize) -> Result[Decoder, OutputError] {
+        if max_bytes < 0 {
+            return Result::Err(OutputError::InvalidLimit(max_bytes))
+        }
+        Result::Ok(
+            Decoder {
+                encoding,
+                max_bytes,
+                input_count: Ref::new(0),
+                output_count: Ref::new(0),
+                pending: Ref::new(""),
+                terminal: Ref::new(false),
+                closed: Ref::new(false),
+            },
+        )
+    }
+
+    pub fn input_len(self: Decoder) -> isize {
+        self.input_count.get()
+    }
+
+    pub fn output_len(self: Decoder) -> isize {
+        self.output_count.get()
+    }
+
+    pub fn is_finished(self: Decoder) -> bool {
+        self.closed.get()
+    }
+
+    pub fn update(self: Decoder, input: string) -> Result[bytes::Bytes, StreamError] {
+        if self.closed.get() {
+            return Result::Err(StreamError::Closed)
+        }
+        if input.byte_len() > 9223372036854775807 - self.input_count.get() {
+            return Result::Err(StreamError::Output(OutputError::LengthOverflow))
+        }
+        let group = text::StringBuilder::new();
+        group.write_string(self.pending.get());
+        let mut group_start = self.input_count.get() - group.len();
+        let mut terminal = self.terminal.get();
+        let output = bytes::Bytes::new();
+        let mut total = self.output_count.get();
+        for index in 0..input.byte_len() {
+            let offset = self.input_count.get() + index;
+            if terminal {
+                return Result::Err(
+                    stream_decode_error(offset, error(0, DecodeErrorKind::InvalidPadding)),
+                )
+            }
+            let value = input.byte_get(index);
+            if !is_padding(value, self.encoding) {
+                let _ = decode_digit(value, self.encoding, 0).map_err(
+                    |error_value: DecodeError| stream_decode_error(offset, error_value),
+                )?;
+            }
+            group.values.push(value);
+            if group.len() == 8 {
+                let encoded = group.finish();
+                let decoded = self.encoding.decode(encoded).map_err(
+                    |error_value: DecodeError| stream_decode_error(group_start, error_value),
+                )?;
+                if decoded.len() > self.max_bytes - total {
+                    return Result::Err(
+                        StreamError::Output(OutputError::LimitExceeded(self.max_bytes)),
+                    )
+                }
+                output.extend_from_slice(decoded.as_slice());
+                total += decoded.len();
+                terminal = self.encoding.padding_value.is_some()
+                    && is_padding(encoded.byte_get(7), self.encoding);
+                group.clear();
+                group_start += 8;
+            }
+        }
+        let pending = group.finish();
+        let mut digits = pending.byte_len();
+        while digits > 0 && is_padding(pending.byte_get(digits - 1), self.encoding) {
+            digits -= 1;
+        }
+        if digits * 5 / 8 > self.max_bytes - total {
+            return Result::Err(StreamError::Output(OutputError::LimitExceeded(self.max_bytes)))
+        }
+        self.input_count.set(self.input_count.get() + input.byte_len());
+        self.output_count.set(total);
+        self.pending.set(pending);
+        self.terminal.set(terminal);
+        Result::Ok(output)
+    }
+
+    pub fn finish(self: Decoder) -> Result[bytes::Bytes, StreamError] {
+        if self.closed.get() {
+            return Result::Ok(bytes::Bytes::new())
+        }
+        let pending = self.pending.get();
+        let decoded = self.encoding.decode(pending).map_err(
+            |error_value: DecodeError| stream_decode_error(
+                self.input_count.get() - pending.byte_len(),
+                error_value,
+            ),
+        )?;
+        if decoded.len() > self.max_bytes - self.output_count.get() {
+            return Result::Err(StreamError::Output(OutputError::LimitExceeded(self.max_bytes)))
+        }
+        self.output_count.set(self.output_count.get() + decoded.len());
+        self.pending.set("");
+        self.closed.set(true);
+        Result::Ok(decoded)
+    }
+
+    pub fn reset(self: Decoder) -> () {
+        self.input_count.set(0);
+        self.output_count.set(0);
+        self.pending.set("");
+        self.terminal.set(false);
+        self.closed.set(false);
+    }
+}
+
+impl Encoder {
+    pub fn new(encoding: Encoding, max_bytes: isize) -> Result[Encoder, OutputError] {
+        if max_bytes < 0 {
+            return Result::Err(OutputError::InvalidLimit(max_bytes))
+        }
+        Result::Ok(
+            Encoder {
+                encoding,
+                max_bytes,
+                input_count: Ref::new(0),
+                output_count: Ref::new(0),
+                pending: Ref::new(0),
+                bits: Ref::new(0),
+                closed: Ref::new(false),
+            },
+        )
+    }
+
+    pub fn input_len(self: Encoder) -> isize {
+        self.input_count.get()
+    }
+
+    pub fn output_len(self: Encoder) -> isize {
+        self.output_count.get()
+    }
+
+    pub fn is_finished(self: Encoder) -> bool {
+        self.closed.get()
+    }
+
+    pub fn update(self: Encoder, input: Slice[byte]) -> Result[string, StreamError] {
+        if self.closed.get() {
+            return Result::Err(StreamError::Closed)
+        }
+        if input.len() > 9223372036854775807 - self.input_count.get() {
+            return Result::Err(StreamError::Output(OutputError::LengthOverflow))
+        }
+        let input_length = self.input_count.get() + input.len();
+        let final_length = self.encoding.encoded_len(input_length).map_err(
+            |error: OutputError| StreamError::Output(error),
+        )?;
+        if final_length > self.max_bytes {
+            return Result::Err(StreamError::Output(OutputError::LimitExceeded(self.max_bytes)))
+        }
+        let digits = input.len() / 5 * 8 + (self.bits.get() + input.len() % 5 * 8) / 5;
+        let output = text::StringBuilder::with_capacity(digits);
+        let mut pending = self.pending.get();
+        let mut bits = self.bits.get();
+        for value in input {
+            pending = (pending << 8) | value.to_u32();
+            bits += 8;
+            while bits >= 5 {
+                bits -= 5;
+                output.values.push(
+                    self.encoding.symbols.byte_get(((pending >> bits) & 31).to_isize()),
+                );
+            }
+        }
+        self.pending.set(pending);
+        self.bits.set(bits);
+        self.input_count.set(input_length);
+        self.output_count.set(self.output_count.get() + digits);
+        Result::Ok(output.finish())
+    }
+
+    pub fn finish(self: Encoder) -> Result[string, StreamError] {
+        if self.closed.get() {
+            return Result::Ok("")
+        }
+        let output = text::StringBuilder::new();
+        let mut length = self.output_count.get();
+        if self.bits.get() > 0 {
+            output.values.push(
+                self.encoding.symbols.byte_get(
+                    ((self.pending.get() << (5 - self.bits.get())) & 31).to_isize(),
+                ),
+            );
+            length += 1;
+        }
+        if let Some(padding) = self.encoding.padding_value {
+            while length % 8 != 0 {
+                output.values.push(padding);
+                length += 1;
+            }
+        }
+        self.output_count.set(length);
+        self.closed.set(true);
+        Result::Ok(output.finish())
+    }
+
+    pub fn reset(self: Encoder) -> () {
+        self.input_count.set(0);
+        self.output_count.set(0);
+        self.pending.set(0);
+        self.bits.set(0);
+        self.closed.set(false);
+    }
+}
+
+pub struct DecodeError {
+    index_value: isize,
+    kind_value: DecodeErrorKind,
+}
+
+impl Debug for DecodeErrorKind {
+    fn debug(self: DecodeErrorKind) -> string {
+        match self {
+            DecodeErrorKind::InvalidLength => "InvalidLength",
+            DecodeErrorKind::InvalidByte => "InvalidByte",
+            DecodeErrorKind::InvalidPadding => "InvalidPadding",
+            DecodeErrorKind::NonCanonical => "NonCanonical",
+        }
+    }
+}
+
+impl PartialEq for DecodeErrorKind {
+    fn eq(self: DecodeErrorKind, other: DecodeErrorKind) -> bool {
+        match (self, other) {
+            (DecodeErrorKind::InvalidLength, DecodeErrorKind::InvalidLength) => true,
+            (DecodeErrorKind::InvalidByte, DecodeErrorKind::InvalidByte) => true,
+            (DecodeErrorKind::InvalidPadding, DecodeErrorKind::InvalidPadding) => true,
+            (DecodeErrorKind::NonCanonical, DecodeErrorKind::NonCanonical) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for DecodeErrorKind {}
+
+impl Debug for DecodeError {
+    fn debug(self: DecodeError) -> string {
+        self.to_string()
+    }
+}
+
+impl PartialEq for DecodeError {
+    fn eq(self: DecodeError, other: DecodeError) -> bool {
+        self.index_value == other.index_value && self.kind_value == other.kind_value
+    }
+}
+
+impl DecodeError {
+    pub fn index(self: DecodeError) -> isize {
+        self.index_value
+    }
+
+    pub fn kind(self: DecodeError) -> DecodeErrorKind {
+        self.kind_value
+    }
+}
+
+impl ToString for DecodeError {
+    fn to_string(self: DecodeError) -> string {
+        let reason = match self.kind_value {
+            DecodeErrorKind::InvalidLength => "invalid base32 length",
+            DecodeErrorKind::InvalidByte => "invalid base32 digit",
+            DecodeErrorKind::InvalidPadding => "invalid base32 padding",
+            DecodeErrorKind::NonCanonical => "non-canonical base32 trailing bits",
+        };
+        f"{reason} at byte {self.index_value}"
+    }
+}
+
+fn error(index: isize, kind: DecodeErrorKind) -> DecodeError {
+    DecodeError { index_value: index, kind_value: kind }
+}
+
+fn alphabet(variant: Variant) -> string {
+    match variant {
+        Variant::Standard | Variant::StandardNoPadding => "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567",
+        Variant::Hex | Variant::HexNoPadding => "0123456789ABCDEFGHIJKLMNOPQRSTUV",
+    }
+}
+
+fn padded(variant: Variant) -> bool {
+    match variant {
+        Variant::Standard | Variant::Hex => true,
+        Variant::StandardNoPadding | Variant::HexNoPadding => false,
+    }
+}
+
+pub fn encode(input: bytes::Bytes) -> string {
+    encode_with(input, Variant::Standard)
+}
+
+pub fn encode_with(input: bytes::Bytes, variant: Variant) -> string {
+    Encoding::from_variant(variant).encode(input)
+}
+
+fn encode_config(input: bytes::Bytes, encoding: Encoding) -> string {
+    let output = text::StringBuilder::new();
+    let symbols = encoding.symbols;
+    let mut pending: u32 = 0;
+    let mut count = 0;
+    let mut digits = 0;
+    for value in input.as_slice() {
+        pending = (pending << 8) | value.to_u32();
+        count += 8;
+        while count >= 5 {
+            count -= 5;
+            output.write_char(symbols.get(((pending >> count) & 31).to_isize()));
+            digits = (digits + 1) % 8;
+        }
+    }
+    if count > 0 {
+        output.write_char(symbols.get(((pending << (5 - count)) & 31).to_isize()));
+        digits = (digits + 1) % 8;
+    }
+    if let Some(padding) = encoding.padding_value {
+        while digits != 0 {
+            output.values.push(padding);
+            digits = (digits + 1) % 8;
+        }
+    }
+    output.finish()
+}
+
+fn decode_digit(value: byte, encoding: Encoding, index: isize) -> Result[u32, DecodeError] {
+    if value < 128 {
+        let digit = encoding.decode_map[value.to_isize()];
+        if digit >= 0 {
+            return Result::Ok(digit.to_u32())
+        }
+    }
+    Result::Err(error(index, DecodeErrorKind::InvalidByte))
+}
+
+pub fn decode(input: string) -> Result[bytes::Bytes, DecodeError] {
+    decode_with(input, Variant::Standard)
+}
+
+pub fn decode_with(input: string, variant: Variant) -> Result[bytes::Bytes, DecodeError] {
+    Encoding::from_variant(variant).decode(input)
+}
+
+fn decode_config(input: string, encoding: Encoding) -> Result[bytes::Bytes, DecodeError] {
+    let (data_length, remainder) = decode_shape(input, encoding)?;
+    decode_data(input, encoding, data_length, remainder)
+}
+
+fn decode_shape(input: string, encoding: Encoding) -> Result[(isize, isize), DecodeError] {
+    let length = input.byte_len();
+    let mut data_length = length;
+    while data_length > 0 && is_padding(input.byte_get(data_length - 1), encoding) {
+        data_length -= 1;
+    }
+    let padding = length - data_length;
+    if encoding.padding_value.is_none() && padding > 0 {
+        return Result::Err(error(data_length, DecodeErrorKind::InvalidPadding))
+    }
+    let remainder = data_length % 8;
+    if remainder == 1 || remainder == 3 || remainder == 6 {
+        return Result::Err(error(data_length, DecodeErrorKind::InvalidLength))
+    }
+    if encoding.padding_value.is_some() {
+        if length % 8 != 0 {
+            return Result::Err(error(length, DecodeErrorKind::InvalidLength))
+        }
+        let expected = if remainder == 0 {
+            0
+        } else {
+            8 - remainder
+        };
+        if padding != expected {
+            return Result::Err(error(data_length, DecodeErrorKind::InvalidPadding))
+        }
+    }
+    Result::Ok((data_length, remainder))
+}
+
+fn decode_data(input: string, encoding: Encoding, data_length: isize, remainder: isize) -> Result[
+    bytes::Bytes,
+    DecodeError,
+] {
+    let output = bytes::Bytes::with_capacity((data_length / 8) * 5 + (remainder * 5) / 8);
+    let mut pending: u32 = 0;
+    let mut count = 0;
+    for index in 0..data_length {
+        let value = input.byte_get(index);
+        if is_padding(value, encoding) {
+            return Result::Err(error(index, DecodeErrorKind::InvalidPadding))
+        }
+        pending = (pending << 5) | decode_digit(value, encoding, index)?;
+        count += 5;
+        if count >= 8 {
+            count -= 8;
+            output.push((pending >> count).to_u8());
+        }
+    }
+    if count > 0 && pending & ((1 << count) - 1) != 0 {
+        return Result::Err(error(data_length - 1, DecodeErrorKind::NonCanonical))
+    }
+    Result::Ok(output)
+}
+
+pub fn encode_checked(input: bytes::Bytes, max_bytes: isize) -> Result[string, OutputError] {
+    Encoding::from_variant(Variant::Standard).encode_checked(input, max_bytes)
+}
+
+pub fn decode_checked(input: string, max_bytes: isize) -> Result[bytes::Bytes, OutputError] {
+    Encoding::from_variant(Variant::Standard).decode_checked(input, max_bytes)
+}

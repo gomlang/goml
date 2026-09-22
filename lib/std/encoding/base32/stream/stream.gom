@@ -1,0 +1,230 @@
+package stream;
+
+use std::bytes;
+use std::encoding::base32;
+use std::io;
+use io::{Read, Write, Close};
+
+fn error(kind: io::ErrorKind, operation: string, message: string) -> io::Error {
+    io::Error::new(kind, operation, Option::None, Option::None, message)
+}
+
+fn terminal_error(cause: io::Error) -> io::Error {
+    if cause.kind() == io::ErrorKind::Interrupted {
+        error(io::ErrorKind::Other, "base32 stream", f"terminal output failure: {cause}")
+    } else {
+        cause
+    }
+}
+
+pub struct Encoder[W] {
+    writer: W,
+    state: base32::Encoder,
+    failure_value: Ref[Option[io::Error]],
+}
+
+impl[W: Write] Encoder[W] {
+    pub fn new(writer: W, encoding: base32::Encoding, max_bytes: isize) -> Result[
+        Encoder[W],
+        io::Error,
+    ] {
+        let state = base32::Encoder::new(encoding, max_bytes).map_err(
+            |cause: base32::OutputError| error(
+                io::ErrorKind::InvalidInput,
+                "base32 encoder",
+                cause.to_string(),
+            ),
+        )?;
+        Result::Ok(Encoder { writer, state, failure_value: Ref::new(Option::None) })
+    }
+
+    pub fn failure(self: Encoder[W]) -> Option[io::Error] {
+        self.failure_value.get()
+    }
+
+    pub fn input_len(self: Encoder[W]) -> isize {
+        self.state.input_len()
+    }
+
+    pub fn is_finished(self: Encoder[W]) -> bool {
+        self.state.is_finished() && self.failure_value.get().is_none()
+    }
+
+    fn emit(self: Encoder[W], encoded: string) -> Result[(), io::Error] {
+        if encoded.byte_len() == 0 {
+            return Result::Ok(())
+        }
+        match self.writer.write_all(bytes::Bytes::from_string(encoded).as_slice()) {
+            Ok(()) => Result::Ok(()),
+            Err(cause) => {
+                self.failure_value.set(Option::Some(cause));
+                Result::Err(terminal_error(cause))
+            },
+        }
+    }
+
+    pub fn finish(self: Encoder[W]) -> Result[(), io::Error] {
+        if let Some(cause) = self.failure_value.get() {
+            return Result::Err(terminal_error(cause))
+        }
+        let encoded = self.state.finish().map_err(
+            |cause: base32::StreamError| error(
+                io::ErrorKind::InvalidData,
+                "finish base32",
+                cause.to_string(),
+            ),
+        )?;
+        self.emit(encoded)
+    }
+}
+
+impl[W: Write] Write for Encoder[W] {
+    fn write(self: Encoder[W], input: Slice[byte]) -> Result[isize, io::Error] {
+        if let Some(cause) = self.failure_value.get() {
+            return Result::Err(terminal_error(cause))
+        }
+        if self.state.is_finished() {
+            return Result::Err(
+                error(io::ErrorKind::BrokenPipe, "write base32", "encoder is finished"),
+            )
+        }
+        let encoded = self.state.update(input).map_err(
+            |cause: base32::StreamError| error(
+                io::ErrorKind::InvalidData,
+                "write base32",
+                cause.to_string(),
+            ),
+        )?;
+        self.emit(encoded)?;
+        Result::Ok(input.len())
+    }
+
+    fn write_all(self: Encoder[W], input: Slice[byte]) -> Result[(), io::Error] {
+        self.write(input)?;
+        Result::Ok(())
+    }
+
+    fn flush(self: Encoder[W]) -> Result[(), io::Error] {
+        if let Some(cause) = self.failure_value.get() {
+            return Result::Err(terminal_error(cause))
+        }
+        match self.writer.flush() {
+            Ok(()) => Result::Ok(()),
+            Err(cause) => {
+                self.failure_value.set(Option::Some(cause));
+                Result::Err(terminal_error(cause))
+            },
+        }
+    }
+}
+
+impl[W: Write] Close for Encoder[W] {
+    fn close(self: Encoder[W]) -> Result[(), io::Error] {
+        self.finish()
+    }
+}
+
+pub struct Decoder[R] {
+    reader: R,
+    state: base32::Decoder,
+    pending: Ref[bytes::Bytes],
+    offset: Ref[isize],
+    ended: Ref[bool],
+    failure_value: Ref[Option[io::Error]],
+}
+
+impl[R: Read] Decoder[R] {
+    pub fn new(reader: R, encoding: base32::Encoding, max_bytes: isize) -> Result[
+        Decoder[R],
+        io::Error,
+    ] {
+        let state = base32::Decoder::new(encoding, max_bytes).map_err(
+            |cause: base32::OutputError| error(
+                io::ErrorKind::InvalidInput,
+                "base32 decoder",
+                cause.to_string(),
+            ),
+        )?;
+        Result::Ok(
+            Decoder {
+                reader,
+                state,
+                pending: Ref::new(bytes::Bytes::new()),
+                offset: Ref::new(0),
+                ended: Ref::new(false),
+                failure_value: Ref::new(Option::None),
+            },
+        )
+    }
+
+    pub fn failure(self: Decoder[R]) -> Option[io::Error] {
+        self.failure_value.get()
+    }
+
+    fn fail(self: Decoder[R], cause: io::Error) -> Result[isize, io::Error] {
+        self.failure_value.set(Option::Some(cause));
+        Result::Err(cause)
+    }
+}
+
+impl[R: Read] Read for Decoder[R] {
+    fn read(self: Decoder[R], output: MutSlice[byte]) -> Result[isize, io::Error] {
+        if let Some(cause) = self.failure_value.get() {
+            return Result::Err(cause)
+        }
+        if output.len() == 0 {
+            return Result::Ok(0)
+        }
+        let one = b"\0";
+        while self.offset.get() == self.pending.get().len() {
+            if self.ended.get() {
+                return Result::Ok(0)
+            }
+            let count = match self.reader.read(one.as_mut_slice()) {
+                Ok(count) => count,
+                Err(cause) => return self.fail(cause),
+            };
+            if count < 0 || count > 1 {
+                return self.fail(
+                    error(io::ErrorKind::InvalidData, "read base32", "invalid reader byte count"),
+                )
+            }
+            let decoded = if count == 0 {
+                self.ended.set(true);
+                self.state.finish()
+            } else {
+                if one[0] >= 128 {
+                    return self.fail(
+                        error(
+                            io::ErrorKind::InvalidData,
+                            "read base32",
+                            f"non-ASCII byte at {self.state.input_len()}",
+                        ),
+                    )
+                }
+                self.state.update(char_from_u32(one[0].to_u32()).unwrap_or(' ').to_string())
+            };
+            match decoded {
+                Ok(data) => {
+                    self.pending.set(data);
+                    self.offset.set(0);
+                },
+                Err(cause) => return self.fail(
+                    error(io::ErrorKind::InvalidData, "read base32", cause.to_string()),
+                ),
+            }
+        }
+        let pending = self.pending.get();
+        let available = pending.len() - self.offset.get();
+        let count = if output.len() < available {
+            output.len()
+        } else {
+            available
+        };
+        for index in 0..count {
+            output[index] = pending.get(self.offset.get() + index);
+        }
+        self.offset.set(self.offset.get() + count);
+        Result::Ok(count)
+    }
+}
