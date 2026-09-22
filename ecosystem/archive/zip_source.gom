@@ -1,0 +1,370 @@
+package archive;
+
+use std::bytes;
+use std::io;
+use io::{Read, ReadAt, Write};
+use ecosystem::compress;
+use ecosystem::compress::flate;
+
+fn zip_at[R: ReadAt](reader: R, offset: isize, count: isize, size: isize) -> Result[
+    bytes::Bytes,
+    Error,
+] {
+    if offset < 0 || count < 0 || offset > size || count > size - offset {
+        return Result::Err(failure(ErrorKind::Truncated, offset, "ZIP source range"))
+    }
+    let data = zeros(count);
+    reader.read_exact_at(data.as_mut_slice(), offset).map_err(
+        |error| failure(ErrorKind::Io, offset, error.to_string()),
+    )?;
+    Result::Ok(data)
+}
+
+fn zip_directory_at[R: ReadAt](reader: R, size: isize, limits: Limits) -> Result[
+    ZipDirectory,
+    Error,
+] {
+    if size < 22 || size > limits.max_archive_bytes {
+        return Result::Err(failure(ErrorKind::Limit, 0, "ZIP source size limit"))
+    }
+    let tail_size = if size < 65557 {
+        size
+    } else {
+        65557
+    };
+    let tail_start = size - tail_size;
+    let tail = zip_at(reader, tail_start, tail_size, size)?;
+    let mut relative = tail_size - 22;
+    let mut found = false;
+    loop {
+        if le(tail, relative, 4)? == 0x06054b50
+            && relative + 22 + le(tail, relative + 20, 2)?.to_isize() == tail_size {
+            found = true;
+            break
+        }
+        if relative == 0 {
+            break
+        }
+        relative -= 1;
+    }
+    if !found {
+        return Result::Err(failure(ErrorKind::Invalid, 0, "missing valid ZIP end record"))
+    }
+    let end = tail_start + relative;
+    let disk = le(tail, relative + 4, 2)?;
+    let start_disk = le(tail, relative + 6, 2)?;
+    let disk_count = le(tail, relative + 8, 2)?;
+    let mut count = le(tail, relative + 10, 2)?;
+    if disk != 0 || start_disk != 0 || disk_count != count {
+        return Result::Err(failure(ErrorKind::Unsupported, end, "split ZIP archive"))
+    }
+    let mut directory_size = le(tail, relative + 12, 4)?;
+    let mut start = le(tail, relative + 16, 4)?;
+    let mut directory_end = end;
+    if count == 65535 || directory_size == 4294967295 || start == 4294967295 {
+        if end < 20 {
+            return Result::Err(failure(ErrorKind::Invalid, end, "missing ZIP64 locator"))
+        }
+        let locator = zip_at(reader, end - 20, 20, size)?;
+        if le(locator, 0, 4)? != 0x07064b50 {
+            return Result::Err(failure(ErrorKind::Invalid, end, "missing ZIP64 locator"))
+        }
+        if le(locator, 4, 4)? != 0 || le(locator, 16, 4)? != 1 {
+            return Result::Err(failure(ErrorKind::Unsupported, end, "split ZIP64 archive"))
+        }
+        let record_offset = le(locator, 8, 8)?;
+        if record_offset > (end - 76).to_u64() {
+            return Result::Err(failure(ErrorKind::Invalid, end, "ZIP64 record offset"))
+        }
+        let record = zip_at(reader, record_offset.to_isize(), 56, size)?;
+        if le(record, 0, 4)? != 0x06064b50
+            || le(record, 4, 8)? != (end - 20 - record_offset.to_isize() - 12).to_u64() {
+            return Result::Err(failure(ErrorKind::Invalid, end, "invalid ZIP64 end record"))
+        }
+        if le(record, 16, 4)? != 0 || le(record, 20, 4)? != 0 {
+            return Result::Err(failure(ErrorKind::Unsupported, end, "split ZIP64 archive"))
+        }
+        count = le(record, 32, 8)?;
+        if le(record, 24, 8)? != count {
+            return Result::Err(failure(ErrorKind::Unsupported, end, "split ZIP64 archive"))
+        }
+        directory_size = le(record, 40, 8)?;
+        start = le(record, 48, 8)?;
+        directory_end = record_offset.to_isize();
+    }
+    if count > limits.max_entries.to_u64() || directory_size > limits.max_metadata_bytes.to_u64() {
+        return Result::Err(failure(ErrorKind::Limit, end, "ZIP directory limit"))
+    }
+    if start > directory_end.to_u64() || directory_size != directory_end.to_u64() - start {
+        return Result::Err(failure(ErrorKind::Invalid, end, "ZIP directory bounds mismatch"))
+    }
+    Result::Ok(
+        ZipDirectory {
+            count: count.to_isize(),
+            start: start.to_isize(),
+            end: directory_end,
+            comment: text(part(tail, relative + 22, tail_size - relative - 22)?)?,
+        },
+    )
+}
+
+fn zip_local_at[R: ReadAt](reader: R, source_size: isize, parsed: ParsedZip, directory_start: isize) -> Result[
+    (isize, isize),
+    Error,
+] {
+    let local = parsed.local;
+    if local < 0 || local > directory_start || directory_start - local < 30 {
+        return Result::Err(failure(ErrorKind::Invalid, local, "invalid ZIP local header bounds"))
+    }
+    let header = zip_at(reader, local, 30, source_size)?;
+    let version = le(header, 4, 2)?;
+    let flags = le(header, 6, 2)?;
+    let method = le(header, 8, 2)?;
+    if le(header, 0, 4)? != 0x04034b50 || version != parsed.version || flags != parsed.flags
+        || method != parsed.method {
+        return Result::Err(
+            failure(ErrorKind::Invalid, local, "ZIP local and central headers disagree"),
+        )
+    }
+    let name_len = le(header, 26, 2)?.to_isize();
+    let extra_len = le(header, 28, 2)?.to_isize();
+    if name_len + extra_len > directory_start - local - 30 {
+        return Result::Err(failure(ErrorKind::Invalid, local, "ZIP local metadata bounds"))
+    }
+    let metadata = zip_at(reader, local + 30, name_len + extra_len, source_size)?;
+    if text(part(metadata, 0, name_len)?)? != parsed.record.header.path {
+        return Result::Err(failure(ErrorKind::Invalid, local, "ZIP local filename mismatch"))
+    }
+    let extra = part(metadata, name_len, extra_len)?;
+    let _ = zip_extra(extra, parsed.record.header.modified)?;
+    let data_offset = local + 30 + name_len + extra_len;
+    if parsed.record.compressed_size > directory_start - data_offset {
+        return Result::Err(failure(ErrorKind::Invalid, local, "ZIP entry overlaps directory"))
+    }
+    let range_end = data_offset + parsed.record.compressed_size;
+    let packed_raw = le(header, 18, 4)?;
+    let size_raw = le(header, 22, 4)?;
+    if flags & 8 != 0 {
+        let available = directory_start - range_end;
+        let length = if available < 24 {
+            available
+        } else {
+            24
+        };
+        let descriptor = zip_at(reader, range_end, length, source_size)?;
+        let uses_zip64 = parsed.zip64 || packed_raw == 4294967295 || size_raw == 4294967295;
+        return Result::Ok(
+            (
+                data_offset,
+                zip_descriptor(descriptor, 0, length, parsed.record, uses_zip64)? + range_end,
+            ),
+        )
+    }
+    let (size, packed, _) = zip64_values(extra, size_raw, packed_raw, 0)?;
+    if le(header, 14, 4)? != parsed.record.checksum.to_u64()
+        || packed != parsed.record.compressed_size.to_u64()
+        || size != parsed.record.size.to_u64() {
+        return Result::Err(failure(ErrorKind::Invalid, local, "ZIP local sizes or CRC mismatch"))
+    }
+    Result::Ok((data_offset, range_end))
+}
+
+pub struct ZipSource[R] {
+    reader: R,
+    size: isize,
+    records_value: Vec[ZipRecord],
+    comment_value: string,
+    limits: Limits,
+}
+
+impl[R: ReadAt] ZipSource[R] {
+    pub fn open(reader: R, size: isize, limits: Limits) -> Result[ZipSource[R], Error] {
+        limits.validate()?;
+        let directory = zip_directory_at(reader, size, limits)?;
+        let central = zip_at(reader, directory.start, directory.end - directory.start, size)?;
+        let records = Vec::new();
+        let ranges: Vec[(isize, isize)] = Vec::new();
+        let mut offset = 0;
+        let mut total = 0;
+        for _ in 0..directory.count {
+            let parsed = zip_central(central, offset, central.len(), limits)?;
+            if parsed.record.size > limits.max_total_bytes - total {
+                return Result::Err(failure(ErrorKind::Limit, offset, "ZIP expanded size limit"))
+            }
+            total += parsed.record.size;
+            let (data_offset, range_end) = zip_local_at(reader, size, parsed, directory.start)?;
+            ranges.push((parsed.local, range_end));
+            records.push(ZipRecord { data_offset, ..parsed.record });
+            offset = parsed.next;
+        }
+        if offset != central.len() {
+            return Result::Err(
+                failure(ErrorKind::Invalid, offset, "ZIP directory size or count mismatch"),
+            )
+        }
+        ranges.sort_by(
+            |left, right| {
+                let (a, _) = left;
+                let (b, _) = right;
+                a - b
+            },
+        );
+        let mut previous_end = 0;
+        for (start, finish) in ranges {
+            if start < previous_end {
+                return Result::Err(failure(ErrorKind::Invalid, start, "overlapping ZIP entries"))
+            }
+            previous_end = finish;
+        }
+        Result::Ok(
+            ZipSource {
+                reader,
+                size,
+                records_value: records,
+                comment_value: directory.comment,
+                limits,
+            },
+        )
+    }
+
+    pub fn len(self: ZipSource[R]) -> isize {
+        self.records_value.len()
+    }
+
+    pub fn comment(self: ZipSource[R]) -> string {
+        self.comment_value
+    }
+
+    pub fn records(self: ZipSource[R]) -> Vec[ZipRecord] {
+        self.records_value.copy()
+    }
+
+    pub fn entry(self: ZipSource[R], index: isize) -> Result[Entry, Error] {
+        let record = self.records_value.get_checked(index).ok_or(
+            failure(ErrorKind::Invalid, index, "ZIP index outside archive"),
+        )?;
+        let packed = zip_at(self.reader, record.data_offset, record.compressed_size, self.size)?;
+        let data = match record.compression {
+            Stored => packed,
+            Deflate => inflate(packed, record.size)?,
+        };
+        if data.len() != record.size {
+            return Result::Err(
+                failure(ErrorKind::Invalid, record.data_offset, "ZIP expanded size mismatch"),
+            )
+        }
+        if crc32(data) != record.checksum {
+            return Result::Err(
+                failure(ErrorKind::Checksum, record.data_offset, "ZIP CRC32 mismatch"),
+            )
+        }
+        if record.header.kind == EntryKind::Symlink {
+            return Result::Ok(
+                Entry {
+                    header: Header { link: text(data)?, ..record.header },
+                    data: bytes::Bytes::new(),
+                },
+            )
+        }
+        Result::Ok(Entry { header: record.header, data })
+    }
+
+    pub fn copy_entry[W: Write](self: ZipSource[R], index: isize, writer: W) -> Result[(), Error] {
+        let record = self.records_value.get_checked(index).ok_or(
+            failure(ErrorKind::Invalid, index, "ZIP index outside archive"),
+        )?;
+        if record.header.kind == EntryKind::Symlink {
+            let _ = self.entry(index)?;
+            return Result::Ok(())
+        }
+        let section = io::SectionReader::new(
+            self.reader,
+            record.data_offset,
+            record.compressed_size,
+        ).map_err(|error| failure(ErrorKind::Invalid, record.data_offset, error.to_string()))?;
+        let buffer = zeros(8192);
+        let mut count = 0;
+        let mut checksum: u32 = 0;
+        if record.compression == Compression::Deflate {
+            let decoder = flate::Decoder::new(
+                section,
+                compress::Limits {
+                    max_input_bytes: record.compressed_size,
+                    max_output_bytes: record.size,
+                    max_blocks: 9223372036854775807,
+                    max_work: 9223372036854775807,
+                },
+            ).map_err(|error| compression_error(error, record.data_offset))?;
+            loop {
+                let amount = decoder.read_chunk(buffer.as_mut_slice()).map_err(
+                    |error| compression_error(error, record.data_offset),
+                )?;
+                if amount == 0 {
+                    break
+                }
+                if amount > record.size - count {
+                    return Result::Err(
+                        failure(ErrorKind::Limit, record.data_offset, "ZIP expanded size limit"),
+                    )
+                }
+                checksum = crc32_update(checksum, buffer.slice(0, amount));
+                writer.write_all(buffer.slice(0, amount)).map_err(
+                    |error| failure(ErrorKind::Io, record.data_offset, error.to_string()),
+                )?;
+                count += amount;
+            }
+            if decoder.consumed() != record.compressed_size {
+                return Result::Err(
+                    failure(ErrorKind::Invalid, record.data_offset, "ZIP compressed size mismatch"),
+                )
+            }
+        } else {
+            while count < record.size {
+                let amount = section.read(buffer.as_mut_slice()).map_err(
+                    |error| failure(ErrorKind::Io, record.data_offset, error.to_string()),
+                )?;
+                if amount == 0 {
+                    return Result::Err(
+                        failure(ErrorKind::Truncated, record.data_offset, "truncated ZIP body"),
+                    )
+                }
+                if amount > record.size - count {
+                    return Result::Err(
+                        failure(ErrorKind::Invalid, record.data_offset, "ZIP stored size mismatch"),
+                    )
+                }
+                checksum = crc32_update(checksum, buffer.slice(0, amount));
+                writer.write_all(buffer.slice(0, amount)).map_err(
+                    |error| failure(ErrorKind::Io, record.data_offset, error.to_string()),
+                )?;
+                count += amount;
+            }
+            if section.position() != record.compressed_size {
+                return Result::Err(
+                    failure(ErrorKind::Invalid, record.data_offset, "ZIP stored size mismatch"),
+                )
+            }
+        }
+        if count != record.size {
+            return Result::Err(
+                failure(ErrorKind::Invalid, record.data_offset, "ZIP expanded size mismatch"),
+            )
+        }
+        if checksum != record.checksum {
+            return Result::Err(
+                failure(ErrorKind::Checksum, record.data_offset, "ZIP CRC32 mismatch"),
+            )
+        }
+        Result::Ok(())
+    }
+
+    pub fn limits(self: ZipSource[R]) -> Limits {
+        self.limits
+    }
+}
+
+impl[R: ReadAt + io::Close] ZipSource[R] {
+    pub fn close(self: ZipSource[R]) -> Result[(), Error] {
+        self.reader.close().map_err(|error| failure(ErrorKind::Io, 0, error.to_string()))
+    }
+}

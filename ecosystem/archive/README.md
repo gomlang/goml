@@ -1,6 +1,6 @@
 # archive
 
-A pure GoML implementation of USTAR/PAX TAR and classic ZIP archives. Format
+A pure GoML implementation of USTAR/PAX TAR and ZIP archives. Format
 parsing, writing, CRC32, DEFLATE/GZIP compression, metadata validation, resource
 budgets, and extraction are implemented in GoML using the standard library.
 There are no Go adapters or native module dependencies.
@@ -37,6 +37,13 @@ let first_file = indexed.entry(1)?;
   local headers, descriptors and entry ranges. `read[R: Read]` reads a bounded
   archive into memory. `records` exposes metadata without decompression;
   `entry`, `entries`, and `copy_entry[W: Write]` validate expanded sizes and CRC32.
+  `copy_entry` decompresses into bounded chunks without retaining the expanded
+  entry; a late checksum or writer error may leave a partial output.
+- `ZipSource[R: ReadAt]::open(reader, size, limits)` indexes bounded directory
+  metadata without reading every entry body. `entry` reads one selected entry;
+  `copy_entry` streams it through a bounded buffer. `open_zip_source` opens a
+  regular file on Linux and returns a source that the caller must `close`.
+  The caller must keep any supplied random-access source stable while indexed.
 - `open_tar`, `open_tar_gz`, `open_zip`, `read_file`, and `write_file` supply file
   APIs. `write_file` creates a new file exclusively and never overwrites one.
 - `crc32` and incremental `crc32_update` implement IEEE CRC32 in GoML.
@@ -44,6 +51,13 @@ let first_file = indexed.entry(1)?;
   header checksums, and concatenated members. DEFLATE decoding supports stored,
   fixed Huffman, and dynamic Huffman blocks. Encoding uses LZ77 matching with
   fixed Huffman codes and falls back to stored blocks for incompressible input.
+
+DEFLATE encoding and decoding are shared with `ecosystem::compress::flate`,
+using a bounded 32 KiB history window. These archive convenience APIs still
+materialize the returned entry/member data; direct incremental encoding and
+decoding are available from the compress module. GZIP framing, including
+concatenated members and optional headers, is shared there. ZLIB and LZW are
+also available from the compress module.
 
 Writers complete short writes through standard traits and propagate write errors,
 including interruptions, without automatic replay. Partial
@@ -65,8 +79,9 @@ are terminal; later calls return `Closed` without additional source reads.
 
 `Header` contains path, type, permissions, UID/GID, Unix modification seconds,
 user/group names, link target, ZIP comment and unknown PAX key/value extensions.
-USTAR prefixes are decoded; writing uses PAX when strings or IDs do not fit
-USTAR. TAR supports files, directories, symbolic links and hard links. ZIP
+USTAR prefixes, PAX records, GNU long-name/link records and checked GNU
+base-256 numeric fields are decoded; writing uses PAX when strings or IDs do
+not fit USTAR. TAR supports files, directories, symbolic links and hard links. ZIP
 supports files, directories and Unix symbolic-link entries, Stored and Deflate,
 UTF-8 names, extended Unix timestamps, archive/file comments, and both signed and
 unsigned classic data descriptors. ZIP directory ranges are checked in sorted
@@ -117,15 +132,20 @@ permissions are kept traversable while extracting.
 
 ## Deliberate format boundaries
 
-- ZIP64, split/encrypted archives, non-Deflate compression, legacy non-ASCII
-  codepage names, TAR devices/FIFOs, GNU base-256/sparse extensions and GNU longname
-  records produce recoverable errors.
+- ZIP64 end records, entry extra fields and 64-bit descriptors can be read
+  within limits. ZIP64 writing is automatic when classic fields overflow and
+  may be forced through `ZipWriter::with_zip64`.
+- Split/encrypted archives, non-Deflate compression, legacy non-ASCII
+  codepage names, TAR devices/FIFOs and GNU sparse extensions produce
+  recoverable errors.
 - PAX numeric fields support nonnegative values; modification fractions are
   reduced to whole seconds. ZIP writing supports unsigned 32-bit Unix seconds;
   decoding ZIP entries without extended timestamps currently yields zero.
-- The TAR reader materializes each body; ZIP indexing and GZIP convenience APIs
-  materialize the bounded archive. They are not constant-memory streaming
-  decompressors. `ZipWriter::append_reader` buffers one bounded entry.
+- `TarReader::next_header` and `read_body_chunk` stream entry bodies within
+  limits; calling `next_header` again skips any unread body. `TarReader::next`,
+  `decode_tar`, `ZipArchive` indexing and GZIP convenience APIs still materialize
+  bounded data. `ZipSource` indexes only metadata; `ZipWriter::append_reader`
+  buffers one bounded entry.
 - File convenience APIs use the Linux standard file-descriptor API. Extraction
   also works on kernels without `openat2`, using `openat`, `mkdirat` and
   no-follow directory descriptors. Format and standard `Read`/`Write` APIs do

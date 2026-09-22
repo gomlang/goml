@@ -34,6 +34,61 @@ fn tar_octal(block: bytes::Bytes, offset: isize, length: isize) -> Result[u64, E
     Result::Ok(result)
 }
 
+fn tar_number(block: bytes::Bytes, offset: isize, length: isize) -> Result[u64, Error] {
+    let field = part(block, offset, length)?;
+    if field.get(0) != 0x80 {
+        return tar_octal(block, offset, length)
+    }
+    let mut value: u64 = 0;
+    for index in 1..length {
+        let next = field.get(index).to_u64();
+        if value > (18446744073709551615 - next) / 256 {
+            return Result::Err(failure(ErrorKind::Invalid, offset, "tar number overflow"))
+        }
+        value = value * 256 + next;
+    }
+    Result::Ok(value)
+}
+
+fn tar_timestamp(block: bytes::Bytes, offset: isize, length: isize) -> Result[i64, Error] {
+    let field = part(block, offset, length)?;
+    if field.get(0) == 0xff {
+        let mut magnitude: u64 = 0;
+        for value in field.as_slice() {
+            let next = (255 - value).to_u64();
+            if magnitude > (9223372036854775807 - next) / 256 {
+                return Result::Err(failure(ErrorKind::Invalid, offset, "tar timestamp overflow"))
+            }
+            magnitude = magnitude * 256 + next;
+        }
+        if magnitude > 9223372036854775807 {
+            return Result::Err(failure(ErrorKind::Invalid, offset, "tar timestamp overflow"))
+        }
+        return Result::Ok(-magnitude.to_i64() - 1)
+    }
+    let value = tar_number(block, offset, length)?;
+    if value > 9223372036854775807 {
+        return Result::Err(failure(ErrorKind::Invalid, offset, "tar timestamp overflow"))
+    }
+    Result::Ok(value.to_i64())
+}
+
+fn tar_long_text(data: bytes::Bytes) -> Result[string, Error] {
+    let mut end = 0;
+    while end < data.len() && data.get(end) != 0 {
+        end += 1;
+    }
+    if end == 0 || end == data.len() {
+        return Result::Err(failure(ErrorKind::Invalid, 0, "invalid GNU long name"))
+    }
+    for index in end..data.len() {
+        if data.get(index) != 0 {
+            return Result::Err(failure(ErrorKind::Invalid, index, "invalid GNU long name"))
+        }
+    }
+    text(part(data, 0, end)?)
+}
+
 fn tar_set_string(block: bytes::Bytes, offset: isize, width: isize, value: string) -> Result[
     (),
     Error,
@@ -327,6 +382,8 @@ pub struct TarReader[R] {
     offset: Ref[isize],
     count: Ref[isize],
     total: Ref[isize],
+    remaining: Ref[isize],
+    padding: Ref[isize],
     done: Ref[bool],
     broken: Ref[bool],
     globals: Ref[Vec[(string, string)]],
@@ -342,6 +399,8 @@ impl[R: Read] TarReader[R] {
                 offset: Ref::new(0),
                 count: Ref::new(0),
                 total: Ref::new(0),
+                remaining: Ref::new(0),
+                padding: Ref::new(0),
                 done: Ref::new(false),
                 broken: Ref::new(false),
                 globals: Ref::new(Vec::new()),
@@ -385,11 +444,103 @@ impl[R: Read] TarReader[R] {
     }
 
     fn next_inner(self: TarReader[R]) -> Result[Option[Entry], Error] {
+        let Some((header, size)) = self.next_header_inner()? else {
+            return Result::Ok(Option::None)
+        };
+        let data = bytes::Bytes::with_capacity(size);
+        let scratch = zeros(8192);
+        while self.remaining.get() > 0 {
+            let count = self.read_body_inner(scratch.as_mut_slice())?;
+            data.extend_from_slice(scratch.slice(0, count));
+        }
+        self.finish_current()?;
+        Result::Ok(Option::Some(Entry { header, data }))
+    }
+
+    pub fn next_header(self: TarReader[R]) -> Result[Option[(Header, isize)], Error] {
+        if self.broken.get() {
+            return Result::Err(failure(ErrorKind::Closed, self.offset.get(), "tar reader failed"))
+        }
+        match self.next_header_inner() {
+            Err(error) => {
+                self.broken.set(true);
+                Result::Err(error)
+            },
+            Ok(value) => Result::Ok(value),
+        }
+    }
+
+    pub fn read_body_chunk(self: TarReader[R], output: MutSlice[byte]) -> Result[isize, Error] {
+        if self.broken.get() {
+            return Result::Err(failure(ErrorKind::Closed, self.offset.get(), "tar reader failed"))
+        }
+        match self.read_body_inner(output) {
+            Err(error) => {
+                self.broken.set(true);
+                Result::Err(error)
+            },
+            Ok(value) => Result::Ok(value),
+        }
+    }
+
+    fn read_body_inner(self: TarReader[R], output: MutSlice[byte]) -> Result[isize, Error] {
+        if self.remaining.get() == 0 || output.len() == 0 {
+            return Result::Ok(0)
+        }
+        let size = if output.len() < self.remaining.get() {
+            output.len()
+        } else {
+            self.remaining.get()
+        };
+        if size > self.limits.max_archive_bytes - self.offset.get() {
+            return Result::Err(
+                failure(ErrorKind::Limit, self.offset.get(), "archive exceeds limit"),
+            )
+        }
+        let count = match self.reader.read(output.sub(0, size)) {
+            Ok(count) => count,
+            Err(error) => return Result::Err(
+                failure(ErrorKind::Io, self.offset.get(), error.to_string()),
+            ),
+        };
+        if count < 0 || count > size {
+            return Result::Err(
+                failure(ErrorKind::Io, self.offset.get(), "invalid tar reader count"),
+            )
+        }
+        if count == 0 {
+            return Result::Err(
+                failure(ErrorKind::Truncated, self.offset.get(), "truncated tar body"),
+            )
+        }
+        self.offset.set(self.offset.get() + count);
+        self.remaining.set(self.remaining.get() - count);
+        Result::Ok(count)
+    }
+
+    fn finish_current(self: TarReader[R]) -> Result[(), Error] {
+        if self.remaining.get() > 0 {
+            let scratch = zeros(8192);
+            while self.remaining.get() > 0 {
+                let _ = self.read_body_inner(scratch.as_mut_slice())?;
+            }
+        }
+        if self.padding.get() > 0 {
+            let _ = self.read_bytes(self.padding.get())?;
+            self.padding.set(0);
+        }
+        Result::Ok(())
+    }
+
+    fn next_header_inner(self: TarReader[R]) -> Result[Option[(Header, isize)], Error] {
+        self.finish_current()?;
         if self.done.get() {
             return Result::Ok(Option::None)
         }
         let mut local: Vec[(string, string)] = Vec::new();
         let mut metadata_bytes = 0;
+        let mut long_name: Option[string] = Option::None;
+        let mut long_link: Option[string] = Option::None;
         loop {
             let block = self.read_bytes(512)?;
             let mut sum: u64 = 0;
@@ -409,9 +560,9 @@ impl[R: Read] TarReader[R] {
                         )
                     }
                 }
-                if !local.is_empty() {
+                if !local.is_empty() || long_name.is_some() || long_link.is_some() {
                     return Result::Err(
-                        failure(ErrorKind::Invalid, self.offset.get(), "orphan PAX header"),
+                        failure(ErrorKind::Invalid, self.offset.get(), "orphan tar metadata"),
                     )
                 }
                 self.done.set(true);
@@ -436,7 +587,7 @@ impl[R: Read] TarReader[R] {
                 )
             }
             let magic = tar_string(block, 257, 6)?;
-            if magic != "ustar" {
+            if magic != "ustar" && magic != "ustar " {
                 return Result::Err(
                     failure(
                         ErrorKind::Unsupported,
@@ -445,18 +596,37 @@ impl[R: Read] TarReader[R] {
                     ),
                 )
             }
-            let size_raw = tar_octal(block, 124, 12)?;
+            let size_raw = tar_number(block, 124, 12)?;
             let flag = block.get(156);
-            if flag == b'x' || flag == b'g' {
+            if flag == b'x' || flag == b'g' || flag == b'L' || flag == b'K' {
                 if size_raw > (self.limits.max_metadata_bytes - metadata_bytes).to_u64() {
                     return Result::Err(
-                        failure(ErrorKind::Limit, self.offset.get(), "PAX metadata exceeds limit"),
+                        failure(ErrorKind::Limit, self.offset.get(), "tar metadata exceeds limit"),
                     )
                 }
                 let size = size_raw.to_isize();
                 metadata_bytes += size;
-                let records = parse_pax(self.read_bytes(size)?)?;
+                let data = self.read_bytes(size)?;
                 let _ = self.read_bytes((512 - size % 512) % 512)?;
+                if flag == b'L' || flag == b'K' {
+                    let value = tar_long_text(data)?;
+                    if value.to_bytes().len() > self.limits.max_path_bytes {
+                        return Result::Err(
+                            failure(
+                                ErrorKind::Limit,
+                                self.offset.get(),
+                                "GNU long name exceeds limit",
+                            ),
+                        )
+                    }
+                    if flag == b'L' {
+                        long_name = Option::Some(value);
+                    } else {
+                        long_link = Option::Some(value);
+                    }
+                    continue
+                }
+                let records = parse_pax(data)?;
                 if flag == b'g' {
                     let existing = self.globals.get();
                     let combined = Vec::new();
@@ -511,22 +681,22 @@ impl[R: Read] TarReader[R] {
             } else {
                 prefix + "/" + name
             };
-            let timestamp = tar_octal(block, 136, 12)?;
-            if timestamp > 9223372036854775807 {
+            let mode = tar_number(block, 100, 8)?;
+            if mode > 4294967295 {
                 return Result::Err(
-                    failure(ErrorKind::Invalid, self.offset.get(), "timestamp overflow"),
+                    failure(ErrorKind::Invalid, self.offset.get(), "tar mode overflow"),
                 )
             }
             let mut header = Header {
-                path,
+                path: long_name.unwrap_or(path),
                 kind,
-                mode: tar_octal(block, 100, 8)?.to_u32(),
-                uid: tar_octal(block, 108, 8)?,
-                gid: tar_octal(block, 116, 8)?,
-                modified: timestamp.to_i64(),
+                mode: mode.to_u32(),
+                uid: tar_number(block, 108, 8)?,
+                gid: tar_number(block, 116, 8)?,
+                modified: tar_timestamp(block, 136, 12)?,
                 user: tar_string(block, 265, 32)?,
                 group: tar_string(block, 297, 32)?,
-                link: tar_string(block, 157, 100)?,
+                link: long_link.unwrap_or(tar_string(block, 157, 100)?),
                 comment: "",
                 pax: Vec::new(),
             };
@@ -576,13 +746,17 @@ impl[R: Read] TarReader[R] {
                     failure(ErrorKind::Limit, self.offset.get(), "tar entry exceeds limit"),
                 )
             }
-            let data = self.read_bytes(size.to_isize())?;
-            let _ = self.read_bytes((512 - size.to_isize() % 512) % 512)?;
-            let entry = Entry { header, data };
-            validate_entry(entry, self.limits)?;
+            validate_entry(Entry { header, data: bytes::Bytes::new() }, self.limits)?;
+            if header.kind != EntryKind::File && size != 0 {
+                return Result::Err(
+                    failure(ErrorKind::Invalid, self.offset.get(), "non-file tar body"),
+                )
+            }
+            self.remaining.set(size.to_isize());
+            self.padding.set((512 - size.to_isize() % 512) % 512);
             self.count.set(self.count.get() + 1);
-            self.total.set(self.total.get() + data.len());
-            return Result::Ok(Option::Some(entry))
+            self.total.set(self.total.get() + size.to_isize());
+            return Result::Ok(Option::Some((header, size.to_isize())))
         }
     }
 }
