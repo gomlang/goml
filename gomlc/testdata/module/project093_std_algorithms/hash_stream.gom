@@ -1,0 +1,226 @@
+package main;
+
+use std::bytes;
+use std::hash;
+use hash::Hasher;
+use std::hash::fnv;
+use std::hash::stream;
+use std::io;
+use io::{Read, Write};
+use std::testing;
+
+struct CountHasher {
+    captured: Vec[byte],
+    updates: Ref[isize],
+}
+
+fn count_hasher() -> CountHasher {
+    CountHasher { captured: Vec::new(), updates: Ref::new(0) }
+}
+
+struct UnreportedHashRead {
+    cursor: io::Cursor,
+    error: io::Error,
+}
+
+impl Read for UnreportedHashRead {
+    fn read(self: UnreportedHashRead, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        let count = if output.len() < 2 {
+            output.len()
+        } else {
+            2
+        };
+        self.cursor.read(output.sub(0, count))?;
+        Result::Err(self.error)
+    }
+}
+
+impl Hasher for CountHasher {
+    fn update(self: CountHasher, input: Slice[byte]) -> () {
+        self.updates.set(self.updates.get() + 1);
+        for value in input {
+            self.captured.push(value);
+        }
+    }
+
+    fn reset(self: CountHasher) -> () {
+        self.captured.truncate(0);
+        self.updates.set(0);
+    }
+
+    fn sum(self: CountHasher) -> bytes::Bytes {
+        sum_bytes(self.captured.len().to_u64(), 4)
+    }
+
+    fn size(self: CountHasher) -> isize {
+        4
+    }
+
+    fn block_size(self: CountHasher) -> isize {
+        1
+    }
+}
+
+fn check_hash_streams() -> () {
+    for length in 0..20 {
+        let data = Vec::new();
+        for index in 0..length {
+            data.push(index.to_u8());
+        }
+        let expected = fnv::Digest::new128a();
+        expected.update(b"prefix".as_slice());
+        expected.update(data.as_slice());
+        for width in 1..10 {
+            let read_hash = fnv::Digest::new128a();
+            let write_hash = fnv::Digest::new128a();
+            read_hash.update(b"prefix".as_slice());
+            write_hash.update(b"prefix".as_slice());
+            let source = CopyReader {
+                cursor: io::Cursor::new(bytes::Bytes::from_vec(data)),
+                interrupted: Ref::new(false),
+            };
+            let destination = CopyWriter {
+                cursor: io::Cursor::new(bytes::Bytes::new()),
+                interrupted: Ref::new(false),
+            };
+            let reader = stream::Reader::new(source, read_hash);
+            let writer = stream::Writer::new(destination, write_hash);
+            let storage = Vec::new();
+            for _ in 0..width + 2 {
+                storage.push(255.to_u8());
+            }
+            assert_equal(
+                testing::expect_ok(
+                    io::copy_buffer(reader, writer, storage.as_mut_slice().sub(1, width + 1)),
+                    "hashed copy",
+                ),
+                length.to_u64(),
+            );
+            assert_equal(reader.hasher().sum().to_vec(), expected.sum().to_vec());
+            assert_equal(writer.hasher().sum().to_vec(), expected.sum().to_vec());
+            assert_equal(read_hash.sum().to_vec(), expected.sum().to_vec());
+            assert_equal(write_hash.sum().to_vec(), expected.sum().to_vec());
+            assert_equal(writer.inner().cursor.bytes().to_vec(), data);
+            assert_equal(reader.inner().cursor.position(), length);
+            assert_equal(storage[0], 255.to_u8());
+            assert_equal(storage[width + 1], 255.to_u8());
+        }
+    }
+    let input = b"abc";
+    for count in[-1, 0, 2, 4] {
+        let events = Vec::new();
+        let probe = multi_probe(events, 1, count);
+        let rh = count_hasher();
+        let wh = count_hasher();
+        let reader = stream::Reader::new(probe, rh);
+        let writer = stream::Writer::new(probe, wh);
+        let output = b"abc";
+        let read = reader.read(output.as_mut_slice());
+        let write = writer.write(input.as_slice());
+        if count < 0 || count > input.len() {
+            match read {
+                Err(error) => assert_equal(error.kind(), io::ErrorKind::InvalidData),
+                Ok(_) => testing::assert(false),
+            }
+            match write {
+                Err(error) => assert_equal(error.kind(), io::ErrorKind::InvalidData),
+                Ok(_) => testing::assert(false),
+            }
+            assert_equal(rh.updates.get(), 0);
+            assert_equal(wh.updates.get(), 0);
+        } else {
+            assert_equal(testing::expect_ok(read, "hash read count"), count);
+            assert_equal(testing::expect_ok(write, "hash write count"), count);
+            assert_equal(rh.captured, input.slice(0, count).to_vec());
+            assert_equal(wh.captured, input.slice(0, count).to_vec());
+            assert_equal(
+                rh.updates.get(),
+                if count == 0 {
+                    0
+                } else {
+                    1
+                },
+            );
+            assert_equal(
+                wh.updates.get(),
+                if count == 0 {
+                    0
+                } else {
+                    1
+                },
+            );
+        }
+        assert_equal(events.len(), 2);
+    }
+    for kind in[io::ErrorKind::Interrupted, io::ErrorKind::PermissionDenied] {
+        let error = io::Error::new(kind, "hash probe", Option::None, Option::Some(13), "failure");
+        let probe = multi_probe(Vec::new(), 1, 0);
+        probe.result.set(Result::Err(error));
+        probe.flush_result.set(Result::Err(error));
+        let rh = count_hasher();
+        let wh = count_hasher();
+        let reader = stream::Reader::new(probe, rh);
+        let writer = stream::Writer::new(probe, wh);
+        assert_equal(reader.read(input.as_mut_slice()), Result::Err(error));
+        assert_equal(writer.write(input.as_slice()), Result::Err(error));
+        assert_equal(writer.flush(), Result::Err(error));
+        assert_equal(rh.updates.get(), 0);
+        assert_equal(wh.updates.get(), 0);
+        probe.result.set(Result::Ok(2));
+        testing::expect_ok(reader.read(input.as_mut_slice()), "recover reader");
+        testing::expect_ok(writer.write(input.as_slice()), "recover writer");
+        assert_equal(rh.captured, b"ab");
+        assert_equal(wh.captured, b"ab");
+    }
+    let recorder = count_hasher();
+    let sink = stream::Writer::new(io::Discard::new(), recorder);
+    testing::expect_ok(sink.write_all(input.as_slice()), "hash sink");
+    testing::expect_ok(sink.flush(), "hash flush");
+    assert_equal(recorder.captured, input);
+    let alias = sink;
+    testing::expect_ok(alias.write_all(b"!".as_slice()), "hash alias");
+    assert_equal(recorder.captured, b"abc!");
+    let empty: Vec[byte] = Vec::new();
+    let events = Vec::new();
+    let zero = multi_probe(events, 1, 0);
+    let zero_hash = count_hasher();
+    let reader = stream::Reader::new(zero, zero_hash);
+    let writer = stream::Writer::new(zero, zero_hash);
+    assert_equal(testing::expect_ok(reader.read(empty.as_mut_slice()), "empty hash read"), 0);
+    assert_equal(testing::expect_ok(writer.write(empty.as_slice()), "empty hash write"), 0);
+    assert_equal(events.len(), 2);
+    match reader.read_exact(input.as_mut_slice()) {
+        Err(error) => assert_equal(error.kind(), io::ErrorKind::UnexpectedEof),
+        Ok(_) => testing::assert(false),
+    }
+    match writer.write_all(input.as_slice()) {
+        Err(error) => assert_equal(error.kind(), io::ErrorKind::WriteZero),
+        Ok(_) => testing::assert(false),
+    }
+    assert_equal(zero_hash.updates.get(), 0);
+    let error = io::Error::new(
+        io::ErrorKind::Other,
+        "unreported progress",
+        Option::None,
+        Option::None,
+        "failure",
+    );
+    let destination = io::Cursor::new(bytes::Bytes::new());
+    let source = io::Cursor::new(bytes::Bytes::from_string("abc"));
+    let unchanged = count_hasher();
+    let partial_writer = stream::Writer::new(
+        PartialMirror { output: destination, error },
+        unchanged,
+    );
+    let partial_reader = stream::Reader::new(
+        UnreportedHashRead { cursor: source, error },
+        unchanged,
+    );
+    let buffer = b"???";
+    assert_equal(partial_writer.write(input.as_slice()), Result::Err(error));
+    assert_equal(partial_reader.read(buffer.as_mut_slice()), Result::Err(error));
+    assert_equal(destination.bytes().to_vec(), b"ab");
+    assert_equal(source.position(), 2);
+    assert_equal(buffer, b"ab?");
+    assert_equal(unchanged.updates.get(), 0);
+}
