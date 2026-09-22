@@ -1,0 +1,100 @@
+package tests;
+
+use ecosystem::request::{Client};
+use ecosystem::request::trace::{Trace, EventKind, Event};
+use std::testing;
+
+fn event_index(events: Vec[Event], kind: EventKind) -> isize {
+    for index in 0..events.len() {
+        if events[index].kind == kind {
+            return index
+        }
+    };
+    -1
+}
+
+#[test]
+fn trace_captures_http1_dial_reuse_write_and_response() -> () {
+    let server = start(false, false);
+    defer close(server);
+    let trace = testing::expect_some(Trace::new(128), "trace");
+    let client = testing::expect_ok(Client::builder().trace(trace).build(), "client");
+    defer client.close();
+    let _ = testing::expect_ok(client.get(url(server) + "/echo").send(), "first request");
+    let first = trace.drain();
+    testing::assert_eq(first[0].kind, EventKind::RequestStart);
+    testing::assert_eq(first[first.len() - 1].kind, EventKind::RequestDone);
+    testing::assert(event_index(first, EventKind::ConnectStart) > 0);
+    testing::assert(
+        event_index(first, EventKind::ConnectDone) > event_index(first, EventKind::ConnectStart),
+    );
+    testing::assert(
+        event_index(first, EventKind::Connection) > event_index(first, EventKind::ConnectDone),
+    );
+    testing::assert(
+        event_index(first, EventKind::RequestWritten) > event_index(first, EventKind::Connection),
+    );
+    testing::assert(
+        event_index(first, EventKind::ResponseReceived)
+            > event_index(first, EventKind::RequestWritten),
+    );
+    testing::assert_eq(testing::expect_some(first[first.len() - 1].status, "status"), 200);
+    let _ = testing::expect_ok(client.get(url(server) + "/echo").send(), "second request");
+    let second = trace.drain();
+    testing::assert_eq(second[0].request_id, first[0].request_id + 1);
+    testing::assert_eq(event_index(second, EventKind::ConnectStart), -1);
+    testing::assert(second[event_index(second, EventKind::Connection)].reused);
+    testing::assert_eq(second[second.len() - 1].kind, EventKind::RequestDone);
+}
+
+#[test]
+fn trace_correlates_redirect_hops_and_http2_connection() -> () {
+    let server = start(false, false);
+    defer close(server);
+    let trace = testing::expect_some(Trace::new(128), "trace");
+    let client = testing::expect_ok(Client::builder().trace(trace).build(), "client");
+    defer client.close();
+    let response = testing::expect_ok(
+        client.get(url(server) + "/redirect?to=/echo").send(),
+        "redirect request",
+    );
+    testing::assert_eq(response.history().len(), 1);
+    let events = trace.drain();
+    testing::assert(event_index(events, EventKind::Redirect) >= 0);
+    testing::assert_eq(events[0].kind, EventKind::RequestStart);
+    testing::assert_eq(events[events.len() - 1].kind, EventKind::RequestDone);
+    testing::assert_eq(events[event_index(events, EventKind::Redirect)].attempt, 0);
+    testing::assert_eq(events[events.len() - 2].attempt, 1);
+    for event in events {
+        testing::assert_eq(event.request_id, events[0].request_id);
+    }
+    let secure = start(true, false);
+    defer close(secure);
+    let tls_trace = testing::expect_some(Trace::new(128), "TLS trace");
+    let tls_client = testing::expect_ok(
+        Client::builder().add_root_certificate(certificate(secure)).trace(tls_trace).build(),
+        "TLS client",
+    );
+    defer tls_client.close();
+    let _ = testing::expect_ok(tls_client.get(url(secure) + "/echo").send(), "HTTP/2 request");
+    let events = tls_trace.drain();
+    testing::assert(event_index(events, EventKind::RequestQueued) >= 0);
+    testing::assert_eq(events[event_index(events, EventKind::Connection)].protocol, "h2");
+    testing::assert_eq(events[events.len() - 1].kind, EventKind::RequestDone);
+}
+
+#[test]
+fn trace_records_final_failure_after_a_bounded_response() -> () {
+    let server = start(false, false);
+    defer close(server);
+    let trace = testing::expect_some(Trace::new(64), "trace");
+    let client = testing::expect_ok(Client::builder().trace(trace).build(), "client");
+    defer client.close();
+    testing::assert(client.get(url(server) + "/large").body_limit(2).send().is_err());
+    let events = trace.drain();
+    testing::assert_eq(events[0].kind, EventKind::RequestStart);
+    testing::assert_eq(events[events.len() - 1].kind, EventKind::RequestFailed);
+    testing::assert(event_index(events, EventKind::ResponseReceived) > 0);
+    testing::assert(event_index(events, EventKind::ResponseReceived) < events.len() - 1);
+    testing::assert_eq(event_index(events, EventKind::RequestDone), -1);
+}
