@@ -1,0 +1,399 @@
+package tests;
+
+use ecosystem::compress;
+use ecosystem::compress::zlib;
+use std::bytes;
+use std::encoding::hex;
+use std::hash::adler32;
+use std::io;
+use io::Read;
+use std::testing;
+use std::panic;
+
+#[go_ffi("example.com/goml-ecosystem/compress/testoracle", "ZlibEncode")]
+extern fn reference_encode(input: string, dictionary: string, level: isize) -> string;
+
+#[go_ffi("example.com/goml-ecosystem/compress/testoracle", "ZlibDecode")]
+extern fn reference_decode(input: string, dictionary: string) -> string;
+
+fn limits(input: isize, output: isize) -> compress::Limits {
+    compress::Limits {
+        max_input_bytes: input,
+        max_output_bytes: output,
+        max_blocks: 100,
+        max_work: 10000000,
+    }
+}
+
+fn reference(data: bytes::Bytes, dictionary: bytes::Bytes, level: isize) -> bytes::Bytes {
+    testing::expect_ok(
+        hex::decode(reference_encode(hex::encode(data), hex::encode(dictionary), level)),
+        "reference zlib",
+    )
+}
+
+fn collect[R: io::Read](reader: zlib::Reader[R], chunk: isize) -> Result[
+    bytes::Bytes,
+    compress::Error,
+] {
+    let output = bytes::Bytes::new();
+    let buffer = bytes::Bytes::new();
+    for _ in 0..chunk {
+        buffer.push(0);
+    }
+    loop {
+        let count = reader.read_chunk(buffer.as_mut_slice())?;
+        if count == 0 {
+            break
+        }
+        output.extend_from_slice(buffer.slice(0, count));
+    }
+    Result::Ok(output)
+}
+
+#[test]
+fn streams_go_zlib_and_writes_go_readable_frames() -> () {
+    let long = bytes::Bytes::new();
+    for index in 0..70000 {
+        long.push((index % 251).to_u8());
+    }
+    let dictionary = bytes::Bytes::new();
+    for index in 0..40000 {
+        dictionary.push((index % 251).to_u8());
+    }
+    for sample in[bytes::Bytes::new(), bytes::Bytes::from_string("zlib 😀 zlib"), long] {
+        for dict in[bytes::Bytes::new(), dictionary] {
+            for level in[-2, -1, 0, 1, 6, 9] {
+                let encoded = reference(sample, dict, level);
+                for chunk in[1, 7, 4096] {
+                    let source = io::Cursor::new(encoded);
+                    let reader = if dict.len() == 0 {
+                        testing::expect_ok(
+                            zlib::Reader::new(source, limits(encoded.len(), sample.len())),
+                            "plain zlib reader",
+                        )
+                    } else {
+                        testing::expect_ok(
+                            zlib::Reader::with_dictionary(
+                                source,
+                                limits(encoded.len(), sample.len()),
+                                dict.as_slice(),
+                            ),
+                            "dictionary zlib reader",
+                        )
+                    };
+                    testing::assert(
+                        testing::expect_ok(collect(reader, chunk), "zlib read").to_vec()
+                            == sample.to_vec(),
+                    );
+                    testing::assert_eq(reader.consumed(), encoded.len());
+                    testing::assert_eq(reader.produced(), sample.len());
+                    testing::assert(reader.is_finished());
+                }
+                let written = if dict.len() == 0 {
+                    testing::expect_ok(
+                        zlib::encode(sample, limits(sample.len(), sample.len() * 2 + 100), level),
+                        "zlib encode",
+                    )
+                } else {
+                    testing::expect_ok(
+                        zlib::encode_with_dictionary(
+                            sample,
+                            limits(sample.len(), sample.len() * 2 + 100),
+                            level,
+                            dict.as_slice(),
+                        ),
+                        "zlib dictionary encode",
+                    )
+                };
+                testing::assert_eq(
+                    reference_decode(hex::encode(written), hex::encode(dict)),
+                    hex::encode(sample),
+                );
+                let roundtrip = if dict.len() == 0 {
+                    zlib::decode(written, limits(written.len(), sample.len()))
+                } else {
+                    zlib::decode_with_dictionary(
+                        written,
+                        limits(written.len(), sample.len()),
+                        dict.as_slice(),
+                    )
+                };
+                testing::assert(
+                    testing::expect_ok(roundtrip, "self decode").to_vec() == sample.to_vec(),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn validates_dictionary_id_headers_adler_and_trailing_data() -> () {
+    let dictionary = bytes::Bytes::from_vec(b"abcabcabcabc");
+    let input = bytes::Bytes::from_vec(b"abcabc");
+    let encoded = reference(input, dictionary, 6);
+    testing::assert_eq(
+        testing::expect_err(
+            zlib::decode(encoded, limits(encoded.len(), input.len())),
+            "missing dictionary",
+        ).kind,
+        compress::ErrorKind::Dictionary,
+    );
+    testing::assert_eq(
+        testing::expect_err(
+            zlib::decode_with_dictionary(
+                encoded,
+                limits(encoded.len(), input.len()),
+                b"wrong".as_slice(),
+            ),
+            "wrong dictionary",
+        ).kind,
+        compress::ErrorKind::Dictionary,
+    );
+    let dict_id = adler32::checksum(dictionary.as_slice());
+    testing::assert_eq(encoded.get(2), (dict_id >> 24).to_u8());
+    let corrupt = reference(input, bytes::Bytes::new(), 6);
+    corrupt.set(corrupt.len() - 1, corrupt.get(corrupt.len() - 1) ^ 1);
+    testing::assert_eq(
+        testing::expect_err(
+            zlib::decode(corrupt, limits(corrupt.len(), input.len())),
+            "Adler mismatch",
+        ).kind,
+        compress::ErrorKind::Checksum,
+    );
+    let header = reference(input, bytes::Bytes::new(), 6);
+    header.set(1, header.get(1) ^ 1);
+    testing::assert_eq(
+        testing::expect_err(zlib::decode(header, limits(header.len(), input.len())), "FCHECK").kind,
+        compress::ErrorKind::Invalid,
+    );
+    let trailing = reference(input, bytes::Bytes::new(), 6);
+    trailing.extend_from_slice(b"TAIL".as_slice());
+    let source = io::Cursor::new(trailing);
+    let reader = testing::expect_ok(
+        zlib::Reader::new(source, limits(trailing.len(), input.len())),
+        "framed reader",
+    );
+    testing::assert(
+        testing::expect_ok(collect(reader, 1), "framed payload").to_vec() == input.to_vec(),
+    );
+    testing::assert_eq(reader.consumed(), trailing.len() - 4);
+    testing::assert_eq(source.position(), trailing.len() - 4);
+    testing::assert_err(zlib::decode(trailing, limits(trailing.len(), input.len())));
+}
+
+#[test]
+fn rejects_truncated_and_bounded_zlib_frames() -> () {
+    let input = bytes::Bytes::from_vec(b"hello world");
+    let encoded = reference(input, bytes::Bytes::new(), 6);
+    for length in[0, 1, encoded.len() - 1] {
+        let short = bytes::Bytes::from_slice_copy(encoded.slice(0, length));
+        testing::assert_err(zlib::decode(short, limits(short.len(), input.len())));
+    }
+    testing::assert_eq(
+        testing::expect_err(
+            zlib::decode(encoded, limits(encoded.len(), input.len() - 1)),
+            "output quota",
+        ).kind,
+        compress::ErrorKind::Limit,
+    );
+    testing::assert_eq(
+        testing::expect_err(
+            zlib::decode(encoded, limits(encoded.len() - 1, input.len())),
+            "input quota",
+        ).kind,
+        compress::ErrorKind::Limit,
+    );
+}
+
+#[test]
+fn honors_advertised_window_size() -> () {
+    let small = bytes::Bytes::from_vec(b"\x08\x1d\x03\x00\x00\x00\x00\x01");
+    testing::assert_eq(
+        testing::expect_ok(zlib::decode(small, limits(small.len(), 0)), "small window").len(),
+        0,
+    );
+    let pattern = bytes::Bytes::new();
+    let mut seed: u32 = 883723;
+    for _ in 0..300 {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        pattern.push(seed.to_u8());
+    }
+    let input = bytes::Bytes::new();
+    for _ in 0..50 {
+        input.extend_from_slice(pattern.as_slice());
+    }
+    let encoded = reference(input, bytes::Bytes::new(), 9);
+    let narrowed = encoded.copy();
+    let base = narrowed.get(1).to_isize() & 0xe0;
+    narrowed.set(0, 0x08);
+    narrowed.set(1, (base + ((31 - ((0x08 * 256 + base) % 31)) % 31)).to_u8());
+    testing::assert_eq(
+        testing::expect_err(
+            zlib::decode(narrowed, limits(narrowed.len(), input.len())),
+            "window distance",
+        ).kind,
+        compress::ErrorKind::Invalid,
+    );
+}
+
+struct FaultReader {
+    source: io::Cursor,
+    calls: Ref[isize],
+    mode: isize,
+    callback: () -> (),
+}
+
+impl io::Read for FaultReader {
+    fn read(self: FaultReader, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        (self.callback)();
+        if self.mode == 0 {
+            return Result::Ok(-1)
+        }
+        if self.mode == 1 {
+            return Result::Ok(2)
+        }
+        if self.mode == 2 {
+            return self.source.read(output)
+        }
+        Result::Err(
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                "probe",
+                Option::None,
+                Option::None,
+                "interrupted",
+            ),
+        )
+    }
+}
+
+#[test]
+fn reader_provider_failures_reentry_and_unwind_are_terminal() -> () {
+    for mode in[0, 1, 3] {
+        let source = FaultReader {
+            source: io::Cursor::new(bytes::Bytes::new()),
+            calls: Ref::new(0),
+            mode,
+            callback: || {},
+        };
+        let reader = testing::expect_ok(zlib::Reader::new(source, limits(100, 100)), "fault reader");
+        testing::assert_eq(
+            testing::expect_err(collect(reader, 1), "provider fault").kind,
+            compress::ErrorKind::Io,
+        );
+        testing::assert_err(collect(reader, 1));
+        testing::assert_eq(source.calls.get(), 1);
+    }
+    let callback: Ref[() -> ()] = Ref::new(|| {});
+    let source = FaultReader {
+        source: io::Cursor::new(reference(bytes::Bytes::new(), bytes::Bytes::new(), 6)),
+        calls: Ref::new(0),
+        mode: 2,
+        callback: || (callback.get())(),
+    };
+    let reader = testing::expect_ok(zlib::Reader::new(source, limits(100, 100)), "reentry reader");
+    callback.set(
+        || {
+            let _ = collect(reader, 1);
+        },
+    );
+    testing::assert_eq(
+        testing::expect_err(collect(reader, 1), "reentry").kind,
+        compress::ErrorKind::State,
+    );
+    testing::assert_eq(reader.consumed(), 1);
+    testing::assert_eq(source.calls.get(), 1);
+    let source = FaultReader {
+        source: io::Cursor::new(reference(bytes::Bytes::new(), bytes::Bytes::new(), 6)),
+        calls: Ref::new(0),
+        mode: 2,
+        callback: || panic::raise("reader panic"),
+    };
+    let reader = testing::expect_ok(zlib::Reader::new(source, limits(100, 100)), "panic reader");
+    testing::assert_err(panic::catch(|| collect(reader, 1)));
+    testing::assert_eq(
+        testing::expect_err(collect(reader, 1), "poison").kind,
+        compress::ErrorKind::State,
+    );
+    testing::assert_eq(source.calls.get(), 1);
+}
+
+struct FaultWriter {
+    calls: Ref[isize],
+    mode: isize,
+    callback: () -> (),
+}
+
+impl io::Write for FaultWriter {
+    fn write(self: FaultWriter, input: Slice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        if self.calls.get() == 1 {
+            return Result::Ok(input.len())
+        };
+        (self.callback)();
+        if self.mode == 0 {
+            return Result::Ok(0)
+        }
+        if self.mode == 1 {
+            return Result::Ok(input.len() + 1)
+        }
+        if self.mode == 2 {
+            return Result::Ok(1)
+        }
+        Result::Err(
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                "probe",
+                Option::None,
+                Option::None,
+                "interrupted",
+            ),
+        )
+    }
+}
+
+#[test]
+fn writer_provider_failures_reentry_and_unwind_are_terminal() -> () {
+    for mode in[0, 1, 3] {
+        let sink = FaultWriter { calls: Ref::new(0), mode, callback: || {} };
+        let writer = testing::expect_ok(zlib::Writer::new(sink, limits(3, 100), 0), "fault writer");
+        testing::expect_ok(writer.write_chunk(b"abc".as_slice()), "buffered input");
+        testing::assert_eq(
+            testing::expect_err(writer.finish(), "provider fault").kind,
+            compress::ErrorKind::Io,
+        );
+        testing::assert_err(writer.finish());
+        testing::assert_eq(sink.calls.get(), 2);
+    }
+    let callback: Ref[() -> ()] = Ref::new(|| {});
+    let sink = FaultWriter { calls: Ref::new(0), mode: 2, callback: || (callback.get())() };
+    let writer = testing::expect_ok(zlib::Writer::new(sink, limits(3, 100), 0), "reentry writer");
+    testing::expect_ok(writer.write_chunk(b"abc".as_slice()), "reentry input");
+    callback.set(
+        || {
+            let _ = writer.finish();
+        },
+    );
+    testing::assert_eq(
+        testing::expect_err(writer.finish(), "reentry").kind,
+        compress::ErrorKind::State,
+    );
+    testing::assert_eq(sink.calls.get(), 2);
+    let sink = FaultWriter {
+        calls: Ref::new(0),
+        mode: 2,
+        callback: || panic::raise("writer panic"),
+    };
+    let writer = testing::expect_ok(zlib::Writer::new(sink, limits(3, 100), 0), "panic writer");
+    testing::expect_ok(writer.write_chunk(b"abc".as_slice()), "panic input");
+    testing::assert_err(panic::catch(|| writer.finish()));
+    testing::assert_eq(
+        testing::expect_err(writer.finish(), "poison").kind,
+        compress::ErrorKind::State,
+    );
+    testing::assert_eq(sink.calls.get(), 2);
+}

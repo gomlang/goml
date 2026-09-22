@@ -1,0 +1,306 @@
+package tests;
+
+use ecosystem::compress;
+use ecosystem::compress::flate;
+use std::bytes;
+use std::encoding::hex;
+use std::io;
+use std::testing;
+use std::panic;
+
+#[go_ffi("example.com/goml-ecosystem/compress/testoracle", "Decode")]
+extern fn reference_decode(input: string, dictionary: string) -> string;
+
+fn encode_limits(input: isize, output: isize, blocks: isize, work: isize) -> compress::Limits {
+    compress::Limits {
+        max_input_bytes: input,
+        max_output_bytes: output,
+        max_blocks: blocks,
+        max_work: work,
+    }
+}
+
+fn encode_chunks(data: bytes::Bytes, dictionary: bytes::Bytes, level: isize, chunk: isize) -> bytes::Bytes {
+    let sink = io::Cursor::new(bytes::Bytes::new());
+    let encoder = testing::expect_ok(
+        flate::Encoder::with_dictionary(
+            sink,
+            encode_limits(data.len(), data.len() * 2 + 100, 100, 10000000),
+            level,
+            dictionary.as_slice(),
+        ),
+        "encoder",
+    );
+    let mut offset = 0;
+    while offset < data.len() {
+        let end = if data.len() - offset < chunk {
+            data.len()
+        } else {
+            offset + chunk
+        };
+        testing::assert_eq(
+            testing::expect_ok(encoder.write_chunk(data.slice(offset, end)), "write chunk"),
+            end - offset,
+        );
+        offset = end;
+    }
+    testing::expect_ok(encoder.finish(), "finish");
+    testing::expect_ok(encoder.finish(), "idempotent finish");
+    testing::assert_eq(encoder.accepted(), data.len());
+    testing::assert_eq(encoder.written(), sink.bytes().len());
+    testing::assert(encoder.is_finished());
+    sink.bytes()
+}
+
+#[test]
+fn encoder_streams_all_levels_and_dictionaries_to_go_decoder() -> () {
+    let long = bytes::Bytes::new();
+    for index in 0..70000 {
+        long.push((index % 251).to_u8());
+    }
+    let dictionary = bytes::Bytes::new();
+    for index in 0..40000 {
+        dictionary.push((index % 251).to_u8());
+    }
+    for sample in[bytes::Bytes::new(), bytes::Bytes::from_string("abcabcabcabc hello 😀"), long] {
+        for dict in[bytes::Bytes::new(), dictionary] {
+            for level in[-2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9] {
+                for chunk in[1, 173, 40000] {
+                    let encoded = encode_chunks(sample, dict, level, chunk);
+                    testing::assert_eq(
+                        reference_decode(hex::encode(encoded), hex::encode(dict)),
+                        hex::encode(sample),
+                    );
+                    let decoder = testing::expect_ok(
+                        flate::Decoder::with_dictionary(
+                            io::Cursor::new(encoded),
+                            encode_limits(encoded.len(), sample.len(), 100, 10000000),
+                            dict.as_slice(),
+                        ),
+                        "roundtrip decoder",
+                    );
+                    let output = bytes::Bytes::new();
+                    let buffer = bytes::Bytes::from_vec(b".......");
+                    loop {
+                        let count = testing::expect_ok(
+                            decoder.read_chunk(buffer.as_mut_slice()),
+                            "roundtrip read",
+                        );
+                        if count == 0 {
+                            break
+                        }
+                        output.extend_from_slice(buffer.slice(0, count));
+                    }
+                    testing::assert(output.to_vec() == sample.to_vec());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn encoder_enforces_limits_and_terminal_state() -> () {
+    let sink = io::Cursor::new(bytes::Bytes::new());
+    let encoder = testing::expect_ok(
+        flate::Encoder::new(sink, encode_limits(3, 100, 1, 100), 0),
+        "limited encoder",
+    );
+    testing::assert_eq(testing::expect_ok(encoder.write_chunk(b"abc".as_slice()), "accepted"), 3);
+    testing::expect_ok(encoder.finish(), "limited finish");
+    testing::assert_eq(encoder.written(), 8);
+    testing::assert_err(encoder.write_chunk(b"x".as_slice()));
+    match encoder.error() {
+        Some(error) => testing::assert_eq(error.kind, compress::ErrorKind::State),
+        None => testing::fail("missing terminal error"),
+    }
+    let sink = io::Cursor::new(bytes::Bytes::new());
+    let encoder = testing::expect_ok(
+        flate::Encoder::new(sink, encode_limits(2, 100, 1, 100), 0),
+        "input budget",
+    );
+    testing::assert_eq(
+        testing::expect_ok(encoder.write_chunk(b"abc".as_slice()), "accepted prefix"),
+        2,
+    );
+    testing::assert_eq(encoder.accepted(), 2);
+    testing::assert_eq(
+        testing::expect_err(encoder.finish(), "sticky input bound").kind,
+        compress::ErrorKind::Limit,
+    );
+    testing::assert_eq(sink.bytes().len(), 0);
+    let sink = io::Cursor::new(bytes::Bytes::new());
+    let encoder = testing::expect_ok(
+        flate::Encoder::new(sink, encode_limits(3, 7, 1, 100), 0),
+        "output budget",
+    );
+    testing::expect_ok(encoder.write_chunk(b"abc".as_slice()), "input");
+    testing::assert_eq(
+        testing::expect_err(encoder.finish(), "output bound").kind,
+        compress::ErrorKind::Limit,
+    );
+    testing::assert_eq(encoder.written(), 7);
+    testing::assert_eq(sink.bytes().len(), 7);
+    testing::assert_err(
+        flate::Encoder::new(io::Cursor::new(bytes::Bytes::new()), encode_limits(1, 100, 1, 100), 10),
+    );
+}
+
+#[test]
+fn flush_syncs_stream_and_default_level_is_supported() -> () {
+    let sink = io::Cursor::new(bytes::Bytes::new());
+    let encoder = testing::expect_ok(
+        flate::Encoder::new(sink, encode_limits(6, 100, 4, 1000), -1),
+        "default level",
+    );
+    testing::expect_ok(encoder.write_chunk(b"abc".as_slice()), "first chunk");
+    testing::expect_ok(encoder.flush(), "sync flush");
+    testing::assert(sink.bytes().len() > 0);
+    testing::expect_ok(encoder.write_chunk(b"def".as_slice()), "second chunk");
+    testing::expect_ok(encoder.finish(), "final block");
+    testing::assert_eq(
+        reference_decode(hex::encode(sink.bytes()), ""),
+        hex::encode(bytes::Bytes::from_vec(b"abcdef")),
+    );
+    testing::assert(encoder.is_finished());
+}
+
+struct FaultWriter {
+    mode: isize,
+    calls: Ref[isize],
+    callback: () -> (),
+}
+
+impl io::Write for FaultWriter {
+    fn write(self: FaultWriter, input: Slice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        (self.callback)();
+        if self.mode == 0 {
+            return Result::Ok(0)
+        }
+        if self.mode == 1 {
+            return Result::Ok(input.len() + 1)
+        }
+        if self.mode == 2 {
+            return Result::Ok(1)
+        }
+        Result::Err(
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                "probe",
+                Option::None,
+                Option::None,
+                "interrupted",
+            ),
+        )
+    }
+}
+
+#[test]
+fn encoder_rejects_writer_faults_reentry_and_unwind() -> () {
+    for mode in[0, 1, 3] {
+        let writer = FaultWriter { mode, calls: Ref::new(0), callback: || {} };
+        let encoder = testing::expect_ok(
+            flate::Encoder::new(writer, encode_limits(3, 100, 1, 100), 0),
+            "fault encoder",
+        );
+        testing::expect_ok(encoder.write_chunk(b"abc".as_slice()), "buffered input");
+        testing::assert_eq(
+            testing::expect_err(encoder.finish(), "writer fault").kind,
+            compress::ErrorKind::Io,
+        );
+        testing::assert_err(encoder.finish());
+        testing::assert_eq(writer.calls.get(), 1);
+    }
+    let callback: Ref[() -> ()] = Ref::new(|| {});
+    let writer = FaultWriter { mode: 2, calls: Ref::new(0), callback: || (callback.get())() };
+    let encoder = testing::expect_ok(
+        flate::Encoder::new(writer, encode_limits(3, 100, 1, 100), 0),
+        "reentrant encoder",
+    );
+    testing::expect_ok(encoder.write_chunk(b"abc".as_slice()), "reentrant input");
+    callback.set(
+        || {
+            let _ = encoder.finish();
+        },
+    );
+    testing::assert_eq(
+        testing::expect_err(encoder.finish(), "reentrant write").kind,
+        compress::ErrorKind::State,
+    );
+    testing::assert_eq(writer.calls.get(), 1);
+    let writer = FaultWriter {
+        mode: 2,
+        calls: Ref::new(0),
+        callback: || panic::raise("writer panic"),
+    };
+    let encoder = testing::expect_ok(
+        flate::Encoder::new(writer, encode_limits(3, 100, 1, 100), 0),
+        "panic encoder",
+    );
+    testing::expect_ok(encoder.write_chunk(b"abc".as_slice()), "panic input");
+    testing::assert_err(panic::catch(|| encoder.finish()));
+    testing::assert_eq(
+        testing::expect_err(encoder.finish(), "poison after panic").kind,
+        compress::ErrorKind::State,
+    );
+    testing::assert_eq(writer.calls.get(), 1);
+}
+
+struct ShortWriter {
+    output: bytes::Bytes,
+}
+
+impl io::Write for ShortWriter {
+    fn write(self: ShortWriter, input: Slice[byte]) -> Result[isize, io::Error] {
+        self.output.push(input[0]);
+        Result::Ok(1)
+    }
+}
+
+#[test]
+fn encoder_completes_short_writes_and_bounds_work_and_blocks() -> () {
+    let writer = ShortWriter { output: bytes::Bytes::new() };
+    let encoder = testing::expect_ok(
+        flate::Encoder::new(writer, encode_limits(3, 32, 1, 100), 0),
+        "short writer encoder",
+    );
+    testing::expect_ok(encoder.write_chunk(b"abc".as_slice()), "short writer input");
+    testing::expect_ok(encoder.finish(), "short writer finish");
+    testing::assert_eq(encoder.written(), 8);
+    testing::assert_eq(
+        reference_decode(hex::encode(writer.output), ""),
+        hex::encode(bytes::Bytes::from_vec(b"abc")),
+    );
+    let encoder = testing::expect_ok(
+        flate::Encoder::new(io::Cursor::new(bytes::Bytes::new()), encode_limits(0, 100, 0, 100), 0),
+        "block bound",
+    );
+    testing::assert_eq(
+        testing::expect_err(encoder.finish(), "block limit").kind,
+        compress::ErrorKind::Limit,
+    );
+    let encoder = testing::expect_ok(
+        flate::Encoder::new(io::Cursor::new(bytes::Bytes::new()), encode_limits(1, 100, 1, 0), 0),
+        "work bound",
+    );
+    testing::assert_eq(
+        testing::expect_err(encoder.write_chunk(b"x".as_slice()), "work limit").kind,
+        compress::ErrorKind::Limit,
+    );
+    testing::assert_eq(encoder.accepted(), 0);
+}
+
+#[test]
+fn incompressible_blocks_use_bounded_stored_fallback() -> () {
+    let input = bytes::Bytes::new();
+    let mut seed: u32 = 7832471;
+    for _ in 0..70000 {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        input.push(seed.to_u8());
+    }
+    let encoded = encode_chunks(input, bytes::Bytes::new(), 9, 40000);
+    testing::assert(encoded.len() <= input.len() + 15);
+    testing::assert_eq(reference_decode(hex::encode(encoded), ""), hex::encode(input));
+}

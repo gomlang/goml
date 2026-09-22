@@ -1,0 +1,124 @@
+package tests;
+
+use ecosystem::compress;
+use ecosystem::compress::lzw;
+use std::bytes;
+use std::encoding::hex;
+use std::io;
+use std::testing;
+
+#[go_ffi("example.com/goml-ecosystem/compress/testoracle", "LzwDecode")]
+extern fn reference_decode(input: string, order: isize, literal_width: isize) -> string;
+
+fn limits(input: isize, output: isize, epochs: isize, work: isize) -> compress::Limits {
+    compress::Limits {
+        max_input_bytes: input,
+        max_output_bytes: output,
+        max_blocks: epochs,
+        max_work: work,
+    }
+}
+
+fn go_order(order: lzw::BitOrder) -> isize {
+    if order == lzw::BitOrder::Lsb {
+        0
+    } else {
+        1
+    }
+}
+
+fn encode_chunks(input: bytes::Bytes, order: lzw::BitOrder, literal_width: isize, chunk: isize) -> bytes::Bytes {
+    let sink = io::Cursor::new(bytes::Bytes::new());
+    let writer = testing::expect_ok(
+        lzw::Writer::new(
+            sink,
+            limits(input.len(), input.len() * 3 + 100, 100, 10000000),
+            order,
+            literal_width,
+        ),
+        "LZW writer",
+    );
+    let mut offset = 0;
+    while offset < input.len() {
+        let end = if input.len() - offset < chunk {
+            input.len()
+        } else {
+            offset + chunk
+        };
+        testing::assert_eq(
+            testing::expect_ok(writer.write_chunk(input.slice(offset, end)), "LZW chunk"),
+            end - offset,
+        );
+        offset = end;
+    }
+    testing::expect_ok(writer.finish(), "LZW finish");
+    testing::expect_ok(writer.finish(), "LZW idempotent finish");
+    testing::assert_eq(writer.accepted(), input.len());
+    testing::assert_eq(writer.written(), sink.bytes().len());
+    testing::assert(writer.is_finished());
+    sink.bytes()
+}
+
+#[test]
+fn encoder_interoperates_with_go_across_bit_orders_widths_and_dictionary_resets() -> () {
+    for order in[lzw::BitOrder::Lsb, lzw::BitOrder::Msb] {
+        for width in[2, 4, 8] {
+            let long = bytes::Bytes::new();
+            let mut seed: u32 = 9367421;
+            for _ in 0..30000 {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                long.push(seed.to_u8() & ((1 << width) - 1).to_u8());
+            }
+            for sample in[bytes::Bytes::new(), bytes::Bytes::from_vec(b"\x00\x01\x00\x01"), long] {
+                for chunk in[1, 73, 4096] {
+                    let encoded = encode_chunks(sample, order, width, chunk);
+                    testing::assert_eq(
+                        reference_decode(hex::encode(encoded), go_order(order), width),
+                        hex::encode(sample),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn encoder_rejects_invalid_literals_and_bounds() -> () {
+    testing::assert_err(
+        lzw::Writer::new(
+            io::Cursor::new(bytes::Bytes::new()),
+            limits(1, 10, 1, 10),
+            lzw::BitOrder::Lsb,
+            1,
+        ),
+    );
+    let sink = io::Cursor::new(bytes::Bytes::new());
+    let writer = testing::expect_ok(
+        lzw::Writer::new(sink, limits(3, 100, 1, 100), lzw::BitOrder::Lsb, 2),
+        "bounded writer",
+    );
+    testing::assert_eq(
+        testing::expect_ok(writer.write_chunk(b"\x00\x01\x04".as_slice()), "valid prefix"),
+        2,
+    );
+    testing::assert_eq(writer.accepted(), 2);
+    testing::assert_eq(
+        testing::expect_err(writer.finish(), "sticky invalid literal").kind,
+        compress::ErrorKind::Invalid,
+    );
+    let writer = testing::expect_ok(
+        lzw::Writer::new(
+            io::Cursor::new(bytes::Bytes::new()),
+            limits(0, 0, 1, 100),
+            lzw::BitOrder::Lsb,
+            2,
+        ),
+        "output bound",
+    );
+    testing::assert_eq(
+        testing::expect_err(writer.finish(), "output bound").kind,
+        compress::ErrorKind::Limit,
+    );
+}

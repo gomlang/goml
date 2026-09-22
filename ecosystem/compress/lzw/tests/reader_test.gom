@@ -1,0 +1,127 @@
+package tests;
+
+use ecosystem::compress;
+use ecosystem::compress::lzw;
+use std::bytes;
+use std::encoding::hex;
+use std::io;
+use std::testing;
+
+#[go_ffi("example.com/goml-ecosystem/compress/testoracle", "LzwEncode")]
+extern fn reference_encode(input: string, order: isize, literal_width: isize) -> string;
+
+fn reference(input: bytes::Bytes, order: lzw::BitOrder, literal_width: isize) -> bytes::Bytes {
+    testing::expect_ok(
+        hex::decode(reference_encode(hex::encode(input), go_order(order), literal_width)),
+        "reference LZW",
+    )
+}
+
+fn collect[R: io::Read](reader: lzw::Reader[R], chunk: isize) -> Result[
+    bytes::Bytes,
+    compress::Error,
+] {
+    let output = bytes::Bytes::new();
+    let buffer = bytes::Bytes::new();
+    for _ in 0..chunk {
+        buffer.push(0);
+    }
+    loop {
+        let count = reader.read_chunk(buffer.as_mut_slice())?;
+        if count == 0 {
+            break
+        }
+        output.extend_from_slice(buffer.slice(0, count));
+    }
+    Result::Ok(output)
+}
+
+#[test]
+fn decoder_interoperates_with_go_across_orders_widths_and_resets() -> () {
+    for order in[lzw::BitOrder::Lsb, lzw::BitOrder::Msb] {
+        for width in[2, 4, 8] {
+            let long = bytes::Bytes::new();
+            let mut seed: u32 = 376541;
+            for _ in 0..30000 {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                long.push(seed.to_u8() & ((1 << width) - 1).to_u8());
+            }
+            for sample in[bytes::Bytes::new(), bytes::Bytes::from_vec(b"\x00\x01\x00\x01"), long] {
+                for encoded in[
+                    reference(sample, order, width),
+                    encode_chunks(sample, order, width, 73),
+                ] {
+                    for chunk in[1, 7, 4096] {
+                        let reader = testing::expect_ok(
+                            lzw::Reader::new(
+                                io::Cursor::new(encoded),
+                                limits(encoded.len(), sample.len(), 100, 10000000),
+                                order,
+                                width,
+                            ),
+                            "LZW reader",
+                        );
+                        testing::assert(
+                            testing::expect_ok(collect(reader, chunk), "LZW decode").to_vec()
+                                == sample.to_vec(),
+                        );
+                        testing::assert_eq(reader.consumed(), encoded.len());
+                        testing::assert_eq(reader.produced(), sample.len());
+                        testing::assert(reader.is_finished());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn decoder_reports_invalid_codes_truncation_and_quotas() -> () {
+    let invalid = bytes::Bytes::from_vec(b"\x7c\x01");
+    testing::assert_eq(
+        testing::expect_err(
+            lzw::decode(invalid, limits(invalid.len(), 100, 10, 100), lzw::BitOrder::Lsb, 2),
+            "invalid code",
+        ).kind,
+        compress::ErrorKind::Invalid,
+    );
+    let sample = bytes::Bytes::from_vec(b"hello world");
+    let encoded = reference(sample, lzw::BitOrder::Lsb, 8);
+    for length in[0, 1, encoded.len() - 1] {
+        let short = bytes::Bytes::from_slice_copy(encoded.slice(0, length));
+        testing::assert_err(
+            lzw::decode(
+                short,
+                limits(short.len() + 1, sample.len(), 10, 10000),
+                lzw::BitOrder::Lsb,
+                8,
+            ),
+        );
+    }
+    testing::assert_eq(
+        testing::expect_err(
+            lzw::decode(
+                encoded,
+                limits(encoded.len(), sample.len() - 1, 10, 10000),
+                lzw::BitOrder::Lsb,
+                8,
+            ),
+            "output limit",
+        ).kind,
+        compress::ErrorKind::Limit,
+    );
+    testing::assert_eq(
+        testing::expect_err(
+            lzw::decode(
+                encoded,
+                limits(encoded.len(), sample.len(), 0, 10000),
+                lzw::BitOrder::Lsb,
+                8,
+            ),
+            "epoch limit",
+        ).kind,
+        compress::ErrorKind::Limit,
+    );
+}

@@ -1,0 +1,257 @@
+package tests;
+
+use ecosystem::compress;
+use ecosystem::compress::flate;
+use std::bytes;
+use std::encoding::hex;
+use std::io;
+use io::Read;
+use std::testing;
+use std::panic;
+
+#[go_ffi("example.com/goml-ecosystem/compress/testoracle", "Encode")]
+extern fn reference_encode(input: string, dictionary: string, level: isize) -> string;
+
+fn limits(input: isize, output: isize) -> compress::Limits {
+    compress::Limits {
+        max_input_bytes: input,
+        max_output_bytes: output,
+        max_blocks: 10000,
+        max_work: 10000000,
+    }
+}
+
+fn reference(data: bytes::Bytes, dictionary: bytes::Bytes, level: isize) -> bytes::Bytes {
+    testing::expect_ok(
+        hex::decode(reference_encode(hex::encode(data), hex::encode(dictionary), level)),
+        "reference encoding",
+    )
+}
+
+fn collect[R: Read](decoder: flate::Decoder[R], chunk: isize) -> Result[
+    bytes::Bytes,
+    compress::Error,
+] {
+    let output = bytes::Bytes::new();
+    let buffer = bytes::Bytes::new();
+    for _ in 0..chunk {
+        buffer.push(0);
+    }
+    loop {
+        let count = decoder.read_chunk(buffer.as_mut_slice())?;
+        if count == 0 {
+            break
+        }
+        output.extend_from_slice(buffer.slice(0, count));
+    }
+    Result::Ok(output)
+}
+
+#[test]
+fn decodes_stored_fixed_dynamic_dictionary_and_window_wrap() -> () {
+    let samples = Vec::from_array(
+        [bytes::Bytes::new(), bytes::Bytes::from_string("abcabcabcabc hello 😀")],
+    );
+    let long = bytes::Bytes::new();
+    let mut seed: u32 = 92374;
+    for index in 0..100000 {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        long.push(
+            if index % 1000 < 900 {
+                (index % 251).to_u8()
+            } else {
+                seed.to_u8()
+            },
+        );
+    }
+    samples.push(long);
+    let dictionary = bytes::Bytes::new();
+    for index in 0..50000 {
+        dictionary.push((index % 251).to_u8());
+    }
+    for dict in[bytes::Bytes::new(), dictionary] {
+        for sample in samples {
+            for level in[-2, 0, 1, 6, 9] {
+                let encoded = reference(sample, dict, level);
+                for chunk in[1, 7, 4096] {
+                    let reader = io::Cursor::new(encoded);
+                    let decoder = testing::expect_ok(
+                        flate::Decoder::with_dictionary(
+                            reader,
+                            limits(encoded.len(), sample.len()),
+                            dict.as_slice(),
+                        ),
+                        "decoder",
+                    );
+                    let decoded = testing::expect_ok(collect(decoder, chunk), "reference decode");
+                    testing::assert(decoded.to_vec() == sample.to_vec());
+                    testing::assert_eq(decoder.produced(), sample.len());
+                    testing::assert_eq(decoder.consumed(), encoded.len());
+                    testing::assert(decoder.is_finished());
+                    testing::assert(decoder.error().is_none());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn retains_trailers_and_reports_malformed_input_and_bounds() -> () {
+    for raw in[b"\x03\x00", b"\x01\x00\x00\xff\xff", b"\x00\x00\x00\xff\xff\x03\x00"] {
+        let input = bytes::Bytes::from_vec(raw);
+        testing::assert_eq(
+            testing::expect_ok(flate::decode(input, limits(input.len(), 0)), "empty blocks").len(),
+            0,
+        );
+    }
+    let sample = bytes::Bytes::from_string("hello hello hello");
+    let encoded = reference(sample, bytes::Bytes::new(), 6);
+    let joined = encoded.copy();
+    joined.extend_from_slice(b"trailer".as_slice());
+    let reader = io::Cursor::new(joined);
+    let decoder = testing::expect_ok(
+        flate::Decoder::new(reader, limits(encoded.len(), sample.len())),
+        "trailer decoder",
+    );
+    testing::assert(
+        testing::expect_ok(collect(decoder, 1), "trailer decode").to_vec() == sample.to_vec(),
+    );
+    testing::assert_eq(reader.position(), encoded.len());
+    testing::assert_eq(
+        testing::expect_err(
+            flate::decode(joined, limits(joined.len(), sample.len())),
+            "trailing input",
+        ).kind,
+        compress::ErrorKind::Invalid,
+    );
+    for length in 0..encoded.len() {
+        let input = bytes::Bytes::from_slice_copy(encoded.slice(0, length));
+        testing::assert_eq(
+            testing::expect_err(
+                flate::decode(input, limits(encoded.len(), sample.len())),
+                "truncated stream",
+            ).kind,
+            compress::ErrorKind::Truncated,
+        );
+    }
+    for budget in[
+        compress::Limits { max_input_bytes: 0, ..limits(encoded.len(), sample.len()) },
+        compress::Limits { max_output_bytes: 0, ..limits(encoded.len(), sample.len()) },
+        compress::Limits { max_blocks: 0, ..limits(encoded.len(), sample.len()) },
+        compress::Limits { max_work: 0, ..limits(encoded.len(), sample.len()) },
+    ] {
+        testing::assert_eq(
+            testing::expect_err(flate::decode(encoded, budget), "decoder limit").kind,
+            compress::ErrorKind::Limit,
+        );
+    }
+    for raw in[b"\x07", b"\x01\x01\x00\xff\xff", b"\x03\x02\x00"] {
+        testing::assert_err(flate::decode(bytes::Bytes::from_vec(raw), limits(100, 100)));
+    }
+    let source = io::Cursor::new(encoded);
+    let decoder = testing::expect_ok(
+        flate::Decoder::new(source, limits(encoded.len(), 5)),
+        "short quota",
+    );
+    let buffer = bytes::Bytes::from_vec(b"....................");
+    testing::assert_eq(
+        testing::expect_ok(decoder.read_chunk(buffer.as_mut_slice()), "confirmed prefix"),
+        5,
+    );
+    testing::assert_eq(
+        testing::expect_some(decoder.error(), "pending limit").kind,
+        compress::ErrorKind::Limit,
+    );
+    let position = source.position();
+    testing::assert_eq(
+        testing::expect_err(decoder.read_chunk(buffer.as_mut_slice()), "delayed limit").kind,
+        compress::ErrorKind::Limit,
+    );
+    testing::assert_eq(source.position(), position);
+}
+
+struct FailingReader {
+    mode: isize,
+    calls: Ref[isize],
+    callback: () -> (),
+}
+
+impl Read for FailingReader {
+    fn read(self: FailingReader, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        (self.callback)();
+        output[0] = 3;
+        if self.mode == 0 {
+            return Result::Ok(-1)
+        }
+        if self.mode == 1 {
+            return Result::Ok(2)
+        }
+        if self.mode == 2 {
+            return Result::Ok(1)
+        }
+        Result::Err(
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                "probe",
+                Option::None,
+                Option::None,
+                "interrupted",
+            ),
+        )
+    }
+}
+
+#[test]
+fn rejects_provider_faults_and_reentrancy_without_retry() -> () {
+    for mode in[0, 1, 3] {
+        let source = FailingReader { mode, calls: Ref::new(0), callback: || {} };
+        let decoder = testing::expect_ok(
+            flate::Decoder::new(source, limits(100, 100)),
+            "fault decoder",
+        );
+        let error = testing::expect_err(collect(decoder, 1), "fault");
+        testing::assert_eq(error.kind, compress::ErrorKind::Io);
+        testing::assert_eq(
+            testing::expect_some(error.cause, "I/O cause").kind(),
+            if mode == 3 {
+                io::ErrorKind::Interrupted
+            } else {
+                io::ErrorKind::InvalidData
+            },
+        );
+        testing::assert_err(collect(decoder, 1));
+        testing::assert_eq(source.calls.get(), 1);
+    }
+    let callback: Ref[() -> ()] = Ref::new(|| {});
+    let source = FailingReader { mode: 2, calls: Ref::new(0), callback: || (callback.get())() };
+    let decoder = testing::expect_ok(
+        flate::Decoder::new(source, limits(100, 100)),
+        "reentry decoder",
+    );
+    callback.set(
+        || {
+            let _ = collect(decoder, 1);
+        },
+    );
+    testing::assert_eq(
+        testing::expect_err(collect(decoder, 1), "reentry").kind,
+        compress::ErrorKind::State,
+    );
+    testing::assert_eq(decoder.consumed(), 1);
+    testing::assert_eq(source.calls.get(), 1);
+    let source = FailingReader {
+        mode: 2,
+        calls: Ref::new(0),
+        callback: || panic::raise("reader panic"),
+    };
+    let decoder = testing::expect_ok(flate::Decoder::new(source, limits(100, 100)), "panic decoder");
+    testing::assert_err(panic::catch(|| collect(decoder, 1)));
+    testing::assert_eq(
+        testing::expect_err(collect(decoder, 1), "poison after panic").kind,
+        compress::ErrorKind::State,
+    );
+    testing::assert_eq(source.calls.get(), 1);
+}

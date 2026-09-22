@@ -1,0 +1,330 @@
+package tests;
+
+use ecosystem::compress;
+use ecosystem::compress::gzip;
+use std::bytes;
+use std::encoding::hex;
+use std::hash::crc32;
+use std::io;
+use io::Read;
+use std::testing;
+use std::panic;
+
+#[go_ffi("example.com/goml-ecosystem/compress/testoracle", "GzipEncode")]
+extern fn reference_encode(input: string, level: isize) -> string;
+
+#[go_ffi("example.com/goml-ecosystem/compress/testoracle", "GzipDecode")]
+extern fn reference_decode(input: string) -> string;
+
+fn limits(input: isize, output: isize) -> compress::Limits {
+    compress::Limits {
+        max_input_bytes: input,
+        max_output_bytes: output,
+        max_blocks: 100,
+        max_work: 10000000,
+    }
+}
+
+fn reference(data: bytes::Bytes, level: isize) -> bytes::Bytes {
+    testing::expect_ok(hex::decode(reference_encode(hex::encode(data), level)), "reference gzip")
+}
+
+fn collect[R: io::Read](reader: gzip::Reader[R], chunk: isize) -> Result[
+    bytes::Bytes,
+    compress::Error,
+] {
+    let output = bytes::Bytes::new();
+    let buffer = bytes::Bytes::new();
+    for _ in 0..chunk {
+        buffer.push(0);
+    }
+    loop {
+        let count = reader.read_chunk(buffer.as_mut_slice())?;
+        if count == 0 {
+            break
+        }
+        output.extend_from_slice(buffer.slice(0, count));
+    }
+    Result::Ok(output)
+}
+
+#[test]
+fn streams_go_gzip_and_writes_go_readable_members() -> () {
+    let long = bytes::Bytes::new();
+    for index in 0..70000 {
+        long.push((index % 251).to_u8());
+    }
+    for sample in[bytes::Bytes::new(), bytes::Bytes::from_string("hello gzip 😀"), long] {
+        for level in[-2, -1, 0, 1, 6, 9] {
+            let encoded = reference(sample, level);
+            for chunk in[1, 7, 4096] {
+                let reader = testing::expect_ok(
+                    gzip::Reader::new(
+                        io::Cursor::new(encoded),
+                        limits(encoded.len() + 1, sample.len()),
+                    ),
+                    "gzip reader",
+                );
+                testing::assert(
+                    testing::expect_ok(collect(reader, chunk), "gzip read").to_vec()
+                        == sample.to_vec(),
+                );
+                testing::assert_eq(reader.consumed(), encoded.len());
+                testing::assert_eq(reader.produced(), sample.len());
+                testing::assert_eq(reader.members(), 1);
+                testing::assert(reader.is_finished());
+            }
+            let written = testing::expect_ok(
+                gzip::encode(sample, limits(sample.len(), sample.len() * 2 + 100), level),
+                "gzip encode",
+            );
+            testing::assert_eq(reference_decode(hex::encode(written)), hex::encode(sample));
+            testing::assert(
+                testing::expect_ok(
+                    gzip::decode(written, limits(written.len(), sample.len())),
+                    "self decode",
+                ).to_vec()
+                    == sample.to_vec(),
+            );
+        }
+    }
+}
+
+#[test]
+fn accepts_concatenated_members_and_optional_header_fields() -> () {
+    let first = reference(bytes::Bytes::from_vec(b"abc"), 6);
+    let second = reference(bytes::Bytes::from_vec(b"def"), 0);
+    let joined = first.copy();
+    joined.extend_from_slice(second.as_slice());
+    let reader = testing::expect_ok(
+        gzip::Reader::new(io::Cursor::new(joined), limits(joined.len() + 1, 6)),
+        "concatenated",
+    );
+    testing::assert(testing::expect_ok(collect(reader, 1), "multi-member").to_vec() == b"abcdef");
+    testing::assert_eq(reader.members(), 2);
+    testing::assert_eq(reader.consumed(), joined.len());
+    let decorated = bytes::Bytes::new();
+    decorated.extend_from_slice(first.slice(0, 3));
+    decorated.push(0x1e);
+    decorated.extend_from_slice(first.slice(4, 10));
+    decorated.extend_from_slice(b"\x03\x00xyzname\x00comment\x00".as_slice());
+    let checksum = crc32::checksum(decorated.as_slice(), crc32::Table::new(crc32::IEEE));
+    decorated.push(checksum.to_u8());
+    decorated.push((checksum >> 8).to_u8());
+    decorated.extend_from_slice(first.slice(10, first.len()));
+    testing::assert(
+        testing::expect_ok(gzip::decode(decorated, limits(decorated.len(), 3)), "optional header").to_vec()
+            == b"abc",
+    );
+    let header_crc_offset = decorated.len() - first.len() + 8;
+    decorated.set(header_crc_offset, decorated.get(header_crc_offset) ^ 1);
+    testing::assert_eq(
+        testing::expect_err(gzip::decode(decorated, limits(decorated.len(), 3)), "header CRC").kind,
+        compress::ErrorKind::Checksum,
+    );
+}
+
+#[test]
+fn rejects_truncation_crc_mismatch_trailing_garbage_and_limits() -> () {
+    let source = bytes::Bytes::from_vec(b"hello world");
+    let encoded = reference(source, 6);
+    for length in[0, 1, 9, encoded.len() - 1] {
+        let truncated = bytes::Bytes::from_slice_copy(encoded.slice(0, length));
+        testing::assert_err(gzip::decode(truncated, limits(truncated.len(), source.len())));
+    }
+    let corrupt = encoded.copy();
+    corrupt.set(corrupt.len() - 8, corrupt.get(corrupt.len() - 8) ^ 1);
+    testing::assert_eq(
+        testing::expect_err(gzip::decode(corrupt, limits(corrupt.len(), source.len())), "bad CRC").kind,
+        compress::ErrorKind::Checksum,
+    );
+    let garbage = encoded.copy();
+    garbage.push(1);
+    testing::assert_eq(
+        testing::expect_err(
+            gzip::decode(garbage, limits(garbage.len(), source.len())),
+            "trailing data",
+        ).kind,
+        compress::ErrorKind::Invalid,
+    );
+    testing::assert_eq(
+        testing::expect_err(
+            gzip::decode(encoded, limits(encoded.len(), source.len() - 1)),
+            "output limit",
+        ).kind,
+        compress::ErrorKind::Limit,
+    );
+}
+
+struct FaultReader {
+    source: io::Cursor,
+    calls: Ref[isize],
+    mode: isize,
+    callback: () -> (),
+}
+
+impl io::Read for FaultReader {
+    fn read(self: FaultReader, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        (self.callback)();
+        if self.mode == 0 {
+            return Result::Ok(-1)
+        }
+        if self.mode == 1 {
+            return Result::Ok(2)
+        }
+        if self.mode == 2 {
+            return self.source.read(output)
+        }
+        Result::Err(
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                "probe",
+                Option::None,
+                Option::None,
+                "interrupted",
+            ),
+        )
+    }
+}
+
+#[test]
+fn reader_rejects_provider_faults_reentry_and_unwind() -> () {
+    for mode in[0, 1, 3] {
+        let source = FaultReader {
+            source: io::Cursor::new(bytes::Bytes::new()),
+            calls: Ref::new(0),
+            mode,
+            callback: || {},
+        };
+        let reader = testing::expect_ok(gzip::Reader::new(source, limits(100, 100)), "fault reader");
+        testing::assert_eq(
+            testing::expect_err(collect(reader, 1), "reader fault").kind,
+            compress::ErrorKind::Io,
+        );
+        testing::assert_err(collect(reader, 1));
+        testing::assert_eq(source.calls.get(), 1);
+    }
+    let callback: Ref[() -> ()] = Ref::new(|| {});
+    let source = FaultReader {
+        source: io::Cursor::new(reference(bytes::Bytes::new(), 6)),
+        calls: Ref::new(0),
+        mode: 2,
+        callback: || (callback.get())(),
+    };
+    let reader = testing::expect_ok(gzip::Reader::new(source, limits(100, 100)), "reentry reader");
+    callback.set(
+        || {
+            let _ = collect(reader, 1);
+        },
+    );
+    testing::assert_eq(
+        testing::expect_err(collect(reader, 1), "reader reentry").kind,
+        compress::ErrorKind::State,
+    );
+    testing::assert_eq(reader.consumed(), 1);
+    testing::assert_eq(source.calls.get(), 1);
+    let source = FaultReader {
+        source: io::Cursor::new(reference(bytes::Bytes::new(), 6)),
+        calls: Ref::new(0),
+        mode: 2,
+        callback: || panic::raise("reader panic"),
+    };
+    let reader = testing::expect_ok(gzip::Reader::new(source, limits(100, 100)), "panic reader");
+    testing::assert_err(panic::catch(|| collect(reader, 1)));
+    testing::assert_eq(
+        testing::expect_err(collect(reader, 1), "poison after panic").kind,
+        compress::ErrorKind::State,
+    );
+    testing::assert_eq(source.calls.get(), 1);
+}
+
+struct FaultWriter {
+    calls: Ref[isize],
+    output: bytes::Bytes,
+    mode: isize,
+    callback: () -> (),
+}
+
+impl io::Write for FaultWriter {
+    fn write(self: FaultWriter, input: Slice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        if self.calls.get() == 1 {
+            self.output.extend_from_slice(input);
+            return Result::Ok(input.len())
+        };
+        (self.callback)();
+        if self.mode == 0 {
+            return Result::Ok(0)
+        }
+        if self.mode == 1 {
+            return Result::Ok(input.len() + 1)
+        }
+        if self.mode == 2 {
+            self.output.push(input[0]);
+            return Result::Ok(1)
+        }
+        Result::Err(
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                "probe",
+                Option::None,
+                Option::None,
+                "interrupted",
+            ),
+        )
+    }
+}
+
+#[test]
+fn writer_rejects_provider_faults_reentry_and_unwind() -> () {
+    for mode in[0, 1, 3] {
+        let sink = FaultWriter {
+            calls: Ref::new(0),
+            output: bytes::Bytes::new(),
+            mode,
+            callback: || {},
+        };
+        let writer = testing::expect_ok(gzip::Writer::new(sink, limits(3, 100), 0), "fault writer");
+        testing::expect_ok(writer.write_chunk(b"abc".as_slice()), "buffered input");
+        testing::assert_eq(
+            testing::expect_err(writer.finish(), "writer fault").kind,
+            compress::ErrorKind::Io,
+        );
+        testing::assert_err(writer.finish());
+        testing::assert_eq(sink.calls.get(), 2);
+    }
+    let callback: Ref[() -> ()] = Ref::new(|| {});
+    let sink = FaultWriter {
+        calls: Ref::new(0),
+        output: bytes::Bytes::new(),
+        mode: 2,
+        callback: || (callback.get())(),
+    };
+    let writer = testing::expect_ok(gzip::Writer::new(sink, limits(3, 100), 0), "reentry writer");
+    testing::expect_ok(writer.write_chunk(b"abc".as_slice()), "reentry input");
+    callback.set(
+        || {
+            let _ = writer.finish();
+        },
+    );
+    testing::assert_eq(
+        testing::expect_err(writer.finish(), "writer reentry").kind,
+        compress::ErrorKind::State,
+    );
+    testing::assert_eq(sink.calls.get(), 2);
+    let sink = FaultWriter {
+        calls: Ref::new(0),
+        output: bytes::Bytes::new(),
+        mode: 2,
+        callback: || panic::raise("writer panic"),
+    };
+    let writer = testing::expect_ok(gzip::Writer::new(sink, limits(3, 100), 0), "panic writer");
+    testing::expect_ok(writer.write_chunk(b"abc".as_slice()), "panic input");
+    testing::assert_err(panic::catch(|| writer.finish()));
+    testing::assert_eq(
+        testing::expect_err(writer.finish(), "poison after panic").kind,
+        compress::ErrorKind::State,
+    );
+    testing::assert_eq(sink.calls.get(), 2);
+}

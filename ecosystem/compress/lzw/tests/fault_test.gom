@@ -1,0 +1,215 @@
+package tests;
+
+use ecosystem::compress;
+use ecosystem::compress::lzw;
+use std::bytes;
+use std::encoding::hex;
+use std::io;
+use io::Read;
+use std::panic;
+use std::testing;
+
+struct FaultReader {
+    source: io::Cursor,
+    calls: Ref[isize],
+    mode: isize,
+    callback: () -> (),
+}
+
+impl io::Read for FaultReader {
+    fn read(self: FaultReader, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        (self.callback)();
+        if self.mode == 0 {
+            return Result::Ok(-1)
+        }
+        if self.mode == 1 {
+            return Result::Ok(2)
+        }
+        if self.mode == 2 {
+            return self.source.read(output)
+        }
+        Result::Err(
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                "probe",
+                Option::None,
+                Option::None,
+                "interrupted",
+            ),
+        )
+    }
+}
+
+#[test]
+fn reader_provider_faults_and_aliases_are_terminal() -> () {
+    for mode in[0, 1, 3] {
+        let source = FaultReader {
+            source: io::Cursor::new(bytes::Bytes::new()),
+            calls: Ref::new(0),
+            mode,
+            callback: || {},
+        };
+        let reader = testing::expect_ok(
+            lzw::Reader::new(source, limits(100, 100, 10, 100), lzw::BitOrder::Lsb, 8),
+            "fault reader",
+        );
+        testing::assert_eq(
+            testing::expect_err(collect(reader, 1), "provider fault").kind,
+            compress::ErrorKind::Io,
+        );
+        testing::assert_err(collect(reader, 1));
+        testing::assert_eq(source.calls.get(), 1);
+    }
+    let sample = encode_chunks(bytes::Bytes::from_vec(b"abc"), lzw::BitOrder::Lsb, 8, 3);
+    let callback: Ref[() -> ()] = Ref::new(|| {});
+    let source = FaultReader {
+        source: io::Cursor::new(sample),
+        calls: Ref::new(0),
+        mode: 2,
+        callback: || (callback.get())(),
+    };
+    let reader = testing::expect_ok(
+        lzw::Reader::new(source, limits(100, 100, 10, 100), lzw::BitOrder::Lsb, 8),
+        "reentry reader",
+    );
+    callback.set(
+        || {
+            let _ = collect(reader, 1);
+        },
+    );
+    testing::assert_eq(
+        testing::expect_err(collect(reader, 1), "reentry").kind,
+        compress::ErrorKind::State,
+    );
+    testing::assert_eq(reader.consumed(), 1);
+    testing::assert_eq(source.calls.get(), 1);
+    let source = FaultReader {
+        source: io::Cursor::new(sample),
+        calls: Ref::new(0),
+        mode: 2,
+        callback: || panic::raise("reader panic"),
+    };
+    let reader = testing::expect_ok(
+        lzw::Reader::new(source, limits(100, 100, 10, 100), lzw::BitOrder::Lsb, 8),
+        "panic reader",
+    );
+    testing::assert_err(panic::catch(|| collect(reader, 1)));
+    testing::assert_eq(
+        testing::expect_err(collect(reader, 1), "poison").kind,
+        compress::ErrorKind::State,
+    );
+    testing::assert_eq(source.calls.get(), 1);
+}
+
+struct FaultWriter {
+    output: bytes::Bytes,
+    calls: Ref[isize],
+    mode: isize,
+    callback: () -> (),
+}
+
+impl io::Write for FaultWriter {
+    fn write(self: FaultWriter, input: Slice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        (self.callback)();
+        if self.mode == 0 {
+            return Result::Ok(0)
+        }
+        if self.mode == 1 {
+            return Result::Ok(input.len() + 1)
+        }
+        if self.mode == 2 {
+            self.output.push(input[0]);
+            return Result::Ok(1)
+        }
+        Result::Err(
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                "probe",
+                Option::None,
+                Option::None,
+                "interrupted",
+            ),
+        )
+    }
+}
+
+#[test]
+fn writer_completes_short_writes_and_poisoned_provider_failures() -> () {
+    let sink = FaultWriter {
+        output: bytes::Bytes::new(),
+        calls: Ref::new(0),
+        mode: 2,
+        callback: || {},
+    };
+    let writer = testing::expect_ok(
+        lzw::Writer::new(sink, limits(3, 100, 10, 100), lzw::BitOrder::Lsb, 8),
+        "short writer",
+    );
+    testing::expect_ok(writer.write_chunk(b"abc".as_slice()), "short input");
+    testing::expect_ok(writer.finish(), "short finish");
+    testing::assert_eq(writer.written(), sink.output.len());
+    testing::assert_eq(
+        reference_decode(hex::encode(sink.output), 0, 8),
+        hex::encode(bytes::Bytes::from_vec(b"abc")),
+    );
+    for mode in[0, 1, 3] {
+        let sink = FaultWriter {
+            output: bytes::Bytes::new(),
+            calls: Ref::new(0),
+            mode,
+            callback: || {},
+        };
+        let writer = testing::expect_ok(
+            lzw::Writer::new(sink, limits(3, 100, 10, 100), lzw::BitOrder::Lsb, 8),
+            "fault writer",
+        );
+        testing::expect_ok(writer.write_chunk(b"abc".as_slice()), "buffered input");
+        testing::assert_eq(
+            testing::expect_err(writer.finish(), "provider fault").kind,
+            compress::ErrorKind::Io,
+        );
+        testing::assert_err(writer.finish());
+        testing::assert_eq(sink.calls.get(), 1);
+    }
+    let callback: Ref[() -> ()] = Ref::new(|| {});
+    let sink = FaultWriter {
+        output: bytes::Bytes::new(),
+        calls: Ref::new(0),
+        mode: 2,
+        callback: || (callback.get())(),
+    };
+    let writer = testing::expect_ok(
+        lzw::Writer::new(sink, limits(3, 100, 10, 100), lzw::BitOrder::Lsb, 8),
+        "reentry writer",
+    );
+    testing::expect_ok(writer.write_chunk(b"abc".as_slice()), "reentry input");
+    callback.set(
+        || {
+            let _ = writer.finish();
+        },
+    );
+    testing::assert_eq(
+        testing::expect_err(writer.finish(), "reentry").kind,
+        compress::ErrorKind::State,
+    );
+    testing::assert_eq(sink.calls.get(), 1);
+    let sink = FaultWriter {
+        output: bytes::Bytes::new(),
+        calls: Ref::new(0),
+        mode: 2,
+        callback: || panic::raise("writer panic"),
+    };
+    let writer = testing::expect_ok(
+        lzw::Writer::new(sink, limits(3, 100, 10, 100), lzw::BitOrder::Lsb, 8),
+        "panic writer",
+    );
+    testing::expect_ok(writer.write_chunk(b"abc".as_slice()), "panic input");
+    testing::assert_err(panic::catch(|| writer.finish()));
+    testing::assert_eq(
+        testing::expect_err(writer.finish(), "poison").kind,
+        compress::ErrorKind::State,
+    );
+    testing::assert_eq(sink.calls.get(), 1);
+}
