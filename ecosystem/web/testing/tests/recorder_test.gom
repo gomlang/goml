@@ -1,0 +1,109 @@
+package tests;
+
+use ecosystem::web::{Router, Response, Headers};
+use ecosystem::web::testing::{Recorder, FaultTransport, Fault};
+use std::bytes::{Bytes};
+use std::testing;
+use std::task;
+
+#[test]
+fn recorder_reuses_dispatch_and_snapshots_exchanges() -> () {
+    let router = Router::new().post(
+        "/echo",
+        |request| {
+            let body = request.body().collect(1024)?;
+            Result::Ok(
+                Response::new(201).body(body).header(
+                    "x-source",
+                    request.headers().get("x-test").unwrap_or(""),
+                ),
+            )
+        },
+    );
+    let recorder = Recorder::new(router);
+    let response = testing::expect_ok(
+        testing::expect_ok(recorder.request("POST", "/echo").header("x-test", "recorded"), "header").body(
+            Bytes::from_string("payload"),
+        ).send(),
+        "record",
+    );
+    testing::assert_eq(response.status, 201);
+    testing::assert_eq(testing::expect_some(response.headers.get("x-source"), "header"), "recorded");
+    testing::assert_eq(testing::expect_ok(response.text(), "body"), "payload");
+    let exchanges = recorder.exchanges();
+    testing::assert_eq(exchanges.len(), 1);
+    testing::assert_eq(exchanges[0].method, "POST");
+    testing::assert_eq(exchanges[0].target, "/echo");
+    let _ = testing::expect_ok(
+        recorder.record("GET", "/missing", Headers::new(), Bytes::new()),
+        "missing",
+    );
+    testing::assert_eq(exchanges.len(), 1);
+    testing::assert_eq(recorder.exchanges().len(), 2);
+    testing::assert_err(recorder.record("BAD METHOD", "/", Headers::new(), Bytes::new()));
+    let exchanges = recorder.exchanges();
+    testing::assert_eq(exchanges.len(), 3);
+    testing::assert(exchanges[2].result.is_err());
+}
+
+#[test]
+fn recorder_serializes_concurrent_history_updates() -> () {
+    let recorder = Recorder::new(Router::new().get("/", |_| Result::Ok(Response::text(200, "ok"))));
+    task::scope(
+        |scope| {
+            let calls = Vec::new();
+            for _ in 0..16 {
+                calls.push(
+                    scope.spawn(|_| recorder.record("GET", "/", Headers::new(), Bytes::new())),
+                );
+            }
+            for call in calls {
+                testing::assert_eq(testing::expect_ok(call.join(), "dispatch").status, 200);
+            }
+        },
+    );
+    testing::assert_eq(recorder.exchanges().len(), 16);
+}
+
+#[test]
+fn fault_transport_rejects_truncates_and_fails_after_dispatch() -> () {
+    let called = Channel::new(1);
+    called.send(0);
+    let router = Router::new().post(
+        "/",
+        |request| {
+            let count = called.recv().unwrap_or(0);
+            called.send(count + 1);
+            let body = request.body().collect(100)?;
+            Result::Ok(Response::new(200).body(body))
+        },
+    );
+    let transport = FaultTransport::new(
+        router,
+        Vec::from_array(
+            [
+                Fault::Reject(ecosystem::web::ErrorKind::Transport),
+                Fault::TruncateBody(2),
+                Fault::FailAfter(ecosystem::web::ErrorKind::Timeout),
+            ],
+        ),
+    );
+    testing::assert_err(
+        transport.dispatch("POST", "/", Headers::new(), Bytes::from_string("hello")),
+    );
+    let partial = testing::expect_ok(
+        transport.dispatch("POST", "/", Headers::new(), Bytes::from_string("hello")),
+        "partial",
+    );
+    testing::assert_eq(testing::expect_ok(partial.text(), "partial text"), "he");
+    testing::assert_err(
+        transport.dispatch("POST", "/", Headers::new(), Bytes::from_string("hello")),
+    );
+    let normal = testing::expect_ok(
+        transport.dispatch("POST", "/", Headers::new(), Bytes::from_string("hello")),
+        "normal",
+    );
+    testing::assert_eq(testing::expect_ok(normal.text(), "normal text"), "hello");
+    testing::assert_eq(transport.calls(), 4);
+    testing::assert_eq(called.recv().unwrap_or(0), 3);
+}
