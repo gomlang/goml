@@ -81,6 +81,17 @@ Handlers, middleware, fallbacks and stream producers run inside `std::panic::cat
 
 `dispatch(method, target, headers, bytes)` runs the same GoML routing and body/stream machinery against an in-process response recorder. It does not open a socket. Handler-produced error responses remain ordinary captured responses; callback panics, transport body-limit, timeout and capture-limit failures return `Err`. A panic returns a generic `Internal` error, and request/writer aliases expire before `dispatch` returns. Targets must use origin form (`/path?query`). Captured responses copy their bytes on access.
 
+`ecosystem::web::testing` adds a reusable dispatch recorder with exchange
+history, a loopback HTTP test-server wrapper, and scripted fault dispatches.
+The child package reuses this router and server implementation; see its
+`testing/README.md` for the bounded behavior and failure modes.
+
+`ecosystem::web::proxy` adds a bounded reverse-proxy handler using the existing
+request client. It strips hop-by-hop and untrusted forwarding headers on both
+legs, retains duplicate end-to-end headers, passes backend redirects through,
+and propagates the incoming cancellation context. See [proxy/README.md](proxy/README.md)
+for body limits, response mapping and unsupported upgrade/streaming cases.
+
 ## Scope and verification
 
 The current listener serves plain HTTP/1.1 and HTTP/1.0 over TCP. TLS termination, HTTP/2, HTTP/3, WebSocket upgrades, multipart extraction, static file serving, compression negotiation and CORS are not bundled. They can be implemented as later transport or middleware additions. The library deliberately reserves transport framing headers and does not expose connection hijacking.
