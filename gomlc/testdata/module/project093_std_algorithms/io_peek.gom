@@ -1,0 +1,153 @@
+package main;
+
+use std::io;
+use io::{Read, BufRead};
+use std::bytes;
+use std::testing;
+
+struct PeekProbe {
+    cursor: io::Cursor,
+    step: isize,
+    calls: Ref[isize],
+    fail_on: Ref[isize],
+    mode: isize,
+    requests: Vec[isize],
+}
+
+fn peek_probe(value: string, step: isize, fail_on: isize, mode: isize) -> PeekProbe {
+    PeekProbe {
+        cursor: io::Cursor::new(bytes::Bytes::from_string(value)),
+        step,
+        calls: Ref::new(0),
+        fail_on: Ref::new(fail_on),
+        mode,
+        requests: Vec::new(),
+    }
+}
+
+fn peek_interrupted() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        "peek probe",
+        Option::Some("source"),
+        Option::Some(4),
+        "consumed input",
+    )
+}
+
+impl Read for PeekProbe {
+    fn read(self: PeekProbe, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        self.requests.push(output.len());
+        let length = if self.step < output.len() {
+            self.step
+        } else {
+            output.len()
+        };
+        let count = self.cursor.read(output.sub(0, length))?;
+        if self.calls.get() == self.fail_on.get() {
+            match self.mode {
+                0 => Result::Err(peek_interrupted()),
+                1 => Result::Ok(-1),
+                _ => Result::Ok(output.len() + 1),
+            }
+        } else {
+            Result::Ok(count)
+        }
+    }
+}
+
+fn check_io_peek() -> () {
+    for step in[1, 2, 8] {
+        let source = peek_probe("abcdefgh", step, -1, 0);
+        let reader = testing::expect_ok(io::BufReader::with_capacity(source, 4), "peek reader");
+        let alias = reader;
+        assert_equal(testing::expect_ok(reader.peek(0), "empty peek").len(), 0);
+        assert_equal(source.calls.get(), 0);
+        let first = testing::expect_ok(reader.peek(3), "short reads peek").to_vec();
+        assert_equal(first, b"abc");
+        let calls = source.calls.get();
+        assert_equal(testing::expect_ok(alias.peek(2), "alias peek").to_vec(), b"ab");
+        assert_equal(source.calls.get(), calls);
+        testing::expect_ok(reader.consume(2), "consume peek prefix");
+        assert_equal(testing::expect_ok(alias.peek(4), "compact peek").to_vec(), b"cdef");
+        assert_equal(reader.buffered_len(), 4);
+        assert_equal(reader.capacity(), 4);
+        assert_equal(source.cursor.position(), 6);
+        assert_equal(first, b"abc");
+        for request in source.requests {
+            testing::assert(request > 0 && request <= 4);
+        }
+        let replacement = peek_probe("XYZ", 8, -1, 0);
+        alias.reset(replacement);
+        assert_equal(reader.buffered_len(), 0);
+        assert_equal(replacement.calls.get(), 0);
+        assert_equal(testing::expect_ok(reader.peek(2), "peek after reset").to_vec(), b"XY");
+        assert_equal(reader.buffered_len(), 3);
+        let output = b"???";
+        assert_equal(testing::expect_ok(alias.read(output.as_mut_slice()), "consume after peek"), 3);
+        assert_equal(output, b"XYZ");
+    }
+    let source = peek_probe("abcdef", 8, -1, 0);
+    let reader = testing::expect_ok(io::BufReader::with_capacity(source, 4), "peek bounds");
+    for amount in[-9223372036854775807 - 1, -1, 5, 9223372036854775807] {
+        let error = testing::expect_err(reader.peek(amount), "invalid empty peek");
+        assert_equal(error.error().kind(), io::ErrorKind::InvalidInput);
+        assert_equal(error.available().len(), 0);
+        assert_equal(source.calls.get(), 0);
+    }
+    testing::expect_ok(reader.peek(4), "fill capacity");
+    testing::expect_ok(reader.consume(1), "offset for invalid peek");
+    let retained = testing::expect_ok(reader.fill_buf(), "retained view");
+    for amount in[-1, 5] {
+        let error = testing::expect_err(reader.peek(amount), "invalid buffered peek");
+        assert_equal(error.available().to_vec(), b"bcd");
+        assert_equal(error.error().kind(), io::ErrorKind::InvalidInput);
+        assert_equal(retained.to_vec(), b"bcd");
+        assert_equal(source.calls.get(), 1);
+        assert_equal(reader.buffered_len(), 3);
+    }
+    assert_equal(testing::expect_ok(reader.peek(0), "zero buffered peek").len(), 0);
+    assert_equal(source.calls.get(), 1);
+    assert_equal(reader.buffered_len(), 3);
+    let source = peek_probe("abc", 2, -1, 0);
+    let reader = testing::expect_ok(io::BufReader::with_capacity(source, 4), "peek EOF");
+    for attempt in[3, 4] {
+        let error = testing::expect_err(reader.peek(4), "partial EOF peek");
+        assert_equal(error.error().kind(), io::ErrorKind::UnexpectedEof);
+        assert_equal(error.available().to_vec(), b"abc");
+        assert_equal(source.calls.get(), attempt);
+        assert_equal(source.cursor.position(), 3);
+    }
+    assert_equal(testing::expect_ok(reader.peek(3), "confirmed EOF prefix").to_vec(), b"abc");
+    assert_equal(source.calls.get(), 4);
+    for mode in 0..3 {
+        for fail_on in[1, 3] {
+            let source = peek_probe("abcdefgh", 1, fail_on, mode);
+            let reader = testing::expect_ok(io::BufReader::with_capacity(source, 4), "failing peek");
+            let error = testing::expect_err(reader.peek(4), "peek provider failure");
+            assert_equal(error.available().to_vec(), b"ab".slice(0, fail_on - 1).to_vec());
+            assert_equal(reader.buffered_len(), fail_on - 1);
+            assert_equal(source.calls.get(), fail_on);
+            assert_equal(source.cursor.position(), fail_on);
+            if mode == 0 {
+                assert_equal(error.error(), peek_interrupted());
+            } else {
+                assert_equal(error.error().kind(), io::ErrorKind::InvalidData);
+            }
+            let confirmed = error.available().to_vec();
+            let expected = if fail_on == 1 {
+                b"bcde"
+            } else {
+                b"abde"
+            };
+            assert_equal(
+                testing::expect_ok(reader.peek(4), "explicit peek retry").to_vec(),
+                expected,
+            );
+            assert_equal(confirmed, b"ab".slice(0, fail_on - 1).to_vec());
+            assert_equal(source.cursor.position(), 5);
+            assert_equal(reader.capacity(), 4);
+        }
+    }
+}

@@ -1,0 +1,156 @@
+package main;
+
+use std::io;
+use std::io::{Write, WriteAt};
+use std::testing;
+
+fn write_retry_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        "write retry probe",
+        Option::None,
+        Option::None,
+        "interrupted after possible side effects",
+    )
+}
+
+struct WriteRetryProbe {
+    data: Vec[byte],
+    calls: Ref[isize],
+    interrupt: bool,
+    width: isize,
+}
+
+fn write_retry_probe(interrupt: bool, width: isize) -> WriteRetryProbe {
+    WriteRetryProbe { data: Vec::new(), calls: Ref::new(0), interrupt, width }
+}
+
+impl Write for WriteRetryProbe {
+    fn write(self: WriteRetryProbe, buffer: Slice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        if self.interrupt && self.calls.get() == 1 {
+            return Result::Err(write_retry_error())
+        }
+        let count = if buffer.len() < self.width {
+            buffer.len()
+        } else {
+            self.width
+        };
+        for index in 0..count {
+            self.data.push(buffer[index]);
+        }
+        Result::Ok(count)
+    }
+}
+
+struct WriteRetryForward[W] {
+    writer: W,
+}
+
+impl[W: Write] Write for WriteRetryForward[W] {
+    fn write(self: WriteRetryForward[W], buffer: Slice[byte]) -> Result[isize, io::Error] {
+        self.writer.write(buffer)
+    }
+}
+
+struct WriteRetryAt {
+    data: Vec[byte],
+    calls: Ref[isize],
+}
+
+impl WriteAt for WriteRetryAt {
+    fn write_at(self: WriteRetryAt, buffer: Slice[byte], offset: isize) -> Result[
+        isize,
+        io::TransferError,
+    ] {
+        self.calls.set(self.calls.get() + 1);
+        assert_equal(offset, self.data.len());
+        let count = if self.calls.get() == 1 && buffer.len() > 0 {
+            1
+        } else {
+            buffer.len()
+        };
+        for index in 0..count {
+            self.data.push(buffer[index]);
+        }
+        if self.calls.get() == 1 {
+            Result::Err(io::TransferError::new(count.to_usize(), write_retry_error()))
+        } else {
+            Result::Ok(count)
+        }
+    }
+}
+
+fn check_write_retry_failure(result: Result[(), io::Error]) -> () {
+    match result {
+        Err(error) => assert_equal(error, write_retry_error()),
+        Ok(_) => testing::fail("interrupted write must not be retried"),
+    }
+}
+
+fn check_io_write_retry() -> () {
+    for buffered in[false, true] {
+        let first = write_retry_probe(false, 100);
+        let second = write_retry_probe(true, 100);
+        let multi = io::MultiWriter::new(Vec::from_array([first, second]).as_slice());
+        if buffered {
+            let writer = testing::expect_ok(io::BufWriter::with_capacity(multi, 3), "buffer multi");
+            testing::expect_ok(writer.write_all(b"abc".as_slice()), "stage broadcast");
+            check_write_retry_failure(writer.flush());
+            assert_equal(writer.buffered_len(), 3);
+        } else {
+            let writer = WriteRetryForward { writer: multi };
+            check_write_retry_failure(writer.write_all(b"abc".as_slice()));
+        }
+        assert_equal(first.calls.get(), 1);
+        assert_equal(second.calls.get(), 1);
+        assert_equal(first.data, b"abc");
+        assert_equal(second.data, b"");
+    }
+    for buffered in[false, true] {
+        let destination = WriteRetryAt { data: Vec::new(), calls: Ref::new(0) };
+        let offset = testing::expect_ok(io::OffsetWriter::new(destination, 0), "offset destination");
+        if buffered {
+            let writer = testing::expect_ok(
+                io::BufWriter::with_capacity(offset, 3),
+                "buffer offset",
+            );
+            testing::expect_ok(writer.write_all(b"abc".as_slice()), "stage offset");
+            check_write_retry_failure(writer.flush());
+            assert_equal(writer.buffered_len(), 3);
+        } else {
+            let writer = WriteRetryForward { writer: offset };
+            check_write_retry_failure(writer.write_all(b"abc".as_slice()));
+        }
+        assert_equal(destination.calls.get(), 1);
+        assert_equal(destination.data, b"a");
+        assert_equal(offset.position(), 1);
+    }
+    let first = write_retry_probe(false, 100);
+    let second = write_retry_probe(true, 100);
+    let multi = io::MultiWriter::new(Vec::from_array([first, second]).as_slice());
+    let writer = testing::expect_ok(io::BufWriter::with_capacity(multi, 3), "full buffer multi");
+    check_write_retry_failure(writer.write_all(b"abcdef".as_slice()));
+    assert_equal(first.calls.get(), 1);
+    assert_equal(second.calls.get(), 1);
+    assert_equal(first.data, b"abc");
+    assert_equal(second.data, b"");
+    assert_equal(writer.buffered_len(), 3);
+    for width in 1..5 {
+        let direct = write_retry_probe(false, width);
+        testing::expect_ok(
+            WriteRetryForward { writer: direct }.write_all(b"abcdefg".as_slice()),
+            "short writes",
+        );
+        assert_equal(direct.data, b"abcdefg");
+        let destination = write_retry_probe(false, width);
+        let buffered = testing::expect_ok(
+            io::BufWriter::with_capacity(destination, 3),
+            "short buffer",
+        );
+        testing::expect_ok(buffered.write_all(b"abcdefg".as_slice()), "buffer short writes");
+        testing::expect_ok(buffered.flush(), "short flush");
+        assert_equal(destination.data, b"abcdefg");
+        assert_equal(buffered.buffered_len(), 0);
+    }
+}

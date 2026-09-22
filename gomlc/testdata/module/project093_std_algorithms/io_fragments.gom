@@ -1,0 +1,384 @@
+package main;
+
+use std::io;
+use std::testing;
+
+struct FragmentSource {
+    data: Vec[byte],
+    position: Ref[isize],
+    calls: Ref[isize],
+    requests: Vec[isize],
+    chunk: isize,
+    fail_on: isize,
+    mode: isize,
+}
+
+fn fragment_source(data: Vec[byte], chunk: isize, fail_on: isize, mode: isize) -> FragmentSource {
+    FragmentSource {
+        data,
+        position: Ref::new(0),
+        calls: Ref::new(0),
+        requests: Vec::new(),
+        chunk,
+        fail_on,
+        mode,
+    }
+}
+
+fn fragment_source_error(mode: isize) -> io::Error {
+    io::Error::new(
+        if mode == 0 {
+            io::ErrorKind::Interrupted
+        } else {
+            io::ErrorKind::BrokenPipe
+        },
+        "fragment source",
+        Option::Some("input"),
+        Option::Some(19),
+        "injected fragment failure",
+    )
+}
+
+impl io::Read for FragmentSource {
+    fn read(self: FragmentSource, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        self.requests.push(output.len());
+        testing::assert(output.len() > 0);
+        if self.calls.get() == self.fail_on {
+            output[0] = 200;
+            if self.position.get() < self.data.len() {
+                self.position.set(self.position.get() + 1);
+            }
+            return match self.mode {
+                0 | 1 => Result::Err(fragment_source_error(self.mode)),
+                2 => Result::Ok(-1),
+                _ => Result::Ok(output.len() + 1),
+            }
+        }
+        let mut count = self.data.len() - self.position.get();
+        if count > self.chunk {
+            count = self.chunk;
+        }
+        if count > output.len() {
+            count = output.len();
+        }
+        for index in 0..count {
+            output[index] = self.data[self.position.get() + index];
+        }
+        self.position.set(self.position.get() + count);
+        Result::Ok(count)
+    }
+}
+
+fn fragment_end_code(value: io::FragmentEnd) -> isize {
+    match value {
+        Delimiter => 0,
+        BufferFull => 1,
+        Eof => 2,
+    }
+}
+
+fn check_delimited_fragments(data: Vec[byte], delimiter: byte, capacity: isize, chunk: isize) -> () {
+    let source = fragment_source(data, chunk, -1, 0);
+    let reader = testing::expect_ok(
+        io::BufReader::with_capacity(source, capacity),
+        "fragment reader",
+    );
+    let alias = reader;
+    let mut offset = 0;
+    let mut finished = false;
+    for _ in 0..data.len() + 3 {
+        if finished {
+            break
+        }
+        let mut end = offset;
+        let mut kind = 2;
+        while end < data.len() && end - offset < capacity {
+            let current = data[end];
+            end += 1;
+            if current == delimiter {
+                kind = 0;
+                break
+            }
+        }
+        if kind != 0 && end - offset == capacity {
+            kind = 1;
+        }
+        let result = testing::expect_ok(alias.read_fragment(delimiter), "delimiter fragment");
+        assert_equal(result.bytes().to_vec(), data.as_slice().sub(offset, end).to_vec());
+        assert_equal(result.consumed(), end - offset);
+        assert_equal(fragment_end_code(result.end()), kind);
+        if kind == 1 {
+            testing::assert(result.bytes().len() > 0);
+        }
+        offset = end;
+        finished = kind == 2;
+    }
+    testing::assert(finished);
+    assert_equal(offset, data.len());
+    let calls = source.calls.get();
+    let eof = testing::expect_ok(reader.read_fragment(delimiter), "repeat nonsticky EOF");
+    assert_equal(fragment_end_code(eof.end()), 2);
+    assert_equal(eof.bytes().len(), 0);
+    assert_equal(eof.consumed(), 0);
+    assert_equal(source.calls.get(), calls + 1);
+    for request in source.requests {
+        testing::assert(request <= capacity);
+    }
+}
+
+fn check_line_fragments(data: Vec[byte], expected: Vec[Vec[byte]], capacity: isize, chunk: isize) -> () {
+    let source = fragment_source(data, chunk, -1, 0);
+    let reader = testing::expect_ok(
+        io::BufReader::with_capacity(source, capacity),
+        "line fragment reader",
+    );
+    let mut current: Vec[byte] = Vec::new();
+    let mut index = 0;
+    let mut done = false;
+    let mut consumed = 0;
+    for _ in 0..data.len() * 2 + 4 {
+        if done {
+            break
+        }
+        let result = testing::expect_ok(reader.read_line_fragment(), "line fragment");
+        testing::assert(result.consumed() >= result.bytes().len());
+        let wire_end = consumed + result.consumed();
+        testing::assert(wire_end <= data.len());
+        let mut payload_end = wire_end;
+        if fragment_end_code(result.end()) == 0 {
+            testing::assert(payload_end > consumed);
+            assert_equal(data[payload_end - 1], b'\n');
+            payload_end -= 1;
+            if payload_end > consumed && data[payload_end - 1] == b'\r' {
+                payload_end -= 1;
+            }
+        }
+        assert_equal(result.bytes().to_vec(), data.as_slice().sub(consumed, payload_end).to_vec());
+        consumed = wire_end;
+        for value in result.bytes() {
+            current.push(value);
+        }
+        match result.end() {
+            Delimiter => {
+                testing::assert(index < expected.len());
+                assert_equal(current, expected[index]);
+                current = Vec::new();
+                index += 1;
+            },
+            BufferFull => testing::assert(result.bytes().len() > 0),
+            Eof => {
+                if !current.is_empty() {
+                    testing::assert(index < expected.len());
+                    assert_equal(current, expected[index]);
+                    index += 1;
+                }
+                done = true;
+            },
+        }
+    }
+    testing::assert(done);
+    assert_equal(index, expected.len());
+    assert_equal(consumed, data.len());
+    for request in source.requests {
+        testing::assert(request <= capacity);
+    }
+}
+
+fn check_io_fragments() -> () {
+    for mode in 0..4 {
+        for line in[false, true] {
+            let source = fragment_source(b"abc", 1, 1, mode);
+            let reader = testing::expect_ok(
+                io::BufReader::with_capacity(source, 1),
+                "initial fragment failure",
+            );
+            let result = if line {
+                reader.read_line_fragment()
+            } else {
+                reader.read_fragment(b'\n')
+            };
+            let error = testing::expect_err(result, "no confirmed fragment");
+            assert_equal(error.bytes().len(), 0);
+            assert_equal(error.consumed(), 0);
+            assert_equal(reader.buffered_len(), 0);
+            assert_equal(source.calls.get(), 1);
+            assert_equal(source.position.get(), 1);
+            if mode < 2 {
+                assert_equal(error.error(), fragment_source_error(mode));
+            } else {
+                assert_equal(error.error().kind(), io::ErrorKind::InvalidData);
+            }
+            let next = testing::expect_ok(
+                reader.read_fragment(b'\n'),
+                "next input after unreported consumption",
+            );
+            assert_equal(next.bytes().to_vec(), b"b");
+            assert_equal(next.consumed(), 1);
+        }
+    }
+    let cr_source = fragment_source(b"\xe2\x82\r\n", 1, -1, 0);
+    let cr_reader = testing::expect_ok(io::BufReader::with_capacity(cr_source, 1), "scalar CR tail");
+    assert_equal(
+        testing::expect_ok(cr_reader.read_char(), "malformed scalar before CR"),
+        Option::Some(('�', 1)),
+    );
+    assert_equal(
+        testing::expect_ok(cr_reader.read_byte(), "continuation before CR"),
+        Option::Some(0x82.to_u8()),
+    );
+    let cr_line = testing::expect_ok(
+        cr_reader.read_line_fragment(),
+        "CR lookahead after scalar offset",
+    );
+    assert_equal(cr_line.bytes().len(), 0);
+    assert_equal(cr_line.consumed(), 2);
+    assert_equal(cr_line.end(), io::FragmentEnd::Delimiter);
+    assert_equal(cr_source.calls.get(), 4);
+    assert_equal(cr_source.position.get(), 4);
+    for capacity in 1..6 {
+        for chunk in 1..6 {
+            for code in 0..256 {
+                let delimiter = code.to_u8();
+                let other = ((code + 1) % 256).to_u8();
+                check_delimited_fragments(
+                    Vec::from_array([delimiter, other, other, delimiter, other]),
+                    delimiter,
+                    capacity,
+                    chunk,
+                );
+            }
+            check_delimited_fragments(b"", b'\n', capacity, chunk);
+            check_line_fragments(b"", Vec::new(), capacity, chunk);
+            check_line_fragments(b"\n\r\n\n", Vec::from_array([b"", b"", b""]), capacity, chunk);
+            check_line_fragments(
+                b"abc\r\ndef\nlast\r",
+                Vec::from_array([b"abc", b"def", b"last\r"]),
+                capacity,
+                chunk,
+            );
+            check_line_fragments(
+                b"\r\r\n\rX\r\r",
+                Vec::from_array([b"\r", b"\rX\r\r"]),
+                capacity,
+                chunk,
+            );
+            check_line_fragments(
+                "é\r\n界🙂\n".to_bytes(),
+                Vec::from_array(["é".to_bytes(), "界🙂".to_bytes()]),
+                capacity,
+                chunk,
+            );
+        }
+        let source = fragment_source(b"abcdef", 10, -1, 0);
+        let reader = testing::expect_ok(
+            io::BufReader::with_capacity(source, capacity),
+            "full fragment calls",
+        );
+        let fragment = testing::expect_ok(reader.read_fragment(b'\n'), "full boundary");
+        assert_equal(fragment_end_code(fragment.end()), 1);
+        assert_equal(source.calls.get(), 1);
+        let snapshot = fragment.bytes().to_vec();
+        let _ = reader.read_fragment(b'\n');
+        assert_equal(snapshot, b"abcdef".as_slice().sub(0, capacity).to_vec());
+        let source = fragment_source(Vec::from_array([b'\n']), 10, -1, 0);
+        let reader = testing::expect_ok(
+            io::BufReader::with_capacity(source, capacity),
+            "delimiter boundary calls",
+        );
+        let fragment = testing::expect_ok(reader.read_fragment(b'\n'), "delimiter first");
+        assert_equal(fragment_end_code(fragment.end()), 0);
+        assert_equal(source.calls.get(), 1);
+    }
+    for mode in 0..4 {
+        for line in[false, true] {
+            let data = if line {
+                b"\rabc"
+            } else {
+                b"abcd"
+            };
+            let capacity = if line {
+                1
+            } else {
+                3
+            };
+            let source = fragment_source(data, 1, 2, mode);
+            let reader = testing::expect_ok(
+                io::BufReader::with_capacity(source, capacity),
+                "fragment failure",
+            );
+            let result = if line {
+                reader.read_line_fragment()
+            } else {
+                reader.read_fragment(b'\n')
+            };
+            let error = testing::expect_err(result, "fragment source failure");
+            assert_equal(
+                error.bytes().to_vec(),
+                if line {
+                    b"\r"
+                } else {
+                    b"a"
+                },
+            );
+            assert_equal(error.consumed(), 1);
+            if mode < 2 {
+                assert_equal(error.error(), fragment_source_error(mode));
+            } else {
+                assert_equal(error.error().kind(), io::ErrorKind::InvalidData);
+            }
+            assert_equal(source.calls.get(), 2);
+            assert_equal(source.position.get(), 2);
+            let snapshot = error.bytes().to_vec();
+            let next = testing::expect_ok(reader.read_fragment(b'\n'), "explicit fragment recovery");
+            testing::assert(next.bytes().len() > 0);
+            assert_equal(
+                next.bytes()[0],
+                if line {
+                    b'b'
+                } else {
+                    b'c'
+                },
+            );
+            assert_equal(
+                snapshot,
+                if line {
+                    b"\r"
+                } else {
+                    b"a"
+                },
+            );
+        }
+    }
+    let source = fragment_source(b"\xe2\x82aZ", 1, -1, 0);
+    let reader = testing::expect_ok(
+        io::BufReader::with_capacity(source, 1),
+        "oversized character residue",
+    );
+    assert_equal(
+        testing::expect_ok(reader.read_char(), "malformed character"),
+        Option::Some(('�', 1)),
+    );
+    assert_equal(reader.buffered_len(), 2);
+    let calls = source.calls.get();
+    let fragment = testing::expect_ok(reader.read_fragment(b'\n'), "residue fragment");
+    assert_equal(fragment.bytes().to_vec(), b"\x82");
+    assert_equal(fragment_end_code(fragment.end()), 1);
+    assert_equal(source.calls.get(), calls);
+    testing::assert(reader.unread_char().is_err());
+    testing::assert(reader.unread_byte().is_err());
+    let fragment = testing::expect_ok(reader.read_line_fragment(), "residue line fragment");
+    assert_equal(fragment.bytes().to_vec(), b"a");
+    assert_equal(fragment_end_code(fragment.end()), 1);
+    assert_equal(source.calls.get(), calls);
+    for line in[false, true] {
+        let reader = io::BufReader::new(io::StringReader::new("ab\n"));
+        testing::expect_ok(reader.read_byte(), "prime fragment rollback");
+        let _ = if line {
+            reader.read_line_fragment()
+        } else {
+            reader.read_fragment(b'\n')
+        };
+        testing::assert(reader.unread_byte().is_err());
+    }
+}

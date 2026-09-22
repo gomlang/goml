@@ -1,0 +1,203 @@
+package main;
+
+use std::io;
+use io::{Read, BufRead};
+use std::bytes;
+use std::testing;
+
+struct DiscardProbe {
+    data: Vec[byte],
+    offset: Ref[isize],
+    width: isize,
+    reads: Ref[isize],
+    fills: Ref[isize],
+    consumes: Ref[isize],
+    fail_fill: isize,
+    fail_consume: isize,
+}
+
+fn discard_probe(width: isize) -> DiscardProbe {
+    DiscardProbe {
+        data: b"abcdef",
+        offset: Ref::new(0),
+        width,
+        reads: Ref::new(0),
+        fills: Ref::new(0),
+        consumes: Ref::new(0),
+        fail_fill: -1,
+        fail_consume: -1,
+    }
+}
+
+fn discard_probe_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        "discard probe",
+        Option::Some("source"),
+        Option::Some(4),
+        "consumed without a successful result",
+    )
+}
+
+impl Read for DiscardProbe {
+    fn read(self: DiscardProbe, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.reads.set(self.reads.get() + 1);
+        let mut count = self.data.len() - self.offset.get();
+        if count > self.width {
+            count = self.width;
+        }
+        if count > output.len() {
+            count = output.len();
+        }
+        for index in 0..count {
+            output[index] = self.data[self.offset.get() + index];
+        }
+        self.offset.set(self.offset.get() + count);
+        Result::Ok(count)
+    }
+}
+
+impl BufRead for DiscardProbe {
+    fn fill_buf(self: DiscardProbe) -> Result[Slice[byte], io::Error] {
+        self.fills.set(self.fills.get() + 1);
+        if self.fills.get() == self.fail_fill {
+            if self.offset.get() < self.data.len() {
+                self.offset.set(self.offset.get() + 1);
+            }
+            return Result::Err(discard_probe_error())
+        }
+        let mut end = self.offset.get() + self.width;
+        if end > self.data.len() {
+            end = self.data.len();
+        }
+        Result::Ok(self.data.as_slice().sub(self.offset.get(), end))
+    }
+
+    fn consume(self: DiscardProbe, amount: isize) -> Result[(), io::Error] {
+        self.consumes.set(self.consumes.get() + 1);
+        testing::assert(
+            amount > 0 && amount <= self.width && amount <= self.data.len() - self.offset.get(),
+        );
+        self.offset.set(self.offset.get() + amount);
+        if self.consumes.get() == self.fail_consume {
+            Result::Err(discard_probe_error())
+        } else {
+            Result::Ok(())
+        }
+    }
+}
+
+struct DiscardReadFault {
+    source: DiscardProbe,
+    fail_on: isize,
+}
+
+impl Read for DiscardReadFault {
+    fn read(self: DiscardReadFault, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        let count = self.source.read(output)?;
+        if self.source.reads.get() == self.fail_on {
+            Result::Err(discard_probe_error())
+        } else {
+            Result::Ok(count)
+        }
+    }
+}
+
+fn check_discard_fault(result: Result[isize, io::TransferError], count: isize) -> () {
+    let error = testing::expect_err(result, "discard interruption");
+    assert_equal(error.transferred(), count.to_usize());
+    assert_equal(error.error().kind(), io::ErrorKind::Interrupted);
+    assert_equal(error.error().to_string(), discard_probe_error().to_string());
+    assert_equal(error.error().raw_os_code(), Option::Some(4));
+}
+
+fn check_io_discard() -> () {
+    for amount in[-1, -9223372036854775807 - 1, 0] {
+        let probe = discard_probe(1);
+        if amount < 0 {
+            let error = testing::expect_err(probe.discard(amount), "negative discard");
+            assert_equal(error.transferred(), 0.to_usize());
+            assert_equal(error.error().kind(), io::ErrorKind::InvalidInput);
+        } else {
+            assert_equal(testing::expect_ok(probe.discard(amount), "zero discard"), 0);
+        }
+        assert_equal(probe.fills.get(), 0);
+        assert_equal(probe.consumes.get(), 0);
+        assert_equal(probe.reads.get(), 0);
+        assert_equal(probe.offset.get(), 0);
+    }
+    for width in[1, 2, 4, 8] {
+        for amount in 0..9 {
+            let source = discard_probe(width);
+            let reader = testing::expect_ok(
+                io::BufReader::with_capacity(source, 3),
+                "discard buffered reader",
+            );
+            let alias = reader;
+            let result = alias.discard(amount);
+            if amount <= 6 {
+                assert_equal(testing::expect_ok(result, "cross fill discard"), amount);
+                let remaining = testing::expect_ok(reader.read_to_end(6), "remaining bytes");
+                assert_equal(remaining.to_vec(), b"abcdef".as_slice().sub(amount, 6).to_vec());
+            } else {
+                let error = testing::expect_err(result, "partial EOF discard");
+                assert_equal(error.transferred(), 6.to_usize());
+                assert_equal(error.error().kind(), io::ErrorKind::UnexpectedEof);
+            }
+        }
+    }
+    let cursor = io::Cursor::new(bytes::Bytes::from_string("abc"));
+    let alias = cursor;
+    assert_equal(testing::expect_ok(alias.discard(2), "cursor discard"), 2);
+    assert_equal(cursor.position(), 2);
+    let error = testing::expect_err(cursor.discard(9223372036854775807), "large discard EOF");
+    assert_equal(error.transferred(), 1.to_usize());
+    assert_equal(error.error().kind(), io::ErrorKind::UnexpectedEof);
+    assert_equal(alias.position(), 3);
+    let source = discard_probe(4);
+    let reader = testing::expect_ok(io::BufReader::with_capacity(source, 4), "prefilled discard");
+    let snapshot = testing::expect_ok(reader.fill_buf(), "prefill").to_vec();
+    assert_equal(testing::expect_ok(reader.discard(3), "buffered only discard"), 3);
+    assert_equal(source.reads.get(), 1);
+    assert_equal(reader.buffered_len(), 1);
+    assert_equal(snapshot, b"abcd");
+    for call in[1, 2] {
+        let source = discard_probe(2);
+        let reader = testing::expect_ok(
+            io::BufReader::with_capacity(DiscardReadFault { source, fail_on: call }, 3),
+            "discard failed underlying read",
+        );
+        let alias = reader;
+        let error = testing::expect_err(reader.discard(6), "discard underlying interruption");
+        assert_equal(error.transferred(), ((call - 1) * 2).to_usize());
+        assert_equal(error.error(), discard_probe_error());
+        assert_equal(source.reads.get(), call);
+        assert_equal(source.offset.get(), call * 2);
+        assert_equal(reader.buffered_len(), 0);
+        let untouched = b"???";
+        assert_equal(
+            testing::expect_ok(alias.read(untouched.slice_mut(1, 1)), "empty read after failure"),
+            0,
+        );
+        assert_equal(untouched, b"???");
+        assert_equal(source.reads.get(), call);
+        assert_equal(
+            testing::expect_ok(alias.read_to_end(6), "explicit read after failed discard").to_vec(),
+            b"abcdef".slice(call * 2, 6).to_vec(),
+        );
+        assert_equal(source.offset.get(), 6);
+        assert_equal(source.reads.get(), 4);
+        assert_equal(source.fills.get(), 0);
+        assert_equal(source.consumes.get(), 0);
+        let source = DiscardProbe { fail_fill: call, ..discard_probe(2) };
+        check_discard_fault(source.discard(6), (call - 1) * 2);
+        assert_equal(source.fills.get(), call);
+        assert_equal(source.consumes.get(), call - 1);
+        assert_equal(source.offset.get(), (call - 1) * 2 + 1);
+        let source = DiscardProbe { fail_consume: call, ..discard_probe(2) };
+        check_discard_fault(source.discard(6), (call - 1) * 2);
+        assert_equal(source.fills.get(), call);
+        assert_equal(source.consumes.get(), call);
+        assert_equal(source.offset.get(), call * 2);
+    }
+}

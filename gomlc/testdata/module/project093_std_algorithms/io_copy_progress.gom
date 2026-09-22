@@ -1,0 +1,236 @@
+package main;
+
+use std::io;
+use io::{Read, Write};
+use std::testing;
+
+fn copy_progress_failure(kind: io::ErrorKind) -> io::Error {
+    io::Error::new(
+        kind,
+        "copy progress probe",
+        Option::Some("stream"),
+        Option::Some(73),
+        "failed after possible progress",
+    )
+}
+
+struct ProgressReader {
+    data: Vec[byte],
+    position: Ref[isize],
+    calls: Ref[isize],
+    chunk: isize,
+    fail_at: isize,
+    mode: isize,
+}
+
+fn progress_reader(length: isize, chunk: isize, fail_at: isize, mode: isize) -> ProgressReader {
+    let data = Vec::new();
+    for index in 0..length {
+        data.push((index + 1).to_u8());
+    }
+    ProgressReader { data, position: Ref::new(0), calls: Ref::new(0), chunk, fail_at, mode }
+}
+
+impl Read for ProgressReader {
+    fn read(self: ProgressReader, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        if self.position.get() == self.fail_at {
+            output[0] = 200;
+            self.position.set(self.position.get() + 1);
+            return match self.mode {
+                0 => Result::Err(copy_progress_failure(io::ErrorKind::PermissionDenied)),
+                1 => Result::Err(copy_progress_failure(io::ErrorKind::Interrupted)),
+                2 => Result::Ok(-1),
+                _ => Result::Ok(output.len() + 1),
+            }
+        }
+        let mut count = self.data.len() - self.position.get();
+        if count > output.len() {
+            count = output.len();
+        }
+        if count > self.chunk {
+            count = self.chunk;
+        }
+        for index in 0..count {
+            output[index] = self.data[self.position.get() + index];
+        }
+        self.position.set(self.position.get() + count);
+        Result::Ok(count)
+    }
+}
+
+struct ProgressWriter {
+    data: Vec[byte],
+    calls: Ref[isize],
+    chunk: isize,
+    fail_at: isize,
+    mode: isize,
+}
+
+fn progress_writer(chunk: isize, fail_at: isize, mode: isize) -> ProgressWriter {
+    ProgressWriter { data: Vec::new(), calls: Ref::new(0), chunk, fail_at, mode }
+}
+
+impl Write for ProgressWriter {
+    fn write(self: ProgressWriter, input: Slice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        if self.data.len() == self.fail_at {
+            self.data.push(input[0]);
+            return match self.mode {
+                0 => Result::Err(copy_progress_failure(io::ErrorKind::BrokenPipe)),
+                1 => Result::Err(copy_progress_failure(io::ErrorKind::Interrupted)),
+                2 => Result::Ok(-1),
+                3 => Result::Ok(input.len() + 1),
+                _ => Result::Ok(0),
+            }
+        }
+        let count = if self.chunk < input.len() {
+            self.chunk
+        } else {
+            input.len()
+        };
+        for index in 0..count {
+            self.data.push(input[index]);
+        }
+        Result::Ok(count)
+    }
+
+    fn write_all(self: ProgressWriter, input: Slice[byte]) -> Result[(), io::Error] {
+        testing::fail("copy progress must not call write_all");
+        Result::Err(copy_progress_failure(io::ErrorKind::Other))
+    }
+
+    fn flush(self: ProgressWriter) -> Result[(), io::Error] {
+        testing::fail("copy progress must not flush");
+        Result::Err(copy_progress_failure(io::ErrorKind::Other))
+    }
+}
+
+fn check_io_copy_progress() -> () {
+    for length in 0..13 {
+        for read_chunk in 1..5 {
+            for write_chunk in 1..5 {
+                for capacity in 1..6 {
+                    let reader = progress_reader(length, read_chunk, -1, 0);
+                    let reader_alias = reader;
+                    let writer = progress_writer(write_chunk, -1, 0);
+                    let writer_alias = writer;
+                    let scratch = Vec::new();
+                    for _ in 0..capacity + 2 {
+                        scratch.push(255.to_u8());
+                    }
+                    assert_equal(
+                        testing::expect_ok(
+                            io::copy_buffer_progress(
+                                reader,
+                                writer,
+                                scratch.as_mut_slice().sub(1, capacity + 1),
+                            ),
+                            "fragmented progress copy",
+                        ),
+                        length.to_u64(),
+                    );
+                    assert_equal(reader_alias.position.get(), length);
+                    assert_equal(writer_alias.data, reader.data);
+                    assert_equal(scratch[0], 255.to_u8());
+                    assert_equal(scratch[capacity + 1], 255.to_u8());
+                }
+                let reader = progress_reader(length, read_chunk, -1, 0);
+                let writer = progress_writer(write_chunk, -1, 0);
+                assert_equal(
+                    testing::expect_ok(io::copy_progress(reader, writer), "default progress copy"),
+                    length.to_u64(),
+                );
+                assert_equal(writer.data, reader.data);
+            }
+        }
+    }
+    for at in 0..8 {
+        for mode in 0..4 {
+            let reader = progress_reader(8, 1, at, mode);
+            let writer = progress_writer(1, -1, 0);
+            let scratch = b"???";
+            let error = testing::expect_err(
+                io::copy_buffer_progress(reader, writer, scratch.as_mut_slice()),
+                "reader progress failure",
+            );
+            assert_equal(error.read_count(), at.to_u64());
+            assert_equal(error.written_count(), at.to_u64());
+            assert_equal(reader.calls.get(), at + 1);
+            assert_equal(reader.position.get(), at + 1);
+            assert_equal(writer.data.len(), at);
+            assert_equal(scratch[0], 200.to_u8());
+            if mode < 2 {
+                assert_equal(
+                    error.error(),
+                    copy_progress_failure(
+                        if mode == 0 {
+                            io::ErrorKind::PermissionDenied
+                        } else {
+                            io::ErrorKind::Interrupted
+                        },
+                    ),
+                );
+            } else {
+                assert_equal(error.error().kind(), io::ErrorKind::InvalidData);
+            }
+            testing::assert(error.to_string().contains("reading"));
+            assert_equal(error.debug(), error.to_string());
+        }
+        for mode in 0..5 {
+            let reader = progress_reader(8, 3, -1, 0);
+            let writer = progress_writer(1, at, mode);
+            let scratch = b"???";
+            let error = testing::expect_err(
+                io::copy_buffer_progress(reader, writer, scratch.as_mut_slice()),
+                "writer progress failure",
+            );
+            let read_count = if at < 6 {
+                (at / 3 + 1) * 3
+            } else {
+                8
+            };
+            assert_equal(error.read_count(), read_count.to_u64());
+            assert_equal(error.written_count(), at.to_u64());
+            assert_equal(reader.position.get(), read_count);
+            assert_equal(writer.calls.get(), at + 1);
+            assert_equal(writer.data.len(), at + 1);
+            for index in 0..at + 1 {
+                assert_equal(writer.data[index], (index + 1).to_u8());
+            }
+            if mode < 2 {
+                assert_equal(
+                    error.error(),
+                    copy_progress_failure(
+                        if mode == 0 {
+                            io::ErrorKind::BrokenPipe
+                        } else {
+                            io::ErrorKind::Interrupted
+                        },
+                    ),
+                );
+            } else {
+                assert_equal(
+                    error.error().kind(),
+                    if mode == 4 {
+                        io::ErrorKind::WriteZero
+                    } else {
+                        io::ErrorKind::InvalidData
+                    },
+                );
+            }
+        }
+    }
+    let reader = progress_reader(8, 1, 0, 1);
+    let writer = progress_writer(1, 0, 1);
+    let empty: Vec[byte] = Vec::new();
+    let error = testing::expect_err(
+        io::copy_buffer_progress(reader, writer, empty.as_mut_slice()),
+        "empty copy scratch",
+    );
+    assert_equal(error.error().kind(), io::ErrorKind::InvalidInput);
+    assert_equal(error.read_count(), 0.to_u64());
+    assert_equal(error.written_count(), 0.to_u64());
+    assert_equal(reader.calls.get(), 0);
+    assert_equal(writer.calls.get(), 0);
+}

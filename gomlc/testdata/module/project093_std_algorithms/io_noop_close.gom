@@ -1,0 +1,119 @@
+package main;
+
+use std::io;
+use io::{Read, Close};
+use std::bytes;
+use std::resource;
+use std::testing;
+
+struct NoopCloseProbe {
+    reader: io::Cursor,
+    reads: Ref[isize],
+    closes: Ref[isize],
+    next: Ref[Option[Result[isize, io::Error]]],
+    length: Ref[isize],
+}
+
+fn noop_close_error(kind: io::ErrorKind) -> io::Error {
+    io::Error::new(
+        kind,
+        "noop closer probe",
+        Option::Some("source"),
+        Option::Some(7),
+        "original failure",
+    )
+}
+
+impl Read for NoopCloseProbe {
+    fn read(self: NoopCloseProbe, buffer: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.reads.set(self.reads.get() + 1);
+        self.length.set(buffer.len());
+        match self.next.get() {
+            Some(result) => {
+                if buffer.len() > 0 {
+                    buffer[0] = b'!';
+                }
+                result
+            },
+            None => self.reader.read(buffer),
+        }
+    }
+}
+
+impl Close for NoopCloseProbe {
+    fn close(self: NoopCloseProbe) -> Result[(), io::Error] {
+        self.closes.set(self.closes.get() + 1);
+        Result::Err(noop_close_error(io::ErrorKind::PermissionDenied))
+    }
+}
+
+fn check_noop_closers() -> () {
+    let source = NoopCloseProbe {
+        reader: io::Cursor::new(bytes::Bytes::from_string("abcdef")),
+        reads: Ref::new(0),
+        closes: Ref::new(0),
+        next: Ref::new(Option::None),
+        length: Ref::new(-1),
+    };
+    let reader = io::NoopCloser::new(source);
+    let alias = reader;
+    for _ in 0..3 {
+        testing::expect_ok(reader.close(), "no-op close");
+        testing::expect_ok(alias.close(), "alias no-op close");
+    }
+    assert_equal(source.closes.get(), 0);
+    assert_equal(source.reads.get(), 0);
+    let output = b"???";
+    assert_equal(testing::expect_ok(reader.read(output.slice_mut(1, 1)), "empty forwarded read"), 0);
+    assert_equal(source.reads.get(), 1);
+    assert_equal(source.length.get(), 0);
+    assert_equal(output, b"???");
+    assert_equal(testing::expect_ok(reader.read(output.slice_mut(1, 2)), "read after close"), 1);
+    assert_equal(output, b"?a?");
+    assert_equal(source.length.get(), 1);
+    testing::expect_ok(alias.read_exact(output.slice_mut(1, 2)), "alias read exact");
+    assert_equal(output, b"?b?");
+    let success: Result[isize, resource::ScopeError[string, io::Error]] = io::with_resource(
+        reader,
+        |scoped| scoped.read(output.slice_mut(1, 2)).map_err(|error| error.to_string()),
+    );
+    assert_equal(testing::expect_ok(success, "scoped no-op cleanup"), 1);
+    assert_equal(output, b"?c?");
+    assert_equal(source.closes.get(), 0);
+    let failure: Result[isize, resource::ScopeError[string, io::Error]] = io::with_resource(
+        alias,
+        |_| Result::Err("action failure"),
+    );
+    let failure = testing::expect_err(failure, "action error survives no-op cleanup");
+    assert_equal(failure.action, Option::Some("action failure"));
+    testing::assert(failure.cleanup.is_empty());
+    assert_equal(source.closes.get(), 0);
+    assert_equal(testing::expect_ok(reader.read_to_string(3), "read after scopes"), "def");
+    for count in[-1, 0, 1, 2] {
+        source.next.set(Option::Some(Result::Ok(count)));
+        let before = source.reads.get();
+        assert_equal(alias.read(output.slice_mut(1, 2)), Result::Ok(count));
+        assert_equal(source.reads.get(), before + 1);
+        assert_equal(source.length.get(), 1);
+        assert_equal(output, b"?!?");
+    }
+    for kind in[io::ErrorKind::Interrupted, io::ErrorKind::BrokenPipe] {
+        let error = noop_close_error(kind);
+        source.next.set(Option::Some(Result::Err(error)));
+        let before = source.reads.get();
+        assert_equal(reader.read(output.slice_mut(1, 2)), Result::Err(error));
+        assert_equal(source.reads.get(), before + 1);
+        testing::expect_ok(reader.close(), "close after read error");
+        assert_equal(source.closes.get(), 0);
+    }
+    source.next.set(Option::Some(Result::Ok(-1)));
+    let error = testing::expect_err(
+        reader.read_exact(output.slice_mut(1, 2)),
+        "default helper validates count",
+    );
+    assert_equal(error.kind(), io::ErrorKind::InvalidData);
+    let cursor = io::Cursor::new(bytes::Bytes::from_string("plain"));
+    let plain = io::NoopCloser::new(cursor);
+    testing::expect_ok(plain.close(), "reader without Close");
+    assert_equal(testing::expect_ok(plain.read_to_string(5), "plain reader"), "plain");
+}

@@ -1,0 +1,257 @@
+package main;
+
+use std::io;
+use io::{Read, Write, Close};
+use std::task;
+use std::testing;
+
+fn pipe_case(body: (task::Scope, io::PipeReader, io::PipeWriter) -> ()) -> () {
+    task::scope(
+        |scope| {
+            let (reader, writer) = io::pipe();
+            defer {
+                let _ = reader.close();
+                let _ = writer.close();
+                scope.cancel();
+            };
+            let watchdog = scope.spawn(
+                |cancel| {
+                    match task::sleep_nanoseconds_with(cancel, 10000000000) {
+                        task::WaitResult::Completed(()) => {
+                            let _ = reader.close();
+                            let _ = writer.close();
+                            true
+                        },
+                        task::WaitResult::Cancelled => false,
+                    }
+                },
+            );
+            body(scope, reader, writer);
+            scope.cancel();
+            testing::assert(!watchdog.join());
+        },
+    );
+}
+
+fn pipe_write_error(result: Result[isize, io::Error]) -> () {
+    match result {
+        Err(error) => assert_equal(error.kind(), io::ErrorKind::BrokenPipe),
+        Ok(_) => testing::fail("closed pipe write must fail"),
+    }
+}
+
+fn check_io_pipe() -> () {
+    pipe_case(
+        |scope, reader, writer| {
+            let empty: Vec[byte] = Vec::new();
+            assert_equal(
+                testing::expect_ok(reader.read(empty.as_mut_slice()), "empty open pipe read"),
+                0,
+            );
+            assert_equal(
+                testing::expect_ok(writer.write(empty.as_slice()), "empty open pipe write"),
+                0,
+            );
+            assert_equal(
+                testing::expect_ok(
+                    writer.write_progress(empty.as_slice()),
+                    "empty progress pipe write",
+                ),
+                0,
+            );
+            let started: Channel[()] = Channel::new(1);
+            let producer = scope.spawn(
+                |_| {
+                    let input = b"abcdef";
+                    started.send(());
+                    let count = testing::expect_ok(
+                        writer.write_progress(input.as_slice()),
+                        "pipe write progress",
+                    );
+                    for index in 0..input.len() {
+                        input[index] = b'X';
+                    }
+                    count
+                },
+            );
+            testing::expect_some(started.recv(), "producer started");
+            let output = b"??";
+            let alias = reader;
+            assert_equal(
+                testing::expect_ok(alias.read(output.as_mut_slice()), "first partial pipe read"),
+                2,
+            );
+            assert_equal(output, b"ab");
+            let finished = producer.done();
+            let early = select {
+                recv(finished) as _ => true,
+                default => false,
+            };
+            testing::assert(!early);
+            assert_equal(
+                testing::expect_ok(reader.read(output.as_mut_slice()), "second partial pipe read"),
+                2,
+            );
+            assert_equal(output, b"cd");
+            let early = select {
+                recv(finished) as _ => true,
+                default => false,
+            };
+            testing::assert(!early);
+            assert_equal(
+                testing::expect_ok(reader.read(output.as_mut_slice()), "final partial pipe read"),
+                2,
+            );
+            assert_equal(producer.join(), 6);
+            assert_equal(output, b"ef");
+            let writer_alias = writer;
+            testing::expect_ok(writer_alias.close(), "normal writer close");
+            assert_equal(testing::expect_ok(reader.read(output.as_mut_slice()), "pipe EOF"), 0);
+            assert_equal(testing::expect_ok(alias.read(output.as_mut_slice()), "shared EOF"), 0);
+        },
+    );
+    pipe_case(
+        |scope, reader, writer| {
+            let producer = scope.spawn(|_| writer.write_progress(b"abcdef".as_slice()));
+            let output = b"??";
+            assert_equal(
+                testing::expect_ok(reader.read(output.as_mut_slice()), "read before close"),
+                2,
+            );
+            testing::expect_ok(reader.close(), "close reader with active writer");
+            let error = testing::expect_err(producer.join(), "writer interrupted by reader close");
+            assert_equal(error.transferred(), 2.to_usize());
+            assert_equal(error.error().kind(), io::ErrorKind::BrokenPipe);
+            pipe_write_error(writer.write(b"x".as_slice()));
+            assert_equal(output, b"ab");
+        },
+    );
+    pipe_case(
+        |scope, reader, writer| {
+            let producers: Vec[task::Task[isize]] = Vec::new();
+            for id in 0..8 {
+                producers.push(
+                    scope.spawn(
+                        |_| {
+                            let input = Vec::new();
+                            for _ in 0..7 {
+                                input.push((id + 1).to_u8());
+                            }
+                            let count = testing::expect_ok(
+                                writer.write(input.as_slice()),
+                                "concurrent pipe write",
+                            );
+                            for index in 0..input.len() {
+                                input[index] = 255;
+                            }
+                            count
+                        },
+                    ),
+                );
+            }
+            let actual = Vec::new();
+            let output = b"???";
+            while actual.len() < 56 {
+                let count = testing::expect_ok(
+                    reader.read(output.as_mut_slice()),
+                    "concurrent write collection",
+                );
+                testing::assert(count > 0);
+                for index in 0..count {
+                    actual.push(output[index]);
+                }
+            }
+            for producer in producers {
+                assert_equal(producer.join(), 7);
+            }
+            let seen = Vec::new();
+            for _ in 0..8 {
+                seen.push(false);
+            }
+            for block in 0..8 {
+                let id = actual[block * 7].to_isize() - 1;
+                testing::assert(id >= 0 && id < 8);
+                testing::assert(!seen[id]);
+                seen[id] = true;
+                for index in 0..7 {
+                    assert_equal(actual[block * 7 + index], (id + 1).to_u8());
+                }
+            }
+        },
+    );
+    pipe_case(
+        |scope, reader, writer| {
+            let consumers: Vec[task::Task[Vec[byte]]] = Vec::new();
+            for _ in 0..5 {
+                consumers.push(
+                    scope.spawn(
+                        |_| {
+                            let received = Vec::new();
+                            let output = b"??";
+                            loop {
+                                let count = testing::expect_ok(
+                                    reader.read(output.as_mut_slice()),
+                                    "concurrent pipe reader",
+                                );
+                                if count == 0 {
+                                    break
+                                }
+                                for index in 0..count {
+                                    received.push(output[index]);
+                                }
+                            }
+                            received
+                        },
+                    ),
+                );
+            }
+            let input = Vec::new();
+            for code in 0..128 {
+                input.push(code.to_u8());
+            }
+            assert_equal(
+                testing::expect_ok(
+                    writer.write_progress(input.as_slice()),
+                    "write to concurrent readers",
+                ),
+                128,
+            );
+            for index in 0..input.len() {
+                input[index] = 255;
+            }
+            testing::expect_ok(writer.close(), "close concurrent source");
+            let counts = Vec::new();
+            for _ in 0..128 {
+                counts.push(0);
+            }
+            let mut total = 0;
+            for consumer in consumers {
+                for value in consumer.join() {
+                    testing::assert(value < 128);
+                    counts[value.to_isize()] += 1;
+                    total += 1;
+                }
+            }
+            assert_equal(total, 128);
+            for count in counts {
+                assert_equal(count, 1);
+            }
+        },
+    );
+    pipe_case(
+        |scope, reader, writer| {
+            let started: Channel[()] = Channel::new(1);
+            let consumer = scope.spawn(
+                |_| {
+                    let output = b"?";
+                    started.send(());
+                    reader.read(output.as_mut_slice())
+                },
+            );
+            testing::expect_some(started.recv(), "reader started");
+            testing::expect_ok(writer.close(), "wake waiting reader with EOF");
+            assert_equal(testing::expect_ok(consumer.join(), "waiting reader EOF"), 0);
+            pipe_write_error(writer.write(b"x".as_slice()));
+        },
+    );
+}

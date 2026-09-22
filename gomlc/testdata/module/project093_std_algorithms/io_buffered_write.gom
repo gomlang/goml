@@ -1,0 +1,267 @@
+package main;
+
+use std::io;
+use io::{Read, Write, Close};
+use std::bytes;
+use std::testing;
+
+struct BufferedWriteSink {
+    data: Vec[byte],
+    calls: Ref[isize],
+    flushes: Ref[isize],
+    closes: Ref[isize],
+    step: isize,
+    fail_on: isize,
+}
+
+fn buffered_write_sink(step: isize, fail_on: isize) -> BufferedWriteSink {
+    BufferedWriteSink {
+        data: Vec::new(),
+        calls: Ref::new(0),
+        flushes: Ref::new(0),
+        closes: Ref::new(0),
+        step,
+        fail_on,
+    }
+}
+
+fn buffered_write_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        "buffered write probe",
+        Option::Some("stream"),
+        Option::Some(4),
+        "unconfirmed side effects",
+    )
+}
+
+impl Write for BufferedWriteSink {
+    fn write(self: BufferedWriteSink, input: Slice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        let count = if input.len() < self.step {
+            input.len()
+        } else {
+            self.step
+        };
+        for index in 0..count {
+            self.data.push(input[index]);
+        }
+        if self.calls.get() == self.fail_on {
+            Result::Err(buffered_write_error())
+        } else {
+            Result::Ok(count)
+        }
+    }
+
+    fn flush(self: BufferedWriteSink) -> Result[(), io::Error] {
+        self.flushes.set(self.flushes.get() + 1);
+        Result::Ok(())
+    }
+}
+
+impl Close for BufferedWriteSink {
+    fn close(self: BufferedWriteSink) -> Result[(), io::Error] {
+        self.closes.set(self.closes.get() + 1);
+        Result::Ok(())
+    }
+}
+
+struct BufferedWriteSource {
+    cursor: io::Cursor,
+    calls: Ref[isize],
+    fail_on: isize,
+    invalid: Option[isize],
+}
+
+impl Read for BufferedWriteSource {
+    fn read(self: BufferedWriteSource, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        let count = self.cursor.read(output.sub(0, 1))?;
+        if self.calls.get() == self.fail_on {
+            match self.invalid {
+                Some(value) => Result::Ok(value),
+                None => Result::Err(buffered_write_error()),
+            }
+        } else {
+            Result::Ok(count)
+        }
+    }
+}
+
+fn check_io_buffered_write() -> () {
+    for capacity in 1..6 {
+        let sink = buffered_write_sink(1, -1);
+        let writer = testing::expect_ok(
+            io::BufWriter::with_capacity(sink, capacity),
+            "buffered writer",
+        );
+        let alias = writer;
+        testing::expect_ok(writer.write_byte(255), "arbitrary byte");
+        assert_equal(testing::expect_ok(alias.write_char('🙂'), "buffered scalar"), 4);
+        assert_equal(testing::expect_ok(writer.write_string("界\u0000é"), "buffered text"), 6);
+        assert_equal(sink.flushes.get(), 0);
+        assert_equal(sink.closes.get(), 0);
+        testing::assert(writer.buffered_len() > 0);
+        testing::expect_ok(alias.flush(), "explicit drain");
+        assert_equal(sink.data, b"\xff\xf0\x9f\x99\x82\xe7\x95\x8c\x00\xc3\xa9");
+        assert_equal(sink.flushes.get(), 1);
+        assert_equal(sink.closes.get(), 0);
+    }
+    let large = "🙂".repeat(1100);
+    let sink = buffered_write_sink(2, -1);
+    let writer = testing::expect_ok(io::BufWriter::with_capacity(sink, 5), "multi-scratch text");
+    assert_equal(testing::expect_ok(writer.write_string(large), "large text accepted"), 4400);
+    assert_equal(sink.flushes.get(), 0);
+    testing::expect_ok(writer.flush(), "large text flush");
+    assert_equal(sink.data, large.to_bytes());
+    let split_scalar = "a" + large;
+    for capacity in 1..6 {
+        let sink = buffered_write_sink(3, -1);
+        let writer = testing::expect_ok(
+            io::BufWriter::with_capacity(sink, capacity),
+            "split scalar writer",
+        );
+        assert_equal(
+            testing::expect_ok(writer.write_string(split_scalar), "split scalar scratch boundary"),
+            split_scalar.byte_len(),
+        );
+        assert_equal(sink.flushes.get(), 0);
+        testing::expect_ok(writer.flush(), "split scalar flush");
+        assert_equal(sink.data, split_scalar.to_bytes());
+    }
+    let sink = buffered_write_sink(1, 4097);
+    let writer = testing::expect_ok(io::BufWriter::with_capacity(sink, 1), "second scratch failure");
+    let error = testing::expect_err(writer.write_string(large), "progress across scratch chunks");
+    assert_equal(error.transferred(), 4097.to_usize());
+    assert_equal(error.error(), buffered_write_error());
+    assert_equal(sink.calls.get(), 4097);
+    assert_equal(writer.buffered_len(), 1);
+    assert_equal(sink.flushes.get(), 0);
+    for scalar in[false, true] {
+        let sink = buffered_write_sink(1, 2);
+        let writer = testing::expect_ok(
+            io::BufWriter::with_capacity(sink, 2),
+            "partial Unicode writer",
+        );
+        let result = if scalar {
+            writer.write_char('🙂')
+        } else {
+            writer.write_string("🙂界")
+        };
+        let error = testing::expect_err(result, "partial scalar bytes accepted");
+        assert_equal(error.transferred(), 2.to_usize());
+        assert_equal(error.error(), buffered_write_error());
+        assert_equal(writer.buffered_len(), 1);
+        assert_equal(sink.data, b"\xf0\x9f");
+        assert_equal(sink.calls.get(), 2);
+        assert_equal(
+            testing::expect_ok(writer.write_string(""), "empty text after failed drain"),
+            0,
+        );
+        assert_equal(sink.calls.get(), 2);
+        assert_equal(writer.buffered_len(), 1);
+        let replacement = buffered_write_sink(4, -1);
+        let alias = writer;
+        alias.reset(replacement);
+        assert_equal(testing::expect_ok(writer.write_string("ok"), "alias reset writer"), 2);
+        testing::expect_ok(alias.flush(), "new sink only");
+        assert_equal(replacement.data, b"ok");
+        assert_equal(sink.calls.get(), 2);
+        assert_equal(sink.flushes.get(), 0);
+        assert_equal(sink.closes.get(), 0);
+    }
+    for operation in 0..3 {
+        let sink = buffered_write_sink(1, 1);
+        let writer = testing::expect_ok(
+            io::BufWriter::with_capacity(sink, 2),
+            "pending drain writer",
+        );
+        assert_equal(testing::expect_ok(writer.write_string("ab"), "old pending text"), 2);
+        assert_equal(testing::expect_ok(writer.write_string(""), "empty full writer"), 0);
+        assert_equal(sink.calls.get(), 0);
+        if operation == 0 {
+            assert_equal(writer.write_byte(b'X'), Result::Err(buffered_write_error()));
+        } else {
+            let result = if operation == 1 {
+                writer.write_char('界')
+            } else {
+                writer.write_string("new")
+            };
+            let error = testing::expect_err(result, "old drain failure");
+            assert_equal(error.transferred(), 0.to_usize());
+            assert_equal(error.error(), buffered_write_error());
+        }
+        assert_equal(sink.data, b"a");
+        assert_equal(writer.buffered_len(), 2);
+        assert_equal(sink.calls.get(), 1);
+        assert_equal(sink.flushes.get(), 0);
+        assert_equal(sink.closes.get(), 0);
+    }
+    let sink = buffered_write_sink(2, -1);
+    let writer = testing::expect_ok(
+        io::BufWriter::with_capacity(sink, 3),
+        "read into buffered writer",
+    );
+    testing::expect_ok(writer.write_byte(b'!'), "existing pending prefix");
+    let source = BufferedWriteSource {
+        cursor: io::Cursor::new(bytes::Bytes::from_string("abcdef")),
+        calls: Ref::new(0),
+        fail_on: -1,
+        invalid: Option::None,
+    };
+    assert_equal(testing::expect_ok(writer.read_from(source), "short source read"), 6.to_u64());
+    assert_equal(source.calls.get(), 7);
+    assert_equal(writer.buffered_len(), 1);
+    assert_equal(sink.data, b"!abcde");
+    assert_equal(sink.flushes.get(), 0);
+    testing::expect_ok(writer.flush(), "explicit copy flush");
+    assert_equal(sink.data, b"!abcdef");
+    assert_equal(sink.closes.get(), 0);
+    let sink = buffered_write_sink(1, 1);
+    let writer = testing::expect_ok(
+        io::BufWriter::with_capacity(sink, 2),
+        "copy destination failure",
+    );
+    testing::expect_ok(writer.write_byte(b'!'), "pending destination prefix");
+    let source = io::Cursor::new(bytes::Bytes::from_string("abcdef"));
+    let error = testing::expect_err(writer.read_from(source), "copy drain failure");
+    assert_equal(error.read_count(), 6.to_u64());
+    assert_equal(error.written_count(), 1.to_u64());
+    assert_equal(error.error(), buffered_write_error());
+    assert_equal(source.position(), 6);
+    assert_equal(writer.buffered_len(), 2);
+    assert_equal(sink.data, b"!");
+    assert_equal(sink.calls.get(), 1);
+    assert_equal(sink.flushes.get(), 0);
+    assert_equal(sink.closes.get(), 0);
+    for invalid in[Option::None, Option::Some(-1), Option::Some(8193)] {
+        let sink = buffered_write_sink(1, -1);
+        let writer = testing::expect_ok(
+            io::BufWriter::with_capacity(sink, 5),
+            "failed buffered copy",
+        );
+        testing::expect_ok(writer.write_byte(b'!'), "old copy pending byte");
+        let source = BufferedWriteSource {
+            cursor: io::Cursor::new(bytes::Bytes::from_string("abcdef")),
+            calls: Ref::new(0),
+            fail_on: 3,
+            invalid,
+        };
+        let error = testing::expect_err(writer.read_from(source), "copy source failure");
+        assert_equal(error.read_count(), 2.to_u64());
+        assert_equal(error.written_count(), 2.to_u64());
+        if invalid.is_none() {
+            assert_equal(error.error(), buffered_write_error());
+        } else {
+            assert_equal(error.error().kind(), io::ErrorKind::InvalidData);
+        }
+        assert_equal(source.calls.get(), 3);
+        assert_equal(source.cursor.position(), 3);
+        assert_equal(writer.buffered_len(), 3);
+        assert_equal(sink.calls.get(), 0);
+        assert_equal(sink.flushes.get(), 0);
+        testing::expect_ok(writer.flush(), "flush confirmed copied prefix");
+        assert_equal(sink.data, b"!ab");
+        assert_equal(sink.closes.get(), 0);
+    }
+}
