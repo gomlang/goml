@@ -6,6 +6,19 @@ It provides reusable concurrent clients, request builders, typed JSON, forms,
 multipart uploads, validated multivalue headers, URL handling, authentication,
 redirect policies, cancellation and bounded response bodies.
 
+Form/query codecs reuse the pure GoML `std::net::url` implementation. Request
+retains its text policy: decoded fields must be valid UTF-8, malformed escapes
+and raw semicolons fail, duplicate values keep their order, and fields are sorted
+by name when encoded. Raw URL parsing does not automatically decode queries;
+`Url::query` and the builder query operation perform that validation. Paths retain
+their original valid percent spelling instead of using the standard ASCII
+serializer's uppercase normalization. Absolute URL decomposition and path-escape
+validation use `std::net::url::Reference`; raw query parsing remains separate.
+Fragment text is dropped before decomposition, retaining the client's existing
+fragment policy. HTTP(S), credential and redirect policies
+remain in this ecosystem module. These shared APIs require the development
+toolchain containing `std::net::url`; this change does not publish a registry version.
+
 The implementation is pure GoML: URL and MIME encoding, HTTP/1.1 framing,
 HTTP/2 and HPACK, connection pooling, cookies, proxies and redirects are ordinary
 GoML code. TCP, DNS, TLS and cancellation use `std::net`, `std::net::tls` and
