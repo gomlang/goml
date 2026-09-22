@@ -1,0 +1,223 @@
+package fs;
+
+use module::collections;
+use module::io;
+use io::Close;
+
+struct DirectoryWork {
+    remaining: Ref[isize],
+}
+
+fn directory_work_take(work: Option[DirectoryWork], amount: isize) -> bool {
+    if amount < 0 {
+        return false
+    }
+    match work {
+        None => true,
+        Some(work) => {
+            let remaining = work.remaining.get();
+            if remaining < amount {
+                false
+            } else {
+                work.remaining.set(remaining - amount);
+                true
+            }
+        },
+    }
+}
+
+struct NamedDirectoryBatch[E] {
+    entries: Vec[(string, E)],
+    cause: Option[Error],
+    limited: bool,
+}
+
+fn directory_data_error(name: string, message: string) -> Error {
+    Error::new(
+        io::ErrorKind::InvalidData,
+        "read directory",
+        Option::Some(name),
+        Option::None,
+        message,
+    )
+}
+
+fn directory_work_error(name: string) -> Error {
+    Error::new(
+        io::ErrorKind::InvalidData,
+        "walk",
+        Option::Some(name),
+        Option::None,
+        "filesystem work limit exceeded",
+    )
+}
+
+fn named_directory_batch[E](entries: Vec[(string, E)], cause: Option[Error], limited: bool) -> NamedDirectoryBatch[
+    E,
+] {
+    collections::stable_sort_by(
+        entries,
+        |left: (string, E), right: (string, E)| {
+            if left.0 < right.0 {
+                -1
+            } else if left.0 > right.0 {
+                1
+            } else {
+                0
+            }
+        },
+    );
+    NamedDirectoryBatch { entries, cause, limited }
+}
+
+fn collect_named_directory[D: ReadDirFile](
+    file: D,
+    name: string,
+    max_entries: isize,
+    work: Option[DirectoryWork],
+) -> NamedDirectoryBatch[D::Entry] {
+    let entries: Vec[(string, D::Entry)] = Vec::new();
+    loop {
+        let remaining = max_entries - entries.len();
+        let mut requested = if remaining < 128 {
+            remaining + 1
+        } else {
+            128
+        };
+        if let Some(work) = work {
+            let available = work.remaining.get();
+            if available < 2 {
+                return named_directory_batch(
+                    entries,
+                    Option::Some(directory_work_error(name)),
+                    true,
+                )
+            }
+            if requested > available - 1 {
+                requested = available - 1;
+            }
+        }
+        if !directory_work_take(work, 1) {
+            return named_directory_batch(entries, Option::Some(directory_work_error(name)), true)
+        }
+        let (page, cause) = match file.read_dir(requested) {
+            Ok(page) => (page.as_slice(), Option::None),
+            Err(error) => (error.entries(), Option::Some(error.error())),
+        };
+        if page.len() > requested {
+            return named_directory_batch(
+                entries,
+                Option::Some(directory_data_error(name, "directory page exceeds requested count")),
+                false,
+            )
+        }
+        if !directory_work_take(work, page.len()) {
+            return named_directory_batch(entries, Option::Some(directory_work_error(name)), true)
+        }
+        let cached: Vec[(string, D::Entry)] = Vec::with_capacity(page.len());
+        let mut valid = true;
+        for entry in page {
+            let entry_name = entry.name();
+            if entry_name == "." || !valid_path(entry_name) || entry_name.contains("/") {
+                valid = false;
+            }
+            cached.push((entry_name, entry));
+        }
+        if !valid {
+            return named_directory_batch(
+                entries,
+                Option::Some(directory_data_error(name, "invalid directory entry name")),
+                false,
+            )
+        }
+        let accepted = if cached.len() > remaining {
+            remaining
+        } else {
+            cached.len()
+        };
+        for index in 0..accepted {
+            entries.push(cached[index]);
+        }
+        if let Some(error) = cause {
+            return named_directory_batch(entries, Option::Some(error), false)
+        }
+        if cached.len() > remaining {
+            return named_directory_batch(
+                entries,
+                Option::Some(directory_data_error(name, "directory exceeds entry limit")),
+                true,
+            )
+        }
+        if cached.is_empty() {
+            return named_directory_batch(entries, Option::None, false)
+        }
+    }
+}
+
+fn read_named_directory_from[F: FileSystem](
+    filesystem: F,
+    name: string,
+    max_entries: isize,
+    work: Option[DirectoryWork],
+) -> NamedDirectoryBatch[F::Handle::Entry] where F::Handle: ReadDirFile {
+    if !directory_work_take(work, 1) {
+        return named_directory_batch(Vec::new(), Option::Some(directory_work_error(name)), true)
+    }
+    let file = match filesystem.open(name) {
+        Ok(file) => file,
+        Err(error) => return named_directory_batch(Vec::new(), Option::Some(error), false),
+    };
+    let needs_close = Ref::new(true);
+    defer {
+        if needs_close.get() {
+            needs_close.set(false);
+            let _ = file.close();
+        }
+    };
+    let batch = collect_named_directory(file, name, max_entries, work);
+    needs_close.set(false);
+    let closed = file.close().map_err(|error| portable_io_error(error, "close file", name));
+    if batch.cause.is_some() {
+        batch
+    } else {
+        match closed {
+            Ok(()) => batch,
+            Err(error) => NamedDirectoryBatch {
+                entries: batch.entries,
+                cause: Option::Some(error),
+                limited: false,
+            },
+        }
+    }
+}
+
+pub fn read_dir_from[F: FileSystem](filesystem: F, name: string, max_entries: isize) -> Result[
+    Vec[F::Handle::Entry],
+    ReadDirError[F::Handle::Entry],
+] where F::Handle: ReadDirFile {
+    if !valid_path(name) {
+        return Result::Err(
+            ReadDirError::new(
+                Vec::new(),
+                portable_input_error("read directory", name, "invalid filesystem path"),
+            ),
+        )
+    }
+    if max_entries < 0 {
+        return Result::Err(
+            ReadDirError::new(
+                Vec::new(),
+                portable_input_error("read directory", name, "limit must be non-negative"),
+            ),
+        )
+    }
+    let batch = read_named_directory_from(filesystem, name, max_entries, Option::None);
+    let entries = Vec::with_capacity(batch.entries.len());
+    for entry in batch.entries {
+        entries.push(entry.1);
+    }
+    match batch.cause {
+        Some(error) => Result::Err(ReadDirError::new(entries, error)),
+        None => Result::Ok(entries),
+    }
+}

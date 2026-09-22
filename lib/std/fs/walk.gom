@@ -1,0 +1,211 @@
+package fs;
+
+use module::io;
+
+pub enum WalkControl {
+    Continue,
+    SkipDir,
+    SkipAll,
+}
+
+pub struct WalkLimits {
+    pub max_depth: isize,
+    pub max_directory_entries: isize,
+    pub max_directories: isize,
+    pub max_work: isize,
+}
+
+enum WalkEntrySource[E] {
+    Root(Metadata),
+    Child(E),
+}
+
+pub struct WalkEntry[E] {
+    name_value: string,
+    type_value: FileType,
+    source: WalkEntrySource[E],
+}
+
+impl[E: DirectoryEntry] DirectoryEntry for WalkEntry[E] {
+    fn name(self: WalkEntry[E]) -> string {
+        self.name_value
+    }
+
+    fn file_type(self: WalkEntry[E]) -> FileType {
+        self.type_value
+    }
+
+    fn metadata(self: WalkEntry[E]) -> Result[Metadata, Error] {
+        match self.source {
+            Root(value) => Result::Ok(value),
+            Child(entry) => entry.metadata(),
+        }
+    }
+}
+
+struct WalkFrame[E] {
+    path: string,
+    depth: isize,
+    entries: Vec[(string, E)],
+    position: isize,
+}
+
+fn walk_next[E: DirectoryEntry](frames: Vec[WalkFrame[E]]) -> Option[(string, WalkEntry[E], isize)] {
+    loop {
+        if frames.is_empty() {
+            return Option::None
+        }
+        let top = frames.len() - 1;
+        let frame = frames[top];
+        if frame.position == frame.entries.len() {
+            let _ = frames.pop();
+        } else {
+            let (name, source) = frame.entries[frame.position];
+            frames[top] = WalkFrame {
+                path: frame.path,
+                depth: frame.depth,
+                entries: frame.entries,
+                position: frame.position + 1,
+            };
+            let path = if frame.path == "." {
+                name
+            } else {
+                frame.path + "/" + name
+            };
+            let entry = WalkEntry {
+                name_value: name,
+                type_value: source.file_type(),
+                source: WalkEntrySource::Child(source),
+            };
+            return Option::Some((path, entry, frame.depth + 1))
+        }
+    }
+}
+
+fn walk_limit_error(path: string, message: string) -> Error {
+    Error::new(io::ErrorKind::InvalidData, "walk", Option::Some(path), Option::None, message)
+}
+
+fn walk_limit_failure[E](
+    path: string,
+    entry: Option[WalkEntry[E]],
+    cause: Error,
+    visit: (string, Option[WalkEntry[E]], Option[Error]) -> Result[WalkControl, Error],
+) -> Result[(), Error] {
+    match visit(path, entry, Option::Some(cause))? {
+        SkipAll => Result::Ok(()),
+        Continue | SkipDir => Result::Err(cause),
+    }
+}
+
+fn walk_root_name(root: string) -> string {
+    let mut start = 0;
+    for index in 0..root.byte_len() {
+        if root.byte_get(index) == b'/' {
+            start = index + 1;
+        }
+    }
+    root.byte_slice(start, root.byte_len())
+}
+
+pub fn walk_from[F: FileSystem](
+    filesystem: F,
+    root: string,
+    limits: WalkLimits,
+    visit: (string, Option[WalkEntry[F::Handle::Entry]], Option[Error]) -> Result[
+        WalkControl,
+        Error,
+    ],
+) -> Result[(), Error] where F::Handle: ReadDirFile {
+    if !valid_path(root) {
+        return Result::Err(portable_input_error("walk", root, "invalid filesystem path"))
+    }
+    if limits.max_depth < 0 || limits.max_directory_entries < 0 || limits.max_directories < 0
+        || limits.max_work < 0 {
+        return Result::Err(portable_input_error("walk", root, "limits must be non-negative"))
+    }
+    let work = DirectoryWork { remaining: Ref::new(limits.max_work) };
+    if !directory_work_take(Option::Some(work), 1) {
+        return walk_limit_failure(root, Option::None, directory_work_error(root), visit)
+    }
+    let metadata = match stat_from(filesystem, root) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            let _ = visit(root, Option::None, Option::Some(error))?;
+            return Result::Ok(())
+        },
+    };
+    let root_entry: WalkEntry[F::Handle::Entry] = WalkEntry {
+        name_value: walk_root_name(root),
+        type_value: metadata.file_type(),
+        source: WalkEntrySource::Root(metadata),
+    };
+    let frames: Vec[WalkFrame[F::Handle::Entry]] = Vec::new();
+    let mut current = Option::Some((root, root_entry, 0));
+    let mut directories = 0;
+    while let Some((path, entry, depth)) = current {
+        let control = visit(path, Option::Some(entry), Option::None)?;
+        match control {
+            SkipAll => return Result::Ok(()),
+            SkipDir => {
+                if !entry.type_value.is_dir() {
+                    let _ = frames.pop();
+                }
+            },
+            Continue => {
+                if entry.type_value.is_dir() {
+                    if depth >= limits.max_depth {
+                        return walk_limit_failure(
+                            path,
+                            Option::Some(entry),
+                            walk_limit_error(path, "walk exceeds depth limit"),
+                            visit,
+                        )
+                    }
+                    if directories >= limits.max_directories {
+                        return walk_limit_failure(
+                            path,
+                            Option::Some(entry),
+                            walk_limit_error(path, "walk exceeds directory limit"),
+                            visit,
+                        )
+                    }
+                    directories += 1;
+                    let batch = read_named_directory_from(
+                        filesystem,
+                        path,
+                        limits.max_directory_entries,
+                        Option::Some(work),
+                    );
+                    if batch.limited {
+                        let message = match batch.cause {
+                            Some(cause) => cause.message(),
+                            None => "walk exceeds collection limit",
+                        };
+                        return walk_limit_failure(
+                            path,
+                            Option::Some(entry),
+                            walk_limit_error(path, message),
+                            visit,
+                        )
+                    }
+                    let mut descend = true;
+                    if let Some(error) = batch.cause {
+                        match visit(path, Option::Some(entry), Option::Some(error))? {
+                            Continue => (),
+                            SkipDir => {
+                                descend = false;
+                            },
+                            SkipAll => return Result::Ok(()),
+                        }
+                    }
+                    if descend && !batch.entries.is_empty() {
+                        frames.push(WalkFrame { path, depth, entries: batch.entries, position: 0 });
+                    }
+                }
+            },
+        }
+        current = walk_next(frames);
+    }
+    Result::Ok(())
+}
