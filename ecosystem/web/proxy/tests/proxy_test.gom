@@ -1,0 +1,140 @@
+package tests;
+
+use ecosystem::request::{Client, RedirectPolicy};
+use ecosystem::web::{Router, Response};
+use ecosystem::web::proxy::{Proxy};
+use ecosystem::web::testing::{TestServer};
+use std::testing;
+use std::time::{Duration};
+
+#[test]
+fn reverse_proxy_forwards_path_query_body_status_and_safe_headers() -> () {
+    let backend = testing::expect_ok(
+        TestServer::start(
+            Router::new().fallback(
+                |incoming| {
+                    let forwarded = incoming.headers().get("x-forwarded-for").unwrap_or("");
+                    let host = incoming.headers().get("x-forwarded-host").unwrap_or("");
+                    let proto = incoming.headers().get("x-forwarded-proto").unwrap_or("");
+                    let body = incoming.text()?;
+                    Result::Ok(
+                        Response::text(
+                            201,
+                            incoming.method() + " " + incoming.path() + "?" + incoming.raw_query()
+                                + " "
+                                + body
+                                + " "
+                                + forwarded
+                                + " "
+                                + host
+                                + " "
+                                + proto,
+                        ).append_header("x-duplicate", "one").append_header("x-duplicate", "two"),
+                    )
+                },
+            ),
+        ),
+        "backend",
+    );
+    defer {
+        let _ = backend.shutdown(Duration::from_seconds(2));
+    };
+    let upstream = testing::expect_ok(Client::new(), "upstream client");
+    defer upstream.close();
+    let proxy = testing::expect_ok(
+        Proxy::new(backend.base_url() + "/base", upstream, 1024, 1024),
+        "proxy",
+    );
+    let frontend = testing::expect_ok(
+        TestServer::start(Router::new().fallback(proxy.handler())),
+        "frontend",
+    );
+    defer {
+        let _ = frontend.shutdown(Duration::from_seconds(2));
+    };
+    let client = testing::expect_ok(Client::new(), "client");
+    defer client.close();
+    let received = testing::expect_ok(
+        client.post(frontend.base_url() + "/child?q=one%20two").text("payload").header(
+            "x-forwarded-for",
+            "spoofed",
+        ).send(),
+        "proxied response",
+    );
+    testing::assert_eq(received.status().as_isize(), 201);
+    testing::assert_eq(received.headers().get_all("x-duplicate").len(), 2);
+    let body = testing::expect_ok(received.text(), "response body");
+    testing::assert(body.starts_with("POST /base/child?q=one%20two payload 127.0.0.1 "));
+    testing::assert(body.ends_with(" http"));
+    testing::assert(!body.contains("spoofed"));
+}
+
+#[test]
+fn reverse_proxy_limits_bodies_and_maps_upstream_failures() -> () {
+    let backend = testing::expect_ok(
+        TestServer::start(Router::new().fallback(|_| Result::Ok(Response::text(200, "long")))),
+        "backend",
+    );
+    let upstream = testing::expect_ok(Client::new(), "upstream client");
+    defer upstream.close();
+    let proxy = testing::expect_ok(Proxy::new(backend.base_url(), upstream, 2, 2), "proxy");
+    let frontend = testing::expect_ok(
+        TestServer::start(Router::new().fallback(proxy.handler())),
+        "frontend",
+    );
+    defer {
+        let _ = frontend.shutdown(Duration::from_seconds(2));
+    };
+    let client = testing::expect_ok(Client::new(), "client");
+    defer client.close();
+    let too_large = testing::expect_ok(
+        client.post(frontend.base_url() + "/").text("three").send(),
+        "oversize inbound response",
+    );
+    testing::assert_eq(too_large.status().as_isize(), 413);
+    let upstream_limit = testing::expect_ok(
+        client.get(frontend.base_url() + "/").send(),
+        "oversize upstream response",
+    );
+    testing::assert_eq(upstream_limit.status().as_isize(), 502);
+    testing::assert_ok(backend.shutdown(Duration::from_seconds(2)));
+    let unavailable = testing::expect_ok(
+        client.get(frontend.base_url() + "/").send(),
+        "unavailable upstream response",
+    );
+    testing::assert_eq(unavailable.status().as_isize(), 502);
+}
+
+#[test]
+fn reverse_proxy_preserves_redirects_and_rejects_unsafe_targets() -> () {
+    let backend = testing::expect_ok(
+        TestServer::start(Router::new().get("/base/redirect", |_| Response::redirect(302, "/next"))),
+        "backend",
+    );
+    defer {
+        let _ = backend.shutdown(Duration::from_seconds(2));
+    };
+    let outbound = testing::expect_ok(Client::new(), "upstream client");
+    defer outbound.close();
+    testing::assert_err(Proxy::new(backend.base_url() + "?q=1", outbound, 1, 1));
+    testing::assert_err(Proxy::new(backend.base_url(), outbound, -1, 1));
+    let proxy = testing::expect_ok(
+        Proxy::new(backend.base_url() + "/base", outbound, 1024, 1024),
+        "proxy",
+    );
+    let frontend = testing::expect_ok(
+        TestServer::start(Router::new().fallback(proxy.handler())),
+        "frontend",
+    );
+    defer {
+        let _ = frontend.shutdown(Duration::from_seconds(2));
+    };
+    let client = testing::expect_ok(Client::new(), "client");
+    defer client.close();
+    let received = testing::expect_ok(
+        client.get(frontend.base_url() + "/redirect").redirect(RedirectPolicy::None).send(),
+        "redirect response",
+    );
+    testing::assert_eq(received.status().as_isize(), 302);
+    testing::assert_eq(received.headers().get("location").unwrap_or(""), "/next");
+}
