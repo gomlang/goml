@@ -1,0 +1,272 @@
+package main;
+
+use std::rand;
+use std::bytes;
+use std::testing;
+use std::utf8;
+
+#[go_ffi("unicode/utf8", "DecodeRune")]
+extern fn go_decode_rune(input: Slice[byte]) -> (char, isize);
+
+#[go_ffi("unicode/utf8", "DecodeLastRune")]
+extern fn go_decode_last_rune(input: Slice[byte]) -> (char, isize);
+
+#[go_ffi("unicode/utf8", "FullRune")]
+extern fn go_full_rune(input: Slice[byte]) -> bool;
+
+#[go_ffi("unicode/utf8", "RuneCount")]
+extern fn go_rune_count(input: Slice[byte]) -> isize;
+
+#[go_ffi("unicode/utf8", "Valid")]
+extern fn go_valid_utf8(input: Slice[byte]) -> bool;
+
+#[go_ffi("unicode/utf8", "ValidRune")]
+extern fn go_valid_rune(value: i32) -> bool;
+
+#[go_ffi("unicode/utf8", "RuneStart")]
+extern fn go_rune_start(value: byte) -> bool;
+
+#[go_ffi("unicode/utf8", "EncodeRune")]
+extern fn go_encode_rune(output: MutSlice[byte], value: char) -> isize;
+
+fn check_utf8_case(input: Slice[byte]) -> () {
+    let first = go_decode_rune(input);
+    assert_equal(utf8::decode_rune(input), first);
+    assert_equal(utf8::decode_last_rune(input), go_decode_last_rune(input));
+    assert_equal(utf8::full_rune(input), go_full_rune(input));
+    assert_equal(utf8::rune_count(input), go_rune_count(input));
+    assert_equal(utf8::validate(input).is_ok(), go_valid_utf8(input));
+    if !go_valid_utf8(input) {
+        let mut index = 0;
+        while index < input.len() {
+            let suffix = input.sub(index, input.len());
+            let (value, width) = go_decode_rune(suffix);
+            if value == utf8::REPLACEMENT && width == 1 {
+                let error = testing::expect_err(utf8::validate(input), "invalid UTF-8 offset");
+                assert_equal(error.valid_up_to(), index);
+                assert_equal(
+                    error.error_length(),
+                    if go_full_rune(suffix) {
+                        Option::Some(1)
+                    } else {
+                        Option::None
+                    },
+                );
+                break
+            }
+            index += width;
+        }
+    }
+    let strict = utf8::decode_first(input);
+    if first.1 == 0 || (first.0 == '�' && first.1 == 1) {
+        testing::assert(strict.is_err());
+    } else {
+        assert_equal(testing::expect_ok(strict, "strict scalar"), first);
+    }
+}
+
+fn check_utf8_stream(input: Slice[byte]) -> () {
+    let decoder = utf8::Decoder::new();
+    let chars: Vec[char] = Vec::new();
+    let mut failed = false;
+    for value in input {
+        match decoder.feed(value) {
+            Result::Ok(Option::Some(character)) => chars.push(character),
+            Result::Ok(Option::None) => (),
+            Result::Err(utf8::DecoderError::InvalidUtf8(error)) => {
+                failed = true;
+                assert_equal(utf8::validate(input), Result::Err(error));
+                let consumed = decoder.consumed();
+                testing::assert(decoder.feed(b'x').is_err());
+                testing::assert(decoder.finish().is_err());
+                assert_equal(decoder.consumed(), consumed);
+                break
+            },
+            _ => testing::fail("unexpected decoder state"),
+        }
+    }
+    if !failed {
+        match decoder.finish() {
+            Result::Ok(()) => {
+                testing::assert(go_valid_utf8(input));
+                assert_equal(
+                    chars.join(""),
+                    testing::expect_ok(utf8::decode_slice(input), "valid stream"),
+                );
+                testing::expect_ok(decoder.finish(), "idempotent finish");
+                match decoder.feed(b'x') {
+                    Result::Err(utf8::DecoderError::Finished) => (),
+                    _ => testing::fail("feed after finish was not rejected"),
+                }
+            },
+            Result::Err(utf8::DecoderError::InvalidUtf8(error)) => {
+                assert_equal(error.error_length(), Option::None);
+                assert_equal(utf8::validate(input), Result::Err(error));
+            },
+            _ => testing::fail("unexpected finish error"),
+        }
+    }
+    decoder.reset();
+    assert_equal(decoder.consumed(), 0);
+    assert_equal(testing::expect_ok(decoder.feed(b'x'), "reset stream"), Option::Some('x'));
+    testing::expect_ok(decoder.finish(), "reset finish");
+}
+
+fn check_utf8() -> () {
+    check_utf8_multibyte_boundaries();
+    let empty: Vec[byte] = Vec::new();
+    check_utf8_case(empty.as_slice());
+    check_utf8_stream(empty.as_slice());
+    for first in 0..256 {
+        assert_equal(utf8::rune_start(first.to_u8()), go_rune_start(first.to_u8()));
+        check_utf8_case(Vec::from_array([first.to_u8()]).as_slice());
+        for second in 0..256 {
+            check_utf8_case(Vec::from_array([first.to_u8(), second.to_u8()]).as_slice());
+        }
+    }
+    for raw in Vec::from_array(
+        [
+            0,
+            0x7f,
+            0x80,
+            0x7ff,
+            0x800,
+            0xd7ff,
+            0xd800,
+            0xdfff,
+            0xe000,
+            0xffff,
+            0x10000,
+            0x10ffff,
+            0x110000,
+            0xffffffff,
+        ],
+    ) {
+        assert_equal(utf8::valid_scalar(raw.to_u32()), go_valid_rune(raw.to_i32()));
+    }
+    let mut scalar: u32 = 0;
+    while scalar <= 0x10ffff {
+        if let Option::Some(value) = char_from_u32(scalar) {
+            let encoded = utf8::encode_char(value);
+            let buffer: Vec[byte] = Vec::from_array([0, 0, 0, 0]);
+            let width = go_encode_rune(buffer.as_mut_slice(), value);
+            assert_equal(encoded, buffer.slice(0, width).to_vec());
+            assert_equal(utf8::encoded_len(value), width);
+            let builder = bytes::Builder::new();
+            utf8::encode_char_to(value, builder);
+            assert_equal(builder.to_vec(), encoded);
+            check_utf8_case(encoded.as_slice());
+            check_utf8_stream(encoded.as_slice());
+            let output: Vec[byte] = Vec::from_array([99, 99, 99, 99, 99, 99]);
+            assert_equal(
+                testing::expect_ok(
+                    utf8::encode_char_into(value, output.as_mut_slice(), 1),
+                    "scalar output",
+                ),
+                width,
+            );
+            assert_equal(output.slice(1, width + 1).to_vec(), encoded);
+            assert_equal(output[0], 99.to_u8());
+            assert_equal(output[width + 1], 99.to_u8());
+            let before = output.copy();
+            testing::assert(utf8::encode_char_into(value, output.as_mut_slice(), -1).is_err());
+            testing::assert(utf8::encode_char_into(value, output.as_mut_slice(), 7).is_err());
+            testing::assert(utf8::encode_char_into(value, output.as_mut_slice(), 6).is_err());
+            assert_equal(output, before);
+        }
+        scalar += 97;
+    }
+    for input in Vec::from_array(
+        [
+            Vec::from_array([0xe0, 0x80]),
+            Vec::from_array([0xe1, 0x80]),
+            Vec::from_array([0xed, 0xa0, 0x80]),
+            Vec::from_array([0xf0, 0x80, 0x80]),
+            Vec::from_array([0xf4, 0x90, 0x80, 0x80]),
+            Vec::from_array([0xf4, 0x8f, 0xbf, 0xbf]),
+            Vec::from_array([0xef, 0xbf, 0xbd]),
+            Vec::from_array([0xf0, 0x90, 0x80, 0x80]),
+            Vec::from_array([0x61, 0xe2, 0x82]),
+            Vec::from_array([0x61, 0xe2, 0x82, 0xac, 0xff]),
+        ],
+    ) {
+        let bytes: Vec[byte] = Vec::new();
+        for value in input {
+            bytes.push(value.to_u8())
+        }
+        for end in 0..bytes.len() + 1 {
+            check_utf8_case(bytes.slice(0, end));
+            check_utf8_stream(bytes.slice(0, end));
+        }
+    }
+    let mut seed: u64 = 419;
+    for length in 0..4096 {
+        seed = rand::next_u64(seed);
+        let input = rand::bytes(seed, length % 33);
+        check_utf8_case(input.as_slice());
+        check_utf8_stream(input.as_slice());
+        let expected: Vec[char] = Vec::new();
+        let mut index = 0;
+        while index < input.len() {
+            let (value, width) = go_decode_rune(input.slice(index, input.len()));
+            expected.push(value);
+            index += width;
+        }
+        assert_equal(utf8::decode_lossy(input.as_slice()), expected.join(""));
+    }
+    let decoder = utf8::Decoder::new();
+    let alias = decoder;
+    assert_equal(testing::expect_ok(decoder.feed(0xe2), "initial fragment"), Option::None);
+    assert_equal(testing::expect_ok(alias.feed(0x82), "shared fragment"), Option::None);
+    assert_equal(testing::expect_ok(decoder.feed(0xac), "complete fragment"), Option::Some('€'));
+    assert_equal(alias.consumed(), 3);
+    alias.reset();
+    assert_equal(decoder.consumed(), 0);
+    match utf8::validate(Vec::from_array([0xe0.to_u8(), 0x80.to_u8()]).as_slice()) {
+        Result::Err(error) => assert_equal(error.error_length(), Option::Some(1)),
+        _ => testing::fail("overlong prefix accepted"),
+    }
+}
+
+fn check_utf8_multibyte_boundaries() -> () {
+    for lead in[0xc2, 0xdf, 0xe0, 0xe1, 0xed, 0xef, 0xf0, 0xf1, 0xf4] {
+        for second in 0..256 {
+            for third in[0, 0x7f, 0x80, 0xbf, 0xff] {
+                for fourth in[0, 0x7f, 0x80, 0xbf, 0xff] {
+                    let data = Vec::from_array(
+                        [lead.to_u8(), second.to_u8(), third.to_u8(), fourth.to_u8()],
+                    );
+                    check_utf8_case(data.as_slice());
+                    let prefixed = Vec::from_array([b'x', 0xc2.to_u8(), 0xa2.to_u8()]);
+                    prefixed.extend(data);
+                    check_utf8_case(prefixed.as_slice());
+                    check_utf8_stream(prefixed.as_slice());
+                    let mut end = prefixed.len();
+                    while end > 0 {
+                        let expected = go_decode_last_rune(prefixed.slice(0, end));
+                        assert_equal(utf8::decode_last_rune(prefixed.slice(0, end)), expected);
+                        end -= expected.1;
+                    }
+                }
+            }
+        }
+    }
+    let decoder = utf8::Decoder::new();
+    let alias = decoder;
+    testing::expect_ok(decoder.feed(b'x'), "prefix ASCII");
+    testing::expect_ok(alias.feed(0xf0), "incomplete prefix");
+    testing::expect_ok(decoder.feed(0x90), "incomplete continuation");
+    match alias.finish() {
+        Err(utf8::DecoderError::InvalidUtf8(error)) => {
+            assert_equal(error.valid_up_to(), 1);
+            assert_equal(error.error_length(), Option::None);
+        },
+        _ => testing::fail("incomplete stream not rejected"),
+    }
+    testing::assert(decoder.feed(0x80).is_err());
+    assert_equal(alias.consumed(), 3);
+    decoder.reset();
+    assert_equal(alias.consumed(), 0);
+    assert_equal(testing::expect_ok(alias.feed(b'a'), "reset alias"), Option::Some('a'));
+    testing::expect_ok(alias.finish(), "reset finish");
+}
