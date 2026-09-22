@@ -1,0 +1,279 @@
+package cookies;
+
+use std::net;
+use std::unicode;
+
+struct StoredCookie {
+    domain: string,
+    host_only: bool,
+    path: string,
+    name: string,
+    value: string,
+    secure: bool,
+    expires: Option[i64],
+    sequence: i64,
+}
+
+pub struct Jar {
+    suffixes: SuffixList,
+    entries: Vec[StoredCookie],
+    next_sequence: i64,
+}
+
+fn domain_matches(host: string, domain: string) -> bool {
+    host == domain || host.ends_with("." + domain)
+}
+
+fn path_matches(path: string, cookie_path: string) -> bool {
+    path == cookie_path
+        || path.starts_with(cookie_path)
+            && (cookie_path.ends_with("/")
+                || path.byte_slice(cookie_path.byte_len(), path.byte_len()).starts_with("/"))
+}
+
+fn default_path(request_path: string) -> string {
+    if !request_path.starts_with("/") {
+        return "/"
+    }
+    let directory = request_path.rfind("/").unwrap_or(0);
+    if directory == 0 {
+        "/"
+    } else {
+        request_path.byte_slice(0, directory)
+    }
+}
+
+fn cookie_token(value: string) -> bool {
+    if value == "" {
+        return false
+    }
+    for byte in value.to_bytes() {
+        if !((byte >= b'a' && byte <= b'z') || (byte >= b'A' && byte <= b'Z')
+            || (byte >= b'0' && byte <= b'9')
+            || byte == b'!'
+            || byte == b'#'
+            || byte == b'$'
+            || byte == b'%'
+            || byte == b'&'
+            || byte == b'\''
+            || byte == b'*'
+            || byte == b'+'
+            || byte == b'-'
+            || byte == b'.'
+            || byte == b'^'
+            || byte == b'_'
+            || byte == b'`'
+            || byte == b'|'
+            || byte == b'~') {
+            return false
+        }
+    }
+    true
+}
+
+fn evict_oldest(entries: Vec[StoredCookie], domain: Option[string]) -> () {
+    let mut oldest = Option::None;
+    for index in 0..entries.len() {
+        if domain.map(|value| value == entries[index].domain).unwrap_or(true) {
+            if oldest.map(|value| entries[index].sequence < entries[value].sequence).unwrap_or(true) {
+                oldest = Option::Some(index);
+            }
+        }
+    }
+    if let Some(index) = oldest {
+        let _ = entries.remove(index);
+    }
+}
+
+impl Jar {
+    pub fn new() -> Option[Jar] {
+        default_suffix_list().map(|list| Jar::with_suffixes(list))
+    }
+
+    pub fn with_suffixes(suffixes: SuffixList) -> Jar {
+        Jar { suffixes, entries: Vec::new(), next_sequence: 0 }
+    }
+
+    pub fn len(self: Jar) -> isize {
+        self.entries.len()
+    }
+
+    pub fn prune(self: Jar, now: i64) -> Jar {
+        let entries: Vec[StoredCookie] = Vec::new();
+        for cookie in self.entries {
+            if cookie.expires.map(|expiry| expiry > now).unwrap_or(true) {
+                entries.push(cookie);
+            }
+        }
+        Jar { entries, ..self }
+    }
+
+    fn parse(self: Jar, host: string, request_path: string, text: string, now: i64) -> Option[
+        StoredCookie,
+    ] {
+        if text.byte_len() > 4096 || !valid_domain(host) && net::IpAddr::parse(host).is_err() {
+            return Option::None
+        }
+        let parts = text.split(";");
+        let (name, value) = parts[0].trim().split_once("=")?;
+        if !cookie_token(name) {
+            return Option::None
+        }
+        let value = if value.starts_with("\"") && value.ends_with("\"") && value.byte_len() >= 2 {
+            value.byte_slice(1, value.byte_len() - 1)
+        } else {
+            value
+        };
+        for byte in value.to_bytes() {
+            if byte < 32 || byte >= 127 || byte == b';' || byte == b'\\' || byte == b'"' {
+                return Option::None
+            }
+        }
+        let mut domain = host;
+        let mut host_only = true;
+        let mut path = default_path(request_path);
+        let mut secure = false;
+        let mut expires = Option::None;
+        let mut max_age = Option::None;
+        for index in 1..parts.len() {
+            let part = parts[index].trim();
+            let (key, value) = part.split_once("=").unwrap_or((part, ""));
+            match lower_ascii(key.trim()) {
+                "domain" => {
+                    let mut candidate = unicode::lowercase(value.trim());
+                    if candidate.starts_with(".") {
+                        candidate = candidate.byte_slice(1, candidate.byte_len());
+                    }
+                    if !valid_domain(candidate) || !domain_matches(host, candidate) {
+                        return Option::None
+                    }
+                    if net::IpAddr::parse(host).is_ok() {
+                        if host != candidate {
+                            return Option::None
+                        }
+                    } else {
+                        let suffix = self.suffixes.suffix(candidate)?;
+                        if suffix == candidate && host != candidate {
+                            return Option::None
+                        }
+                        if suffix != candidate {
+                            host_only = false;
+                        }
+                    }
+                    domain = candidate;
+                },
+                "path" => if value.starts_with("/") {
+                    path = value;
+                },
+                "secure" => {
+                    secure = true;
+                },
+                "expires" => {
+                    expires = cookie_date(value);
+                },
+                "max-age" => if value.starts_with("-") {
+                    if decimal(value.byte_slice(1, value.byte_len())).is_some() {
+                        max_age = Option::Some(now);
+                    }
+                } else if let Some(age) = decimal(value) {
+                    max_age = Option::Some(
+                        if age == 0 {
+                            now
+                        } else if now > 9223372036854775807 - age.to_i64() {
+                            9223372036854775807
+                        } else {
+                            now + age.to_i64()
+                        },
+                    );
+                },
+                _ => (),
+            }
+        }
+        Option::Some(
+            StoredCookie {
+                domain,
+                host_only,
+                path,
+                name,
+                value,
+                secure,
+                expires: if max_age.is_some() {
+                    max_age
+                } else {
+                    expires
+                },
+                sequence: self.next_sequence,
+            },
+        )
+    }
+
+    pub fn set(self: Jar, host: string, path: string, header: string, now: i64) -> Jar {
+        let host = unicode::lowercase(host);
+        let jar = self.prune(now);
+        let mut cookie = match jar.parse(host, path, header, now) {
+            Some(cookie) => cookie,
+            None => return jar,
+        };
+        let entries: Vec[StoredCookie] = Vec::new();
+        for old in jar.entries {
+            if old.domain == cookie.domain && old.path == cookie.path && old.name == cookie.name {
+                cookie.sequence = old.sequence;
+            } else {
+                entries.push(old);
+            }
+        }
+        let mut next_sequence = jar.next_sequence;
+        if cookie.sequence == next_sequence && next_sequence < 9223372036854775807 {
+            next_sequence += 1;
+        }
+        if cookie.expires.map(|expiry| expiry > now).unwrap_or(true) {
+            entries.push(cookie);
+        }
+        let mut domain_count = 0;
+        for stored in entries {
+            if stored.domain == cookie.domain {
+                domain_count += 1;
+            }
+        }
+        if domain_count > 180 {
+            evict_oldest(entries, Option::Some(cookie.domain));
+        }
+        if entries.len() > 3000 {
+            evict_oldest(entries, Option::None);
+        }
+        Jar { entries, next_sequence, ..jar }
+    }
+
+    pub fn header(self: Jar, host: string, path: string, secure: bool, now: i64) -> (Jar, string) {
+        let jar = self.prune(now);
+        let host = unicode::lowercase(host);
+        let matches: Vec[StoredCookie] = Vec::new();
+        for cookie in jar.entries {
+            if (cookie.host_only && cookie.domain == host
+                || !cookie.host_only && domain_matches(host, cookie.domain))
+                && path_matches(path, cookie.path)
+                && (!cookie.secure || secure) {
+                matches.push(cookie);
+            }
+        }
+        matches.stable_sort_by(
+            |left, right| if left.path.byte_len() != right.path.byte_len() {
+                right.path.byte_len() - left.path.byte_len()
+            } else if left.sequence < right.sequence {
+                -1
+            } else if left.sequence > right.sequence {
+                1
+            } else {
+                0
+            },
+        );
+        let mut value = "";
+        for cookie in matches {
+            if value != "" {
+                value += "; ";
+            }
+            value += cookie.name + "=" + cookie.value;
+        };
+        (jar, value)
+    }
+}
