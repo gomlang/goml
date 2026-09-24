@@ -1,0 +1,152 @@
+package core;
+
+use module::ast;
+
+const DCE_MAX_TYPE_NODES: isize = 256;
+
+fn dce_bounded_types(values: Vec[Type], remaining: Ref[isize]) -> bool {
+    for value in values {
+        if !dce_bounded_type(value, remaining) {
+            return false
+        }
+    }
+    true
+}
+
+fn dce_bounded_named_types(values: Vec[(string, Type)], remaining: Ref[isize]) -> bool {
+    for value in values {
+        if !dce_bounded_type(value.1, remaining) {
+            return false
+        }
+    }
+    true
+}
+
+fn dce_bounded_type(value: Type, remaining: Ref[isize]) -> bool {
+    if remaining.get() <= 0 {
+        return false
+    }
+    remaining.set(remaining.get() - 1);
+    match value {
+        Param { .. } | Projection { .. } | Error => false,
+        External { args, .. } => dce_bounded_types(args, remaining),
+        Tuple { items } => dce_bounded_types(items, remaining),
+        Dyn { args, associated_types, additional_bounds, .. } => {
+            if !dce_bounded_types(args, remaining)
+                || !dce_bounded_named_types(associated_types, remaining) {
+                return false
+            }
+            for bound in additional_bounds {
+                if !dce_bounded_types(bound.args, remaining)
+                    || !dce_bounded_named_types(bound.associated_types, remaining) {
+                    return false
+                }
+            }
+            true
+        },
+        App { ty, args } => dce_bounded_type(ty, remaining) && dce_bounded_types(args, remaining),
+        Array { elem, .. } | Slice { elem } | MutSlice { elem } | VecType { elem } | GoPointer {
+            elem,
+        } | GoFunction { signature: elem } | RefType { elem } | Channel { elem, .. } => {
+            dce_bounded_type(elem, remaining)
+        },
+        HashMap { key, value } | GoMap { key, value } => {
+            dce_bounded_type(key, remaining) && dce_bounded_type(value, remaining)
+        },
+        Func { params, ret_ty } => {
+            dce_bounded_types(params, remaining) && dce_bounded_type(ret_ty, remaining)
+        },
+        Unit | Never | Bool | Int | Int8 | Int16 | Int32 | Int64 | Uint | Uint8 | Uint16 | Uint32 | Uint64 | Float32 | Float64 | String | Char | Con {
+            ..,
+        } => true,
+    }
+}
+
+fn dce_bindable_type(value: Type) -> bool {
+    dce_bounded_type(value, Ref::new(DCE_MAX_TYPE_NODES))
+}
+
+fn dce_match_types(patterns: Vec[Type], actuals: Vec[Type], bindings: Vec[(string, Type)]) -> bool {
+    if patterns.len() != actuals.len() {
+        return false
+    }
+    for index in 0..patterns.len() {
+        if !dce_match_type(patterns[index], actuals[index], bindings) {
+            return false
+        }
+    }
+    true
+}
+
+fn dce_match_type(pattern: Type, actual: Type, bindings: Vec[(string, Type)]) -> bool {
+    match (pattern, actual) {
+        (_, Param { .. } | Projection { .. } | Error) => true,
+        (Param { name }, actual) => {
+            for binding in bindings {
+                if binding.0 == name {
+                    return dce_match_type(binding.1, actual, Vec::new())
+                }
+            }
+            if dce_bindable_type(actual) {
+                bindings.push((name, actual))
+            }
+            true
+        },
+        (Projection { .. } | Error, _) => true,
+        (
+            External { import_path: left_path, name: left_name, args: left_args },
+            External { import_path: right_path, name: right_name, args: right_args },
+        ) => left_path == right_path && left_name == right_name
+            && dce_match_types(left_args, right_args, bindings),
+        (Tuple { items: left }, Tuple { items: right }) => dce_match_types(left, right, bindings),
+        (Dyn { trait_name: left, .. }, Dyn { trait_name: right, .. }) => left == right,
+        (App { ty: left, args: left_args }, App { ty: right, args: right_args }) => {
+            dce_match_type(left, right, bindings)
+                && dce_match_types(left_args, right_args, bindings)
+        },
+        (Array { len: left_len, elem: left }, Array { len: right_len, elem: right }) => {
+            left_len == right_len && dce_match_type(left, right, bindings)
+        },
+        (Slice { elem: left }, Slice { elem: right }) | (
+            MutSlice { elem: left },
+            MutSlice { elem: right },
+        ) | (VecType { elem: left }, VecType { elem: right }) | (
+            GoPointer { elem: left },
+            GoPointer { elem: right },
+        ) | (GoFunction { signature: left }, GoFunction { signature: right }) | (
+            RefType { elem: left },
+            RefType { elem: right },
+        ) => dce_match_type(left, right, bindings),
+        (
+            Channel { elem: left, direction: left_direction },
+            Channel { elem: right, direction: right_direction },
+        ) => ast::channel_directions_equal(left_direction, right_direction)
+            && dce_match_type(left, right, bindings),
+        (
+            HashMap { key: left_key, value: left_value },
+            HashMap { key: right_key, value: right_value },
+        ) | (
+            GoMap { key: left_key, value: left_value },
+            GoMap { key: right_key, value: right_value },
+        ) => {
+            dce_match_type(left_key, right_key, bindings)
+                && dce_match_type(left_value, right_value, bindings)
+        },
+        (
+            Func { params: left_params, ret_ty: left_ret },
+            Func { params: right_params, ret_ty: right_ret },
+        ) => {
+            dce_match_types(left_params, right_params, bindings)
+                && dce_match_type(left_ret, right_ret, bindings)
+        },
+        _ => types_equal(pattern, actual),
+    }
+}
+
+fn dce_function_type(value: Function) -> Type {
+    let params = Vec::new();
+    for param in value.params {
+        params.push(param.1)
+    }
+    Type::Func { params, ret_ty: value.ret_ty }
+}

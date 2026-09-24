@@ -1,0 +1,602 @@
+package core;
+
+use module::tast;
+
+const DCE_MAX_FUNCTION_USES: isize = 32;
+
+struct DceFunctionUse {
+    name: string,
+    bindings: Vec[(string, Type)],
+}
+
+struct DceFunctions {
+    functions: HashMap[string, Function],
+    inherent_methods: HashMap[string, Vec[string]],
+    trait_functions: HashMap[string, Vec[string]],
+    trait_methods: HashMap[string, Vec[string]],
+    trait_names: DceNames,
+    reachable: DceNames,
+    pending: Vec[DceFunctionUse],
+    visited: DceNames,
+    generalized: DceNames,
+    use_counts: HashMap[string, isize],
+    bindings: Vec[(string, Type)],
+    constants: HashMap[string, Constant],
+    live_constants: DceNames,
+}
+
+fn dce_function_names_add(values: HashMap[string, Vec[string]], key: string, name: string) -> () {
+    values.entry(key).or_insert_with(|| Vec::new()).push(name)
+}
+
+fn dce_trait_method_key(trait_name: string, method_name: string) -> string {
+    f"{trait_name.byte_len()}:{trait_name}{method_name}"
+}
+
+fn dce_functions_context(value: File) -> DceFunctions {
+    let functions: HashMap[string, Function] = HashMap::new();
+    let inherent_methods: HashMap[string, Vec[string]] = HashMap::new();
+    let trait_functions: HashMap[string, Vec[string]] = HashMap::new();
+    let trait_methods: HashMap[string, Vec[string]] = HashMap::new();
+    let trait_names = new_dce_names();
+    for function in value.functions {
+        functions[function.name] = function;
+        match function.origin {
+            Inherent { owner: _, method_name } => {
+                dce_function_names_add(inherent_methods, method_name, function.name)
+            },
+            TraitImplementation { method_name } => match function.trait_impl {
+                Some(metadata) => {
+                    dce_names_add(trait_names, metadata.trait_ref.name);
+                    dce_function_names_add(trait_functions, metadata.trait_ref.name, function.name);
+                    dce_function_names_add(
+                        trait_methods,
+                        dce_trait_method_key(metadata.trait_ref.name, method_name),
+                        function.name,
+                    )
+                },
+                None => (),
+            },
+            Source => (),
+        }
+    }
+    let constants: HashMap[string, Constant] = HashMap::new();
+    for constant in value.constants {
+        constants[constant.name] = constant;
+    }
+    DceFunctions {
+        functions,
+        inherent_methods,
+        trait_functions,
+        trait_methods,
+        trait_names,
+        reachable: new_dce_names(),
+        pending: Vec::new(),
+        visited: new_dce_names(),
+        generalized: new_dce_names(),
+        use_counts: HashMap::new(),
+        bindings: Vec::new(),
+        constants,
+        live_constants: new_dce_names(),
+    }
+}
+
+fn dce_with_bindings(ctx: DceFunctions, bindings: Vec[(string, Type)]) -> DceFunctions {
+    DceFunctions {
+        functions: ctx.functions,
+        inherent_methods: ctx.inherent_methods,
+        trait_functions: ctx.trait_functions,
+        trait_methods: ctx.trait_methods,
+        trait_names: ctx.trait_names,
+        reachable: ctx.reachable,
+        pending: ctx.pending,
+        visited: ctx.visited,
+        generalized: ctx.generalized,
+        use_counts: ctx.use_counts,
+        bindings,
+        constants: ctx.constants,
+        live_constants: ctx.live_constants,
+    }
+}
+
+fn dce_type(ctx: DceFunctions, value: Type) -> Type {
+    substitute_type(value, ctx.bindings)
+}
+
+fn dce_retain_function_use(ctx: DceFunctions, function: Function, arguments: Vec[(string, Type)]) -> () {
+    if ctx.generalized.contains(function.name) {
+        return
+    }
+    let bindings = Vec::new();
+    let count = ctx.use_counts[function.name].unwrap_or(0);
+    if count < DCE_MAX_FUNCTION_USES {
+        for name in function.generics {
+            if let Some(ty) = find_type_binding(arguments, name) {
+                if dce_bindable_type(ty) {
+                    bindings.push((name, ty))
+                }
+            }
+        }
+    }
+    let mut key = f"{function.name.byte_len()}:{function.name}";
+    for binding in bindings {
+        let ty = type_key(binding.1);
+        key = key + f"{binding.0.byte_len()}:{binding.0}{ty.byte_len()}:{ty}";
+    }
+    if ctx.visited.insert(key) {
+        if bindings.is_empty() {
+            let _ = ctx.generalized.insert(function.name);
+        }
+        ctx.use_counts[function.name] = count + 1;
+        let _ = ctx.reachable.insert(function.name);
+        ctx.pending.push(DceFunctionUse { name: function.name, bindings })
+    }
+}
+
+fn dce_retain_function(ctx: DceFunctions, name: string) -> () {
+    if let Some(function) = ctx.functions[name] {
+        dce_retain_function_use(ctx, function, Vec::new())
+    }
+}
+
+fn dce_retain_typed_function(
+    ctx: DceFunctions,
+    name: string,
+    ty: Type,
+    arguments: Vec[(string, Type)],
+) -> () {
+    if let Some(function) = ctx.functions[name] {
+        let bindings = Vec::new();
+        for argument in arguments {
+            bindings.push((argument.0, dce_type(ctx, argument.1)))
+        }
+        if dce_match_type(dce_function_type(function), dce_type(ctx, ty), bindings) {
+            dce_retain_function_use(ctx, function, bindings)
+        } else {
+            dce_retain_function_use(ctx, function, Vec::new())
+        }
+    }
+}
+
+fn dce_retain_indexed_functions(
+    ctx: DceFunctions,
+    values: HashMap[string, Vec[string]],
+    key: string,
+) -> () {
+    if let Some(names) = values[key] {
+        for name in names {
+            dce_retain_function(ctx, name)
+        }
+    }
+}
+
+fn dce_retain_inherent_methods(ctx: DceFunctions, owner: Type, method_name: string, ty: Type) -> () {
+    if let Some(names) = ctx.inherent_methods[method_name] {
+        for name in names {
+            if let Some(function) = ctx.functions[name] {
+                if let Inherent { owner: pattern, .. } = function.origin {
+                    let bindings = Vec::new();
+                    if dce_match_type(pattern, dce_type(ctx, owner), bindings)
+                        && dce_match_type(dce_function_type(function), dce_type(ctx, ty), bindings) {
+                        dce_retain_function_use(ctx, function, bindings)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn dce_retain_trait_functions(ctx: DceFunctions, trait_name: string) -> () {
+    dce_retain_indexed_functions(ctx, ctx.trait_functions, trait_name)
+}
+
+fn dce_retain_trait_candidates(
+    ctx: DceFunctions,
+    names: Vec[string],
+    reference: TraitRef,
+    owner: Type,
+    ty: Type,
+) -> () {
+    let args = Vec::new();
+    for arg in reference.args {
+        args.push(dce_type(ctx, arg))
+    }
+    for name in names {
+        if let Some(function) = ctx.functions[name] {
+            if let Some(metadata) = function.trait_impl {
+                let bindings = Vec::new();
+                if dce_match_type(metadata.for_ty, dce_type(ctx, owner), bindings)
+                    && dce_match_types(metadata.trait_ref.args, args, bindings)
+                    && dce_match_type(dce_function_type(function), dce_type(ctx, ty), bindings) {
+                    dce_retain_function_use(ctx, function, bindings)
+                }
+            }
+        }
+    }
+}
+
+fn dce_retain_trait_owner(ctx: DceFunctions, reference: TraitRef, owner: Type) -> () {
+    if let Some(names) = ctx.trait_functions[reference.name] {
+        dce_retain_trait_candidates(ctx, names, reference, owner, Type::Error)
+    }
+    dce_retain_structural_traits(ctx, reference, owner)
+}
+
+fn dce_retain_structural_traits(ctx: DceFunctions, reference: TraitRef, owner: Type) -> () {
+    let items = match dce_type(ctx, owner) {
+        Tuple { items } => items,
+        Array { elem, .. } => Vec::from_array([elem]),
+        _ => return,
+    };
+    for item in items {
+        dce_retain_trait_owner(ctx, reference, item)
+    }
+    if let Ok(builtin) = tast::builtin_contract() {
+        if reference.name == builtin.ordering.partial_ord || reference.name == builtin.ordering.ord {
+            let equality = TraitRef { name: builtin.partial_eq.name, args: Vec::new() };
+            for item in items {
+                dce_retain_trait_owner(ctx, equality, item)
+            }
+            dce_retain_trait_owner(ctx, equality, Type::Con { name: builtin.ordering.name })
+        }
+    }
+}
+
+fn dce_retain_trait_methods(
+    ctx: DceFunctions,
+    reference: TraitRef,
+    method_name: string,
+    owner: Type,
+    ty: Type,
+) -> () {
+    if let Some(names) = ctx.trait_methods[dce_trait_method_key(reference.name, method_name)] {
+        dce_retain_trait_candidates(ctx, names, reference, owner, ty)
+    }
+    dce_retain_structural_traits(ctx, reference, owner)
+}
+
+fn dce_runtime_trait_name(value: string) -> bool {
+    value == "PartialEq" || value.ends_with("::PartialEq") || value == "Hash"
+        || value.ends_with("::Hash")
+}
+
+fn dce_retain_runtime_trait_functions(ctx: DceFunctions, owner: Type) -> () {
+    for name in ctx.trait_names {
+        if dce_runtime_trait_name(name) {
+            dce_retain_trait_owner(ctx, TraitRef { name, args: Vec::new() }, owner)
+        }
+    }
+}
+
+fn dce_collect_types(ctx: DceFunctions, values: Vec[Type]) -> () {
+    for value in values {
+        dce_collect_type(ctx, value)
+    }
+}
+
+fn dce_collect_named_types(ctx: DceFunctions, values: Vec[(string, Type)]) -> () {
+    for value in values {
+        dce_collect_type(ctx, value.1)
+    }
+}
+
+fn dce_collect_trait_ref_types(ctx: DceFunctions, value: TraitRef) -> () {
+    dce_collect_types(ctx, value.args)
+}
+
+fn dce_collect_dyn_bounds(ctx: DceFunctions, values: Vec[DynTraitBound]) -> () {
+    for value in values {
+        dce_retain_trait_functions(ctx, value.trait_name);
+        dce_collect_types(ctx, value.args);
+        dce_collect_named_types(ctx, value.associated_types)
+    }
+}
+
+fn dce_collect_type(ctx: DceFunctions, value: Type) -> () {
+    match dce_type(ctx, value) {
+        External { import_path: _, name: _, args } => dce_collect_types(ctx, args),
+        Tuple { items } => dce_collect_types(ctx, items),
+        Dyn { trait_name, args, associated_types, additional_bounds } => {
+            dce_retain_trait_functions(ctx, trait_name);
+            dce_collect_types(ctx, args);
+            dce_collect_named_types(ctx, associated_types);
+            dce_collect_dyn_bounds(ctx, additional_bounds)
+        },
+        Projection { for_ty, name: _, trait_ref } => {
+            dce_collect_type(ctx, for_ty);
+            if let Some(reference) = trait_ref {
+                dce_retain_trait_owner(ctx, reference, for_ty);
+                dce_collect_trait_ref_types(ctx, reference)
+            }
+        },
+        App { ty, args } => {
+            dce_collect_type(ctx, ty);
+            dce_collect_types(ctx, args)
+        },
+        Array { len: _, elem } | Slice { elem } | MutSlice { elem } | VecType { elem } | Channel {
+            elem,
+            direction: _,
+        } => dce_collect_type(ctx, elem),
+        GoPointer { elem } => dce_collect_type(ctx, elem),
+        GoFunction { signature } => dce_collect_type(ctx, signature),
+        RefType { elem } => {
+            dce_retain_runtime_trait_functions(ctx, elem);
+            dce_collect_type(ctx, elem)
+        },
+        HashMap { key, value } => {
+            dce_retain_runtime_trait_functions(ctx, key);
+            dce_collect_type(ctx, key);
+            dce_collect_type(ctx, value)
+        },
+        GoMap { key, value } => {
+            dce_retain_runtime_trait_functions(ctx, key);
+            dce_collect_type(ctx, key);
+            dce_collect_type(ctx, value)
+        },
+        Func { params, ret_ty } => {
+            dce_collect_types(ctx, params);
+            dce_collect_type(ctx, ret_ty)
+        },
+        Unit | Never | Bool | Int | Int8 | Int16 | Int32 | Int64 | Uint | Uint8 | Uint16 | Uint32 | Uint64 | Float32 | Float64 | String | Char | Con {
+            ..,
+        } | Param { .. } | Error => (),
+    }
+}
+
+fn dce_collect_callable(ctx: DceFunctions, value: Callable, ty: Type) -> () {
+    match value {
+        Function(name) => dce_retain_typed_function(ctx, name, ty, Vec::new()),
+        FunctionInstance { name, bindings } => {
+            dce_retain_typed_function(ctx, name, ty, bindings);
+            for binding in bindings {
+                dce_collect_type(ctx, binding.1)
+            }
+        },
+        LangItem { item: _, function_name } => dce_retain_typed_function(
+            ctx,
+            function_name,
+            ty,
+            Vec::new(),
+        ),
+        TraitMethod { trait_ref, method_name, for_ty, has_receiver: _ } => {
+            dce_retain_trait_methods(ctx, trait_ref, method_name, for_ty, ty);
+            dce_collect_trait_ref_types(ctx, trait_ref);
+            dce_collect_type(ctx, for_ty)
+        },
+        DynTraitMethod { trait_name, dispatch_name: _, method_name: _ } => {
+            dce_retain_trait_functions(ctx, trait_name)
+        },
+        InherentMethod { receiver_ty, method_name } => {
+            dce_retain_inherent_methods(ctx, receiver_ty, method_name, ty);
+            dce_collect_type(ctx, receiver_ty)
+        },
+        Runtime(_) | Intrinsic(_) | GoForeign { .. } | GoMethod { .. } | GoInterfaceBridge { .. } => (),
+    }
+}
+
+fn dce_collect_function_exprs(ctx: DceFunctions, values: Vec[Expr]) -> () {
+    for value in values {
+        dce_collect_function_expr(ctx, value)
+    }
+}
+
+fn dce_collect_optional_function_expr(ctx: DceFunctions, value: Option[Expr]) -> () {
+    if let Some(value) = value {
+        dce_collect_function_expr(ctx, value)
+    }
+}
+
+fn dce_collect_function_block(ctx: DceFunctions, value: Block) -> () {
+    for stmt in value.stmts {
+        dce_collect_type(ctx, stmt.ty);
+        dce_collect_function_expr(ctx, stmt.value)
+    }
+    dce_collect_optional_function_expr(ctx, value.tail)
+}
+
+fn dce_collect_function_select_arms(ctx: DceFunctions, values: Vec[SelectArm]) -> () {
+    for value in values {
+        match value {
+            Receive { channel, guard, binding: _, binding_ty, body } => {
+                dce_collect_function_expr(ctx, channel);
+                dce_collect_optional_function_expr(ctx, guard);
+                dce_collect_type(ctx, binding_ty);
+                dce_collect_function_expr(ctx, body)
+            },
+            Send { channel, value, guard, body } => {
+                dce_collect_function_expr(ctx, channel);
+                dce_collect_function_expr(ctx, value);
+                dce_collect_optional_function_expr(ctx, guard);
+                dce_collect_function_expr(ctx, body)
+            },
+        }
+    }
+}
+
+fn dce_collect_function_expr(ctx: DceFunctions, value: Expr) -> () {
+    dce_collect_type(ctx, expr_type(value));
+    match value {
+        Var { name, ty } => {
+            dce_retain_typed_function(ctx, name, ty, Vec::new());
+            dce_retain_constant(ctx, name)
+        },
+        Callable { callable, ty } => dce_collect_callable(ctx, callable, ty),
+        Prim { .. } | Continue { .. } => (),
+        Constr { args, .. } | Tuple { items: args, .. } | Array { items: args, .. } => {
+            dce_collect_function_exprs(ctx, args)
+        },
+        Closure { params, body, ty: _ } => {
+            for param in params {
+                dce_collect_type(ctx, param.ty)
+            }
+            dce_collect_function_expr(ctx, body)
+        },
+        Block { block, ty: _ } => dce_collect_function_block(ctx, block),
+        Match { expr, arms, default, ty: _ } => {
+            dce_collect_function_expr(ctx, expr);
+            for arm in arms {
+                dce_collect_function_expr(ctx, arm.lhs);
+                dce_collect_function_expr(ctx, arm.body)
+            }
+            dce_collect_optional_function_expr(ctx, default)
+        },
+        Select { arms, default, .. } => {
+            dce_collect_function_select_arms(ctx, arms);
+            dce_collect_optional_function_expr(ctx, default)
+        },
+        If { cond, then_branch, else_branch, ty: _ } => {
+            dce_collect_function_expr(ctx, cond);
+            dce_collect_function_expr(ctx, then_branch);
+            dce_collect_function_expr(ctx, else_branch)
+        },
+        While { cond, body, ty: _ } => {
+            dce_collect_function_expr(ctx, cond);
+            dce_collect_function_expr(ctx, body)
+        },
+        Loop { body, ty: _ } => dce_collect_function_expr(ctx, body),
+        Break { target: _, value, ty: _ } => dce_collect_optional_function_expr(ctx, value),
+        Return { expr, ty: _ } => dce_collect_optional_function_expr(ctx, expr),
+        Go { expr, ty: _ } | ConstrGet { expr, .. } | Unary { expr, .. } | Cast { expr, .. } | Proj {
+            tuple: expr,
+            ..,
+        } => dce_collect_function_expr(ctx, expr),
+        Binary { op: _, lhs, rhs, ty: _ } => {
+            dce_collect_function_expr(ctx, lhs);
+            dce_collect_function_expr(ctx, rhs)
+        },
+        Assign { name: _, value, target_ty, ty: _ } => {
+            dce_collect_function_expr(ctx, value);
+            dce_collect_type(ctx, target_ty)
+        },
+        Call { func, args, ty: _ } => {
+            dce_collect_function_expr(ctx, func);
+            dce_collect_function_exprs(ctx, args)
+        },
+        ToDyn { trait_name, for_ty, expr, ty: _ } => {
+            dce_retain_trait_functions(ctx, trait_name);
+            dce_collect_type(ctx, for_ty);
+            dce_collect_function_expr(ctx, expr)
+        },
+        DynCall { trait_name, method_name: _, receiver, args, ty: _ } => {
+            dce_retain_trait_functions(ctx, trait_name);
+            dce_collect_function_expr(ctx, receiver);
+            dce_collect_function_exprs(ctx, args)
+        },
+        TraitCall { trait_ref, method_name, instance_name, for_ty, receiver, args, ty } => {
+            let params = Vec::new();
+            if let Some(value) = receiver {
+                params.push(expr_type(value))
+            }
+            for arg in args {
+                params.push(expr_type(arg))
+            }
+            let signature = Type::Func { params, ret_ty: ty };
+            dce_retain_trait_methods(ctx, trait_ref, method_name, for_ty, signature);
+            if let Some(name) = instance_name {
+                dce_retain_typed_function(ctx, name, signature, Vec::new())
+            }
+            dce_collect_trait_ref_types(ctx, trait_ref);
+            dce_collect_type(ctx, for_ty);
+            dce_collect_optional_function_expr(ctx, receiver);
+            dce_collect_function_exprs(ctx, args)
+        },
+    }
+}
+
+fn dce_collect_function_predicates(ctx: DceFunctions, values: Vec[TypePredicate]) -> () {
+    for value in values {
+        match value {
+            GoComparable(ty) => dce_collect_type(ctx, ty),
+            Trait { for_ty, trait_ref } => {
+                dce_retain_trait_owner(ctx, trait_ref, for_ty);
+                dce_collect_type(ctx, for_ty);
+                dce_collect_trait_ref_types(ctx, trait_ref)
+            },
+            Equality { lhs, rhs } => {
+                dce_collect_type(ctx, lhs);
+                dce_collect_type(ctx, rhs)
+            },
+        }
+    }
+}
+
+fn dce_collect_function(ctx: DceFunctions, value: Function) -> () {
+    for param in value.params {
+        dce_collect_type(ctx, param.1)
+    }
+    dce_collect_type(ctx, value.ret_ty);
+    dce_collect_function_predicates(ctx, value.predicates);
+    if let Some(metadata) = value.trait_impl {
+        dce_collect_trait_ref_types(ctx, metadata.trait_ref);
+        dce_collect_type(ctx, metadata.for_ty);
+        dce_collect_named_types(ctx, metadata.associated_types)
+    }
+    dce_collect_function_block(ctx, value.body)
+}
+
+fn dce_retain_constant(ctx: DceFunctions, name: string) -> () {
+    if let Some(value) = ctx.constants[name] {
+        if ctx.live_constants.insert(name) {
+            dce_collect_type(ctx, value.ty);
+            dce_collect_constant_expr(ctx, value.value)
+        }
+    }
+}
+
+fn dce_collect_constant_expr(ctx: DceFunctions, value: ConstExpr) -> () {
+    match value {
+        Ref { name, ty } => {
+            dce_retain_constant(ctx, name);
+            dce_collect_type(ctx, ty)
+        },
+        Unary { expr, .. } | Cast { expr, .. } => dce_collect_constant_expr(ctx, expr),
+        Binary { lhs, rhs, .. } => {
+            dce_collect_constant_expr(ctx, lhs);
+            dce_collect_constant_expr(ctx, rhs)
+        },
+        Tuple { items, .. } | Array { items, .. } | Constr { args: items, .. } => {
+            for item in items {
+                dce_collect_constant_expr(ctx, item)
+            }
+        },
+        Prim { .. } | Error { .. } => (),
+    }
+}
+
+pub fn eliminate_unreachable_functions(value: File) -> File {
+    let ctx = dce_functions_context(value);
+    for function in value.functions {
+        if function.root && function.generics.is_empty()
+            && type_is_concrete(dce_function_type(function)) {
+            dce_retain_function(ctx, function.name)
+        }
+    }
+    let mut index = 0;
+    while index < ctx.pending.len() {
+        let pending = ctx.pending[index];
+        index += 1;
+        if let Some(function) = ctx.functions[pending.name] {
+            dce_collect_function(dce_with_bindings(ctx, pending.bindings), function)
+        }
+    }
+    let functions: Vec[Function] = Vec::new();
+    for function in value.functions {
+        if dce_names_contains(ctx.reachable, function.name) {
+            functions.push(function)
+        }
+    }
+    let constants = Vec::new();
+    for constant in value.constants {
+        if ctx.live_constants.contains(constant.name) {
+            constants.push(constant)
+        }
+    }
+    File {
+        functions,
+        enums: value.enums,
+        structs: value.structs,
+        type_instances: value.type_instances,
+        constants,
+        statics: value.statics,
+    }
+}

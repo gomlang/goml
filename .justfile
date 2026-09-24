@@ -195,12 +195,12 @@ install: make-tools
 
 update-golden: make
     bash tools/lib/install.sh _artifact/gomlc-test/test
-    cd gomlc && UPDATE_EXPECT=1 ../stage2/bin/goml test formatter --target-dir ../_artifact/gomlc-test --compiler ../stage2/bin/gomlc --jobs 16 --timeout 10m
-    cd gomlc && UPDATE_EXPECT=1 ../stage2/bin/goml test pipeline_test --target-dir ../_artifact/gomlc-test --compiler ../stage2/bin/gomlc --jobs 16 --timeout 10m
-    cd gomlc && UPDATE_EXPECT=1 GOML_TEST_GOML=../stage2/bin/goml GOML_TEST_GOMLC=../stage2/bin/gomlc ../stage2/bin/goml test compiler_test --target-dir ../_artifact/gomlc-test --compiler ../stage2/bin/gomlc --jobs 16 --timeout 10m
+    cd gomlc && UPDATE_EXPECT=1 ../stage2/bin/goml test formatter --target-dir ../_artifact/gomlc-test --compiler ../stage2/bin/gomlc --jobs "${GOML_TEST_JOBS:-16}" --timeout 10m
+    cd gomlc && UPDATE_EXPECT=1 ../stage2/bin/goml test pipeline_test --target-dir ../_artifact/gomlc-test --compiler ../stage2/bin/gomlc --jobs "${GOML_TEST_JOBS:-16}" --timeout 10m
+    cd gomlc && UPDATE_EXPECT=1 GOML_TEST_GOML=../stage2/bin/goml GOML_TEST_GOMLC=../stage2/bin/gomlc ../stage2/bin/goml test compiler_test --target-dir ../_artifact/gomlc-test --compiler ../stage2/bin/gomlc --jobs "${GOML_TEST_JOBS:-16}" --timeout 10m
 
 verify-golden: make
     bash tools/lib/install.sh _artifact/gomlc-test/test
-    cd gomlc && ../stage2/bin/goml test formatter --target-dir ../_artifact/gomlc-test --compiler ../stage2/bin/gomlc --jobs 16 --timeout 10m
-    cd gomlc && ../stage2/bin/goml test pipeline_test --target-dir ../_artifact/gomlc-test --compiler ../stage2/bin/gomlc --jobs 16 --timeout 10m
-    cd gomlc && GOML_TEST_GOML=../stage2/bin/goml GOML_TEST_GOMLC=../stage2/bin/gomlc ../stage2/bin/goml test compiler_test --target-dir ../_artifact/gomlc-test --compiler ../stage2/bin/gomlc --jobs 16 --timeout 10m
+    cd gomlc && ../stage2/bin/goml test formatter --target-dir ../_artifact/gomlc-test --compiler ../stage2/bin/gomlc --jobs "${GOML_TEST_JOBS:-16}" --timeout 10m
+    cd gomlc && ../stage2/bin/goml test pipeline_test --target-dir ../_artifact/gomlc-test --compiler ../stage2/bin/gomlc --jobs "${GOML_TEST_JOBS:-16}" --timeout 10m
+    cd gomlc && GOML_TEST_GOML=../stage2/bin/goml GOML_TEST_GOMLC=../stage2/bin/gomlc ../stage2/bin/goml test compiler_test --target-dir ../_artifact/gomlc-test --compiler ../stage2/bin/gomlc --jobs "${GOML_TEST_JOBS:-16}" --timeout 10m
