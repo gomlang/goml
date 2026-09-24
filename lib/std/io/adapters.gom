@@ -1,15 +1,44 @@
 package io;
 
 use module::bytes;
+use module::utf8;
+use module::unicode;
 
 pub struct Cursor {
     data: bytes::Bytes,
     offset: Ref[isize],
+    limit: isize,
 }
 
 impl Cursor {
     pub fn new(data: bytes::Bytes) -> Cursor {
-        Cursor { data: bytes::Bytes::from_vec(data.to_vec().copy()), offset: Ref::new(0) }
+        Cursor {
+            data: bytes::Bytes::from_vec(data.to_vec().copy()),
+            offset: Ref::new(0),
+            limit: 9223372036854775807,
+        }
+    }
+
+    pub fn with_limit(data: bytes::Bytes, max_bytes: isize) -> Result[Cursor, Error] {
+        if max_bytes < 0 {
+            return Result::Err(
+                stream_error(ErrorKind::InvalidInput, "create cursor", "limit must be non-negative"),
+            )
+        }
+        if data.len() > max_bytes {
+            return Result::Err(
+                stream_error(
+                    ErrorKind::InvalidData,
+                    "create cursor",
+                    "initial data exceeds byte limit",
+                ),
+            )
+        }
+        Result::Ok(Cursor { data: data.copy(), offset: Ref::new(0), limit: max_bytes })
+    }
+
+    pub fn limit(self: Cursor) -> isize {
+        self.limit
     }
 
     pub fn position(self: Cursor) -> isize {
@@ -34,6 +63,37 @@ impl Cursor {
     pub fn bytes(self: Cursor) -> bytes::Bytes {
         bytes::Bytes::from_vec(self.data.to_vec().copy())
     }
+
+    fn write_position(self: Cursor, buffer: Slice[byte], position: isize, operation: string) -> Result[
+        isize,
+        Error,
+    ] {
+        if position < 0 || position > self.data.len() {
+            return Result::Err(
+                stream_error(ErrorKind::InvalidInput, operation, "position is outside the buffer"),
+            )
+        }
+        if buffer.len() > 9223372036854775807 - position {
+            return Result::Err(
+                stream_error(ErrorKind::InvalidInput, operation, "buffer length overflow"),
+            )
+        }
+        if buffer.len() > self.limit - position {
+            return Result::Err(
+                stream_error(ErrorKind::InvalidData, operation, "write exceeds cursor byte limit"),
+            )
+        }
+        let source = buffer.to_vec();
+        for index in 0..source.len() {
+            let target = position + index;
+            if target < self.data.len() {
+                self.data.set(target, source[index]);
+            } else {
+                self.data.push(source[index]);
+            }
+        }
+        Result::Ok(source.len())
+    }
 }
 
 impl Read for Cursor {
@@ -54,21 +114,52 @@ impl Read for Cursor {
 
 impl Write for Cursor {
     fn write(self: Cursor, buffer: Slice[byte]) -> Result[isize, Error] {
-        if buffer.len() > 9223372036854775807 - self.offset.get() {
-            return Result::Err(
-                stream_error(ErrorKind::InvalidInput, "write cursor", "buffer length overflow"),
+        let count = self.write_position(buffer, self.offset.get(), "write cursor")?;
+        self.offset.set(self.offset.get() + count);
+        Result::Ok(count)
+    }
+}
+
+impl ReadAt for Cursor {
+    fn read_at(self: Cursor, buffer: MutSlice[byte], offset: isize) -> Result[isize, TransferError] {
+        check_at_range(offset, buffer.len(), "read cursor at")?;
+        if buffer.len() == 0 {
+            return Result::Ok(0)
+        }
+        let available = if offset < self.data.len() {
+            self.data.len() - offset
+        } else {
+            0
+        };
+        let count = if available < buffer.len() {
+            available
+        } else {
+            buffer.len()
+        };
+        for index in 0..count {
+            buffer[index] = self.data.get(offset + index);
+        }
+        if count < buffer.len() {
+            Result::Err(
+                positional_error(
+                    ErrorKind::UnexpectedEof,
+                    "read cursor at",
+                    "buffer extends beyond cursor data",
+                    count,
+                ),
             )
+        } else {
+            Result::Ok(count)
         }
-        for index in 0..buffer.len() {
-            let position = self.offset.get() + index;
-            if position < self.data.len() {
-                self.data.set(position, buffer[index])
-            } else {
-                self.data.push(buffer[index])
-            }
-        }
-        self.offset.set(self.offset.get() + buffer.len());
-        Result::Ok(buffer.len())
+    }
+}
+
+impl WriteAt for Cursor {
+    fn write_at(self: Cursor, buffer: Slice[byte], offset: isize) -> Result[isize, TransferError] {
+        check_at_range(offset, buffer.len(), "write cursor at")?;
+        self.write_position(buffer, offset, "write cursor at").map_err(
+            |error: Error| TransferError::new(0, error),
+        )
     }
 }
 
@@ -90,6 +181,347 @@ impl BufRead for Cursor {
             self.offset.set(self.offset.get() + amount);
             Result::Ok(())
         }
+    }
+}
+
+pub struct SectionReader[R] {
+    reader: R,
+    start: isize,
+    length: isize,
+    offset: Ref[isize],
+    pending: Ref[Option[Error]],
+}
+
+impl[R: ReadAt] SectionReader[R] {
+    pub fn new(reader: R, start: isize, length: isize) -> Result[SectionReader[R], Error] {
+        if length < 0 {
+            return Result::Err(
+                stream_error(ErrorKind::InvalidInput, "section reader", "negative length"),
+            )
+        }
+        check_at_range(start, length, "section reader").map_err(
+            |error: TransferError| error.error(),
+        )?;
+        Result::Ok(
+            SectionReader {
+                reader,
+                start,
+                length,
+                offset: Ref::new(0),
+                pending: Ref::new(Option::None),
+            },
+        )
+    }
+
+    pub fn size(self: SectionReader[R]) -> isize {
+        self.length
+    }
+
+    pub fn position(self: SectionReader[R]) -> isize {
+        self.offset.get()
+    }
+
+    pub fn set_position(self: SectionReader[R], position: isize) -> Result[(), Error] {
+        if position < 0 || position > self.length {
+            return Result::Err(
+                stream_error(
+                    ErrorKind::InvalidInput,
+                    "seek section",
+                    "position is outside the section",
+                ),
+            )
+        }
+        self.offset.set(position);
+        self.pending.set(Option::None);
+        Result::Ok(())
+    }
+}
+
+impl[R: ReadAt] ReadAt for SectionReader[R] {
+    fn read_at(self: SectionReader[R], buffer: MutSlice[byte], offset: isize) -> Result[
+        isize,
+        TransferError,
+    ] {
+        check_at_range(offset, buffer.len(), "read section at")?;
+        if buffer.len() == 0 {
+            return Result::Ok(0)
+        }
+        if offset >= self.length {
+            return Result::Err(
+                positional_error(ErrorKind::UnexpectedEof, "read section at", "end of section", 0),
+            )
+        }
+        let count = if buffer.len() < self.length - offset {
+            buffer.len()
+        } else {
+            self.length - offset
+        };
+        let result = self.reader.read_at(buffer.sub(0, count), self.start + offset);
+        complete_transfer(result, count, "read section at", ErrorKind::UnexpectedEof)?;
+        if count < buffer.len() {
+            Result::Err(
+                positional_error(
+                    ErrorKind::UnexpectedEof,
+                    "read section at",
+                    "buffer extends beyond section",
+                    count,
+                ),
+            )
+        } else {
+            Result::Ok(count)
+        }
+    }
+}
+
+impl[R: ReadAt] Read for SectionReader[R] {
+    fn read(self: SectionReader[R], buffer: MutSlice[byte]) -> Result[isize, Error] {
+        if buffer.len() == 0 {
+            return Result::Ok(0)
+        }
+        match self.pending.get() {
+            Some(error) => {
+                self.pending.set(Option::None);
+                return Result::Err(error)
+            },
+            None => (),
+        }
+        if self.offset.get() == self.length {
+            return Result::Ok(0)
+        }
+        let count = if buffer.len() < self.length - self.offset.get() {
+            buffer.len()
+        } else {
+            self.length - self.offset.get()
+        };
+        match self.read_at(buffer.sub(0, count), self.offset.get()) {
+            Ok(transferred) => {
+                self.offset.set(self.offset.get() + transferred);
+                Result::Ok(transferred)
+            },
+            Err(error) => {
+                let transferred = error.transferred().to_isize();
+                if transferred > 0 {
+                    self.offset.set(self.offset.get() + transferred);
+                    self.pending.set(Option::Some(error.error()));
+                    Result::Ok(transferred)
+                } else {
+                    Result::Err(error.error())
+                }
+            },
+        }
+    }
+}
+
+pub struct OffsetWriter[W] {
+    writer: W,
+    base: isize,
+    offset: Ref[isize],
+}
+
+impl[W: WriteAt] OffsetWriter[W] {
+    pub fn new(writer: W, base: isize) -> Result[OffsetWriter[W], Error] {
+        check_at_range(base, 0, "offset writer").map_err(|error: TransferError| error.error())?;
+        Result::Ok(OffsetWriter { writer, base, offset: Ref::new(0) })
+    }
+
+    pub fn position(self: OffsetWriter[W]) -> isize {
+        self.offset.get()
+    }
+
+    pub fn set_position(self: OffsetWriter[W], position: isize) -> Result[(), Error] {
+        check_at_range(position, self.base, "seek offset writer").map_err(
+            |error: TransferError| error.error(),
+        )?;
+        self.offset.set(position);
+        Result::Ok(())
+    }
+}
+
+impl[W: WriteAt] WriteAt for OffsetWriter[W] {
+    fn write_at(self: OffsetWriter[W], buffer: Slice[byte], offset: isize) -> Result[
+        isize,
+        TransferError,
+    ] {
+        check_at_range(offset, self.base, "write offset at")?;
+        let absolute = self.base + offset;
+        check_at_range(absolute, buffer.len(), "write offset at")?;
+        let result = self.writer.write_at(buffer, absolute);
+        complete_transfer(result, buffer.len(), "write offset at", ErrorKind::InvalidData)?;
+        Result::Ok(buffer.len())
+    }
+}
+
+impl[W: WriteAt] Write for OffsetWriter[W] {
+    fn write(self: OffsetWriter[W], buffer: Slice[byte]) -> Result[isize, Error] {
+        match self.write_at(buffer, self.offset.get()) {
+            Ok(count) => {
+                self.offset.set(self.offset.get() + count);
+                Result::Ok(count)
+            },
+            Err(error) => {
+                self.offset.set(self.offset.get() + error.transferred().to_isize());
+                Result::Err(error.error())
+            },
+        }
+    }
+
+    fn write_all(self: OffsetWriter[W], buffer: Slice[byte]) -> Result[(), Error] {
+        self.write(buffer)?;
+        Result::Ok(())
+    }
+}
+
+pub struct MultiReader[R] {
+    readers: Vec[Option[R]],
+    index: Ref[isize],
+}
+
+impl[R: Read] MultiReader[R] {
+    pub fn new(readers: Slice[R]) -> MultiReader[R] {
+        let values = Vec::new();
+        for reader in readers {
+            values.push(Option::Some(reader));
+        }
+        MultiReader { readers: values, index: Ref::new(0) }
+    }
+}
+
+impl[R: Read] Read for MultiReader[R] {
+    fn read(self: MultiReader[R], buffer: MutSlice[byte]) -> Result[isize, Error] {
+        if buffer.len() == 0 {
+            return Result::Ok(0)
+        }
+        while self.index.get() < self.readers.len() {
+            let index = self.index.get();
+            match self.readers[index] {
+                Some(reader) => {
+                    let count = valid_count(reader.read(buffer)?, buffer.len(), "multi reader")?;
+                    if count > 0 {
+                        return Result::Ok(count)
+                    }
+                    self.readers[index] = Option::None;
+                },
+                None => (),
+            }
+            self.index.set(index + 1);
+        }
+        Result::Ok(0)
+    }
+}
+
+pub struct MultiWriter[W] {
+    writers: Vec[W],
+}
+
+impl[W: Write] MultiWriter[W] {
+    pub fn new(writers: Slice[W]) -> MultiWriter[W] {
+        MultiWriter { writers: writers.to_vec() }
+    }
+}
+
+impl[W: Write] Write for MultiWriter[W] {
+    fn write(self: MultiWriter[W], buffer: Slice[byte]) -> Result[isize, Error] {
+        for writer in self.writers {
+            let count = valid_count(writer.write(buffer)?, buffer.len(), "multi writer")?;
+            if count != buffer.len() {
+                return Result::Err(
+                    stream_error(
+                        if count == 0 {
+                            ErrorKind::WriteZero
+                        } else {
+                            ErrorKind::InvalidData
+                        },
+                        "multi writer",
+                        "destination returned a short write",
+                    ),
+                )
+            }
+        }
+        Result::Ok(buffer.len())
+    }
+
+    fn write_all(self: MultiWriter[W], buffer: Slice[byte]) -> Result[(), Error] {
+        self.write(buffer)?;
+        Result::Ok(())
+    }
+
+    fn flush(self: MultiWriter[W]) -> Result[(), Error] {
+        for writer in self.writers {
+            writer.flush()?;
+        }
+        Result::Ok(())
+    }
+}
+
+pub struct TeeReader[R, W] {
+    reader: R,
+    writer: W,
+    failure_value: Ref[Option[Error]],
+    failed_read_count_value: Ref[isize],
+}
+
+impl[R: Read, W: Write] TeeReader[R, W] {
+    pub fn new(reader: R, writer: W) -> TeeReader[R, W] {
+        TeeReader {
+            reader,
+            writer,
+            failure_value: Ref::new(Option::None),
+            failed_read_count_value: Ref::new(0),
+        }
+    }
+
+    pub fn failure(self: TeeReader[R, W]) -> Option[Error] {
+        self.failure_value.get()
+    }
+
+    pub fn failed_read_count(self: TeeReader[R, W]) -> isize {
+        self.failed_read_count_value.get()
+    }
+}
+
+fn tee_read_error(error: Error) -> Error {
+    if error.kind() == ErrorKind::Interrupted {
+        stream_error(ErrorKind::Other, "tee read", f"terminal mirror failure: {error}")
+    } else {
+        error
+    }
+}
+
+impl[R: Read, W: Write] Read for TeeReader[R, W] {
+    fn read(self: TeeReader[R, W], buffer: MutSlice[byte]) -> Result[isize, Error] {
+        match self.failure_value.get() {
+            Some(error) => return Result::Err(tee_read_error(error)),
+            None => (),
+        }
+        if buffer.len() == 0 {
+            return Result::Ok(0)
+        }
+        let count = valid_count(self.reader.read(buffer)?, buffer.len(), "tee read")?;
+        if count == 0 {
+            return Result::Ok(0)
+        }
+        match self.writer.write_all(buffer.as_slice().sub(0, count)) {
+            Ok(()) => Result::Ok(count),
+            Err(error) => {
+                self.failure_value.set(Option::Some(error));
+                self.failed_read_count_value.set(count);
+                Result::Err(tee_read_error(error))
+            },
+        }
+    }
+}
+
+pub struct Discard {}
+
+impl Discard {
+    pub fn new() -> Discard {
+        Discard {}
+    }
+}
+
+impl Write for Discard {
+    fn write(self: Discard, buffer: Slice[byte]) -> Result[isize, Error] {
+        Result::Ok(buffer.len())
     }
 }
 
@@ -128,16 +560,54 @@ impl[R: Read] Read for Take[R] {
     }
 }
 
+pub struct PeekError {
+    available_value: Slice[byte],
+    error_value: Error,
+}
+
+impl PeekError {
+    pub fn available(self: PeekError) -> Slice[byte] {
+        self.available_value
+    }
+
+    pub fn error(self: PeekError) -> Error {
+        self.error_value
+    }
+}
+
+impl ToString for PeekError {
+    fn to_string(self: PeekError) -> string {
+        self.error_value.to_string()
+    }
+}
+
+impl Debug for PeekError {
+    fn debug(self: PeekError) -> string {
+        self.to_string()
+    }
+}
+
 pub struct BufReader[R] {
-    reader: R,
+    reader: Ref[R],
     buffer: bytes::Bytes,
     offset: Ref[isize],
     length: Ref[isize],
+    capacity_value: isize,
+    last_byte: Ref[bool],
+    last_char_width: Ref[isize],
 }
 
 impl[R: Read] BufReader[R] {
     pub fn new(reader: R) -> BufReader[R] {
-        BufReader { reader, buffer: byte_buffer(8192), offset: Ref::new(0), length: Ref::new(0) }
+        BufReader {
+            reader: Ref::new(reader),
+            buffer: byte_buffer(8192),
+            offset: Ref::new(0),
+            length: Ref::new(0),
+            capacity_value: 8192,
+            last_byte: Ref::new(false),
+            last_char_width: Ref::new(0),
+        }
     }
 
     pub fn with_capacity(reader: R, capacity: isize) -> Result[BufReader[R], Error] {
@@ -152,10 +622,19 @@ impl[R: Read] BufReader[R] {
         } else {
             Result::Ok(
                 BufReader {
-                    reader,
-                    buffer: byte_buffer(capacity),
+                    reader: Ref::new(reader),
+                    buffer: byte_buffer(
+                        if capacity < 4 {
+                            4
+                        } else {
+                            capacity
+                        },
+                    ),
                     offset: Ref::new(0),
                     length: Ref::new(0),
+                    capacity_value: capacity,
+                    last_byte: Ref::new(false),
+                    last_char_width: Ref::new(0),
                 },
             )
         }
@@ -164,27 +643,179 @@ impl[R: Read] BufReader[R] {
     pub fn buffered_len(self: BufReader[R]) -> isize {
         self.length.get() - self.offset.get()
     }
+
+    fn invalidate_unread(self: BufReader[R]) -> () {
+        self.last_byte.set(false);
+        self.last_char_width.set(0);
+    }
+
+    fn compact(self: BufReader[R]) -> () {
+        let remaining = self.buffered_len();
+        if self.offset.get() > 0 {
+            for index in 0..remaining {
+                self.buffer.set(index, self.buffer.get(self.offset.get() + index));
+            }
+            self.offset.set(0);
+            self.length.set(remaining);
+        }
+    }
+
+    pub fn read_byte(self: BufReader[R]) -> Result[Option[byte], Error] {
+        self.invalidate_unread();
+        let available = self.fill_buf()?;
+        if available.len() == 0 {
+            return Result::Ok(Option::None)
+        }
+        let value = available[0];
+        self.offset.set(self.offset.get() + 1);
+        self.last_byte.set(true);
+        Result::Ok(Option::Some(value))
+    }
+
+    pub fn unread_byte(self: BufReader[R]) -> Result[(), Error] {
+        let allowed = self.last_byte.get();
+        self.invalidate_unread();
+        if !allowed {
+            return Result::Err(
+                stream_error(
+                    ErrorKind::InvalidInput,
+                    "unread buffered byte",
+                    "previous operation was not a successful read",
+                ),
+            )
+        }
+        self.offset.set(self.offset.get() - 1);
+        Result::Ok(())
+    }
+
+    pub fn read_char(self: BufReader[R]) -> Result[Option[(char, isize)], Error] {
+        self.invalidate_unread();
+        loop {
+            let available = self.buffer.slice(self.offset.get(), self.length.get());
+            if utf8::full_rune(available) {
+                break
+            }
+            self.compact();
+            let start = self.length.get();
+            let spare = self.buffer.len() - start;
+            let capacity = if spare < self.capacity() {
+                spare
+            } else {
+                self.capacity()
+            };
+            let count = valid_count(
+                self.reader.get().read(self.buffer.slice_mut(start, start + capacity))?,
+                capacity,
+                "read buffered character",
+            )?;
+            self.length.set(start + count);
+            if count == 0 {
+                break
+            }
+        }
+        if self.buffered_len() == 0 {
+            return Result::Ok(Option::None)
+        }
+        let decoded = utf8::decode_rune(self.buffer.slice(self.offset.get(), self.length.get()));
+        self.offset.set(self.offset.get() + decoded.1);
+        self.last_byte.set(true);
+        self.last_char_width.set(decoded.1);
+        Result::Ok(Option::Some(decoded))
+    }
+
+    pub fn unread_char(self: BufReader[R]) -> Result[(), Error] {
+        let width = self.last_char_width.get();
+        self.invalidate_unread();
+        if width == 0 {
+            return Result::Err(
+                stream_error(
+                    ErrorKind::InvalidInput,
+                    "unread buffered character",
+                    "previous operation was not a successful character read",
+                ),
+            )
+        }
+        self.offset.set(self.offset.get() - width);
+        Result::Ok(())
+    }
+
+    fn peek_failure(self: BufReader[R], error: Error) -> PeekError {
+        PeekError {
+            available_value: self.buffer.slice(self.offset.get(), self.length.get()),
+            error_value: error,
+        }
+    }
+
+    pub fn peek(self: BufReader[R], amount: isize) -> Result[Slice[byte], PeekError] {
+        self.invalidate_unread();
+        if amount < 0 || amount > self.capacity() {
+            return Result::Err(
+                self.peek_failure(
+                    stream_error(
+                        ErrorKind::InvalidInput,
+                        "peek buffer",
+                        "amount exceeds buffer capacity",
+                    ),
+                ),
+            )
+        }
+        if amount <= self.buffered_len() {
+            return Result::Ok(self.buffer.slice(self.offset.get(), self.offset.get() + amount))
+        }
+        self.compact();
+        while self.length.get() < amount {
+            let start = self.length.get();
+            let count = match self.reader.get().read(self.buffer.slice_mut(start, self.capacity())) {
+                Ok(count) => valid_count(count, self.capacity() - start, "peek buffer").map_err(
+                    |error| self.peek_failure(error),
+                )?,
+                Err(error) => return Result::Err(self.peek_failure(error)),
+            };
+            if count == 0 {
+                return Result::Err(
+                    self.peek_failure(
+                        stream_error(
+                            ErrorKind::UnexpectedEof,
+                            "peek buffer",
+                            "stream ended before requested bytes were buffered",
+                        ),
+                    ),
+                )
+            }
+            self.length.set(start + count);
+        }
+        Result::Ok(self.buffer.slice(0, amount))
+    }
+
+    pub fn capacity(self: BufReader[R]) -> isize {
+        self.capacity_value
+    }
+
+    pub fn reset(self: BufReader[R], reader: R) -> () {
+        self.invalidate_unread();
+        self.reader.set(reader);
+        self.offset.set(0);
+        self.length.set(0);
+    }
 }
 
 impl[R: Read] BufRead for BufReader[R] {
     fn fill_buf(self: BufReader[R]) -> Result[Slice[byte], Error] {
+        self.invalidate_unread();
         if self.offset.get() == self.length.get() {
-            loop {
-                match self.reader.read(self.buffer.as_mut_slice()) {
-                    Ok(count) => {
-                        self.length.set(valid_count(count, self.buffer.len(), "buffered read")?);
-                        self.offset.set(0);
-                        break
-                    },
-                    Err(error) if error.kind() == ErrorKind::Interrupted => (),
-                    Err(error) => return Result::Err(error),
-                }
-            }
+            let count = valid_count(
+                self.reader.get().read(self.buffer.slice_mut(0, self.capacity()))?,
+                self.capacity(),
+                "buffered read",
+            )?;
+            self.length.set(count);
+            self.offset.set(0);
         }
         Result::Ok(self.buffer.slice(self.offset.get(), self.length.get()))
     }
 
     fn consume(self: BufReader[R], amount: isize) -> Result[(), Error] {
+        self.invalidate_unread();
         if amount < 0 || amount > self.buffered_len() {
             Result::Err(
                 stream_error(
@@ -202,6 +833,7 @@ impl[R: Read] BufRead for BufReader[R] {
 
 impl[R: Read] Read for BufReader[R] {
     fn read(self: BufReader[R], buffer: MutSlice[byte]) -> Result[isize, Error] {
+        self.invalidate_unread();
         if buffer.len() == 0 {
             return Result::Ok(0)
         }
@@ -215,26 +847,289 @@ impl[R: Read] Read for BufReader[R] {
             buffer[index] = available[index];
         }
         self.consume(count)?;
+        self.last_byte.set(count > 0);
         Result::Ok(count)
     }
 }
 
 impl[R: Read + Close] Close for BufReader[R] {
     fn close(self: BufReader[R]) -> Result[(), Error] {
-        self.reader.close()
+        self.reader.get().close()
+    }
+}
+
+pub enum ScanStep {
+    More(isize),
+    Token(isize, isize, isize),
+    Emit(isize, bytes::Bytes),
+    Final(Option[(isize, isize)]),
+}
+
+pub fn scan_runes(input: Slice[byte], at_eof: bool) -> Result[ScanStep, Error] {
+    if input.len() == 0 {
+        return Result::Ok(
+            if at_eof {
+                ScanStep::Final(Option::None)
+            } else {
+                ScanStep::More(0)
+            },
+        )
+    }
+    if !at_eof && !utf8::full_rune(input) {
+        return Result::Ok(ScanStep::More(0))
+    }
+    match utf8::decode_first(input) {
+        Ok((_, width)) => Result::Ok(ScanStep::Token(width, 0, width)),
+        Err(_) => Result::Ok(ScanStep::Emit(1, bytes::Bytes::from_string("�"))),
+    }
+}
+
+pub fn scan_words(input: Slice[byte], at_eof: bool) -> Result[ScanStep, Error] {
+    let mut start = 0;
+    while start < input.len() {
+        let rest = input.sub(start, input.len());
+        if !at_eof && !utf8::full_rune(rest) {
+            return Result::Ok(ScanStep::More(start))
+        }
+        let (value, width) = utf8::decode_rune(rest);
+        if !unicode::is_whitespace(value) {
+            break
+        }
+        start += width;
+    }
+    let mut end = start;
+    while end < input.len() {
+        let rest = input.sub(end, input.len());
+        if !at_eof && !utf8::full_rune(rest) {
+            return Result::Ok(ScanStep::More(start))
+        }
+        let (value, width) = utf8::decode_rune(rest);
+        if unicode::is_whitespace(value) {
+            return Result::Ok(ScanStep::Token(end + width, start, end))
+        }
+        end += width;
+    }
+    if at_eof {
+        Result::Ok(
+            ScanStep::Final(
+                if start < end {
+                    Option::Some((start, end))
+                } else {
+                    Option::None
+                },
+            ),
+        )
+    } else {
+        Result::Ok(ScanStep::More(start))
+    }
+}
+
+pub fn scan_lines(input: Slice[byte], at_eof: bool) -> Result[ScanStep, Error] {
+    for index in 0..input.len() {
+        if input[index] == b'\n' {
+            let end = if index > 0 && input[index - 1] == b'\r' {
+                index - 1
+            } else {
+                index
+            };
+            return Result::Ok(ScanStep::Token(index + 1, 0, end))
+        }
+    }
+    if at_eof {
+        if input.len() == 0 {
+            Result::Ok(ScanStep::Final(Option::None))
+        } else {
+            let end = if input[input.len() - 1] == b'\r' {
+                input.len() - 1
+            } else {
+                input.len()
+            };
+            Result::Ok(ScanStep::Final(Option::Some((0, end))))
+        }
+    } else {
+        Result::Ok(ScanStep::More(0))
+    }
+}
+
+pub fn scan_bytes(input: Slice[byte], at_eof: bool) -> Result[ScanStep, Error] {
+    if input.len() > 0 {
+        Result::Ok(ScanStep::Token(1, 0, 1))
+    } else if at_eof {
+        Result::Ok(ScanStep::Final(Option::None))
+    } else {
+        Result::Ok(ScanStep::More(0))
+    }
+}
+
+pub struct Scanner[R] {
+    reader: R,
+    split: (Slice[byte], bool) -> Result[ScanStep, Error],
+    limit: isize,
+    buffer: Ref[bytes::Bytes],
+    eof: Ref[bool],
+    done: Ref[bool],
+    failure_value: Ref[Option[Error]],
+}
+
+impl[R: Read] Scanner[R] {
+    pub fn new(reader: R, max_buffer: isize) -> Result[Scanner[R], Error] {
+        Scanner::with_split(reader, max_buffer, scan_lines)
+    }
+
+    pub fn with_split(
+        reader: R,
+        max_buffer: isize,
+        split: (Slice[byte], bool) -> Result[ScanStep, Error],
+    ) -> Result[Scanner[R], Error] {
+        if max_buffer <= 0 {
+            return Result::Err(
+                stream_error(ErrorKind::InvalidInput, "scanner", "buffer limit must be positive"),
+            )
+        }
+        Result::Ok(
+            Scanner {
+                reader,
+                split,
+                limit: max_buffer,
+                buffer: Ref::new(bytes::Bytes::new()),
+                eof: Ref::new(false),
+                done: Ref::new(false),
+                failure_value: Ref::new(Option::None),
+            },
+        )
+    }
+
+    pub fn failure(self: Scanner[R]) -> Option[Error] {
+        self.failure_value.get()
+    }
+
+    fn fail(self: Scanner[R], error: Error) -> Result[Option[bytes::Bytes], Error] {
+        self.failure_value.set(Option::Some(error));
+        self.buffer.set(bytes::Bytes::new());
+        Result::Err(error)
+    }
+
+    fn invalid(self: Scanner[R], message: string) -> Result[Option[bytes::Bytes], Error] {
+        self.fail(stream_error(ErrorKind::InvalidData, "scanner", message))
+    }
+
+    pub fn next(self: Scanner[R]) -> Result[Option[bytes::Bytes], Error] {
+        if let Some(error) = self.failure_value.get() {
+            return Result::Err(error)
+        }
+        if self.done.get() {
+            return Result::Ok(Option::None)
+        }
+        loop {
+            let buffer = self.buffer.get();
+            let step = match (self.split)(buffer.as_slice(), self.eof.get()) {
+                Ok(step) => step,
+                Err(error) => return self.fail(error),
+            };
+            match step {
+                ScanStep::Emit(advance, token) => {
+                    if advance <= 0 || advance > buffer.len() {
+                        return self.invalid("invalid emitted token advance")
+                    }
+                    let result = bytes::Bytes::from_slice_copy(token.as_slice());
+                    self.buffer.set(
+                        bytes::Bytes::from_slice_copy(buffer.slice(advance, buffer.len())),
+                    );
+                    return Result::Ok(Option::Some(result))
+                },
+                ScanStep::Token(advance, start, end) => {
+                    if advance <= 0 || advance > buffer.len() || start < 0 || end < start
+                        || end > advance {
+                        return self.invalid("invalid token range or non-progressing split")
+                    }
+                    let token = bytes::Bytes::from_slice_copy(buffer.slice(start, end));
+                    self.buffer.set(
+                        bytes::Bytes::from_slice_copy(buffer.slice(advance, buffer.len())),
+                    );
+                    return Result::Ok(Option::Some(token))
+                },
+                ScanStep::Final(range) => {
+                    let token = match range {
+                        Some((start, end)) => {
+                            if start < 0 || end < start || end > buffer.len() {
+                                return self.invalid("invalid final token range")
+                            }
+                            Option::Some(bytes::Bytes::from_slice_copy(buffer.slice(start, end)))
+                        },
+                        None => Option::None,
+                    };
+                    self.buffer.set(bytes::Bytes::new());
+                    self.done.set(true);
+                    return Result::Ok(token)
+                },
+                ScanStep::More(advance) => {
+                    if advance < 0 || advance > buffer.len() {
+                        return self.invalid("invalid split advance")
+                    }
+                    if advance > 0 {
+                        self.buffer.set(
+                            bytes::Bytes::from_slice_copy(buffer.slice(advance, buffer.len())),
+                        );
+                        continue
+                    }
+                    if self.eof.get() {
+                        if buffer.len() > 0 {
+                            return self.fail(
+                                stream_error(
+                                    ErrorKind::UnexpectedEof,
+                                    "scanner",
+                                    "split requires more input at EOF",
+                                ),
+                            )
+                        }
+                        self.done.set(true);
+                        return Result::Ok(Option::None)
+                    }
+                },
+            }
+            let remaining = self.limit - buffer.len();
+            let capacity = if remaining == 0 {
+                1
+            } else if remaining < 4096 {
+                remaining
+            } else {
+                4096
+            };
+            let scratch = byte_buffer(capacity);
+            let count = match self.reader.read(scratch.as_mut_slice()) {
+                Ok(count) => count,
+                Err(error) => return self.fail(error),
+            };
+            if count < 0 || count > capacity {
+                return self.invalid("invalid reader byte count")
+            }
+            if count == 0 {
+                self.eof.set(true);
+            } else {
+                if remaining == 0 {
+                    return self.invalid("buffer limit exceeded")
+                }
+                buffer.extend_from_slice(scratch.slice(0, count));
+            }
+        }
     }
 }
 
 pub struct BufWriter[W] {
-    writer: W,
+    writer: Ref[W],
     buffer: bytes::Bytes,
     offset: Ref[isize],
-    capacity: isize,
+    capacity_value: isize,
 }
 
 impl[W: Write] BufWriter[W] {
     pub fn new(writer: W) -> BufWriter[W] {
-        BufWriter { writer, buffer: bytes::Bytes::new(), offset: Ref::new(0), capacity: 8192 }
+        BufWriter {
+            writer: Ref::new(writer),
+            buffer: bytes::Bytes::new(),
+            offset: Ref::new(0),
+            capacity_value: 8192,
+        }
     }
 
     pub fn with_capacity(writer: W, capacity: isize) -> Result[BufWriter[W], Error] {
@@ -248,7 +1143,12 @@ impl[W: Write] BufWriter[W] {
             )
         } else {
             Result::Ok(
-                BufWriter { writer, buffer: bytes::Bytes::new(), offset: Ref::new(0), capacity },
+                BufWriter {
+                    writer: Ref::new(writer),
+                    buffer: bytes::Bytes::new(),
+                    offset: Ref::new(0),
+                    capacity_value: capacity,
+                },
             )
         }
     }
@@ -257,12 +1157,25 @@ impl[W: Write] BufWriter[W] {
         self.buffer.len() - self.offset.get()
     }
 
+    pub fn capacity(self: BufWriter[W]) -> isize {
+        self.capacity_value
+    }
+
+    pub fn available(self: BufWriter[W]) -> isize {
+        self.capacity_value - self.buffered_len()
+    }
+
+    pub fn reset(self: BufWriter[W], writer: W) -> () {
+        self.writer.set(writer);
+        self.buffer.clear();
+        self.offset.set(0);
+    }
+
     fn drain(self: BufWriter[W]) -> Result[(), Error] {
         while self.offset.get() < self.buffer.len() {
             let remaining = self.buffer.slice(self.offset.get(), self.buffer.len());
-            let count = match self.writer.write(remaining) {
+            let count = match self.writer.get().write(remaining) {
                 Ok(count) => valid_count(count, remaining.len(), "flush buffer")?,
-                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                 Err(error) => return Result::Err(error),
             };
             if count == 0 {
@@ -283,10 +1196,10 @@ impl[W: Write] Write for BufWriter[W] {
         if buffer.len() == 0 {
             return Result::Ok(0)
         }
-        if self.buffer.len() == self.capacity || self.offset.get() > 0 {
+        if self.buffer.len() == self.capacity_value || self.offset.get() > 0 {
             self.drain()?
         }
-        let available = self.capacity - self.buffer.len();
+        let available = self.capacity_value - self.buffer.len();
         let count = if buffer.len() < available {
             buffer.len()
         } else {
@@ -298,14 +1211,14 @@ impl[W: Write] Write for BufWriter[W] {
 
     fn flush(self: BufWriter[W]) -> Result[(), Error] {
         self.drain()?;
-        self.writer.flush()
+        self.writer.get().flush()
     }
 }
 
 impl[W: Write + Close] Close for BufWriter[W] {
     fn close(self: BufWriter[W]) -> Result[(), Error] {
         self.flush()?;
-        self.writer.close()
+        self.writer.get().close()
     }
 }
 

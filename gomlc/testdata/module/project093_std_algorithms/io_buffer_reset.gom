@@ -1,0 +1,186 @@
+package main;
+
+use std::io;
+use io::{Read, Write, BufRead, Close};
+use std::bytes;
+use std::testing;
+
+struct BufferResetProbe {
+    cursor: io::Cursor,
+    reads: Ref[isize],
+    writes: Ref[isize],
+    flushes: Ref[isize],
+    closes: Ref[isize],
+    fail_write_on: isize,
+    fail_read: bool,
+}
+
+fn buffer_reset_probe(value: string) -> BufferResetProbe {
+    BufferResetProbe {
+        cursor: io::Cursor::new(bytes::Bytes::from_string(value)),
+        reads: Ref::new(0),
+        writes: Ref::new(0),
+        flushes: Ref::new(0),
+        closes: Ref::new(0),
+        fail_write_on: -1,
+        fail_read: false,
+    }
+}
+
+fn buffer_reset_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Other,
+        "buffer reset test",
+        Option::None,
+        Option::None,
+        "injected failure",
+    )
+}
+
+impl Read for BufferResetProbe {
+    fn read(self: BufferResetProbe, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.reads.set(self.reads.get() + 1);
+        if self.fail_read {
+            Result::Err(buffer_reset_error())
+        } else {
+            self.cursor.read(output)
+        }
+    }
+}
+
+impl Write for BufferResetProbe {
+    fn write(self: BufferResetProbe, input: Slice[byte]) -> Result[isize, io::Error] {
+        self.writes.set(self.writes.get() + 1);
+        if self.writes.get() == self.fail_write_on {
+            return Result::Err(buffer_reset_error())
+        }
+        self.cursor.write(
+            input.sub(
+                0,
+                if input.len() > 2 {
+                    2
+                } else {
+                    input.len()
+                },
+            ),
+        )
+    }
+
+    fn flush(self: BufferResetProbe) -> Result[(), io::Error] {
+        self.flushes.set(self.flushes.get() + 1);
+        Result::Ok(())
+    }
+}
+
+impl Close for BufferResetProbe {
+    fn close(self: BufferResetProbe) -> Result[(), io::Error] {
+        self.closes.set(self.closes.get() + 1);
+        Result::Ok(())
+    }
+}
+
+fn check_buffer_resets() -> () {
+    assert_equal(io::BufReader::new(buffer_reset_probe("")).capacity(), 8192);
+    assert_equal(io::BufWriter::new(buffer_reset_probe("")).capacity(), 8192);
+    assert_equal(io::BufWriter::new(buffer_reset_probe("")).available(), 8192);
+    for capacity in[1, 2, 3, 8, 8192] {
+        let source = buffer_reset_probe("old source");
+        let next = buffer_reset_probe("界🙂new");
+        let reader = testing::expect_ok(
+            io::BufReader::with_capacity(source, capacity),
+            "reset reader",
+        );
+        let alias = reader;
+        assert_equal(reader.capacity(), capacity);
+        let snapshot = testing::expect_ok(reader.fill_buf(), "prefill old reader").to_vec();
+        assert_equal(source.reads.get(), 1);
+        if snapshot.len() > 1 {
+            testing::expect_ok(alias.consume(1), "consume old prefix");
+        }
+        testing::assert(reader.buffered_len() > 0);
+        alias.reset(next);
+        assert_equal(reader.capacity(), capacity);
+        assert_equal(reader.buffered_len(), 0);
+        assert_equal(source.reads.get(), 1);
+        assert_equal(source.closes.get(), 0);
+        assert_equal(next.reads.get(), 0);
+        assert_equal(
+            testing::expect_ok(reader.read_to_string(10), "new reader after reset"),
+            "界🙂new",
+        );
+        assert_equal(alias.buffered_len(), 0);
+        for index in 0..snapshot.len() {
+            assert_equal(snapshot[index], "old source".byte_get(index));
+        }
+        testing::expect_ok(alias.close(), "close replacement reader");
+        assert_equal(next.closes.get(), 1);
+        assert_equal(source.closes.get(), 0);
+        assert_equal(source.reads.get(), 1);
+        let output = buffer_reset_probe("");
+        let next = buffer_reset_probe("");
+        let writer = testing::expect_ok(
+            io::BufWriter::with_capacity(output, capacity),
+            "reset writer",
+        );
+        let alias = writer;
+        assert_equal(writer.available(), capacity);
+        let old = Vec::from_array([b'o']);
+        assert_equal(testing::expect_ok(writer.write(old.as_slice()), "buffer old byte"), 1);
+        assert_equal(alias.buffered_len(), 1);
+        assert_equal(alias.available(), capacity - 1);
+        alias.reset(next);
+        assert_equal(writer.capacity(), capacity);
+        assert_equal(writer.buffered_len(), 0);
+        assert_equal(writer.available(), capacity);
+        assert_equal(output.writes.get(), 0);
+        assert_equal(output.flushes.get(), 0);
+        assert_equal(output.closes.get(), 0);
+        let bytes = "界🙂new".to_bytes();
+        testing::expect_ok(writer.write_all(bytes.as_slice()), "new writer after reset");
+        testing::expect_ok(alias.close(), "close replacement writer");
+        assert_equal(next.cursor.bytes().to_vec(), bytes);
+        assert_equal(next.flushes.get(), 1);
+        assert_equal(next.closes.get(), 1);
+        assert_equal(writer.available(), capacity);
+        assert_equal(output.writes.get(), 0);
+        assert_equal(output.flushes.get(), 0);
+        assert_equal(output.closes.get(), 0);
+    }
+    let output = BufferResetProbe { fail_write_on: 2, ..buffer_reset_probe("") };
+    let writer = testing::expect_ok(io::BufWriter::with_capacity(output, 8), "partial reset writer");
+    let alias = writer;
+    testing::expect_ok(writer.write_all(b"abcdef".as_slice()), "pending partial output");
+    assert_equal(writer.available(), 2);
+    testing::assert(writer.flush().is_err());
+    assert_equal(output.writes.get(), 2);
+    assert_equal(writer.buffered_len(), 4);
+    assert_equal(writer.available(), 4);
+    let snapshot = output.cursor.bytes();
+    assert_equal(snapshot.to_vec(), b"ab");
+    let next = buffer_reset_probe("");
+    alias.reset(next);
+    assert_equal(writer.buffered_len(), 0);
+    assert_equal(writer.available(), 8);
+    testing::expect_ok(writer.write_all(b"new".as_slice()), "write after partial reset");
+    testing::expect_ok(alias.flush(), "flush after partial reset");
+    assert_equal(next.cursor.bytes().to_vec(), b"new");
+    assert_equal(output.writes.get(), 2);
+    assert_equal(output.flushes.get(), 0);
+    assert_equal(output.closes.get(), 0);
+    assert_equal(snapshot.to_vec(), b"ab");
+    assert_equal(writer.available(), 8);
+    for failed in[false, true] {
+        let source = BufferResetProbe { fail_read: failed, ..buffer_reset_probe("") };
+        let reader = io::BufReader::new(source);
+        if failed {
+            testing::assert(reader.fill_buf().is_err());
+        } else {
+            testing::assert(testing::expect_ok(reader.fill_buf(), "old EOF").len() == 0);
+        }
+        let alias = reader;
+        alias.reset(buffer_reset_probe("x"));
+        assert_equal(testing::expect_ok(reader.read_to_string(1), "reset after stop"), "x");
+        assert_equal(source.reads.get(), 1);
+        assert_equal(source.closes.get(), 0);
+    }
+}

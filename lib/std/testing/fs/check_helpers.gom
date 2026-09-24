@@ -1,0 +1,247 @@
+package fs;
+
+use module::fs as filesystem;
+
+fn check_helper_parent(path: string) -> (string, string) {
+    let mut separator = -1;
+    for index in 0..path.byte_len() {
+        if path.byte_get(index) == b'/' {
+            separator = index;
+        }
+    }
+    if separator < 0 {
+        (".", path)
+    } else {
+        (path.byte_slice(0, separator), path.byte_slice(separator + 1, path.byte_len()))
+    }
+}
+
+fn check_helper_stat[F: filesystem::FileSystem](
+    state: CheckState,
+    source: F,
+    path: string,
+    metadata: filesystem::Metadata,
+    sub_root: string,
+    sub_name: string,
+    through_sub: bool,
+) -> () where F::Handle: filesystem::ReadDirFile {
+    let operation = if through_sub {
+        "sub filesystem stat helper"
+    } else {
+        "stat helper"
+    };
+    let actual = check_observed_helper(
+        state,
+        source,
+        path,
+        operation,
+        |observed| {
+            if through_sub {
+                let sub = filesystem::SubFs::new(observed, sub_root)?;
+                filesystem::stat_from(sub, sub_name)
+            } else {
+                filesystem::stat_from(observed, path)
+            }
+        },
+    );
+    if let Some(actual) = actual {
+        if !check_metadata_equal(metadata, actual) {
+            check_inconsistent(
+                state,
+                path,
+                operation,
+                "helper metadata differs from the stable snapshot",
+            );
+        }
+    }
+}
+
+fn check_helper_file[F: filesystem::FileSystem](
+    state: CheckState,
+    source: F,
+    path: string,
+    metadata: filesystem::Metadata,
+) -> () where F::Handle: filesystem::ReadDirFile {
+    let issue_count = state.issues.len();
+    let baseline = check_with_handle(
+        state,
+        source,
+        path,
+        |handle| {
+            if !check_file_metadata(state, handle, path, metadata) {
+                return Option::None
+            }
+            check_read_snapshot(state, handle, path)
+        },
+    );
+    if check_stopped(state) || state.issues.len() != issue_count {
+        return
+    }
+    let baseline = match baseline {
+        Some(Some(baseline)) => baseline,
+        _ => return,
+    };
+    if baseline.len().to_i64() != metadata.len() {
+        check_inconsistent(
+            state,
+            path,
+            "helper baseline",
+            "confirmed file length differs from snapshot metadata",
+        );
+        return
+    }
+    let (parent, name) = check_helper_parent(path);
+    for through_sub in[false, true] {
+        check_helper_stat(state, source, path, metadata, parent, name, through_sub);
+        if check_stopped(state) {
+            return
+        }
+        let operation = if through_sub {
+            "sub filesystem read file helper"
+        } else {
+            "read file helper"
+        };
+        let actual = check_observed_helper(
+            state,
+            source,
+            path,
+            operation,
+            |observed| {
+                if through_sub {
+                    let sub = filesystem::SubFs::new(observed, parent)?;
+                    filesystem::read_file_from(sub, name, state.limits.max_file_bytes)
+                } else {
+                    filesystem::read_file_from(observed, path, state.limits.max_file_bytes)
+                }
+            },
+        );
+        if let Some(actual) = actual {
+            let mut equal = actual.len() == baseline.len();
+            if equal {
+                let bytes = actual.as_slice();
+                for index in 0..baseline.len() {
+                    if bytes[index] != baseline[index] {
+                        equal = false;
+                        break
+                    }
+                }
+            }
+            if !equal {
+                check_inconsistent(
+                    state,
+                    path,
+                    operation,
+                    "helper bytes differ from the stable snapshot",
+                );
+            }
+        }
+        if check_stopped(state) {
+            return
+        }
+    }
+}
+
+fn check_helper_directory_result(
+    state: CheckState,
+    path: string,
+    operation: string,
+    expected: Vec[CheckedEntry],
+    actual: Vec[CheckedEntry],
+) -> () {
+    for index in 0..actual.len() {
+        let name = actual[index].name;
+        if name == "." || !filesystem::valid_path(name) || name.contains("/") {
+            check_inconsistent(
+                state,
+                path,
+                operation,
+                "helper returned an invalid directory entry name",
+            );
+            return
+        }
+        if index > 0 && actual[index - 1].name > name {
+            check_inconsistent(
+                state,
+                path,
+                operation,
+                "helper directory names are not in nondecreasing order",
+            );
+            return
+        }
+    }
+    let used: Vec[bool] = Vec::new();
+    for _ in actual {
+        used.push(false);
+    }
+    let mut equal = actual.len() == expected.len();
+    for entry in expected {
+        let mut found = false;
+        for index in 0..actual.len() {
+            if !used[index] && checked_directory_entry_equal(entry, actual[index]) {
+                used[index] = true;
+                found = true;
+                break
+            }
+        }
+        if !found {
+            equal = false;
+        }
+    }
+    if !equal {
+        check_inconsistent(
+            state,
+            path,
+            operation,
+            "helper directory entry multiset differs from the stable snapshot",
+        );
+    }
+}
+
+fn check_helper_directory[F: filesystem::FileSystem](
+    state: CheckState,
+    source: F,
+    path: string,
+    metadata: filesystem::Metadata,
+    entries: Vec[CheckedEntry],
+) -> () where F::Handle: filesystem::ReadDirFile {
+    for through_sub in[false, true] {
+        check_helper_stat(state, source, path, metadata, path, ".", through_sub);
+        if check_stopped(state) {
+            return
+        }
+        let operation = if through_sub {
+            "sub filesystem read directory helper"
+        } else {
+            "read directory helper"
+        };
+        let actual = check_observed_helper(
+            state,
+            source,
+            path,
+            operation,
+            |observed| {
+                let result = if through_sub {
+                    let sub = filesystem::SubFs::new(observed, path)?;
+                    filesystem::read_dir_from(sub, ".", state.limits.max_directory_entries)
+                } else {
+                    filesystem::read_dir_from(observed, path, state.limits.max_directory_entries)
+                };
+                let page = result.map_err(|error| error.error())?;
+                let checked = Vec::new();
+                for entry in page {
+                    let Some(entry) = check_observed_entry(entry) else {
+                        return Result::Ok(Option::None)
+                    };
+                    checked.push(entry);
+                }
+                Result::Ok(Option::Some(checked))
+            },
+        );
+        if let Some(Some(actual)) = actual {
+            check_helper_directory_result(state, path, operation, entries, actual);
+        }
+        if check_stopped(state) {
+            return
+        }
+    }
+}

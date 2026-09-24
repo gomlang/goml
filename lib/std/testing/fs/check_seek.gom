@@ -1,0 +1,214 @@
+package fs;
+
+use module::fs as filesystem;
+use module::io;
+use io::Seek;
+
+fn check_seek_target[H: io::Seek](
+    state: CheckState,
+    file: H,
+    path: string,
+    from: io::SeekFrom,
+    expected: isize,
+) -> bool {
+    let Some(position) = check_call(
+        state,
+        path,
+        "seek file",
+        || file.seek(from).map_err(check_io_error),
+    ) else {
+        return false
+    };
+    if position != expected {
+        check_violation(
+            state,
+            path,
+            "seek file",
+            "successful seek returned an incorrect absolute position",
+        );
+        false
+    } else {
+        true
+    }
+}
+
+fn check_seek_invalid[H: io::Seek](state: CheckState, file: H, path: string, from: io::SeekFrom) -> bool {
+    let Some(result) = check_call(
+        state,
+        path,
+        "seek invalid position",
+        || Result::Ok(file.seek(from)),
+    ) else {
+        return false
+    };
+    match result {
+        Ok(_) => {
+            check_violation(
+                state,
+                path,
+                "seek invalid position",
+                "negative or overflowing position was accepted",
+            );
+            false
+        },
+        Err(error) => {
+            if error.kind() == io::ErrorKind::InvalidInput {
+                true
+            } else {
+                check_issue(
+                    state,
+                    CheckIssue {
+                        path,
+                        operation: "seek invalid position",
+                        kind: CheckIssueKind::ProviderError(check_io_error(error)),
+                    },
+                );
+                false
+            }
+        },
+    }
+}
+
+fn check_seek_content[H: filesystem::File](
+    state: CheckState,
+    file: H,
+    path: string,
+    baseline: Slice[byte],
+    position: isize,
+) -> bool where H: io::Seek {
+    let remaining = baseline.len() - position;
+    let wanted = if remaining < 17 {
+        remaining
+    } else {
+        17
+    };
+    if wanted == 0 {
+        if !check_file_eof(state, file, path, baseline.len()) {
+            return false
+        }
+        return check_seek_target(state, file, path, io::SeekFrom::Current(0), position)
+    }
+    let buffer = check_file_buffer(wanted);
+    let mut compared = 0;
+    while compared < wanted {
+        let Some(amount) = check_file_request(state, path, wanted - compared) else {
+            return false
+        };
+        let Some(count) = check_file_read(state, file, path, buffer.slice_mut(0, amount)) else {
+            return false
+        };
+        if count == 0 {
+            check_inconsistent(
+                state,
+                path,
+                "read after seek",
+                "file ended before the snapshot suffix at the requested position",
+            );
+            return false
+        }
+        for index in 0..count {
+            if buffer[index] != baseline[position + compared + index] {
+                check_inconsistent(
+                    state,
+                    path,
+                    "read after seek",
+                    "sequential content after seeking differs from the snapshot",
+                );
+                return false
+            }
+        }
+        compared += count;
+    }
+    check_seek_target(state, file, path, io::SeekFrom::Current(0), position + compared)
+}
+
+fn check_seek_subject[H: filesystem::File](
+    state: CheckState,
+    file: H,
+    path: string,
+    baseline: Slice[byte],
+    metadata: filesystem::Metadata,
+) -> () where H: io::Seek {
+    if !check_file_metadata(state, file, path, metadata) {
+        return
+    }
+    let length = baseline.len();
+    for position in[0, length / 2, length] {
+        if !check_seek_target(state, file, path, io::SeekFrom::Start(position), position)
+            || !check_seek_content(state, file, path, baseline, position) {
+            return
+        }
+    }
+    if !check_seek_target(state, file, path, io::SeekFrom::Start(0), 0)
+        || !check_seek_target(state, file, path, io::SeekFrom::Current(length), length)
+        || !check_seek_content(state, file, path, baseline, length)
+        || !check_seek_target(state, file, path, io::SeekFrom::Current(-length), 0)
+        || !check_seek_content(state, file, path, baseline, 0) {
+        return
+    }
+    for offset in[-1, -9223372036854775807 - 1] {
+        if !check_seek_invalid(state, file, path, io::SeekFrom::Start(offset)) {
+            return
+        }
+        if !check_seek_target(state, file, path, io::SeekFrom::Start(0), 0)
+            || !check_seek_invalid(state, file, path, io::SeekFrom::Current(offset)) {
+            return
+        }
+    }
+    if length > 0 {
+        if !check_seek_target(state, file, path, io::SeekFrom::Start(1), 1)
+            || !check_seek_invalid(state, file, path, io::SeekFrom::Current(9223372036854775807)) {
+            return
+        }
+    }
+    if !check_seek_target(state, file, path, io::SeekFrom::End(0), length)
+        || !check_seek_content(state, file, path, baseline, length)
+        || !check_seek_target(state, file, path, io::SeekFrom::End(-length), 0)
+        || !check_seek_content(state, file, path, baseline, 0) {
+        return
+    }
+    if !check_seek_invalid(state, file, path, io::SeekFrom::End(-9223372036854775807 - 1)) {
+        return
+    }
+    if length > 0 {
+        let _ = check_seek_invalid(state, file, path, io::SeekFrom::End(9223372036854775807));
+    }
+}
+
+fn check_seek_file[F: filesystem::FileSystem](
+    state: CheckState,
+    source: F,
+    path: string,
+    metadata: filesystem::Metadata,
+) -> () where F::Handle: io::Seek {
+    let _ = check_with_handle(
+        state,
+        source,
+        path,
+        |baseline_file| {
+            if !check_file_metadata(state, baseline_file, path, metadata) {
+                return
+            }
+            let Some(baseline) = check_read_snapshot(state, baseline_file, path) else {
+                return
+            };
+            if baseline.len().to_i64() != metadata.len() {
+                check_inconsistent(
+                    state,
+                    path,
+                    "seek snapshot",
+                    "confirmed baseline length differs from metadata",
+                );
+                return
+            }
+            let _ = check_with_handle(
+                state,
+                source,
+                path,
+                |subject| {
+                    check_seek_subject(state, subject, path, baseline.as_slice(), metadata)
+                },
+            );
+        },
+    );
+}

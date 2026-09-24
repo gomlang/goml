@@ -1,0 +1,587 @@
+package main;
+
+use std::bytes;
+use std::bytes::endian;
+use std::bytes::endian::stream;
+use std::io;
+use std::ffi;
+use std::testing;
+
+#[go_ffi("example.com/goml-std-algorithms/native", "BinaryRecordBytes")]
+extern fn go_binary_record_bytes(
+    enabled: bool,
+    sequence: u16,
+    samples: Slice[i16],
+    weight_bits: u32,
+    little: bool,
+) -> ffi::RawSlice[byte];
+
+struct BinaryRecord {
+    enabled: bool,
+    sequence: u16,
+    samples: Vec[i16],
+    weight: f32,
+}
+
+fn write_record(writer: endian::Writer, value: BinaryRecord, order: endian::Endian) -> Result[
+    (),
+    endian::BoundsError,
+] {
+    writer.write_bool(value.enabled)?;
+    writer.write_u16(value.sequence, order)?;
+    writer.write_with(
+        6,
+        |fields: endian::Writer| {
+            for sample in value.samples {
+                fields.write_i16(sample, order)?;
+            }
+            Result::Ok(())
+        },
+    )?;
+    writer.write_f32(value.weight, order)
+}
+
+fn read_record(reader: endian::Reader, order: endian::Endian) -> Result[
+    BinaryRecord,
+    endian::BoundsError,
+] {
+    let enabled = reader.read_bool()?;
+    let sequence = reader.read_u16(order)?;
+    let samples = reader.read_with(
+        6,
+        |fields: endian::Reader| {
+            let result: Vec[i16] = Vec::new();
+            for _ in 0..3 {
+                result.push(fields.read_i16(order)?);
+            }
+            Result::Ok(result)
+        },
+    )?;
+    let weight = reader.read_f32(order)?;
+    Result::Ok(BinaryRecord { enabled, sequence, samples, weight })
+}
+
+fn block_buffer(length: isize, value: byte) -> Vec[byte] {
+    let result: Vec[byte] = Vec::new();
+    for _ in 0..length {
+        result.push(value);
+    }
+    result
+}
+
+fn check_endian_blocks() -> () {
+    check_stream_block_limits();
+    for bits in[
+        0.to_u32(),
+        1.to_u32(),
+        2147483648.to_u32(),
+        2139095040.to_u32(),
+        2143289345.to_u32(),
+        4294967295.to_u32(),
+    ] {
+        for order in[endian::Endian::Little, endian::Endian::Big] {
+            for enabled in[false, true] {
+                let record = BinaryRecord {
+                    enabled,
+                    sequence: bits.to_u16(),
+                    samples: Vec::from_array([bits.to_i16(), (-32768).to_i16(), 32767.to_i16()]),
+                    weight: float32_from_bits(bits),
+                };
+                let little = match order {
+                    endian::Endian::Little => true,
+                    endian::Endian::Big => false,
+                };
+                let expected = go_binary_record_bytes(
+                    enabled,
+                    record.sequence,
+                    record.samples.as_slice(),
+                    bits,
+                    little,
+                ).as_slice().to_vec();
+                let builder = endian::Builder::new();
+                testing::expect_ok(
+                    builder.write_with(
+                        16,
+                        16,
+                        |block: endian::Writer| write_record(block, record, order),
+                    ),
+                    "Go record encoding",
+                );
+                assert_equal(builder.to_vec(), expected);
+                let reader = endian::Reader::new(expected.as_slice());
+                let decoded = testing::expect_ok(
+                    reader.read_with(16, |block: endian::Reader| read_record(block, order)),
+                    "Go record decoding",
+                );
+                assert_equal(decoded.enabled, enabled);
+                assert_equal(decoded.sequence, record.sequence);
+                assert_equal(decoded.samples, record.samples);
+                assert_equal(decoded.weight.to_bits(), bits);
+            }
+        }
+    }
+    let record = BinaryRecord {
+        enabled: true,
+        sequence: 4660,
+        samples: Vec::from_array([-32768.to_i16(), -1.to_i16(), 32767.to_i16()]),
+        weight: float32_from_bits(2143289345),
+    };
+    for order in[endian::Endian::Little, endian::Endian::Big] {
+        let builder = endian::Builder::new();
+        builder.write_u8(165);
+        testing::expect_ok(
+            builder.write_with(16, 17, |writer: endian::Writer| write_record(writer, record, order)),
+            "record builder",
+        );
+        builder.write_u8(42);
+        let expected: Vec[byte] = match order {
+            endian::Endian::Little => Vec::from_array(
+                [165, 1, 52, 18, 0, 128, 255, 255, 255, 127, 1, 0, 192, 127, 0, 0, 0, 42],
+            ),
+            endian::Endian::Big => Vec::from_array(
+                [165, 1, 18, 52, 128, 0, 255, 255, 127, 255, 127, 192, 0, 1, 0, 0, 0, 42],
+            ),
+        };
+        assert_equal(builder.to_vec(), expected);
+        let sink = CopyWriter {
+            cursor: io::Cursor::new(bytes::Bytes::new()),
+            interrupted: Ref::new(false),
+        };
+        testing::expect_ok(
+            stream::write_with(
+                sink,
+                16,
+                16,
+                |block: endian::Writer| write_record(block, record, order),
+            ),
+            "stream record write",
+        );
+        assert_equal(sink.cursor.bytes().to_vec(), expected.as_slice().sub(1, 17).to_vec());
+        for chunk in 1..18 {
+            let source = FixedReader {
+                cursor: io::Cursor::new(
+                    bytes::Bytes::from_slice_copy(expected.as_slice().sub(1, 18)),
+                ),
+                chunk,
+                interrupted: Ref::new(false),
+            };
+            let decoded = testing::expect_some(
+                testing::expect_ok(
+                    stream::read_with(
+                        source,
+                        16,
+                        16,
+                        |block: endian::Reader| read_record(block, order),
+                    ),
+                    "stream record read",
+                ),
+                "record present",
+            );
+            assert_equal(decoded.samples, record.samples);
+            assert_equal(decoded.sequence, record.sequence);
+            assert_equal(decoded.enabled, record.enabled);
+            assert_equal(decoded.weight.to_bits(), record.weight.to_bits());
+            assert_equal(source.cursor.position(), 16);
+            assert_equal(
+                testing::expect_ok(stream::read_u8(source), "stream tail"),
+                Option::Some(42.to_u8()),
+            );
+        }
+        for length in 0..16 {
+            let calls = Ref::new(0);
+            let source = FixedReader {
+                cursor: io::Cursor::new(
+                    bytes::Bytes::from_slice_copy(expected.as_slice().sub(1, length + 1)),
+                ),
+                chunk: 3,
+                interrupted: Ref::new(false),
+            };
+            let result = stream::read_with(
+                source,
+                16,
+                16,
+                |block: endian::Reader| {
+                    calls.set(calls.get() + 1);
+                    read_record(block, order)
+                },
+            );
+            if length == 0 {
+                testing::assert(testing::expect_ok(result, "empty stream").is_none());
+            } else {
+                match result {
+                    Err(stream::ReadError::Io(error, count)) => {
+                        assert_equal(error.kind(), io::ErrorKind::UnexpectedEof);
+                        assert_equal(count, length);
+                    },
+                    _ => testing::assert(false),
+                }
+            }
+            assert_equal(calls.get(), 0);
+            assert_equal(source.cursor.position(), length);
+        }
+        let reader = endian::Reader::new(expected.as_slice());
+        testing::expect_ok(reader.read_u8(), "record prefix");
+        let alias = reader;
+        let decoded = testing::expect_ok(
+            reader.read_with(16, |block: endian::Reader| read_record(block, order)),
+            "record decode",
+        );
+        assert_equal(decoded.enabled, record.enabled);
+        assert_equal(decoded.sequence, record.sequence);
+        assert_equal(decoded.samples, record.samples);
+        assert_equal(decoded.weight.to_bits(), record.weight.to_bits());
+        assert_equal(alias.position(), 17);
+        assert_equal(testing::expect_ok(reader.read_u8(), "record tail"), 42.to_u8());
+        let output = block_buffer(18, 165);
+        let writer = endian::Writer::new(output.as_mut_slice());
+        testing::expect_ok(writer.write_u8(165), "record output prefix");
+        let alias = writer;
+        testing::expect_ok(
+            writer.write_with(16, |block: endian::Writer| write_record(block, record, order)),
+            "record write",
+        );
+        assert_equal(alias.position(), 17);
+        testing::expect_ok(writer.write_u8(42), "record output tail");
+        assert_equal(output, expected);
+        for length in 0..16 {
+            let calls = Ref::new(0);
+            let short_reader = endian::Reader::new(expected.as_slice().sub(1, length + 1));
+            let result = short_reader.read_with(
+                16,
+                |block: endian::Reader| {
+                    calls.set(calls.get() + 1);
+                    read_record(block, order)
+                },
+            );
+            testing::assert(result.is_err());
+            assert_equal(short_reader.position(), 0);
+            let output = block_buffer(length + 2, 165);
+            let short_writer = endian::Writer::new(output.as_mut_slice().sub(1, length + 1));
+            testing::assert(
+                short_writer.write_with(
+                    16,
+                    |block: endian::Writer| {
+                        calls.set(calls.get() + 1);
+                        write_record(block, record, order)
+                    },
+                ).is_err(),
+            );
+            assert_equal(short_writer.position(), 0);
+            assert_equal(calls.get(), 0);
+            assert_equal(output, block_buffer(length + 2, 165));
+        }
+    }
+    let output = block_buffer(10, 165);
+    let writer = endian::Writer::new(output.as_mut_slice());
+    testing::expect_ok(writer.write_u8(42), "failure prefix");
+    let failed = writer.write_with(
+        8,
+        |block: endian::Writer| {
+            block.write_u16(0, endian::Endian::Big)?;
+            block.write_with(
+                4,
+                |nested: endian::Writer| {
+                    nested.write_u16(0, endian::Endian::Big)?;
+                    nested.write_u32(0, endian::Endian::Big)
+                },
+            )
+        },
+    );
+    let error = testing::expect_err(failed, "expected nested bounds error");
+    assert_equal(error.offset(), 2);
+    assert_equal(error.needed(), 4);
+    assert_equal(error.length(), 4);
+    assert_equal(writer.position(), 1);
+    assert_equal(output[0], 42.to_u8());
+    for index in 1..10 {
+        assert_equal(output[index], 165.to_u8());
+    }
+    let reader = endian::Reader::new(output.as_slice());
+    testing::expect_ok(reader.read_u8(), "failure read prefix");
+    testing::assert(
+        reader.read_with(
+            8,
+            |block: endian::Reader| {
+                block.read_u16(endian::Endian::Big)?;
+                block.read_with(
+                    4,
+                    |nested: endian::Reader| {
+                        nested.read_u16(endian::Endian::Big)?;
+                        nested.read_u32(endian::Endian::Big)
+                    },
+                )
+            },
+        ).is_err(),
+    );
+    assert_equal(reader.position(), 1);
+    let builder = endian::Builder::new();
+    builder.write_u8(42);
+    testing::assert(
+        builder.write_with(
+            8,
+            9,
+            |block: endian::Writer| {
+                block.write_u8(0)?;
+                Result::Err(endian::BoundsError::new(7, 2, 8))
+            },
+        ).is_err(),
+    );
+    assert_equal(builder.to_vec(), Vec::from_array([42.to_u8()]));
+    let calls = Ref::new(0);
+    for width in[-1, 10, 9223372036854775807] {
+        testing::assert(
+            writer.write_with(
+                width,
+                |_: endian::Writer| {
+                    calls.set(calls.get() + 1);
+                    Result::Ok(())
+                },
+            ).is_err(),
+        );
+        testing::assert(
+            reader.read_with(
+                width,
+                |_: endian::Reader| {
+                    calls.set(calls.get() + 1);
+                    Result::Ok(())
+                },
+            ).is_err(),
+        );
+        testing::assert(
+            builder.write_with(
+                width,
+                9,
+                |_: endian::Writer| {
+                    calls.set(calls.get() + 1);
+                    Result::Ok(())
+                },
+            ).is_err(),
+        );
+    }
+    for limit in[-1, 0, 8] {
+        testing::assert(
+            builder.write_with(
+                8,
+                limit,
+                |_: endian::Writer| {
+                    calls.set(calls.get() + 1);
+                    Result::Ok(())
+                },
+            ).is_err(),
+        );
+    }
+    assert_equal(calls.get(), 0);
+    testing::expect_ok(
+        writer.write_with(
+            0,
+            |block: endian::Writer| {
+                assert_equal(block.remaining(), 0);
+                Result::Ok(())
+            },
+        ),
+        "empty write block",
+    );
+    assert_equal(writer.position(), 1);
+    assert_equal(
+        testing::expect_ok(
+            reader.read_with(
+                0,
+                |block: endian::Reader| {
+                    assert_equal(block.remaining(), 0);
+                    Result::Ok(17)
+                },
+            ),
+            "empty read block",
+        ),
+        17,
+    );
+    assert_equal(reader.position(), 1);
+    let retained: Vec[endian::Writer] = Vec::new();
+    testing::expect_ok(
+        writer.write_with(
+            2,
+            |block: endian::Writer| {
+                retained.push(block);
+                block.write_u8(5)
+            },
+        ),
+        "retained scratch",
+    );
+    testing::expect_ok(retained[0].write_u8(99), "mutate retained scratch");
+    assert_equal(output[1], 5.to_u8());
+    assert_equal(output[2], 0.to_u8());
+}
+
+fn check_stream_block_limits() -> () {
+    for fail_on in[1, 3] {
+        let source = codec_interrupted_reader(b"abcd", fail_on);
+        let decoded = Ref::new(0);
+        match stream::read_with(
+            source,
+            4,
+            4,
+            |block: endian::Reader| {
+                decoded.set(decoded.get() + 1);
+                block.read_u32(endian::Endian::Big)
+            },
+        ) {
+            Err(stream::ReadError::Io(error, count)) => {
+                assert_equal(error, source.error);
+                assert_equal(count, fail_on - 1);
+            },
+            _ => testing::fail("block read must stop at interruption"),
+        }
+        assert_equal(decoded.get(), 0);
+        assert_equal(source.calls.get(), fail_on);
+        assert_equal(source.cursor.position(), fail_on);
+    }
+    for count in[-1, 5] {
+        let probe = multi_probe(Vec::new(), 1, count);
+        match stream::read_with(
+            probe,
+            4,
+            4,
+            |block: endian::Reader| block.read_u32(endian::Endian::Big),
+        ) {
+            Err(stream::ReadError::Io(error, progress)) => {
+                assert_equal(error.kind(), io::ErrorKind::InvalidData);
+                assert_equal(progress, 0);
+            },
+            _ => testing::assert(false),
+        }
+    }
+    let events = Vec::new();
+    let probe = multi_probe(events, 1, 0);
+    let interrupted = io::Error::new(
+        io::ErrorKind::Interrupted,
+        "block writer",
+        Option::None,
+        Option::None,
+        "stop",
+    );
+    probe.result.set(Result::Err(interrupted));
+    let writer = io::MultiWriter::new(Vec::from_array([probe]).as_slice());
+    let encoded = Ref::new(0);
+    let error = testing::expect_err(
+        stream::write_with(
+            writer,
+            4,
+            4,
+            |block: endian::Writer| {
+                encoded.set(encoded.get() + 1);
+                block.write_u32(42, endian::Endian::Big)
+            },
+        ),
+        "block writer retry policy",
+    );
+    assert_equal(error, interrupted);
+    assert_equal(encoded.get(), 1);
+    assert_equal(events.len(), 1);
+    let source = FixedReader {
+        cursor: io::Cursor::new(bytes::Bytes::from_vec(block_buffer(4, 165))),
+        chunk: 2,
+        interrupted: Ref::new(true),
+    };
+    let sink = CopyWriter {
+        cursor: io::Cursor::new(bytes::Bytes::new()),
+        interrupted: Ref::new(true),
+    };
+    let calls = Ref::new(0);
+    for pair in[(-1, 4), (4, -1), (4, 3), (9223372036854775807, 4)] {
+        let (width, limit) = pair;
+        match stream::read_with(
+            source,
+            width,
+            limit,
+            |_: endian::Reader| {
+                calls.set(calls.get() + 1);
+                Result::Ok(())
+            },
+        ) {
+            Err(stream::ReadError::Io(error, count)) => {
+                assert_equal(error.kind(), io::ErrorKind::InvalidInput);
+                assert_equal(count, 0);
+            },
+            _ => testing::assert(false),
+        }
+        let error = testing::expect_err(
+            stream::write_with(
+                sink,
+                width,
+                limit,
+                |_: endian::Writer| {
+                    calls.set(calls.get() + 1);
+                    Result::Ok(())
+                },
+            ),
+            "invalid stream block",
+        );
+        assert_equal(error.kind(), io::ErrorKind::InvalidInput);
+    }
+    assert_equal(calls.get(), 0);
+    assert_equal(source.cursor.position(), 0);
+    assert_equal(sink.cursor.position(), 0);
+    testing::assert(source.interrupted.get());
+    testing::assert(sink.interrupted.get());
+    assert_equal(
+        testing::expect_ok(
+            stream::read_with(
+                source,
+                0,
+                0,
+                |block: endian::Reader| {
+                    assert_equal(block.remaining(), 0);
+                    Result::Ok(7)
+                },
+            ),
+            "empty stream block",
+        ),
+        Option::Some(7),
+    );
+    testing::expect_ok(
+        stream::write_with(
+            sink,
+            0,
+            0,
+            |block: endian::Writer| {
+                assert_equal(block.remaining(), 0);
+                Result::Ok(())
+            },
+        ),
+        "empty stream output",
+    );
+    testing::assert(source.interrupted.get());
+    testing::assert(sink.interrupted.get());
+    let error = testing::expect_err(
+        stream::write_with(
+            sink,
+            4,
+            4,
+            |block: endian::Writer| {
+                block.write_u8(0)?;
+                block.write_u64(0, endian::Endian::Big)
+            },
+        ),
+        "failed stream encoding",
+    );
+    assert_equal(error.kind(), io::ErrorKind::InvalidData);
+    assert_equal(sink.cursor.position(), 0);
+    testing::assert(sink.interrupted.get());
+    source.interrupted.set(false);
+    match stream::read_with(
+        source,
+        4,
+        4,
+        |block: endian::Reader| {
+            block.read_u8()?;
+            block.read_u64(endian::Endian::Big)
+        },
+    ) {
+        Err(stream::ReadError::Io(error, count)) => {
+            assert_equal(error.kind(), io::ErrorKind::InvalidData);
+            assert_equal(count, 4);
+        },
+        _ => testing::assert(false),
+    }
+    assert_equal(source.cursor.position(), 4);
+}

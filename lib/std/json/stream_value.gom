@@ -1,0 +1,207 @@
+package json;
+
+use module::io;
+
+enum ValueBuildFrame[T] {
+    Array(Vec[T]),
+    Object {
+        entries: Vec[(string, T)],
+        key: Ref[Option[string]],
+    },
+}
+
+fn value_build_append[T](session: StreamSession, frames: Vec[ValueBuildFrame[T]], value: T) -> Result[
+    (),
+    Error,
+] {
+    if frames.is_empty() {
+        return Result::Err(
+            stream_fail(session, ErrorKind::State, "JSON value builder has no parent", Option::None),
+        )
+    }
+    match frames[frames.len() - 1] {
+        Array(entries) => {
+            entries.push(value);
+            Result::Ok(())
+        },
+        Object { entries, key } => {
+            let Some(name) = key.get() else {
+                return Result::Err(
+                    stream_fail(
+                        session,
+                        ErrorKind::State,
+                        "JSON object value has no key",
+                        Option::None,
+                    ),
+                )
+            };
+            entries.push((name, value));
+            key.set(Option::None);
+            Result::Ok(())
+        },
+    }
+}
+
+fn token_read_value[R: io::Read](cursor: StreamCursor[R], state: TokenState, lease: StreamLease) -> Result[
+    Option[Value],
+    Error,
+] {
+    token_build_value(
+        cursor.session,
+        lease,
+        || token_step(cursor, state, lease, true),
+        |values| Value::Array(values),
+        |entries| Value::Object(entries),
+        |token| match token {
+            String(value) => Result::Ok(Value::String(value)),
+            Number(value) => Result::Ok(Value::Number(value)),
+            Bool(value) => Result::Ok(Value::Bool(value)),
+            Null => Result::Ok(Value::Null),
+            _ => Result::Err(
+                stream_fail(cursor.session, ErrorKind::State, "expected JSON scalar", Option::None),
+            ),
+        },
+    )
+}
+
+fn token_build_value[T](
+    session: StreamSession,
+    lease: StreamLease,
+    next: () -> Result[Option[StreamTokenRecord], Error],
+    array: (Vec[T]) -> T,
+    object: (Vec[(string, T)]) -> T,
+    scalar: (Token) -> Result[T, Error],
+) -> Result[Option[T], Error] {
+    let frames: Vec[ValueBuildFrame[T]] = Vec::new();
+    loop {
+        stream_event(lease, lease.max_events)?;
+        let Some(record) = next()? else {
+            if frames.is_empty() {
+                return Result::Ok(Option::None)
+            }
+            return Result::Err(
+                stream_fail(
+                    session,
+                    ErrorKind::State,
+                    "JSON token stream ended inside value construction",
+                    Option::None,
+                ),
+            )
+        };
+        if record.skipped {
+            return Result::Err(
+                stream_fail_at(
+                    session,
+                    ErrorKind::State,
+                    "JSON value builder received an omitted payload",
+                    Option::None,
+                    record.record.start_offset,
+                    record.record.path,
+                ),
+            )
+        }
+        let value = match record.record.token {
+            StartArray => {
+                frames.push(ValueBuildFrame::Array(Vec::new()));
+                continue
+            },
+            StartObject => {
+                frames.push(
+                    ValueBuildFrame::Object { entries: Vec::new(), key: Ref::new(Option::None) },
+                );
+                continue
+            },
+            Key(name) => {
+                if frames.is_empty() {
+                    return Result::Err(
+                        stream_fail_at(
+                            session,
+                            ErrorKind::State,
+                            "JSON key outside value object",
+                            Option::None,
+                            record.record.start_offset,
+                            record.record.path,
+                        ),
+                    )
+                }
+                match frames[frames.len() - 1] {
+                    Object { entries: _, key } => {
+                        if key.get().is_some() {
+                            return Result::Err(
+                                stream_fail_at(
+                                    session,
+                                    ErrorKind::State,
+                                    "JSON object key has no value",
+                                    Option::None,
+                                    record.record.start_offset,
+                                    record.record.path,
+                                ),
+                            )
+                        }
+                        key.set(Option::Some(name));
+                    },
+                    Array(_) => return Result::Err(
+                        stream_fail_at(
+                            session,
+                            ErrorKind::State,
+                            "JSON key inside value array",
+                            Option::None,
+                            record.record.start_offset,
+                            record.record.path,
+                        ),
+                    ),
+                }
+                continue
+            },
+            EndArray => {
+                match frames.pop() {
+                    Some(ValueBuildFrame::Array(entries)) => array(entries),
+                    _ => return Result::Err(
+                        stream_fail_at(
+                            session,
+                            ErrorKind::State,
+                            "JSON array end does not match value construction",
+                            Option::None,
+                            record.record.start_offset,
+                            record.record.path,
+                        ),
+                    ),
+                }
+            },
+            EndObject => {
+                match frames.pop() {
+                    Some(ValueBuildFrame::Object { entries, key }) => {
+                        if key.get().is_some() {
+                            return Result::Err(
+                                stream_fail_at(
+                                    session,
+                                    ErrorKind::State,
+                                    "JSON object ended without a field value",
+                                    Option::None,
+                                    record.record.start_offset,
+                                    record.record.path,
+                                ),
+                            )
+                        }
+                        object(entries)
+                    },
+                    _ => return Result::Err(
+                        stream_fail_at(
+                            session,
+                            ErrorKind::State,
+                            "JSON object end does not match value construction",
+                            Option::None,
+                            record.record.start_offset,
+                            record.record.path,
+                        ),
+                    ),
+                }
+            },
+            token => scalar(token)?,
+        };
+        if frames.is_empty() {
+            return Result::Ok(Option::Some(value))
+        }
+        value_build_append(session, frames, value)?;
+    }
+}

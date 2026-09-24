@@ -1,0 +1,214 @@
+package main;
+
+use std::io;
+use io::{Read, ReadAt, Write, WriteAt, Seek};
+use std::bytes;
+use std::testing;
+
+struct SeekAtProbe {
+    cursor: io::Cursor,
+    reads: Vec[isize],
+    writes: Vec[isize],
+    partial: Ref[bool],
+}
+
+fn seek_at_probe() -> SeekAtProbe {
+    SeekAtProbe {
+        cursor: io::Cursor::new(bytes::Bytes::from_string("abcdefghij")),
+        reads: Vec::new(),
+        writes: Vec::new(),
+        partial: Ref::new(false),
+    }
+}
+
+fn seek_at_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        "seek at probe",
+        Option::Some("source"),
+        Option::Some(4),
+        "partial input",
+    )
+}
+
+impl ReadAt for SeekAtProbe {
+    fn read_at(self: SeekAtProbe, output: MutSlice[byte], offset: isize) -> Result[
+        isize,
+        io::TransferError,
+    ] {
+        self.reads.push(offset);
+        if self.partial.get() {
+            self.cursor.read_at(output.sub(0, 1), offset)?;
+            Result::Err(io::TransferError::new(1, seek_at_error()))
+        } else {
+            self.cursor.read_at(output, offset)
+        }
+    }
+}
+
+impl WriteAt for SeekAtProbe {
+    fn write_at(self: SeekAtProbe, input: Slice[byte], offset: isize) -> Result[
+        isize,
+        io::TransferError,
+    ] {
+        self.writes.push(offset);
+        self.cursor.write_at(input, offset)
+    }
+}
+
+fn seek_at_generic[S: io::Seek](stream: S, from: io::SeekFrom) -> Result[isize, io::Error] {
+    stream.seek(from)
+}
+
+fn check_io_seek_at() -> () {
+    let source = seek_at_probe();
+    let section = testing::expect_ok(io::SectionReader::new(source, 2, 4), "seek section");
+    let alias = section;
+    assert_equal(
+        testing::expect_ok(seek_at_generic(section, io::SeekFrom::End(0)), "section end"),
+        4,
+    );
+    let output = b"??";
+    assert_equal(testing::expect_ok(section.read(output.as_mut_slice()), "section EOF"), 0);
+    testing::assert(source.reads.is_empty());
+    assert_equal(
+        testing::expect_ok(seek_at_generic(alias, io::SeekFrom::End(-1)), "last section byte"),
+        3,
+    );
+    assert_equal(testing::expect_ok(section.read(output.slice_mut(0, 1)), "section final read"), 1);
+    assert_equal(output[0], b'f');
+    assert_equal(source.reads, Vec::from_array([5]));
+    assert_equal(
+        testing::expect_ok(seek_at_generic(alias, io::SeekFrom::Start(1)), "section start"),
+        1,
+    );
+    assert_equal(
+        testing::expect_ok(seek_at_generic(section, io::SeekFrom::Current(1)), "section current"),
+        2,
+    );
+    assert_equal(alias.position(), 2);
+    for from in[
+        io::SeekFrom::Start(-1),
+        io::SeekFrom::Start(5),
+        io::SeekFrom::Start(-9223372036854775807 - 1),
+        io::SeekFrom::Start(9223372036854775807),
+        io::SeekFrom::Current(-3),
+        io::SeekFrom::Current(-9223372036854775807 - 1),
+        io::SeekFrom::Current(9223372036854775807),
+        io::SeekFrom::End(1),
+        io::SeekFrom::End(-9223372036854775807 - 1),
+        io::SeekFrom::End(9223372036854775807),
+    ] {
+        let error = testing::expect_err(seek_at_generic(section, from), "invalid section seek");
+        assert_equal(error.kind(), io::ErrorKind::InvalidInput);
+        assert_equal(alias.position(), 2);
+        assert_equal(source.reads.len(), 1);
+    }
+    for successful in[false, true] {
+        let source = seek_at_probe();
+        source.partial.set(true);
+        let section = testing::expect_ok(io::SectionReader::new(source, 3, 3), "pending section");
+        let alias = section;
+        assert_equal(
+            testing::expect_ok(section.read(output.as_mut_slice()), "partial read before seek"),
+            1,
+        );
+        assert_equal(output[0], b'd');
+        source.partial.set(false);
+        if successful {
+            assert_equal(
+                testing::expect_ok(
+                    seek_at_generic(alias, io::SeekFrom::Current(0)),
+                    "same position clears pending",
+                ),
+                1,
+            );
+        } else {
+            let error = testing::expect_err(
+                seek_at_generic(alias, io::SeekFrom::End(1)),
+                "failed seek preserves pending",
+            );
+            assert_equal(error.kind(), io::ErrorKind::InvalidInput);
+        }
+        assert_equal(section.position(), 1);
+        assert_equal(source.reads.len(), 1);
+        if !successful {
+            assert_equal(section.read(output.as_mut_slice()), Result::Err(seek_at_error()));
+            assert_equal(source.reads.len(), 1);
+            assert_equal(section.position(), 1);
+        }
+        assert_equal(
+            testing::expect_ok(alias.read(output.slice_mut(0, 1)), "read after pending handling"),
+            1,
+        );
+        assert_equal(output[0], b'e');
+        assert_equal(source.reads, Vec::from_array([3, 4]));
+    }
+    let target = seek_at_probe();
+    let writer = testing::expect_ok(io::OffsetWriter::new(target, 3), "seek offset writer");
+    let alias = writer;
+    assert_equal(
+        testing::expect_ok(seek_at_generic(writer, io::SeekFrom::Start(2)), "offset start"),
+        2,
+    );
+    assert_equal(
+        testing::expect_ok(seek_at_generic(alias, io::SeekFrom::Current(-1)), "offset current"),
+        1,
+    );
+    testing::assert(target.writes.is_empty());
+    assert_equal(writer.position(), 1);
+    assert_equal(testing::expect_ok(writer.write(b"X".as_slice()), "seek then positional write"), 1);
+    assert_equal(target.writes, Vec::from_array([4]));
+    assert_equal(target.cursor.bytes().to_vec(), b"abcdXfghij");
+    for amount in[-9223372036854775807 - 1, -1, 0, 9223372036854775807] {
+        let error = testing::expect_err(
+            seek_at_generic(alias, io::SeekFrom::End(amount)),
+            "unsupported offset end",
+        );
+        assert_equal(error.kind(), io::ErrorKind::Unsupported);
+        assert_equal(writer.position(), 2);
+        assert_equal(target.writes.len(), 1);
+    }
+    assert_equal(
+        testing::expect_ok(
+            seek_at_generic(alias, io::SeekFrom::Start(9223372036854775804)),
+            "maximum relative offset",
+        ),
+        9223372036854775804,
+    );
+    for from in[
+        io::SeekFrom::Current(1),
+        io::SeekFrom::Current(-9223372036854775807 - 1),
+        io::SeekFrom::Start(9223372036854775807),
+        io::SeekFrom::Start(-1),
+    ] {
+        let error = testing::expect_err(seek_at_generic(writer, from), "offset seek overflow");
+        assert_equal(error.kind(), io::ErrorKind::InvalidInput);
+        assert_equal(alias.position(), 9223372036854775804);
+        assert_equal(target.writes.len(), 1);
+    }
+    assert_equal(
+        testing::expect_ok(
+            seek_at_generic(alias, io::SeekFrom::Start(10)),
+            "seek does not write hole",
+        ),
+        10,
+    );
+    assert_equal(target.writes.len(), 1);
+    let error = testing::expect_err(writer.write(b"!".as_slice()), "target rejects hole after seek");
+    assert_equal(error.kind(), io::ErrorKind::InvalidInput);
+    assert_equal(alias.position(), 10);
+    assert_equal(target.writes, Vec::from_array([4, 13]));
+    assert_equal(target.cursor.bytes().to_vec(), b"abcdXfghij");
+    let edge = testing::expect_ok(
+        io::OffsetWriter::new(target, 9223372036854775807),
+        "maximum base",
+    );
+    assert_equal(
+        testing::expect_ok(seek_at_generic(edge, io::SeekFrom::Start(0)), "zero at maximum base"),
+        0,
+    );
+    testing::assert(seek_at_generic(edge, io::SeekFrom::Current(1)).is_err());
+    assert_equal(edge.position(), 0);
+    assert_equal(target.writes.len(), 2);
+}

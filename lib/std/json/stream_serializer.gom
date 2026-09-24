@@ -1,0 +1,748 @@
+package json;
+
+use module::io;
+use module::serde;
+use module::num;
+
+#[derive(PartialEq)]
+enum StreamSerializeKind {
+    Optional,
+    Sequence,
+    Tuple,
+    Map,
+    Struct,
+    Variant(isize),
+}
+
+#[derive(PartialEq)]
+enum StreamSerializeState {
+    Idle,
+    Ready,
+    Busy,
+    Key,
+    KeyDone,
+}
+
+struct StreamSerializeFrame {
+    kind: StreamSerializeKind,
+    length: isize,
+    index: Ref[isize],
+    state: Ref[StreamSerializeState],
+    child_path: Ref[bool],
+    variant_path: bool,
+    depth: isize,
+}
+
+struct StreamSerializer[W] {
+    sink: StreamSink[W],
+    lease: StreamLease,
+    frames: Vec[StreamSerializeFrame],
+    root_started: Ref[bool],
+    root_complete: Ref[bool],
+    values: Ref[isize],
+    depth: Ref[isize],
+}
+
+fn stream_serializer[W](sink: StreamSink[W], lease: StreamLease) -> StreamSerializer[W] {
+    StreamSerializer {
+        sink,
+        lease,
+        frames: Vec::new(),
+        root_started: Ref::new(false),
+        root_complete: Ref::new(false),
+        values: Ref::new(0),
+        depth: Ref::new(0),
+    }
+}
+
+fn serialize_schema[W](value: StreamSerializer[W], message: string) -> Error {
+    stream_fail(value.sink.session, ErrorKind::Schema, message, Option::None)
+}
+
+fn serialize_limit[W](value: StreamSerializer[W], kind: LimitKind) -> Error {
+    stream_fail(
+        value.sink.session,
+        ErrorKind::Limit(kind),
+        "JSON serialization limit exceeded",
+        Option::None,
+    )
+}
+
+fn serialize_event[W](value: StreamSerializer[W]) -> Result[(), string] {
+    stream_event(value.lease, value.sink.limits.max_events).map_err(|error| error.to_string())
+}
+
+fn serialize_preflight[W](
+    value: StreamSerializer[W],
+    frames: isize,
+    values: isize,
+    depth: isize,
+    entries: isize,
+) -> Result[(), Error] {
+    stream_check(value.lease)?;
+    if entries < 0 {
+        return Result::Err(serialize_schema(value, "negative JSON container length"))
+    }
+    if frames > value.sink.limits.max_serde_frames - value.frames.len() {
+        return Result::Err(serialize_limit(value, LimitKind::SerdeFrames))
+    }
+    if values > value.sink.limits.max_values - value.values.get() {
+        return Result::Err(serialize_limit(value, LimitKind::Values))
+    }
+    if depth > value.sink.limits.max_depth - value.depth.get() {
+        return Result::Err(serialize_limit(value, LimitKind::Depth))
+    }
+    if entries > value.sink.limits.max_container_entries {
+        return Result::Err(serialize_limit(value, LimitKind::ContainerEntries))
+    }
+    Result::Ok(())
+}
+
+fn serialize_claim[W](value: StreamSerializer[W], count: isize) -> Result[(), Error] {
+    serialize_preflight(value, 0, count, 0, 0)?;
+    if value.frames.is_empty() {
+        if value.root_started.get() {
+            return Result::Err(
+                serialize_schema(value, "JSON serialization produced multiple root values"),
+            )
+        }
+        value.root_started.set(true);
+    } else {
+        let frame = value.frames[value.frames.len() - 1];
+        if frame.state.get() != StreamSerializeState::Ready {
+            return Result::Err(serialize_schema(value, "JSON value is not expected here"))
+        }
+        frame.state.set(StreamSerializeState::Busy);
+    }
+    value.values.set(value.values.get() + count);
+    Result::Ok(())
+}
+
+fn serialize_completed[W](value: StreamSerializer[W]) -> () {
+    if value.frames.is_empty() {
+        value.root_complete.set(true);
+    } else {
+        let frame = value.frames[value.frames.len() - 1];
+        frame.state.set(StreamSerializeState::Idle);
+        if frame.kind != StreamSerializeKind::Optional {
+            frame.index.set(frame.index.get() + 1);
+        }
+        if frame.child_path.get() {
+            stream_pop_path(value.lease);
+            frame.child_path.set(false);
+        }
+    }
+}
+
+fn serialize_frame(
+    kind: StreamSerializeKind,
+    length: isize,
+    state: StreamSerializeState,
+    variant_path: bool,
+    depth: isize,
+) -> StreamSerializeFrame {
+    StreamSerializeFrame {
+        kind,
+        length,
+        index: Ref::new(0),
+        state: Ref::new(state),
+        child_path: Ref::new(false),
+        variant_path,
+        depth,
+    }
+}
+
+fn finish_stream_serializer[W](value: StreamSerializer[W]) -> Result[(), Error] {
+    stream_check(value.lease)?;
+    if !value.frames.is_empty() || !value.root_complete.get() {
+        Result::Err(serialize_schema(value, "JSON serialization did not complete exactly one root"))
+    } else {
+        Result::Ok(())
+    }
+}
+
+fn serialize_literal[W: io::Write](value: StreamSerializer[W], literal: string) -> Result[(), Error] {
+    serialize_claim(value, 1)?;
+    sink_emit_text(value.sink, value.lease, literal)?;
+    serialize_completed(value);
+    Result::Ok(())
+}
+
+fn serialize_number_text[W: io::Write](value: StreamSerializer[W], number: string) -> Result[
+    (),
+    Error,
+] {
+    serialize_claim(value, 1)?;
+    emit_number(value.sink, value.lease, number)?;
+    serialize_completed(value);
+    Result::Ok(())
+}
+
+fn serialize_string_value[W: io::Write](value: StreamSerializer[W], text: string) -> Result[
+    (),
+    Error,
+] {
+    if !value.frames.is_empty() {
+        let frame = value.frames[value.frames.len() - 1];
+        if frame.kind == StreamSerializeKind::Map && frame.state.get() == StreamSerializeState::Key {
+            stream_push_path(
+                value.lease,
+                PathSegment::Field(text),
+                value.sink.limits.max_path_bytes,
+            )?;
+            frame.child_path.set(true);
+            emit_json_string(value.sink, value.lease, text)?;
+            frame.state.set(StreamSerializeState::KeyDone);
+            return Result::Ok(())
+        }
+    }
+    serialize_claim(value, 1)?;
+    emit_json_string(value.sink, value.lease, text)?;
+    serialize_completed(value);
+    Result::Ok(())
+}
+
+fn serialize_begin_container[W: io::Write](
+    value: StreamSerializer[W],
+    kind: StreamSerializeKind,
+    length: isize,
+    opening: string,
+) -> Result[(), Error] {
+    serialize_preflight(value, 1, 1, 1, length)?;
+    serialize_claim(value, 1)?;
+    sink_emit_text(value.sink, value.lease, opening)?;
+    value.depth.set(value.depth.get() + 1);
+    value.frames.push(serialize_frame(kind, length, StreamSerializeState::Idle, false, 1));
+    Result::Ok(())
+}
+
+fn serialize_child[W: io::Write](
+    value: StreamSerializer[W],
+    kind: StreamSerializeKind,
+    index: isize,
+    segment: PathSegment,
+    name: Option[string],
+) -> Result[(), Error] {
+    stream_check(value.lease)?;
+    if value.frames.is_empty() {
+        return Result::Err(serialize_schema(value, "JSON child without a container"))
+    }
+    let frame = value.frames[value.frames.len() - 1];
+    if frame.kind != kind || frame.state.get() != StreamSerializeState::Idle
+        || index != frame.index.get()
+        || index < 0
+        || index >= frame.length {
+        return Result::Err(serialize_schema(value, "JSON child index or event order is invalid"))
+    }
+    stream_push_path(value.lease, segment, value.sink.limits.max_path_bytes)?;
+    frame.child_path.set(true);
+    if index > 0 {
+        sink_emit_text(value.sink, value.lease, ",")?;
+    }
+    if let Some(name) = name {
+        emit_json_string(value.sink, value.lease, name)?;
+        sink_emit_text(value.sink, value.lease, ":")?;
+    }
+    frame.state.set(StreamSerializeState::Ready);
+    Result::Ok(())
+}
+
+fn serialize_end[W: io::Write](
+    value: StreamSerializer[W],
+    kind: StreamSerializeKind,
+    closing: string,
+) -> Result[(), Error] {
+    stream_check(value.lease)?;
+    if value.frames.is_empty() {
+        return Result::Err(serialize_schema(value, "JSON end event without a container"))
+    }
+    let frame = value.frames[value.frames.len() - 1];
+    if frame.kind != kind || frame.state.get() != StreamSerializeState::Idle
+        || frame.index.get() != frame.length {
+        return Result::Err(serialize_schema(value, "JSON end event or container length is invalid"))
+    }
+    sink_emit_text(value.sink, value.lease, closing)?;
+    if frame.variant_path {
+        stream_pop_path(value.lease);
+    }
+    let _ = value.frames.pop();
+    value.depth.set(value.depth.get() - frame.depth);
+    serialize_completed(value);
+    Result::Ok(())
+}
+
+impl[W: io::Write] serde::Serializer for StreamSerializer[W] {
+    fn serialize_unit(self: StreamSerializer[W]) -> Result[(), string] {
+        serialize_event(self)?;
+        serialize_literal(self, "null").map_err(|error| error.to_string())
+    }
+
+    fn serialize_bool(self: StreamSerializer[W], value: bool) -> Result[(), string] {
+        serialize_event(self)?;
+        serialize_literal(
+            self,
+            if value {
+                "true"
+            } else {
+                "false"
+            },
+        ).map_err(|error| error.to_string())
+    }
+
+    fn serialize_int(self: StreamSerializer[W], value: isize) -> Result[(), string] {
+        serialize_event(self)?;
+        let text = num::format_int(value.to_i64(), 10).map_err(
+            |_| serialize_schema(self, "JSON integer conversion failed").to_string(),
+        )?;
+        serialize_number_text(self, text).map_err(|error| error.to_string())
+    }
+
+    fn serialize_int8(self: StreamSerializer[W], value: i8) -> Result[(), string] {
+        serialize_event(self)?;
+        let text = num::format_int(value.to_i64(), 10).map_err(
+            |_| serialize_schema(self, "JSON integer conversion failed").to_string(),
+        )?;
+        serialize_number_text(self, text).map_err(|error| error.to_string())
+    }
+
+    fn serialize_int16(self: StreamSerializer[W], value: i16) -> Result[(), string] {
+        serialize_event(self)?;
+        let text = num::format_int(value.to_i64(), 10).map_err(
+            |_| serialize_schema(self, "JSON integer conversion failed").to_string(),
+        )?;
+        serialize_number_text(self, text).map_err(|error| error.to_string())
+    }
+
+    fn serialize_int32(self: StreamSerializer[W], value: i32) -> Result[(), string] {
+        serialize_event(self)?;
+        let text = num::format_int(value.to_i64(), 10).map_err(
+            |_| serialize_schema(self, "JSON integer conversion failed").to_string(),
+        )?;
+        serialize_number_text(self, text).map_err(|error| error.to_string())
+    }
+
+    fn serialize_int64(self: StreamSerializer[W], value: i64) -> Result[(), string] {
+        serialize_event(self)?;
+        let text = num::format_int(value, 10).map_err(
+            |_| serialize_schema(self, "JSON integer conversion failed").to_string(),
+        )?;
+        serialize_number_text(self, text).map_err(|error| error.to_string())
+    }
+
+    fn serialize_uint(self: StreamSerializer[W], value: usize) -> Result[(), string] {
+        serialize_event(self)?;
+        let text = num::format_uint(value.to_u64(), 10).map_err(
+            |_| serialize_schema(self, "JSON integer conversion failed").to_string(),
+        )?;
+        serialize_number_text(self, text).map_err(|error| error.to_string())
+    }
+
+    fn serialize_uint8(self: StreamSerializer[W], value: u8) -> Result[(), string] {
+        serialize_event(self)?;
+        let text = num::format_uint(value.to_u64(), 10).map_err(
+            |_| serialize_schema(self, "JSON integer conversion failed").to_string(),
+        )?;
+        serialize_number_text(self, text).map_err(|error| error.to_string())
+    }
+
+    fn serialize_uint16(self: StreamSerializer[W], value: u16) -> Result[(), string] {
+        serialize_event(self)?;
+        let text = num::format_uint(value.to_u64(), 10).map_err(
+            |_| serialize_schema(self, "JSON integer conversion failed").to_string(),
+        )?;
+        serialize_number_text(self, text).map_err(|error| error.to_string())
+    }
+
+    fn serialize_uint32(self: StreamSerializer[W], value: u32) -> Result[(), string] {
+        serialize_event(self)?;
+        let text = num::format_uint(value.to_u64(), 10).map_err(
+            |_| serialize_schema(self, "JSON integer conversion failed").to_string(),
+        )?;
+        serialize_number_text(self, text).map_err(|error| error.to_string())
+    }
+
+    fn serialize_uint64(self: StreamSerializer[W], value: u64) -> Result[(), string] {
+        serialize_event(self)?;
+        let text = num::format_uint(value, 10).map_err(
+            |_| serialize_schema(self, "JSON integer conversion failed").to_string(),
+        )?;
+        serialize_number_text(self, text).map_err(|error| error.to_string())
+    }
+
+    fn serialize_float32(self: StreamSerializer[W], value: f32) -> Result[(), string] {
+        serialize_event(self)?;
+        if value - value != 0.0 {
+            return Result::Err(
+                serialize_schema(self, "JSON does not support non-finite numbers").to_string(),
+            )
+        }
+        let text = num::format_float32_shortest(
+            value,
+            num::FloatNotation::General,
+            self.sink.limits.max_number_bytes,
+        ).map_err(
+            |error| {
+                match error {
+                    num::FormatFloatError::OutputLimit(_) => serialize_limit(
+                        self,
+                        LimitKind::NumberBytes,
+                    ).to_string(),
+                    _ => serialize_schema(self, "JSON floating-point conversion failed").to_string(),
+                }
+            },
+        )?;
+        serialize_number_text(self, text).map_err(|error| error.to_string())
+    }
+
+    fn serialize_float64(self: StreamSerializer[W], value: f64) -> Result[(), string] {
+        serialize_event(self)?;
+        if value - value != 0.0 {
+            return Result::Err(
+                serialize_schema(self, "JSON does not support non-finite numbers").to_string(),
+            )
+        }
+        let text = num::format_float64_shortest(
+            value,
+            num::FloatNotation::General,
+            self.sink.limits.max_number_bytes,
+        ).map_err(
+            |error| {
+                match error {
+                    num::FormatFloatError::OutputLimit(_) => serialize_limit(
+                        self,
+                        LimitKind::NumberBytes,
+                    ).to_string(),
+                    _ => serialize_schema(self, "JSON floating-point conversion failed").to_string(),
+                }
+            },
+        )?;
+        serialize_number_text(self, text).map_err(|error| error.to_string())
+    }
+
+    fn serialize_number(self: StreamSerializer[W], value: string) -> Result[(), string] {
+        serialize_event(self)?;
+        serialize_number_text(self, value).map_err(|error| error.to_string())
+    }
+
+    fn serialize_string(self: StreamSerializer[W], value: string) -> Result[(), string] {
+        serialize_event(self)?;
+        serialize_string_value(self, value).map_err(|error| error.to_string())
+    }
+
+    fn serialize_char(self: StreamSerializer[W], value: char) -> Result[(), string] {
+        serialize_event(self)?;
+        serialize_string_value(self, value.to_string()).map_err(|error| error.to_string())
+    }
+
+    fn serialize_extension(self: StreamSerializer[W], _tag: i8, _data: Slice[byte]) -> Result[
+        (),
+        string,
+    ] {
+        serialize_event(self)?;
+        Result::Err(serialize_schema(self, "JSON does not support extension values").to_string())
+    }
+
+    fn serialize_bytes(self: StreamSerializer[W], value: Slice[byte]) -> Result[(), string] {
+        serialize_event(self)?;
+        serialize_begin_container(self, StreamSerializeKind::Sequence, value.len(), "[").map_err(
+            |error| error.to_string(),
+        )?;
+        for index in 0..value.len() {
+            serialize_event(self)?;
+            serialize_child(
+                self,
+                StreamSerializeKind::Sequence,
+                index,
+                PathSegment::Index(index),
+                Option::None,
+            ).map_err(|error| error.to_string())?;
+            let text = num::format_uint(value[index].to_u64(), 10).map_err(
+                |_| serialize_schema(self, "JSON byte conversion failed").to_string(),
+            )?;
+            serialize_number_text(self, text).map_err(|error| error.to_string())?;
+        }
+        serialize_end(self, StreamSerializeKind::Sequence, "]").map_err(|error| error.to_string())
+    }
+
+    fn begin_optional(self: StreamSerializer[W], present: bool) -> Result[(), string] {
+        serialize_event(self)?;
+        serialize_preflight(
+            self,
+            1,
+            if present {
+                0
+            } else {
+                1
+            },
+            0,
+            0,
+        ).map_err(|error| error.to_string())?;
+        serialize_claim(
+            self,
+            if present {
+                0
+            } else {
+                1
+            },
+        ).map_err(|error| error.to_string())?;
+        if !present {
+            sink_emit_text(self.sink, self.lease, "null").map_err(|error| error.to_string())?;
+        }
+        self.frames.push(
+            serialize_frame(
+                StreamSerializeKind::Optional,
+                0,
+                if present {
+                    StreamSerializeState::Ready
+                } else {
+                    StreamSerializeState::Idle
+                },
+                false,
+                0,
+            ),
+        );
+        Result::Ok(())
+    }
+
+    fn end_optional(self: StreamSerializer[W]) -> Result[(), string] {
+        serialize_event(self)?;
+        serialize_end(self, StreamSerializeKind::Optional, "").map_err(|error| error.to_string())
+    }
+
+    fn begin_sequence(self: StreamSerializer[W], length: isize) -> Result[(), string] {
+        serialize_event(self)?;
+        serialize_begin_container(self, StreamSerializeKind::Sequence, length, "[").map_err(
+            |error| error.to_string(),
+        )
+    }
+
+    fn end_sequence(self: StreamSerializer[W]) -> Result[(), string] {
+        serialize_event(self)?;
+        serialize_end(self, StreamSerializeKind::Sequence, "]").map_err(|error| error.to_string())
+    }
+
+    fn begin_sequence_element(self: StreamSerializer[W], index: isize) -> Result[(), string] {
+        serialize_event(self)?;
+        serialize_child(
+            self,
+            StreamSerializeKind::Sequence,
+            index,
+            PathSegment::Index(index),
+            Option::None,
+        ).map_err(|error| error.to_string())
+    }
+
+    fn begin_tuple(self: StreamSerializer[W], length: isize) -> Result[(), string] {
+        serialize_event(self)?;
+        serialize_begin_container(self, StreamSerializeKind::Tuple, length, "[").map_err(
+            |error| error.to_string(),
+        )
+    }
+
+    fn end_tuple(self: StreamSerializer[W]) -> Result[(), string] {
+        serialize_event(self)?;
+        serialize_end(self, StreamSerializeKind::Tuple, "]").map_err(|error| error.to_string())
+    }
+
+    fn begin_tuple_element(self: StreamSerializer[W], index: isize) -> Result[(), string] {
+        serialize_event(self)?;
+        serialize_child(
+            self,
+            StreamSerializeKind::Tuple,
+            index,
+            PathSegment::Index(index),
+            Option::None,
+        ).map_err(|error| error.to_string())
+    }
+
+    fn begin_map(self: StreamSerializer[W], length: isize) -> Result[(), string] {
+        serialize_event(self)?;
+        serialize_begin_container(self, StreamSerializeKind::Map, length, "{").map_err(
+            |error| error.to_string(),
+        )
+    }
+
+    fn end_map(self: StreamSerializer[W]) -> Result[(), string] {
+        serialize_event(self)?;
+        serialize_end(self, StreamSerializeKind::Map, "}").map_err(|error| error.to_string())
+    }
+
+    fn begin_map_key(self: StreamSerializer[W], index: isize) -> Result[(), string] {
+        serialize_event(self)?;
+        if self.frames.is_empty() {
+            return Result::Err(serialize_schema(self, "map key without map").to_string())
+        }
+        let frame = self.frames[self.frames.len() - 1];
+        if frame.kind != StreamSerializeKind::Map || frame.state.get() != StreamSerializeState::Idle
+            || index < 0
+            || index != frame.index.get()
+            || index >= frame.length {
+            return Result::Err(
+                serialize_schema(self, "map key index or event order is invalid").to_string(),
+            )
+        }
+        if index > 0 {
+            sink_emit_text(self.sink, self.lease, ",").map_err(|error| error.to_string())?;
+        }
+        frame.state.set(StreamSerializeState::Key);
+        Result::Ok(())
+    }
+
+    fn begin_map_value(self: StreamSerializer[W], index: isize) -> Result[(), string] {
+        serialize_event(self)?;
+        if self.frames.is_empty() {
+            return Result::Err(serialize_schema(self, "map value without map").to_string())
+        }
+        let frame = self.frames[self.frames.len() - 1];
+        if frame.kind != StreamSerializeKind::Map
+            || frame.state.get() != StreamSerializeState::KeyDone
+            || index != frame.index.get() {
+            return Result::Err(serialize_schema(self, "map value has no completed key").to_string())
+        }
+        sink_emit_text(self.sink, self.lease, ":").map_err(|error| error.to_string())?;
+        frame.state.set(StreamSerializeState::Ready);
+        Result::Ok(())
+    }
+
+    fn begin_struct(self: StreamSerializer[W], _name: string, fields: isize) -> Result[(), string] {
+        serialize_event(self)?;
+        serialize_begin_container(self, StreamSerializeKind::Struct, fields, "{").map_err(
+            |error| error.to_string(),
+        )
+    }
+
+    fn begin_struct_field(self: StreamSerializer[W], index: isize, name: string) -> Result[
+        (),
+        string,
+    ] {
+        serialize_event(self)?;
+        serialize_child(
+            self,
+            StreamSerializeKind::Struct,
+            index,
+            PathSegment::Field(name),
+            Option::Some(name),
+        ).map_err(|error| error.to_string())
+    }
+
+    fn end_struct(self: StreamSerializer[W]) -> Result[(), string] {
+        serialize_event(self)?;
+        serialize_end(self, StreamSerializeKind::Struct, "}").map_err(|error| error.to_string())
+    }
+
+    fn begin_variant(
+        self: StreamSerializer[W],
+        _enum_name: string,
+        index: isize,
+        name: string,
+        kind: isize,
+        fields: isize,
+    ) -> Result[(), string] {
+        serialize_event(self)?;
+        if index < 0 || kind < 0 || kind > 2 || fields < 0 || kind == 0 && fields != 0 {
+            return Result::Err(
+                serialize_schema(self, "invalid JSON enum variant declaration").to_string(),
+            )
+        }
+        let depth = if kind == 0 {
+            0
+        } else {
+            2
+        };
+        let values = if kind == 0 {
+            1
+        } else {
+            2
+        };
+        serialize_preflight(self, 1, values, depth, fields).map_err(|error| error.to_string())?;
+        if kind != 0 {
+            serialize_preflight(self, 0, 0, 0, 1).map_err(|error| error.to_string())?;
+        }
+        serialize_claim(self, values).map_err(|error| error.to_string())?;
+        stream_push_path(self.lease, PathSegment::Variant(name), self.sink.limits.max_path_bytes).map_err(
+            |error| error.to_string(),
+        )?;
+        if kind == 0 {
+            emit_json_string(self.sink, self.lease, name).map_err(|error| error.to_string())?;
+        } else {
+            sink_emit_text(self.sink, self.lease, "{").map_err(|error| error.to_string())?;
+            emit_json_string(self.sink, self.lease, name).map_err(|error| error.to_string())?;
+            sink_emit_text(
+                self.sink,
+                self.lease,
+                if kind == 1 {
+                    ":["
+                } else {
+                    ":{"
+                },
+            ).map_err(|error| error.to_string())?;
+        }
+        self.depth.set(self.depth.get() + depth);
+        self.frames.push(
+            serialize_frame(
+                StreamSerializeKind::Variant(kind),
+                fields,
+                StreamSerializeState::Idle,
+                true,
+                depth,
+            ),
+        );
+        Result::Ok(())
+    }
+
+    fn begin_variant_field(self: StreamSerializer[W], index: isize, name: string) -> Result[
+        (),
+        string,
+    ] {
+        serialize_event(self)?;
+        if self.frames.is_empty() {
+            return Result::Err(serialize_schema(self, "variant field without variant").to_string())
+        }
+        match self.frames[self.frames.len() - 1].kind {
+            StreamSerializeKind::Variant(kind) => {
+                if kind == 0 {
+                    return Result::Err(
+                        serialize_schema(self, "unit variant has no fields").to_string(),
+                    )
+                }
+                serialize_child(
+                    self,
+                    StreamSerializeKind::Variant(kind),
+                    index,
+                    if kind == 1 {
+                        PathSegment::Index(index)
+                    } else {
+                        PathSegment::Field(name)
+                    },
+                    if kind == 1 {
+                        Option::None
+                    } else {
+                        Option::Some(name)
+                    },
+                ).map_err(|error| error.to_string())
+            },
+            _ => Result::Err(serialize_schema(self, "variant field outside variant").to_string()),
+        }
+    }
+
+    fn end_variant(self: StreamSerializer[W]) -> Result[(), string] {
+        serialize_event(self)?;
+        if self.frames.is_empty() {
+            return Result::Err(serialize_schema(self, "variant end without variant").to_string())
+        }
+        match self.frames[self.frames.len() - 1].kind {
+            StreamSerializeKind::Variant(kind) => serialize_end(
+                self,
+                StreamSerializeKind::Variant(kind),
+                if kind == 0 {
+                    ""
+                } else if kind == 1 {
+                    "]}"
+                } else {
+                    "}}"
+                },
+            ).map_err(|error| error.to_string()),
+            _ => Result::Err(serialize_schema(self, "variant end outside variant").to_string()),
+        }
+    }
+}

@@ -1,0 +1,270 @@
+package main;
+
+use std::testing::fs as memory;
+use std::fs;
+use fs::{FileSystem, LinkFileSystem};
+use std::bytes;
+use std::io;
+use io::Close;
+use std::testing;
+
+fn memory_link_limits() -> memory::MemoryLimits {
+    memory::MemoryLimits {
+        max_nodes: 100,
+        max_data_bytes: 10000,
+        max_path_bytes: 10000,
+        max_depth: 20,
+        max_link_hops: 20,
+        max_resolve_work: 10000,
+    }
+}
+
+fn memory_link_fs(nodes: Vec[memory::MemoryNode], limits: memory::MemoryLimits) -> memory::MemoryFS {
+    testing::expect_ok(memory::MemoryFS::new(nodes, limits), "build link test filesystem")
+}
+
+fn memory_link_error(error: fs::Error, kind: io::ErrorKind, operation: string, name: string) -> () {
+    assert_equal(error.kind(), kind);
+    assert_equal(error.operation(), operation);
+    assert_equal(error.path(), Option::Some(name));
+    assert_equal(error.raw_os_code(), Option::None);
+}
+
+fn memory_link_read(source: memory::MemoryFS, name: string, expected: string) -> () {
+    assert_equal(
+        testing::expect_ok(fs::read_file_from(source, name, 100), "read resolved memory link").to_vec(),
+        expected.to_bytes(),
+    );
+}
+
+pub fn test_fs_memory_links() -> () {
+    let nodes = Vec::from_array(
+        [
+            memory::MemoryNode::file("f", bytes::Bytes::from_string("root")),
+            memory::MemoryNode::file("real/f", bytes::Bytes::from_string("real")),
+            memory::MemoryNode::directory("real/deep"),
+            memory::MemoryNode::link("real/deep/ref", "../../f"),
+            memory::MemoryNode::directory("dir"),
+            memory::MemoryNode::link("alias", "real/deep"),
+            memory::MemoryNode::link("resolved_parent", "alias/../f"),
+            memory::MemoryNode::link("dir/up", "../f"),
+            memory::MemoryNode::link("directory", "./real//deep/../"),
+            memory::MemoryNode::link("l", "f"),
+            memory::MemoryNode::link("chain", "l"),
+            memory::MemoryNode::link("dangling", "missing"),
+            memory::MemoryNode::link("empty", ""),
+            memory::MemoryNode::link("absolute", "/f"),
+            memory::MemoryNode::link("escape", "../f"),
+            memory::MemoryNode::link("file_dot", "f/."),
+            memory::MemoryNode::link("file_slash", "f/"),
+            memory::MemoryNode::link("file_parent", "f/../f"),
+            memory::MemoryNode::link("self", "self"),
+            memory::MemoryNode::link("pair_a", "pair_b"),
+            memory::MemoryNode::link("pair_b", "pair_a"),
+            memory::MemoryNode::link("expanding", "expanding/child"),
+            memory::MemoryNode::file("a\\b", bytes::Bytes::from_string("backslash")),
+            memory::MemoryNode::file("C:name", bytes::Bytes::from_string("colon")),
+            memory::MemoryNode::file("\u0000", bytes::Bytes::from_string("nul")),
+            memory::MemoryNode::file("界", bytes::Bytes::from_string("unicode")),
+        ],
+    );
+    let source = memory_link_fs(nodes, memory_link_limits());
+    for name in["l", "chain", "dir/up"] {
+        memory_link_read(source, name, "root");
+    }
+    memory_link_read(source, "resolved_parent", "real");
+    memory_link_read(source, "directory/f", "real");
+    for (name, value) in[
+        ("a\\b", "backslash"),
+        ("C:name", "colon"),
+        ("\u0000", "nul"),
+        ("界", "unicode"),
+    ] {
+        memory_link_read(source, name, value);
+    }
+    assert_equal(
+        testing::expect_ok(fs::stat_from(source, "directory"), "trailing slash directory").file_type(),
+        fs::FileType::Directory,
+    );
+    for (name, target) in[
+        ("chain", "l"),
+        ("empty", ""),
+        ("absolute", "/f"),
+        ("escape", "../f"),
+        ("self", "self"),
+        ("dangling", "missing"),
+    ] {
+        assert_equal(
+            testing::expect_ok(fs::read_link_from(source, name), "nofollow target"),
+            target,
+        );
+        assert_equal(
+            testing::expect_ok(fs::symlink_metadata_from(source, name), "nofollow metadata").file_type(),
+            fs::FileType::Symlink,
+        );
+    }
+    assert_equal(
+        testing::expect_ok(
+            fs::read_link_from(source, "alias/ref"),
+            "intermediate follow final nofollow",
+        ),
+        "../../f",
+    );
+    assert_equal(
+        testing::expect_ok(
+            fs::symlink_metadata_from(source, "alias/ref"),
+            "intermediate metadata nofollow",
+        ).file_type(),
+        fs::FileType::Symlink,
+    );
+    memory_link_read(source, "alias/ref", "root");
+    for name in["empty", "dangling"] {
+        memory_link_error(
+            testing::expect_err(source.open(name), "missing link target"),
+            io::ErrorKind::NotFound,
+            "open",
+            name,
+        );
+    }
+    for name in["absolute", "escape", "file_dot", "file_slash", "file_parent"] {
+        memory_link_error(
+            testing::expect_err(source.open(name), "invalid link resolution"),
+            io::ErrorKind::InvalidInput,
+            "open",
+            name,
+        );
+    }
+    for name in["self", "pair_a", "expanding"] {
+        memory_link_error(
+            testing::expect_err(source.open(name), "bounded link cycle"),
+            io::ErrorKind::InvalidData,
+            "open",
+            name,
+        );
+    }
+    for name in[".", "f", "real"] {
+        memory_link_error(
+            testing::expect_err(source.read_link(name), "non-link readlink"),
+            io::ErrorKind::InvalidInput,
+            "read link",
+            name,
+        );
+    }
+    let nested = testing::expect_ok(fs::SubFs::new(source, "dir"), "memory link subfs");
+    assert_equal(
+        testing::expect_ok(fs::read_link_from(nested, "up"), "subfs raw relative target"),
+        "../f",
+    );
+    assert_equal(
+        testing::expect_ok(fs::read_file_from(nested, "up", 100), "subfs is not confinement").to_vec(),
+        b"root",
+    );
+    assert_equal(
+        testing::expect_ok(fs::symlink_metadata_from(nested, "up"), "subfs nofollow").file_type(),
+        fs::FileType::Symlink,
+    );
+    for budget in 0..4 {
+        let bounded = memory_link_fs(
+            Vec::new(),
+            memory::MemoryLimits { max_resolve_work: budget, ..memory_link_limits() },
+        );
+        if budget < 3 {
+            memory_link_error(
+                testing::expect_err(bounded.symlink_metadata("."), "root exact work below"),
+                io::ErrorKind::InvalidData,
+                "symlink metadata",
+                ".",
+            );
+        } else {
+            assert_equal(
+                testing::expect_ok(bounded.symlink_metadata("."), "root exact three work").file_type(),
+                fs::FileType::Directory,
+            );
+            let handle = testing::expect_ok(bounded.open("."), "root open exact work");
+            testing::expect_ok(handle.close(), "close root");
+        }
+        for invalid in["", "/", "..", "a/../b", "a//b", "a/", "./f"] {
+            memory_link_error(
+                testing::expect_err(bounded.open(invalid), "invalid path before work"),
+                io::ErrorKind::InvalidInput,
+                "open",
+                invalid,
+            );
+            memory_link_error(
+                testing::expect_err(bounded.read_link(invalid), "invalid link path before work"),
+                io::ErrorKind::InvalidInput,
+                "read link",
+                invalid,
+            );
+            memory_link_error(
+                testing::expect_err(
+                    bounded.symlink_metadata(invalid),
+                    "invalid metadata path before work",
+                ),
+                io::ErrorKind::InvalidInput,
+                "symlink metadata",
+                invalid,
+            );
+        }
+    }
+    let small = Vec::from_array(
+        [
+            memory::MemoryNode::file("f", bytes::Bytes::from_string("x")),
+            memory::MemoryNode::link("l", "f"),
+            memory::MemoryNode::file("界", bytes::Bytes::from_string("y")),
+        ],
+    );
+    for budget in[6, 7] {
+        let bounded = memory_link_fs(
+            small,
+            memory::MemoryLimits { max_resolve_work: budget, ..memory_link_limits() },
+        );
+        if budget == 6 {
+            memory_link_error(
+                testing::expect_err(bounded.open("l"), "link work short by one"),
+                io::ErrorKind::InvalidData,
+                "open",
+                "l",
+            );
+        } else {
+            memory_link_read(bounded, "l", "x");
+        }
+        memory_link_read(bounded, "界", "y");
+    }
+    let no_hops = memory_link_fs(
+        small,
+        memory::MemoryLimits { max_link_hops: 0, max_resolve_work: 4, ..memory_link_limits() },
+    );
+    assert_equal(testing::expect_ok(no_hops.read_link("l"), "nofollow does not spend hops"), "f");
+    assert_equal(
+        testing::expect_ok(no_hops.symlink_metadata("l"), "nofollow exact four work").file_type(),
+        fs::FileType::Symlink,
+    );
+    memory_link_error(
+        testing::expect_err(no_hops.open("l"), "zero hops forbids follow"),
+        io::ErrorKind::InvalidData,
+        "open",
+        "l",
+    );
+    memory_link_read(no_hops, "f", "x");
+    for hops in[1, 2, 9223372036854775807] {
+        let bounded = memory_link_fs(
+            nodes,
+            memory::MemoryLimits {
+                max_link_hops: hops,
+                max_resolve_work: 9223372036854775807,
+                ..memory_link_limits(),
+            },
+        );
+        if hops == 1 {
+            memory_link_error(
+                testing::expect_err(bounded.open("chain"), "chain requires two hops"),
+                io::ErrorKind::InvalidData,
+                "open",
+                "chain",
+            );
+        } else {
+            memory_link_read(bounded, "chain", "root");
+        }
+    }
+}

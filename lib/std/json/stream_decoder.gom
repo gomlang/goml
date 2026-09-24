@@ -1,0 +1,130 @@
+package json;
+
+use module::io;
+use module::bytes;
+use module::serde;
+
+pub struct Decoder[R] {
+    cursor: StreamCursor[R],
+    tokens: TokenState,
+}
+
+fn stream_result[T](session: StreamSession, result: Result[T, Error]) -> Result[T, Error] {
+    match stream_error(session) {
+        Some(error) => Result::Err(error),
+        None => result,
+    }
+}
+
+fn decoder_root_boundary[R](decoder: Decoder[R]) -> Result[(), Error] {
+    if !decoder.tokens.frames.is_empty()
+        || (decoder.tokens.root_started.get() && !decoder.tokens.root_complete.get()) {
+        return Result::Err(
+            stream_fail(
+                decoder.cursor.session,
+                ErrorKind::State,
+                "JSON value decoding requires a root boundary",
+                Option::None,
+            ),
+        )
+    }
+    Result::Ok(())
+}
+
+impl[R: io::Read] Decoder[R] {
+    pub fn new(reader: R, limits: DecodeLimits) -> Result[Decoder[R], Error] {
+        stream_validate_decode_limits(limits)?;
+        Result::Ok(
+            Decoder {
+                cursor: stream_cursor(reader, stream_session(StreamDirection::Decode), limits),
+                tokens: token_state(),
+            },
+        )
+    }
+
+    pub fn offset(self: Decoder[R]) -> isize {
+        self.cursor.session.offset.get()
+    }
+
+    pub fn buffered(self: Decoder[R]) -> bytes::Bytes {
+        cursor_buffered(self.cursor)
+    }
+
+    pub fn next_token(self: Decoder[R]) -> Result[Option[Token], Error] {
+        let lease = stream_enter(self.cursor.session, self.cursor.limits.max_events)?;
+        let completed = Ref::new(false);
+        defer {
+            stream_leave(lease, completed.get());
+        };
+        let result = token_step(self.cursor, self.tokens, lease, true).and_then(
+            |record| {
+                match record {
+                    Some(record) => {
+                        if record.skipped {
+                            Result::Err(
+                                stream_fail(
+                                    self.cursor.session,
+                                    ErrorKind::State,
+                                    "JSON token payload was not captured",
+                                    Option::None,
+                                ),
+                            )
+                        } else {
+                            Result::Ok(Option::Some(record.record.token))
+                        }
+                    },
+                    None => Result::Ok(Option::None),
+                }
+            },
+        );
+        completed.set(true);
+        stream_result(self.cursor.session, result)
+    }
+
+    pub fn next_value(self: Decoder[R]) -> Result[Option[Value], Error] {
+        let lease = stream_enter(self.cursor.session, self.cursor.limits.max_events)?;
+        let completed = Ref::new(false);
+        defer {
+            stream_leave(lease, completed.get());
+        };
+        let result = decoder_root_boundary(self).and_then(
+            |_| token_read_value(self.cursor, self.tokens, lease),
+        );
+        completed.set(true);
+        stream_result(self.cursor.session, result)
+    }
+
+    pub fn finish(self: Decoder[R]) -> Result[(), Error] {
+        let lease = stream_enter(self.cursor.session, self.cursor.limits.max_events)?;
+        let completed = Ref::new(false);
+        defer {
+            stream_leave(lease, completed.get());
+        };
+        let result = token_finish_stream(self.cursor, self.tokens, lease);
+        completed.set(true);
+        stream_result(self.cursor.session, result)
+    }
+
+    pub fn decode[T: serde::Deserialize](self: Decoder[R]) -> Result[Option[T], Error] {
+        let lease = stream_enter(self.cursor.session, self.cursor.limits.max_events)?;
+        let completed = Ref::new(false);
+        defer {
+            stream_leave(lease, completed.get());
+        };
+        let result = decoder_root_boundary(self).and_then(
+            |_| {
+                stream_event(lease, lease.max_events)?;
+                if !token_begin_root(self.cursor, self.tokens, lease)? {
+                    return Result::Ok(Option::None)
+                }
+                let deserializer = stream_deserializer(self, lease);
+                let decoded: Result[T, string] = serde::Deserialize::deserialize(deserializer);
+                let value = decoded.map_err(|message| decode_schema(deserializer, message))?;
+                finish_stream_deserializer(deserializer)?;
+                Result::Ok(Option::Some(value))
+            },
+        );
+        completed.set(true);
+        stream_result(self.cursor.session, result)
+    }
+}

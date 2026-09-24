@@ -1,0 +1,238 @@
+package text;
+
+pub enum ReplaceError {
+    InvalidLimit(isize),
+    RuleLimit(isize),
+    RuleBytesLimit(isize),
+    OutputLimit(isize),
+    WorkLimit(isize),
+    InvalidText(isize),
+}
+
+impl ToString for ReplaceError {
+    fn to_string(self: ReplaceError) -> string {
+        match self {
+            InvalidLimit(value) => f"negative replacement limit {value}",
+            RuleLimit(value) => f"replacement rule count exceeds {value}",
+            RuleBytesLimit(value) => f"replacement rule bytes exceed {value}",
+            OutputLimit(value) => f"replacement output exceeds {value} bytes",
+            WorkLimit(value) => f"replacement matching work exceeds {value}",
+            InvalidText(offset) => f"invalid replacement input at byte {offset}",
+        }
+    }
+}
+
+impl Debug for ReplaceError {
+    fn debug(self: ReplaceError) -> string {
+        self.to_string()
+    }
+}
+
+struct ReplacementNode {
+    edges: HashMap[byte, isize],
+    rule: isize,
+}
+
+fn replacement_node() -> ReplacementNode {
+    ReplacementNode { edges: HashMap::new(), rule: -1 }
+}
+
+fn replacement_visit(work: Ref[isize], limit: isize) -> Result[(), ReplaceError] {
+    if work.get() == limit {
+        return Result::Err(ReplaceError::WorkLimit(limit))
+    }
+    work.set(work.get() + 1);
+    Result::Ok(())
+}
+
+pub struct Replacer {
+    nodes: Vec[ReplacementNode],
+    rules: Vec[(string, string)],
+}
+
+struct ReplacementCursor {
+    replacer: Replacer,
+    value: string,
+    max_bytes: isize,
+    max_work: isize,
+    work: Ref[isize],
+    used: Ref[isize],
+    offset: Ref[isize],
+    ignore_empty: Ref[bool],
+}
+
+impl ReplacementCursor {
+    fn next_part(self: ReplacementCursor) -> Result[Option[string], ReplaceError] {
+        loop {
+            let start = self.offset.get();
+            let (rule, end) = self.replacer.lookup(
+                self.value,
+                start,
+                self.ignore_empty.get(),
+                self.work,
+                self.max_work,
+            )?;
+            let part = if rule >= 0 {
+                self.ignore_empty.set(end == start);
+                self.offset.set(end);
+                self.replacer.rules[rule].1
+            } else {
+                if start == self.value.byte_len() {
+                    return Result::Ok(Option::None)
+                }
+                let width = match self.value.decode_at(start) {
+                    Some((_, width)) => width,
+                    None => return Result::Err(ReplaceError::InvalidText(start)),
+                };
+                self.offset.set(start + width);
+                self.ignore_empty.set(false);
+                self.value.byte_slice(start, start + width)
+            };
+            if part.byte_len() > self.max_bytes - self.used.get() {
+                return Result::Err(ReplaceError::OutputLimit(self.max_bytes))
+            }
+            self.used.set(self.used.get() + part.byte_len());
+            if part.byte_len() > 0 {
+                return Result::Ok(Option::Some(part))
+            }
+        }
+    }
+}
+
+impl Replacer {
+    pub fn new(rules: Slice[(string, string)], max_rules: isize, max_rule_bytes: isize) -> Result[
+        Replacer,
+        ReplaceError,
+    ] {
+        if max_rules < 0 {
+            return Result::Err(ReplaceError::InvalidLimit(max_rules))
+        }
+        if max_rule_bytes < 0 {
+            return Result::Err(ReplaceError::InvalidLimit(max_rule_bytes))
+        }
+        if rules.len() > max_rules {
+            return Result::Err(ReplaceError::RuleLimit(max_rules))
+        }
+        let mut used = 0;
+        for (old, replacement) in rules {
+            for length in[old.byte_len(), replacement.byte_len()] {
+                if length > max_rule_bytes - used {
+                    return Result::Err(ReplaceError::RuleBytesLimit(max_rule_bytes))
+                }
+                used += length;
+            }
+        }
+        let nodes = Vec::from_array([replacement_node()]);
+        for index in 0..rules.len() {
+            let old = rules[index].0;
+            let mut node = 0;
+            for offset in 0..old.byte_len() {
+                let edges = nodes[node].edges;
+                let key = old.byte_get(offset);
+                node = match edges.get(key) {
+                    Some(child) => child,
+                    None => {
+                        let child = nodes.len();
+                        nodes.push(replacement_node());
+                        edges.set(key, child);
+                        child
+                    },
+                };
+            }
+            let mut terminal = nodes[node];
+            if terminal.rule < 0 {
+                terminal.rule = index;
+                nodes[node] = terminal;
+            }
+        }
+        Result::Ok(Replacer { nodes, rules: rules.to_vec() })
+    }
+
+    fn lookup(
+        self: Replacer,
+        value: string,
+        start: isize,
+        ignore_empty: bool,
+        work: Ref[isize],
+        max_work: isize,
+    ) -> Result[(isize, isize), ReplaceError] {
+        replacement_visit(work, max_work)?;
+        let mut best = if ignore_empty {
+            -1
+        } else {
+            self.nodes[0].rule
+        };
+        let mut end = start;
+        let mut offset = start;
+        let mut node = 0;
+        while offset < value.byte_len() && best != 0 {
+            replacement_visit(work, max_work)?;
+            node = match self.nodes[node].edges.get(value.byte_get(offset)) {
+                Some(child) => child,
+                None => break,
+            };
+            offset += 1;
+            let candidate = self.nodes[node].rule;
+            if candidate >= 0 && (best < 0 || candidate < best) {
+                best = candidate;
+                end = offset;
+            }
+        }
+        Result::Ok((best, end))
+    }
+
+    pub fn chunks(self: Replacer, value: string, max_bytes: isize, max_work: isize) -> Result[
+        FnIterator[Result[string, ReplaceError]],
+        ReplaceError,
+    ] {
+        if max_bytes < 0 {
+            return Result::Err(ReplaceError::InvalidLimit(max_bytes))
+        }
+        if max_work < 0 {
+            return Result::Err(ReplaceError::InvalidLimit(max_work))
+        }
+        let cursor = ReplacementCursor {
+            replacer: self,
+            value,
+            max_bytes,
+            max_work,
+            work: Ref::new(0),
+            used: Ref::new(0),
+            offset: Ref::new(0),
+            ignore_empty: Ref::new(false),
+        };
+        let done = Ref::new(false);
+        Result::Ok(
+            FnIterator::from_fn(
+                || {
+                    if done.get() {
+                        return Option::None
+                    }
+                    match cursor.next_part() {
+                        Ok(Some(part)) => Option::Some(Result::Ok(part)),
+                        Ok(None) => {
+                            done.set(true);
+                            Option::None
+                        },
+                        Err(error) => {
+                            done.set(true);
+                            Option::Some(Result::Err(error))
+                        },
+                    }
+                },
+            ),
+        )
+    }
+
+    pub fn replace(self: Replacer, value: string, max_bytes: isize, max_work: isize) -> Result[
+        string,
+        ReplaceError,
+    ] {
+        let chunks = self.chunks(value, max_bytes, max_work)?;
+        let output = StringBuilder::new();
+        for part in chunks {
+            output.write_string(part?);
+        }
+        Result::Ok(output.finish())
+    }
+}

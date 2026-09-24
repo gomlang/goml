@@ -1,0 +1,242 @@
+package main;
+
+use std::text;
+use std::text::stream as text_stream;
+use std::io;
+use io::Write;
+use std::testing;
+
+struct ReplacementWriter {
+    data: Vec[byte],
+    step: isize,
+    limit: isize,
+    mode: isize,
+    interrupted: Ref[bool],
+    calls: Ref[isize],
+}
+
+fn replacement_writer(step: isize, limit: isize, mode: isize) -> ReplacementWriter {
+    ReplacementWriter {
+        data: Vec::new(),
+        step,
+        limit,
+        mode,
+        interrupted: Ref::new(false),
+        calls: Ref::new(0),
+    }
+}
+
+fn replacement_io_error(kind: io::ErrorKind) -> io::Error {
+    io::Error::new(kind, "test replacement", Option::None, Option::None, "injected failure")
+}
+
+impl Write for ReplacementWriter {
+    fn write(self: ReplacementWriter, input: Slice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        testing::assert(input.len() > 0 && input.len() <= 4096);
+        if !self.interrupted.get() {
+            self.interrupted.set(true);
+            return Result::Err(replacement_io_error(io::ErrorKind::Interrupted))
+        }
+        if self.data.len() == self.limit {
+            return match self.mode {
+                0 => Result::Err(replacement_io_error(io::ErrorKind::BrokenPipe)),
+                1 => Result::Ok(0),
+                2 => Result::Ok(-1),
+                _ => Result::Ok(input.len() + 1),
+            }
+        }
+        let mut count = input.len();
+        if count > self.step {
+            count = self.step;
+        }
+        if count > self.limit - self.data.len() {
+            count = self.limit - self.data.len();
+        }
+        for index in 0..count {
+            self.data.push(input[index]);
+        }
+        Result::Ok(count)
+    }
+
+    fn flush(self: ReplacementWriter) -> Result[(), io::Error] {
+        testing::fail("replacement must not implicitly flush");
+        Result::Ok(())
+    }
+}
+
+struct DelayedReplacementInterrupt {
+    writer: ReplacementWriter,
+    interrupt: bool,
+}
+
+impl Write for DelayedReplacementInterrupt {
+    fn write(self: DelayedReplacementInterrupt, input: Slice[byte]) -> Result[isize, io::Error] {
+        if self.interrupt && self.writer.calls.get() == 1 {
+            self.writer.interrupted.set(false);
+        }
+        self.writer.write(input)
+    }
+
+    fn flush(self: DelayedReplacementInterrupt) -> Result[(), io::Error] {
+        self.writer.flush()
+    }
+}
+
+fn check_replacement_streams() -> () {
+    let rules = Vec::from_array([("a", "界🙂"), ("b", ""), ("", "-")]);
+    let replacer = testing::expect_ok(
+        text::Replacer::new(rules.as_slice(), 3, 10),
+        "stream replacer",
+    );
+    for input in["", "a", "aba", "界a🙂"] {
+        let expected = testing::expect_ok(replacer.replace(input, 100, 1000), "stream expected");
+        for step in[1, 2, 7, 4096] {
+            for limit in 0..expected.byte_len() + 1 {
+                for mode in 0..4 {
+                    let writer = replacement_writer(step, limit, mode);
+                    writer.interrupted.set(true);
+                    let result = text_stream::write_replaced(
+                        replacer,
+                        input,
+                        writer,
+                        expected.byte_len(),
+                        1000,
+                    );
+                    if limit == expected.byte_len() {
+                        assert_equal(testing::expect_ok(result, "complete stream"), limit);
+                    } else {
+                        match result {
+                            Err(text_stream::ReplaceWriteError::Write(count, error)) => {
+                                assert_equal(count, limit);
+                                assert_equal(
+                                    error.kind(),
+                                    match mode {
+                                        0 => io::ErrorKind::BrokenPipe,
+                                        1 => io::ErrorKind::WriteZero,
+                                        _ => io::ErrorKind::InvalidData,
+                                    },
+                                );
+                            },
+                            _ => testing::fail("stream failure missing"),
+                        }
+                    }
+                    assert_equal(writer.data.len(), limit);
+                    for index in 0..limit {
+                        assert_equal(writer.data[index], expected.byte_get(index));
+                    }
+                }
+            }
+        }
+    }
+    let identity = testing::expect_ok(
+        text::Replacer::new(Vec::new().as_slice(), 0, 0),
+        "stream identity",
+    );
+    for (byte_limit, work_limit) in[(1, 100), (100, 2), (-1, 100), (100, -1)] {
+        let writer = replacement_writer(1, 100, 0);
+        writer.interrupted.set(true);
+        match text_stream::write_replaced(identity, "ab", writer, byte_limit, work_limit) {
+            Err(error) => {
+                let count = if byte_limit < 0 || work_limit < 0 {
+                    0
+                } else {
+                    1
+                };
+                assert_equal(error.transferred(), count);
+                assert_equal(writer.data.len(), count);
+                match error {
+                    text_stream::ReplaceWriteError::Replacement(_, _) => (),
+                    _ => testing::fail("replacement error became I/O error"),
+                }
+                if count == 0 {
+                    assert_equal(writer.calls.get(), 0);
+                }
+            },
+            _ => testing::fail("replacement budget ignored"),
+        }
+    }
+    let large = testing::expect_ok(text::repeat_checked("界", 4000, 12000), "large replacement");
+    let large_replacer = testing::expect_ok(
+        text::Replacer::new(Vec::from_array([("a", large)]).as_slice(), 1, 12001),
+        "large replacer",
+    );
+    let writer = replacement_writer(17, 12000, 0);
+    writer.interrupted.set(true);
+    assert_equal(
+        testing::expect_ok(
+            text_stream::write_replaced(large_replacer, "a", writer, 12000, 10),
+            "large stream",
+        ),
+        12000,
+    );
+    for index in 0..12000 {
+        assert_equal(writer.data[index], large.byte_get(index));
+    }
+    let empty_writer = replacement_writer(1, 0, 0);
+    assert_equal(
+        testing::expect_ok(
+            text_stream::write_replaced(identity, "", empty_writer, 0, 1),
+            "empty stream",
+        ),
+        0,
+    );
+    assert_equal(empty_writer.calls.get(), 0);
+    let interrupted = replacement_writer(1, 100, 0);
+    match text_stream::write_replaced(identity, "ab", interrupted, 2, 100) {
+        Err(text_stream::ReplaceWriteError::Write(count, error)) => {
+            assert_equal(count, 0);
+            assert_equal(error.kind(), io::ErrorKind::Interrupted);
+        },
+        _ => testing::fail("interrupted replacement write must stop"),
+    }
+    assert_equal(interrupted.calls.get(), 1);
+    assert_equal(interrupted.data.len(), 0);
+    let first = replacement_writer(4096, 100, 0);
+    first.interrupted.set(true);
+    let second = replacement_writer(4096, 100, 0);
+    let broadcast = io::MultiWriter::new(Vec::from_array([first, second]).as_slice());
+    match text_stream::write_replaced(identity, "界a", broadcast, 4, 100) {
+        Err(text_stream::ReplaceWriteError::Write(count, error)) => {
+            assert_equal(count, 0);
+            assert_equal(error.kind(), io::ErrorKind::Interrupted);
+        },
+        _ => testing::fail("broadcast interruption must not retry prior destinations"),
+    }
+    assert_equal(first.calls.get(), 1);
+    assert_equal(second.calls.get(), 1);
+    assert_equal(first.data.len(), 3);
+    for index in 0..3 {
+        assert_equal(first.data[index], "界".byte_get(index));
+    }
+    assert_equal(second.data.len(), 0);
+    let first = replacement_writer(4096, 100, 0);
+    first.interrupted.set(true);
+    let second = replacement_writer(4096, 100, 0);
+    second.interrupted.set(true);
+    let broadcast = io::MultiWriter::new(
+        Vec::from_array(
+            [
+                DelayedReplacementInterrupt { writer: first, interrupt: false },
+                DelayedReplacementInterrupt { writer: second, interrupt: true },
+            ],
+        ).as_slice(),
+    );
+    match text_stream::write_replaced(identity, "界ab", broadcast, 5, 100) {
+        Err(text_stream::ReplaceWriteError::Write(count, error)) => {
+            assert_equal(count, 3);
+            assert_equal(error.kind(), io::ErrorKind::Interrupted);
+        },
+        _ => testing::fail("broadcast interruption must retain only confirmed progress"),
+    }
+    assert_equal(first.calls.get(), 2);
+    assert_equal(second.calls.get(), 2);
+    assert_equal(first.data.len(), 4);
+    assert_equal(second.data.len(), 3);
+    for index in 0..4 {
+        assert_equal(first.data[index], "界a".byte_get(index));
+    }
+    for index in 0..3 {
+        assert_equal(second.data[index], "界".byte_get(index));
+    }
+}

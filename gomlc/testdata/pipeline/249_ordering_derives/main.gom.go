@@ -476,20 +476,6 @@ type Option__string struct {
     _tag uint8
 }
 
-func _goml_m_trait__impl_i_std_p_cmp_p_Ord_i_isize_i_cmp(self__0 int, other__0 int) Ordering {
-    var t0 bool = self__0 < other__0
-    if t0 {
-        return Less
-    } else {
-        var t1 bool = self__0 > other__0
-        if t1 {
-            return Greater
-        } else {
-            return Equal
-        }
-    }
-}
-
 func _goml_m_trait__impl_i_std_p_cmp_p_PartialOrd_i_Version_i_partial__cmp(self__0 Version, other__0 Version) Option__Ordering {
     var t0 int = self__0.major
     var t1 int = other__0.major
@@ -1494,44 +1480,31 @@ func main0() struct{} {
     return struct{}{}
 }
 
+func _goml_m_trait__impl_i_PartialEq_i_isize_i_eq(self__0 int, other__0 int) bool {
+    var t0 bool = self__0 == other__0
+    return t0
+}
+
+func _goml_m_trait__impl_i_std_p_cmp_p_Ord_i_isize_i_cmp(self__0 int, other__0 int) Ordering {
+    var t0 bool = self__0 < other__0
+    if t0 {
+        return Less
+    } else {
+        var t1 bool = self__0 > other__0
+        if t1 {
+            return Greater
+        } else {
+            return Equal
+        }
+    }
+}
+
 func _goml_m_trait__impl_i_PartialEq_i_Ordering_i_eq(self__0 Ordering, other__0 Ordering) bool {
     if self__0 <= Greater {
         return other__0 == self__0
     } else {
         panic("non-exhaustive match")
     }
-}
-
-func _goml_m_std_p_cmp_p_trait__default_i_PartialOrd_i_lt____Self__isize(self__0 int, other__0 int) bool {
-    var commute_field0 Ordering
-    var inline0 bool = self__0 < other__0
-    var inline1 Ordering
-    if inline0 {
-        inline1 = Less
-    } else {
-        var inline2 bool = self__0 > other__0
-        if inline2 {
-            inline1 = Greater
-        } else {
-            inline1 = Equal
-        }
-    }
-    commute_field0 = inline1
-    switch commute_field0 {
-    case Less:
-        return true
-    case Equal:
-        return false
-    case Greater:
-        return false
-    default:
-        panic("non-exhaustive match")
-    }
-}
-
-func _goml_m_trait__impl_i_PartialEq_i_isize_i_eq(self__0 int, other__0 int) bool {
-    var t0 bool = self__0 == other__0
-    return t0
 }
 
 func println__T_string(value__0 string) struct{} {
@@ -2376,6 +2349,33 @@ func _goml_m_trait__impl_i_std_p_cmp_p_PartialOrd_i_Slice_l_isize_r__i_partial__
         _tag: 1,
     }
     return inline2
+}
+
+func _goml_m_std_p_cmp_p_trait__default_i_PartialOrd_i_lt____Self__isize(self__0 int, other__0 int) bool {
+    var commute_field0 Ordering
+    var inline0 bool = self__0 < other__0
+    var inline1 Ordering
+    if inline0 {
+        inline1 = Less
+    } else {
+        var inline2 bool = self__0 > other__0
+        if inline2 {
+            inline1 = Greater
+        } else {
+            inline1 = Equal
+        }
+    }
+    commute_field0 = inline1
+    switch commute_field0 {
+    case Less:
+        return true
+    case Equal:
+        return false
+    case Greater:
+        return false
+    default:
+        panic("non-exhaustive match")
+    }
 }
 
 func _goml_m_trait__impl_i_PartialEq_i_Vec_l_isize_r__i_eq(self__0 *_goml_vec_int, other__0 *_goml_vec_int) bool {

@@ -1,0 +1,389 @@
+package fs;
+
+use module::bytes;
+use module::collections;
+use module::io;
+use module::path::slash;
+use module::utf8;
+use utf8::BytesUtf8;
+
+pub struct GlobLimits {
+    pub max_pattern_chars: isize,
+    pub max_components: isize,
+    pub max_directory_entries: isize,
+    pub max_directories: isize,
+    pub max_match_calls: isize,
+    pub max_matches: isize,
+    pub max_work: isize,
+}
+
+pub enum GlobCause {
+    FileSystem(Error),
+    Pattern(isize, slash::MatchError),
+}
+
+impl ToString for GlobCause {
+    fn to_string(self: GlobCause) -> string {
+        match self {
+            FileSystem(error) => error.to_string(),
+            Pattern(component, error) => "glob component " + component.to_string() + ": "
+                + error.to_string(),
+        }
+    }
+}
+
+impl Debug for GlobCause {
+    fn debug(self: GlobCause) -> string {
+        self.to_string()
+    }
+}
+
+pub struct GlobError {
+    matches_value: Vec[string],
+    cause_value: GlobCause,
+}
+
+impl GlobError {
+    pub fn new(matches: Vec[string], cause: GlobCause) -> GlobError {
+        let snapshot = Vec::with_capacity(matches.len());
+        for value in matches {
+            snapshot.push(value);
+        }
+        GlobError { matches_value: snapshot, cause_value: cause }
+    }
+
+    pub fn matches(self: GlobError) -> Slice[string] {
+        self.matches_value.as_slice()
+    }
+
+    pub fn cause(self: GlobError) -> GlobCause {
+        self.cause_value
+    }
+}
+
+impl ToString for GlobError {
+    fn to_string(self: GlobError) -> string {
+        self.cause_value.to_string()
+    }
+}
+
+impl Debug for GlobError {
+    fn debug(self: GlobError) -> string {
+        self.to_string()
+    }
+}
+
+struct GlobComponent {
+    pattern: slash::Pattern,
+    chars: isize,
+    literal: Option[string],
+}
+
+struct GlobFrame[E] {
+    directory: string,
+    component: isize,
+    entries: Vec[(string, E)],
+    position: isize,
+    cause: Option[Error],
+}
+
+fn glob_error(path: string, kind: io::ErrorKind, message: string) -> GlobCause {
+    GlobCause::FileSystem(Error::new(kind, "glob", Option::Some(path), Option::None, message))
+}
+
+fn glob_limit(path: string, message: string) -> GlobCause {
+    glob_error(path, io::ErrorKind::InvalidData, message)
+}
+
+fn glob_join(directory: string, name: string) -> string {
+    if directory == "." {
+        name
+    } else {
+        directory + "/" + name
+    }
+}
+
+fn glob_literal(component: string) -> Option[string] {
+    let output = Vec::new();
+    let mut position = 0;
+    while position < component.byte_len() {
+        let value = component.byte_get(position);
+        if value == b'*' || value == b'?' || value == b'[' {
+            return Option::None
+        }
+        if value == b'\\' {
+            position += 1;
+            if position == component.byte_len() {
+                return Option::None
+            }
+        }
+        output.push(component.byte_get(position));
+        position += 1;
+    }
+    match bytes::Bytes::from_vec(output).to_string_utf8() {
+        Ok(value) => Option::Some(value),
+        Err(_) => Option::None,
+    }
+}
+
+fn glob_components(pattern: string, limits: GlobLimits) -> Result[Vec[GlobComponent], GlobCause] {
+    if limits.max_pattern_chars < 0 || limits.max_components < 0 || limits.max_directory_entries < 0
+        || limits.max_directories < 0
+        || limits.max_match_calls < 0
+        || limits.max_matches < 0
+        || limits.max_work < 0 {
+        return Result::Err(
+            glob_error(pattern, io::ErrorKind::InvalidInput, "limits must be non-negative"),
+        )
+    }
+    let mut total = 0;
+    for _ in pattern.chars() {
+        if total >= limits.max_pattern_chars {
+            return Result::Err(glob_limit(pattern, "glob exceeds pattern character limit"))
+        }
+        total += 1;
+    }
+    let components = Vec::new();
+    let mut start = 0;
+    let mut position = 0;
+    loop {
+        if position == pattern.byte_len() || pattern.byte_get(position) == b'/' {
+            let value = pattern.byte_slice(start, position);
+            if value.byte_len() == 0 || value == ".." || (value == "." && pattern != ".") {
+                return Result::Err(
+                    glob_error(pattern, io::ErrorKind::InvalidInput, "invalid glob path component"),
+                )
+            }
+            if components.len() >= limits.max_components {
+                return Result::Err(glob_limit(pattern, "glob exceeds component limit"))
+            }
+            let compiled = slash::Pattern::compile_with_limit(value, limits.max_pattern_chars).map_err(
+                |error| GlobCause::Pattern(components.len(), error),
+            )?;
+            let literal = glob_literal(value);
+            if let Some(name) = literal {
+                if name == ".." || (name == "." && pattern != ".") {
+                    return Result::Err(
+                        glob_error(
+                            pattern,
+                            io::ErrorKind::InvalidInput,
+                            "invalid glob literal component",
+                        ),
+                    )
+                }
+            }
+            let mut chars = 0;
+            for _ in value.chars() {
+                chars += 1;
+            }
+            components.push(GlobComponent { pattern: compiled, chars, literal });
+            if position == pattern.byte_len() {
+                return Result::Ok(components)
+            }
+            start = position + 1;
+        }
+        position += 1;
+    }
+}
+
+fn glob_match(
+    component: GlobComponent,
+    index: isize,
+    name: string,
+    directory: string,
+    limits: GlobLimits,
+    work: DirectoryWork,
+    calls: Ref[isize],
+) -> Result[bool, GlobCause] {
+    if calls.get() >= limits.max_match_calls {
+        return Result::Err(glob_limit(directory, "glob exceeds match call limit"))
+    }
+    let p = component.chars;
+    let n = name.byte_len();
+    let remaining = work.remaining.get();
+    if p > remaining {
+        return Result::Err(glob_limit(directory, "glob exceeds matching work limit"))
+    }
+    let mut cost = p;
+    if n > 0 {
+        let per_byte = (remaining - p) / n;
+        if per_byte < 1 || p > (per_byte - 1) / 2 {
+            return Result::Err(glob_limit(directory, "glob exceeds matching work limit"))
+        }
+        cost += n * (1 + 2 * p);
+    }
+    if !directory_work_take(Option::Some(work), cost) {
+        return Result::Err(glob_limit(directory, "glob exceeds matching work limit"))
+    }
+    calls.set(calls.get() + 1);
+    component.pattern.matches_with_limit(name, cost).map_err(
+        |error| GlobCause::Pattern(index, error),
+    )
+}
+
+fn glob_frame[F: FileSystem](
+    filesystem: F,
+    directory: string,
+    component: isize,
+    final_component: bool,
+    limits: GlobLimits,
+    work: DirectoryWork,
+    directories: Ref[isize],
+) -> Result[GlobFrame[F::Handle::Entry], GlobCause] where F::Handle: ReadDirFile {
+    if directories.get() >= limits.max_directories {
+        return Result::Err(glob_limit(directory, "glob exceeds directory limit"))
+    }
+    directories.set(directories.get() + 1);
+    let batch = read_named_directory_from(
+        filesystem,
+        directory,
+        limits.max_directory_entries,
+        Option::Some(work),
+    );
+    if batch.limited {
+        let message = match batch.cause {
+            Some(error) => error.message(),
+            None => "glob exceeds directory collection limit",
+        };
+        return Result::Err(glob_limit(directory, message))
+    }
+    if !final_component {
+        if let Some(error) = batch.cause {
+            return Result::Err(GlobCause::FileSystem(error))
+        }
+    }
+    Result::Ok(
+        GlobFrame { directory, component, entries: batch.entries, position: 0, cause: batch.cause },
+    )
+}
+
+fn glob_prefer_cause(cause: Option[Error], fallback: GlobCause) -> GlobCause {
+    match cause {
+        Some(error) => GlobCause::FileSystem(error),
+        None => fallback,
+    }
+}
+
+fn glob_collect[F: FileSystem](
+    filesystem: F,
+    pattern: string,
+    limits: GlobLimits,
+    matches: Vec[string],
+) -> Result[(), GlobCause] where F::Handle: ReadDirFile {
+    let components = glob_components(pattern, limits)?;
+    let work = DirectoryWork { remaining: Ref::new(limits.max_work) };
+    let mut directory = ".";
+    let mut first = 0;
+    while first < components.len() {
+        match components[first].literal {
+            Some(name) => {
+                directory = glob_join(directory, name);
+                first += 1;
+            },
+            None => break,
+        }
+    }
+    if first == components.len() {
+        if !directory_work_take(Option::Some(work), 1) {
+            return Result::Err(glob_limit(directory, "glob exceeds stat work limit"))
+        }
+        let _ = stat_from(filesystem, directory).map_err(|error| GlobCause::FileSystem(error))?;
+        if limits.max_matches == 0 {
+            return Result::Err(glob_limit(directory, "glob exceeds match limit"))
+        }
+        matches.push(directory);
+        return Result::Ok(())
+    }
+    let directories = Ref::new(0);
+    let calls = Ref::new(0);
+    let frames = Vec::from_array(
+        [
+            glob_frame(
+                filesystem,
+                directory,
+                first,
+                first == components.len() - 1,
+                limits,
+                work,
+                directories,
+            )?,
+        ],
+    );
+    while !frames.is_empty() {
+        let top = frames.len() - 1;
+        let frame = frames[top];
+        if frame.position == frame.entries.len() {
+            if let Some(error) = frame.cause {
+                return Result::Err(GlobCause::FileSystem(error))
+            }
+            let _ = frames.pop();
+        } else {
+            let (name, entry) = frame.entries[frame.position];
+            frames[top] = GlobFrame { position: frame.position + 1, ..frame };
+            let matched = glob_match(
+                components[frame.component],
+                frame.component,
+                name,
+                frame.directory,
+                limits,
+                work,
+                calls,
+            ).map_err(|error| glob_prefer_cause(frame.cause, error))?;
+            if matched {
+                let path = glob_join(frame.directory, name);
+                if frame.component == components.len() - 1 {
+                    if matches.len() >= limits.max_matches {
+                        return Result::Err(
+                            glob_prefer_cause(
+                                frame.cause,
+                                glob_limit(frame.directory, "glob exceeds match limit"),
+                            ),
+                        )
+                    }
+                    matches.push(path);
+                } else {
+                    let kind = entry.file_type();
+                    if kind.is_dir() || kind.is_symlink() {
+                        let next = frame.component + 1;
+                        frames.push(
+                            glob_frame(
+                                filesystem,
+                                path,
+                                next,
+                                next == components.len() - 1,
+                                limits,
+                                work,
+                                directories,
+                            )?,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Result::Ok(())
+}
+
+pub fn glob_from[F: FileSystem](filesystem: F, pattern: string, limits: GlobLimits) -> Result[
+    Vec[string],
+    GlobError,
+] where F::Handle: ReadDirFile {
+    let matches = Vec::new();
+    let result = glob_collect(filesystem, pattern, limits, matches);
+    collections::stable_sort_by(
+        matches,
+        |left: string, right: string| {
+            if left < right {
+                -1
+            } else if left > right {
+                1
+            } else {
+                0
+            }
+        },
+    );
+    match result {
+        Ok(()) => Result::Ok(matches),
+        Err(cause) => Result::Err(GlobError::new(matches, cause)),
+    }
+}

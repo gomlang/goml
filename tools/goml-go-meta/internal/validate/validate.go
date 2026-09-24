@@ -110,6 +110,29 @@ func Check(ctx context.Context, request protocol.Request) protocol.Response {
 			firstFile = file
 		}
 	}
+	origins := witnessOrigins{}
+	if caller.LoadMode == "files" {
+		bundlePath := filepath.Join(caller.Directory, "goml_ffi_witness_bundle.go")
+		if _, err := os.Lstat(bundlePath); !os.IsNotExist(err) {
+			return failure(request, "ffi-package-load", "witness file conflicts with an existing file: "+bundlePath)
+		}
+		sources := map[string][]byte{}
+		for path := range fileBindings {
+			sources[path] = overlay[path]
+			delete(overlay, path)
+		}
+		for path := range fileQueries {
+			sources[path] = overlay[path]
+			delete(overlay, path)
+		}
+		data, mapping, err := bundleWitnesses(caller.Package, bundlePath, sources)
+		if err != nil {
+			return failure(request, "ffi-protocol", err.Error())
+		}
+		overlay[bundlePath] = data
+		origins = mapping
+		firstFile = bundlePath
+	}
 	flags, err := splitGoFlags(request.BuildContext.GOFLAGS)
 	if err != nil {
 		return failure(request, "ffi-protocol", err.Error())
@@ -122,11 +145,7 @@ func Check(ctx context.Context, request protocol.Request) protocol.Response {
 	}
 	patterns := []string{"file=" + firstFile}
 	if caller.LoadMode == "files" {
-		patterns = nil
-		for file := range overlay {
-			patterns = append(patterns, file)
-		}
-		sort.Strings(patterns)
+		patterns = []string{firstFile}
 	}
 	loadMode := packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles | packages.NeedImports | packages.NeedDeps | packages.NeedTypes | packages.NeedTypesSizes | packages.NeedModule
 	for _, binding := range request.Bindings {
@@ -189,14 +208,15 @@ func Check(ctx context.Context, request protocol.Request) protocol.Response {
 		p := allPackages[path]
 		for _, problem := range p.Errors {
 			indices := []int{}
+			problemFiles := origins.diagnostic(problem.Pos)
 			for file, bindings := range fileBindings {
-				if strings.HasPrefix(problem.Pos, file+":") {
+				if containsFile(problemFiles, file) {
 					indices = append(indices, bindings...)
 				}
 			}
 			queryIndices := []int{}
 			for file, index := range fileQueries {
-				if strings.HasPrefix(problem.Pos, file+":") {
+				if containsFile(problemFiles, file) {
 					queryIndices = append(queryIndices, index)
 				}
 			}
@@ -221,7 +241,7 @@ func Check(ctx context.Context, request protocol.Request) protocol.Response {
 		}
 	}
 	graph := typeGraph{ids: map[types.Type]string{}}
-	methods := selectedWitnessMethods(root, fileBindings)
+	methods := selectedWitnessMethods(root, fileBindings, origins)
 	for i, binding := range request.Bindings {
 		if binding.CallMode == "method" {
 			method := methods[i]
@@ -353,7 +373,7 @@ func Check(ctx context.Context, request protocol.Request) protocol.Response {
 	return response
 }
 
-func selectedWitnessMethods(root *packages.Package, files map[string][]int) map[int]*types.Func {
+func selectedWitnessMethods(root *packages.Package, files map[string][]int, origins witnessOrigins) map[int]*types.Func {
 	result := map[int]*types.Func{}
 	if root == nil || root.TypesInfo == nil || root.Fset == nil {
 		return result
@@ -366,8 +386,11 @@ func selectedWitnessMethods(root *packages.Package, files map[string][]int) map[
 		if !ok {
 			continue
 		}
-		for _, index := range files[root.Fset.Position(expression.Pos()).Filename] {
-			result[index] = method
+		position := root.Fset.Position(expression.Pos())
+		for _, file := range origins.files(position.Filename, position.Line) {
+			for _, index := range files[file] {
+				result[index] = method
+			}
 		}
 	}
 	return result

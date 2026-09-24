@@ -1,0 +1,334 @@
+package hash;
+
+use module::bytes;
+use module::hash as standard_hash;
+use standard_hash::Hasher;
+
+const KECCAK_ROUND_CONSTANTS: [u64; 24] = [
+    0x0000000000000001,
+    0x0000000000008082,
+    0x800000000000808a,
+    0x8000000080008000,
+    0x000000000000808b,
+    0x0000000080000001,
+    0x8000000080008081,
+    0x8000000000008009,
+    0x000000000000008a,
+    0x0000000000000088,
+    0x0000000080008009,
+    0x000000008000000a,
+    0x000000008000808b,
+    0x800000000000008b,
+    0x8000000000008089,
+    0x8000000000008003,
+    0x8000000000008002,
+    0x8000000000000080,
+    0x000000000000800a,
+    0x800000008000000a,
+    0x8000000080008081,
+    0x8000000000008080,
+    0x0000000080000001,
+    0x8000000080008008,
+];
+
+const KECCAK_ROTATIONS: [isize; 25] = [
+    0,
+    1,
+    62,
+    28,
+    27,
+    36,
+    44,
+    6,
+    55,
+    20,
+    3,
+    10,
+    43,
+    25,
+    39,
+    41,
+    45,
+    15,
+    21,
+    8,
+    18,
+    2,
+    61,
+    56,
+    14,
+];
+
+pub const MAX_SHAKE_OUTPUT_BYTES: isize = 1048576;
+
+fn rotate_left_keccak(value: u64, count: isize) -> u64 {
+    if count == 0 {
+        value
+    } else {
+        (value << count) | (value >> (64 - count))
+    }
+}
+
+fn keccak_f1600(state: Vec[u64]) -> () {
+    for round in 0..24 {
+        let parity = Vec::with_capacity(5);
+        for x in 0..5 {
+            parity.push(state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20])
+        }
+        for x in 0..5 {
+            let difference = parity[(x + 4) % 5] ^ rotate_left_keccak(parity[(x + 1) % 5], 1);
+            for y in 0..5 {
+                let index = x + 5 * y;
+                state[index] = state[index] ^ difference;
+            }
+        }
+        let moved = Vec::with_capacity(25);
+        for _ in 0..25 {
+            moved.push(0)
+        }
+        for y in 0..5 {
+            for x in 0..5 {
+                let index = x + 5 * y;
+                let destination = y + 5 * ((2 * x + 3 * y) % 5);
+                moved[destination] = rotate_left_keccak(state[index], KECCAK_ROTATIONS[index]);
+            }
+        }
+        for y in 0..5 {
+            for x in 0..5 {
+                let index = x + 5 * y;
+                state[index] = moved[index]
+                    ^ ((~moved[(x + 1) % 5 + 5 * y]) & moved[(x + 2) % 5 + 5 * y]);
+            }
+        }
+        state[0] = state[0] ^ KECCAK_ROUND_CONSTANTS[round];
+    }
+}
+
+struct KeccakSponge {
+    state: Ref[Vec[u64]],
+    position: Ref[isize],
+    rate: isize,
+    domain: byte,
+    squeezing: Ref[bool],
+}
+
+impl KeccakSponge {
+    fn new(rate: isize, domain: byte) -> KeccakSponge {
+        let state = Vec::with_capacity(25);
+        for _ in 0..25 {
+            state.push(0)
+        }
+        KeccakSponge {
+            state: Ref::new(state),
+            position: Ref::new(0),
+            rate,
+            domain,
+            squeezing: Ref::new(false),
+        }
+    }
+
+    fn copy(self: KeccakSponge) -> KeccakSponge {
+        let state = Vec::with_capacity(25);
+        for lane in self.state.get() {
+            state.push(lane)
+        }
+        KeccakSponge {
+            state: Ref::new(state),
+            position: Ref::new(self.position.get()),
+            rate: self.rate,
+            domain: self.domain,
+            squeezing: Ref::new(self.squeezing.get()),
+        }
+    }
+
+    fn reset(self: KeccakSponge) -> () {
+        for index in 0..25 {
+            self.state.get()[index] = 0;
+        }
+        self.position.set(0);
+        self.squeezing.set(false)
+    }
+
+    fn absorb(self: KeccakSponge, input: Slice[byte]) -> () {
+        for item in input {
+            let position = self.position.get();
+            let lane = position / 8;
+            self.state.get()[lane] = self.state.get()[lane]
+                ^ (item.to_u64() << ((position % 8) * 8));
+            let next = position + 1;
+            if next == self.rate {
+                keccak_f1600(self.state.get());
+                self.position.set(0)
+            } else {
+                self.position.set(next)
+            }
+        }
+    }
+
+    fn start_squeezing(self: KeccakSponge) -> () {
+        if self.squeezing.get() {
+            return
+        }
+        let position = self.position.get();
+        let lane = position / 8;
+        self.state.get()[lane] = self.state.get()[lane]
+            ^ (self.domain.to_u64() << ((position % 8) * 8));
+        let last = self.rate - 1;
+        let high_bit: u64 = 0x80;
+        self.state.get()[last / 8] = self.state.get()[last / 8] ^ (high_bit << ((last % 8) * 8));
+        keccak_f1600(self.state.get());
+        self.position.set(0);
+        self.squeezing.set(true)
+    }
+
+    fn squeeze(self: KeccakSponge, length: isize) -> bytes::Bytes {
+        self.start_squeezing();
+        let output = bytes::Bytes::with_capacity(length);
+        for _ in 0..length {
+            let position = self.position.get();
+            if position == self.rate {
+                keccak_f1600(self.state.get());
+                self.position.set(0)
+            }
+            let current = self.position.get();
+            output.push((self.state.get()[current / 8] >> ((current % 8) * 8)).to_u8());
+            self.position.set(current + 1)
+        }
+        output
+    }
+}
+
+pub enum Sha3Variant {
+    Sha3_224,
+    Sha3_256,
+    Sha3_384,
+    Sha3_512,
+}
+
+pub struct Sha3Digest {
+    sponge: KeccakSponge,
+    variant: Sha3Variant,
+}
+
+fn sha3_rate(variant: Sha3Variant) -> isize {
+    match variant {
+        Sha3Variant::Sha3_224 => 144,
+        Sha3Variant::Sha3_256 => 136,
+        Sha3Variant::Sha3_384 => 104,
+        Sha3Variant::Sha3_512 => 72,
+    }
+}
+
+fn sha3_size(variant: Sha3Variant) -> isize {
+    match variant {
+        Sha3Variant::Sha3_224 => 28,
+        Sha3Variant::Sha3_256 => 32,
+        Sha3Variant::Sha3_384 => 48,
+        Sha3Variant::Sha3_512 => 64,
+    }
+}
+
+impl Sha3Digest {
+    pub fn new224() -> Sha3Digest {
+        Sha3Digest::new(Sha3Variant::Sha3_224)
+    }
+
+    pub fn new256() -> Sha3Digest {
+        Sha3Digest::new(Sha3Variant::Sha3_256)
+    }
+
+    pub fn new384() -> Sha3Digest {
+        Sha3Digest::new(Sha3Variant::Sha3_384)
+    }
+
+    pub fn new512() -> Sha3Digest {
+        Sha3Digest::new(Sha3Variant::Sha3_512)
+    }
+
+    pub fn new(variant: Sha3Variant) -> Sha3Digest {
+        Sha3Digest { sponge: KeccakSponge::new(sha3_rate(variant), 0x06), variant }
+    }
+
+    pub fn copy(self: Sha3Digest) -> Sha3Digest {
+        Sha3Digest { sponge: self.sponge.copy(), variant: self.variant }
+    }
+}
+
+impl Hasher for Sha3Digest {
+    fn update(self: Sha3Digest, input: Slice[byte]) -> () {
+        self.sponge.absorb(input)
+    }
+
+    fn reset(self: Sha3Digest) -> () {
+        self.sponge.reset()
+    }
+
+    fn sum(self: Sha3Digest) -> bytes::Bytes {
+        self.sponge.copy().squeeze(self.size())
+    }
+
+    fn size(self: Sha3Digest) -> isize {
+        sha3_size(self.variant)
+    }
+
+    fn block_size(self: Sha3Digest) -> isize {
+        self.sponge.rate
+    }
+}
+
+pub enum ShakeError {
+    AlreadySqueezing,
+    InvalidLength,
+}
+
+impl ToString for ShakeError {
+    fn to_string(self: ShakeError) -> string {
+        match self {
+            ShakeError::AlreadySqueezing => "SHAKE cannot absorb after squeezing begins",
+            ShakeError::InvalidLength => "SHAKE squeeze length must be between zero and 1048576 bytes",
+        }
+    }
+}
+
+impl Debug for ShakeError {
+    fn debug(self: ShakeError) -> string {
+        self.to_string()
+    }
+}
+
+pub struct ShakeDigest {
+    sponge: KeccakSponge,
+}
+
+impl ShakeDigest {
+    pub fn new128() -> ShakeDigest {
+        ShakeDigest { sponge: KeccakSponge::new(168, 0x1f) }
+    }
+
+    pub fn new256() -> ShakeDigest {
+        ShakeDigest { sponge: KeccakSponge::new(136, 0x1f) }
+    }
+
+    pub fn absorb(self: ShakeDigest, input: Slice[byte]) -> Result[(), ShakeError] {
+        if self.sponge.squeezing.get() {
+            return Result::Err(ShakeError::AlreadySqueezing)
+        }
+        self.sponge.absorb(input);
+        Result::Ok(())
+    }
+
+    pub fn squeeze(self: ShakeDigest, length: isize) -> Result[bytes::Bytes, ShakeError] {
+        if length < 0 || length > MAX_SHAKE_OUTPUT_BYTES {
+            return Result::Err(ShakeError::InvalidLength)
+        }
+        Result::Ok(self.sponge.squeeze(length))
+    }
+
+    pub fn reset(self: ShakeDigest) -> () {
+        self.sponge.reset()
+    }
+
+    pub fn copy(self: ShakeDigest) -> ShakeDigest {
+        ShakeDigest { sponge: self.sponge.copy() }
+    }
+}

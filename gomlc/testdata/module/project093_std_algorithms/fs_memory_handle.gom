@@ -1,0 +1,386 @@
+package main;
+
+use std::bytes;
+use std::fs;
+use fs::{DirectoryEntry, File, FileSystem, ReadDirFile};
+use std::io;
+use io::{Read, ReadAt, Seek, Close};
+use std::testing;
+use std::testing::fs as memory;
+
+fn memory_handle_fixture() -> memory::MemoryFS {
+    testing::expect_ok(
+        memory::MemoryFS::new(
+            Vec::from_array(
+                [
+                    memory::MemoryNode::file("file", bytes::Bytes::from_string("abcdef")),
+                    memory::MemoryNode::file("empty", bytes::Bytes::new()),
+                    memory::MemoryNode::link("link", "file"),
+                    memory::MemoryNode::file("dir/z", bytes::Bytes::from_string("z")),
+                    memory::MemoryNode::directory("dir/m"),
+                    memory::MemoryNode::file("dir/a", bytes::Bytes::from_string("a")),
+                    memory::MemoryNode {
+                        path: "special",
+                        mode: fs::FileMode::from_parts(fs::NodeKind::NamedPipe, 0o640, Option::None),
+                        modified_unix_nanoseconds: 123,
+                        content: memory::MemoryContent::Special,
+                    },
+                ],
+            ),
+            memory::MemoryLimits {
+                max_nodes: 100,
+                max_data_bytes: 100,
+                max_path_bytes: 1000,
+                max_depth: 20,
+                max_link_hops: 20,
+                max_resolve_work: 10000,
+            },
+        ),
+        "memory handle fixture",
+    )
+}
+
+fn memory_handle_io_cause(error: io::Error, kind: io::ErrorKind, path: string) -> () {
+    assert_equal(error.kind(), kind);
+    assert_equal(error.context(), Option::Some(path));
+    assert_equal(error.raw_os_code(), Option::None);
+}
+
+fn check_memory_handle_aliases() -> () {
+    let source = memory_handle_fixture();
+    let handle = testing::expect_ok(source.open("file"), "memory open file");
+    let alias = handle;
+    let other = testing::expect_ok(source.open("file"), "memory independent open");
+    let output = b"?";
+    assert_equal(testing::expect_ok(handle.read(output.as_mut_slice()), "first byte"), 1);
+    assert_equal(output, b"a");
+    assert_equal(testing::expect_ok(alias.read(output.as_mut_slice()), "alias next byte"), 1);
+    assert_equal(output, b"b");
+    let metadata = testing::expect_ok(alias.stat(), "stat does not move position");
+    assert_equal(metadata.len(), 6);
+    assert_equal(metadata.file_type(), fs::FileType::File);
+    assert_equal(testing::expect_ok(handle.seek(io::SeekFrom::Current(0)), "shared position"), 2);
+    assert_equal(testing::expect_ok(other.read(output.as_mut_slice()), "independent first byte"), 1);
+    assert_equal(output, b"a");
+    assert_equal(testing::expect_ok(handle.read(b"".as_mut_slice()), "empty file read"), 0);
+    assert_equal(
+        testing::expect_ok(alias.read(output.as_mut_slice()), "empty read preserves position"),
+        1,
+    );
+    assert_equal(output, b"c");
+    testing::expect_ok(alias.close(), "alias close");
+    memory_handle_io_cause(
+        testing::expect_err(
+            handle.read(output.as_mut_slice()),
+            "alias close affects original handle",
+        ),
+        io::ErrorKind::InvalidInput,
+        "file",
+    );
+    assert_equal(output, b"c");
+    testing::expect_ok(handle.close(), "idempotent alias close");
+    assert_equal(
+        testing::expect_ok(other.read(output.as_mut_slice()), "other open survives close"),
+        1,
+    );
+    assert_equal(output, b"b");
+    testing::expect_ok(other.close(), "independent close");
+    let empty = testing::expect_ok(source.open("empty"), "empty memory file");
+    for _ in 0..2 {
+        output[0] = b'?';
+        assert_equal(testing::expect_ok(empty.read(output.as_mut_slice()), "repeat EOF"), 0);
+        assert_equal(output, b"?");
+    }
+    testing::expect_ok(empty.close(), "empty file close");
+}
+
+fn check_memory_handle_read_at() -> () {
+    let handle = testing::expect_ok(memory_handle_fixture().open("link"), "read-at linked file");
+    testing::expect_ok(handle.seek(io::SeekFrom::Start(2)), "prime sequential position");
+    let output = b"????";
+    let error = testing::expect_err(handle.read_at(output.as_mut_slice(), 3), "short read-at");
+    assert_equal(error.transferred(), 3.to_usize());
+    memory_handle_io_cause(error.error(), io::ErrorKind::UnexpectedEof, "link");
+    assert_equal(output, b"def?");
+    assert_equal(
+        testing::expect_ok(handle.seek(io::SeekFrom::Current(0)), "read-at leaves position"),
+        2,
+    );
+    assert_equal(
+        testing::expect_ok(handle.read_at(output.as_mut_slice(), 1), "complete read-at"),
+        4,
+    );
+    assert_equal(output, b"bcde");
+    assert_equal(
+        testing::expect_ok(handle.seek(io::SeekFrom::Current(0)), "complete read-at position"),
+        2,
+    );
+    for offset in[-9223372036854775807 - 1, -1, 9223372036854775807] {
+        let untouched = b"??";
+        let error = testing::expect_err(
+            handle.read_at(untouched.as_mut_slice(), offset),
+            "invalid read-at range",
+        );
+        assert_equal(error.transferred(), 0.to_usize());
+        memory_handle_io_cause(error.error(), io::ErrorKind::InvalidInput, "link");
+        assert_equal(untouched, b"??");
+        assert_equal(
+            testing::expect_ok(handle.seek(io::SeekFrom::Current(0)), "failed read-at position"),
+            2,
+        );
+    }
+    for offset in[0, 6, 9223372036854775807] {
+        assert_equal(
+            testing::expect_ok(
+                handle.read_at(b"".as_mut_slice(), offset),
+                "empty nonnegative read-at",
+            ),
+            0,
+        );
+    }
+    let error = testing::expect_err(
+        handle.read_at(b"".as_mut_slice(), -1),
+        "negative empty read-at",
+    );
+    assert_equal(error.transferred(), 0.to_usize());
+    memory_handle_io_cause(error.error(), io::ErrorKind::InvalidInput, "link");
+    for offset in[6, 7, 9223372036854775806] {
+        let untouched = b"?";
+        let error = testing::expect_err(
+            handle.read_at(untouched.as_mut_slice(), offset),
+            "past end read-at",
+        );
+        assert_equal(error.transferred(), 0.to_usize());
+        memory_handle_io_cause(error.error(), io::ErrorKind::UnexpectedEof, "link");
+        assert_equal(untouched, b"?");
+    }
+    let output = b"?";
+    testing::expect_ok(
+        handle.read(output.as_mut_slice()),
+        "sequential cursor after read-at failures",
+    );
+    assert_equal(output, b"c");
+    testing::expect_ok(handle.close(), "read-at handle close");
+}
+
+fn check_memory_handle_seek() -> () {
+    let handle = testing::expect_ok(memory_handle_fixture().open("file"), "seek memory file");
+    assert_equal(testing::expect_ok(handle.seek(io::SeekFrom::End(-2)), "relative end"), 4);
+    let output = b"???";
+    assert_equal(testing::expect_ok(handle.read(output.as_mut_slice()), "read end suffix"), 2);
+    assert_equal(output, b"ef?");
+    for from in[
+        io::SeekFrom::Start(-1),
+        io::SeekFrom::Start(-9223372036854775807 - 1),
+        io::SeekFrom::Current(-7),
+        io::SeekFrom::Current(9223372036854775807),
+        io::SeekFrom::End(-7),
+        io::SeekFrom::End(9223372036854775807),
+    ] {
+        memory_handle_io_cause(
+            testing::expect_err(handle.seek(from), "invalid seek"),
+            io::ErrorKind::InvalidInput,
+            "file",
+        );
+        assert_equal(
+            testing::expect_ok(handle.seek(io::SeekFrom::Current(0)), "invalid seek unchanged"),
+            6,
+        );
+    }
+    assert_equal(
+        testing::expect_ok(
+            handle.seek(io::SeekFrom::Start(9223372036854775807)),
+            "maximum seek position",
+        ),
+        9223372036854775807,
+    );
+    let untouched = b"?";
+    assert_equal(
+        testing::expect_ok(handle.read(untouched.as_mut_slice()), "seek beyond EOF read"),
+        0,
+    );
+    assert_equal(untouched, b"?");
+    for delta in[1, -9223372036854775807 - 1] {
+        memory_handle_io_cause(
+            testing::expect_err(
+                handle.seek(io::SeekFrom::Current(delta)),
+                "maximum position checked addition",
+            ),
+            io::ErrorKind::InvalidInput,
+            "file",
+        );
+        assert_equal(
+            testing::expect_ok(handle.seek(io::SeekFrom::Current(0)), "maximum preserved"),
+            9223372036854775807,
+        );
+    }
+    assert_equal(
+        testing::expect_ok(
+            handle.seek(io::SeekFrom::Current(-9223372036854775807)),
+            "seek back from maximum",
+        ),
+        0,
+    );
+    assert_equal(testing::expect_ok(handle.seek(io::SeekFrom::End(1)), "end beyond EOF"), 7);
+    testing::expect_ok(handle.close(), "seek handle close");
+}
+
+fn check_memory_handle_directories() -> () {
+    let source = memory_handle_fixture();
+    let handle = testing::expect_ok(source.open("dir"), "directory memory handle");
+    let alias = handle;
+    let other = testing::expect_ok(source.open("dir"), "independent directory handle");
+    for amount in[0, -1, -9223372036854775807 - 1] {
+        let error = testing::expect_err(handle.read_dir(amount), "invalid page amount");
+        assert_equal(error.entries().len(), 0);
+        assert_equal(error.error().kind(), io::ErrorKind::InvalidInput);
+        assert_equal(error.error().path(), Option::Some("dir"));
+    }
+    let first = testing::expect_ok(handle.read_dir(1), "first sorted directory page");
+    assert_equal(first.len(), 1);
+    assert_equal(first[0].name(), "a");
+    assert_equal(testing::expect_ok(alias.read_dir(1), "shared directory cursor")[0].name(), "m");
+    assert_equal(
+        testing::expect_ok(handle.stat(), "directory stat").file_type(),
+        fs::FileType::Directory,
+    );
+    let last = testing::expect_ok(handle.read_dir(9223372036854775807), "last directory page");
+    assert_equal(last.len(), 1);
+    assert_equal(last[0].name(), "z");
+    for _ in 0..2 {
+        assert_equal(testing::expect_ok(alias.read_dir(1), "repeat directory EOF").len(), 0);
+    }
+    let independent = testing::expect_ok(other.read_dir(2), "independent directory cursor");
+    assert_equal(independent.len(), 2);
+    assert_equal(independent[0].name(), "a");
+    assert_equal(independent[1].name(), "m");
+    testing::expect_ok(handle.close(), "close directory");
+    testing::expect_ok(alias.close(), "close directory alias");
+    assert_equal(first[0].name(), "a");
+    let metadata = testing::expect_ok(first[0].metadata(), "snapshot metadata survives close");
+    assert_equal(metadata.len(), 1);
+    assert_equal(metadata.file_type(), fs::FileType::File);
+    assert_equal(first[0].mode(), metadata.mode());
+    assert_equal(
+        testing::expect_ok(other.read_dir(1), "independent directory remains open")[0].name(),
+        "z",
+    );
+    testing::expect_ok(other.close(), "close independent directory");
+}
+
+fn check_memory_handle_kind_and_close() -> () {
+    let source = memory_handle_fixture();
+    for path in["dir", "special"] {
+        let handle = testing::expect_ok(source.open(path), "open non-file node");
+        let kind = if path == "dir" {
+            io::ErrorKind::InvalidInput
+        } else {
+            io::ErrorKind::Unsupported
+        };
+        let output = b"?";
+        memory_handle_io_cause(
+            testing::expect_err(handle.read(output.as_mut_slice()), "non-file read"),
+            kind,
+            path,
+        );
+        memory_handle_io_cause(
+            testing::expect_err(handle.read(b"".as_mut_slice()), "non-file empty read"),
+            kind,
+            path,
+        );
+        assert_equal(output, b"?");
+        let error = testing::expect_err(
+            handle.read_at(output.as_mut_slice(), 0),
+            "non-file read-at",
+        );
+        assert_equal(error.transferred(), 0.to_usize());
+        memory_handle_io_cause(error.error(), kind, path);
+        assert_equal(output, b"?");
+        memory_handle_io_cause(
+            testing::expect_err(handle.seek(io::SeekFrom::Start(0)), "non-file seek"),
+            kind,
+            path,
+        );
+        if path == "special" {
+            let metadata = testing::expect_ok(handle.stat(), "special metadata available");
+            assert_equal(metadata.mode().kind(), fs::NodeKind::NamedPipe);
+            assert_equal(metadata.mode().flags(), Option::None);
+            assert_equal(metadata.modified_unix_nanoseconds(), 123);
+            assert_equal(
+                testing::expect_err(handle.read_dir(1), "special directory operation").error().kind(),
+                io::ErrorKind::Unsupported,
+            );
+        } else {
+            assert_equal(
+                testing::expect_ok(
+                    handle.read_dir(1),
+                    "failed file operations leave directory cursor unchanged",
+                )[0].name(),
+                "a",
+            );
+        }
+        testing::expect_ok(handle.close(), "close non-file node");
+    }
+    let file = testing::expect_ok(source.open("file"), "file directory failure");
+    let error = testing::expect_err(file.read_dir(1), "file is not directory");
+    assert_equal(error.entries().len(), 0);
+    assert_equal(error.error().kind(), io::ErrorKind::InvalidInput);
+    assert_equal(
+        testing::expect_ok(
+            file.seek(io::SeekFrom::Current(0)),
+            "read-dir failure does not alter file cursor",
+        ),
+        0,
+    );
+    testing::expect_ok(file.close(), "close file after directory failure");
+    for path in["link", "dir", "special"] {
+        let handle = testing::expect_ok(source.open(path), "handle for closed checks");
+        testing::expect_ok(handle.close(), "initial close");
+        testing::expect_ok(handle.close(), "repeat close");
+        let output = b"?";
+        memory_handle_io_cause(
+            testing::expect_err(handle.read(output.as_mut_slice()), "closed read"),
+            io::ErrorKind::InvalidInput,
+            path,
+        );
+        memory_handle_io_cause(
+            testing::expect_err(handle.read(b"".as_mut_slice()), "closed empty read"),
+            io::ErrorKind::InvalidInput,
+            path,
+        );
+        assert_equal(output, b"?");
+        for offset in[-1, 0, 9223372036854775807] {
+            let error = testing::expect_err(
+                handle.read_at(output.as_mut_slice(), offset),
+                "closed read-at priority",
+            );
+            assert_equal(error.transferred(), 0.to_usize());
+            memory_handle_io_cause(error.error(), io::ErrorKind::InvalidInput, path);
+            assert_equal(error.error().message(), "memory handle is closed");
+            assert_equal(output, b"?");
+        }
+        memory_handle_io_cause(
+            testing::expect_err(handle.seek(io::SeekFrom::Start(-1)), "closed seek"),
+            io::ErrorKind::InvalidInput,
+            path,
+        );
+        let error = testing::expect_err(handle.stat(), "closed stat");
+        assert_equal(error.kind(), io::ErrorKind::InvalidInput);
+        assert_equal(error.path(), Option::Some(path));
+        for amount in[0, 1] {
+            let error = testing::expect_err(handle.read_dir(amount), "closed read-dir priority");
+            assert_equal(error.entries().len(), 0);
+            assert_equal(error.error().kind(), io::ErrorKind::InvalidInput);
+            assert_equal(error.error().path(), Option::Some(path));
+            assert_equal(error.error().message(), "memory handle is closed");
+        }
+    }
+}
+
+pub fn test_fs_memory_handle() -> () {
+    check_memory_handle_aliases();
+    check_memory_handle_read_at();
+    check_memory_handle_seek();
+    check_memory_handle_directories();
+    check_memory_handle_kind_and_close();
+}

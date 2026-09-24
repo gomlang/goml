@@ -1,0 +1,287 @@
+package main;
+
+use std::fs;
+use fs::{DirectoryEntry, File, FileSystem, ReadDirFile};
+use std::io;
+use io::{Read, Close};
+use std::panic;
+use std::testing;
+
+fn mode_flags(bits: isize) -> fs::ModeFlags {
+    fs::ModeFlags {
+        set_uid: bits & 1 != 0,
+        set_gid: bits & 2 != 0,
+        sticky: bits & 4 != 0,
+        append_only: bits & 8 != 0,
+        exclusive: bits & 16 != 0,
+        temporary: bits & 32 != 0,
+    }
+}
+
+fn mode_kinds() -> Vec[fs::NodeKind] {
+    Vec::from_array(
+        [
+            fs::NodeKind::File,
+            fs::NodeKind::Directory,
+            fs::NodeKind::Symlink,
+            fs::NodeKind::BlockDevice,
+            fs::NodeKind::CharacterDevice,
+            fs::NodeKind::NamedPipe,
+            fs::NodeKind::Socket,
+            fs::NodeKind::Irregular,
+            fs::NodeKind::Unknown,
+        ],
+    )
+}
+
+fn mode_legacy_kind(kind: fs::NodeKind) -> fs::FileType {
+    match kind {
+        File => fs::FileType::File,
+        Directory => fs::FileType::Directory,
+        Symlink => fs::FileType::Symlink,
+        BlockDevice | CharacterDevice | NamedPipe | Socket | Irregular | Unknown => fs::FileType::Other,
+    }
+}
+
+fn mode_kind_from_legacy(kind: fs::FileType) -> fs::NodeKind {
+    match kind {
+        File => fs::NodeKind::File,
+        Directory => fs::NodeKind::Directory,
+        Symlink => fs::NodeKind::Symlink,
+        Other => fs::NodeKind::Unknown,
+    }
+}
+
+fn check_mode_values() -> () {
+    let kinds = mode_kinds();
+    for index in 0..kinds.len() {
+        for other in 0..kinds.len() {
+            assert_equal(kinds[index] == kinds[other], index == other);
+        }
+        let kind = kinds[index];
+        let unknown = fs::FileMode::from_parts(kind, 0xffffffe4.to_u32(), Option::None);
+        assert_equal(unknown.kind(), kind);
+        assert_equal(unknown.permissions().mode(), 0o744.to_u32());
+        assert_equal(unknown.flags(), Option::None);
+        assert_equal(unknown.file_type(), mode_legacy_kind(kind));
+        testing::assert(unknown != fs::FileMode::new(kind, 0o744, mode_flags(0)));
+        assert_equal(
+            fs::FileMode::from_parts(kind, 0o744, Option::Some(mode_flags(63))),
+            fs::FileMode::new(kind, 0o744, mode_flags(63)),
+        );
+        let snapshot = fs::SnapshotEntry::new("unknown", fs::Metadata::from_mode(unknown, 1, 2));
+        assert_equal(snapshot.mode(), unknown);
+        assert_equal(
+            testing::expect_ok(snapshot.metadata(), "advanced kind with unknown flags").mode(),
+            unknown,
+        );
+        for permission in 0..512 {
+            let mode = fs::FileMode::new(kind, permission.to_u32(), mode_flags(0));
+            assert_equal(mode.kind(), kind);
+            assert_equal(mode.permissions().mode(), permission.to_u32());
+            assert_equal(mode.permissions().readonly(), permission & 0o222 == 0);
+            assert_equal(mode.flags(), Option::Some(mode_flags(0)));
+            assert_equal(mode.file_type(), mode_legacy_kind(kind));
+            assert_equal(
+                mode,
+                fs::FileMode::new(kind, permission.to_u32() | 0xfffffe00.to_u32(), mode_flags(0)),
+            );
+            let metadata = fs::Metadata::from_mode(mode, 123, -456);
+            assert_equal(metadata.mode(), mode);
+            assert_equal(metadata.file_type(), mode_legacy_kind(kind));
+            assert_equal(metadata.permissions().mode(), permission.to_u32());
+            assert_equal(metadata.len(), 123);
+            assert_equal(metadata.modified_unix_nanoseconds(), -456);
+        }
+    }
+    for bits in 0..64 {
+        let flags = mode_flags(bits);
+        assert_equal(flags.set_uid, bits & 1 != 0);
+        assert_equal(flags.set_gid, bits & 2 != 0);
+        assert_equal(flags.sticky, bits & 4 != 0);
+        assert_equal(flags.append_only, bits & 8 != 0);
+        assert_equal(flags.exclusive, bits & 16 != 0);
+        assert_equal(flags.temporary, bits & 32 != 0);
+        for other in 0..64 {
+            assert_equal(flags == mode_flags(other), bits == other);
+            assert_equal(
+                fs::FileMode::new(fs::NodeKind::Socket, 0o640, flags)
+                    == fs::FileMode::new(fs::NodeKind::Socket, 0o640, mode_flags(other)),
+                bits == other,
+            );
+        }
+        assert_equal(
+            fs::FileMode::new(fs::NodeKind::Socket, 0o640, flags).flags(),
+            Option::Some(flags),
+        );
+    }
+    let baseline = fs::FileMode::new(fs::NodeKind::File, 0o640, mode_flags(0));
+    testing::assert(baseline != fs::FileMode::new(fs::NodeKind::File, 0o641, mode_flags(0)));
+    testing::assert(baseline != fs::FileMode::new(fs::NodeKind::Directory, 0o640, mode_flags(0)));
+    testing::assert(baseline != fs::FileMode::from_file_type(fs::FileType::File, 0o640));
+    let all = fs::FileMode::new(fs::NodeKind::Irregular, 0xffffffff.to_u32(), mode_flags(63));
+    assert_equal(all.permissions().mode(), 0o777.to_u32());
+    assert_equal(all.flags(), Option::Some(mode_flags(63)));
+}
+
+fn check_mode_legacy_metadata() -> () {
+    for kind in[
+        fs::FileType::File,
+        fs::FileType::Directory,
+        fs::FileType::Symlink,
+        fs::FileType::Other,
+    ] {
+        for permissions in[0.to_u32(), 0o640.to_u32(), 0xffffffff.to_u32()] {
+            let mode = fs::FileMode::from_file_type(kind, permissions);
+            assert_equal(mode.kind(), mode_kind_from_legacy(kind));
+            assert_equal(mode.file_type(), kind);
+            assert_equal(mode.permissions().mode(), permissions & 0o777.to_u32());
+            assert_equal(mode.flags(), Option::None);
+            assert_equal(mode, fs::FileMode::from_file_type(kind, permissions & 0o777.to_u32()));
+            let metadata = fs::Metadata::from_parts(kind, -7, permissions, -9);
+            assert_equal(metadata.mode(), mode);
+            assert_equal(metadata.file_type(), kind);
+            assert_equal(metadata.permissions().mode(), permissions & 0o777.to_u32());
+            assert_equal(metadata.permissions().readonly(), permissions & 0o222.to_u32() == 0);
+            assert_equal(metadata.len(), -7);
+            assert_equal(metadata.modified_unix_nanoseconds(), -9);
+            testing::assert(
+                metadata.mode()
+                    != fs::FileMode::new(mode_kind_from_legacy(kind), permissions, mode_flags(0)),
+            );
+        }
+    }
+    for value in[-9223372036854775807 - 1, 9223372036854775807] {
+        let metadata = fs::Metadata::from_mode(
+            fs::FileMode::new(fs::NodeKind::BlockDevice, 0, mode_flags(1)),
+            value.to_i64(),
+            value.to_i64(),
+        );
+        assert_equal(metadata.len(), value.to_i64());
+        assert_equal(metadata.modified_unix_nanoseconds(), value.to_i64());
+    }
+}
+
+struct ModeSnapshotFs {
+    entries: Vec[fs::SnapshotEntry],
+    opens: Ref[isize],
+    closes: Ref[isize],
+}
+
+struct ModeSnapshotHandle {
+    source: ModeSnapshotFs,
+    position: Ref[isize],
+}
+
+impl FileSystem for ModeSnapshotFs {
+    type Handle = ModeSnapshotHandle;
+
+    fn open(self: ModeSnapshotFs, name: string) -> Result[ModeSnapshotHandle, fs::Error] {
+        self.opens.set(self.opens.get() + 1);
+        Result::Ok(ModeSnapshotHandle { source: self, position: Ref::new(0) })
+    }
+}
+
+impl Read for ModeSnapshotHandle {
+    fn read(self: ModeSnapshotHandle, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        panic::raise("snapshot listing must not read bytes")
+    }
+}
+
+impl Close for ModeSnapshotHandle {
+    fn close(self: ModeSnapshotHandle) -> Result[(), io::Error] {
+        self.source.closes.set(self.source.closes.get() + 1);
+        Result::Ok(())
+    }
+}
+
+impl File for ModeSnapshotHandle {
+    fn stat(self: ModeSnapshotHandle) -> Result[fs::Metadata, fs::Error] {
+        panic::raise("snapshot listing must not stat")
+    }
+}
+
+impl ReadDirFile for ModeSnapshotHandle {
+    type Entry = fs::SnapshotEntry;
+
+    fn read_dir(self: ModeSnapshotHandle, amount: isize) -> Result[
+        Vec[fs::SnapshotEntry],
+        fs::ReadDirError[fs::SnapshotEntry],
+    ] {
+        testing::assert(amount > 0);
+        let count = if self.source.entries.len() - self.position.get() < amount {
+            self.source.entries.len() - self.position.get()
+        } else {
+            amount
+        };
+        let entries = self.source.entries.slice(self.position.get(), self.position.get() + count).to_vec();
+        self.position.set(self.position.get() + count);
+        Result::Ok(entries)
+    }
+}
+
+fn check_mode_snapshot_entries() -> () {
+    let entries = Vec::new();
+    let kinds = mode_kinds();
+    for index in 0..kinds.len() {
+        let mode = fs::FileMode::new(kinds[index], 0o765, mode_flags(index));
+        let entry = fs::SnapshotEntry::new(
+            index.to_string(),
+            fs::Metadata::from_mode(mode, index.to_i64(), -index.to_i64()),
+        );
+        assert_equal(entry.name(), index.to_string());
+        assert_equal(entry.file_type(), mode_legacy_kind(kinds[index]));
+        assert_equal(entry.mode(), mode);
+        for _ in 0..3 {
+            let metadata = testing::expect_ok(entry.metadata(), "snapshot cached metadata");
+            assert_equal(metadata.mode(), mode);
+            assert_equal(metadata.len(), index.to_i64());
+            assert_equal(metadata.modified_unix_nanoseconds(), -index.to_i64());
+        }
+        entries.push(entry);
+    }
+    let provider = ModeSnapshotFs { entries, opens: Ref::new(0), closes: Ref::new(0) };
+    let result = testing::expect_ok(
+        fs::read_dir_from(provider, ".", 9),
+        "snapshot directory provider",
+    );
+    for index in 0..result.len() {
+        assert_equal(result[index].name(), index.to_string());
+        assert_equal(result[index].mode(), entries[index].mode());
+        assert_equal(
+            testing::expect_ok(result[index].metadata(), "listed snapshot metadata").mode(),
+            entries[index].mode(),
+        );
+    }
+    assert_equal(result.len(), 9);
+    assert_equal(provider.opens.get(), 1);
+    assert_equal(provider.closes.get(), 1);
+    for name in["", ".", "..", "a/b"] {
+        let mode = fs::FileMode::new(fs::NodeKind::CharacterDevice, 0o600, mode_flags(63));
+        let entry = fs::SnapshotEntry::new(name, fs::Metadata::from_mode(mode, 11, 12));
+        assert_equal(entry.name(), name);
+        assert_equal(entry.mode(), mode);
+        assert_equal(
+            testing::expect_ok(entry.metadata(), "unvalidated snapshot still holds metadata").mode(),
+            mode,
+        );
+        let provider = ModeSnapshotFs {
+            entries: Vec::from_array([entry]),
+            opens: Ref::new(0),
+            closes: Ref::new(0),
+        };
+        let error = testing::expect_err(
+            fs::read_dir_from(provider, ".", 1),
+            "collector validates snapshot name",
+        );
+        assert_equal(error.error().kind(), io::ErrorKind::InvalidData);
+        assert_equal(error.entries().len(), 0);
+        assert_equal(provider.closes.get(), 1);
+    }
+}
+
+fn check_fs_mode() -> () {
+    check_mode_values();
+    check_mode_legacy_metadata();
+    check_mode_snapshot_entries();
+}

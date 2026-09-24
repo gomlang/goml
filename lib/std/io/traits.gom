@@ -25,7 +25,6 @@ pub trait Read {
         while offset < buffer.len() {
             let count = match self.read(buffer.sub(offset, buffer.len())) {
                 Ok(count) => valid_count(count, buffer.len() - offset, "read exact")?,
-                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                 Err(error) => return Result::Err(error),
             };
             if count == 0 {
@@ -58,7 +57,6 @@ pub trait Read {
             };
             let count = match self.read(buffer.slice_mut(0, capacity)) {
                 Ok(count) => valid_count(count, capacity, "read to end")?,
-                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                 Err(error) => return Result::Err(error),
             };
             if count == 0 {
@@ -89,7 +87,6 @@ pub trait Write {
         while offset < buffer.len() {
             let count = match self.write(buffer.sub(offset, buffer.len())) {
                 Ok(count) => valid_count(count, buffer.len() - offset, "write all")?,
-                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                 Err(error) => return Result::Err(error),
             };
             if count == 0 {
@@ -107,9 +104,204 @@ pub trait Close {
     fn close(self: Self) -> Result[(), Error];
 }
 
+pub struct TransferError {
+    transferred_value: usize,
+    error_value: Error,
+}
+
+impl TransferError {
+    pub fn new(transferred: usize, error: Error) -> TransferError {
+        TransferError { transferred_value: transferred, error_value: error }
+    }
+
+    pub fn transferred(self: TransferError) -> usize {
+        self.transferred_value
+    }
+
+    pub fn error(self: TransferError) -> Error {
+        self.error_value
+    }
+}
+
+impl ToString for TransferError {
+    fn to_string(self: TransferError) -> string {
+        f"after {self.transferred_value} bytes: {self.error_value}"
+    }
+}
+
+impl Debug for TransferError {
+    fn debug(self: TransferError) -> string {
+        self.to_string()
+    }
+}
+
+pub fn read_at_least[R: Read](reader: R, buffer: MutSlice[byte], minimum: isize) -> Result[
+    isize,
+    TransferError,
+] {
+    if minimum < 0 || minimum > buffer.len() {
+        return Result::Err(
+            TransferError::new(
+                0,
+                stream_error(
+                    ErrorKind::InvalidInput,
+                    "read at least",
+                    "minimum exceeds buffer range",
+                ),
+            ),
+        )
+    }
+    let mut total = 0;
+    while total < minimum {
+        let count = match reader.read(buffer.sub(total, buffer.len())) {
+            Ok(count) => valid_count(count, buffer.len() - total, "read at least").map_err(
+                |error| TransferError::new(total.to_usize(), error),
+            )?,
+            Err(error) => return Result::Err(TransferError::new(total.to_usize(), error)),
+        };
+        if count == 0 {
+            return Result::Err(
+                TransferError::new(
+                    total.to_usize(),
+                    stream_error(
+                        ErrorKind::UnexpectedEof,
+                        "read at least",
+                        "stream ended before minimum",
+                    ),
+                ),
+            )
+        }
+        total += count;
+    }
+    Result::Ok(total)
+}
+
+fn positional_error(kind: ErrorKind, operation: string, message: string, count: isize) -> TransferError {
+    TransferError::new(count.to_usize(), stream_error(kind, operation, message))
+}
+
+fn check_at_range(offset: isize, length: isize, operation: string) -> Result[(), TransferError] {
+    if offset < 0 || length > 9223372036854775807 - offset {
+        Result::Err(
+            positional_error(ErrorKind::InvalidInput, operation, "invalid positional range", 0),
+        )
+    } else {
+        Result::Ok(())
+    }
+}
+
+fn complete_transfer(
+    result: Result[isize, TransferError],
+    length: isize,
+    operation: string,
+    short_kind: ErrorKind,
+) -> Result[(), TransferError] {
+    match result {
+        Result::Ok(count) => {
+            if count < 0 || count > length {
+                Result::Err(
+                    positional_error(
+                        ErrorKind::InvalidData,
+                        operation,
+                        "invalid byte count returned by stream",
+                        0,
+                    ),
+                )
+            } else if count != length {
+                Result::Err(
+                    positional_error(short_kind, operation, "incomplete positional transfer", count),
+                )
+            } else {
+                Result::Ok(())
+            }
+        },
+        Result::Err(error) => {
+            if error.transferred() > length.to_usize() {
+                Result::Err(
+                    positional_error(
+                        ErrorKind::InvalidData,
+                        operation,
+                        "invalid error progress returned by stream",
+                        0,
+                    ),
+                )
+            } else {
+                Result::Err(error)
+            }
+        },
+    }
+}
+
+pub trait ReadAt {
+    fn read_at(self: Self, buffer: MutSlice[byte], offset: isize) -> Result[isize, TransferError];
+    fn read_exact_at(self: Self, buffer: MutSlice[byte], offset: isize) -> Result[(), TransferError] {
+        check_at_range(offset, buffer.len(), "read exact at")?;
+        complete_transfer(
+            self.read_at(buffer, offset),
+            buffer.len(),
+            "read exact at",
+            ErrorKind::UnexpectedEof,
+        )
+    }
+}
+
+pub trait WriteAt {
+    fn write_at(self: Self, buffer: Slice[byte], offset: isize) -> Result[isize, TransferError];
+    fn write_all_at(self: Self, buffer: Slice[byte], offset: isize) -> Result[(), TransferError] {
+        check_at_range(offset, buffer.len(), "write all at")?;
+        complete_transfer(
+            self.write_at(buffer, offset),
+            buffer.len(),
+            "write all at",
+            ErrorKind::InvalidData,
+        )
+    }
+}
+
 pub trait BufRead: Read {
     fn fill_buf(self: Self) -> Result[Slice[byte], Error];
     fn consume(self: Self, amount: isize) -> Result[(), Error];
+    fn discard(self: Self, amount: isize) -> Result[isize, TransferError] {
+        if amount < 0 {
+            return Result::Err(
+                TransferError::new(
+                    0,
+                    stream_error(
+                        ErrorKind::InvalidInput,
+                        "discard buffer",
+                        "amount must be non-negative",
+                    ),
+                ),
+            )
+        }
+        let mut discarded = 0;
+        while discarded < amount {
+            let buffer = self.fill_buf().map_err(
+                |error| TransferError::new(discarded.to_usize(), error),
+            )?;
+            if buffer.len() == 0 {
+                return Result::Err(
+                    TransferError::new(
+                        discarded.to_usize(),
+                        stream_error(
+                            ErrorKind::UnexpectedEof,
+                            "discard buffer",
+                            "stream ended before requested amount",
+                        ),
+                    ),
+                )
+            }
+            let remaining = amount - discarded;
+            let count = if buffer.len() < remaining {
+                buffer.len()
+            } else {
+                remaining
+            };
+            self.consume(count).map_err(|error| TransferError::new(discarded.to_usize(), error))?;
+            discarded += count;
+        }
+        Result::Ok(discarded)
+    }
     fn read_until(self: Self, delimiter: byte, limit: isize) -> Result[bytes::Bytes, Error] {
         if limit < 0 {
             return Result::Err(
@@ -172,20 +364,46 @@ fn byte_buffer(length: isize) -> bytes::Bytes {
 
 pub fn copy[R: Read, W: Write](reader: R, writer: W) -> Result[u64, Error] {
     let buffer = byte_buffer(8192);
+    copy_buffer(reader, writer, buffer.as_mut_slice())
+}
+
+pub fn copy_buffer[R: Read, W: Write](reader: R, writer: W, buffer: MutSlice[byte]) -> Result[
+    u64,
+    Error,
+] {
+    if buffer.len() == 0 {
+        return Result::Err(
+            stream_error(ErrorKind::InvalidInput, "copy buffer", "buffer must not be empty"),
+        )
+    }
     let mut total: u64 = 0;
     loop {
-        let count = match reader.read(buffer.as_mut_slice()) {
+        let count = match reader.read(buffer) {
             Ok(count) => valid_count(count, buffer.len(), "copy")?,
-            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
             Err(error) => return Result::Err(error),
         };
         if count == 0 {
             return Result::Ok(total)
         }
-        writer.write_all(buffer.slice(0, count))?;
+        writer.write_all(buffer.as_slice().sub(0, count))?;
         if total > 18446744073709551615 - count.to_u64() {
             return Result::Err(stream_error(ErrorKind::InvalidData, "copy", "byte count overflow"))
         }
         total += count.to_u64();
+    }
+}
+
+pub fn copy_n[R: Read, W: Write](reader: R, writer: W, count: isize) -> Result[u64, Error] {
+    let limited = Take::new(reader, count)?;
+    if count == 0 {
+        return Result::Ok(0)
+    }
+    let transferred = copy(limited, writer)?;
+    if transferred != count.to_u64() {
+        Result::Err(
+            stream_error(ErrorKind::UnexpectedEof, "copy n", "input ended before requested count"),
+        )
+    } else {
+        Result::Ok(transferred)
     }
 }

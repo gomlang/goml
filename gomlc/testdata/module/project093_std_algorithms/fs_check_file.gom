@@ -1,0 +1,317 @@
+package main;
+
+use std::bytes;
+use std::fs;
+use fs::{File, FileSystem, ReadDirFile};
+use std::io;
+use io::{Read, Close};
+use std::testing;
+use std::testing::fs as memory;
+
+struct CheckFileProbe {
+    source: memory::MemoryFS,
+    mode: isize,
+    opened: Ref[isize],
+    closed: Ref[isize],
+    duplicate_closes: Ref[isize],
+    file_opens: Ref[isize],
+    shared: Ref[Option[memory::MemoryHandle]],
+}
+
+struct CheckFileProbeHandle {
+    owner: CheckFileProbe,
+    handle: memory::MemoryHandle,
+    is_file: bool,
+    closed: Ref[bool],
+}
+
+fn check_file_probe(mode: isize, content: string) -> CheckFileProbe {
+    let source = testing::expect_ok(
+        memory::MemoryFS::new(
+            Vec::from_array([memory::MemoryNode::file("data", bytes::Bytes::from_string(content))]),
+            memory::MemoryLimits {
+                max_nodes: 10,
+                max_data_bytes: 10000,
+                max_path_bytes: 100,
+                max_depth: 10,
+                max_link_hops: 10,
+                max_resolve_work: 1000,
+            },
+        ),
+        "file-check provider tree",
+    );
+    CheckFileProbe {
+        source,
+        mode,
+        opened: Ref::new(0),
+        closed: Ref::new(0),
+        duplicate_closes: Ref::new(0),
+        file_opens: Ref::new(0),
+        shared: Ref::new(Option::None),
+    }
+}
+
+fn check_file_probe_limits() -> memory::CheckLimits {
+    memory::CheckLimits {
+        max_nodes: 10,
+        max_depth: 10,
+        max_directory_entries: 10,
+        max_file_bytes: 1000,
+        max_total_read_bytes: 10000,
+        max_provider_calls: 10000,
+        max_issues: 100,
+        max_path_bytes: 100,
+    }
+}
+
+impl FileSystem for CheckFileProbe {
+    type Handle = CheckFileProbeHandle;
+
+    fn open(self: CheckFileProbe, name: string) -> Result[CheckFileProbeHandle, fs::Error] {
+        let is_file = name == "data";
+        let handle = if self.mode == 4 && is_file && self.file_opens.get() >= 2 {
+            testing::expect_some(self.shared.get(), "shared cursor installed")
+        } else {
+            self.source.open(name)?
+        };
+        self.opened.set(self.opened.get() + 1);
+        if is_file {
+            self.file_opens.set(self.file_opens.get() + 1);
+            if self.mode == 4 && self.file_opens.get() == 2 {
+                self.shared.set(Option::Some(handle));
+            }
+        }
+        Result::Ok(CheckFileProbeHandle { owner: self, handle, is_file, closed: Ref::new(false) })
+    }
+}
+
+impl Close for CheckFileProbeHandle {
+    fn close(self: CheckFileProbeHandle) -> Result[(), io::Error] {
+        self.owner.closed.set(self.owner.closed.get() + 1);
+        if self.closed.get() {
+            self.owner.duplicate_closes.set(self.owner.duplicate_closes.get() + 1);
+        }
+        self.closed.set(true);
+        self.handle.close()
+    }
+}
+
+impl Read for CheckFileProbeHandle {
+    fn read(self: CheckFileProbeHandle, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        if !self.is_file {
+            return self.handle.read(output)
+        }
+        if output.len() == 0 {
+            if self.owner.mode == 3 {
+                return Result::Ok(1)
+            }
+            if self.owner.mode == 7 {
+                let _ = self.handle.read(b"?".as_mut_slice())?;
+            }
+            return self.handle.read(output)
+        }
+        let requested = if self.owner.mode == 0 && output.len() > 3 {
+            3
+        } else {
+            output.len()
+        };
+        let count = self.handle.read(output.sub(0, requested))?;
+        if self.owner.mode == 1 {
+            return Result::Ok(-1)
+        }
+        if self.owner.mode == 2 {
+            return Result::Ok(output.len() + 1)
+        }
+        if self.owner.mode == 6 && count > 0 && output.len() > 17 {
+            output[0] = 255;
+        }
+        Result::Ok(count)
+    }
+}
+
+impl File for CheckFileProbeHandle {
+    fn stat(self: CheckFileProbeHandle) -> Result[fs::Metadata, fs::Error] {
+        if self.is_file && self.owner.mode == 5 {
+            let _ = self.handle.read(b"?".as_mut_slice()).map_err(
+                |error| fs::Error::new(
+                    error.kind(),
+                    error.operation(),
+                    error.context(),
+                    error.raw_os_code(),
+                    error.message(),
+                ),
+            )?;
+        }
+        self.handle.stat()
+    }
+}
+
+impl ReadDirFile for CheckFileProbeHandle {
+    type Entry = fs::SnapshotEntry;
+
+    fn read_dir(self: CheckFileProbeHandle, amount: isize) -> Result[
+        Vec[fs::SnapshotEntry],
+        fs::ReadDirError[fs::SnapshotEntry],
+    ] {
+        self.handle.read_dir(amount)
+    }
+}
+
+fn check_file_probe_run(provider: CheckFileProbe, limits: memory::CheckLimits) -> memory::CheckReport {
+    let report = testing::expect_ok(
+        memory::check_fs(
+            provider,
+            memory::ExpectedTree::Contains(Vec::from_array(["data"])),
+            limits,
+        ),
+        "file checker report",
+    );
+    assert_equal(provider.opened.get(), provider.closed.get());
+    assert_equal(provider.duplicate_closes.get(), 0);
+    assert_equal(report.cleanup_calls(), provider.closed.get());
+    report
+}
+
+fn check_file_probe_has_issue(report: memory::CheckReport, category: isize) -> bool {
+    for issue in report.issues() {
+        let actual = match issue.kind {
+            ContractViolation(_) => 0,
+            InconsistentSnapshot(_) => 1,
+            ProviderError(_) => 2,
+            ProviderPanic(_) => 3,
+        };
+        if actual == category && issue.path == "data" {
+            return true
+        }
+    }
+    false
+}
+
+fn check_file_probe_contracts() -> () {
+    let content = "abcdefghijklmnopqrst".repeat(10);
+    let short = check_file_probe(0, content);
+    let report = check_file_probe_run(short, check_file_probe_limits());
+    testing::assert(report.passed());
+    testing::assert(report.complete());
+    testing::assert(report.stop_reason().is_none());
+    assert_equal(report.issues().len(), 0);
+    assert_equal(report.read_bytes(), content.byte_len() * 2);
+    for mode in[1, 2, 3] {
+        let provider = check_file_probe(mode, content);
+        let report = check_file_probe_run(provider, check_file_probe_limits());
+        testing::assert(!report.passed());
+        testing::assert(!report.complete());
+        testing::assert(check_file_probe_has_issue(report, 0));
+        testing::assert(!check_file_probe_has_issue(report, 2));
+        testing::assert(!check_file_probe_has_issue(report, 3));
+        testing::assert(report.stop_reason().is_none());
+        assert_equal(report.read_bytes(), 0);
+    }
+    for mode in[4, 5, 6, 7] {
+        let provider = check_file_probe(mode, content);
+        let report = check_file_probe_run(provider, check_file_probe_limits());
+        testing::assert(!report.passed());
+        testing::assert(!report.complete());
+        testing::assert(check_file_probe_has_issue(report, 1));
+        testing::assert(!check_file_probe_has_issue(report, 0));
+        testing::assert(!check_file_probe_has_issue(report, 2));
+        testing::assert(!check_file_probe_has_issue(report, 3));
+        testing::assert(report.stop_reason().is_none());
+    }
+}
+
+fn check_file_probe_byte_budgets() -> () {
+    for total in[0, 11, 12, 13] {
+        let provider = check_file_probe(8, "abcdef");
+        let report = check_file_probe_run(
+            provider,
+            memory::CheckLimits {
+                max_file_bytes: 6,
+                max_total_read_bytes: total,
+                ..check_file_probe_limits(),
+            },
+        );
+        assert_equal(report.issues().len(), 0);
+        if total == 13 {
+            testing::assert(report.passed());
+            assert_equal(report.read_bytes(), 12);
+        } else {
+            testing::assert(!report.passed());
+            testing::assert(!report.complete());
+            assert_equal(report.read_bytes(), total);
+            match report.stop_reason() {
+                Some(memory::CheckStop::Budget(path, memory::CheckBudget::TotalReadBytes)) => assert_equal(
+                    path,
+                    "data",
+                ),
+                _ => testing::fail("missing total-read budget stop"),
+            }
+        }
+    }
+    for limit in[0, 5] {
+        let provider = check_file_probe(8, "abcdef");
+        let report = check_file_probe_run(
+            provider,
+            memory::CheckLimits { max_file_bytes: limit, ..check_file_probe_limits() },
+        );
+        testing::assert(!report.passed());
+        assert_equal(report.issues().len(), 0);
+        assert_equal(report.read_bytes(), limit + 1);
+        match report.stop_reason() {
+            Some(memory::CheckStop::Budget(path, memory::CheckBudget::FileBytes)) => assert_equal(
+                path,
+                "data",
+            ),
+            _ => testing::fail("missing file-size budget stop"),
+        }
+    }
+    for total in[0, 1] {
+        let provider = check_file_probe(8, "");
+        let report = check_file_probe_run(
+            provider,
+            memory::CheckLimits {
+                max_file_bytes: 0,
+                max_total_read_bytes: total,
+                ..check_file_probe_limits(),
+            },
+        );
+        assert_equal(report.read_bytes(), 0);
+        assert_equal(report.issues().len(), 0);
+        assert_equal(report.passed(), total == 1);
+        if total == 0 {
+            match report.stop_reason() {
+                Some(memory::CheckStop::Budget(_, memory::CheckBudget::TotalReadBytes)) => (),
+                _ => testing::fail("zero allowance cannot certify empty file EOF"),
+            }
+        }
+    }
+}
+
+fn check_file_probe_call_budgets() -> () {
+    let baseline = check_file_probe_run(check_file_probe(8, "abcdef"), check_file_probe_limits());
+    testing::assert(baseline.passed());
+    for delta in[0, 1] {
+        let limit = baseline.provider_calls() - delta;
+        let report = check_file_probe_run(
+            check_file_probe(8, "abcdef"),
+            memory::CheckLimits { max_provider_calls: limit, ..check_file_probe_limits() },
+        );
+        assert_equal(report.provider_calls(), limit);
+        assert_equal(report.issues().len(), 0);
+        if delta == 0 {
+            testing::assert(report.passed());
+        } else {
+            testing::assert(!report.passed());
+            match report.stop_reason() {
+                Some(memory::CheckStop::Budget(_, memory::CheckBudget::ProviderCalls)) => (),
+                _ => testing::fail("missing exact provider-call stop"),
+            }
+        }
+    }
+}
+
+pub fn test_fs_check_file() -> () {
+    check_file_probe_contracts();
+    check_file_probe_byte_budgets();
+    check_file_probe_call_budgets();
+}

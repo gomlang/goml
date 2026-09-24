@@ -12,8 +12,10 @@ make:
 
 make-tools: make
 
+[positional-arguments]
 test: make-tools
     cd tools/goml-go-meta && go test ./...
+    cd lib/cabi && CGO_ENABLED=0 go test -gcflags=all=-d=checkptr=2 ./...
     bash tools/lib/install.sh _artifact/gomlc-test/test
     cd gomlc && GOML_TEST_GOML=../stage2/bin/goml GOML_TEST_GOMLC=../stage2/bin/gomlc GOML_TEST_COMPILER_WORLD=../stage2/lib/compiler/compiler-world-v2.gaf ../stage2/bin/goml test --target-dir ../_artifact/gomlc-test --compiler ../stage2/bin/gomlc --jobs 16 --timeout 10m
     cd goml && GOML_TEST_GOML=../stage2/bin/goml GOML_TEST_GOMLC=../stage2/bin/gomlc ../stage2/bin/goml test --compiler ../stage2/bin/gomlc --jobs 16 --timeout 10m
@@ -117,11 +119,14 @@ bootstrap:
     just _bootstrap-stage3
 
 _ci-scripts:
+    go run tools/generate_unicode_tables.go --check
+    python3 tools/generate_unicode_casefold.py --check
     python3 tools/syscall/generate.py --check
     python3 tools/syscall/layouts.py --check --verify-headers
     bash -n tools/release/release.sh tools/release/test.sh tools/release/package.sh tools/release/smoke.sh tools/release/lsp_smoke.sh
     bash -n tools/lib/install.sh tools/lib/test.sh tools/lib/finalize-toolchain.sh tools/goml-go-meta/build.sh
     cd tools/goml-go-meta && go test -race ./...
+    cd lib/cabi && CGO_ENABLED=0 go test -gcflags=all=-d=checkptr=2 ./...
     bash tools/release/test.sh
     bash tools/lib/test.sh stage2
     bash tools/release/release.sh check-version "$(cat VERSION)"
@@ -184,6 +189,7 @@ install: make-tools
     cp stage2/bin/gomlfmt "${GOML_HOME:-$HOME/.goml}/bin/gomlfmt"
     cp stage2/bin/gomllsp "${GOML_HOME:-$HOME/.goml}/bin/gomllsp"
     cp stage2/bin/goml-go-meta "${GOML_HOME:-$HOME/.goml}/bin/goml-go-meta"
+    cp stage2/bin/goml-c-bind "${GOML_HOME:-$HOME/.goml}/bin/goml-c-bind"
     bash tools/lib/install.sh "${GOML_HOME:-$HOME/.goml}"
     bash tools/lib/finalize-toolchain.sh "${GOML_HOME:-$HOME/.goml}" "${GOML_HOME:-$HOME/.goml}/bin/goml" "${GOML_HOME:-$HOME/.goml}/bin/gomlc"
 

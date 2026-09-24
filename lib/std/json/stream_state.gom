@@ -1,0 +1,306 @@
+package json;
+
+use module::io;
+
+fn stream_session(direction: StreamDirection) -> StreamSession {
+    StreamSession {
+        first_error: Ref::new(Option::None),
+        active: Ref::new(false),
+        generation: Ref::new(0),
+        events: Ref::new(0),
+        offset: Ref::new(0),
+        read: Ref::new(0),
+        written: Ref::new(0),
+        path: Vec::new(),
+        path_bytes: Ref::new(0),
+        direction,
+    }
+}
+
+fn stream_path_snapshot(path: Vec[PathSegment]) -> Vec[PathSegment] {
+    let snapshot = Vec::with_capacity(path.len());
+    for segment in path {
+        snapshot.push(segment);
+    }
+    snapshot
+}
+
+fn stream_materialize_error(session: StreamSession, failure: FailureDescriptor) -> Error {
+    let offset = match session.direction {
+        Decode => failure.offset,
+        Encode => session.written.get(),
+    };
+    Error {
+        kind_value: failure.kind,
+        offset_value: offset,
+        path_value: failure.path,
+        message_value: failure.message,
+        cause_value: failure.cause,
+        read_value: session.read.get().to_usize(),
+        written_value: session.written.get().to_usize(),
+    }
+}
+
+fn stream_error(session: StreamSession) -> Option[Error] {
+    session.first_error.get().map(|failure| stream_materialize_error(session, failure))
+}
+
+fn stream_fail_at(
+    session: StreamSession,
+    kind: ErrorKind,
+    message: string,
+    cause: Option[io::Error],
+    offset: isize,
+    path: Vec[PathSegment],
+) -> Error {
+    let failure = match session.first_error.get() {
+        Some(failure) => failure,
+        None => {
+            let failure = FailureDescriptor {
+                kind,
+                offset,
+                path: stream_path_snapshot(path),
+                message,
+                cause,
+            };
+            session.first_error.set(Option::Some(failure));
+            failure
+        },
+    };
+    stream_materialize_error(session, failure)
+}
+
+fn stream_fail(session: StreamSession, kind: ErrorKind, message: string, cause: Option[io::Error]) -> Error {
+    stream_fail_at(session, kind, message, cause, session.offset.get(), session.path)
+}
+
+fn stream_enter(session: StreamSession, max_events: isize) -> Result[StreamLease, Error] {
+    if let Some(error) = stream_error(session) {
+        return Result::Err(error)
+    }
+    if session.active.get() {
+        return Result::Err(
+            stream_fail(session, ErrorKind::State, "reentrant JSON operation", Option::None),
+        )
+    }
+    if max_events < 0 {
+        return Result::Err(
+            stream_fail(
+                session,
+                ErrorKind::InvalidLimit,
+                "max_events must be non-negative",
+                Option::None,
+            ),
+        )
+    }
+    if session.generation.get() == 9223372036854775807 {
+        return Result::Err(
+            stream_fail(
+                session,
+                ErrorKind::State,
+                "JSON operation generation overflows isize",
+                Option::None,
+            ),
+        )
+    }
+    let generation = session.generation.get() + 1;
+    session.generation.set(generation);
+    session.events.set(0);
+    session.active.set(true);
+    Result::Ok(StreamLease { session, generation, max_events })
+}
+
+fn stream_check(lease: StreamLease) -> Result[(), Error] {
+    if let Some(error) = stream_error(lease.session) {
+        return Result::Err(error)
+    }
+    if !lease.session.active.get() || lease.session.generation.get() != lease.generation {
+        return Result::Err(
+            stream_fail(lease.session, ErrorKind::State, "expired JSON operation", Option::None),
+        )
+    }
+    Result::Ok(())
+}
+
+fn stream_event(lease: StreamLease, max_events: isize) -> Result[(), Error] {
+    stream_check(lease)?;
+    if max_events != lease.max_events {
+        return Result::Err(
+            stream_fail(
+                lease.session,
+                ErrorKind::State,
+                "JSON event allowance changed during operation",
+                Option::None,
+            ),
+        )
+    }
+    if lease.session.events.get() >= lease.max_events {
+        return Result::Err(
+            stream_fail(
+                lease.session,
+                ErrorKind::Limit(LimitKind::Events),
+                "JSON event limit exceeded",
+                Option::None,
+            ),
+        )
+    }
+    lease.session.events.set(lease.session.events.get() + 1);
+    Result::Ok(())
+}
+
+fn stream_leave(lease: StreamLease, completed: bool) -> () {
+    if lease.session.active.get() && lease.session.generation.get() == lease.generation {
+        if !completed {
+            let _ = stream_fail(
+                lease.session,
+                ErrorKind::State,
+                "JSON operation did not complete",
+                Option::None,
+            );
+        }
+        lease.session.active.set(false);
+    }
+}
+
+fn stream_path_segment_bytes(segment: PathSegment) -> Option[isize] {
+    match segment {
+        Field(name) | Variant(name) => Option::Some(name.byte_len()),
+        Index(index) => {
+            if index < 0 {
+                return Option::None
+            }
+            let mut value = index;
+            let mut digits = 1;
+            while value >= 10 {
+                value /= 10;
+                digits += 1;
+            }
+            Option::Some(digits)
+        },
+    }
+}
+
+fn stream_push_path(lease: StreamLease, segment: PathSegment, max_path_bytes: isize) -> Result[
+    (),
+    Error,
+] {
+    stream_check(lease)?;
+    if max_path_bytes < 0 {
+        return Result::Err(
+            stream_fail(
+                lease.session,
+                ErrorKind::InvalidLimit,
+                "max_path_bytes must be non-negative",
+                Option::None,
+            ),
+        )
+    }
+    let Some(amount) = stream_path_segment_bytes(segment) else {
+        return Result::Err(
+            stream_fail(lease.session, ErrorKind::State, "negative JSON path index", Option::None),
+        )
+    };
+    let used = lease.session.path_bytes.get();
+    if used > max_path_bytes || amount > max_path_bytes - used {
+        return Result::Err(
+            stream_fail(
+                lease.session,
+                ErrorKind::Limit(LimitKind::PathBytes),
+                "JSON path byte limit exceeded",
+                Option::None,
+            ),
+        )
+    }
+    lease.session.path.push(segment);
+    lease.session.path_bytes.set(used + amount);
+    Result::Ok(())
+}
+
+fn stream_pop_path(lease: StreamLease) -> () {
+    if !lease.session.active.get() || lease.session.generation.get() != lease.generation {
+        let _ = stream_fail(lease.session, ErrorKind::State, "expired JSON operation", Option::None);
+        return
+    }
+    if let Some(segment) = lease.session.path.pop() {
+        if let Some(amount) = stream_path_segment_bytes(segment) {
+            let used = lease.session.path_bytes.get();
+            if amount <= used {
+                lease.session.path_bytes.set(used - amount);
+            } else {
+                let _ = stream_fail(
+                    lease.session,
+                    ErrorKind::State,
+                    "invalid JSON path accounting",
+                    Option::None,
+                );
+            }
+        }
+    } else {
+        let _ = stream_fail(
+            lease.session,
+            ErrorKind::State,
+            "JSON path stack is empty",
+            Option::None,
+        );
+    }
+}
+
+fn stream_serde_fail(lease: StreamLease, message: string) -> string {
+    if let Err(error) = stream_check(lease) {
+        return error.to_string()
+    }
+    stream_fail(lease.session, ErrorKind::Schema, message, Option::None).to_string()
+}
+
+fn stream_validate_decode_limits(limits: DecodeLimits) -> Result[(), Error] {
+    for (name, amount) in[
+        ("max_input_bytes", limits.max_input_bytes),
+        ("max_value_bytes", limits.max_value_bytes),
+        ("max_depth", limits.max_depth),
+        ("max_values", limits.max_values),
+        ("max_string_bytes", limits.max_string_bytes),
+        ("max_number_bytes", limits.max_number_bytes),
+        ("max_container_entries", limits.max_container_entries),
+        ("max_path_bytes", limits.max_path_bytes),
+        ("max_serde_frames", limits.max_serde_frames),
+        ("max_events", limits.max_events),
+    ] {
+        if amount < 0 {
+            return Result::Err(
+                stream_fail(
+                    stream_session(StreamDirection::Decode),
+                    ErrorKind::InvalidLimit,
+                    name + " must be non-negative",
+                    Option::None,
+                ),
+            )
+        }
+    }
+    Result::Ok(())
+}
+
+fn stream_validate_encode_limits(limits: EncodeLimits) -> Result[(), Error] {
+    for (name, amount) in[
+        ("max_output_bytes", limits.max_output_bytes),
+        ("max_depth", limits.max_depth),
+        ("max_values", limits.max_values),
+        ("max_string_bytes", limits.max_string_bytes),
+        ("max_number_bytes", limits.max_number_bytes),
+        ("max_container_entries", limits.max_container_entries),
+        ("max_path_bytes", limits.max_path_bytes),
+        ("max_serde_frames", limits.max_serde_frames),
+        ("max_events", limits.max_events),
+    ] {
+        if amount < 0 {
+            return Result::Err(
+                stream_fail(
+                    stream_session(StreamDirection::Encode),
+                    ErrorKind::InvalidLimit,
+                    name + " must be non-negative",
+                    Option::None,
+                ),
+            )
+        }
+    }
+    Result::Ok(())
+}

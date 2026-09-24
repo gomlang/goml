@@ -1,0 +1,196 @@
+package main;
+
+use std::bytes;
+use std::encoding::hex;
+use std::ffi;
+use std::hash;
+use hash::Hasher;
+use std::hash::adler32;
+use std::hash::crc32;
+use std::hash::crc64;
+use std::hash::fnv;
+use std::rand;
+use std::testing;
+
+const CRC64_CHECK: u64 = 0x995dc9bbdf1939fa;
+
+#[go_ffi("hash/adler32", "Checksum")]
+extern fn go_adler32(input: Slice[byte]) -> u32;
+
+#[go_type("hash/crc32", "Table")]
+extern type GoCrc32Table;
+
+#[go_ffi("hash/crc32", "MakeTable")]
+extern fn go_crc32_table(polynomial: u32) -> ffi::Ptr[GoCrc32Table];
+
+#[go_ffi("hash/crc32", "Checksum")]
+extern fn go_crc32(input: Slice[byte], table: ffi::Ptr[GoCrc32Table]) -> u32;
+
+#[go_ffi("hash/crc32", "Update")]
+extern fn go_crc32_update(previous: u32, table: ffi::Ptr[GoCrc32Table], input: Slice[byte]) -> u32;
+
+#[go_type("hash/crc64", "Table")]
+extern type GoCrc64Table;
+
+#[go_ffi("hash/crc64", "MakeTable")]
+extern fn go_crc64_table(polynomial: u64) -> ffi::Ptr[GoCrc64Table];
+
+#[go_ffi("hash/crc64", "Checksum")]
+extern fn go_crc64(input: Slice[byte], table: ffi::Ptr[GoCrc64Table]) -> u64;
+
+#[go_ffi("hash/crc64", "Update")]
+extern fn go_crc64_update(previous: u64, table: ffi::Ptr[GoCrc64Table], input: Slice[byte]) -> u64;
+
+fn check_digest[H: Hasher](digest: H, input: bytes::Bytes, expected: bytes::Bytes) -> () {
+    assert_equal(digest.size(), expected.len());
+    assert_equal(digest.block_size(), 1);
+    let empty = digest.sum().to_vec_copy();
+    let alias = digest;
+    let mut start = 0;
+    while start < input.len() {
+        let remaining = input.len() - start;
+        let count = if remaining < 7 {
+            remaining
+        } else {
+            7
+        };
+        alias.update(input.slice(start, start + count));
+        start += count;
+    }
+    assert_equal(digest.sum().to_vec(), expected.to_vec());
+    let snapshot = digest.sum();
+    if !snapshot.is_empty() {
+        snapshot.set(0, snapshot.get(0) ^ 255);
+    }
+    assert_equal(digest.sum().to_vec(), expected.to_vec());
+    digest.update(bytes::Bytes::new().as_slice());
+    assert_equal(digest.sum().to_vec(), expected.to_vec());
+    digest.reset();
+    assert_equal(digest.sum().to_vec(), empty);
+    digest.update(input.as_slice());
+    assert_equal(digest.sum().to_vec(), expected.to_vec());
+}
+
+fn sum_bytes(value: u64, width: isize) -> bytes::Bytes {
+    let output = bytes::Bytes::new();
+    for index in 0..width {
+        output.push((value >> ((width - 1 - index) * 8)).to_u8())
+    }
+    output
+}
+
+fn check_checksums() -> () {
+    check_fnv_known_answers();
+    let maximum_bytes = filled_bytes(255, 65536);
+    assert_equal(adler32::checksum(maximum_bytes.as_slice()), go_adler32(maximum_bytes.as_slice()));
+    for split in[0, 1, 5551, 5552, 5553, 11104, 65535, 65536] {
+        let previous = adler32::checksum(maximum_bytes.slice(0, split));
+        assert_equal(
+            adler32::update(previous, maximum_bytes.slice(split, maximum_bytes.len())),
+            go_adler32(maximum_bytes.as_slice()),
+        );
+    }
+    let known = bytes::Bytes::from_string("123456789");
+    assert_equal(adler32::checksum(known.as_slice()), 0x091e01de.to_u32());
+    assert_equal(
+        crc32::checksum(known.as_slice(), crc32::Table::new(crc32::IEEE)),
+        0xcbf43926.to_u32(),
+    );
+    assert_equal(crc64::checksum(known.as_slice(), crc64::Table::new(crc64::ECMA)), CRC64_CHECK);
+    for length in Vec::from_array([0, 1, 2, 7, 31, 255, 256, 5551, 5552, 5553, 11104, 65536]) {
+        let input = bytes::Bytes::from_vec(rand::bytes(length.to_u64(), length));
+        let sum = go_adler32(input.as_slice());
+        assert_equal(adler32::checksum(input.as_slice()), sum);
+        let middle = input.len() / 2;
+        assert_equal(
+            adler32::update(
+                adler32::checksum(input.slice(0, middle)),
+                input.slice(middle, input.len()),
+            ),
+            sum,
+        );
+        check_digest(adler32::Digest::new(), input, sum_bytes(sum.to_u64(), 4));
+        for polynomial in Vec::from_array(
+            [crc32::IEEE, crc32::CASTAGNOLI, crc32::KOOPMAN, 0.to_u32(), 1.to_u32()],
+        ) {
+            let table = crc32::Table::new(polynomial);
+            let expected = go_crc32(input.as_slice(), go_crc32_table(polynomial));
+            assert_equal(crc32::checksum(input.as_slice(), table), expected);
+            for previous in[0.to_u32(), 1.to_u32(), 0xffffffff.to_u32(), 0x12345678.to_u32()] {
+                let continued = crc32::update(previous, table, input.as_slice());
+                assert_equal(
+                    continued,
+                    go_crc32_update(previous, go_crc32_table(polynomial), input.as_slice()),
+                );
+                assert_equal(
+                    crc32::update(
+                        crc32::update(previous, table, input.slice(0, middle)),
+                        table,
+                        input.slice(middle, input.len()),
+                    ),
+                    continued,
+                );
+            }
+            check_digest(crc32::Digest::new(table), input, sum_bytes(expected.to_u64(), 4));
+            let original = crc32::Digest::new(table);
+            original.update(input.slice(0, middle));
+            let copy = original.copy();
+            original.reset();
+            assert_equal(copy.sum32(), crc32::checksum(input.slice(0, middle), table));
+            copy.update(input.slice(middle, input.len()));
+            assert_equal(copy.sum32(), expected);
+            assert_equal(original.sum32(), 0.to_u32());
+        }
+        for polynomial in Vec::from_array([crc64::ISO, crc64::ECMA, 0.to_u64(), 1.to_u64()]) {
+            let table = crc64::Table::new(polynomial);
+            let expected = go_crc64(input.as_slice(), go_crc64_table(polynomial));
+            assert_equal(crc64::checksum(input.as_slice(), table), expected);
+            for previous in[0.to_u64(), 1.to_u64(), 0xffffffffffffffff, 0x123456789abcdef0] {
+                let continued = crc64::update(previous, table, input.as_slice());
+                assert_equal(
+                    continued,
+                    go_crc64_update(previous, go_crc64_table(polynomial), input.as_slice()),
+                );
+                assert_equal(
+                    crc64::update(
+                        crc64::update(previous, table, input.slice(0, middle)),
+                        table,
+                        input.slice(middle, input.len()),
+                    ),
+                    continued,
+                );
+            }
+            check_digest(crc64::Digest::new(table), input, sum_bytes(expected, 8));
+            let original = crc64::Digest::new(table);
+            original.update(input.slice(0, middle));
+            let copy = original.copy();
+            original.reset();
+            assert_equal(copy.sum64(), crc64::checksum(input.slice(0, middle), table));
+            copy.update(input.slice(middle, input.len()));
+            assert_equal(copy.sum64(), expected);
+            assert_equal(original.sum64(), 0.to_u64());
+        }
+        check_fnv(input);
+    }
+    let first = adler32::Digest::new();
+    first.update(known.slice(0, 3));
+    let copy = first.copy();
+    first.update(known.slice(3, known.len()));
+    assert_equal(copy.sum32(), adler32::checksum(known.slice(0, 3)));
+    let c32 = crc32::Digest::new(crc32::Table::new(crc32::IEEE));
+    c32.update(known.as_slice());
+    let c32_copy = c32.copy();
+    c32.reset();
+    assert_equal(c32_copy.sum32(), 0xcbf43926.to_u32());
+    let c64 = crc64::Digest::new(crc64::Table::new(crc64::ECMA));
+    c64.update(known.as_slice());
+    let c64_copy = c64.copy();
+    c64.reset();
+    assert_equal(c64_copy.sum64(), CRC64_CHECK);
+    let f = fnv::Digest::new128a();
+    f.update(known.as_slice());
+    let f_copy = f.copy();
+    let before = f.sum();
+    f.reset();
+    assert_equal(hex::encode(f_copy.sum()), hex::encode(before));
+}

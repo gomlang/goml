@@ -1,0 +1,283 @@
+package main;
+
+use std::bytes;
+use std::bytes::endian;
+use std::bytes::endian::stream;
+use std::io;
+use io::Read;
+use std::testing;
+
+struct FixedReader {
+    cursor: io::Cursor,
+    chunk: isize,
+    interrupted: Ref[bool],
+}
+
+impl Read for FixedReader {
+    fn read(self: FixedReader, buffer: MutSlice[byte]) -> Result[isize, io::Error] {
+        if self.interrupted.get() {
+            self.interrupted.set(false);
+            return Result::Err(
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "fixed reader",
+                    Option::None,
+                    Option::None,
+                    "retry",
+                ),
+            )
+        }
+        let length = if buffer.len() < self.chunk {
+            buffer.len()
+        } else {
+            self.chunk
+        };
+        self.cursor.read(buffer.sub(0, length))
+    }
+}
+
+fn check_fixed_value[T](
+    value: T,
+    width: isize,
+    order: endian::Endian,
+    encode: (CopyWriter, T) -> Result[(), io::Error],
+    decode: (FixedReader) -> Result[Option[T], stream::ReadError],
+    bits: (T) -> u64,
+) -> () {
+    let writer = CopyWriter {
+        cursor: io::Cursor::new(bytes::Bytes::new()),
+        interrupted: Ref::new(false),
+    };
+    testing::expect_ok(encode(writer, value), "fixed write");
+    let expected: Vec[byte] = Vec::new();
+    for index in 0..width {
+        let shift = match order {
+            endian::Endian::Little => index * 8,
+            endian::Endian::Big => (width - index - 1) * 8,
+        };
+        expected.push((bits(value) >> shift).to_u8());
+    }
+    assert_equal(writer.cursor.bytes().to_vec(), expected);
+    let encoded = writer.cursor.bytes();
+    encoded.push(42);
+    for chunk in 1..10 {
+        let reader = FixedReader {
+            cursor: io::Cursor::new(encoded),
+            chunk,
+            interrupted: Ref::new(false),
+        };
+        let decoded = testing::expect_some(
+            testing::expect_ok(decode(reader), "fixed read"),
+            "fixed value",
+        );
+        assert_equal(bits(decoded), bits(value));
+        assert_equal(reader.cursor.position(), width);
+        assert_equal(
+            testing::expect_ok(stream::read_u8(reader), "fixed tail"),
+            Option::Some(42.to_u8()),
+        );
+        testing::assert(testing::expect_ok(decode(reader), "fixed clean eof").is_none());
+    }
+    for length in 1..width {
+        let reader = FixedReader {
+            cursor: io::Cursor::new(bytes::Bytes::from_vec(expected.slice(0, length).to_vec())),
+            chunk: 1,
+            interrupted: Ref::new(false),
+        };
+        match decode(reader) {
+            Err(stream::ReadError::Io(error, count)) => {
+                assert_equal(error.kind(), io::ErrorKind::UnexpectedEof);
+                assert_equal(count, length);
+            },
+            _ => testing::assert(false),
+        }
+    }
+}
+
+struct CodecInterruptedRead {
+    cursor: io::Cursor,
+    calls: Ref[isize],
+    fail_on: isize,
+    error: io::Error,
+}
+
+impl Read for CodecInterruptedRead {
+    fn read(self: CodecInterruptedRead, buffer: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        let count = self.cursor.read(buffer.sub(0, 1))?;
+        if self.calls.get() == self.fail_on {
+            Result::Err(self.error)
+        } else {
+            Result::Ok(count)
+        }
+    }
+}
+
+fn codec_interrupted_reader(value: Vec[byte], fail_on: isize) -> CodecInterruptedRead {
+    CodecInterruptedRead {
+        cursor: io::Cursor::new(bytes::Bytes::from_vec(value)),
+        calls: Ref::new(0),
+        fail_on,
+        error: io::Error::new(
+            io::ErrorKind::Interrupted,
+            "codec read",
+            Option::Some("source"),
+            Option::Some(4),
+            "consumed before error",
+        ),
+    }
+}
+
+fn check_fixed_stream() -> () {
+    for fail_on in[1, 3] {
+        let reader = codec_interrupted_reader(b"abcdefgh", fail_on);
+        match stream::read_u64(reader, endian::Endian::Big) {
+            Err(stream::ReadError::Io(error, count)) => {
+                assert_equal(error, reader.error);
+                assert_equal(count, fail_on - 1);
+            },
+            _ => testing::fail("fixed read must stop at interruption"),
+        }
+        assert_equal(reader.calls.get(), fail_on);
+        assert_equal(reader.cursor.position(), fail_on);
+    }
+    let events = Vec::new();
+    let probe = multi_probe(events, 1, 0);
+    let interrupted = io::Error::new(
+        io::ErrorKind::Interrupted,
+        "fixed writer",
+        Option::None,
+        Option::None,
+        "stop",
+    );
+    probe.result.set(Result::Err(interrupted));
+    let writer = io::MultiWriter::new(Vec::from_array([probe]).as_slice());
+    match stream::write_u64(writer, 1, endian::Endian::Big) {
+        Err(error) => assert_equal(error, interrupted),
+        Ok(_) => testing::assert(false),
+    }
+    assert_equal(events.len(), 1);
+    let patterns: Vec[u64] = Vec::from_array(
+        [
+            0,
+            1,
+            72623859790382856,
+            9223372036854775808,
+            18446744073709551615,
+            9218868437227405312,
+            9221120237041090561,
+            2139095040,
+            2143289345,
+            2147483648,
+        ],
+    );
+    for order in[endian::Endian::Little, endian::Endian::Big] {
+        for pattern in patterns {
+            check_fixed_value(
+                pattern.to_u8(),
+                1,
+                order,
+                |writer: CopyWriter, value: u8| stream::write_u8(writer, value),
+                |reader: FixedReader| stream::read_u8(reader),
+                |value: u8| value.to_u64(),
+            );
+            check_fixed_value(
+                pattern.to_i8(),
+                1,
+                order,
+                |writer: CopyWriter, value: i8| stream::write_i8(writer, value),
+                |reader: FixedReader| stream::read_i8(reader),
+                |value: i8| value.to_u8().to_u64(),
+            );
+            check_fixed_value(
+                pattern.to_u16(),
+                2,
+                order,
+                |writer: CopyWriter, value: u16| stream::write_u16(writer, value, order),
+                |reader: FixedReader| stream::read_u16(reader, order),
+                |value: u16| value.to_u64(),
+            );
+            check_fixed_value(
+                pattern.to_i16(),
+                2,
+                order,
+                |writer: CopyWriter, value: i16| stream::write_i16(writer, value, order),
+                |reader: FixedReader| stream::read_i16(reader, order),
+                |value: i16| value.to_u16().to_u64(),
+            );
+            check_fixed_value(
+                pattern.to_u32(),
+                4,
+                order,
+                |writer: CopyWriter, value: u32| stream::write_u32(writer, value, order),
+                |reader: FixedReader| stream::read_u32(reader, order),
+                |value: u32| value.to_u64(),
+            );
+            check_fixed_value(
+                pattern.to_i32(),
+                4,
+                order,
+                |writer: CopyWriter, value: i32| stream::write_i32(writer, value, order),
+                |reader: FixedReader| stream::read_i32(reader, order),
+                |value: i32| value.to_u32().to_u64(),
+            );
+            check_fixed_value(
+                pattern,
+                8,
+                order,
+                |writer: CopyWriter, value: u64| stream::write_u64(writer, value, order),
+                |reader: FixedReader| stream::read_u64(reader, order),
+                |value: u64| value,
+            );
+            check_fixed_value(
+                pattern.to_i64(),
+                8,
+                order,
+                |writer: CopyWriter, value: i64| stream::write_i64(writer, value, order),
+                |reader: FixedReader| stream::read_i64(reader, order),
+                |value: i64| value.to_u64(),
+            );
+            check_fixed_value(
+                float32_from_bits(pattern.to_u32()),
+                4,
+                order,
+                |writer: CopyWriter, value: f32| stream::write_f32(writer, value, order),
+                |reader: FixedReader| stream::read_f32(reader, order),
+                |value: f32| value.to_bits().to_u64(),
+            );
+            check_fixed_value(
+                float64_from_bits(pattern),
+                8,
+                order,
+                |writer: CopyWriter, value: f64| stream::write_f64(writer, value, order),
+                |reader: FixedReader| stream::read_f64(reader, order),
+                |value: f64| value.to_bits(),
+            );
+        }
+    }
+    for count in[-1, 9] {
+        let probe = multi_probe(Vec::new(), 1, count);
+        match stream::read_u64(probe, endian::Endian::Big) {
+            Err(stream::ReadError::Io(error, progress)) => {
+                assert_equal(error.kind(), io::ErrorKind::InvalidData);
+                assert_equal(progress, 0);
+            },
+            _ => testing::assert(false),
+        }
+    }
+    let failure = io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "fixed source",
+        Option::None,
+        Option::None,
+        "stop",
+    );
+    let reader = VarintFailure { calls: Ref::new(0), error: failure };
+    match stream::read_u64(reader, endian::Endian::Little) {
+        Err(stream::ReadError::Io(error, count)) => {
+            assert_equal(error, failure);
+            assert_equal(count, 1);
+        },
+        _ => testing::assert(false),
+    }
+}

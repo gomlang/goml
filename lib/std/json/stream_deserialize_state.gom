@@ -1,0 +1,352 @@
+package json;
+
+use module::io;
+use module::num;
+
+#[derive(PartialEq)]
+enum StreamDeserializeKind {
+    Optional,
+    Sequence,
+    Tuple,
+    Map,
+    Struct,
+    Variant,
+}
+
+#[derive(PartialEq)]
+enum StreamDeserializeState {
+    Idle,
+    Ready,
+    Busy,
+    Entry,
+    Key,
+    KeyDone,
+}
+
+struct StreamDeserializeFrame {
+    kind: StreamDeserializeKind,
+    state: Ref[StreamDeserializeState],
+    index: Ref[isize],
+    length: Ref[isize],
+    done: Ref[bool],
+    tagged: bool,
+    variant_kind: Ref[isize],
+}
+
+struct StreamDeserializer[R] {
+    decoder: Decoder[R],
+    lease: StreamLease,
+    frames: Vec[StreamDeserializeFrame],
+    pending: Ref[Option[StreamTokenRecord]],
+    context: Ref[TokenRecord],
+    root_started: Ref[bool],
+    root_complete: Ref[bool],
+}
+
+fn stream_deserializer[R](decoder: Decoder[R], lease: StreamLease) -> StreamDeserializer[R] {
+    StreamDeserializer {
+        decoder,
+        lease,
+        frames: Vec::new(),
+        pending: Ref::new(Option::None),
+        context: Ref::new(
+            TokenRecord {
+                token: Token::Null,
+                start_offset: decoder.cursor.session.offset.get(),
+                path: stream_path_snapshot(decoder.cursor.session.path),
+            },
+        ),
+        root_started: Ref::new(false),
+        root_complete: Ref::new(false),
+    }
+}
+
+fn decode_schema[R](value: StreamDeserializer[R], message: string) -> Error {
+    let record = value.context.get();
+    stream_fail_at(
+        value.lease.session,
+        ErrorKind::Schema,
+        message,
+        Option::None,
+        record.start_offset,
+        record.path,
+    )
+}
+
+fn decode_event[R](value: StreamDeserializer[R]) -> Result[(), string] {
+    stream_event(value.lease, value.lease.max_events).map_err(|error| error.to_string())
+}
+
+fn decode_frame[R](value: StreamDeserializer[R], kind: StreamDeserializeKind) -> Result[
+    StreamDeserializeFrame,
+    Error,
+] {
+    stream_check(value.lease)?;
+    if value.frames.is_empty() {
+        return Result::Err(decode_schema(value, "JSON serde event has no active container"))
+    }
+    let frame = value.frames[value.frames.len() - 1];
+    if frame.kind != kind {
+        return Result::Err(decode_schema(value, "JSON serde event does not match its container"))
+    }
+    Result::Ok(frame)
+}
+
+fn decode_frame_limit[R](value: StreamDeserializer[R]) -> Result[(), Error] {
+    stream_check(value.lease)?;
+    if value.frames.len() >= value.decoder.cursor.limits.max_serde_frames {
+        return Result::Err(
+            stream_fail(
+                value.lease.session,
+                ErrorKind::Limit(LimitKind::SerdeFrames),
+                "JSON deserialization frame limit exceeded",
+                Option::None,
+            ),
+        )
+    }
+    Result::Ok(())
+}
+
+fn decode_new_frame(kind: StreamDeserializeKind, length: isize, tagged: bool) -> StreamDeserializeFrame {
+    StreamDeserializeFrame {
+        kind,
+        state: Ref::new(StreamDeserializeState::Idle),
+        index: Ref::new(0),
+        length: Ref::new(length),
+        done: Ref::new(false),
+        tagged,
+        variant_kind: Ref::new(-1),
+    }
+}
+
+fn decode_claim[R](value: StreamDeserializer[R]) -> Result[(), Error] {
+    stream_check(value.lease)?;
+    if value.frames.is_empty() {
+        if value.root_started.get() {
+            return Result::Err(
+                decode_schema(value, "JSON deserialization consumed multiple root values"),
+            )
+        }
+        value.root_started.set(true);
+    } else {
+        let frame = value.frames[value.frames.len() - 1];
+        if frame.state.get() != StreamDeserializeState::Ready {
+            return Result::Err(decode_schema(value, "JSON value is not expected here"))
+        }
+        frame.state.set(StreamDeserializeState::Busy);
+    }
+    Result::Ok(())
+}
+
+fn decode_completed[R](value: StreamDeserializer[R]) -> () {
+    if value.frames.is_empty() {
+        value.root_complete.set(true);
+    } else {
+        let frame = value.frames[value.frames.len() - 1];
+        frame.state.set(StreamDeserializeState::Idle);
+        if frame.kind != StreamDeserializeKind::Optional {
+            frame.index.set(frame.index.get() + 1);
+        }
+    }
+}
+
+fn decode_step[R: io::Read](value: StreamDeserializer[R], capture: bool) -> Result[
+    Option[StreamTokenRecord],
+    Error,
+] {
+    stream_check(value.lease)?;
+    let result = match value.pending.get() {
+        Some(record) => {
+            value.pending.set(Option::None);
+            Option::Some(record)
+        },
+        None => token_step(value.decoder.cursor, value.decoder.tokens, value.lease, capture)?,
+    };
+    if let Some(record) = result {
+        value.context.set(record.record);
+    }
+    Result::Ok(result)
+}
+
+fn decode_take[R: io::Read](value: StreamDeserializer[R]) -> Result[TokenRecord, Error] {
+    match decode_step(value, true)? {
+        Some(record) => Result::Ok(record.record),
+        None => Result::Err(
+            stream_fail(
+                value.lease.session,
+                ErrorKind::UnexpectedEof,
+                "expected JSON value",
+                Option::None,
+            ),
+        ),
+    }
+}
+
+fn decode_peek[R: io::Read](value: StreamDeserializer[R]) -> Result[TokenRecord, Error] {
+    stream_check(value.lease)?;
+    if let Some(record) = value.pending.get() {
+        return Result::Ok(record.record)
+    }
+    let record = decode_take(value)?;
+    value.pending.set(Option::Some(StreamTokenRecord { record, skipped: false }));
+    Result::Ok(record)
+}
+
+fn decode_expect[R: io::Read](value: StreamDeserializer[R], token: Token) -> Result[(), Error] {
+    let record = decode_take(value)?;
+    if record.token != token {
+        return Result::Err(decode_schema(value, "unexpected JSON value or container end"))
+    }
+    Result::Ok(())
+}
+
+fn decode_scalar[R: io::Read](value: StreamDeserializer[R]) -> Result[TokenRecord, Error] {
+    decode_claim(value)?;
+    let record = decode_take(value)?;
+    match record.token {
+        String(_) | Number(_) | Bool(_) | Null => {
+            decode_completed(value);
+            Result::Ok(record)
+        },
+        _ => Result::Err(decode_schema(value, "expected JSON scalar")),
+    }
+}
+
+fn decode_number[R: io::Read](value: StreamDeserializer[R]) -> Result[string, Error] {
+    match decode_scalar(value)?.token {
+        Number(number) => Result::Ok(number),
+        _ => Result::Err(decode_schema(value, "expected JSON number")),
+    }
+}
+
+fn decode_integer[R: io::Read](value: StreamDeserializer[R], width: isize) -> Result[i64, string] {
+    let number = decode_number(value).map_err(|error| error.to_string())?;
+    num::parse_int_bits(number, 10, width).map_err(
+        |error| decode_schema(value, error.to_string()).to_string(),
+    )
+}
+
+fn decode_unsigned[R: io::Read](value: StreamDeserializer[R], width: isize) -> Result[u64, string] {
+    let number = decode_number(value).map_err(|error| error.to_string())?;
+    num::parse_uint_bits(number, 10, width).map_err(
+        |error| decode_schema(value, error.to_string()).to_string(),
+    )
+}
+
+fn decode_key[R](value: StreamDeserializer[R]) -> bool {
+    if value.frames.is_empty() {
+        false
+    } else {
+        let frame = value.frames[value.frames.len() - 1];
+        frame.kind == StreamDeserializeKind::Map && frame.state.get() == StreamDeserializeState::Key
+    }
+}
+
+fn decode_text[R: io::Read](value: StreamDeserializer[R]) -> Result[string, Error] {
+    if decode_key(value) {
+        let record = decode_take(value)?;
+        if let Token::Key(name) = record.token {
+            value.frames[value.frames.len() - 1].state.set(StreamDeserializeState::KeyDone);
+            return Result::Ok(name)
+        }
+        return Result::Err(decode_schema(value, "expected JSON object key"))
+    }
+    match decode_scalar(value)?.token {
+        String(text) => Result::Ok(text),
+        _ => Result::Err(decode_schema(value, "expected JSON string")),
+    }
+}
+
+fn decode_begin[R: io::Read](
+    value: StreamDeserializer[R],
+    kind: StreamDeserializeKind,
+    length: isize,
+    token: Token,
+) -> Result[(), Error] {
+    if length < 0 {
+        return Result::Err(decode_schema(value, "negative JSON schema length"))
+    }
+    decode_frame_limit(value)?;
+    decode_claim(value)?;
+    decode_expect(value, token)?;
+    value.frames.push(decode_new_frame(kind, length, false));
+    Result::Ok(())
+}
+
+fn decode_idle[R](value: StreamDeserializer[R], frame: StreamDeserializeFrame) -> Result[(), Error] {
+    if frame.state.get() != StreamDeserializeState::Idle {
+        Result::Err(decode_schema(value, "previous JSON child is incomplete"))
+    } else {
+        Result::Ok(())
+    }
+}
+
+fn decode_next_array[R: io::Read](value: StreamDeserializer[R], frame: StreamDeserializeFrame) -> Result[
+    bool,
+    Error,
+] {
+    decode_idle(value, frame)?;
+    if frame.done.get() {
+        return Result::Ok(false)
+    }
+    let token = decode_peek(value)?.token;
+    if token == Token::EndArray {
+        frame.done.set(true);
+        Result::Ok(false)
+    } else {
+        frame.state.set(StreamDeserializeState::Ready);
+        Result::Ok(true)
+    }
+}
+
+fn decode_next_field[R: io::Read](value: StreamDeserializer[R], frame: StreamDeserializeFrame) -> Result[
+    Option[string],
+    Error,
+] {
+    decode_idle(value, frame)?;
+    if frame.done.get() {
+        return Result::Ok(Option::None)
+    }
+    match decode_peek(value)?.token {
+        EndObject => {
+            frame.done.set(true);
+            Result::Ok(Option::None)
+        },
+        Key(name) => {
+            let _ = decode_take(value)?;
+            frame.state.set(StreamDeserializeState::Ready);
+            Result::Ok(Option::Some(name))
+        },
+        _ => Result::Err(decode_schema(value, "expected JSON object key or end")),
+    }
+}
+
+fn decode_end[R: io::Read](
+    value: StreamDeserializer[R],
+    kind: StreamDeserializeKind,
+    closing: Token,
+) -> Result[(), Error] {
+    let frame = decode_frame(value, kind)?;
+    decode_idle(value, frame)?;
+    if kind == StreamDeserializeKind::Tuple {
+        if frame.index.get() != frame.length.get() {
+            return Result::Err(decode_schema(value, "JSON tuple has incomplete elements"))
+        }
+    } else if !frame.done.get() {
+        return Result::Err(decode_schema(value, "JSON container ended before all children"))
+    }
+    decode_expect(value, closing)?;
+    let _ = value.frames.pop();
+    decode_completed(value);
+    Result::Ok(())
+}
+
+fn finish_stream_deserializer[R](value: StreamDeserializer[R]) -> Result[(), Error] {
+    stream_check(value.lease)?;
+    if !value.frames.is_empty() || !value.root_complete.get() || value.pending.get().is_some()
+        || !value.decoder.tokens.root_complete.get() {
+        Result::Err(decode_schema(value, "JSON deserialization did not complete exactly one root"))
+    } else {
+        Result::Ok(())
+    }
+}

@@ -1,0 +1,286 @@
+package fs;
+
+use module::bytes;
+use module::fs as filesystem;
+use module::io;
+
+struct MemoryCursor {
+    position: isize,
+    directory_position: isize,
+    closed: bool,
+}
+
+pub struct MemoryHandle {
+    source: MemoryFS,
+    node: isize,
+    name: string,
+    state: Ref[MemoryCursor],
+}
+
+fn memory_handle_io_error(error: filesystem::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        error.operation(),
+        error.path(),
+        error.raw_os_code(),
+        error.message(),
+    )
+}
+
+impl MemoryHandle {
+    fn check_open(self: MemoryHandle, operation: string) -> Result[MemoryCursor, filesystem::Error] {
+        let state = self.state.get();
+        if state.closed {
+            Result::Err(
+                memory_error(
+                    io::ErrorKind::InvalidInput,
+                    operation,
+                    Option::Some(self.name),
+                    "memory handle is closed",
+                ),
+            )
+        } else {
+            Result::Ok(state)
+        }
+    }
+
+    fn file_content(self: MemoryHandle, operation: string) -> Result[bytes::Bytes, io::Error] {
+        let _ = self.check_open(operation).map_err(memory_handle_io_error)?;
+        match self.source.nodes[self.node].content {
+            MemoryContent::File(content) => Result::Ok(content),
+            MemoryContent::Directory => Result::Err(
+                memory_handle_io_error(
+                    memory_error(
+                        io::ErrorKind::InvalidInput,
+                        operation,
+                        Option::Some(self.name),
+                        "memory node is a directory",
+                    ),
+                ),
+            ),
+            MemoryContent::Special | MemoryContent::Link(_) => Result::Err(
+                memory_handle_io_error(
+                    memory_error(
+                        io::ErrorKind::Unsupported,
+                        operation,
+                        Option::Some(self.name),
+                        "memory node does not support file data",
+                    ),
+                ),
+            ),
+        }
+    }
+}
+
+impl filesystem::FileSystem for MemoryFS {
+    type Handle = MemoryHandle;
+
+    fn open(self: MemoryFS, name: string) -> Result[MemoryHandle, filesystem::Error] {
+        let node = resolve_memory(self, name, true, "open")?;
+        Result::Ok(
+            MemoryHandle {
+                source: self,
+                node,
+                name,
+                state: Ref::new(MemoryCursor { position: 0, directory_position: 0, closed: false }),
+            },
+        )
+    }
+}
+
+impl io::Close for MemoryHandle {
+    fn close(self: MemoryHandle) -> Result[(), io::Error] {
+        let state = self.state.get();
+        if !state.closed {
+            self.state.set(MemoryCursor { closed: true, ..state });
+        }
+        Result::Ok(())
+    }
+}
+
+impl filesystem::File for MemoryHandle {
+    fn stat(self: MemoryHandle) -> Result[filesystem::Metadata, filesystem::Error] {
+        let _ = self.check_open("stat memory file")?;
+        Result::Ok(self.source.nodes[self.node].metadata)
+    }
+}
+
+impl io::Read for MemoryHandle {
+    fn read(self: MemoryHandle, buffer: MutSlice[byte]) -> Result[isize, io::Error] {
+        let content = self.file_content("read memory file")?;
+        let state = self.state.get();
+        let remaining = if state.position < content.len() {
+            content.len() - state.position
+        } else {
+            0
+        };
+        let count = if remaining < buffer.len() {
+            remaining
+        } else {
+            buffer.len()
+        };
+        for index in 0..count {
+            buffer[index] = content.get(state.position + index);
+        }
+        if count > 0 {
+            self.state.set(MemoryCursor { position: state.position + count, ..state });
+        }
+        Result::Ok(count)
+    }
+}
+
+impl io::ReadAt for MemoryHandle {
+    fn read_at(self: MemoryHandle, buffer: MutSlice[byte], offset: isize) -> Result[
+        isize,
+        io::TransferError,
+    ] {
+        let operation = "read memory file at";
+        let content = self.file_content(operation).map_err(|error| io::TransferError::new(0, error))?;
+        if offset < 0 || offset > 9223372036854775807 - buffer.len() {
+            return Result::Err(
+                io::TransferError::new(
+                    0,
+                    memory_handle_io_error(
+                        memory_error(
+                            io::ErrorKind::InvalidInput,
+                            operation,
+                            Option::Some(self.name),
+                            "invalid or overflowing read range",
+                        ),
+                    ),
+                ),
+            )
+        }
+        let remaining = if offset < content.len() {
+            content.len() - offset
+        } else {
+            0
+        };
+        let count = if remaining < buffer.len() {
+            remaining
+        } else {
+            buffer.len()
+        };
+        for index in 0..count {
+            buffer[index] = content.get(offset + index);
+        }
+        if count < buffer.len() {
+            Result::Err(
+                io::TransferError::new(
+                    count.to_usize(),
+                    memory_handle_io_error(
+                        memory_error(
+                            io::ErrorKind::UnexpectedEof,
+                            operation,
+                            Option::Some(self.name),
+                            "memory file ended before requested count",
+                        ),
+                    ),
+                ),
+            )
+        } else {
+            Result::Ok(count)
+        }
+    }
+}
+
+impl io::Seek for MemoryHandle {
+    fn seek(self: MemoryHandle, from: io::SeekFrom) -> Result[isize, io::Error] {
+        let operation = "seek memory file";
+        let content = self.file_content(operation)?;
+        let state = self.state.get();
+        let (base, delta) = match from {
+            Start(offset) => (0, offset),
+            Current(offset) => (state.position, offset),
+            End(offset) => (content.len(), offset),
+        };
+        if delta < -base || delta > 9223372036854775807 - base {
+            return Result::Err(
+                memory_handle_io_error(
+                    memory_error(
+                        io::ErrorKind::InvalidInput,
+                        operation,
+                        Option::Some(self.name),
+                        "invalid or overflowing seek position",
+                    ),
+                ),
+            )
+        }
+        let position = base + delta;
+        self.state.set(MemoryCursor { position, ..state });
+        Result::Ok(position)
+    }
+}
+
+impl filesystem::ReadDirFile for MemoryHandle {
+    type Entry = filesystem::SnapshotEntry;
+
+    fn read_dir(self: MemoryHandle, amount: isize) -> Result[
+        Vec[filesystem::SnapshotEntry],
+        filesystem::ReadDirError[filesystem::SnapshotEntry],
+    ] {
+        let operation = "read memory directory";
+        let state = self.check_open(operation).map_err(
+            |error| {
+                let entries: Vec[filesystem::SnapshotEntry] = Vec::new();
+                filesystem::ReadDirError::new(entries, error)
+            },
+        )?;
+        if amount <= 0 {
+            return Result::Err(
+                filesystem::ReadDirError::new(
+                    Vec::new(),
+                    memory_error(
+                        io::ErrorKind::InvalidInput,
+                        operation,
+                        Option::Some(self.name),
+                        "directory amount must be positive",
+                    ),
+                ),
+            )
+        }
+        let record = self.source.nodes[self.node];
+        match record.content {
+            MemoryContent::Directory => (),
+            MemoryContent::File(_) => return Result::Err(
+                filesystem::ReadDirError::new(
+                    Vec::new(),
+                    memory_error(
+                        io::ErrorKind::InvalidInput,
+                        operation,
+                        Option::Some(self.name),
+                        "memory node is not a directory",
+                    ),
+                ),
+            ),
+            MemoryContent::Special | MemoryContent::Link(_) => return Result::Err(
+                filesystem::ReadDirError::new(
+                    Vec::new(),
+                    memory_error(
+                        io::ErrorKind::Unsupported,
+                        operation,
+                        Option::Some(self.name),
+                        "memory node does not support directory entries",
+                    ),
+                ),
+            ),
+        }
+        let remaining = record.children.len() - state.directory_position;
+        let count = if remaining < amount {
+            remaining
+        } else {
+            amount
+        };
+        let entries = Vec::with_capacity(count);
+        for index in 0..count {
+            let child = self.source.nodes[record.children[state.directory_position + index]];
+            entries.push(filesystem::SnapshotEntry::new(child.name, child.metadata));
+        }
+        if count > 0 {
+            self.state.set(
+                MemoryCursor { directory_position: state.directory_position + count, ..state },
+            );
+        }
+        Result::Ok(entries)
+    }
+}

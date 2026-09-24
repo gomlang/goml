@@ -1,0 +1,273 @@
+package fs;
+
+use module::fs as filesystem;
+use filesystem::{DirectoryEntry, ReadDirFile};
+use module::io;
+
+struct RetainedCheckEntry[E] {
+    source: E,
+    checked: CheckedEntry,
+}
+
+fn check_directory_invalid_amount[D: filesystem::ReadDirFile](
+    state: CheckState,
+    handle: D,
+    path: string,
+    amount: isize,
+) -> () {
+    let result = check_call(
+        state,
+        path,
+        "read directory invalid amount",
+        || Result::Ok(handle.read_dir(amount)),
+    );
+    if let Some(result) = result {
+        match result {
+            Ok(_) => check_violation(
+                state,
+                path,
+                "read directory",
+                "nonpositive amount did not return InvalidInput",
+            ),
+            Err(error) => {
+                if error.error().kind() != io::ErrorKind::InvalidInput || error.entries().len() != 0 {
+                    check_violation(
+                        state,
+                        path,
+                        "read directory",
+                        "nonpositive amount returned a wrong error or consumed entries",
+                    );
+                }
+            },
+        }
+    }
+}
+
+fn check_directory_entry[E: filesystem::DirectoryEntry](state: CheckState, entry: E, path: string) -> Option[
+    CheckedEntry,
+] {
+    let name = check_call(state, path, "directory entry name", || Result::Ok(entry.name()))?;
+    if name == "." || !filesystem::valid_path(name) || name.contains("/") {
+        check_violation(
+            state,
+            path,
+            "directory entry name",
+            "entry name is not a single valid component",
+        );
+        return Option::None
+    }
+    let file_type = check_call(
+        state,
+        path,
+        "directory entry type",
+        || Result::Ok(entry.file_type()),
+    )?;
+    let metadata = check_call(state, path, "directory entry metadata", || entry.metadata());
+    if let Some(metadata) = metadata {
+        if metadata.file_type() != file_type {
+            check_inconsistent(
+                state,
+                path,
+                "directory entry metadata",
+                "metadata type differs from entry type",
+            );
+        }
+    }
+    Option::Some(CheckedEntry { name, file_type, metadata })
+}
+
+fn check_directory_pages[D: filesystem::ReadDirFile](
+    state: CheckState,
+    handle: D,
+    path: string,
+    width: isize,
+    invalid_probes: bool,
+) -> Vec[RetainedCheckEntry[D::Entry]] {
+    let retained: Vec[RetainedCheckEntry[D::Entry]] = Vec::new();
+    let mut count = 0;
+    let mut probed_middle = false;
+    if invalid_probes {
+        for amount in[0, -1, -9223372036854775807 - 1] {
+            check_directory_invalid_amount(state, handle, path, amount);
+            if check_stopped(state) {
+                return retained
+            }
+        }
+    }
+    loop {
+        if check_stopped(state) {
+            return retained
+        }
+        let remaining = state.limits.max_directory_entries - count;
+        let requested = if remaining < width {
+            remaining + 1
+        } else {
+            width
+        };
+        let Some(result) = check_call(
+            state,
+            path,
+            "read directory",
+            || Result::Ok(handle.read_dir(requested)),
+        ) else {
+            return retained
+        };
+        let (page, error) = match result {
+            Ok(page) => (page.as_slice(), Option::None),
+            Err(error) => (error.entries(), Option::Some(error.error())),
+        };
+        if page.len() > requested {
+            check_violation(
+                state,
+                path,
+                "read directory",
+                "provider returned more entries than requested",
+            );
+            if let Some(error) = error {
+                check_issue(
+                    state,
+                    CheckIssue {
+                        path,
+                        operation: "read directory",
+                        kind: CheckIssueKind::ProviderError(error),
+                    },
+                );
+            }
+            return retained
+        }
+        let allowed = if page.len() > remaining {
+            remaining
+        } else {
+            page.len()
+        };
+        for index in 0..allowed {
+            let entry = page[index];
+            if let Some(checked) = check_directory_entry(state, entry, path) {
+                retained.push(RetainedCheckEntry { source: entry, checked });
+            }
+            if check_stopped(state) {
+                return retained
+            }
+        }
+        count += allowed;
+        if let Some(error) = error {
+            check_issue(
+                state,
+                CheckIssue {
+                    path,
+                    operation: "read directory",
+                    kind: CheckIssueKind::ProviderError(error),
+                },
+            );
+        }
+        if page.len() > remaining {
+            check_budget(state, path, CheckBudget::DirectoryEntries);
+            return retained
+        }
+        if error.is_some() || page.len() == 0 {
+            return retained
+        }
+        if invalid_probes && !probed_middle {
+            check_directory_invalid_amount(state, handle, path, 0);
+            check_directory_invalid_amount(state, handle, path, -1);
+            probed_middle = true;
+        }
+    }
+}
+
+fn checked_directory_entry_equal(left: CheckedEntry, right: CheckedEntry) -> bool {
+    if left.name != right.name || left.file_type != right.file_type {
+        return false
+    }
+    match (left.metadata, right.metadata) {
+        (Some(left), Some(right)) => check_metadata_equal(left, right),
+        _ => true,
+    }
+}
+
+fn check_directory_after_close[E: filesystem::DirectoryEntry](
+    state: CheckState,
+    path: string,
+    retained: Vec[RetainedCheckEntry[E]],
+) -> Vec[CheckedEntry] {
+    let entries = Vec::new();
+    for retained in retained {
+        if check_stopped(state) {
+            return entries
+        }
+        if let Some(after) = check_directory_entry(state, retained.source, path) {
+            if !checked_directory_entry_equal(retained.checked, after) {
+                check_inconsistent(
+                    state,
+                    path,
+                    "directory entry after close",
+                    "entry changed after later pages or directory close",
+                );
+            }
+        }
+        entries.push(retained.checked);
+    }
+    entries
+}
+
+fn check_directory[F: filesystem::FileSystem](state: CheckState, source: F, path: string) -> Option[
+    Vec[CheckedEntry],
+] where F::Handle: filesystem::ReadDirFile {
+    let issue_count = state.issues.len();
+    let first = check_with_handle(
+        state,
+        source,
+        path,
+        |handle: F::Handle| check_directory_pages(state, handle, path, 1, false),
+    )?;
+    if check_stopped(state) {
+        return Option::None
+    }
+    let first = check_directory_after_close(state, path, first);
+    if check_stopped(state) {
+        return Option::None
+    }
+    let second = check_with_handle(
+        state,
+        source,
+        path,
+        |handle: F::Handle| check_directory_pages(state, handle, path, 7, true),
+    )?;
+    if check_stopped(state) {
+        return Option::None
+    }
+    let second = check_directory_after_close(state, path, second);
+    if check_stopped(state) {
+        return Option::None
+    }
+    if state.issues.len() != issue_count {
+        return Option::Some(first)
+    }
+    let used: Vec[bool] = Vec::new();
+    for _ in second {
+        used.push(false);
+    }
+    let mut consistent = first.len() == second.len();
+    for entry in first {
+        let mut found = false;
+        for index in 0..second.len() {
+            if !used[index] && checked_directory_entry_equal(entry, second[index]) {
+                used[index] = true;
+                found = true;
+                break
+            }
+        }
+        if !found {
+            consistent = false;
+        }
+    }
+    if !consistent {
+        check_inconsistent(
+            state,
+            path,
+            "directory page widths",
+            "directory entry multisets differ between page widths or invalid-amount probes advanced the cursor",
+        );
+    }
+    Option::Some(first)
+}

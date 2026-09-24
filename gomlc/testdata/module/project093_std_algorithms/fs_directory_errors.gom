@@ -1,0 +1,538 @@
+package main;
+
+use std::fs;
+use fs::{File, FileSystem, DirectoryEntry, ReadDirFile};
+use std::io;
+use io::{Read, Close};
+use std::panic;
+use std::testing;
+
+struct DirectoryFaultEntry {
+    label: string,
+    id: isize,
+    names: Ref[isize],
+    metadata_calls: Ref[isize],
+    type_calls: Ref[isize],
+    panic_name: bool,
+}
+
+fn directory_fault_entry(label: string, id: isize) -> DirectoryFaultEntry {
+    DirectoryFaultEntry {
+        label,
+        id,
+        names: Ref::new(0),
+        metadata_calls: Ref::new(0),
+        type_calls: Ref::new(0),
+        panic_name: false,
+    }
+}
+
+impl DirectoryEntry for DirectoryFaultEntry {
+    fn name(self: DirectoryFaultEntry) -> string {
+        self.names.set(self.names.get() + 1);
+        if self.panic_name {
+            panic::raise("directory name panic")
+        }
+        self.label
+    }
+
+    fn file_type(self: DirectoryFaultEntry) -> fs::FileType {
+        self.type_calls.set(self.type_calls.get() + 1);
+        fs::FileType::File
+    }
+
+    fn metadata(self: DirectoryFaultEntry) -> Result[fs::Metadata, fs::Error] {
+        self.metadata_calls.set(self.metadata_calls.get() + 1);
+        Result::Err(directory_fault_error("metadata"))
+    }
+}
+
+struct DirectoryFault {
+    pages: Vec[Vec[DirectoryFaultEntry]],
+    requests: Vec[isize],
+    opens: Ref[isize],
+    closes: Ref[isize],
+    effects: Ref[isize],
+    error_on: isize,
+    oversized_on: isize,
+    panic_on: isize,
+    open_mode: isize,
+    close_mode: isize,
+}
+
+fn directory_fault(pages: Vec[Vec[DirectoryFaultEntry]]) -> DirectoryFault {
+    DirectoryFault {
+        pages,
+        requests: Vec::new(),
+        opens: Ref::new(0),
+        closes: Ref::new(0),
+        effects: Ref::new(0),
+        error_on: -1,
+        oversized_on: -1,
+        panic_on: -1,
+        open_mode: 0,
+        close_mode: 0,
+    }
+}
+
+fn directory_fault_error(operation: string) -> fs::Error {
+    fs::Error::new(
+        io::ErrorKind::Interrupted,
+        operation,
+        Option::Some("provider/root/original"),
+        Option::Some(47),
+        "directory original cause",
+    )
+}
+
+fn directory_fault_close_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        "provider close",
+        Option::Some("provider close context"),
+        Option::Some(19),
+        "close original cause",
+    )
+}
+
+impl FileSystem for DirectoryFault {
+    type Handle = DirectoryFault;
+
+    fn open(self: DirectoryFault, name: string) -> Result[DirectoryFault, fs::Error] {
+        self.opens.set(self.opens.get() + 1);
+        if self.open_mode == 2 {
+            panic::raise("directory open panic")
+        }
+        if self.open_mode == 1 {
+            Result::Err(directory_fault_error("open"))
+        } else {
+            Result::Ok(self)
+        }
+    }
+}
+
+impl Read for DirectoryFault {
+    fn read(self: DirectoryFault, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        panic::raise("directory helper must not read bytes")
+    }
+}
+
+impl Close for DirectoryFault {
+    fn close(self: DirectoryFault) -> Result[(), io::Error] {
+        self.closes.set(self.closes.get() + 1);
+        if self.close_mode == 2 {
+            panic::raise("directory close panic")
+        }
+        if self.close_mode == 1 {
+            Result::Err(directory_fault_close_error())
+        } else {
+            Result::Ok(())
+        }
+    }
+}
+
+impl File for DirectoryFault {
+    fn stat(self: DirectoryFault) -> Result[fs::Metadata, fs::Error] {
+        panic::raise("directory helper must not stat")
+    }
+}
+
+impl ReadDirFile for DirectoryFault {
+    type Entry = DirectoryFaultEntry;
+
+    fn read_dir(self: DirectoryFault, amount: isize) -> Result[
+        Vec[DirectoryFaultEntry],
+        fs::ReadDirError[DirectoryFaultEntry],
+    ] {
+        testing::assert(amount > 0 && amount <= 128);
+        self.requests.push(amount);
+        let call = self.requests.len();
+        self.effects.set(self.effects.get() + 1);
+        if call == self.panic_on {
+            panic::raise("directory read panic")
+        }
+        let page = if call == self.oversized_on {
+            let entries = Vec::new();
+            for index in 0..amount + 1 {
+                entries.push(
+                    DirectoryFaultEntry {
+                        panic_name: true,
+                        ..directory_fault_entry("oversized", index),
+                    },
+                );
+            }
+            entries
+        } else if call <= self.pages.len() {
+            self.pages[call - 1]
+        } else {
+            Vec::new()
+        };
+        if call == self.error_on {
+            self.effects.set(self.effects.get() + 100);
+            Result::Err(fs::ReadDirError::new(page, directory_fault_error("read directory")))
+        } else {
+            Result::Ok(page)
+        }
+    }
+}
+
+fn directory_fault_ids(entries: Slice[DirectoryFaultEntry]) -> Vec[isize] {
+    let result = Vec::new();
+    for entry in entries {
+        result.push(entry.id);
+    }
+    result
+}
+
+fn directory_fault_entries_untouched(entries: Slice[DirectoryFaultEntry], name_calls: isize) -> () {
+    for entry in entries {
+        assert_equal(entry.names.get(), name_calls);
+        assert_equal(entry.metadata_calls.get(), 0);
+        assert_equal(entry.type_calls.get(), 0);
+    }
+}
+
+fn check_directory_fault_partial() -> () {
+    let first = Vec::from_array([directory_fault_entry("z", 0), directory_fault_entry("a", 1)]);
+    let second = Vec::from_array([directory_fault_entry("a", 2), directory_fault_entry("b", 3)]);
+    let source = DirectoryFault {
+        error_on: 2,
+        close_mode: 1,
+        ..directory_fault(Vec::from_array([first, second])),
+    };
+    let error = testing::expect_err(
+        fs::read_dir_from(source, "dir", 20),
+        "partial directory failure",
+    );
+    assert_equal(error.error(), directory_fault_error("read directory"));
+    assert_equal(directory_fault_ids(error.entries()), Vec::from_array([1, 2, 3, 0]));
+    assert_equal(source.requests, Vec::from_array([21, 19]));
+    assert_equal(source.effects.get(), 102);
+    assert_equal(source.closes.get(), 1);
+    directory_fault_entries_untouched(first.as_slice(), 1);
+    directory_fault_entries_untouched(second.as_slice(), 1);
+    let values = Vec::from_array([directory_fault_entry("copy", 9)]);
+    let error = fs::ReadDirError::new(values, directory_fault_error("copy"));
+    values[0] = directory_fault_entry("changed", 10);
+    values.push(directory_fault_entry("added", 11));
+    assert_equal(directory_fault_ids(error.entries()), Vec::from_array([9]));
+}
+
+fn check_directory_fault_invalid_pages() -> () {
+    for provider_error in[false, true] {
+        for invalid in["", ".", "..", "/", "a/b", "a/"] {
+            let first = Vec::from_array([directory_fault_entry("z", 0)]);
+            let rejected = Vec::from_array(
+                [directory_fault_entry("a", 1), directory_fault_entry(invalid, 2)],
+            );
+            let source = DirectoryFault {
+                error_on: if provider_error {
+                    2
+                } else {
+                    -1
+                },
+                ..directory_fault(Vec::from_array([first, rejected])),
+            };
+            let error = testing::expect_err(
+                fs::read_dir_from(source, "dir", 10),
+                "invalid directory component",
+            );
+            assert_equal(error.error().kind(), io::ErrorKind::InvalidData);
+            assert_equal(directory_fault_ids(error.entries()), Vec::from_array([0]));
+            assert_equal(source.requests.len(), 2);
+            assert_equal(source.closes.get(), 1);
+        }
+        let source = DirectoryFault {
+            oversized_on: 2,
+            error_on: if provider_error {
+                2
+            } else {
+                -1
+            },
+            ..directory_fault(Vec::from_array([Vec::from_array([directory_fault_entry("z", 0)])])),
+        };
+        let error = testing::expect_err(
+            fs::read_dir_from(source, "dir", 200),
+            "oversized directory page",
+        );
+        assert_equal(error.error().kind(), io::ErrorKind::InvalidData);
+        assert_equal(directory_fault_ids(error.entries()), Vec::from_array([0]));
+        assert_equal(source.requests, Vec::from_array([128, 128]));
+        assert_equal(source.closes.get(), 1);
+    }
+}
+
+fn check_directory_fault_budgets() -> () {
+    for provider_error in[false, true] {
+        let entries = Vec::from_array(
+            [
+                directory_fault_entry("z", 0),
+                directory_fault_entry("a", 1),
+                directory_fault_entry("b", 2),
+            ],
+        );
+        let source = DirectoryFault {
+            error_on: if provider_error {
+                1
+            } else {
+                -1
+            },
+            close_mode: 1,
+            ..directory_fault(Vec::from_array([entries])),
+        };
+        let error = testing::expect_err(
+            fs::read_dir_from(source, "dir", 2),
+            "budget and provider failure",
+        );
+        assert_equal(directory_fault_ids(error.entries()), Vec::from_array([1, 0]));
+        if provider_error {
+            assert_equal(error.error(), directory_fault_error("read directory"));
+        } else {
+            assert_equal(error.error().kind(), io::ErrorKind::InvalidData);
+        }
+        assert_equal(source.requests, Vec::from_array([3]));
+        assert_equal(source.closes.get(), 1);
+        directory_fault_entries_untouched(entries.as_slice(), 1);
+        let source = DirectoryFault {
+            error_on: if provider_error {
+                1
+            } else {
+                -1
+            },
+            ..directory_fault(
+                Vec::from_array([Vec::from_array([directory_fault_entry("probe", 0)])]),
+            ),
+        };
+        let error = testing::expect_err(fs::read_dir_from(source, ".", 0), "zero budget probe");
+        assert_equal(error.entries().len(), 0);
+        assert_equal(source.requests, Vec::from_array([1]));
+        if provider_error {
+            assert_equal(error.error(), directory_fault_error("read directory"));
+        } else {
+            assert_equal(error.error().kind(), io::ErrorKind::InvalidData);
+        }
+    }
+    let source = directory_fault(Vec::new());
+    assert_equal(
+        testing::expect_ok(fs::read_dir_from(source, ".", 0), "zero budget empty directory").len(),
+        0,
+    );
+    assert_equal(source.requests, Vec::from_array([1]));
+    assert_equal(source.closes.get(), 1);
+}
+
+fn check_directory_fault_page_boundaries() -> () {
+    for with_prefix in[false, true] {
+        let prefix = Vec::from_array([directory_fault_entry("z", 0), directory_fault_entry("a", 1)]);
+        let source = DirectoryFault {
+            error_on: if with_prefix {
+                2
+            } else {
+                1
+            },
+            close_mode: 1,
+            ..directory_fault(
+                if with_prefix {
+                    Vec::from_array([prefix])
+                } else {
+                    Vec::new()
+                },
+            ),
+        };
+        let error = testing::expect_err(
+            fs::read_dir_from(source, "dir", 2),
+            "empty error page is not EOF",
+        );
+        assert_equal(error.error(), directory_fault_error("read directory"));
+        assert_equal(
+            directory_fault_ids(error.entries()),
+            if with_prefix {
+                Vec::from_array([1, 0])
+            } else {
+                Vec::new()
+            },
+        );
+        assert_equal(
+            source.requests,
+            if with_prefix {
+                Vec::from_array([3, 1])
+            } else {
+                Vec::from_array([3])
+            },
+        );
+        assert_equal(
+            source.effects.get(),
+            if with_prefix {
+                102
+            } else {
+                101
+            },
+        );
+        assert_equal(source.closes.get(), 1);
+        directory_fault_entries_untouched(
+            prefix.as_slice(),
+            if with_prefix {
+                1
+            } else {
+                0
+            },
+        );
+    }
+    for provider_error in[false, true] {
+        let prefix = Vec::from_array([directory_fault_entry("z", 0)]);
+        let rejected = Vec::from_array(
+            [directory_fault_entry("a", 1), directory_fault_entry("../probe", 2)],
+        );
+        let source = DirectoryFault {
+            error_on: if provider_error {
+                2
+            } else {
+                -1
+            },
+            close_mode: 1,
+            ..directory_fault(Vec::from_array([prefix, rejected])),
+        };
+        let error = testing::expect_err(
+            fs::read_dir_from(source, "dir", 2),
+            "invalid budget probe rejects whole page",
+        );
+        assert_equal(error.error().kind(), io::ErrorKind::InvalidData);
+        assert_equal(directory_fault_ids(error.entries()), Vec::from_array([0]));
+        assert_equal(source.requests, Vec::from_array([3, 2]));
+        assert_equal(source.closes.get(), 1);
+        directory_fault_entries_untouched(prefix.as_slice(), 1);
+        directory_fault_entries_untouched(rejected.as_slice(), 1);
+    }
+    let prefix = Vec::from_array([directory_fault_entry("z", 0), directory_fault_entry("a", 1)]);
+    let probe = Vec::from_array([directory_fault_entry("extra", 2)]);
+    let source = DirectoryFault {
+        error_on: 2,
+        close_mode: 1,
+        ..directory_fault(Vec::from_array([prefix, probe])),
+    };
+    let error = testing::expect_err(
+        fs::read_dir_from(source, "dir", 2),
+        "full budget preserves subsequent provider cause",
+    );
+    assert_equal(error.error(), directory_fault_error("read directory"));
+    assert_equal(directory_fault_ids(error.entries()), Vec::from_array([1, 0]));
+    assert_equal(source.requests, Vec::from_array([3, 1]));
+    assert_equal(source.effects.get(), 102);
+    assert_equal(source.closes.get(), 1);
+    directory_fault_entries_untouched(prefix.as_slice(), 1);
+    directory_fault_entries_untouched(probe.as_slice(), 1);
+}
+
+fn check_directory_fault_cleanup() -> () {
+    let source = DirectoryFault {
+        close_mode: 1,
+        ..directory_fault(
+            Vec::from_array(
+                [Vec::from_array([directory_fault_entry("z", 0), directory_fault_entry("a", 1)])],
+            ),
+        ),
+    };
+    let error = testing::expect_err(fs::read_dir_from(source, "logical", 10), "close only failure");
+    assert_equal(directory_fault_ids(error.entries()), Vec::from_array([1, 0]));
+    assert_equal(error.error().kind(), io::ErrorKind::BrokenPipe);
+    assert_equal(error.error().operation(), "close file");
+    assert_equal(error.error().path(), Option::Some("logical"));
+    assert_equal(error.error().raw_os_code(), Option::Some(19));
+    assert_equal(error.error().message(), "close original cause");
+    assert_equal(source.closes.get(), 1);
+    for mode in 0..5 {
+        let entry = DirectoryFaultEntry {
+            panic_name: mode == 1 || mode == 3,
+            ..directory_fault_entry("entry", 0),
+        };
+        let source = DirectoryFault {
+            panic_on: if mode == 0 || mode == 2 {
+                1
+            } else {
+                -1
+            },
+            close_mode: if mode >= 2 {
+                2
+            } else {
+                0
+            },
+            ..directory_fault(Vec::from_array([Vec::from_array([entry])])),
+        };
+        let caught = testing::expect_err(
+            panic::catch(|| fs::read_dir_from(source, "dir", 10)),
+            "directory panic cleanup",
+        );
+        assert_equal(
+            caught.message(),
+            if mode >= 2 {
+                "directory close panic"
+            } else if mode == 1 {
+                "directory name panic"
+            } else {
+                "directory read panic"
+            },
+        );
+        assert_equal(source.closes.get(), 1);
+    }
+    for mode in[1, 2] {
+        let source = DirectoryFault { open_mode: mode, ..directory_fault(Vec::new()) };
+        if mode == 1 {
+            let error = testing::expect_err(
+                fs::read_dir_from(source, "logical", 10),
+                "open original cause",
+            );
+            assert_equal(error.error(), directory_fault_error("open"));
+            assert_equal(error.entries().len(), 0);
+        } else {
+            assert_equal(
+                testing::expect_err(
+                    panic::catch(|| fs::read_dir_from(source, "logical", 10)),
+                    "open panic",
+                ).message(),
+                "directory open panic",
+            );
+        }
+        assert_equal(source.opens.get(), 1);
+        assert_equal(source.closes.get(), 0);
+        assert_equal(source.requests.len(), 0);
+    }
+}
+
+fn check_fs_directory_errors() -> () {
+    for path in["", "..", "/dir", "a//b"] {
+        let source = directory_fault(Vec::new());
+        let error = testing::expect_err(
+            fs::read_dir_from(source, path, 10),
+            "directory path precheck",
+        );
+        assert_equal(error.error().kind(), io::ErrorKind::InvalidInput);
+        assert_equal(error.error().path(), Option::Some(path));
+        assert_equal(source.opens.get(), 0);
+    }
+    let source = directory_fault(Vec::new());
+    assert_equal(
+        testing::expect_err(fs::read_dir_from(source, ".", -1), "directory budget precheck").error().kind(),
+        io::ErrorKind::InvalidInput,
+    );
+    assert_equal(source.opens.get(), 0);
+    let entries = Vec::from_array(
+        [
+            directory_fault_entry("\u0000", 0),
+            directory_fault_entry("a\\b", 1),
+            directory_fault_entry("C:name", 2),
+        ],
+    );
+    let source = directory_fault(Vec::from_array([entries]));
+    assert_equal(
+        directory_fault_ids(
+            testing::expect_ok(fs::read_dir_from(source, ".", 3), "portable component characters").as_slice(),
+        ),
+        Vec::from_array([0, 2, 1]),
+    );
+    directory_fault_entries_untouched(entries.as_slice(), 1);
+    check_directory_fault_partial();
+    check_directory_fault_invalid_pages();
+    check_directory_fault_budgets();
+    check_directory_fault_page_boundaries();
+    check_directory_fault_cleanup();
+}

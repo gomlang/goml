@@ -1,0 +1,316 @@
+package main;
+
+use std::fs;
+use fs::{File, FileSystem, DirectoryEntry, ReadDirFile};
+use std::io;
+use io::{Read, Close};
+use std::panic;
+use std::testing;
+
+struct WalkCleanupFs {
+    source: WalkProbeFs,
+    mode: isize,
+    active_at_panic: Ref[isize],
+}
+
+struct WalkCleanupHandle {
+    source: WalkProbeHandle,
+    owner: WalkCleanupFs,
+}
+
+struct WalkCleanupEntry {
+    source: WalkProbeEntry,
+    owner: WalkCleanupFs,
+}
+
+impl DirectoryEntry for WalkCleanupEntry {
+    fn name(self: WalkCleanupEntry) -> string {
+        if self.owner.mode == 0 {
+            self.owner.active_at_panic.set(self.owner.source.active.get());
+            panic::raise("walk entry name panic")
+        }
+        self.source.name()
+    }
+
+    fn file_type(self: WalkCleanupEntry) -> fs::FileType {
+        self.owner.active_at_panic.set(self.owner.source.active.get());
+        panic::raise("walk entry type panic")
+    }
+
+    fn metadata(self: WalkCleanupEntry) -> Result[fs::Metadata, fs::Error] {
+        self.source.metadata()
+    }
+}
+
+impl FileSystem for WalkCleanupFs {
+    type Handle = WalkCleanupHandle;
+
+    fn open(self: WalkCleanupFs, name: string) -> Result[WalkCleanupHandle, fs::Error] {
+        self.source.open(name).map(|source| WalkCleanupHandle { source, owner: self })
+    }
+}
+
+impl Read for WalkCleanupHandle {
+    fn read(self: WalkCleanupHandle, buffer: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.source.read(buffer)
+    }
+}
+
+impl Close for WalkCleanupHandle {
+    fn close(self: WalkCleanupHandle) -> Result[(), io::Error] {
+        self.source.close()
+    }
+}
+
+impl File for WalkCleanupHandle {
+    fn stat(self: WalkCleanupHandle) -> Result[fs::Metadata, fs::Error] {
+        self.source.stat()
+    }
+}
+
+impl ReadDirFile for WalkCleanupHandle {
+    type Entry = WalkCleanupEntry;
+
+    fn read_dir(self: WalkCleanupHandle, amount: isize) -> Result[
+        Vec[WalkCleanupEntry],
+        fs::ReadDirError[WalkCleanupEntry],
+    ] {
+        match self.source.read_dir(amount) {
+            Ok(entries) => {
+                let result = Vec::new();
+                for source in entries {
+                    result.push(WalkCleanupEntry { source, owner: self.owner });
+                }
+                Result::Ok(result)
+            },
+            Err(error) => {
+                let result = Vec::new();
+                for source in error.entries() {
+                    result.push(WalkCleanupEntry { source, owner: self.owner });
+                }
+                Result::Err(fs::ReadDirError::new(result, error.error()))
+            },
+        }
+    }
+}
+
+fn walk_cleanup_close_count(source: WalkProbeFs) -> isize {
+    let mut count = 0;
+    for event in source.events {
+        if event.starts_with("close:") {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn check_fs_walk_cleanup() -> () {
+    let tree = walk_probe_tree();
+    let source = walk_probe_fs(
+        Vec::from_array([WalkProbeNode { close_mode: 1, ..tree.nodes[0] }, tree.nodes[1]]),
+    );
+    let visited = Vec::new();
+    let failures = Ref::new(0);
+    testing::expect_ok(
+        fs::walk_from(
+            source,
+            ".",
+            walk_probe_limits(),
+            |path, entry, error| {
+                assert_equal(source.active.get(), 0);
+                testing::assert(entry.is_some());
+                if let Some(cause) = error {
+                    assert_equal(path, ".");
+                    assert_equal(cause.kind(), io::ErrorKind::BrokenPipe);
+                    assert_equal(cause.operation(), "close file");
+                    assert_equal(cause.path(), Option::Some("."));
+                    assert_equal(cause.raw_os_code(), Option::Some(19));
+                    assert_equal(cause.message(), "walk close cause");
+                    failures.set(failures.get() + 1);
+                    visited.push("close error");
+                } else {
+                    visited.push(path);
+                }
+                Result::Ok(fs::WalkControl::Continue)
+            },
+        ),
+        "close-only failure retains directory entries",
+    );
+    assert_equal(failures.get(), 1);
+    assert_equal(visited, Vec::from_array([".", "close error", "a", "a/b", "a/q", "m", "z"]));
+    assert_equal(walk_cleanup_close_count(source), 3);
+    let callback_error = walk_probe_error("cleanup callback");
+    for open_error in[false, true] {
+        let source = walk_probe_fs(
+            Vec::from_array(
+                [
+                    WalkProbeNode {
+                        open_error,
+                        stat_error: !open_error,
+                        ..walk_probe_node(".", Vec::new()),
+                    },
+                ],
+            ),
+        );
+        let callbacks = Ref::new(0);
+        let error = testing::expect_err(
+            fs::walk_from(
+                source,
+                ".",
+                walk_probe_limits(),
+                |path, entry, cause| {
+                    assert_equal(path, ".");
+                    assert_equal(source.active.get(), 0);
+                    testing::assert(entry.is_none());
+                    assert_equal(
+                        testing::expect_some(cause, "root failure"),
+                        walk_probe_error(
+                            if open_error {
+                                "open"
+                            } else {
+                                "stat"
+                            },
+                        ),
+                    );
+                    callbacks.set(callbacks.get() + 1);
+                    Result::Err(callback_error)
+                },
+            ),
+            "root failure callback error",
+        );
+        assert_equal(error, callback_error);
+        assert_equal(callbacks.get(), 1);
+        assert_equal(
+            walk_cleanup_close_count(source),
+            if open_error {
+                0
+            } else {
+                1
+            },
+        );
+        assert_equal(source.active.get(), 0);
+    }
+    for stop in[".", "a"] {
+        let source = walk_probe_tree();
+        let visited = Vec::new();
+        let error = testing::expect_err(
+            fs::walk_from(
+                source,
+                ".",
+                walk_probe_limits(),
+                |path, entry, cause| {
+                    assert_equal(source.active.get(), 0);
+                    testing::assert(entry.is_some());
+                    testing::assert(cause.is_none());
+                    visited.push(path);
+                    if path == stop {
+                        Result::Err(callback_error)
+                    } else {
+                        Result::Ok(fs::WalkControl::Continue)
+                    }
+                },
+            ),
+            "normal callback error stops traversal",
+        );
+        assert_equal(error, callback_error);
+        assert_equal(
+            visited,
+            if stop == "." {
+                Vec::from_array(["."])
+            } else {
+                Vec::from_array([".", "a"])
+            },
+        );
+        testing::assert(!source.events.contains("open:a"));
+        assert_equal(
+            walk_cleanup_close_count(source),
+            if stop == "." {
+                1
+            } else {
+                2
+            },
+        );
+        assert_equal(source.active.get(), 0);
+    }
+    let tree = walk_probe_tree();
+    let source = walk_probe_fs(
+        Vec::from_array(
+            [WalkProbeNode { chunk: 1, error_on: 1, close_mode: 1, ..tree.nodes[0] }, tree.nodes[1]],
+        ),
+    );
+    let callbacks = Ref::new(0);
+    let caught = testing::expect_err(
+        panic::catch(
+            || fs::walk_from(
+                source,
+                ".",
+                walk_probe_limits(),
+                |_, _, error| {
+                    assert_equal(source.active.get(), 0);
+                    callbacks.set(callbacks.get() + 1);
+                    if let Some(error) = error {
+                        assert_equal(error, walk_probe_error("read directory"));
+                        panic::raise("walk error callback panic")
+                    }
+                    Result::Ok(fs::WalkControl::Continue)
+                },
+            ),
+        ),
+        "read error callback panic",
+    );
+    assert_equal(caught.message(), "walk error callback panic");
+    assert_equal(callbacks.get(), 2);
+    assert_equal(walk_cleanup_close_count(source), 2);
+    assert_equal(source.active.get(), 0);
+    testing::assert(!source.events.contains("open:a"));
+    for mode in 0..2 {
+        let source = walk_probe_fs(
+            Vec::from_array(
+                [
+                    walk_probe_node(
+                        ".",
+                        Vec::from_array([walk_probe_entry("child", fs::FileType::File, 0)]),
+                    ),
+                ],
+            ),
+        );
+        let owner = WalkCleanupFs { source, mode, active_at_panic: Ref::new(-1) };
+        let callbacks = Ref::new(0);
+        let caught = testing::expect_err(
+            panic::catch(
+                || fs::walk_from(
+                    owner,
+                    ".",
+                    walk_probe_limits(),
+                    |path, _, error| {
+                        assert_equal(path, ".");
+                        assert_equal(source.active.get(), 0);
+                        testing::assert(error.is_none());
+                        callbacks.set(callbacks.get() + 1);
+                        Result::Ok(fs::WalkControl::Continue)
+                    },
+                ),
+            ),
+            "entry accessor panic cleanup",
+        );
+        assert_equal(
+            caught.message(),
+            if mode == 0 {
+                "walk entry name panic"
+            } else {
+                "walk entry type panic"
+            },
+        );
+        assert_equal(
+            owner.active_at_panic.get(),
+            if mode == 0 {
+                1
+            } else {
+                0
+            },
+        );
+        assert_equal(callbacks.get(), 1);
+        assert_equal(walk_cleanup_close_count(source), 2);
+        assert_equal(source.active.get(), 0);
+    }
+}

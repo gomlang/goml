@@ -19,10 +19,29 @@ test -f "$prefix/lib/builtin/derive.gom"
 test -f "$prefix/lib/prelude/prelude.gom"
 test -f "$prefix/lib/prelude/goml.toml"
 test -f "$prefix/lib/std/goml.toml"
+test -f "$prefix/lib/cabi/go.mod"
+test -f "$prefix/lib/cabi/runtime_linux_amd64.s"
 test ! -e "$prefix/lib/builtin_contract.gom"
 test ! -e "$prefix/lib/builtin_prelude.gom"
 test ! -e "$prefix/lib/builtin_numeric.gom"
 test ! -e "$prefix/lib/builtin_derive.gom"
+
+mkdir -p "$temporary/install/lib/std/obsolete" "$temporary/install/lib/std/fs" \
+    "$temporary/install/lib/compiler" "$temporary/install/lib/custom"
+printf '%s\n' stale > "$temporary/install/lib/std/obsolete/old.gom"
+printf '%s\n' stale > "$temporary/install/lib/std/fs/removed.gom"
+printf '%s\n' retained > "$temporary/install/lib/compiler/retained"
+printf '%s\n' retained > "$temporary/install/lib/custom/retained"
+bash "$repo_root/tools/lib/install.sh" "$temporary/install"
+test ! -e "$temporary/install/lib/std/obsolete"
+test ! -e "$temporary/install/lib/std/fs/removed.gom"
+test -f "$temporary/install/lib/std/fs/fs.gom"
+test -f "$temporary/install/lib/compiler/retained"
+test -f "$temporary/install/lib/custom/retained"
+if bash "$repo_root/tools/lib/install.sh" "$repo_root" > "$temporary/install-stdout" 2> "$temporary/install-stderr"; then
+    exit 1
+fi
+grep -F 'cannot install toolchain resources over their source directory' "$temporary/install-stderr" >/dev/null
 
 mkdir -p "$temporary/toolchain/bin"
 cp "$prefix/bin/goml" "$temporary/toolchain/bin/goml"

@@ -1,0 +1,361 @@
+package main;
+
+use std::io;
+use io::{Read, Write, Close};
+use std::panic;
+use std::task;
+use std::testing;
+use std::time;
+
+fn pipe_close_cause(label: string) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        label,
+        Option::Some("pipe close"),
+        Option::Some(71),
+        label,
+    )
+}
+
+fn pipe_close_join[T](work: task::Task[T]) -> T {
+    let timer = time::Timer::new(time::Duration::from_seconds(10));
+    defer {
+        let _ = timer.stop();
+    };
+    select {
+        recv(work.done()) as _ => work.join(),
+        recv(timer.done()) as _ => panic::raise("pipe close task timed out"),
+    }
+}
+
+fn pipe_close_started(signal: Channel[()]) -> () {
+    let timer = time::Timer::new(time::Duration::from_seconds(10));
+    defer {
+        let _ = timer.stop();
+    };
+    select {
+        recv(signal) as value => assert_equal(value, Option::Some(())),
+        recv(timer.done()) as _ => panic::raise("pipe close start timed out"),
+    }
+}
+
+fn check_pipe_close_states() -> () {
+    for custom in[false, true] {
+        let (reader, writer) = io::pipe();
+        let cause = pipe_close_cause("writer first");
+        testing::expect_ok(
+            if custom {
+                writer.close_error(cause)
+            } else {
+                writer.close()
+            },
+            "writer close",
+        );
+        testing::expect_ok(
+            writer.close_error(pipe_close_cause("writer later")),
+            "writer repeat close",
+        );
+        testing::expect_ok(writer.close(), "writer repeat normal close");
+        for length in[0, 1] {
+            let output = b"?";
+            let result = reader.read(output.slice_mut(0, length));
+            if custom {
+                assert_equal(testing::expect_err(result, "writer cause"), cause);
+            } else {
+                assert_equal(testing::expect_ok(result, "writer EOF"), 0);
+            }
+            assert_equal(output, b"?");
+            assert_equal(
+                testing::expect_err(writer.write(b"".as_slice()), "closed empty write").kind(),
+                io::ErrorKind::BrokenPipe,
+            );
+        }
+        testing::expect_ok(reader.close_error(pipe_close_cause("reader first")), "reader close");
+        assert_equal(
+            testing::expect_err(reader.read(b"".as_mut_slice()), "local read close wins").kind(),
+            io::ErrorKind::BrokenPipe,
+        );
+    }
+    let (reader, writer) = io::pipe();
+    let cause = pipe_close_cause("reader first");
+    testing::expect_ok(reader.close_error(cause), "reader custom close");
+    testing::expect_ok(
+        reader.close_error(pipe_close_cause("reader later")),
+        "reader repeated custom",
+    );
+    testing::expect_ok(reader.close(), "reader repeated normal");
+    for input in[b"", b"x"] {
+        let error = testing::expect_err(
+            writer.write_progress(input.as_slice()),
+            "reader cause to writer",
+        );
+        assert_equal(error.error(), cause);
+        assert_equal(error.transferred(), 0.to_usize());
+    }
+    testing::expect_ok(writer.close_error(pipe_close_cause("writer own")), "writer own close");
+    assert_equal(
+        testing::expect_err(writer.write(b"".as_slice()), "writer local close wins").kind(),
+        io::ErrorKind::BrokenPipe,
+    );
+    let (reader, writer) = io::pipe();
+    testing::expect_ok(reader.close(), "normal reader close");
+    assert_equal(
+        testing::expect_err(writer.write(b"x".as_slice()), "normal reader broken pipe").kind(),
+        io::ErrorKind::BrokenPipe,
+    );
+    testing::expect_ok(writer.close(), "finish closed reader");
+}
+
+fn check_pipe_close_waiting_readers() -> () {
+    for local in[false, true] {
+        for custom in[false, true] {
+            task::scope(
+                |scope: task::Scope| {
+                    let (reader, writer) = io::pipe();
+                    defer {
+                        let _ = reader.close();
+                        let _ = writer.close();
+                    };
+                    let started: Channel[()] = Channel::new(1);
+                    let waiting = scope.spawn(
+                        |_: task::CancelToken| {
+                            let output = b"?";
+                            started.send(());
+                            let result = reader.read(output.as_mut_slice());
+                            (result, output)
+                        },
+                    );
+                    pipe_close_started(started);
+                    let cause = pipe_close_cause("unblock read");
+                    testing::expect_ok(
+                        if local {
+                            reader.close_error(cause)
+                        } else if custom {
+                            writer.close_error(cause)
+                        } else {
+                            writer.close()
+                        },
+                        "unblock waiting reader",
+                    );
+                    let result = pipe_close_join(waiting);
+                    assert_equal(result.1, b"?");
+                    if local {
+                        assert_equal(
+                            testing::expect_err(result.0, "reader own closed").kind(),
+                            io::ErrorKind::BrokenPipe,
+                        );
+                    } else if custom {
+                        assert_equal(testing::expect_err(result.0, "reader peer cause"), cause);
+                    } else {
+                        assert_equal(testing::expect_ok(result.0, "reader peer EOF"), 0);
+                    }
+                },
+            );
+        }
+    }
+}
+
+fn check_pipe_close_pending() -> () {
+    for local_writer in[false, true] {
+        task::scope(
+            |scope: task::Scope| {
+                let (reader, writer) = io::pipe();
+                defer {
+                    let _ = reader.close();
+                    let _ = writer.close();
+                };
+                let waiting = scope.spawn(
+                    |_: task::CancelToken| writer.write_progress(b"abcd".as_slice()),
+                );
+                let prefix = scope.spawn(
+                    |_: task::CancelToken| {
+                        let output = b"??";
+                        let count = reader.read(output.as_mut_slice());
+                        (count, output)
+                    },
+                );
+                let prefix = pipe_close_join(prefix);
+                assert_equal(testing::expect_ok(prefix.0, "pipe prefix"), 2);
+                assert_equal(prefix.1, b"ab");
+                let reader_cause = pipe_close_cause("pending reader close");
+                let writer_cause = pipe_close_cause("pending writer close");
+                if local_writer {
+                    testing::expect_ok(writer.close_error(writer_cause), "abort own pending write");
+                    assert_equal(
+                        testing::expect_err(
+                            reader.read(b"".as_mut_slice()),
+                            "writer custom only to reader",
+                        ),
+                        writer_cause,
+                    );
+                    testing::expect_ok(reader.close_error(reader_cause), "later reader close");
+                } else {
+                    testing::expect_ok(reader.close_error(reader_cause), "abort peer pending write");
+                    testing::expect_ok(writer.close_error(writer_cause), "later writer close");
+                }
+                let error = testing::expect_err(pipe_close_join(waiting), "pending transfer stops");
+                assert_equal(error.transferred(), 2.to_usize());
+                if local_writer {
+                    assert_equal(error.error().kind(), io::ErrorKind::BrokenPipe);
+                } else {
+                    assert_equal(error.error(), reader_cause);
+                }
+            },
+        );
+    }
+}
+
+fn check_pipe_close_competing() -> () {
+    for local_writer in[false, true] {
+        task::scope(
+            |scope: task::Scope| {
+                let (reader, writer) = io::pipe();
+                defer {
+                    let _ = reader.close();
+                    let _ = writer.close();
+                };
+                let first = scope.spawn(
+                    |_: task::CancelToken| writer.write_progress(b"abcd".as_slice()),
+                );
+                let prefix = scope.spawn(
+                    |_: task::CancelToken| {
+                        let output = b"?";
+                        reader.read(output.as_mut_slice())
+                    },
+                );
+                assert_equal(testing::expect_ok(pipe_close_join(prefix), "publish first packet"), 1);
+                let started: Channel[()] = Channel::new(2);
+                let second = scope.spawn(
+                    |_: task::CancelToken| {
+                        started.send(());
+                        writer.write_progress(b"ef".as_slice())
+                    },
+                );
+                let third = scope.spawn(
+                    |_: task::CancelToken| {
+                        started.send(());
+                        writer.write_progress(b"gh".as_slice())
+                    },
+                );
+                pipe_close_started(started);
+                pipe_close_started(started);
+                let cause = pipe_close_cause("competing close");
+                testing::expect_ok(
+                    if local_writer {
+                        writer.close_error(cause)
+                    } else {
+                        reader.close_error(cause)
+                    },
+                    "close competing writers",
+                );
+                let errors = [
+                    testing::expect_err(pipe_close_join(first), "first writer released"),
+                    testing::expect_err(pipe_close_join(second), "second writer released"),
+                    testing::expect_err(pipe_close_join(third), "third writer released"),
+                ];
+                for index in 0..3 {
+                    assert_equal(
+                        errors[index].transferred(),
+                        (if index == 0 {
+                            1
+                        } else {
+                            0
+                        }).to_usize(),
+                    );
+                    if local_writer {
+                        assert_equal(errors[index].error().kind(), io::ErrorKind::BrokenPipe);
+                    } else {
+                        assert_equal(errors[index].error(), cause);
+                    }
+                }
+            },
+        );
+    }
+}
+
+fn check_pipe_close_completed() -> () {
+    task::scope(
+        |scope: task::Scope| {
+            let (reader, writer) = io::pipe();
+            defer {
+                let _ = reader.close();
+                let _ = writer.close();
+            };
+            let pending = scope.spawn(
+                |_: task::CancelToken| writer.write_progress(b"ab".as_slice()),
+            );
+            let reading = scope.spawn(
+                |_: task::CancelToken| {
+                    let output = b"??";
+                    let count = reader.read(output.as_mut_slice());
+                    (count, output)
+                },
+            );
+            let result = pipe_close_join(reading);
+            assert_equal(testing::expect_ok(result.0, "complete packet"), 2);
+            assert_equal(result.1, b"ab");
+            testing::expect_ok(
+                reader.close_error(pipe_close_cause("after success reader")),
+                "close after completion",
+            );
+            testing::expect_ok(
+                writer.close_error(pipe_close_cause("after success writer")),
+                "close after completion",
+            );
+            assert_equal(
+                testing::expect_ok(pipe_close_join(pending), "completion is irrevocable"),
+                2,
+            );
+        },
+    );
+}
+
+fn check_pipe_close_racing() -> () {
+    for _ in 0..16 {
+        task::scope(
+            |scope: task::Scope| {
+                let (reader, writer) = io::pipe();
+                defer {
+                    let _ = reader.close();
+                    let _ = writer.close();
+                };
+                let pending = scope.spawn(
+                    |_: task::CancelToken| writer.write_progress(b"abcd".as_slice()),
+                );
+                let reading = scope.spawn(|_: task::CancelToken| reader.read(b"??".as_mut_slice()));
+                assert_equal(testing::expect_ok(pipe_close_join(reading), "racing prefix"), 2);
+                let gate: Channel[()] = Channel::new(0);
+                let cause = pipe_close_cause("racing reader");
+                let closing_reader = scope.spawn(
+                    |_: task::CancelToken| {
+                        let _ = gate.recv();
+                        reader.close_error(cause)
+                    },
+                );
+                let closing_writer = scope.spawn(
+                    |_: task::CancelToken| {
+                        let _ = gate.recv();
+                        writer.close_error(pipe_close_cause("racing writer"))
+                    },
+                );
+                gate.close();
+                testing::expect_ok(pipe_close_join(closing_reader), "racing reader closed");
+                testing::expect_ok(pipe_close_join(closing_writer), "racing writer closed");
+                let error = testing::expect_err(pipe_close_join(pending), "racing pending released");
+                assert_equal(error.transferred(), 2.to_usize());
+                testing::assert(
+                    error.error() == cause || error.error().kind() == io::ErrorKind::BrokenPipe,
+                );
+            },
+        );
+    }
+}
+
+fn check_io_pipe_close() -> () {
+    check_pipe_close_states();
+    check_pipe_close_waiting_readers();
+    check_pipe_close_pending();
+    check_pipe_close_competing();
+    check_pipe_close_completed();
+    check_pipe_close_racing();
+}

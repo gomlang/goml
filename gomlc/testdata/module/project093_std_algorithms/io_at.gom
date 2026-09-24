@@ -1,0 +1,599 @@
+package main;
+
+use std::bytes;
+use std::io;
+use std::io::{ReadAt, WriteAt, Read, Write, BufRead};
+use std::testing;
+
+struct ProbeAt {
+    result: Result[isize, io::TransferError],
+    calls: Ref[isize],
+}
+
+impl ReadAt for ProbeAt {
+    fn read_at(self: ProbeAt, buffer: MutSlice[byte], offset: isize) -> Result[
+        isize,
+        io::TransferError,
+    ] {
+        self.calls.set(self.calls.get() + 1);
+        self.result
+    }
+}
+
+impl WriteAt for ProbeAt {
+    fn write_at(self: ProbeAt, buffer: Slice[byte], offset: isize) -> Result[
+        isize,
+        io::TransferError,
+    ] {
+        self.calls.set(self.calls.get() + 1);
+        self.result
+    }
+}
+
+fn check_transfer_error[T](result: Result[T, io::TransferError], count: usize, kind: io::ErrorKind) -> () {
+    match result {
+        Err(error) => {
+            assert_equal(error.transferred(), count);
+            assert_equal(error.error().kind(), kind);
+        },
+        Ok(_) => testing::assert(false),
+    }
+}
+
+fn check_io_at() -> () {
+    check_cursor_limits();
+    check_offset_writer();
+    check_section_reader();
+    let initial = b"abcdef";
+    for offset in 0..9 {
+        for length in 0..9 {
+            let cursor = io::Cursor::new(bytes::Bytes::from_vec(initial.copy()));
+            testing::expect_ok(cursor.set_position(2), "position");
+            let output = Vec::new();
+            for _ in 0..length {
+                output.push(b'?');
+            }
+            let count = if offset >= 6 {
+                0
+            } else if length < 6 - offset {
+                length
+            } else {
+                6 - offset
+            };
+            let result = cursor.read_at(output.as_mut_slice(), offset);
+            if count == length {
+                assert_equal(testing::expect_ok(result, "read at"), count);
+            } else {
+                check_transfer_error(result, count.to_usize(), io::ErrorKind::UnexpectedEof);
+            }
+            for index in 0..length {
+                assert_equal(
+                    output[index],
+                    if index < count {
+                        initial[offset + index]
+                    } else {
+                        b'?'
+                    },
+                );
+            }
+            assert_equal(cursor.position(), 2);
+        }
+    }
+    for start in 0..7 {
+        for end in start..7 {
+            for destination in 0..7 {
+                for positional in[false, true] {
+                    let cursor = io::Cursor::new(bytes::Bytes::from_vec(initial.copy()));
+                    let source = testing::expect_ok(cursor.fill_buf(), "view").sub(start, end);
+                    let expected = initial.copy();
+                    for index in 0..end - start {
+                        let target = destination + index;
+                        if target < expected.len() {
+                            expected[target] = initial[start + index];
+                        } else {
+                            expected.push(initial[start + index]);
+                        }
+                    }
+                    testing::expect_ok(cursor.set_position(destination), "destination");
+                    if positional {
+                        assert_equal(
+                            testing::expect_ok(cursor.write_at(source, destination), "write at"),
+                            end - start,
+                        );
+                        assert_equal(cursor.position(), destination);
+                    } else {
+                        assert_equal(testing::expect_ok(cursor.write(source), "write"), end - start);
+                        assert_equal(cursor.position(), destination + end - start);
+                    }
+                    assert_equal(cursor.bytes().to_vec(), expected);
+                }
+            }
+        }
+    }
+    let cursor = io::Cursor::new(bytes::Bytes::from_vec(initial.copy()));
+    let output = b"???";
+    for offset in[-1, 9223372036854775807] {
+        check_transfer_error(
+            cursor.read_at(output.as_mut_slice(), offset),
+            0,
+            io::ErrorKind::InvalidInput,
+        );
+        check_transfer_error(
+            cursor.write_at(initial.as_slice(), offset),
+            0,
+            io::ErrorKind::InvalidInput,
+        );
+        assert_equal(output, b"???");
+        assert_equal(cursor.bytes().to_vec(), initial);
+    }
+    check_transfer_error(cursor.write_at(initial.as_slice(), 7), 0, io::ErrorKind::InvalidInput);
+    for count in[-1, 0, 2, 3, 4] {
+        let probe = ProbeAt { result: Result::Ok(count), calls: Ref::new(0) };
+        let read = probe.read_exact_at(output.as_mut_slice(), 0);
+        let write = probe.write_all_at(output.as_slice(), 0);
+        if count == 3 {
+            testing::expect_ok(read, "full read");
+            testing::expect_ok(write, "full write");
+        } else {
+            let valid = count >= 0 && count <= 3;
+            check_transfer_error(
+                read,
+                if valid {
+                    count.to_usize()
+                } else {
+                    0
+                },
+                if valid {
+                    io::ErrorKind::UnexpectedEof
+                } else {
+                    io::ErrorKind::InvalidData
+                },
+            );
+            check_transfer_error(
+                write,
+                if valid {
+                    count.to_usize()
+                } else {
+                    0
+                },
+                io::ErrorKind::InvalidData,
+            );
+        }
+        assert_equal(probe.calls.get(), 2);
+    }
+    for count in[0, 2, 3, 4] {
+        let error = io::Error::new(
+            io::ErrorKind::Interrupted,
+            "probe",
+            Option::None,
+            Option::None,
+            "stop",
+        );
+        let probe = ProbeAt {
+            result: Result::Err(io::TransferError::new(count.to_usize(), error)),
+            calls: Ref::new(0),
+        };
+        let kind = if count <= 3 {
+            io::ErrorKind::Interrupted
+        } else {
+            io::ErrorKind::InvalidData
+        };
+        let progress = if count <= 3 {
+            count.to_usize()
+        } else {
+            0
+        };
+        check_transfer_error(probe.read_exact_at(output.as_mut_slice(), 0), progress, kind);
+        check_transfer_error(probe.write_all_at(output.as_slice(), 0), progress, kind);
+        assert_equal(probe.calls.get(), 2);
+        check_transfer_error(
+            probe.read_exact_at(output.as_mut_slice(), -1),
+            0,
+            io::ErrorKind::InvalidInput,
+        );
+        check_transfer_error(
+            probe.write_all_at(output.as_slice(), 9223372036854775807),
+            0,
+            io::ErrorKind::InvalidInput,
+        );
+        assert_equal(probe.calls.get(), 2);
+    }
+}
+
+fn check_cursor_limits() -> () {
+    let destination = testing::expect_ok(
+        io::Cursor::with_limit(bytes::Bytes::from_string("abc"), 5),
+        "buffered destination",
+    );
+    testing::expect_ok(destination.set_position(3), "append position");
+    let buffered = testing::expect_ok(
+        io::BufWriter::with_capacity(destination, 8),
+        "buffered bounded cursor",
+    );
+    let repaired = testing::expect_ok(
+        bytes::replace_invalid_utf8(b"x\xff\x80z".as_slice(), b"y".as_slice(), 3),
+        "repair stream input",
+    );
+    testing::expect_ok(buffered.write_all(repaired.as_slice()), "buffer repaired bytes");
+    repaired.set(0, b'!');
+    for _ in 0..2 {
+        testing::assert(buffered.flush().is_err());
+        assert_equal(buffered.buffered_len(), 3);
+        assert_equal(destination.position(), 3);
+        assert_equal(destination.bytes().to_vec(), b"abc");
+    }
+    testing::expect_ok(destination.set_position(0), "retry overwrite position");
+    testing::expect_ok(buffered.flush(), "retry buffered overwrite");
+    assert_equal(buffered.buffered_len(), 0);
+    assert_equal(destination.bytes().to_vec(), b"xyz");
+    testing::expect_ok(destination.set_position(0), "read repaired bytes");
+    let reader = testing::expect_ok(
+        io::BufReader::with_capacity(destination, 1),
+        "fragmented repaired read",
+    );
+    assert_equal(testing::expect_ok(reader.read_to_end(3), "read bounded result").to_vec(), b"xyz");
+    testing::assert(io::Cursor::with_limit(bytes::Bytes::new(), -1).is_err());
+    testing::assert(io::Cursor::with_limit(bytes::Bytes::from_string("a"), 0).is_err());
+    let empty = testing::expect_ok(
+        io::Cursor::with_limit(bytes::Bytes::new(), 0),
+        "empty bounded cursor",
+    );
+    assert_equal(testing::expect_ok(empty.write(b"".as_slice()), "empty write"), 0);
+    testing::assert(empty.write(b"a".as_slice()).is_err());
+    assert_equal(empty.position(), 0);
+    assert_equal(empty.bytes().len(), 0);
+    for limit in 6..11 {
+        for start in 0..7 {
+            for end in start..7 {
+                for destination in 0..7 {
+                    for positional in[false, true] {
+                        let initial = bytes::Bytes::from_string("abcdef");
+                        let cursor = testing::expect_ok(
+                            io::Cursor::with_limit(initial, limit),
+                            "bounded cursor",
+                        );
+                        initial.set(0, b'z');
+                        let alias = cursor;
+                        assert_equal(alias.limit(), limit);
+                        let original = cursor.bytes().to_vec();
+                        let view = testing::expect_ok(cursor.fill_buf(), "bounded view").sub(
+                            start,
+                            end,
+                        );
+                        testing::expect_ok(cursor.set_position(destination), "bounded seek");
+                        let count = end - start;
+                        if destination + count > limit {
+                            if positional {
+                                check_transfer_error(
+                                    cursor.write_at(view, destination),
+                                    0,
+                                    io::ErrorKind::InvalidData,
+                                );
+                            } else {
+                                match cursor.write(view) {
+                                    Err(error) => assert_equal(
+                                        error.kind(),
+                                        io::ErrorKind::InvalidData,
+                                    ),
+                                    Ok(_) => testing::fail("over-limit write succeeded"),
+                                }
+                            }
+                            assert_equal(alias.position(), destination);
+                            assert_equal(alias.bytes().to_vec(), original);
+                        } else {
+                            if positional {
+                                assert_equal(
+                                    testing::expect_ok(
+                                        cursor.write_at(view, destination),
+                                        "bounded positional write",
+                                    ),
+                                    count,
+                                );
+                                assert_equal(alias.position(), destination);
+                            } else {
+                                assert_equal(
+                                    testing::expect_ok(
+                                        cursor.write(view),
+                                        "bounded sequential write",
+                                    ),
+                                    count,
+                                );
+                                assert_equal(alias.position(), destination + count);
+                            }
+                            let expected = original.copy();
+                            for index in 0..count {
+                                let target = destination + index;
+                                if target < expected.len() {
+                                    expected[target] = original[start + index];
+                                } else {
+                                    expected.push(original[start + index]);
+                                }
+                            }
+                            assert_equal(alias.bytes().to_vec(), expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn check_offset_writer() -> () {
+    for base in 0..7 {
+        for offset in 0..7 - base {
+            let cursor = io::Cursor::new(bytes::Bytes::from_vec(b"abcdef"));
+            let writer = testing::expect_ok(io::OffsetWriter::new(cursor, base), "offset writer");
+            testing::expect_ok(writer.set_position(offset), "offset seek");
+            testing::expect_ok(writer.write_all(b"XYZ".as_slice()), "offset write all");
+            assert_equal(writer.position(), offset + 3);
+            assert_equal(cursor.position(), 0);
+            let expected = b"abcdef";
+            for index in 0..3 {
+                let target = base + offset + index;
+                if target < expected.len() {
+                    expected[target] = b"XYZ"[index];
+                } else {
+                    expected.push(b"XYZ"[index]);
+                }
+            }
+            assert_equal(cursor.bytes().to_vec(), expected);
+            let alias = writer;
+            testing::expect_ok(alias.set_position(0), "shared offset seek");
+            assert_equal(writer.position(), 0);
+            testing::expect_ok(writer.write_at(b"!".as_slice(), offset), "positional offset write");
+            assert_equal(writer.position(), 0);
+            let nested = testing::expect_ok(io::OffsetWriter::new(writer, offset), "nested writer");
+            testing::expect_ok(nested.write_all(b"?".as_slice()), "nested write");
+            assert_equal(cursor.bytes().get(base + offset), b'?');
+            assert_equal(writer.position(), 0);
+        }
+    }
+    let output = b"abc";
+    let failure = io::Error::new(
+        io::ErrorKind::Interrupted,
+        "offset probe",
+        Option::None,
+        Option::None,
+        "stop",
+    );
+    for count in[0, 2, 3, 4] {
+        let probe = ProbeAt {
+            result: Result::Err(io::TransferError::new(count.to_usize(), failure)),
+            calls: Ref::new(0),
+        };
+        let writer = testing::expect_ok(io::OffsetWriter::new(probe, 10), "probe writer");
+        match writer.write_all(output.as_slice()) {
+            Err(error) => {
+                if count <= 3 {
+                    assert_equal(error, failure);
+                } else {
+                    assert_equal(error.kind(), io::ErrorKind::InvalidData);
+                }
+            },
+            Ok(_) => testing::assert(false),
+        }
+        assert_equal(
+            writer.position(),
+            if count <= 3 {
+                count
+            } else {
+                0
+            },
+        );
+        assert_equal(probe.calls.get(), 1);
+        let position = writer.position();
+        check_transfer_error(writer.write_at(output.as_slice(), -1), 0, io::ErrorKind::InvalidInput);
+        check_transfer_error(
+            writer.write_at(output.as_slice(), 9223372036854775807),
+            0,
+            io::ErrorKind::InvalidInput,
+        );
+        testing::assert(writer.set_position(-1).is_err());
+        testing::assert(writer.set_position(9223372036854775807).is_err());
+        assert_equal(writer.position(), position);
+        assert_equal(probe.calls.get(), 1);
+    }
+    for count in[-1, 0, 2, 3, 4] {
+        let probe = ProbeAt { result: Result::Ok(count), calls: Ref::new(0) };
+        let writer = testing::expect_ok(io::OffsetWriter::new(probe, 0), "count writer");
+        let result = writer.write(output.as_slice());
+        if count == 3 {
+            assert_equal(testing::expect_ok(result, "full offset write"), 3);
+        } else {
+            testing::assert(result.is_err());
+        }
+        assert_equal(
+            writer.position(),
+            if count >= 0 && count <= 3 {
+                count
+            } else {
+                0
+            },
+        );
+    }
+    let probe = ProbeAt { result: Result::Ok(0), calls: Ref::new(0) };
+    testing::assert(io::OffsetWriter::new(probe, -1).is_err());
+    let writer = testing::expect_ok(
+        io::OffsetWriter::new(probe, 9223372036854775807),
+        "maximum base",
+    );
+    check_transfer_error(writer.write_at(output.as_slice(), 0), 0, io::ErrorKind::InvalidInput);
+    assert_equal(probe.calls.get(), 0);
+    let empty: Vec[byte] = Vec::new();
+    testing::expect_ok(writer.write_all(empty.as_slice()), "maximum empty write");
+    assert_equal(probe.calls.get(), 1);
+}
+
+fn check_section_reader() -> () {
+    check_section_errors();
+    let data = b"abcdefgh";
+    let cursor = io::Cursor::new(bytes::Bytes::from_vec(data));
+    for start in 0..9 {
+        for length in 0..9 - start {
+            let section = testing::expect_ok(
+                io::SectionReader::new(cursor, start, length),
+                "section",
+            );
+            assert_equal(section.size(), length);
+            for offset in 0..length + 2 {
+                for capacity in 0..10 {
+                    let output = Vec::new();
+                    for _ in 0..capacity {
+                        output.push(b'?');
+                    }
+                    let available = if offset < length {
+                        length - offset
+                    } else {
+                        0
+                    };
+                    let count = if capacity < available {
+                        capacity
+                    } else {
+                        available
+                    };
+                    let result = section.read_at(output.as_mut_slice(), offset);
+                    if count == capacity {
+                        assert_equal(testing::expect_ok(result, "section read at"), count);
+                    } else {
+                        check_transfer_error(result, count.to_usize(), io::ErrorKind::UnexpectedEof);
+                    }
+                    for index in 0..capacity {
+                        assert_equal(
+                            output[index],
+                            if index < count {
+                                data[start + offset + index]
+                            } else {
+                                b'?'
+                            },
+                        );
+                    }
+                    assert_equal(section.position(), 0);
+                }
+            }
+            let output = b"??????????";
+            assert_equal(
+                testing::expect_ok(section.read(output.as_mut_slice()), "section read"),
+                length,
+            );
+            assert_equal(section.position(), length);
+            assert_equal(testing::expect_ok(section.read(output.as_mut_slice()), "section eof"), 0);
+            testing::expect_ok(section.set_position(0), "section seek");
+            let alias = section;
+            testing::expect_ok(alias.read(output.as_mut_slice()), "shared section read");
+            assert_equal(section.position(), length);
+            assert_equal(cursor.position(), 0);
+        }
+    }
+    let outer = testing::expect_ok(io::SectionReader::new(cursor, 2, 4), "outer");
+    let inner = testing::expect_ok(io::SectionReader::new(outer, 1, 2), "inner");
+    let output = b"??";
+    testing::expect_ok(inner.read_exact_at(output.as_mut_slice(), 0), "nested section");
+    assert_equal(output, b"de");
+    assert_equal(outer.position(), 0);
+    for start in[-1, 9223372036854775807] {
+        testing::assert(io::SectionReader::new(cursor, start, 2).is_err());
+    }
+    testing::assert(io::SectionReader::new(cursor, 0, -1).is_err());
+    let short = testing::expect_ok(io::SectionReader::new(cursor, 6, 4), "short backing store");
+    let large = b"????";
+    assert_equal(testing::expect_ok(short.read(large.as_mut_slice()), "partial read"), 2);
+    assert_equal(large, b"gh??");
+    assert_equal(short.position(), 2);
+    let empty: Vec[byte] = Vec::new();
+    assert_equal(testing::expect_ok(short.read(empty.as_mut_slice()), "empty read"), 0);
+    match short.read(large.as_mut_slice()) {
+        Err(error) => assert_equal(error.kind(), io::ErrorKind::UnexpectedEof),
+        Ok(_) => testing::assert(false),
+    }
+    testing::expect_ok(short.set_position(0), "rewind short section");
+    assert_equal(testing::expect_ok(short.read(large.as_mut_slice()), "partial again"), 2);
+    testing::assert(short.set_position(5).is_err());
+    testing::expect_ok(short.set_position(4), "clear pending error");
+    assert_equal(testing::expect_ok(short.read(large.as_mut_slice()), "logical eof"), 0);
+    for count in[-1, 1, 4] {
+        let probe = ProbeAt { result: Result::Ok(count), calls: Ref::new(0) };
+        let section = testing::expect_ok(io::SectionReader::new(probe, 10, 3), "probe section");
+        check_transfer_error(
+            section.read_at(large.as_mut_slice(), 0),
+            if count == 1 {
+                1
+            } else {
+                0
+            },
+            if count == 1 {
+                io::ErrorKind::UnexpectedEof
+            } else {
+                io::ErrorKind::InvalidData
+            },
+        );
+        assert_equal(probe.calls.get(), 1);
+        check_transfer_error(
+            section.read_at(large.as_mut_slice(), -1),
+            0,
+            io::ErrorKind::InvalidInput,
+        );
+        assert_equal(probe.calls.get(), 1);
+    }
+}
+
+fn check_section_errors() -> () {
+    let output = b"???";
+    let empty: Vec[byte] = Vec::new();
+    let failure = io::Error::new(
+        io::ErrorKind::Interrupted,
+        "section probe",
+        Option::None,
+        Option::None,
+        "stop",
+    );
+    for count in[0, 2, 3, 4] {
+        let probe = ProbeAt {
+            result: Result::Err(io::TransferError::new(count.to_usize(), failure)),
+            calls: Ref::new(0),
+        };
+        let section = testing::expect_ok(io::SectionReader::new(probe, 10, 3), "error section");
+        if count > 0 && count <= 3 {
+            assert_equal(
+                testing::expect_ok(section.read(output.as_mut_slice()), "error progress"),
+                count,
+            );
+            assert_equal(section.position(), count);
+            assert_equal(probe.calls.get(), 1);
+            assert_equal(testing::expect_ok(section.read(empty.as_mut_slice()), "empty pending"), 0);
+            testing::assert(section.set_position(-1).is_err());
+            match section.read(output.as_mut_slice()) {
+                Err(error) => assert_equal(error, failure),
+                Ok(_) => testing::assert(false),
+            }
+            assert_equal(probe.calls.get(), 1);
+        } else {
+            match section.read(output.as_mut_slice()) {
+                Err(error) => assert_equal(
+                    error.kind(),
+                    if count == 0 {
+                        io::ErrorKind::Interrupted
+                    } else {
+                        io::ErrorKind::InvalidData
+                    },
+                ),
+                Ok(_) => testing::assert(false),
+            }
+            assert_equal(section.position(), 0);
+        }
+        testing::expect_ok(section.set_position(0), "reset error section");
+        check_transfer_error(
+            section.read_at(output.as_mut_slice(), 0),
+            if count <= 3 {
+                count.to_usize()
+            } else {
+                0
+            },
+            if count <= 3 {
+                io::ErrorKind::Interrupted
+            } else {
+                io::ErrorKind::InvalidData
+            },
+        );
+        assert_equal(section.position(), 0);
+    }
+}

@@ -1,0 +1,362 @@
+package json;
+
+use module::io;
+use module::utf8;
+
+fn stream_number_step(state: isize, value: byte) -> isize {
+    let digit = value >= b'0' && value <= b'9';
+    match state {
+        0 => if value == b'-' {
+            1
+        } else if value == b'0' {
+            2
+        } else if value >= b'1' && value <= b'9' {
+            3
+        } else {
+            -1
+        },
+        1 => if value == b'0' {
+            2
+        } else if value >= b'1' && value <= b'9' {
+            3
+        } else {
+            -1
+        },
+        2 => if value == b'.' {
+            4
+        } else if value == b'e' || value == b'E' {
+            6
+        } else {
+            -1
+        },
+        3 => if digit {
+            3
+        } else if value == b'.' {
+            4
+        } else if value == b'e' || value == b'E' {
+            6
+        } else {
+            -1
+        },
+        4 => if digit {
+            5
+        } else {
+            -1
+        },
+        5 => if digit {
+            5
+        } else if value == b'e' || value == b'E' {
+            6
+        } else {
+            -1
+        },
+        6 => if value == b'+' || value == b'-' {
+            7
+        } else if digit {
+            8
+        } else {
+            -1
+        },
+        7 => if digit {
+            8
+        } else {
+            -1
+        },
+        8 => if digit {
+            8
+        } else {
+            -1
+        },
+        _ => -1,
+    }
+}
+
+fn stream_number_complete(state: isize) -> bool {
+    state == 2 || state == 3 || state == 5 || state == 8
+}
+
+fn stream_valid_number(value: string) -> bool {
+    let mut state = 0;
+    for index in 0..value.byte_len() {
+        state = stream_number_step(state, value.byte_get(index));
+        if state < 0 {
+            return false
+        }
+    }
+    stream_number_complete(state)
+}
+
+fn lex_boundary(value: byte) -> bool {
+    json_whitespace(value) || value == b',' || value == b']' || value == b'}'
+}
+
+fn lex_error[R](cursor: StreamCursor[R], kind: ErrorKind, message: string) -> Error {
+    stream_fail(cursor.session, kind, message, Option::None)
+}
+
+fn lex_space[R: io::Read](cursor: StreamCursor[R], lease: StreamLease) -> Result[bool, Error] {
+    let mut found = false;
+    loop {
+        match cursor_peek(cursor, lease)? {
+            Option::Some(value) => {
+                if !json_whitespace(value) {
+                    return Result::Ok(found)
+                }
+                let _ = cursor_take(cursor, lease)?;
+                found = true;
+            },
+            Option::None => return Result::Ok(found),
+        }
+    }
+}
+
+fn lex_expect[R: io::Read](cursor: StreamCursor[R], lease: StreamLease, expected: byte) -> Result[
+    (),
+    Error,
+] {
+    match cursor_peek(cursor, lease)? {
+        Option::Some(value) => {
+            if value != expected {
+                return Result::Err(lex_error(cursor, ErrorKind::Syntax, "unexpected JSON byte"))
+            }
+            let _ = cursor_take(cursor, lease)?;
+            Result::Ok(())
+        },
+        Option::None => Result::Err(
+            lex_error(cursor, ErrorKind::UnexpectedEof, "incomplete JSON token"),
+        ),
+    }
+}
+
+fn lex_literal[R: io::Read](cursor: StreamCursor[R], lease: StreamLease, expected: string) -> Result[
+    (),
+    Error,
+] {
+    for index in 0..expected.byte_len() {
+        lex_expect(cursor, lease, expected.byte_get(index))?;
+    }
+    if let Option::Some(value) = cursor_peek(cursor, lease)? {
+        if !lex_boundary(value) {
+            return Result::Err(
+                lex_error(cursor, ErrorKind::Syntax, "invalid JSON literal boundary"),
+            )
+        }
+    }
+    Result::Ok(())
+}
+
+fn lex_number[R: io::Read](cursor: StreamCursor[R], lease: StreamLease, capture: bool) -> Result[
+    Option[string],
+    Error,
+] {
+    let output: Vec[byte] = Vec::new();
+    let mut state = 0;
+    let mut length = 0;
+    loop {
+        match cursor_peek(cursor, lease)? {
+            Option::None => {
+                if !stream_number_complete(state) {
+                    return Result::Err(
+                        lex_error(cursor, ErrorKind::UnexpectedEof, "incomplete JSON number"),
+                    )
+                }
+                break
+            },
+            Option::Some(value) => {
+                if lex_boundary(value) {
+                    if !stream_number_complete(state) {
+                        return Result::Err(
+                            lex_error(cursor, ErrorKind::Syntax, "incomplete JSON number"),
+                        )
+                    }
+                    break
+                }
+                let next = stream_number_step(state, value);
+                if next < 0 {
+                    return Result::Err(lex_error(cursor, ErrorKind::Syntax, "invalid JSON number"))
+                }
+                if length >= cursor.limits.max_number_bytes {
+                    return Result::Err(
+                        lex_error(
+                            cursor,
+                            ErrorKind::Limit(LimitKind::NumberBytes),
+                            "JSON number byte limit exceeded",
+                        ),
+                    )
+                }
+                let _ = cursor_take(cursor, lease)?;
+                if capture {
+                    output.push(value);
+                }
+                length += 1;
+                state = next;
+            },
+        }
+    }
+    Result::Ok(
+        if capture {
+            Option::Some(string_from_utf8(output).1)
+        } else {
+            Option::None
+        },
+    )
+}
+
+fn lex_hex_quad[R: io::Read](cursor: StreamCursor[R], lease: StreamLease) -> Result[u32, Error] {
+    let mut result: u32 = 0;
+    for _ in 0..4 {
+        let value = match cursor_peek(cursor, lease)? {
+            Option::Some(value) => value,
+            Option::None => return Result::Err(
+                lex_error(cursor, ErrorKind::UnexpectedEof, "incomplete JSON unicode escape"),
+            ),
+        };
+        let digit = match hex_digit(value) {
+            Option::Some(digit) => digit,
+            Option::None => return Result::Err(
+                lex_error(cursor, ErrorKind::Syntax, "invalid JSON unicode escape"),
+            ),
+        };
+        let _ = cursor_take(cursor, lease)?;
+        result = result * 16 + digit;
+    }
+    Result::Ok(result)
+}
+
+fn lex_escape[R: io::Read](cursor: StreamCursor[R], lease: StreamLease) -> Result[char, Error] {
+    let value = match cursor_peek(cursor, lease)? {
+        Option::Some(value) => value,
+        Option::None => return Result::Err(
+            lex_error(cursor, ErrorKind::UnexpectedEof, "incomplete JSON escape"),
+        ),
+    };
+    let character = match value {
+        b'"' => '"',
+        b'\\' => '\\',
+        b'/' => '/',
+        b'b' => '\u0008',
+        b'f' => '\u000c',
+        b'n' => '\n',
+        b'r' => '\r',
+        b't' => '\t',
+        b'u' => {
+            let _ = cursor_take(cursor, lease)?;
+            let first_start = cursor.session.offset.get();
+            let first = lex_hex_quad(cursor, lease)?;
+            let codepoint = if first >= 0xd800 && first <= 0xdbff {
+                lex_expect(cursor, lease, b'\\')?;
+                lex_expect(cursor, lease, b'u')?;
+                let second_start = cursor.session.offset.get();
+                let second = lex_hex_quad(cursor, lease)?;
+                if second < 0xdc00 || second > 0xdfff {
+                    return Result::Err(
+                        stream_fail_at(
+                            cursor.session,
+                            ErrorKind::Syntax,
+                            "invalid JSON low surrogate",
+                            Option::None,
+                            second_start,
+                            cursor.session.path,
+                        ),
+                    )
+                }
+                0x10000 + (first - 0xd800) * 0x400 + second - 0xdc00
+            } else if first >= 0xdc00 && first <= 0xdfff {
+                return Result::Err(
+                    stream_fail_at(
+                        cursor.session,
+                        ErrorKind::Syntax,
+                        "unexpected JSON low surrogate",
+                        Option::None,
+                        first_start,
+                        cursor.session.path,
+                    ),
+                )
+            } else {
+                first
+            };
+            return match char_from_u32(codepoint) {
+                Option::Some(character) => Result::Ok(character),
+                Option::None => Result::Err(
+                    lex_error(cursor, ErrorKind::Syntax, "invalid JSON unicode scalar"),
+                ),
+            }
+        },
+        _ => return Result::Err(lex_error(cursor, ErrorKind::Syntax, "invalid JSON escape")),
+    };
+    let _ = cursor_take(cursor, lease)?;
+    Result::Ok(character)
+}
+
+fn lex_string[R: io::Read](cursor: StreamCursor[R], lease: StreamLease, capture: bool) -> Result[
+    Option[string],
+    Error,
+] {
+    lex_expect(cursor, lease, b'"')?;
+    let output: Vec[byte] = Vec::new();
+    let decoder = utf8::Decoder::new();
+    let mut length = 0;
+    loop {
+        let value = match cursor_peek(cursor, lease)? {
+            Option::Some(value) => value,
+            Option::None => return Result::Err(
+                lex_error(cursor, ErrorKind::UnexpectedEof, "unterminated JSON string"),
+            ),
+        };
+        if value == b'"' {
+            let _ = cursor_take(cursor, lease)?;
+            return Result::Ok(
+                if capture {
+                    Option::Some(string_from_utf8(output).1)
+                } else {
+                    Option::None
+                },
+            )
+        }
+        if value < b' ' {
+            return Result::Err(lex_error(cursor, ErrorKind::Syntax, "unescaped JSON control byte"))
+        }
+        let scalar_start = cursor.session.offset.get();
+        let character = if value == b'\\' {
+            let _ = cursor_take(cursor, lease)?;
+            lex_escape(cursor, lease)?
+        } else {
+            decoder.reset();
+            loop {
+                let value = match cursor_peek(cursor, lease)? {
+                    Option::Some(value) => value,
+                    Option::None => return Result::Err(
+                        lex_error(cursor, ErrorKind::UnexpectedEof, "incomplete JSON UTF-8 scalar"),
+                    ),
+                };
+                let decoded = decoder.feed(value).map_err(
+                    |_| lex_error(cursor, ErrorKind::Utf8, "invalid JSON UTF-8 scalar"),
+                )?;
+                let _ = cursor_take(cursor, lease)?;
+                if let Option::Some(character) = decoded {
+                    break character
+                }
+            }
+        };
+        let width = utf8::encoded_len(character);
+        if width > cursor.limits.max_string_bytes - length {
+            return Result::Err(
+                stream_fail_at(
+                    cursor.session,
+                    ErrorKind::Limit(LimitKind::StringBytes),
+                    "JSON decoded string byte limit exceeded",
+                    Option::None,
+                    scalar_start,
+                    cursor.session.path,
+                ),
+            )
+        }
+        length += width;
+        if capture {
+            let encoded = utf8::encode_char(character);
+            for byte in encoded {
+                output.push(byte);
+            }
+        }
+    }
+}

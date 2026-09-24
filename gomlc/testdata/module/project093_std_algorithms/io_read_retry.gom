@@ -1,0 +1,206 @@
+package main;
+
+use std::io;
+use io::{Read, ReadAt, Write};
+use std::bytes;
+use std::testing;
+
+fn read_retry_error(kind: io::ErrorKind) -> io::Error {
+    io::Error::new(
+        kind,
+        "read retry probe",
+        Option::Some("source"),
+        Option::Some(91),
+        "injected read failure",
+    )
+}
+
+struct ReadRetryProbe {
+    calls: Ref[isize],
+    consumed: Ref[isize],
+    prefix: isize,
+}
+
+fn read_retry_probe(prefix: isize) -> ReadRetryProbe {
+    ReadRetryProbe { calls: Ref::new(0), consumed: Ref::new(0), prefix }
+}
+
+impl Read for ReadRetryProbe {
+    fn read(self: ReadRetryProbe, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        if self.calls.get() > self.prefix + 1 {
+            return Result::Err(read_retry_error(io::ErrorKind::Other))
+        }
+        testing::assert(output.len() > 0);
+        self.consumed.set(self.consumed.get() + 1);
+        if self.calls.get() <= self.prefix {
+            output[0] = b'a';
+            Result::Ok(1)
+        } else {
+            output[0] = b'x';
+            Result::Err(read_retry_error(io::ErrorKind::Interrupted))
+        }
+    }
+}
+
+fn check_read_retry_error[T](result: Result[T, io::Error]) -> () {
+    match result {
+        Err(error) => assert_equal(error, read_retry_error(io::ErrorKind::Interrupted)),
+        Ok(_) => testing::fail("read interruption must not be retried or swallowed"),
+    }
+}
+
+struct ReadRetryAt {
+    calls: Ref[isize],
+    offsets: Vec[isize],
+}
+
+impl ReadAt for ReadRetryAt {
+    fn read_at(self: ReadRetryAt, output: MutSlice[byte], offset: isize) -> Result[
+        isize,
+        io::TransferError,
+    ] {
+        self.calls.set(self.calls.get() + 1);
+        self.offsets.push(offset);
+        if self.calls.get() > 1 {
+            return Result::Err(io::TransferError::new(0, read_retry_error(io::ErrorKind::Other)))
+        }
+        testing::assert(output.len() > 0);
+        output[0] = b'a';
+        Result::Err(io::TransferError::new(1, read_retry_error(io::ErrorKind::Interrupted)))
+    }
+}
+
+struct ReadRetryMirror {
+    calls: Ref[isize],
+}
+
+impl Write for ReadRetryMirror {
+    fn write(self: ReadRetryMirror, input: Slice[byte]) -> Result[isize, io::Error] {
+        testing::assert(input.len() > 0);
+        self.calls.set(self.calls.get() + 1);
+        Result::Err(read_retry_error(io::ErrorKind::Interrupted))
+    }
+}
+
+fn check_io_read_retry() -> () {
+    for prefix in 0..2 {
+        for mode in 0..8 {
+            let reader = read_retry_probe(prefix);
+            let output = b"???";
+            let destination = io::Cursor::new(bytes::Bytes::new());
+            match mode {
+                0 => {
+                    check_read_retry_error(reader.read_exact(output.as_mut_slice()));
+                    assert_equal(output[prefix], b'x');
+                    assert_equal(output[2], b'?');
+                    if prefix > 0 {
+                        assert_equal(output[0], b'a');
+                    }
+                },
+                1 => check_read_retry_error(reader.read_to_end(10)),
+                2 => check_read_retry_error(reader.read_to_string(10)),
+                3 => check_read_retry_error(io::copy(reader, destination)),
+                4 => check_read_retry_error(
+                    io::copy_buffer(reader, destination, output.as_mut_slice()),
+                ),
+                5 => check_read_retry_error(io::copy_n(reader, destination, 3)),
+                6 => {
+                    let buffered = testing::expect_ok(
+                        io::BufReader::with_capacity(reader, 1),
+                        "retry buffered reader",
+                    );
+                    check_read_retry_error(buffered.read_exact(output.as_mut_slice()));
+                    assert_equal(buffered.buffered_len(), 0);
+                    if prefix > 0 {
+                        assert_equal(output[0], b'a');
+                    }
+                    assert_equal(output[prefix], b'?');
+                },
+                _ => {
+                    let scanner = testing::expect_ok(io::Scanner::new(reader, 10), "retry scanner");
+                    check_read_retry_error(scanner.next());
+                    let alias = scanner;
+                    assert_equal(
+                        testing::expect_some(alias.failure(), "scanner failure"),
+                        read_retry_error(io::ErrorKind::Interrupted),
+                    );
+                    check_read_retry_error(alias.next());
+                    check_read_retry_error(scanner.next());
+                },
+            }
+            assert_equal(reader.calls.get(), prefix + 1);
+            assert_equal(reader.consumed.get(), prefix + 1);
+            if mode >= 3 && mode <= 5 {
+                assert_equal(destination.position(), prefix);
+                assert_equal(
+                    destination.bytes().to_vec(),
+                    if prefix == 0 {
+                        b""
+                    } else {
+                        b"a"
+                    },
+                );
+            }
+        }
+        let reader = read_retry_probe(prefix);
+        let output = b"???";
+        match io::read_at_least(reader, output.as_mut_slice(), 3) {
+            Err(error) => {
+                assert_equal(error.transferred(), prefix.to_usize());
+                assert_equal(error.error(), read_retry_error(io::ErrorKind::Interrupted));
+            },
+            Ok(_) => testing::fail("minimum read must stop"),
+        }
+        assert_equal(reader.consumed.get(), prefix + 1);
+        assert_equal(reader.calls.get(), prefix + 1);
+        assert_equal(output[prefix], b'x');
+    }
+    for exact in[false, true] {
+        let provider = ReadRetryAt { calls: Ref::new(0), offsets: Vec::new() };
+        let section = testing::expect_ok(
+            io::SectionReader::new(provider, 4, 3),
+            "interrupted section",
+        );
+        let output = b"???";
+        if exact {
+            check_read_retry_error(section.read_exact(output.as_mut_slice()));
+        } else {
+            assert_equal(
+                testing::expect_ok(section.read(output.as_mut_slice()), "section confirmed prefix"),
+                1,
+            );
+            check_read_retry_error(section.read(output.as_mut_slice().sub(1, 3)));
+        }
+        assert_equal(output, b"a??");
+        assert_equal(section.position(), 1);
+        assert_equal(provider.calls.get(), 1);
+        assert_equal(provider.offsets, Vec::from_array([4]));
+    }
+    let source = read_retry_probe(0);
+    let mirror = io::Cursor::new(bytes::Bytes::new());
+    let tee = io::TeeReader::new(source, mirror);
+    let output = b"???";
+    check_read_retry_error(tee.read_exact(output.as_mut_slice()));
+    assert_equal(source.calls.get(), 1);
+    assert_equal(source.consumed.get(), 1);
+    assert_equal(output, b"x??");
+    assert_equal(mirror.position(), 0);
+    testing::assert(tee.failure().is_none());
+    let source = io::Cursor::new(bytes::Bytes::from_string("abc"));
+    let mirror = ReadRetryMirror { calls: Ref::new(0) };
+    let tee = io::TeeReader::new(source, mirror);
+    for _ in 0..2 {
+        match tee.read_exact(output.as_mut_slice()) {
+            Err(error) => assert_equal(error.kind(), io::ErrorKind::Other),
+            Ok(_) => testing::fail("terminal mirror failure must stop"),
+        }
+    }
+    assert_equal(mirror.calls.get(), 1);
+    assert_equal(source.position(), 3);
+    assert_equal(tee.failed_read_count(), 3);
+    assert_equal(
+        testing::expect_some(tee.failure(), "mirror original failure"),
+        read_retry_error(io::ErrorKind::Interrupted),
+    );
+}

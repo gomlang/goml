@@ -16,6 +16,7 @@ GoML is statically typed and garbage-collected, with Rust-like syntax, monomorph
 - [Compile-time evaluation](docs/comptime.md): CTIR and programmable derive architecture
 - [Go bindings](docs/ffi/bind-go.md) and [metadata protocol](docs/ffi/protocol-v1.md): Go interoperability
 - [gomlgo](gomlgo/README.md): independent Go frontend, interpreter, and differential tests
+- [Ecosystem libraries](../gomlang/ecosystem/README.md): independent sibling repositories, consumers, examples, and verification
 - [VS Code extension](editors/vscode/README.md): editor setup and commands
 - [Releasing](docs/releasing.md): release archives, installation, and stage0 advancement
 

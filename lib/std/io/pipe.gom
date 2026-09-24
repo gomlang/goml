@@ -1,0 +1,186 @@
+package io;
+
+struct PipePacket {
+    input: Slice[byte],
+    consumed: isize,
+    reply: Channel[Result[isize, TransferError]],
+}
+
+struct PipeState {
+    read_closed: Option[Error],
+    write_closed: Option[Option[Error]],
+    active: Option[PipePacket],
+    changed: Channel[()],
+}
+
+pub struct PipeReader {
+    state: Channel[PipeState],
+}
+
+pub struct PipeWriter {
+    state: Channel[PipeState],
+}
+
+fn pipe_closed() -> Error {
+    stream_error(ErrorKind::BrokenPipe, "pipe", "pipe endpoint is closed")
+}
+
+fn pipe_state_error() -> Error {
+    stream_error(ErrorKind::Other, "pipe", "pipe state is unavailable")
+}
+
+fn pipe_changed(state: PipeState) -> PipeState {
+    let previous = state.changed;
+    let mut next = state;
+    next.changed = Channel::new(0);
+    previous.close();
+    next
+}
+
+pub fn pipe() -> (PipeReader, PipeWriter) {
+    let state = Channel::new(1);
+    state.send(
+        PipeState {
+            read_closed: Option::None,
+            write_closed: Option::None,
+            active: Option::None,
+            changed: Channel::new(0),
+        },
+    );
+    (PipeReader { state }, PipeWriter { state })
+}
+
+impl PipeReader {
+    pub fn close_error(self: PipeReader, error: Error) -> Result[(), Error] {
+        let Some(mut state) = self.state.recv() else {
+            return Result::Ok(())
+        };
+        if state.read_closed.is_none() {
+            state.read_closed = Option::Some(error);
+            if let Some(packet) = state.active {
+                state.active = Option::None;
+                packet.reply.send(
+                    Result::Err(TransferError::new(packet.consumed.to_usize(), error)),
+                );
+            }
+            state = pipe_changed(state);
+        }
+        self.state.send(state);
+        Result::Ok(())
+    }
+}
+
+impl Close for PipeReader {
+    fn close(self: PipeReader) -> Result[(), Error] {
+        self.close_error(pipe_closed())
+    }
+}
+
+impl Read for PipeReader {
+    fn read(self: PipeReader, buffer: MutSlice[byte]) -> Result[isize, Error] {
+        loop {
+            let mut state = self.state.recv().ok_or(pipe_state_error())?;
+            if state.read_closed.is_some() {
+                self.state.send(state);
+                return Result::Err(pipe_closed())
+            }
+            if let Some(closed) = state.write_closed {
+                self.state.send(state);
+                return match closed {
+                    Some(error) => Result::Err(error),
+                    None => Result::Ok(0),
+                }
+            }
+            if buffer.len() == 0 {
+                self.state.send(state);
+                return Result::Ok(0)
+            }
+            if let Some(mut packet) = state.active {
+                let remaining = packet.input.len() - packet.consumed;
+                let count = if remaining < buffer.len() {
+                    remaining
+                } else {
+                    buffer.len()
+                };
+                for index in 0..count {
+                    buffer[index] = packet.input[packet.consumed + index];
+                }
+                packet.consumed += count;
+                if packet.consumed == packet.input.len() {
+                    state.active = Option::None;
+                    packet.reply.send(Result::Ok(packet.consumed));
+                } else {
+                    state.active = Option::Some(packet);
+                }
+                self.state.send(pipe_changed(state));
+                return Result::Ok(count)
+            }
+            let changed = state.changed;
+            self.state.send(state);
+            let _ = changed.recv();
+        }
+    }
+}
+
+impl PipeWriter {
+    fn close_with(self: PipeWriter, error: Option[Error]) -> Result[(), Error] {
+        let Some(mut state) = self.state.recv() else {
+            return Result::Ok(())
+        };
+        if state.write_closed.is_none() {
+            state.write_closed = Option::Some(error);
+            if let Some(packet) = state.active {
+                state.active = Option::None;
+                packet.reply.send(
+                    Result::Err(TransferError::new(packet.consumed.to_usize(), pipe_closed())),
+                );
+            }
+            state = pipe_changed(state);
+        }
+        self.state.send(state);
+        Result::Ok(())
+    }
+
+    pub fn close_error(self: PipeWriter, error: Error) -> Result[(), Error] {
+        self.close_with(Option::Some(error))
+    }
+
+    pub fn write_progress(self: PipeWriter, input: Slice[byte]) -> Result[isize, TransferError] {
+        loop {
+            let mut state = self.state.recv().ok_or(TransferError::new(0, pipe_state_error()))?;
+            if state.write_closed.is_some() {
+                self.state.send(state);
+                return Result::Err(TransferError::new(0, pipe_closed()))
+            }
+            if let Some(error) = state.read_closed {
+                self.state.send(state);
+                return Result::Err(TransferError::new(0, error))
+            }
+            if input.len() == 0 {
+                self.state.send(state);
+                return Result::Ok(0)
+            }
+            if state.active.is_none() {
+                let reply = Channel::new(1);
+                state.active = Option::Some(PipePacket { input, consumed: 0, reply });
+                self.state.send(pipe_changed(state));
+                return reply.recv().ok_or(TransferError::new(0, pipe_state_error()))?
+            }
+            let changed = state.changed;
+            self.state.send(state);
+            let _ = changed.recv();
+        }
+    }
+}
+
+impl Write for PipeWriter {
+    fn write(self: PipeWriter, input: Slice[byte]) -> Result[isize, Error] {
+        self.write_progress(input).map_err(|error| error.error())
+    }
+}
+
+impl Close for PipeWriter {
+    fn close(self: PipeWriter) -> Result[(), Error] {
+        self.close_with(Option::None)
+    }
+}

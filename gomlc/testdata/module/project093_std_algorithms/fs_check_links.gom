@@ -1,0 +1,225 @@
+package main;
+
+use std::testing::fs as memory;
+use std::fs;
+use fs::{FileSystem, LinkFileSystem};
+use std::io;
+use std::panic;
+use std::testing;
+
+struct CheckLinksSource {
+    inner: memory::MemoryFS,
+    mode: isize,
+    opens: Vec[string],
+    reads: Ref[isize],
+    stats: Ref[isize],
+}
+
+fn check_links_source(mode: isize, many: bool) -> CheckLinksSource {
+    let nodes = Vec::from_array([memory::MemoryNode::link("relative", "../outside")]);
+    if many {
+        nodes.push(memory::MemoryNode::link("absolute", "/outside"));
+        nodes.push(memory::MemoryNode::link("empty", ""));
+        nodes.push(memory::MemoryNode::link("loop", "loop"));
+        nodes.push(memory::MemoryNode::link("dangling", "missing"));
+        nodes.push(memory::MemoryNode::link("nul", "\u0000"));
+    }
+    let inner = testing::expect_ok(
+        memory::MemoryFS::new(
+            nodes,
+            memory::MemoryLimits {
+                max_nodes: 100,
+                max_data_bytes: 10000,
+                max_path_bytes: 10000,
+                max_depth: 10,
+                max_link_hops: 0,
+                max_resolve_work: 10000,
+            },
+        ),
+        "build link checker fixture",
+    );
+    CheckLinksSource { inner, mode, opens: Vec::new(), reads: Ref::new(0), stats: Ref::new(0) }
+}
+
+fn check_links_limits() -> memory::CheckLimits {
+    memory::CheckLimits {
+        max_nodes: 100,
+        max_depth: 10,
+        max_directory_entries: 100,
+        max_file_bytes: 100,
+        max_total_read_bytes: 1000,
+        max_provider_calls: 10000,
+        max_issues: 100,
+        max_path_bytes: 10000,
+    }
+}
+
+fn check_links_cause() -> fs::Error {
+    fs::Error::new(
+        io::ErrorKind::Interrupted,
+        "original link operation",
+        Option::Some("original path"),
+        Option::Some(29),
+        "original link cause",
+    )
+}
+
+impl FileSystem for CheckLinksSource {
+    type Handle = memory::MemoryHandle;
+
+    fn open(self: CheckLinksSource, name: string) -> Result[memory::MemoryHandle, fs::Error] {
+        self.opens.push(name);
+        self.inner.open(name)
+    }
+}
+
+impl LinkFileSystem for CheckLinksSource {
+    fn read_link(self: CheckLinksSource, name: string) -> Result[string, fs::Error] {
+        if !fs::valid_path(name) {
+            if self.mode == 4 {
+                return Result::Ok("accepted invalid path")
+            }
+            return self.inner.read_link(name)
+        }
+        self.reads.set(self.reads.get() + 1);
+        if self.mode == 6 {
+            return Result::Err(check_links_cause())
+        }
+        if self.mode == 7 {
+            panic::raise("link checker provider panic")
+        }
+        let target = self.inner.read_link(name)?;
+        if self.mode == 1 && self.reads.get() % 2 == 0 {
+            Result::Ok(target + "changed")
+        } else {
+            Result::Ok(target)
+        }
+    }
+
+    fn symlink_metadata(self: CheckLinksSource, name: string) -> Result[fs::Metadata, fs::Error] {
+        if !fs::valid_path(name) {
+            if self.mode == 5 {
+                return Result::Ok(fs::Metadata::from_parts(fs::FileType::Symlink, 0, 0o777, 0))
+            }
+            return self.inner.symlink_metadata(name)
+        }
+        self.stats.set(self.stats.get() + 1);
+        let original = self.inner.symlink_metadata(name)?;
+        if self.mode == 2 {
+            Result::Ok(fs::Metadata::from_parts(fs::FileType::File, original.len(), 0o777, 0))
+        } else if self.mode == 3 && self.stats.get() % 2 == 0 {
+            Result::Ok(
+                fs::Metadata::from_mode(
+                    original.mode(),
+                    original.len() + 1,
+                    original.modified_unix_nanoseconds(),
+                ),
+            )
+        } else {
+            Result::Ok(original)
+        }
+    }
+}
+
+fn check_links_issue(report: memory::CheckReport, operation: string, kind: isize) -> bool {
+    for issue in report.issues() {
+        if issue.operation == operation {
+            if match issue.kind {
+                memory::CheckIssueKind::ContractViolation(_) => kind == 0,
+                memory::CheckIssueKind::InconsistentSnapshot(_) => kind == 1,
+                memory::CheckIssueKind::ProviderError(error) => kind == 2
+                    && error == check_links_cause(),
+                memory::CheckIssueKind::ProviderPanic(error) => kind == 3
+                    && error.message() == "link checker provider panic",
+            } {
+                return true
+            }
+        }
+    }
+    false
+}
+
+fn check_links_no_follow(source: CheckLinksSource) -> () {
+    for name in source.opens {
+        if fs::valid_path(name) {
+            assert_equal(name, ".");
+        }
+    }
+}
+
+pub fn test_fs_check_links() -> () {
+    let expected = memory::ExpectedTree::Contains(
+        Vec::from_array(["relative", "absolute", "empty", "loop", "dangling", "nul"]),
+    );
+    let baseline_source = check_links_source(0, true);
+    let baseline = testing::expect_ok(
+        memory::check_fs(baseline_source, expected, check_links_limits()),
+        "link baseline",
+    );
+    testing::assert(baseline.passed());
+    assert_equal(baseline_source.reads.get(), 0);
+    assert_equal(baseline_source.stats.get(), 0);
+    let exact_calls = baseline.provider_calls() + 16 + 4 * 6;
+    let source = check_links_source(0, true);
+    let report = testing::expect_ok(
+        memory::check_links(
+            source,
+            expected,
+            memory::CheckLimits { max_provider_calls: exact_calls, ..check_links_limits() },
+        ),
+        "static links exact provider budget",
+    );
+    testing::assert(report.passed());
+    assert_equal(report.provider_calls(), exact_calls);
+    assert_equal(report.cleanup_calls(), baseline.cleanup_calls());
+    assert_equal(source.reads.get(), 12);
+    assert_equal(source.stats.get(), 12);
+    check_links_no_follow(source);
+    let source = check_links_source(0, true);
+    let report = testing::expect_ok(
+        memory::check_links(
+            source,
+            expected,
+            memory::CheckLimits { max_provider_calls: exact_calls - 1, ..check_links_limits() },
+        ),
+        "static links short provider budget",
+    );
+    testing::assert(!report.complete());
+    match report.stop_reason() {
+        Some(memory::CheckStop::Budget(_, memory::CheckBudget::ProviderCalls)) => (),
+        _ => testing::fail("expected link provider-call budget stop"),
+    }
+    assert_equal(report.provider_calls(), exact_calls - 1);
+    check_links_no_follow(source);
+    for mode in 1..8 {
+        let source = check_links_source(mode, false);
+        let report = testing::expect_ok(
+            memory::check_links(
+                source,
+                memory::ExpectedTree::Contains(Vec::from_array(["relative"])),
+                check_links_limits(),
+            ),
+            "link checker fault report",
+        );
+        testing::assert(!report.passed());
+        if mode == 1 {
+            testing::assert(check_links_issue(report, "read link", 1));
+        } else if mode == 2 || mode == 3 {
+            testing::assert(check_links_issue(report, "symlink metadata", 1));
+        } else if mode == 4 {
+            testing::assert(check_links_issue(report, "read link invalid path", 0));
+        } else if mode == 5 {
+            testing::assert(check_links_issue(report, "symlink metadata invalid path", 0));
+        } else if mode == 6 {
+            testing::assert(check_links_issue(report, "read link", 2));
+            testing::assert(report.stop_reason().is_none());
+        } else {
+            testing::assert(check_links_issue(report, "read link", 3));
+            match report.stop_reason() {
+                Some(memory::CheckStop::ProviderPanic) => (),
+                _ => testing::fail("expected link provider panic stop"),
+            }
+        }
+        check_links_no_follow(source);
+    }
+}

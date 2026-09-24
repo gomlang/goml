@@ -1,0 +1,192 @@
+package main;
+
+use std::json;
+use std::io;
+use io::Write;
+use std::testing;
+use std::text;
+
+struct JsonWriteProbe {
+    data: Vec[byte],
+    calls: Ref[isize],
+    step: isize,
+    fail_at: isize,
+    mode: isize,
+}
+
+fn json_write_probe(step: isize, fail_at: isize, mode: isize) -> JsonWriteProbe {
+    JsonWriteProbe { data: Vec::new(), calls: Ref::new(0), step, fail_at, mode }
+}
+
+impl Write for JsonWriteProbe {
+    fn write(self: JsonWriteProbe, input: Slice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        if self.fail_at > 0 && self.calls.get() >= self.fail_at {
+            if self.mode == 0 {
+                return Result::Ok(0)
+            }
+            if self.mode == 1 {
+                return Result::Ok(-1)
+            }
+            if self.mode == 2 {
+                return Result::Ok(input.len() + 1)
+            }
+            self.data.push(b'!');
+            return Result::Err(
+                io::Error::new(
+                    if self.mode == 3 {
+                        io::ErrorKind::Interrupted
+                    } else {
+                        io::ErrorKind::PermissionDenied
+                    },
+                    "json write probe",
+                    Option::Some("sink"),
+                    Option::Some(74),
+                    "failed write side effect",
+                ),
+            )
+        }
+        let mut count = input.len();
+        if count > self.step {
+            count = self.step;
+        }
+        for index in 0..count {
+            self.data.push(input[index]);
+        }
+        Result::Ok(count)
+    }
+}
+
+fn json_written(probe: JsonWriteProbe) -> string {
+    text::StringBuilder { values: probe.data.copy() }.to_string()
+}
+
+fn json_encode_reject(value: json::Value, limits: json::EncodeLimits, kind: json::LimitKind) -> () {
+    let output = json_write_probe(3, 0, 0);
+    let encoder = testing::expect_ok(json::Encoder::new(output, limits), "limited encoder");
+    let error = testing::expect_err(encoder.encode_value(value), "encode quota");
+    testing::assert_eq(error.kind(), json::ErrorKind::Limit(kind));
+    let calls = output.calls.get();
+    testing::assert_eq(
+        testing::expect_err(encoder.encode_value(json::Value::Null), "sticky quota").kind(),
+        error.kind(),
+    );
+    testing::assert_eq(output.calls.get(), calls);
+}
+
+fn test_json_stream_encode() -> () {
+    let input = "{\"中\\n\":[null,true,false,-0,1.2300e+04,\"😀\\t\\u0000\\\\\\\"\"]}";
+    let value = testing::expect_ok(json::parse(input), "encode input");
+    let expected = json::encode(value);
+    for step in 1..32 {
+        let output = json_write_probe(step, 0, 0);
+        let encoder = testing::expect_ok(
+            json::Encoder::new(output, json_encode_limits()),
+            "stream encoder",
+        );
+        testing::assert_eq(
+            testing::expect_ok(encoder.encode_value(value), "stream encode"),
+            (expected.byte_len() + 1).to_usize(),
+        );
+        testing::assert_eq(json_written(output), expected + "\n");
+        testing::expect_ok(encoder.encode(true), "second encoded root");
+        testing::assert_eq(json_written(output), expected + "\ntrue\n");
+        testing::assert_eq(encoder.written(), output.data.len().to_usize());
+    }
+    for mode in 0..5 {
+        let output = json_write_probe(1, 3, mode);
+        let encoder = testing::expect_ok(
+            json::Encoder::new(output, json_encode_limits()),
+            "fault encoder",
+        );
+        let error = testing::expect_err(encoder.encode("abcdef"), "writer failure");
+        testing::assert_eq(error.kind(), json::ErrorKind::Io);
+        testing::assert_eq(error.confirmed_written(), 2.to_usize());
+        testing::assert_eq(error.byte_offset(), 2);
+        testing::assert_eq(encoder.written(), 2.to_usize());
+        let cause = testing::expect_some(error.cause(), "I/O cause");
+        testing::assert_eq(
+            cause.kind(),
+            if mode == 0 {
+                io::ErrorKind::WriteZero
+            } else if mode == 1 || mode == 2 {
+                io::ErrorKind::InvalidData
+            } else if mode == 3 {
+                io::ErrorKind::Interrupted
+            } else {
+                io::ErrorKind::PermissionDenied
+            },
+        );
+        testing::assert_eq(
+            testing::expect_err(encoder.encode(1), "sticky writer").kind(),
+            error.kind(),
+        );
+        testing::assert_eq(output.calls.get(), 3);
+    }
+    let mut limits = json_encode_limits();
+    limits.max_output_bytes = 4;
+    let output = json_write_probe(8, 0, 0);
+    let encoder = testing::expect_ok(json::Encoder::new(output, limits), "LF budget");
+    let error = testing::expect_err(encoder.encode(true), "LF exceeds budget");
+    testing::assert_eq(error.kind(), json::ErrorKind::Limit(json::LimitKind::OutputBytes));
+    testing::assert_eq(json_written(output), "true");
+    testing::assert_eq(
+        testing::expect_ok(json::to_string_with_limits(true, limits), "compact exact quota"),
+        "true",
+    );
+    limits = json_encode_limits();
+    limits.max_depth = 0;
+    json_encode_reject(json::Value::Array(Vec::new()), limits, json::LimitKind::Depth);
+    limits = json_encode_limits();
+    limits.max_values = 1;
+    json_encode_reject(
+        json::Value::Array(Vec::from_array([json::Value::Null])),
+        limits,
+        json::LimitKind::Values,
+    );
+    limits = json_encode_limits();
+    limits.max_string_bytes = 3;
+    json_encode_reject(json::Value::String("😀"), limits, json::LimitKind::StringBytes);
+    limits = json_encode_limits();
+    limits.max_number_bytes = 2;
+    json_encode_reject(json::Value::Number("123"), limits, json::LimitKind::NumberBytes);
+    limits = json_encode_limits();
+    limits.max_container_entries = 0;
+    json_encode_reject(
+        json::Value::Array(Vec::from_array([json::Value::Null])),
+        limits,
+        json::LimitKind::ContainerEntries,
+    );
+    limits = json_encode_limits();
+    limits.max_path_bytes = 0;
+    json_encode_reject(
+        json::Value::Object(Vec::from_array([("x", json::Value::Null)])),
+        limits,
+        json::LimitKind::PathBytes,
+    );
+    limits = json_encode_limits();
+    limits.max_serde_frames = 0;
+    json_encode_reject(json::Value::Array(Vec::new()), limits, json::LimitKind::SerdeFrames);
+    limits = json_encode_limits();
+    limits.max_events = 0;
+    json_encode_reject(json::Value::Null, limits, json::LimitKind::Events);
+    limits = json_encode_limits();
+    limits.max_output_bytes = -1;
+    let output = json_write_probe(1, 0, 0);
+    testing::assert_eq(
+        testing::expect_err(json::Encoder::new(output, limits), "negative encode limit").kind(),
+        json::ErrorKind::InvalidLimit,
+    );
+    testing::assert_eq(output.calls.get(), 0);
+    let cyclic = Vec::new();
+    let value = json::Value::Array(cyclic);
+    cyclic.push(value);
+    json_encode_reject(value, json_encode_limits(), json::LimitKind::Depth);
+    for number in["", "+1", "01", "NaN", "1.", "1e", "1 2"] {
+        let error = testing::expect_err(
+            json::encode_with_limits(json::Value::Number(number), json_encode_limits()),
+            "invalid number output",
+        );
+        testing::assert_eq(error.kind(), json::ErrorKind::Schema);
+    }
+}

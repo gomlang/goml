@@ -1,0 +1,190 @@
+package go_backend;
+
+use module::resources;
+use std::fs;
+use std::path;
+use std::process;
+use std::testing;
+use std::time;
+use std::utf8;
+use utf8::BytesUtf8;
+
+#[test]
+fn panic_runtime_preserves_unicode_payloads_and_cross_package_resumes() -> () {
+    let items: Vec[Item] = Vec::new();
+    emit_runtime_hook_items(
+        items,
+        Vec::from_array(
+            [
+                resources::RuntimeHook::Standard(resources::StandardRuntimeHook::PanicRaise),
+                resources::RuntimeHook::Standard(resources::StandardRuntimeHook::PanicCatch),
+            ],
+        ),
+        Vec::new(),
+    );
+    let root = "_artifact/panic-runtime-boundaries";
+    let foreign_root = path::join(root, "foreign");
+    testing::assert(fs::create_dir_all(foreign_root).is_ok());
+    testing::assert(
+        fs::write_file_structured(path::join(root, "go.mod"), "module panicboundary\n\ngo 1.26\n").is_ok(),
+    );
+    testing::assert(
+        fs::write_file_structured(
+            path::join(root, "runtime.go"),
+            encode_package(File { items }, "panicboundary"),
+        ).is_ok(),
+    );
+    testing::assert(
+        fs::write_file_structured(
+            path::join(foreign_root, "runtime.go"),
+            encode_package(File { items }, "foreign"),
+        ).is_ok(),
+    );
+    let foreign =
+        \\package foreign
+        \\func Relay(body func() struct{}) (message, stack string, resume func() struct{}) {
+        \\    _goml_runtime_std_panic_catch(body, func(text, trace string, rethrow func() struct{}) struct{} {
+        \\        message, stack, resume = text, trace, rethrow
+        \\        return struct{}{}
+        \\    })
+        \\    return
+        \\}
+        \\func Capture(value any) (string, string, func() struct{}) {
+        \\    return Relay(func() struct{} { panic(value) })
+        \\}
+        \\type HostInfo struct {
+        \\    Value any
+        \\    Message string
+        \\    Stack string
+        \\}
+        \\func (info *HostInfo) GomlPanicValue() any { return info.Value }
+        \\func (info *HostInfo) GomlPanicMessage() string { return info.Message }
+        \\func (info *HostInfo) GomlPanicStack() string { return info.Stack }
+        \\func External(value any, message, stack string) func() struct{} {
+        \\    return func() struct{} { panic(&HostInfo{value, message, stack}) }
+        \\}
+    ;
+    testing::assert(
+        fs::write_file_structured(path::join(foreign_root, "bridge.go"), foreign).is_ok(),
+    );
+    let host =
+        \\package panicboundary
+        \\import (
+        \\    "panicboundary/foreign"
+        \\    "testing"
+        \\    "unicode/utf8"
+        \\)
+        \\type panicSnapshot struct {
+        \\    message string
+        \\    stack string
+        \\    resume func() struct{}
+        \\}
+        \\type panicPayload interface {
+        \\    GomlPanicValue() any
+        \\    GomlPanicMessage() string
+        \\    GomlPanicStack() string
+        \\}
+        \\type invalidMessageError struct { message string }
+        \\func (value *invalidMessageError) Error() string { return value.message }
+        \\func capture(body func() struct{}) panicSnapshot {
+        \\    var result panicSnapshot
+        \\    _goml_runtime_std_panic_catch(body, func(message, stack string, resume func() struct{}) struct{} {
+        \\        result = panicSnapshot{message, stack, resume}
+        \\        return struct{}{}
+        \\    })
+        \\    return result
+        \\}
+        \\func recovered(body func() struct{}) (result any) {
+        \\    defer func() { result = recover() }()
+        \\    body()
+        \\    return
+        \\}
+        \\func check(t *testing.T, snapshot panicSnapshot, message string, original any) {
+        \\    t.Helper()
+        \\    if snapshot.message != message || !utf8.ValidString(snapshot.message) {
+        \\        t.Fatalf("invalid diagnostic: got %q, want %q", snapshot.message, message)
+        \\    }
+        \\    if snapshot.stack == "" || !utf8.ValidString(snapshot.stack) || snapshot.resume == nil {
+        \\        t.Fatal("missing or invalid panic information", snapshot)
+        \\    }
+        \\    wrapper, ok := recovered(snapshot.resume).(panicPayload)
+        \\    if !ok { t.Fatal("resume lost structural panic payload") }
+        \\    if wrapper.GomlPanicValue() != original {
+        \\        t.Fatalf("original payload changed: got %#v, want %#v", wrapper.GomlPanicValue(), original)
+        \\    }
+        \\    if wrapper.GomlPanicMessage() != snapshot.message || wrapper.GomlPanicStack() != snapshot.stack {
+        \\        t.Fatal("wrapper diagnostics changed")
+        \\    }
+        \\}
+        \\func TestInvalidUnicodeStringAndErrorPayloads(t *testing.T) {
+        \\    cases := []struct { name string; value any; message string }{
+        \\        {"string", "before\xffafter", "before\ufffdafter"},
+        \\        {"error", &invalidMessageError{"\xfeerror"}, "\ufffderror"},
+        \\        {"unicode", "hello\x00世界", "hello\x00世界"},
+        \\    }
+        \\    for _, test := range cases {
+        \\        t.Run(test.name, func(t *testing.T) {
+        \\            first := capture(func() struct{} { panic(test.value) })
+        \\            check(t, first, test.message, test.value)
+        \\            second := capture(first.resume)
+        \\            check(t, second, test.message, test.value)
+        \\            if second.stack != first.stack { t.Fatal("local resume changed original stack") }
+        \\        })
+        \\    }
+        \\}
+        \\func TestGeneratedPackageBoundariesRetainOriginalPayloadAndStack(t *testing.T) {
+        \\    original := &invalidMessageError{"foreign\xfferror"}
+        \\    message, stack, resume := foreign.Capture(original)
+        \\    first := capture(resume)
+        \\    check(t, first, "foreign\ufffderror", original)
+        \\    if first.message != message || first.stack != stack {
+        \\        t.Fatal("cross-package catch replaced original diagnostics")
+        \\    }
+        \\    nextMessage, nextStack, nextResume := foreign.Relay(first.resume)
+        \\    second := capture(nextResume)
+        \\    check(t, second, message, original)
+        \\    if nextMessage != message || nextStack != stack || second.stack != stack {
+        \\        t.Fatal("round-trip resume replaced original diagnostics")
+        \\    }
+        \\}
+        \\func TestExternalStructuralWrapperNormalizesBothDiagnostics(t *testing.T) {
+        \\    original := &invalidMessageError{"payload\xffbytes"}
+        \\    first := capture(foreign.External(original, "message\xff", "original\xfestack"))
+        \\    check(t, first, "message\ufffd", original)
+        \\    if first.stack != "original\ufffdstack" { t.Fatal("external original stack was lost", first.stack) }
+        \\    message, stack, resume := foreign.Relay(first.resume)
+        \\    second := capture(resume)
+        \\    check(t, second, first.message, original)
+        \\    if message != first.message || stack != first.stack || second.stack != first.stack {
+        \\        t.Fatal("external wrapper round trip changed diagnostics")
+        \\    }
+        \\}
+        \\func TestNormalReturnAndLanguageRaise(t *testing.T) {
+        \\    calls, caught := 0, 0
+        \\    _goml_runtime_std_panic_catch(
+        \\        func() struct{} { calls++; return struct{}{} },
+        \\        func(string, string, func() struct{}) struct{} { caught++; return struct{}{} },
+        \\    )
+        \\    if calls != 1 || caught != 0 { t.Fatal(calls, caught) }
+        \\    result := capture(func() struct{} { return _goml_runtime_std_panic_raise("language λ") })
+        \\    check(t, result, "language λ", "language λ")
+        \\}
+    ;
+    testing::assert(fs::write_file_structured(path::join(root, "runtime_test.go"), host).is_ok());
+    let output = process::Command::new("go").args(
+        Vec::from_array(["test", "-race", "-count=1", "-timeout=30s", "./..."]),
+    ).current_dir(root).env("GOWORK", "off").env("GOTOOLCHAIN", "local").env("GOPROXY", "off").output_timeout_structured(
+        time::Duration::from_seconds(120),
+    );
+    match output {
+        Ok(output) => if !output.status().success() {
+            testing::fail(
+                output.stdout().to_string_utf8().unwrap_or("")
+                    + output.stderr().to_string_utf8().unwrap_or(
+                        "panic runtime boundary test failed",
+                    ),
+            );
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}

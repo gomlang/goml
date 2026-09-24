@@ -261,42 +261,9 @@ const (
     Greater Ordering = 2
 )
 
-type Option__Ordering struct {
-    _p0 Ordering
-    _tag uint8
-}
-
 type Option__isize struct {
     _p0 int
     _tag uint8
-}
-
-func _goml_m_trait__impl_i_std_p_cmp_p_Ord_i_string_i_cmp(self__0 string, other__0 string) Ordering {
-    var t0 bool = self__0 < other__0
-    if t0 {
-        return Less
-    } else {
-        var t1 bool = self__0 > other__0
-        if t1 {
-            return Greater
-        } else {
-            return Equal
-        }
-    }
-}
-
-func _goml_m_trait__impl_i_std_p_cmp_p_Ord_i_isize_i_cmp(self__0 int, other__0 int) Ordering {
-    var t0 bool = self__0 < other__0
-    if t0 {
-        return Less
-    } else {
-        var t1 bool = self__0 > other__0
-        if t1 {
-            return Greater
-        } else {
-            return Equal
-        }
-    }
 }
 
 func main0() struct{} {
@@ -1407,6 +1374,34 @@ func _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_dedup__by____T__isize(self__0 *_goml_
         }
         vec_truncate__Vec_3int(self__0, output__0)
         return struct{}{}
+    }
+}
+
+func _goml_m_trait__impl_i_std_p_cmp_p_Ord_i_string_i_cmp(self__0 string, other__0 string) Ordering {
+    var t0 bool = self__0 < other__0
+    if t0 {
+        return Less
+    } else {
+        var t1 bool = self__0 > other__0
+        if t1 {
+            return Greater
+        } else {
+            return Equal
+        }
+    }
+}
+
+func _goml_m_trait__impl_i_std_p_cmp_p_Ord_i_isize_i_cmp(self__0 int, other__0 int) Ordering {
+    var t0 bool = self__0 < other__0
+    if t0 {
+        return Less
+    } else {
+        var t1 bool = self__0 > other__0
+        if t1 {
+            return Greater
+        } else {
+            return Equal
+        }
     }
 }
 

@@ -1,0 +1,354 @@
+package fs;
+
+use module::fs as filesystem;
+use module::bytes;
+use module::io;
+use module::collections;
+
+pub enum MemoryContent {
+    File(bytes::Bytes),
+    Directory,
+    Link(string),
+    Special,
+}
+
+pub struct MemoryNode {
+    pub path: string,
+    pub mode: filesystem::FileMode,
+    pub modified_unix_nanoseconds: i64,
+    pub content: MemoryContent,
+}
+
+pub struct MemoryLimits {
+    pub max_nodes: isize,
+    pub max_data_bytes: isize,
+    pub max_path_bytes: isize,
+    pub max_depth: isize,
+    pub max_link_hops: isize,
+    pub max_resolve_work: isize,
+}
+
+pub struct MemoryFS {
+    nodes: Vec[MemoryRecord],
+    index: HashMap[string, isize],
+    root: isize,
+    limits: MemoryLimits,
+}
+
+struct MemoryRecord {
+    path: string,
+    name: string,
+    metadata: filesystem::Metadata,
+    content: MemoryContent,
+    children: Vec[isize],
+    parent: isize,
+}
+
+fn memory_error(kind: io::ErrorKind, operation: string, path: Option[string], message: string) -> filesystem::Error {
+    filesystem::Error::new(kind, operation, path, Option::None, message)
+}
+
+fn memory_build_error(kind: io::ErrorKind, path: string, message: string) -> filesystem::Error {
+    memory_error(kind, "build memory filesystem", Option::Some(path), message)
+}
+
+fn memory_default_mode(kind: filesystem::NodeKind, permissions: u32) -> filesystem::FileMode {
+    filesystem::FileMode::new(
+        kind,
+        permissions,
+        filesystem::ModeFlags {
+            set_uid: false,
+            set_gid: false,
+            sticky: false,
+            append_only: false,
+            exclusive: false,
+            temporary: false,
+        },
+    )
+}
+
+impl MemoryNode {
+    pub fn file(path: string, data: bytes::Bytes) -> MemoryNode {
+        MemoryNode {
+            path,
+            mode: memory_default_mode(filesystem::NodeKind::File, 0o444),
+            modified_unix_nanoseconds: 0,
+            content: MemoryContent::File(data),
+        }
+    }
+
+    pub fn directory(path: string) -> MemoryNode {
+        MemoryNode {
+            path,
+            mode: memory_default_mode(filesystem::NodeKind::Directory, 0o555),
+            modified_unix_nanoseconds: 0,
+            content: MemoryContent::Directory,
+        }
+    }
+
+    pub fn link(path: string, target: string) -> MemoryNode {
+        MemoryNode {
+            path,
+            mode: memory_default_mode(filesystem::NodeKind::Symlink, 0o777),
+            modified_unix_nanoseconds: 0,
+            content: MemoryContent::Link(target),
+        }
+    }
+}
+
+fn memory_build_parent(path: string) -> (string, string) {
+    let mut separator = -1;
+    for position in 0..path.byte_len() {
+        if path.byte_get(position) == b'/' {
+            separator = position;
+        }
+    }
+    if separator < 0 {
+        (".", path)
+    } else {
+        (path.byte_slice(0, separator), path.byte_slice(separator + 1, path.byte_len()))
+    }
+}
+
+fn memory_build_add(
+    records: Vec[MemoryRecord],
+    index: HashMap[string, isize],
+    node: MemoryNode,
+    limits: MemoryLimits,
+    path_bytes: Ref[isize],
+    data_bytes: Ref[isize],
+) -> Result[(), filesystem::Error] {
+    if index.get(node.path).is_some() {
+        return Result::Err(
+            memory_build_error(
+                io::ErrorKind::AlreadyExists,
+                node.path,
+                "duplicate memory filesystem path",
+            ),
+        )
+    }
+    if records.len() >= limits.max_nodes {
+        return Result::Err(
+            memory_build_error(
+                io::ErrorKind::InvalidData,
+                node.path,
+                "memory filesystem exceeds node limit",
+            ),
+        )
+    }
+    if node.path.byte_len() > limits.max_path_bytes - path_bytes.get() {
+        return Result::Err(
+            memory_build_error(
+                io::ErrorKind::InvalidData,
+                node.path,
+                "memory filesystem exceeds path byte limit",
+            ),
+        )
+    }
+    if !filesystem::valid_path(node.path) {
+        return Result::Err(
+            memory_build_error(io::ErrorKind::InvalidInput, node.path, "invalid filesystem path"),
+        )
+    }
+    let mut depth = if node.path == "." {
+        0
+    } else {
+        1
+    };
+    for position in 0..node.path.byte_len() {
+        if node.path.byte_get(position) == b'/' {
+            depth += 1;
+        }
+    }
+    if depth > limits.max_depth {
+        return Result::Err(
+            memory_build_error(
+                io::ErrorKind::InvalidData,
+                node.path,
+                "memory filesystem exceeds depth limit",
+            ),
+        )
+    }
+    let kind = node.mode.kind();
+    let consistent = match node.content {
+        File(_) => kind == filesystem::NodeKind::File,
+        Directory => kind == filesystem::NodeKind::Directory,
+        Link(_) => kind == filesystem::NodeKind::Symlink,
+        Special => kind != filesystem::NodeKind::File && kind != filesystem::NodeKind::Directory
+            && kind != filesystem::NodeKind::Symlink,
+    };
+    if !consistent {
+        return Result::Err(
+            memory_build_error(
+                io::ErrorKind::InvalidInput,
+                node.path,
+                "memory content and node kind disagree",
+            ),
+        )
+    }
+    if node.path == "." && kind != filesystem::NodeKind::Directory {
+        return Result::Err(
+            memory_build_error(
+                io::ErrorKind::InvalidInput,
+                node.path,
+                "memory filesystem root must be a directory",
+            ),
+        )
+    }
+    let size = match node.content {
+        File(data) => data.len(),
+        Link(target) => target.byte_len(),
+        Directory | Special => 0,
+    };
+    if size > limits.max_data_bytes - data_bytes.get() {
+        return Result::Err(
+            memory_build_error(
+                io::ErrorKind::InvalidData,
+                node.path,
+                "memory filesystem exceeds data byte limit",
+            ),
+        )
+    }
+    let content = match node.content {
+        File(data) => MemoryContent::File(bytes::Bytes::from_slice_copy(data.as_slice())),
+        Directory => MemoryContent::Directory,
+        Link(target) => MemoryContent::Link(target),
+        Special => MemoryContent::Special,
+    };
+    let (_, name) = memory_build_parent(node.path);
+    let position = records.len();
+    records.push(
+        MemoryRecord {
+            path: node.path,
+            name,
+            metadata: filesystem::Metadata::from_mode(
+                node.mode,
+                size.to_i64(),
+                node.modified_unix_nanoseconds,
+            ),
+            content,
+            children: Vec::new(),
+            parent: -1,
+        },
+    );
+    index.insert(node.path, position);
+    path_bytes.set(path_bytes.get() + node.path.byte_len());
+    data_bytes.set(data_bytes.get() + size);
+    Result::Ok(())
+}
+
+impl MemoryFS {
+    pub fn new(nodes: Vec[MemoryNode], limits: MemoryLimits) -> Result[MemoryFS, filesystem::Error] {
+        if limits.max_nodes < 0 || limits.max_data_bytes < 0 || limits.max_path_bytes < 0
+            || limits.max_depth < 0
+            || limits.max_link_hops < 0
+            || limits.max_resolve_work < 0 {
+            return Result::Err(
+                memory_error(
+                    io::ErrorKind::InvalidInput,
+                    "build memory filesystem",
+                    Option::None,
+                    "limits must be non-negative",
+                ),
+            )
+        }
+        let records = Vec::new();
+        let index = HashMap::new();
+        let path_bytes = Ref::new(0);
+        let data_bytes = Ref::new(0);
+        for node in nodes {
+            memory_build_add(records, index, node, limits, path_bytes, data_bytes)?;
+        }
+        let explicit_count = records.len();
+        if index.get(".").is_none() {
+            memory_build_add(
+                records,
+                index,
+                MemoryNode::directory("."),
+                limits,
+                path_bytes,
+                data_bytes,
+            )?;
+        }
+        for position in 0..explicit_count {
+            let mut path = records[position].path;
+            while path != "." {
+                let (parent, _) = memory_build_parent(path);
+                if let Some(existing) = index.get(parent) {
+                    if !records[existing].metadata.file_type().is_dir() {
+                        return Result::Err(
+                            memory_build_error(
+                                io::ErrorKind::InvalidInput,
+                                parent,
+                                "memory filesystem ancestor is not a directory",
+                            ),
+                        )
+                    }
+                    break
+                }
+                memory_build_add(
+                    records,
+                    index,
+                    MemoryNode::directory(parent),
+                    limits,
+                    path_bytes,
+                    data_bytes,
+                )?;
+                path = parent;
+            }
+        }
+        let root = match index.get(".") {
+            Some(root) => root,
+            None => return Result::Err(
+                memory_build_error(
+                    io::ErrorKind::InvalidData,
+                    ".",
+                    "memory filesystem root is missing",
+                ),
+            ),
+        };
+        for position in 0..records.len() {
+            let record = records[position];
+            let parent = if position == root {
+                root
+            } else {
+                let (parent_path, _) = memory_build_parent(record.path);
+                match index.get(parent_path) {
+                    Some(parent) => parent,
+                    None => return Result::Err(
+                        memory_build_error(
+                            io::ErrorKind::InvalidData,
+                            record.path,
+                            "memory filesystem parent is missing",
+                        ),
+                    ),
+                }
+            };
+            records[position] = MemoryRecord { parent, ..record };
+            if position != root {
+                records[parent].children.push(position);
+            }
+        }
+        for record in records {
+            collections::stable_sort_by(
+                record.children,
+                |left: isize, right: isize| {
+                    let left_name = records[left].name;
+                    let right_name = records[right].name;
+                    if left_name < right_name {
+                        -1
+                    } else if left_name > right_name {
+                        1
+                    } else {
+                        0
+                    }
+                },
+            );
+        }
+        Result::Ok(MemoryFS { nodes: records, index, root, limits })
+    }
+
+    pub fn node_count(self: MemoryFS) -> isize {
+        self.nodes.len()
+    }
+}

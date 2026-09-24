@@ -1,0 +1,269 @@
+package main;
+
+use std::fs;
+use fs::{FileSystem, File, DirectoryEntry, ReadDirFile};
+use std::testing::fs as checker;
+use std::io;
+use io::{Read, Close};
+use std::panic;
+use std::testing;
+
+struct CheckDirSource {
+    mode: isize,
+    opens: Ref[isize],
+    closes: Ref[isize],
+    names: Ref[isize],
+    pages: Ref[isize],
+}
+
+struct CheckDirHandle {
+    source: CheckDirSource,
+    position: Ref[isize],
+    shared_name: Ref[string],
+    closed: Ref[bool],
+}
+
+struct CheckDirEntry {
+    source: CheckDirSource,
+    label: Ref[string],
+    closed: Ref[bool],
+}
+
+fn check_dir_error(kind: io::ErrorKind) -> fs::Error {
+    fs::Error::new(
+        kind,
+        "directory probe",
+        Option::Some("original"),
+        Option::Some(23),
+        "directory probe cause",
+    )
+}
+
+fn check_dir_metadata(kind: fs::FileType) -> fs::Metadata {
+    fs::Metadata::from_parts(kind, 0, 0o555, 42)
+}
+
+impl FileSystem for CheckDirSource {
+    type Handle = CheckDirHandle;
+
+    fn open(self: CheckDirSource, name: string) -> Result[CheckDirHandle, fs::Error] {
+        if !fs::valid_path(name) {
+            return Result::Err(check_dir_error(io::ErrorKind::InvalidInput))
+        }
+        if name != "." {
+            return Result::Err(check_dir_error(io::ErrorKind::NotFound))
+        }
+        self.opens.set(self.opens.get() + 1);
+        Result::Ok(
+            CheckDirHandle {
+                source: self,
+                position: Ref::new(0),
+                shared_name: Ref::new(""),
+                closed: Ref::new(false),
+            },
+        )
+    }
+}
+
+impl Close for CheckDirHandle {
+    fn close(self: CheckDirHandle) -> Result[(), io::Error] {
+        self.source.closes.set(self.source.closes.get() + 1);
+        self.closed.set(true);
+        Result::Ok(())
+    }
+}
+
+impl Read for CheckDirHandle {
+    fn read(self: CheckDirHandle, _buffer: MutSlice[byte]) -> Result[isize, io::Error] {
+        panic::raise("checker must not read a directory as bytes")
+    }
+}
+
+impl File for CheckDirHandle {
+    fn stat(self: CheckDirHandle) -> Result[fs::Metadata, fs::Error] {
+        Result::Ok(check_dir_metadata(fs::FileType::Directory))
+    }
+}
+
+impl DirectoryEntry for CheckDirEntry {
+    fn name(self: CheckDirEntry) -> string {
+        self.source.names.set(self.source.names.get() + 1);
+        if self.source.mode == 3 || (self.source.mode == 6 && self.closed.get()) {
+            panic::raise("directory entry storage is unavailable")
+        }
+        self.label.get()
+    }
+
+    fn file_type(self: CheckDirEntry) -> fs::FileType {
+        fs::FileType::Symlink
+    }
+
+    fn metadata(self: CheckDirEntry) -> Result[fs::Metadata, fs::Error] {
+        if self.source.mode == 8 && self.closed.get() {
+            return Result::Err(check_dir_error(io::ErrorKind::Interrupted))
+        }
+        Result::Ok(check_dir_metadata(fs::FileType::Symlink))
+    }
+}
+
+impl ReadDirFile for CheckDirHandle {
+    type Entry = CheckDirEntry;
+
+    fn read_dir(self: CheckDirHandle, amount: isize) -> Result[
+        Vec[CheckDirEntry],
+        fs::ReadDirError[CheckDirEntry],
+    ] {
+        if amount <= 0 {
+            if self.source.mode == 1 && self.position.get() < 6 {
+                self.position.set(self.position.get() + 1);
+            }
+            return Result::Err(
+                fs::ReadDirError::new(
+                    Vec::new(),
+                    check_dir_error(
+                        if self.source.mode == 2 {
+                            io::ErrorKind::Interrupted
+                        } else {
+                            io::ErrorKind::InvalidInput
+                        },
+                    ),
+                ),
+            )
+        }
+        self.source.pages.set(self.source.pages.get() + 1);
+        let labels = ["z", "a", "z", "a\\b", "C:name", "\u0000"];
+        let remaining = 6 - self.position.get();
+        let mut count = if amount < remaining {
+            amount
+        } else {
+            remaining
+        };
+        if self.source.mode == 3 {
+            count = amount + 1;
+        } else if self.source.mode == 5 || self.source.mode == 7 {
+            if count > 1 {
+                count = 1;
+            }
+        }
+        let entries = Vec::new();
+        for offset in 0..count {
+            let label = if self.source.mode == 3 {
+                "oversized"
+            } else if self.source.mode == 4 {
+                "bad/name"
+            } else {
+                labels[self.position.get() + offset]
+            };
+            let name = if self.source.mode == 5 {
+                self.shared_name.set(label);
+                self.shared_name
+            } else {
+                Ref::new(label)
+            };
+            entries.push(CheckDirEntry { source: self.source, label: name, closed: self.closed });
+        }
+        self.position.set(self.position.get() + count);
+        if self.source.mode == 7 {
+            Result::Err(fs::ReadDirError::new(entries, check_dir_error(io::ErrorKind::Interrupted)))
+        } else {
+            Result::Ok(entries)
+        }
+    }
+}
+
+fn check_dir_limits() -> checker::CheckLimits {
+    checker::CheckLimits {
+        max_nodes: 100,
+        max_depth: 10,
+        max_directory_entries: 30,
+        max_file_bytes: 100,
+        max_total_read_bytes: 1000,
+        max_provider_calls: 1000,
+        max_issues: 100,
+        max_path_bytes: 10000,
+    }
+}
+
+fn check_dir_source(mode: isize) -> CheckDirSource {
+    CheckDirSource {
+        mode,
+        opens: Ref::new(0),
+        closes: Ref::new(0),
+        names: Ref::new(0),
+        pages: Ref::new(0),
+    }
+}
+
+fn check_dir_issue(report: checker::CheckReport, operation: string, classification: isize) -> bool {
+    for issue in report.issues() {
+        if issue.operation == operation {
+            let matches = match issue.kind {
+                checker::CheckIssueKind::ContractViolation(_) => classification == 0,
+                checker::CheckIssueKind::InconsistentSnapshot(_) => classification == 1,
+                checker::CheckIssueKind::ProviderError(error) => classification == 2
+                    && error == check_dir_error(io::ErrorKind::Interrupted),
+                checker::CheckIssueKind::ProviderPanic(_) => classification == 3,
+            };
+            if matches {
+                return true
+            }
+        }
+    }
+    false
+}
+
+pub fn test_fs_check_directory() -> () {
+    let source = check_dir_source(0);
+    let report = testing::expect_ok(
+        checker::check_fs(
+            source,
+            checker::ExpectedTree::Contains(Vec::from_array(["z", "a", "a\\b", "C:name", "\u0000"])),
+            check_dir_limits(),
+        ),
+        "valid unsorted duplicate directory",
+    );
+    testing::assert(report.passed());
+    testing::assert(report.complete());
+    assert_equal(report.issues().len(), 0);
+    assert_equal(report.discovered_nodes(), 7);
+    assert_equal(source.opens.get(), source.closes.get());
+    assert_equal(report.cleanup_calls(), source.closes.get());
+    for mode in 1..9 {
+        let source = check_dir_source(mode);
+        let report = testing::expect_ok(
+            checker::check_fs(
+                source,
+                checker::ExpectedTree::Contains(Vec::new()),
+                check_dir_limits(),
+            ),
+            "faulty directory report",
+        );
+        testing::assert(!report.passed());
+        testing::assert(!report.complete());
+        assert_equal(source.opens.get(), source.closes.get());
+        assert_equal(report.cleanup_calls(), source.closes.get());
+        if mode == 1 {
+            testing::assert(check_dir_issue(report, "directory page widths", 1));
+        } else if mode == 2 || mode == 3 {
+            testing::assert(check_dir_issue(report, "read directory", 0));
+            if mode == 3 {
+                assert_equal(source.names.get(), 0);
+            }
+        } else if mode == 4 {
+            testing::assert(check_dir_issue(report, "directory entry name", 0));
+        } else if mode == 5 {
+            testing::assert(check_dir_issue(report, "directory entry after close", 1));
+        } else if mode == 6 {
+            testing::assert(check_dir_issue(report, "directory entry name", 3));
+            testing::assert(report.stop_reason().is_some());
+        } else if mode == 7 {
+            testing::assert(check_dir_issue(report, "read directory", 2));
+            testing::assert(!check_dir_issue(report, "directory page widths", 1));
+            testing::assert(source.names.get() > 0);
+            assert_equal(source.pages.get(), 2);
+        } else {
+            testing::assert(check_dir_issue(report, "directory entry metadata", 2));
+            testing::assert(!check_dir_issue(report, "directory page widths", 1));
+        }
+    }
+}

@@ -9,4 +9,5 @@ host_goarch="$(go env GOHOSTARCH)"
 (
     cd "$repository_root/tools/goml-go-meta"
     GOWORK=off GO111MODULE=on GOFLAGS= CGO_ENABLED=0 GOOS="$host_goos" GOARCH="$host_goarch" go build -mod=readonly -trimpath -o "$output_prefix/bin/goml-go-meta" .
+    GOWORK=off GO111MODULE=on GOFLAGS= CGO_ENABLED=0 GOOS="$host_goos" GOARCH="$host_goarch" go build -mod=readonly -trimpath -o "$output_prefix/bin/goml-c-bind" ./cmd/goml-c-bind
 )

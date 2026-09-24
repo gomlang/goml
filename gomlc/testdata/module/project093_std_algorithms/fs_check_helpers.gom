@@ -1,0 +1,372 @@
+package main;
+
+use std::bytes;
+use std::fs;
+use fs::{FileSystem, File, DirectoryEntry, ReadDirFile};
+use std::io;
+use io::{Read, Close};
+use std::panic;
+use std::testing;
+use std::testing::fs as memory;
+
+struct CheckHelperProbe {
+    source: memory::MemoryFS,
+    mode: isize,
+    threshold: isize,
+    calls: Ref[isize],
+    opens: Ref[isize],
+    closes: Ref[isize],
+    duplicate_closes: Ref[isize],
+    triggered: Ref[bool],
+    last_read: Ref[isize],
+    last_name: Ref[isize],
+    last_close: Ref[isize],
+}
+
+struct CheckHelperHandle {
+    source: memory::MemoryHandle,
+    owner: CheckHelperProbe,
+    closed: Ref[bool],
+    read_failed: Ref[bool],
+}
+
+struct CheckHelperEntry {
+    source: fs::SnapshotEntry,
+    owner: CheckHelperProbe,
+}
+
+fn check_helper_source() -> memory::MemoryFS {
+    testing::expect_ok(
+        memory::MemoryFS::new(
+            Vec::from_array(
+                [
+                    memory::MemoryNode::file("file", bytes::Bytes::from_string("contents")),
+                    memory::MemoryNode::file("dir/child", bytes::Bytes::from_string("child")),
+                    memory::MemoryNode::file("empty", bytes::Bytes::new()),
+                    memory::MemoryNode::file("a\\b", bytes::Bytes::from_string("slash")),
+                    memory::MemoryNode::file("\u0000", bytes::Bytes::from_string("nul")),
+                    memory::MemoryNode::link("link", "file"),
+                ],
+            ),
+            memory::MemoryLimits {
+                max_nodes: 100,
+                max_data_bytes: 1000,
+                max_path_bytes: 1000,
+                max_depth: 100,
+                max_link_hops: 100,
+                max_resolve_work: 10000,
+            },
+        ),
+        "helper checker memory fixture",
+    )
+}
+
+fn check_helper_expected() -> memory::ExpectedTree {
+    memory::ExpectedTree::Contains(
+        Vec::from_array(["file", "dir", "dir/child", "empty", "a\\b", "\u0000", "link"]),
+    )
+}
+
+fn check_helper_probe(mode: isize, threshold: isize) -> CheckHelperProbe {
+    CheckHelperProbe {
+        source: check_helper_source(),
+        mode,
+        threshold,
+        calls: Ref::new(0),
+        opens: Ref::new(0),
+        closes: Ref::new(0),
+        duplicate_closes: Ref::new(0),
+        triggered: Ref::new(false),
+        last_read: Ref::new(0),
+        last_name: Ref::new(0),
+        last_close: Ref::new(0),
+    }
+}
+
+fn check_helper_tick(source: CheckHelperProbe) -> () {
+    source.calls.set(source.calls.get() + 1);
+}
+
+fn check_helper_ready(source: CheckHelperProbe) -> bool {
+    source.calls.get() > source.threshold && !source.triggered.get()
+}
+
+fn check_helper_io_error(close: bool) -> io::Error {
+    io::Error::new(
+        if close {
+            io::ErrorKind::Other
+        } else {
+            io::ErrorKind::Interrupted
+        },
+        if close {
+            "helper injected close"
+        } else {
+            "helper injected read"
+        },
+        Option::Some("original helper context"),
+        Option::Some(
+            if close {
+                202
+            } else {
+                101
+            },
+        ),
+        if close {
+            "helper close cause"
+        } else {
+            "helper read cause"
+        },
+    )
+}
+
+impl FileSystem for CheckHelperProbe {
+    type Handle = CheckHelperHandle;
+
+    fn open(self: CheckHelperProbe, name: string) -> Result[CheckHelperHandle, fs::Error] {
+        check_helper_tick(self);
+        let source = self.source.open(name)?;
+        self.opens.set(self.opens.get() + 1);
+        Result::Ok(
+            CheckHelperHandle {
+                source,
+                owner: self,
+                closed: Ref::new(false),
+                read_failed: Ref::new(false),
+            },
+        )
+    }
+}
+
+impl File for CheckHelperHandle {
+    fn stat(self: CheckHelperHandle) -> Result[fs::Metadata, fs::Error] {
+        check_helper_tick(self.owner);
+        self.source.stat()
+    }
+}
+
+impl Read for CheckHelperHandle {
+    fn read(self: CheckHelperHandle, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        check_helper_tick(self.owner);
+        self.owner.last_read.set(self.owner.calls.get());
+        if self.owner.mode == 1 && check_helper_ready(self.owner) {
+            self.owner.triggered.set(true);
+            self.read_failed.set(true);
+            return Result::Err(check_helper_io_error(false))
+        }
+        self.source.read(output)
+    }
+}
+
+impl Close for CheckHelperHandle {
+    fn close(self: CheckHelperHandle) -> Result[(), io::Error] {
+        self.owner.closes.set(self.owner.closes.get() + 1);
+        self.owner.last_close.set(self.owner.calls.get());
+        if self.closed.get() {
+            self.owner.duplicate_closes.set(self.owner.duplicate_closes.get() + 1);
+        }
+        self.closed.set(true);
+        self.source.close()?;
+        if self.read_failed.get() {
+            return Result::Err(check_helper_io_error(true))
+        }
+        if self.owner.mode == 2 && check_helper_ready(self.owner) {
+            self.owner.triggered.set(true);
+            return Result::Err(check_helper_io_error(true))
+        }
+        Result::Ok(())
+    }
+}
+
+impl ReadDirFile for CheckHelperHandle {
+    type Entry = CheckHelperEntry;
+
+    fn read_dir(self: CheckHelperHandle, amount: isize) -> Result[
+        Vec[CheckHelperEntry],
+        fs::ReadDirError[CheckHelperEntry],
+    ] {
+        check_helper_tick(self.owner);
+        let entries = Vec::new();
+        match self.source.read_dir(amount) {
+            Ok(page) => {
+                for entry in page {
+                    entries.push(CheckHelperEntry { source: entry, owner: self.owner });
+                }
+                Result::Ok(entries)
+            },
+            Err(error) => {
+                for entry in error.entries() {
+                    entries.push(CheckHelperEntry { source: entry, owner: self.owner });
+                }
+                Result::Err(fs::ReadDirError::new(entries, error.error()))
+            },
+        }
+    }
+}
+
+impl DirectoryEntry for CheckHelperEntry {
+    fn name(self: CheckHelperEntry) -> string {
+        check_helper_tick(self.owner);
+        self.owner.last_name.set(self.owner.calls.get());
+        if self.owner.mode == 3 && check_helper_ready(self.owner) {
+            self.owner.triggered.set(true);
+            panic::raise("helper entry name panic")
+        }
+        self.source.name()
+    }
+
+    fn file_type(self: CheckHelperEntry) -> fs::FileType {
+        check_helper_tick(self.owner);
+        self.source.file_type()
+    }
+
+    fn metadata(self: CheckHelperEntry) -> Result[fs::Metadata, fs::Error] {
+        check_helper_tick(self.owner);
+        self.source.metadata()
+    }
+}
+
+fn check_helper_cleanup(source: CheckHelperProbe, report: memory::CheckReport) -> () {
+    testing::assert_eq(source.opens.get(), source.closes.get());
+    testing::assert_eq(source.duplicate_closes.get(), 0);
+    testing::assert_eq(report.cleanup_calls(), source.closes.get());
+}
+
+fn check_helper_report(source: CheckHelperProbe, limits: memory::CheckLimits) -> memory::CheckReport {
+    let report = testing::expect_ok(
+        memory::check_helpers(source, check_helper_expected(), limits),
+        "helper checker report",
+    );
+    check_helper_cleanup(source, report);
+    report
+}
+
+pub fn test_fs_check_helpers() -> () {
+    let empty = testing::expect_ok(
+        memory::check_helpers(
+            check_public_source(true),
+            memory::ExpectedTree::Empty,
+            check_public_limits(),
+        ),
+        "empty helper checker",
+    );
+    testing::assert(empty.passed());
+    let baseline_source = check_helper_probe(0, 0);
+    let baseline = testing::expect_ok(
+        memory::check_fs(baseline_source, check_helper_expected(), check_public_limits()),
+        "base checker before helper faults",
+    );
+    testing::assert(baseline.passed());
+    check_helper_cleanup(baseline_source, baseline);
+    let threshold = baseline_source.calls.get();
+    let source = check_helper_probe(0, threshold);
+    let full = check_helper_report(source, check_public_limits());
+    testing::assert(full.passed());
+    testing::assert(source.calls.get() > threshold);
+    testing::assert(full.provider_calls() > baseline.provider_calls());
+    testing::assert(full.read_bytes() > baseline.read_bytes());
+    for exact in[true, false] {
+        let mut limits = check_public_limits();
+        limits.max_provider_calls = full.provider_calls()
+            - if exact {
+                0
+            } else {
+                1
+            };
+        let report = check_helper_report(check_helper_probe(0, threshold), limits);
+        if exact {
+            testing::assert(report.passed());
+        } else {
+            testing::assert(!report.passed());
+            match report.stop_reason() {
+                Some(memory::CheckStop::Budget(_, memory::CheckBudget::ProviderCalls)) => (),
+                _ => testing::fail("helper provider budget must stop"),
+            }
+        }
+    }
+    for allowance in[0, 1] {
+        let mut limits = check_public_limits();
+        limits.max_total_read_bytes = full.read_bytes() + allowance;
+        let report = check_helper_report(check_helper_probe(0, threshold), limits);
+        if allowance == 1 {
+            testing::assert(report.passed());
+        } else {
+            testing::assert(!report.passed());
+            match report.stop_reason() {
+                Some(memory::CheckStop::Budget(_, memory::CheckBudget::TotalReadBytes)) => (),
+                _ => testing::fail("helper EOF probe requires read allowance"),
+            }
+        }
+    }
+    for mode in[1, 2, 3] {
+        let fault_at = if mode == 1 {
+            source.last_read.get()
+        } else if mode == 2 {
+            source.last_close.get()
+        } else {
+            source.last_name.get()
+        };
+        testing::assert(fault_at > 0);
+        let faulty = check_helper_probe(mode, fault_at - 1);
+        let report = check_helper_report(faulty, check_public_limits());
+        testing::assert(faulty.triggered.get());
+        testing::assert(!report.passed());
+        let mut reads = 0;
+        let mut closes = 0;
+        let mut panics = 0;
+        for issue in report.issues() {
+            match issue.kind {
+                memory::CheckIssueKind::ProviderError(error) => {
+                    if error.raw_os_code() == Option::Some(101) {
+                        reads += 1;
+                        testing::assert_eq(error.kind(), io::ErrorKind::Interrupted);
+                        testing::assert_eq(error.message(), "helper read cause");
+                    } else if error.raw_os_code() == Option::Some(202) {
+                        closes += 1;
+                        testing::assert_eq(error.message(), "helper close cause");
+                    } else {
+                        testing::fail("synthetic helper error must not become provider error")
+                    }
+                },
+                memory::CheckIssueKind::ProviderPanic(_) => {
+                    panics += 1;
+                },
+                _ => testing::fail("helper faults must retain provider classification"),
+            }
+        }
+        testing::assert_eq(
+            reads,
+            if mode == 1 {
+                1
+            } else {
+                0
+            },
+        );
+        testing::assert_eq(
+            closes,
+            if mode == 3 {
+                0
+            } else {
+                1
+            },
+        );
+        testing::assert_eq(
+            panics,
+            if mode == 3 {
+                1
+            } else {
+                0
+            },
+        );
+    }
+    let duplicates = check_dir_source(0);
+    let report = testing::expect_ok(
+        memory::check_helpers(
+            duplicates,
+            memory::ExpectedTree::Contains(Vec::from_array(["z", "a", "a\\b", "C:name", "\u0000"])),
+            check_dir_limits(),
+        ),
+        "helper sorting preserves valid duplicates",
+    );
+    testing::assert(report.passed());
+    testing::assert_eq(duplicates.opens.get(), duplicates.closes.get());
+}

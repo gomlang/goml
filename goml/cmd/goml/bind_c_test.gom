@@ -1,0 +1,179 @@
+package main;
+
+use module::test_support;
+use std::fs;
+use std::path;
+use std::process;
+use std::testing;
+
+fn dynamic_c_command(root: string, arguments: Vec[string]) -> process::Output {
+    let args = arguments;
+    args.push("--compiler");
+    args.push(test_support::gomlc_binary());
+    testing::expect_ok(
+        process::Command::new(test_support::goml_binary()).args(args).current_dir(root).env(
+            "CGO_ENABLED",
+            "0",
+        ).env("CC", "/bin/false").env("GOML_HOME", path::join(root, "home")).output_structured(),
+        "dynamic C command",
+    )
+}
+
+#[test]
+fn bind_c_dynamic_runs_without_cgo() -> () {
+    let root = test_support::workspace("bind_c_dynamic");
+    let example = path::join(test_support::repository_root(), "examples/ffi-bind-c");
+    for file in Vec::from_array(["goml.toml", "go.mod", "main.gom", "bindings_test.gom"]) {
+        test_support::write_file(
+            path::join(root, file),
+            test_support::read_file(path::join(example, file)).replace("cgo = \"required\"\n", ""),
+        );
+    }
+    test_support::write_file(
+        path::join(root, "sample.h"),
+        test_support::read_file(path::join(example, "sample.h")).replace("static ", ""),
+    );
+    let library = path::join(root, "libsample.so");
+    test_support::assert_success(
+        testing::expect_ok(
+            process::Command::new("cc").args(
+                Vec::from_array(["-shared", "-fPIC", "-x", "c", "sample.h", "-o", library]),
+            ).current_dir(root).output_structured(),
+            "build C fixture",
+        ),
+    );
+    test_support::write_file(
+        path::join(root, "bindings.json"),
+        test_support::read_file(path::join(example, "bindings.json")).replace(
+            "\"version\": 1,",
+            "\"version\": 1, \"backend\": \"dynamic\", \"libraries\": [\"" + library + "\"],",
+        ),
+    );
+    test_support::assert_success(
+        dynamic_c_command(root, Vec::from_array(["bind-c", "bindings.json"])),
+    );
+    let generated = test_support::read_file(path::join(root, "native/generated.go"));
+    test_support::assert_not_contains(generated, "import \"C\"");
+    test_support::assert_contains(generated, "goml.dev/cabi");
+    test_support::assert_success(dynamic_c_command(root, Vec::from_array(["test"])));
+    let run = dynamic_c_command(root, Vec::from_array(["run"]));
+    test_support::assert_success(run);
+    testing::assert_eq(test_support::stdout(run), "42\nGoML calls C\n255\n");
+    let consumer = path::join(root, "consumer");
+    test_support::write_file(
+        path::join(consumer, "goml.toml"),
+        "[module]\npath = \"dynamic_consumer\"\n[dependencies]\n\"demo::dynamic\" = \"0.1.0\"\n",
+    );
+    test_support::write_file(
+        path::join(consumer, "home/cache/registry/index.toml"),
+        "[modules.\"demo::dynamic\"]\nlatest = \"0.1.0\"\nversions = [\"0.1.0\"]\n",
+    );
+    let adapter = path::join(consumer, "home/cache/registry/demo/dynamic/0.1.0");
+    for file in Vec::from_array(
+        [
+            "goml.toml",
+            "go.mod",
+            "bindings.json",
+            "sample.h",
+            "bindings/generated.gom",
+            "native/generated.go",
+            "bindings.json.goml-c-bind.json",
+        ],
+    ) {
+        test_support::write_file(
+            path::join(adapter, file),
+            test_support::read_file(path::join(root, file)),
+        );
+    }
+    test_support::write_file(path::join(adapter, "lib.gom"), "package sample;\n");
+    test_support::write_file(
+        path::join(adapter, "goml.toml"),
+        test_support::read_file(path::join(root, "goml.toml")).replace(
+            "bind_c_example",
+            "demo::dynamic",
+        ),
+    );
+    test_support::write_file(
+        path::join(consumer, "go.mod"),
+        "module example.com/dynamic-consumer\n\ngo 1.26.0\n",
+    );
+    test_support::write_file(
+        path::join(consumer, "main.gom"),
+        "package main;\nuse demo::dynamic::bindings;\nuse std::testing;\nfn main() -> () { println(testing::expect_ok(bindings::signed(-42), \"C dependency\")); }\n",
+    );
+    let dependent = dynamic_c_command(consumer, Vec::from_array(["run"]));
+    test_support::assert_success(dependent);
+    testing::assert_eq(test_support::stdout(dependent), "-42\n");
+    testing::expect_ok(fs::remove_file(library), "remove fixture library");
+    test_support::write_file(
+        path::join(root, "main.gom"),
+        "package main;\nuse module::bindings;\nuse std::testing;\nfn main() -> () { match bindings::create(42) { Err(error) => println(error.to_string()), Ok(_) => testing::fail(\"missing library succeeded\") } }\n",
+    );
+    let missing = dynamic_c_command(root, Vec::from_array(["run"]));
+    test_support::assert_success(missing);
+    test_support::assert_contains(test_support::stdout(missing), "C loader:");
+}
+
+#[test]
+fn bind_c_cli_checks_c_inputs_and_runs_goml_tests() -> () {
+    let root = test_support::workspace("bind_c_example");
+    let example = path::join(test_support::repository_root(), "examples/ffi-bind-c");
+    for file in Vec::from_array(
+        ["goml.toml", "go.mod", "bindings.json", "sample.h", "main.gom", "bindings_test.gom"],
+    ) {
+        test_support::write_file(
+            path::join(root, file),
+            test_support::read_file(path::join(example, file)),
+        );
+    }
+    test_support::assert_success(
+        test_support::project_command(
+            "bind-c",
+            "",
+            Vec::from_array(["bindings.json", "--dry-run"]),
+            root,
+        ),
+    );
+    testing::assert(!fs::exists(path::join(root, "native")));
+    test_support::assert_success(
+        test_support::project_command("bind-c", "", Vec::from_array(["bindings.json"]), root),
+    );
+    test_support::assert_success(test_support::project_command("test", "", Vec::new(), root));
+    let run = test_support::project_command("run", "", Vec::new(), root);
+    test_support::assert_success(run);
+    testing::assert_eq(test_support::stdout(run), "42\nGoML calls C\n255\n");
+    let header = path::join(root, "sample.h");
+    let source = test_support::read_file(header);
+    test_support::write_file(
+        header,
+        source.replace("return counter->value;", "return counter->value + 1;"),
+    );
+    let changed = test_support::project_command("run", "", Vec::new(), root);
+    test_support::assert_success(changed);
+    testing::assert_eq(test_support::stdout(changed), "43\nGoML calls C\n255\n");
+    test_support::write_file(
+        header,
+        source.replace("static int64_t sample_read", "static int32_t sample_read"),
+    );
+    let stale = test_support::project_command("check", "", Vec::new(), root);
+    test_support::assert_failure(stale);
+    test_support::assert_contains(
+        test_support::stderr(stale),
+        "declarations or binding configuration changed",
+    );
+    test_support::assert_success(
+        test_support::project_command("bind-c", "", Vec::from_array(["bindings.json"]), root),
+    );
+    test_support::assert_success(test_support::project_command("check", "", Vec::new(), root));
+    let main = path::join(root, "main.gom");
+    test_support::write_file(
+        main,
+        test_support::read_file(main).replace("GoML calls C", "invalid\\u0000literal"),
+    );
+    let invalid = test_support::project_command("check", "", Vec::new(), root);
+    test_support::assert_failure(invalid);
+    test_support::assert_contains(
+        test_support::stderr(invalid),
+        "C string literal contains an interior NUL byte",
+    );
+}

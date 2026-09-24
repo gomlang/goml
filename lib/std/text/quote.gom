@@ -1,0 +1,374 @@
+package text;
+
+use module::bytes;
+use module::unicode;
+use module::utf8;
+
+pub enum UnquoteError {
+    InvalidLimit(isize),
+    Syntax(isize),
+    OutputLimit(isize),
+    InvalidUtf8(isize),
+}
+
+pub enum QuoteContext {
+    Unquoted,
+    Single,
+    Double,
+}
+
+pub enum QuotedElement {
+    Byte(byte),
+    Scalar(char),
+}
+
+fn quoted_element_bytes(value: QuotedElement) -> Vec[byte] {
+    match value {
+        Byte(value) => Vec::from_array([value]),
+        Scalar(value) => value.to_string().to_bytes(),
+    }
+}
+
+impl ToString for UnquoteError {
+    fn to_string(self: UnquoteError) -> string {
+        match self {
+            UnquoteError::InvalidLimit(value) => f"negative unquote byte limit {value}",
+            UnquoteError::Syntax(offset) => f"invalid quoted literal at byte {offset}",
+            UnquoteError::OutputLimit(offset) => f"output exceeds limit at input byte {offset}",
+            UnquoteError::InvalidUtf8(offset) => f"invalid UTF-8 at decoded byte {offset}",
+        }
+    }
+}
+
+impl Debug for UnquoteError {
+    fn debug(self: UnquoteError) -> string {
+        self.to_string()
+    }
+}
+
+fn unquote_digit(value: byte, radix: u32) -> Option[u32] {
+    let digit = if value >= b'0' && value <= b'9' {
+        (value - b'0').to_u32()
+    } else if value >= b'a' && value <= b'f' {
+        (value - b'a').to_u32() + 10
+    } else if value >= b'A' && value <= b'F' {
+        (value - b'A').to_u32() + 10
+    } else {
+        return Option::None
+    };
+    if digit < radix {
+        Option::Some(digit)
+    } else {
+        Option::None
+    }
+}
+
+fn unquote_escape(value: string, offset: isize, delimiter: byte) -> Result[
+    (QuotedElement, isize),
+    UnquoteError,
+] {
+    if value.byte_len() - offset < 2 {
+        return Result::Err(UnquoteError::Syntax(offset))
+    }
+    let escape = value.byte_get(offset + 1);
+    let simple: Option[byte] = match escape {
+        b'a' => Option::Some(7),
+        b'b' => Option::Some(8),
+        b't' => Option::Some(9),
+        b'n' => Option::Some(10),
+        b'v' => Option::Some(11),
+        b'f' => Option::Some(12),
+        b'r' => Option::Some(13),
+        b'\\' => Option::Some(b'\\'),
+        _ => if (delimiter == b'\'' || delimiter == b'"') && escape == delimiter {
+            Option::Some(escape)
+        } else {
+            Option::None
+        },
+    };
+    if let Some(decoded) = simple {
+        return Result::Ok((QuotedElement::Byte(decoded), offset + 2))
+    }
+    let (start, digits, radix, scalar) = if escape == b'x' {
+        (offset + 2, 2, 16.to_u32(), false)
+    } else if escape == b'u' {
+        (offset + 2, 4, 16.to_u32(), true)
+    } else if escape == b'U' {
+        (offset + 2, 8, 16.to_u32(), true)
+    } else if escape >= b'0' && escape <= b'7' {
+        (offset + 1, 3, 8.to_u32(), false)
+    } else {
+        return Result::Err(UnquoteError::Syntax(offset))
+    };
+    if digits > value.byte_len() - start {
+        return Result::Err(UnquoteError::Syntax(offset))
+    }
+    let mut code: u32 = 0;
+    for index in start..start + digits {
+        let digit = match unquote_digit(value.byte_get(index), radix) {
+            Some(digit) => digit,
+            None => return Result::Err(UnquoteError::Syntax(offset)),
+        };
+        code = code * radix + digit;
+    }
+    let decoded = if scalar {
+        match char_from_u32(code) {
+            Some(character) => QuotedElement::Scalar(character),
+            None => return Result::Err(UnquoteError::Syntax(offset)),
+        }
+    } else {
+        if code > 255 {
+            return Result::Err(UnquoteError::Syntax(offset))
+        }
+        QuotedElement::Byte(code.to_u8())
+    };
+    Result::Ok((decoded, start + digits))
+}
+
+pub fn unquote_element(value: string, context: QuoteContext) -> Result[
+    (QuotedElement, string),
+    UnquoteError,
+] {
+    if value.byte_len() == 0 {
+        return Result::Err(UnquoteError::Syntax(0))
+    }
+    let delimiter = match context {
+        Unquoted => 0,
+        Single => b'\'',
+        Double => b'"',
+    };
+    let first = value.byte_get(0);
+    if delimiter != 0 && first == delimiter {
+        return Result::Err(UnquoteError::Syntax(0))
+    }
+    let (element, end) = if first == b'\\' {
+        unquote_escape(value, 0, delimiter)?
+    } else if first < 128 {
+        (QuotedElement::Byte(first), 1)
+    } else {
+        match value.chars().next() {
+            Some(character) => (QuotedElement::Scalar(character), character.to_string().byte_len()),
+            None => return Result::Err(UnquoteError::Syntax(0)),
+        }
+    };
+    Result::Ok((element, value.byte_slice(end, value.byte_len())))
+}
+
+pub fn unquote_bytes(value: string, max_bytes: isize) -> Result[bytes::Bytes, UnquoteError] {
+    if max_bytes < 0 {
+        return Result::Err(UnquoteError::InvalidLimit(max_bytes))
+    }
+    if value.byte_len() < 2 {
+        return Result::Err(UnquoteError::Syntax(0))
+    }
+    let delimiter = value.byte_get(0);
+    if delimiter != b'"' && delimiter != b'\'' && delimiter != b'`' {
+        return Result::Err(UnquoteError::Syntax(0))
+    }
+    let output = bytes::Builder::new();
+    let mut offset = 1;
+    let mut elements = 0;
+    while offset < value.byte_len() {
+        let first = value.byte_get(offset);
+        if first == delimiter {
+            if offset != value.byte_len() - 1 {
+                return Result::Err(UnquoteError::Syntax(offset + 1))
+            }
+            return Result::Ok(output.finish())
+        }
+        if delimiter == b'\'' && elements > 0 {
+            return Result::Err(UnquoteError::Syntax(offset))
+        }
+        if delimiter == b'`' && first == b'\r' {
+            offset += 1;
+            continue
+        }
+        if delimiter != b'`' && first == b'\n' {
+            return Result::Err(UnquoteError::Syntax(offset))
+        }
+        let (decoded, end) = if delimiter != b'`' && first == b'\\' {
+            let (element, end) = unquote_escape(value, offset, delimiter)?;
+            (quoted_element_bytes(element), end)
+        } else {
+            let width = if first < 128 {
+                1
+            } else if first < 224 {
+                2
+            } else if first < 240 {
+                3
+            } else {
+                4
+            };
+            (value.byte_slice(offset, offset + width).to_bytes(), offset + width)
+        };
+        if decoded.len() > max_bytes - output.len() {
+            return Result::Err(UnquoteError::OutputLimit(offset))
+        }
+        output.extend(decoded.as_slice());
+        elements += 1;
+        offset = end;
+    }
+    Result::Err(UnquoteError::Syntax(value.byte_len()))
+}
+
+pub fn unquote(value: string, max_bytes: isize) -> Result[string, UnquoteError] {
+    let decoded = unquote_bytes(value, max_bytes)?;
+    utf8::decode_slice(decoded.as_slice()).map_err(
+        |error: utf8::Utf8Error| UnquoteError::InvalidUtf8(error.valid_up_to()),
+    )
+}
+
+pub fn quoted_prefix(value: string, max_bytes: isize) -> Result[string, UnquoteError] {
+    if max_bytes < 0 {
+        return Result::Err(UnquoteError::InvalidLimit(max_bytes))
+    }
+    if value.byte_len() < 2 {
+        return Result::Err(UnquoteError::Syntax(0))
+    }
+    let delimiter = value.byte_get(0);
+    if delimiter != b'"' && delimiter != b'\'' && delimiter != b'`' {
+        return Result::Err(UnquoteError::Syntax(0))
+    }
+    if max_bytes == 0 {
+        return Result::Err(UnquoteError::OutputLimit(0))
+    }
+    let mut offset = 1;
+    let mut elements = 0;
+    while offset < value.byte_len() {
+        if offset >= max_bytes {
+            return Result::Err(UnquoteError::OutputLimit(offset))
+        }
+        let first = value.byte_get(offset);
+        if first == delimiter {
+            return Result::Ok(value.byte_slice(0, offset + 1))
+        }
+        if (delimiter == b'\'' && elements > 0) || (delimiter != b'`' && first == b'\n') {
+            return Result::Err(UnquoteError::Syntax(offset))
+        }
+        let end = if delimiter != b'`' && first == b'\\' {
+            unquote_escape(value, offset, delimiter)?.1
+        } else {
+            offset
+                + if first < 128 {
+                    1
+                } else if first < 224 {
+                    2
+                } else if first < 240 {
+                    3
+                } else {
+                    4
+                }
+        };
+        if end > max_bytes {
+            return Result::Err(UnquoteError::OutputLimit(offset))
+        }
+        elements += 1;
+        offset = end;
+    }
+    Result::Err(UnquoteError::Syntax(value.byte_len()))
+}
+
+fn quote_hex(code: u32, digits: isize, prefix: string) -> string {
+    let output = StringBuilder::with_capacity(digits + 2);
+    output.write_string(prefix);
+    let mut shift = (digits - 1) * 4;
+    while shift >= 0 {
+        let index = ((code >> shift) & 15).to_isize();
+        output.values.push("0123456789abcdef".byte_get(index));
+        shift -= 4;
+    }
+    output.finish()
+}
+
+enum QuoteMode {
+    Printable,
+    Ascii,
+    Graphic,
+}
+
+fn quote_scalar(value: char, delimiter: char, mode: QuoteMode) -> string {
+    if value == delimiter || value == '\\' {
+        return "\\" + value.to_string()
+    }
+    let code = value.to_u32();
+    let literal = match mode {
+        Printable => unicode::is_printable(value),
+        Ascii => code < 128 && unicode::is_printable(value),
+        Graphic => unicode::is_graphic(value),
+    };
+    if literal {
+        return value.to_string()
+    }
+    match code {
+        7 => "\\a",
+        8 => "\\b",
+        9 => "\\t",
+        10 => "\\n",
+        11 => "\\v",
+        12 => "\\f",
+        13 => "\\r",
+        _ => if code < 32 || code == 127 {
+            quote_hex(code, 2, "\\x")
+        } else if code <= 65535 {
+            quote_hex(code, 4, "\\u")
+        } else {
+            quote_hex(code, 8, "\\U")
+        },
+    }
+}
+
+fn quote_with(value: string, delimiter: char, mode: QuoteMode, max_bytes: isize) -> Result[
+    string,
+    bytes::TransformError,
+] {
+    check_output_limit(max_bytes)?;
+    let mut length = checked_length(0, 2, max_bytes)?;
+    for character in value.chars() {
+        length = checked_length(
+            length,
+            quote_scalar(character, delimiter, mode).byte_len(),
+            max_bytes,
+        )?;
+    }
+    let output = StringBuilder::with_capacity(length);
+    output.write_char(delimiter);
+    for character in value.chars() {
+        output.write_string(quote_scalar(character, delimiter, mode));
+    }
+    output.write_char(delimiter);
+    Result::Ok(output.finish())
+}
+
+pub fn quote(value: string, max_bytes: isize) -> Result[string, bytes::TransformError] {
+    quote_with(value, '"', QuoteMode::Printable, max_bytes)
+}
+
+pub fn quote_ascii(value: string, max_bytes: isize) -> Result[string, bytes::TransformError] {
+    quote_with(value, '"', QuoteMode::Ascii, max_bytes)
+}
+
+pub fn quote_char(value: char, max_bytes: isize) -> Result[string, bytes::TransformError] {
+    quote_with(value.to_string(), '\'', QuoteMode::Printable, max_bytes)
+}
+
+pub fn quote_char_ascii(value: char, max_bytes: isize) -> Result[string, bytes::TransformError] {
+    quote_with(value.to_string(), '\'', QuoteMode::Ascii, max_bytes)
+}
+
+pub fn quote_graphic(value: string, max_bytes: isize) -> Result[string, bytes::TransformError] {
+    quote_with(value, '"', QuoteMode::Graphic, max_bytes)
+}
+
+pub fn quote_char_graphic(value: char, max_bytes: isize) -> Result[string, bytes::TransformError] {
+    quote_with(value.to_string(), '\'', QuoteMode::Graphic, max_bytes)
+}
+
+pub fn can_backquote(value: string) -> bool {
+    for character in value.chars() {
+        let code = character.to_u32();
+        if (code < 32 && code != 9) || code == 127 || code == 96 || code == 65279 {
+            return false
+        }
+    }
+    true
+}

@@ -1,0 +1,162 @@
+package main;
+
+use std::bytes;
+use std::bytes::endian;
+use std::bytes::endian::stream;
+use std::io;
+use io::Read;
+use std::testing;
+
+struct VarintFailure {
+    calls: Ref[isize],
+    error: io::Error,
+}
+
+impl Read for VarintFailure {
+    fn read(self: VarintFailure, buffer: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.calls.set(self.calls.get() + 1);
+        if self.calls.get() == 1 {
+            buffer[0] = 128;
+            Result::Ok(1)
+        } else {
+            Result::Err(self.error)
+        }
+    }
+}
+
+fn check_varint_stream() -> () {
+    for fail_on in[1, 2] {
+        for signed in[false, true] {
+            let reader = codec_interrupted_reader(b"\x80\x80\x00", fail_on);
+            let result = if signed {
+                stream::read_varint(reader).map(|value| value.map(|number| number.to_u64()))
+            } else {
+                stream::read_uvarint(reader)
+            };
+            match result {
+                Err(stream::ReadError::Io(error, count)) => {
+                    assert_equal(error, reader.error);
+                    assert_equal(count, fail_on - 1);
+                },
+                _ => testing::fail("varint read must stop at interruption"),
+            }
+            assert_equal(reader.calls.get(), fail_on);
+            assert_equal(reader.cursor.position(), fail_on);
+        }
+    }
+    let noncanonical = io::Cursor::new(bytes::Bytes::from_vec(b"\x80\x00\x2a"));
+    assert_equal(
+        testing::expect_ok(stream::read_uvarint(noncanonical), "noncanonical stream value"),
+        Option::Some(0.to_u64()),
+    );
+    assert_equal(noncanonical.position(), 2);
+    let events = Vec::new();
+    let writer = multi_probe(events, 1, 0);
+    let stopped = io::Error::new(
+        io::ErrorKind::Interrupted,
+        "stream writer",
+        Option::None,
+        Option::None,
+        "stop",
+    );
+    writer.result.set(Result::Err(stopped));
+    let broadcast = io::MultiWriter::new(Vec::from_array([writer]).as_slice());
+    match stream::write_uvarint(broadcast, 128) {
+        Err(error) => assert_equal(error, stopped),
+        Ok(_) => testing::assert(false),
+    }
+    assert_equal(events.len(), 1);
+    let values: Vec[u64] = Vec::from_array(
+        [0, 1, 127, 128, 16383, 16384, 9223372036854775808, 18446744073709551615],
+    );
+    let scratch = b"\0\0\0\0\0\0\0\0\0\0";
+    for value in values {
+        let output = CopyWriter {
+            cursor: io::Cursor::new(bytes::Bytes::new()),
+            interrupted: Ref::new(false),
+        };
+        testing::expect_ok(stream::write_uvarint(output, value), "stream unsigned write");
+        let count = go_put_uvarint(scratch.as_mut_slice(), value);
+        assert_equal(output.cursor.bytes().to_vec(), scratch.slice(0, count).to_vec());
+        let input = output.cursor.bytes();
+        input.push(42);
+        let reader = CopyReader { cursor: io::Cursor::new(input), interrupted: Ref::new(false) };
+        assert_equal(
+            testing::expect_ok(stream::read_uvarint(reader), "stream unsigned read"),
+            Option::Some(value),
+        );
+        assert_equal(reader.cursor.position(), count);
+        assert_equal(
+            testing::expect_ok(stream::read_uvarint(reader), "following value"),
+            Option::Some(42.to_u64()),
+        );
+        testing::assert(testing::expect_ok(stream::read_uvarint(reader), "clean eof").is_none());
+    }
+    let signed: Vec[i64] = Vec::from_array(
+        [-9223372036854775808, -129, -1, 0, 1, 128, 9223372036854775807],
+    );
+    for value in signed {
+        let cursor = io::Cursor::new(bytes::Bytes::new());
+        testing::expect_ok(stream::write_varint(cursor, value), "signed stream write");
+        let count = go_put_varint(scratch.as_mut_slice(), value);
+        assert_equal(cursor.bytes().to_vec(), scratch.slice(0, count).to_vec());
+        testing::expect_ok(cursor.set_position(0), "rewind");
+        assert_equal(
+            testing::expect_ok(stream::read_varint(cursor), "signed stream read"),
+            Option::Some(value),
+        );
+    }
+    for length in 1..11 {
+        let input = Vec::new();
+        for _ in 0..length {
+            input.push(128.to_u8());
+        }
+        let reader = io::Cursor::new(bytes::Bytes::from_vec(input));
+        match stream::read_uvarint(reader) {
+            Err(stream::ReadError::Decode(error)) => assert_equal(
+                error,
+                if length < 10 {
+                    endian::VarintError::Truncated(length)
+                } else {
+                    endian::VarintError::Overflow(9)
+                },
+            ),
+            _ => testing::assert(false),
+        }
+        assert_equal(reader.position(), length);
+    }
+    let overflowing = io::Cursor::new(
+        bytes::Bytes::from_vec(b"\x80\x80\x80\x80\x80\x80\x80\x80\x80\x02\x2a"),
+    );
+    testing::assert(stream::read_uvarint(overflowing).is_err());
+    assert_equal(overflowing.position(), 10);
+    assert_equal(
+        testing::expect_ok(stream::read_uvarint(overflowing), "overflow did not consume tail"),
+        Option::Some(42.to_u64()),
+    );
+    let failure = io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "varint source",
+        Option::None,
+        Option::None,
+        "stop",
+    );
+    let reader = VarintFailure { calls: Ref::new(0), error: failure };
+    match stream::read_uvarint(reader) {
+        Err(stream::ReadError::Io(error, count)) => {
+            assert_equal(error, failure);
+            assert_equal(count, 1);
+        },
+        _ => testing::assert(false),
+    }
+    for count in[-1, 2] {
+        let reader = multi_probe(Vec::new(), 1, count);
+        match stream::read_uvarint(reader) {
+            Err(stream::ReadError::Io(error, consumed)) => {
+                assert_equal(error.kind(), io::ErrorKind::InvalidData);
+                assert_equal(consumed, 0);
+            },
+            _ => testing::assert(false),
+        }
+    }
+}

@@ -1,0 +1,207 @@
+package main;
+
+use std::fs;
+use fs::{File, FileSystem};
+use std::io;
+use io::{Read, Close};
+use std::testing;
+
+struct SubFsProbe {
+    paths: Vec[string],
+    closes: Ref[isize],
+    stats: Ref[isize],
+    failure: bool,
+}
+
+struct SubFsFile {
+    reader: io::StringReader,
+    closes: Ref[isize],
+    stats: Ref[isize],
+}
+
+fn sub_fs_probe(failure: bool) -> SubFsProbe {
+    SubFsProbe { paths: Vec::new(), closes: Ref::new(0), stats: Ref::new(0), failure }
+}
+
+fn sub_fs_provider_error(path: string) -> fs::Error {
+    fs::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "provider open",
+        Option::Some(path),
+        Option::Some(13),
+        "provider refused original path",
+    )
+}
+
+impl FileSystem for SubFsProbe {
+    type Handle = SubFsFile;
+
+    fn open(self: SubFsProbe, name: string) -> Result[SubFsFile, fs::Error] {
+        self.paths.push(name);
+        if self.failure {
+            Result::Err(sub_fs_provider_error(name))
+        } else {
+            Result::Ok(
+                SubFsFile {
+                    reader: io::StringReader::new("a界\u0000"),
+                    closes: self.closes,
+                    stats: self.stats,
+                },
+            )
+        }
+    }
+}
+
+impl Read for SubFsFile {
+    fn read(self: SubFsFile, output: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.reader.read(output)
+    }
+}
+
+impl Close for SubFsFile {
+    fn close(self: SubFsFile) -> Result[(), io::Error] {
+        self.closes.set(self.closes.get() + 1);
+        Result::Ok(())
+    }
+}
+
+impl File for SubFsFile {
+    fn stat(self: SubFsFile) -> Result[fs::Metadata, fs::Error] {
+        self.stats.set(self.stats.get() + 1);
+        Result::Ok(fs::Metadata::from_parts(fs::FileType::File, 5, 0o640, 123456))
+    }
+}
+
+fn check_sub_fs_input_error(error: fs::Error, operation: string, path: string) -> () {
+    assert_equal(error.kind(), io::ErrorKind::InvalidInput);
+    assert_equal(error.operation(), operation);
+    assert_equal(error.path(), Option::Some(path));
+    assert_equal(error.raw_os_code(), Option::None);
+}
+
+fn check_fs_sub() -> () {
+    let invalid = Vec::from_array(
+        ["", "/", "/a", "a/", "..", "./a", "a/.", "a/..", "a//b", "a/../b"],
+    );
+    let valid = Vec::from_array(
+        [
+            ".",
+            "a",
+            "a/b",
+            "missing",
+            "not-a-directory",
+            "a\\b",
+            "C:thing",
+            "\u0000",
+            "界",
+            "...",
+            ".hidden",
+        ],
+    );
+    for root in invalid {
+        let provider = sub_fs_probe(false);
+        match fs::SubFs::new(provider, root) {
+            Ok(_) => testing::assert(false),
+            Err(error) => check_sub_fs_input_error(error, "sub filesystem", root),
+        }
+        assert_equal(provider.paths.len(), 0);
+    }
+    for root in valid {
+        let provider = sub_fs_probe(false);
+        let filesystem = testing::expect_ok(
+            fs::SubFs::new(provider, root),
+            "construct sub filesystem without provider access",
+        );
+        assert_equal(provider.paths.len(), 0);
+        for name in invalid {
+            match filesystem.open(name) {
+                Ok(_) => testing::assert(false),
+                Err(error) => check_sub_fs_input_error(error, "open", name),
+            }
+        }
+        assert_equal(provider.paths.len(), 0);
+        for name in valid {
+            let file = testing::expect_ok(filesystem.open(name), "sub filesystem matrix open");
+            let expected = if root == "." {
+                name
+            } else if name == "." {
+                root
+            } else {
+                root + "/" + name
+            };
+            assert_equal(provider.paths[provider.paths.len() - 1], expected);
+            testing::expect_ok(file.close(), "close matrix file");
+        }
+        assert_equal(provider.paths.len(), valid.len());
+        assert_equal(provider.closes.get(), valid.len());
+        assert_equal(provider.stats.get(), 0);
+    }
+    let provider = sub_fs_probe(false);
+    let outer = testing::expect_ok(fs::SubFs::new(provider, "outer"), "outer sub filesystem");
+    let inner = testing::expect_ok(fs::SubFs::new(outer, "inner/deep"), "nested sub filesystem");
+    let identity = testing::expect_ok(fs::SubFs::new(inner, "."), "nested identity");
+    assert_equal(provider.paths.len(), 0);
+    let data = testing::expect_ok(
+        fs::read_file_from(identity, "file", 5),
+        "read through nested sub filesystem",
+    );
+    assert_equal(data.to_vec(), "a界\u0000".to_bytes());
+    assert_equal(provider.paths, Vec::from_array(["outer/inner/deep/file"]));
+    assert_equal(provider.closes.get(), 1);
+    let metadata = testing::expect_ok(fs::stat_from(identity, "."), "stat sub root");
+    assert_equal(metadata.len(), 5);
+    assert_equal(metadata.file_type(), fs::FileType::File);
+    assert_equal(metadata.permissions().mode(), 0o640.to_u32());
+    assert_equal(metadata.modified_unix_nanoseconds(), 123456);
+    assert_equal(provider.paths[1], "outer/inner/deep");
+    assert_equal(provider.stats.get(), 1);
+    assert_equal(provider.closes.get(), 2);
+    let error = testing::expect_err(
+        fs::read_file_from(identity, "file", 4),
+        "sub filesystem read limit",
+    );
+    assert_equal(error.kind(), io::ErrorKind::InvalidData);
+    assert_equal(error.path(), Option::Some("file"));
+    assert_equal(provider.closes.get(), 3);
+    let calls = provider.paths.len();
+    check_sub_fs_input_error(
+        testing::expect_err(fs::read_file_from(identity, "../file", 5), "read path precheck"),
+        "read file",
+        "../file",
+    );
+    check_sub_fs_input_error(
+        testing::expect_err(fs::read_file_from(identity, "file", -1), "read limit precheck"),
+        "read file",
+        "file",
+    );
+    check_sub_fs_input_error(
+        testing::expect_err(fs::stat_from(identity, "../file"), "stat path precheck"),
+        "stat",
+        "../file",
+    );
+    assert_equal(provider.paths.len(), calls);
+    let provider = sub_fs_probe(true);
+    let filesystem = testing::expect_ok(
+        fs::SubFs::new(provider, "root"),
+        "failure provider is not opened by constructor",
+    );
+    assert_equal(provider.paths.len(), 0);
+    match filesystem.open("leaf") {
+        Ok(_) => testing::assert(false),
+        Err(error) => assert_equal(error, sub_fs_provider_error("root/leaf")),
+    }
+    assert_equal(
+        testing::expect_err(
+            fs::read_file_from(filesystem, "leaf", 5),
+            "read preserves provider cause",
+        ),
+        sub_fs_provider_error("root/leaf"),
+    );
+    assert_equal(
+        testing::expect_err(fs::stat_from(filesystem, "."), "stat preserves provider cause"),
+        sub_fs_provider_error("root"),
+    );
+    assert_equal(provider.paths, Vec::from_array(["root/leaf", "root/leaf", "root"]));
+    assert_equal(provider.closes.get(), 0);
+    assert_equal(provider.stats.get(), 0);
+}

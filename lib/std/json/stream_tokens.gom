@@ -1,0 +1,401 @@
+package json;
+
+use module::io;
+
+enum TokenContainer {
+    Array,
+    Object,
+}
+
+struct TokenFrame {
+    kind: TokenContainer,
+    phase: Ref[isize],
+    entries: Ref[isize],
+    child_path: Ref[bool],
+}
+
+struct TokenState {
+    frames: Vec[TokenFrame],
+    root_started: Ref[bool],
+    root_complete: Ref[bool],
+    need_root_separator: Ref[bool],
+    values: Ref[isize],
+}
+
+struct StreamTokenRecord {
+    record: TokenRecord,
+    skipped: bool,
+}
+
+fn token_state() -> TokenState {
+    TokenState {
+        frames: Vec::new(),
+        root_started: Ref::new(false),
+        root_complete: Ref::new(false),
+        need_root_separator: Ref::new(false),
+        values: Ref::new(0),
+    }
+}
+
+fn token_record(token: Token, offset: isize, path: Vec[PathSegment], skipped: bool) -> StreamTokenRecord {
+    StreamTokenRecord { record: TokenRecord { token, start_offset: offset, path }, skipped }
+}
+
+fn token_begin_root[R: io::Read](cursor: StreamCursor[R], state: TokenState, lease: StreamLease) -> Result[
+    bool,
+    Error,
+] {
+    stream_check(lease)?;
+    if state.root_started.get() && !state.root_complete.get() {
+        return Result::Ok(true)
+    }
+    let separated = lex_space(cursor, lease)?;
+    if cursor_peek(cursor, lease)?.is_none() {
+        return Result::Ok(false)
+    }
+    if state.need_root_separator.get() && !separated {
+        return Result::Err(
+            stream_fail(
+                cursor.session,
+                ErrorKind::Syntax,
+                "JSON root values require whitespace separation",
+                Option::None,
+            ),
+        )
+    }
+    state.root_started.set(true);
+    state.root_complete.set(false);
+    state.need_root_separator.set(false);
+    state.values.set(0);
+    cursor.root_start.set(Option::Some(cursor.session.offset.get()));
+    Result::Ok(true)
+}
+
+fn token_complete_value[R](cursor: StreamCursor[R], state: TokenState, lease: StreamLease) -> Result[
+    (),
+    Error,
+] {
+    if state.frames.is_empty() {
+        state.root_complete.set(true);
+        state.need_root_separator.set(true);
+        cursor.root_start.set(Option::None);
+    } else {
+        let frame = state.frames[state.frames.len() - 1];
+        if !frame.child_path.get() {
+            return Result::Err(
+                stream_fail(
+                    cursor.session,
+                    ErrorKind::State,
+                    "JSON value completed without an active parent entry",
+                    Option::None,
+                ),
+            )
+        }
+        stream_pop_path(lease);
+        stream_check(lease)?;
+        frame.child_path.set(false);
+        frame.phase.set(3);
+    }
+    Result::Ok(())
+}
+
+fn token_close[R: io::Read](
+    cursor: StreamCursor[R],
+    state: TokenState,
+    lease: StreamLease,
+    token: Token,
+) -> Result[Option[StreamTokenRecord], Error] {
+    let offset = cursor.session.offset.get();
+    let path = stream_path_snapshot(cursor.session.path);
+    let _ = cursor_take(cursor, lease)?;
+    let Some(_) = state.frames.pop() else {
+        return Result::Err(
+            stream_fail(
+                cursor.session,
+                ErrorKind::State,
+                "JSON container stack is empty",
+                Option::None,
+            ),
+        )
+    };
+    token_complete_value(cursor, state, lease)?;
+    Result::Ok(Option::Some(token_record(token, offset, path, false)))
+}
+
+fn token_value[R: io::Read](
+    cursor: StreamCursor[R],
+    state: TokenState,
+    lease: StreamLease,
+    capture: bool,
+) -> Result[Option[StreamTokenRecord], Error] {
+    let Some(first) = cursor_peek(cursor, lease)? else {
+        return Result::Err(
+            stream_fail(
+                cursor.session,
+                ErrorKind::UnexpectedEof,
+                "expected JSON value",
+                Option::None,
+            ),
+        )
+    };
+    if state.values.get() >= cursor.limits.max_values {
+        return Result::Err(
+            stream_fail(
+                cursor.session,
+                ErrorKind::Limit(LimitKind::Values),
+                "JSON value count limit exceeded",
+                Option::None,
+            ),
+        )
+    }
+    state.values.set(state.values.get() + 1);
+    let offset = cursor.session.offset.get();
+    let path = stream_path_snapshot(cursor.session.path);
+    if first == b'[' || first == b'{' {
+        if state.frames.len() >= cursor.limits.max_depth {
+            return Result::Err(
+                stream_fail(
+                    cursor.session,
+                    ErrorKind::Limit(LimitKind::Depth),
+                    "JSON container depth limit exceeded",
+                    Option::None,
+                ),
+            )
+        }
+        let _ = cursor_take(cursor, lease)?;
+        let (kind, token) = if first == b'[' {
+            (TokenContainer::Array, Token::StartArray)
+        } else {
+            (TokenContainer::Object, Token::StartObject)
+        };
+        state.frames.push(
+            TokenFrame {
+                kind,
+                phase: Ref::new(0),
+                entries: Ref::new(0),
+                child_path: Ref::new(false),
+            },
+        );
+        return Result::Ok(Option::Some(token_record(token, offset, path, false)))
+    }
+    let (token, skipped) = if first == b'"' {
+        match lex_string(cursor, lease, capture)? {
+            Some(value) => (Token::String(value), false),
+            None => (Token::String(""), true),
+        }
+    } else if first == b'-' || (first >= b'0' && first <= b'9') {
+        match lex_number(cursor, lease, capture)? {
+            Some(value) => (Token::Number(value), false),
+            None => (Token::Number(""), true),
+        }
+    } else if first == b't' {
+        lex_literal(cursor, lease, "true")?;
+        (Token::Bool(true), false)
+    } else if first == b'f' {
+        lex_literal(cursor, lease, "false")?;
+        (Token::Bool(false), false)
+    } else if first == b'n' {
+        lex_literal(cursor, lease, "null")?;
+        (Token::Null, false)
+    } else {
+        return Result::Err(
+            stream_fail(cursor.session, ErrorKind::Syntax, "expected JSON value", Option::None),
+        )
+    };
+    token_complete_value(cursor, state, lease)?;
+    Result::Ok(Option::Some(token_record(token, offset, path, skipped)))
+}
+
+fn token_step[R: io::Read](
+    cursor: StreamCursor[R],
+    state: TokenState,
+    lease: StreamLease,
+    capture_scalars: bool,
+) -> Result[Option[StreamTokenRecord], Error] {
+    loop {
+        stream_event(lease, cursor.limits.max_events)?;
+        if state.frames.is_empty() {
+            if !token_begin_root(cursor, state, lease)? {
+                return Result::Ok(Option::None)
+            }
+            return token_value(cursor, state, lease, capture_scalars)
+        }
+        let _ = lex_space(cursor, lease)?;
+        let Some(first) = cursor_peek(cursor, lease)? else {
+            return Result::Err(
+                stream_fail(
+                    cursor.session,
+                    ErrorKind::UnexpectedEof,
+                    "incomplete JSON container",
+                    Option::None,
+                ),
+            )
+        };
+        let frame = state.frames[state.frames.len() - 1];
+        let phase = frame.phase.get();
+        if phase == 3 {
+            let closes = match frame.kind {
+                Array => first == b']',
+                Object => first == b'}',
+            };
+            if closes {
+                let token = match frame.kind {
+                    Array => Token::EndArray,
+                    Object => Token::EndObject,
+                };
+                return token_close(cursor, state, lease, token)
+            }
+            if first != b',' {
+                return Result::Err(
+                    stream_fail(
+                        cursor.session,
+                        ErrorKind::Syntax,
+                        "expected JSON comma or container end",
+                        Option::None,
+                    ),
+                )
+            }
+            let _ = cursor_take(cursor, lease)?;
+            frame.phase.set(1);
+            continue
+        }
+        match frame.kind {
+            Array => {
+                if phase != 0 && phase != 1 {
+                    return Result::Err(
+                        stream_fail(
+                            cursor.session,
+                            ErrorKind::State,
+                            "invalid JSON array phase",
+                            Option::None,
+                        ),
+                    )
+                }
+                if phase == 0 && first == b']' {
+                    return token_close(cursor, state, lease, Token::EndArray)
+                }
+                if first == b']' {
+                    return Result::Err(
+                        stream_fail(
+                            cursor.session,
+                            ErrorKind::Syntax,
+                            "trailing JSON array comma",
+                            Option::None,
+                        ),
+                    )
+                }
+                if frame.entries.get() >= cursor.limits.max_container_entries {
+                    return Result::Err(
+                        stream_fail(
+                            cursor.session,
+                            ErrorKind::Limit(LimitKind::ContainerEntries),
+                            "JSON array entry limit exceeded",
+                            Option::None,
+                        ),
+                    )
+                }
+                stream_push_path(
+                    lease,
+                    PathSegment::Index(frame.entries.get()),
+                    cursor.limits.max_path_bytes,
+                )?;
+                frame.entries.set(frame.entries.get() + 1);
+                frame.child_path.set(true);
+                frame.phase.set(2);
+                return token_value(cursor, state, lease, capture_scalars)
+            },
+            Object => {
+                if phase == 2 {
+                    if first != b':' {
+                        return Result::Err(
+                            stream_fail(
+                                cursor.session,
+                                ErrorKind::Syntax,
+                                "expected JSON object colon",
+                                Option::None,
+                            ),
+                        )
+                    }
+                    let _ = cursor_take(cursor, lease)?;
+                    let _ = lex_space(cursor, lease)?;
+                    frame.phase.set(4);
+                    return token_value(cursor, state, lease, capture_scalars)
+                }
+                if phase != 0 && phase != 1 {
+                    return Result::Err(
+                        stream_fail(
+                            cursor.session,
+                            ErrorKind::State,
+                            "invalid JSON object phase",
+                            Option::None,
+                        ),
+                    )
+                }
+                if phase == 0 && first == b'}' {
+                    return token_close(cursor, state, lease, Token::EndObject)
+                }
+                if first != b'"' {
+                    return Result::Err(
+                        stream_fail(
+                            cursor.session,
+                            ErrorKind::Syntax,
+                            "expected JSON object key",
+                            Option::None,
+                        ),
+                    )
+                }
+                if frame.entries.get() >= cursor.limits.max_container_entries {
+                    return Result::Err(
+                        stream_fail(
+                            cursor.session,
+                            ErrorKind::Limit(LimitKind::ContainerEntries),
+                            "JSON object entry limit exceeded",
+                            Option::None,
+                        ),
+                    )
+                }
+                let offset = cursor.session.offset.get();
+                let Some(name) = lex_string(cursor, lease, true)? else {
+                    return Result::Err(
+                        stream_fail(
+                            cursor.session,
+                            ErrorKind::State,
+                            "JSON key capture was omitted",
+                            Option::None,
+                        ),
+                    )
+                };
+                stream_push_path(lease, PathSegment::Field(name), cursor.limits.max_path_bytes)?;
+                frame.entries.set(frame.entries.get() + 1);
+                frame.child_path.set(true);
+                frame.phase.set(2);
+                let path = stream_path_snapshot(cursor.session.path);
+                return Result::Ok(Option::Some(token_record(Token::Key(name), offset, path, false)))
+            },
+        }
+    }
+}
+
+fn token_finish_stream[R: io::Read](cursor: StreamCursor[R], state: TokenState, lease: StreamLease) -> Result[
+    (),
+    Error,
+] {
+    stream_event(lease, cursor.limits.max_events)?;
+    if !state.frames.is_empty() || (state.root_started.get() && !state.root_complete.get()) {
+        return Result::Err(
+            stream_fail(
+                cursor.session,
+                ErrorKind::State,
+                "cannot finish an incomplete JSON root",
+                Option::None,
+            ),
+        )
+    }
+    let _ = lex_space(cursor, lease)?;
+    if cursor_peek(cursor, lease)?.is_some() {
+        return Result::Err(
+            stream_fail(cursor.session, ErrorKind::TrailingData, "trailing JSON data", Option::None),
+        )
+    }
+    Result::Ok(())
+}

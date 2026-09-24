@@ -1,0 +1,229 @@
+package main;
+
+use std::bytes;
+use std::io;
+use std::testing;
+use std::ffi;
+use std::utf8;
+use utf8::BytesUtf8;
+
+#[go_ffi("example.com/goml-std-algorithms/native", "ScanTokens")]
+extern fn go_scan_tokens(input: Slice[byte], kind: string) -> ffi::RawSlice[ffi::RawSlice[byte]];
+
+fn check_scanner() -> () {
+    check_unicode_scanner();
+    check_scanner_failures();
+    for width in 1..12 {
+        let source = FixedReader {
+            cursor: io::Cursor::new(bytes::Bytes::from_string("a\r\n\nβ\nlast\r")),
+            chunk: width,
+            interrupted: Ref::new(false),
+        };
+        let scanner = testing::expect_ok(io::Scanner::new(source, 5), "line scanner");
+        for expected in Vec::from_array(["a", "", "β", "last"]) {
+            let token = testing::expect_some(testing::expect_ok(scanner.next(), "next"), "token");
+            assert_equal(testing::expect_ok(token.to_string_utf8(), "UTF8"), expected);
+        }
+        testing::assert(testing::expect_ok(scanner.next(), "EOF").is_none());
+        testing::assert(testing::expect_ok(scanner.next(), "repeat EOF").is_none());
+        testing::assert(scanner.failure().is_none());
+    }
+    for input in Vec::from_array(["", "\n", "a\n", "a", "\r"]) {
+        let scanner = testing::expect_ok(
+            io::Scanner::new(io::Cursor::new(bytes::Bytes::from_string(input)), 2),
+            "small scanner",
+        );
+        let mut count = 0;
+        while let Some(_) = testing::expect_ok(scanner.next(), "small next") {
+            count += 1;
+        }
+        assert_equal(
+            count,
+            if input == "" {
+                0
+            } else {
+                1
+            },
+        );
+    }
+    let scanner = testing::expect_ok(
+        io::Scanner::with_split(
+            io::Cursor::new(bytes::Bytes::from_vec(b"a\xffb")),
+            1,
+            io::scan_bytes,
+        ),
+        "bytes scanner",
+    );
+    for expected in b"a\xffb" {
+        let token = testing::expect_some(testing::expect_ok(scanner.next(), "byte"), "byte token");
+        assert_equal(token.to_vec(), Vec::from_array([expected]));
+    }
+    testing::assert(testing::expect_ok(scanner.next(), "bytes EOF").is_none());
+    let source = io::Cursor::new(bytes::Bytes::from_string("12345"));
+    let scanner = testing::expect_ok(io::Scanner::new(source, 4), "limited scanner");
+    testing::assert(scanner.next().is_err());
+    assert_equal(source.position(), 5);
+    let failure = testing::expect_some(scanner.failure(), "sticky failure");
+    match scanner.next() {
+        Err(error) => assert_equal(error, failure),
+        Ok(_) => testing::assert(false),
+    }
+    assert_equal(source.position(), 5);
+    let source = io::Cursor::new(bytes::Bytes::from_string("1234"));
+    let scanner = testing::expect_ok(io::Scanner::new(source, 4), "exact limit");
+    assert_equal(
+        testing::expect_some(testing::expect_ok(scanner.next(), "exact token"), "token").to_vec(),
+        b"1234",
+    );
+    testing::assert(testing::expect_ok(scanner.next(), "exact EOF").is_none());
+    let scanner = testing::expect_ok(
+        io::Scanner::with_split(
+            source,
+            4,
+            |_: Slice[byte], _: bool| Result::Ok(io::ScanStep::Token(0, 0, 0)),
+        ),
+        "invalid callback",
+    );
+    testing::assert(scanner.next().is_err());
+    testing::assert(io::Scanner::new(source, 0).is_err());
+    let scanner = testing::expect_ok(
+        io::Scanner::with_split(
+            source,
+            4,
+            |_: Slice[byte], _: bool| Result::Ok(io::ScanStep::Final(Option::Some((0, 0)))),
+        ),
+        "empty final",
+    );
+    testing::assert(
+        testing::expect_some(testing::expect_ok(scanner.next(), "final"), "empty token").is_empty(),
+    );
+    testing::assert(testing::expect_ok(scanner.next(), "stopped").is_none());
+}
+
+fn check_unicode_scanner() -> () {
+    let inputs = Vec::from_array(
+        [
+            b"",
+            b"a\xff\xc2\xa0b\xe2\x80",
+            b"\xed\xa0\x80 \xf4\x90\x80\x80",
+            b"\r\n\t\x0b\x0c \xc2\x85\xc2\xa0",
+        ],
+    );
+    inputs.push(bytes::Bytes::from_string("α β\n世界　word\r\n😀").to_vec());
+    let all = Vec::new();
+    for code in 0..256 {
+        all.push(code.to_u8());
+    }
+    inputs.push(all);
+    for input in inputs {
+        for kind in Vec::from_array(["lines", "runes", "words"]) {
+            let split = if kind == "lines" {
+                io::scan_lines
+            } else if kind == "runes" {
+                io::scan_runes
+            } else {
+                io::scan_words
+            };
+            let expected = go_scan_tokens(input.as_slice(), kind);
+            for width in 1..10 {
+                let source = FixedReader {
+                    cursor: io::Cursor::new(bytes::Bytes::from_vec(input)),
+                    chunk: width,
+                    interrupted: Ref::new(false),
+                };
+                let scanner = testing::expect_ok(
+                    io::Scanner::with_split(source, 1024, split),
+                    "Unicode scanner",
+                );
+                let mut index = 0;
+                while let Some(token) = testing::expect_ok(scanner.next(), "Unicode token") {
+                    testing::assert(index < expected.len());
+                    assert_equal(token.to_vec(), expected.get(index).to_vec());
+                    index += 1;
+                }
+                assert_equal(index, expected.len());
+            }
+        }
+    }
+}
+
+fn check_scanner_failures() -> () {
+    let failure = io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "scanner source",
+        Option::None,
+        Option::None,
+        "stop",
+    );
+    let events = Vec::new();
+    let source = multi_probe(events, 1, 0);
+    source.result.set(Result::Err(failure));
+    let scanner = testing::expect_ok(io::Scanner::new(source, 3), "error scanner");
+    for _ in 0..2 {
+        match scanner.next() {
+            Err(error) => assert_equal(error, failure),
+            Ok(_) => testing::assert(false),
+        }
+    }
+    assert_equal(events, Vec::from_array([1]));
+    for count in Vec::from_array([-1, 5]) {
+        let source = multi_probe(Vec::new(), 1, count);
+        let scanner = testing::expect_ok(io::Scanner::new(source, 4), "invalid source");
+        testing::assert(scanner.next().is_err());
+        assert_equal(
+            testing::expect_some(scanner.failure(), "failure").kind(),
+            io::ErrorKind::InvalidData,
+        );
+    }
+    for step in Vec::from_array(
+        [
+            io::ScanStep::More(-1),
+            io::ScanStep::More(1),
+            io::ScanStep::Token(1, 0, 2),
+            io::ScanStep::Final(Option::Some((-1, 0))),
+        ],
+    ) {
+        let source = io::Cursor::new(bytes::Bytes::new());
+        let scanner = testing::expect_ok(
+            io::Scanner::with_split(source, 4, |_: Slice[byte], _: bool| Result::Ok(step)),
+            "invalid split",
+        );
+        testing::assert(scanner.next().is_err());
+    }
+    let source = io::Cursor::new(bytes::Bytes::from_string("unfinished"));
+    let scanner = testing::expect_ok(
+        io::Scanner::with_split(
+            source,
+            20,
+            |_: Slice[byte], _: bool| Result::Ok(io::ScanStep::More(0)),
+        ),
+        "unfinished split",
+    );
+    testing::assert(scanner.next().is_err());
+    assert_equal(
+        testing::expect_some(scanner.failure(), "EOF failure").kind(),
+        io::ErrorKind::UnexpectedEof,
+    );
+    let source = io::Cursor::new(bytes::Bytes::from_string("..ab"));
+    let scanner = testing::expect_ok(
+        io::Scanner::with_split(
+            source,
+            4,
+            |input: Slice[byte], eof: bool| {
+                if input.len() > 0 && input[0] == b'.' {
+                    Result::Ok(io::ScanStep::More(1))
+                } else {
+                    io::scan_bytes(input, eof)
+                }
+            },
+        ),
+        "skip split",
+    );
+    let first = testing::expect_some(testing::expect_ok(scanner.next(), "first"), "first token");
+    first.set(0, b'x');
+    assert_equal(
+        testing::expect_some(testing::expect_ok(scanner.next(), "second"), "second token").to_vec(),
+        b"b",
+    );
+    testing::assert(testing::expect_ok(scanner.next(), "skip EOF").is_none());
+}

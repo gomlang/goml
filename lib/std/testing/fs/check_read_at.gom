@@ -1,0 +1,380 @@
+package fs;
+
+use module::fs as filesystem;
+use module::io;
+use io::ReadAt;
+
+fn check_read_at_sequential[H: filesystem::File](
+    state: CheckState,
+    handle: H,
+    path: string,
+    baseline: Vec[byte],
+    position: Ref[isize],
+) -> bool {
+    let Some(amount) = check_file_request(state, path, 1) else {
+        return false
+    };
+    let buffer = check_file_buffer(amount);
+    let Some(count) = check_file_read(state, handle, path, buffer.as_mut_slice()) else {
+        return false
+    };
+    let index = position.get();
+    if index == baseline.len() {
+        if count != 0 {
+            check_inconsistent(
+                state,
+                path,
+                "read_at sequential position",
+                "sequential read produced data beyond the snapshot",
+            );
+            return false
+        }
+    } else {
+        if count != 1 || buffer[0] != baseline[index] {
+            check_inconsistent(
+                state,
+                path,
+                "read_at sequential position",
+                "positional transfer changed sequential position or content",
+            );
+            return false
+        }
+        position.set(index + 1);
+    }
+    true
+}
+
+fn check_read_at_probe[H: io::ReadAt](
+    state: CheckState,
+    handle: H,
+    path: string,
+    baseline: Vec[byte],
+    offset: isize,
+    desired: isize,
+) -> bool {
+    if check_stopped(state) {
+        return false
+    }
+    let amount = if desired == 0 {
+        0
+    } else {
+        match check_file_request(state, path, desired) {
+            Some(amount) => amount,
+            None => return false,
+        }
+    };
+    let buffer = check_file_buffer(amount);
+    let response = check_call(
+        state,
+        path,
+        "read_at",
+        || Result::Ok(handle.read_at(buffer.as_mut_slice(), offset)),
+    );
+    let Some(response) = response else {
+        return false
+    };
+    let invalid_range = offset < 0 || offset > 9223372036854775807 - amount;
+    let (count, cause, success) = match response {
+        Ok(count) => {
+            if count < 0 || count > amount {
+                check_violation(
+                    state,
+                    path,
+                    "read_at",
+                    "positional reader returned an invalid successful count",
+                );
+                return false
+            };
+            (count, Option::None, true)
+        },
+        Err(error) => {
+            if error.transferred() > amount.to_usize() {
+                check_violation(
+                    state,
+                    path,
+                    "read_at",
+                    "positional reader returned progress beyond its buffer",
+                );
+                return false
+            };
+            (error.transferred().to_isize(), Option::Some(error.error()), false)
+        },
+    };
+    let counters = state.counters.get();
+    state.counters.set(CheckCounters { read_bytes: counters.read_bytes + count, ..counters });
+    let mut valid = true;
+    if success && (invalid_range || count != amount) {
+        check_violation(
+            state,
+            path,
+            "read_at",
+            if invalid_range {
+                "positional reader accepted a negative or overflowing range"
+            } else {
+                "short positional transfer was reported as success"
+            },
+        );
+        valid = false;
+    }
+    if invalid_range {
+        if count > 0 {
+            check_violation(
+                state,
+                path,
+                "read_at",
+                "positional reader confirmed progress for an invalid range",
+            );
+            valid = false;
+        }
+        if let Some(error) = cause {
+            if error.kind() != io::ErrorKind::InvalidInput {
+                check_issue(
+                    state,
+                    CheckIssue {
+                        path,
+                        operation: "read_at",
+                        kind: CheckIssueKind::ProviderError(check_io_error(error)),
+                    },
+                );
+                valid = false;
+            }
+        }
+        return valid
+    }
+    let available = if offset < baseline.len() {
+        baseline.len() - offset
+    } else {
+        0
+    };
+    let expected = if available < amount {
+        available
+    } else {
+        amount
+    };
+    if count > available {
+        check_inconsistent(
+            state,
+            path,
+            "read_at",
+            "positional reader confirmed data beyond the snapshot",
+        );
+        valid = false;
+    } else {
+        for index in 0..count {
+            if buffer[index] != baseline[offset + index] {
+                check_inconsistent(
+                    state,
+                    path,
+                    "read_at",
+                    "confirmed positional bytes differ from the snapshot",
+                );
+                valid = false;
+                break
+            }
+        }
+    }
+    if let Some(error) = cause {
+        if amount > 0 && count < amount && error.kind() == io::ErrorKind::UnexpectedEof {
+            if count != expected || expected == amount {
+                check_inconsistent(
+                    state,
+                    path,
+                    "read_at",
+                    "positional EOF disagrees with the snapshot boundary",
+                );
+                valid = false;
+            }
+        } else {
+            check_issue(
+                state,
+                CheckIssue {
+                    path,
+                    operation: "read_at",
+                    kind: CheckIssueKind::ProviderError(check_io_error(error)),
+                },
+            );
+            valid = false;
+        }
+    }
+    valid
+}
+
+fn check_read_at_interleaved[H: filesystem::File + io::ReadAt](
+    state: CheckState,
+    handle: H,
+    path: string,
+    baseline: Vec[byte],
+    position: Ref[isize],
+    offset: isize,
+    amount: isize,
+) -> bool {
+    let valid = check_read_at_probe(state, handle, path, baseline, offset, amount);
+    if check_stopped(state) {
+        return false
+    }
+    let sequential = check_read_at_sequential(state, handle, path, baseline, position);
+    valid && sequential
+}
+
+fn check_read_at_file[F: filesystem::FileSystem](
+    state: CheckState,
+    source: F,
+    path: string,
+    metadata: filesystem::Metadata,
+) -> () where F::Handle: io::ReadAt {
+    let _ = check_with_handle(
+        state,
+        source,
+        path,
+        |baseline_handle| {
+            if !check_file_metadata(state, baseline_handle, path, metadata) {
+                return
+            }
+            let Some(baseline) = check_read_snapshot(state, baseline_handle, path) else {
+                return
+            };
+            if baseline.len().to_i64() != metadata.len() {
+                check_inconsistent(
+                    state,
+                    path,
+                    "read_at baseline",
+                    "confirmed file length differs from snapshot metadata",
+                );
+                return
+            }
+            if !baseline.is_empty() {
+                for offset in[0, baseline.len(), 9223372036854775807] {
+                    let checked = check_with_handle(
+                        state,
+                        source,
+                        path,
+                        |subject| {
+                            if !check_file_metadata(state, subject, path, metadata) {
+                                return false
+                            }
+                            check_read_at_interleaved(
+                                state,
+                                subject,
+                                path,
+                                baseline,
+                                Ref::new(0),
+                                offset,
+                                0,
+                            )
+                        },
+                    );
+                    match checked {
+                        Some(true) => (),
+                        _ => return,
+                    }
+                }
+                let checked = check_with_handle(
+                    state,
+                    source,
+                    path,
+                    |subject| {
+                        if !check_file_metadata(state, subject, path, metadata) {
+                            return false
+                        }
+                        let position = Ref::new(0);
+                        check_read_at_interleaved(state, subject, path, baseline, position, 0, 1)
+                    },
+                );
+                match checked {
+                    Some(true) => (),
+                    _ => return,
+                }
+            }
+            let _ = check_with_handle(
+                state,
+                source,
+                path,
+                |subject| {
+                    if !check_file_metadata(state, subject, path, metadata) {
+                        return
+                    }
+                    let position = Ref::new(0);
+                    let tail = if baseline.is_empty() {
+                        0
+                    } else {
+                        baseline.len() - 1
+                    };
+                    if !check_read_at_interleaved(state, subject, path, baseline, position, tail, 2) {
+                        return
+                    }
+                    if !check_read_at_sequential(state, subject, path, baseline, position) {
+                        return
+                    }
+                    for (offset, amount) in[
+                        (-1, 1),
+                        (-9223372036854775807 - 1, 0),
+                        (9223372036854775807, 1),
+                    ] {
+                        if !check_read_at_interleaved(
+                            state,
+                            subject,
+                            path,
+                            baseline,
+                            position,
+                            offset,
+                            amount,
+                        ) {
+                            return
+                        }
+                    }
+                    let mut offset = 0;
+                    while offset < baseline.len() {
+                        let remaining = baseline.len() - offset;
+                        let desired = if remaining < 17 {
+                            remaining
+                        } else {
+                            17
+                        };
+                        let Some(amount) = check_file_request(state, path, desired) else {
+                            return
+                        };
+                        if !check_read_at_interleaved(
+                            state,
+                            subject,
+                            path,
+                            baseline,
+                            position,
+                            offset,
+                            amount,
+                        ) {
+                            return
+                        }
+                        offset += amount;
+                    }
+                    if !check_read_at_interleaved(state, subject, path, baseline, position, tail, 2) {
+                        return
+                    }
+                    if !check_read_at_interleaved(
+                        state,
+                        subject,
+                        path,
+                        baseline,
+                        position,
+                        baseline.len(),
+                        1,
+                    ) {
+                        return
+                    }
+                    for offset in[0, baseline.len(), 9223372036854775807] {
+                        if !check_read_at_interleaved(
+                            state,
+                            subject,
+                            path,
+                            baseline,
+                            position,
+                            offset,
+                            0,
+                        ) {
+                            return
+                        }
+                    }
+                },
+            );
+        },
+    );
+}
