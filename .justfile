@@ -5,6 +5,7 @@ make:
     bash bootstrap/build-stage.sh stage2 stage0/bin/goml stage0/bin/gomlc
     cp gomlc/_bootstrap/stage2/bin/cmd/gomlc/gomlc stage2/bin/gomlc
     cp gomlc/_bootstrap/stage2/bin/cmd/gomlfmt/gomlfmt stage2/bin/gomlfmt
+    cp gomlc/_bootstrap/stage2/bin/cmd/gomldoc/gomldoc stage2/bin/gomldoc
     cp gomlc/_bootstrap/stage2/bin/cmd/gomllsp/gomllsp stage2/bin/gomllsp
     bash tools/lib/install.sh stage2
     cp goml/_bootstrap/stage2/bin/cmd/goml/goml stage2/bin/goml
@@ -187,6 +188,7 @@ install: make-tools
     cp stage2/bin/gomlc "${GOML_HOME:-$HOME/.goml}/bin/gomlc"
     cp stage2/bin/goml "${GOML_HOME:-$HOME/.goml}/bin/goml"
     cp stage2/bin/gomlfmt "${GOML_HOME:-$HOME/.goml}/bin/gomlfmt"
+    cp stage2/bin/gomldoc "${GOML_HOME:-$HOME/.goml}/bin/gomldoc"
     cp stage2/bin/gomllsp "${GOML_HOME:-$HOME/.goml}/bin/gomllsp"
     cp stage2/bin/goml-go-meta "${GOML_HOME:-$HOME/.goml}/bin/goml-go-meta"
     cp stage2/bin/goml-c-bind "${GOML_HOME:-$HOME/.goml}/bin/goml-c-bind"

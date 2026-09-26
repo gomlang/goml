@@ -1,0 +1,277 @@
+package query;
+
+use module::ast;
+use module::cst;
+use module::doc_comment;
+use module::parser;
+
+fn documentation_canonical(value: Analysis, name: string) -> string {
+    if match name {
+        "bool" | "isize" | "i8" | "i16" | "i32" | "i64" | "usize" | "u8" | "u16" | "u32" | "u64" | "f32" | "f64" | "string" | "char" => true,
+        _ => false,
+    } {
+        return "builtin::" + name
+    }
+    let first = first_namespace_segment(name);
+    if first == "module" {
+        return expand_module_namespace(value.module_path, name)
+    }
+    if let Some(file) = value.lowered.ast {
+        for import in file.uses {
+            let package_name = expand_module_namespace(value.module_path, path_text(import.path));
+            for item in import.items {
+                if item.alias.unwrap_or(item.name) == first {
+                    return package_name + "::" + item.name
+                        + name.byte_slice(first.byte_len(), name.byte_len())
+                }
+            }
+            if import.items.is_empty() {
+                let mut declared = last_path_segment(import.path);
+                for package_value in documentation_index(value).packages {
+                    if package_value.0 == package_name {
+                        declared = package_value.1;
+                        break
+                    }
+                }
+                if import.alias.unwrap_or(declared) == first {
+                    return package_name + name.byte_slice(first.byte_len(), name.byte_len())
+                }
+            }
+        }
+    }
+    if !name.contains("::") && !documentation_link_exists(value, value.package_name + "::" + name)
+        && documentation_link_exists(value, "prelude::" + name) {
+        return "prelude::" + name
+    }
+    for source in value.sources {
+        if name == source.package_name || name.starts_with(source.package_name + "::") {
+            return name
+        }
+    }
+    if name.starts_with(value.module_path + "::") || name.starts_with("std::")
+        || name.starts_with("prelude::") {
+        name
+    } else {
+        value.package_name + "::" + name
+    }
+}
+
+struct DocumentationIndex {
+    names: Vec[(string, bool)],
+    packages: Vec[(string, string)],
+}
+
+fn documentation_index(value: Analysis) -> DocumentationIndex {
+    if let Some(index) = value.documentation_index.get() {
+        return index
+    }
+    let names = Vec::new();
+    let packages = Vec::new();
+    for source in value.sources {
+        let parsed = parser::parse(source.source);
+        let syntax = syntax_index(parsed.root);
+        if let Some(file) = ast::lower(parsed).ast {
+            packages.push((source.package_name, file.package_name));
+            for import in file.uses {
+                if let ast::Visibility::Public = import.visibility {
+                    for item in import.items {
+                        names.push(
+                            (source.package_name + "::" + item.alias.unwrap_or(item.name), true),
+                        )
+                    }
+                    if import.items.is_empty() {
+                        names.push(
+                            (
+                                source.package_name + "::"
+                                    + import.alias.unwrap_or(last_path_segment(import.path)),
+                                true,
+                            ),
+                        )
+                    }
+                }
+            }
+        }
+        for node in syntax.nodes {
+            if documentation_kind(node.kind) != "" && node.kind != cst::NodeKind::IMPL
+                && node.kind != cst::NodeKind::USE {
+                if let Some(token) = first_identifier(syntax, node) {
+                    let mut owner = source.package_name;
+                    let mut public = documentation_public(syntax, node);
+                    let mut inside_impl = false;
+                    let mut parent = node.parent;
+                    while let Some(id) = parent {
+                        let ancestor = syntax.nodes[id];
+                        if ancestor.kind == cst::NodeKind::IMPL {
+                            inside_impl = true;
+                            break
+                        }
+                        if ancestor.kind == cst::NodeKind::TRAIT
+                            || ancestor.kind == cst::NodeKind::STRUCT
+                            || ancestor.kind == cst::NodeKind::ENUM
+                            || ancestor.kind == cst::NodeKind::VARIANT {
+                            if let Some(token) = first_identifier(syntax, ancestor) {
+                                owner = source.package_name + "::" + token.text
+                                    + owner.byte_slice(
+                                        source.package_name.byte_len(),
+                                        owner.byte_len(),
+                                    );
+                            }
+                            if ancestor.kind == cst::NodeKind::TRAIT
+                                || ancestor.kind == cst::NodeKind::ENUM {
+                                public = documentation_public(syntax, ancestor);
+                            }
+                        }
+                        parent = ancestor.parent;
+                    }
+                    if !inside_impl {
+                        names.push((owner + "::" + token.text, public))
+                    }
+                }
+            }
+        }
+    }
+    for symbol in build_symbol_index(value).symbols {
+        if let MethodOrigin::Inherent | MethodOrigin::TraitImplementation = symbol.method_origin {
+            names.push((symbol.qualified_name, symbol.public))
+        }
+    }
+    for environment in value.environments {
+        for reexport in environment.reexports {
+            if reexport.0.contains("::") {
+                names.push((reexport.0, true))
+            }
+        }
+    }
+    let result = DocumentationIndex { names, packages };
+    value.documentation_index.set(Option::Some(result));
+    result
+}
+
+fn documentation_name_public(value: Analysis, name: string) -> bool {
+    for entry in documentation_index(value).names {
+        if (entry.0 == name
+            || (name.starts_with("builtin::") && entry.0 == "prelude::" + short_type_name(name)))
+            && entry.1 {
+            return true
+        }
+    }
+    false
+}
+
+fn documentation_link_exists(value: Analysis, name: string) -> bool {
+    for entry in documentation_index(value).names {
+        if entry.0 == name {
+            return true
+        }
+    }
+    for entry in documentation_index(value).packages {
+        if entry.0 == name {
+            return true
+        }
+    }
+    false
+}
+
+fn documentation_link_ambiguous(value: Analysis, name: string) -> bool {
+    let mut matches = 0;
+    for symbol in build_symbol_index(value).symbols {
+        if symbol.qualified_name == name {
+            matches += 1;
+        }
+    }
+    matches > 1
+}
+
+fn documentation_links(value: Analysis, documentation: string, warnings: Vec[string]) -> Vec[
+    DocLink,
+] {
+    let result = Vec::new();
+    for reference in doc_comment::references(documentation) {
+        let mut target = documentation_canonical(value, reference);
+        if !documentation_link_exists(value, target) && !reference.contains("::") {
+            target = "prelude::" + reference;
+        }
+        if documentation_link_ambiguous(value, target) {
+            warnings.push(value.source_path + ": ambiguous documentation link [" + reference + "]")
+        } else if documentation_link_exists(value, target) {
+            result.push(DocLink { text: reference, target })
+        } else {
+            warnings.push(value.source_path + ": unresolved documentation link [" + reference + "]")
+        }
+    }
+    result
+}
+
+fn documentation_reexports(
+    value: Analysis,
+    root: string,
+    result: Vec[DocItem],
+    warnings: Vec[string],
+) -> () {
+    let nodes: Vec[SyntaxNode] = Vec::new();
+    for node in value.syntax.nodes {
+        if node.kind == cst::NodeKind::USE && node.parent == Option::Some(0) {
+            nodes.push(node)
+        }
+    }
+    if let Some(file) = value.lowered.ast {
+        for index in 0..file.uses.len() {
+            let import = file.uses[index];
+            if let ast::Visibility::Public = import.visibility {
+                let exports: Vec[(string, string)] = Vec::new();
+                let package_name = expand_module_namespace(
+                    value.module_path,
+                    path_text(import.path),
+                );
+                for item in import.items {
+                    exports.push((item.alias.unwrap_or(item.name), package_name + "::" + item.name))
+                }
+                if import.items.is_empty() {
+                    let mut name = last_path_segment(import.path);
+                    for source in value.sources {
+                        if source.package_name == package_name {
+                            if let Some(file) = ast::lower(parser::parse(source.source)).ast {
+                                name = file.package_name;
+                            }
+                            break
+                        }
+                    }
+                    exports.push((import.alias.unwrap_or(name), package_name))
+                }
+                if index < nodes.len() {
+                    if let Some(base) = documentation_item(
+                        value,
+                        nodes[index],
+                        root,
+                        value.package_name,
+                        "",
+                        false,
+                        true,
+                        false,
+                        warnings,
+                    ) {
+                        for exported in exports {
+                            let name = exported.0;
+                            let qualified_name = value.package_name + "::" + name;
+                            let mut target = exported.1;
+                            for environment in value.environments {
+                                for reexport in environment.reexports {
+                                    if reexport.0 == qualified_name
+                                        || ((value.package_name == "main"
+                                            || value.package_name == "prelude"
+                                            || value.package_name == "builtin")
+                                            && reexport.0 == name) {
+                                        target = reexport.1;
+                                    }
+                                }
+                            }
+                            result.push(
+                                DocItem { id: qualified_name, name, qualified_name, target, ..base },
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

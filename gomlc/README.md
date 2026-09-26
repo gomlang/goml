@@ -19,6 +19,7 @@ Use `just bootstrap` for a clean bootstrap and stage3 artifact fixed-point verif
 ```text
 stage2/bin/gomlc
 stage2/bin/gomlfmt
+stage2/bin/gomldoc
 stage2/bin/gomllsp
 stage2/bin/goml
 stage2/bin/goml-go-meta
@@ -44,4 +45,4 @@ just update-golden
 Run all self-hosted compiler, pipeline, query, and language-server tests with
 `just test`. Run `just ci` for the complete repository checks, including fixed-point and packaging verification.
 
-See the [language guide](../docs/goml.md), [formatter rules](../docs/formatting.md), and [compile-time evaluation architecture](../docs/comptime.md) for the corresponding compiler contracts.
+See the [language guide](../docs/goml.md), [formatter rules](../docs/formatting.md), [API documentation](../docs/documentation.md), and [compile-time evaluation architecture](../docs/comptime.md) for the corresponding compiler contracts.

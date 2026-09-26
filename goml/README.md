@@ -28,6 +28,8 @@ cd goml
 
 `check`, `build`, and `test` discover the enclosing `goml.toml` and operate on the complete module. The optional argument to `test` is a test-name substring filter. `run [TARGET]` selects an executable package and passes arguments after `--` to the program. `--dry-run` prints the command plan. `goml fmt` and `goml fmt --check` format or verify the module's production and test sources.
 
+`goml doc` generates offline HTML API documentation for the module in `<target-dir>/doc/`. Use `--format json` for a versioned API model or `--document-private-items` for internal documentation. See [documentation](../docs/documentation.md) for comment syntax, links, and the standalone `gomldoc` command.
+
 Go FFI is validated by default with `--ffi-check required`. See the [language guide](../docs/goml.md#go-ffi) for the boundary rules, [bind-go](../docs/ffi/bind-go.md) for allowlisted binding generation, and [export-go](../docs/goml.md#exporting-a-go-library) for publishing a generated Go package.
 
 `goml clean` removes the current module's configured build target directory. Use `goml clean --target-dir <path>` to clean another target directory inside the module.

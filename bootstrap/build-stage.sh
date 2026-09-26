@@ -33,8 +33,10 @@ bootstrap_go_flags="${bootstrap_go_flags}-gcflags=-c=$go_compile_jobs -ldflags=-
     cd "$repository_root/gomlc"
     if test "$build_mode" = compiler; then
         GOFLAGS="$bootstrap_go_flags" "$driver_path" run cmd/gomlc --jobs "$build_jobs" --target-dir "_bootstrap/$stage_name" --compiler "$compiler_path" -- version >/dev/null
+        "$driver_path" __build-artifacts cmd/gomldoc --jobs "$build_jobs" --target-dir "_bootstrap/$stage_name" --compiler "$compiler_path"
     elif test "$build_mode" = artifacts; then
         "$driver_path" __build-artifacts cmd/gomlc --jobs "$build_jobs" --target-dir "_bootstrap/$stage_name" --compiler "$compiler_path"
+        "$driver_path" __build-artifacts cmd/gomldoc --jobs "$build_jobs" --target-dir "_bootstrap/$stage_name" --compiler "$compiler_path"
     else
         GOFLAGS="$bootstrap_go_flags" "$driver_path" build --jobs "$build_jobs" --target-dir "_bootstrap/$stage_name" --compiler "$compiler_path"
     fi

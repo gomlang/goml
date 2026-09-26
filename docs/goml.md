@@ -10,7 +10,7 @@ The separate [`ecosystem::go_doc`](../../gomlang/go_doc/README.md) module parses
 and renders Go documentation comments with explicit input and output limits.
 It is for Go source documentation, not GoML syntax or compiler comments.
 
-Quick navigation: [packages](#modules-packages-and-imports), [types](#type), [control flow](#control-flow), [patterns](#patterns), [traits](#trait-and-impl), [compile-time evaluation](#compile-time-evaluation), [Go FFI](#go-ffi), [tests](#tests), [prelude](#built-in-prelude), [standard library](#standard-library-package), and [verification](#verify-generated-code).
+Quick navigation: [packages](#modules-packages-and-imports), [types](#type), [control flow](#control-flow), [patterns](#patterns), [traits](#trait-and-impl), [compile-time evaluation](#compile-time-evaluation), [Go FFI](#go-ffi), [tests](#tests), [API documentation](#comments-and-api-documentation), [prelude](#built-in-prelude), [standard library](#standard-library-package), and [verification](#verify-generated-code).
 
 Build and installation instructions are in the [repository README](../README.md) and [release guide](releasing.md). See [formatting](formatting.md) for canonical source layout and [compile-time evaluation architecture](comptime.md) for CTIR internals.
 
@@ -53,6 +53,28 @@ fn main() -> () {
 `main` cannot have parameters or type parameters. When generating an executable file, the package selected as the entry must be declared as `package main;` and define `fn main()`. It is recommended to let `main` return `()`.
 
 ## Lexical rules
+
+### Comments and API documentation
+
+Line comments start with `//` and end at the next newline. `///` (excluding `////`) at the start of a source line documents the following declaration. Consecutive documentation lines form one block; a blank line or an ordinary comment breaks attachment. Attributes belong to the following declaration and may appear between its documentation and declaration keywords.
+
+`//!` comments before the `package` declaration describe the package. For a package with several source files, `gomldoc` combines these descriptions in relative file-path order. Documentation comments remain ordinary lexer trivia and do not affect program typing or execution.
+
+```goml
+//! Small arithmetic helpers.
+package arithmetic;
+
+/// Add one to `value`.
+pub fn increment(value: isize) -> isize {
+    value + 1
+}
+```
+
+`goml doc` generates offline HTML for all production packages in the current module, defaulting to `<target-dir>/doc/`. `goml doc --format json` writes the versioned API model to `module.json` in that directory. Public declarations and members follow the language visibility rules; `--document-private-items` includes private API. The command checks the module and reports dependency or typing failures before replacing existing output.
+
+Documentation supports paragraphs, headings, flat bullet lists, inline code, fenced code blocks, and links. `[Name]` and `[label](goml:alias::Name)` refer to API declarations using the source file's imports. Ordinary links support HTTP, HTTPS, mailto, and fragment destinations. Raw HTML is escaped. Unresolved or ambiguous API links produce warnings; targets outside the generated module are shown as text. Full Markdown, automatic dependency sites, and executable documentation tests are not supported.
+
+See [documentation](documentation.md) for standalone `gomldoc`, output schemas, and installation.
 
 ### Identifiers and keywords
 
@@ -6475,6 +6497,7 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 
 | Avoid | GoML form |
 | --- | --- |
+| `////` or a blank source line inside an API documentation block | Use `///`; use a bare `///` line to separate paragraphs |
 | `Vec<isize>` | `Vec[isize]` |
 | `Simd[T, N]` or vector `a + b` | Import `std::simd`, select a fixed 128/256-bit vector type, and use `a.add(b)` |
 | `fn id<T>(x: T) -> T` | `fn id[T](x: T) -> T` |
@@ -6577,7 +6600,19 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | Call an ordinary function from `comptime` | Mark a supported free function with `#[comptime]` |
 | Capture a runtime local in `comptime` | Pass a literal or compile-time value to a `#[comptime]` function |
 
+The documentation spelling `////` is an ordinary comment, not an item documentation block. A blank line between `///` and a declaration leaves that comment unattached; use a bare `///` line to separate paragraphs within a block.
+
 ## Informal Grammar Quick Facts
+
+Lexical comment conventions (comments are trivia in the grammar below):
+
+```text
+LineComment    ::= "//" { any character except newline }
+ItemDocLine    ::= "///" { any character except newline }
+PackageDocLine ::= "//!" { any character except newline }
+```
+
+`ItemDocLine` excludes lines beginning `////` and requires a standalone comment before a declaration. `PackageDocLine` is recognized only before the first source token.
 
 Base32, varints, checksums, UTF-8 scalar/stream decoding, map/slice helpers, logical slash paths and fixed-width bit operations use ordinary imports, traits, structs, enums, slices and calls. They add no grammar, implicit byte conversions or compiler intrinsics. Map and slice collection use existing `Iterator` associated-type constraints. Shell patterns are string data parsed by `std::path::slash`, not GoML syntax.
 

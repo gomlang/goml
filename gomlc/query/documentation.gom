@@ -1,0 +1,226 @@
+package query;
+
+use module::ast;
+use module::doc_comment;
+use module::parser;
+use module::tast;
+use std::collections;
+use std::fs;
+use std::path;
+use std::text;
+use std::toml;
+
+pub struct DocProject {
+    pub root: string,
+    pub module_path: string,
+    pub target_dir: string,
+}
+
+pub fn documentation_project(directory: string) -> Result[DocProject, string] {
+    if !fs::is_dir(directory) {
+        return Result::Err("expected a module directory: " + directory)
+    }
+    let mut root = fs::canonicalize(directory).map_err(|error| error.to_string())?;
+    while !fs::is_file(path::join(root, "goml.toml")) {
+        let parent = path::parent(root).ok_or("could not find goml.toml")?;
+        if parent == root {
+            return Result::Err("could not find goml.toml")
+        }
+        root = parent;
+    }
+    let manifest = toml::parse(
+        fs::read_file_structured(path::join(root, "goml.toml")).map_err(|error| error.to_string())?,
+    )?;
+    let module_path = toml::field(manifest, "module").and_then(|value| toml::field(value, "path")).and_then(
+        toml::as_string,
+    ).ok_or("missing [module].path")?;
+    let target = match toml::field(manifest, "build").and_then(
+        |value| toml::field(value, "target-dir"),
+    ) {
+        Some(value) => toml::as_string(value).ok_or("[build].target-dir must be a string")?,
+        None => "_artifact",
+    };
+    if module_path == "" || target == "" {
+        return Result::Err("module path and target directory must not be empty")
+    }
+    let target_dir = if path::is_absolute(target) {
+        path::clean(target)
+    } else {
+        path::clean(path::join(root, target))
+    };
+    Result::Ok(DocProject { root, module_path, target_dir })
+}
+
+fn documentation_directories(
+    project: DocProject,
+    directory: string,
+    excluded: string,
+    visited: collections::HashSet[string],
+    result: Vec[string],
+) -> Result[(), string] {
+    let canonical = fs::canonicalize(directory).map_err(|error| error.to_string())?;
+    if !visited.insert(canonical) || canonical != directory || directory == project.target_dir
+        || directory == excluded {
+        return Result::Ok(())
+    }
+    if directory != project.root && fs::is_file(path::join(directory, "goml.toml")) {
+        return Result::Ok(())
+    }
+    let names = fs::read_dir(directory).map_err(|error| error.to_string())?;
+    collections::sort(names);
+    let mut source = "";
+    for name in names {
+        let child = path::join(directory, name);
+        if fs::is_dir(child) {
+            if !name.starts_with(".") && name != "tests" && name != "testdata" {
+                documentation_directories(project, child, excluded, visited, result)?
+            }
+        } else if source == "" && name.ends_with(".gom") && !name.ends_with("_test.gom") {
+            source = child;
+        }
+    }
+    if source != "" {
+        result.push(source)
+    }
+    Result::Ok(())
+}
+
+fn documentation_file_analysis(value: Analysis, source: SourceFile) -> Analysis {
+    let parse = parser::parse(source.source);
+    Analysis {
+        source_path: source.path,
+        source: source.source,
+        parse,
+        syntax: syntax_index(parse.root),
+        lowered: ast::lower(parse),
+        ..value,
+    }
+}
+
+fn documentation_merge(items: Vec[DocItem], additions: Vec[DocItem]) -> () {
+    for addition in additions {
+        let mut found = false;
+        for index in 0..items.len() {
+            if items[index].id == addition.id {
+                documentation_merge(items[index].members, addition.members);
+                found = true;
+            }
+        }
+        if !found {
+            items.push(addition)
+        }
+    }
+}
+
+fn documentation_sort(items: Vec[DocItem]) -> () {
+    collections::sort_by(
+        items,
+        |left, right| if left.id < right.id {
+            -1
+        } else if left.id > right.id {
+            1
+        } else {
+            0
+        },
+    );
+    for item in items {
+        documentation_sort(item.members)
+    }
+}
+
+pub fn document_module(project: DocProject, include_private: bool, output: string) -> Result[
+    DocModule,
+    string,
+] {
+    let sources = Vec::new();
+    documentation_directories(project, project.root, output, collections::HashSet::new(), sources)?;
+    collections::sort(sources);
+    let context = analysis_context();
+    let packages = Vec::new();
+    let warnings = Vec::new();
+    for entry in sources {
+        let source = fs::read_file_structured(entry).map_err(|error| error.to_string())?;
+        let analysis = analyze_with_context(context, entry, source, Vec::new());
+        for diagnostic in analysis.checked.diagnostics {
+            if let tast::DiagnosticSeverity::Error = diagnostic.severity {
+                return Result::Err(diagnostic.source_path + ": " + diagnostic.message)
+            }
+        }
+        let items = Vec::new();
+        let descriptions = Vec::new();
+        let sections = Vec::new();
+        for file in analysis.sources {
+            if file.package_name == analysis.package_name {
+                let file_analysis = documentation_file_analysis(analysis, file);
+                let comments = doc_comment::collect(file.source);
+                if comments.package_text != "" {
+                    descriptions.push(comments.package_text);
+                    sections.push(
+                        DocSection {
+                            source: file.path.byte_slice(
+                                project.root.byte_len() + 1,
+                                file.path.byte_len(),
+                            ),
+                            documentation: comments.package_text,
+                            links: documentation_links(
+                                file_analysis,
+                                comments.package_text,
+                                warnings,
+                            ),
+                        },
+                    )
+                }
+                documentation_merge(
+                    items,
+                    documentation_items(
+                        file_analysis,
+                        project.root,
+                        include_private,
+                        false,
+                        warnings,
+                    ),
+                );
+            }
+        }
+        for expanded in analysis.expanded_asts {
+            let expanded_analysis = documentation_file_analysis(
+                analysis,
+                SourceFile {
+                    path: expanded.0,
+                    source: ast::pretty_documentation(expanded.1),
+                    package_name: analysis.package_name,
+                },
+            );
+            documentation_merge(
+                items,
+                documentation_items(
+                    expanded_analysis,
+                    project.root,
+                    include_private,
+                    true,
+                    warnings,
+                ),
+            );
+        }
+        documentation_sort(items);
+        packages.push(
+            DocPackage {
+                name: analysis.package_name,
+                documentation: text::join(descriptions, "\n\n"),
+                sections,
+                items,
+            },
+        );
+    }
+    collections::sort_by(
+        packages,
+        |left, right| if left.name < right.name {
+            -1
+        } else if left.name > right.name {
+            1
+        } else {
+            0
+        },
+    );
+    Result::Ok(DocModule { name: project.module_path, packages, warnings })
+}

@@ -1,0 +1,371 @@
+package query;
+
+use module::cst;
+use module::ast;
+use module::doc_comment;
+use module::hash;
+use module::lexer;
+use std::text;
+
+fn documentation_kind(kind: cst::NodeKind) -> string {
+    match kind {
+        FN | EXTERN => "function",
+        STRUCT => "struct",
+        ENUM => "enum",
+        TRAIT => "trait",
+        TYPE_ALIAS => "type",
+        EXTERN_TYPE => "extern_type",
+        CONST => "const",
+        STATIC => "static",
+        IMPL => "impl",
+        TRAIT_METHOD_SIG => "method",
+        TRAIT_ASSOCIATED_TYPE | IMPL_ASSOCIATED_TYPE => "associated_type",
+        VARIANT => "variant",
+        STRUCT_FIELD | NEWTYPE_FIELD | ENUM_TUPLE_FIELD => "field",
+        USE => "reexport",
+        _ => "",
+    }
+}
+
+fn documentation_start(syntax: SyntaxIndex, node: SyntaxNode) -> isize {
+    for token in syntax.tokens {
+        if token.start >= node.start && token.end <= node.end && !lexer::token_is_trivia(token.kind) {
+            return token.start
+        }
+    }
+    node.start
+}
+
+fn documentation_text(value: Analysis, node: SyntaxNode) -> string {
+    let targets = Vec::from_array([documentation_start(value.syntax, node)]);
+    let mut declaration_start = node.end;
+    for token in value.syntax.tokens {
+        if token.start >= node.start && token.end <= node.end && !lexer::token_is_trivia(token.kind)
+            && !token_is_inside_attribute(value.syntax, token) {
+            declaration_start = token.start;
+            targets.push(token.start);
+            break
+        }
+    }
+    for attribute in value.syntax.nodes {
+        if attribute.kind == cst::NodeKind::ATTRIBUTE && attribute.start >= node.start
+            && attribute.end <= declaration_start {
+            targets.push(documentation_start(value.syntax, attribute))
+        }
+    }
+    let parts = Vec::new();
+    for comment in doc_comment::collect(value.source).items {
+        if targets.contains(comment.target) {
+            parts.push(comment.text)
+        }
+    }
+    text::join(parts, "\n")
+}
+
+fn documentation_header_end(syntax: SyntaxIndex, node: SyntaxNode) -> isize {
+    let mut end = node.end;
+    for child in syntax.nodes {
+        if child.parent == Option::Some(node.id)
+            && match child.kind {
+                BLOCK | STRUCT_FIELD_LIST | VARIANT_LIST | TRAIT_METHOD_SIG_LIST => true,
+                _ => false,
+            }
+            && child.start < end {
+            end = child.start;
+        }
+    }
+    for token in syntax.tokens {
+        if token.parent == node.id && token.start < end
+            && match token.kind {
+                LBrace | Semi => true,
+                LParen => node.kind == cst::NodeKind::STRUCT,
+                Eq => node.kind == cst::NodeKind::CONST || node.kind == cst::NodeKind::STATIC,
+                _ => false,
+            } {
+            end = token.start;
+        }
+    }
+    end
+}
+
+fn documentation_signature(syntax: SyntaxIndex, node: SyntaxNode) -> string {
+    let result = text::StringBuilder::new();
+    let mut space = false;
+    let end = documentation_header_end(syntax, node);
+    for token in syntax.tokens {
+        if token.start >= node.start && token.end <= end
+            && !token_is_inside_attribute(syntax, token) {
+            if lexer::token_is_trivia(token.kind) {
+                space = !result.is_empty();
+            } else {
+                if space {
+                    result.write_string(" ")
+                }
+                result.write_string(token.text);
+                space = false;
+            }
+        }
+    }
+    result.finish()
+}
+
+fn documentation_public(syntax: SyntaxIndex, node: SyntaxNode) -> bool {
+    for token in syntax.tokens {
+        if token.parent == node.id && token.kind == lexer::TokenKind::PubKeyword {
+            return true
+        }
+    }
+    false
+}
+
+fn documentation_type_public(value: Analysis, ty: ast::TypeExpr, generics: Vec[string]) -> bool {
+    match ty {
+        Con { path } => {
+            let name = path_text(path);
+            generics.contains(name)
+                || documentation_name_public(value, documentation_canonical(value, name))
+        },
+        App { ty, args } => {
+            if !documentation_type_public(value, ty, generics) {
+                return false
+            }
+            for arg in args {
+                if !documentation_type_public(value, arg, generics) {
+                    return false
+                }
+            }
+            true
+        },
+        Tuple { items } => {
+            for item in items {
+                if !documentation_type_public(value, item, generics) {
+                    return false
+                }
+            }
+            true
+        },
+        Array { elem, .. } => documentation_type_public(value, elem, generics),
+        Func { params, ret_ty } => {
+            for param in params {
+                if !documentation_type_public(value, param, generics) {
+                    return false
+                }
+            }
+            documentation_type_public(value, ret_ty, generics)
+        },
+        Dyn { bounds } => {
+            for bound in bounds {
+                if !documentation_name_public(
+                    value,
+                    documentation_canonical(value, path_text(bound.trait_path)),
+                ) {
+                    return false
+                }
+                for arg in bound.args {
+                    if !documentation_type_public(value, arg, generics) {
+                        return false
+                    }
+                }
+                for binding in bound.associated_types {
+                    if !documentation_type_public(value, binding.1, generics) {
+                        return false
+                    }
+                }
+            }
+            true
+        },
+        _ => true,
+    }
+}
+
+fn documentation_impl(value: Analysis, node: SyntaxNode) -> (string, string, bool) {
+    let mut ordinal = 0;
+    for candidate in value.syntax.nodes {
+        if candidate.kind == cst::NodeKind::IMPL && candidate.start < node.start {
+            ordinal += 1;
+        }
+    }
+    if let Some(file) = value.lowered.ast {
+        for item in file.items {
+            if let ast::Item::ImplBlock(block) = item {
+                if ordinal == 0 {
+                    let owner = match explicit_type_name(block.for_type) {
+                        Some(name) => if block.generics.contains(name) {
+                            name
+                        } else {
+                            documentation_canonical(value, name)
+                        },
+                        None => ast::type_text(block.for_type),
+                    };
+                    let trait_name = block.trait_ref.map(
+                        |reference| documentation_canonical(value, path_text(reference.path)),
+                    ).unwrap_or("");
+                    let visible = documentation_type_public(value, block.for_type, block.generics)
+                        && (trait_name == "" || documentation_name_public(value, trait_name));
+                    return (owner, trait_name, visible)
+                }
+                ordinal -= 1;
+            }
+        }
+    }
+    return ("", "", false)
+}
+
+fn documentation_children(value: Analysis, node: SyntaxNode) -> Vec[SyntaxNode] {
+    let result = Vec::new();
+    for child in value.syntax.nodes {
+        if child.parent == Option::Some(node.id) {
+            if documentation_kind(child.kind) != "" {
+                result.push(child)
+            } else if match child.kind {
+                STRUCT_FIELD_LIST | VARIANT_LIST | TRAIT_METHOD_SIG_LIST | TYPE_LIST => true,
+                _ => false,
+            } {
+                for nested in documentation_children(value, child) {
+                    result.push(nested)
+                }
+            }
+        }
+    }
+    result
+}
+
+fn documentation_item(
+    value: Analysis,
+    node: SyntaxNode,
+    root: string,
+    owner: string,
+    parent_kind: string,
+    inherited: bool,
+    include_private: bool,
+    generated: bool,
+    warnings: Vec[string],
+) -> Option[DocItem] {
+    let kind = documentation_kind(node.kind);
+    let kind = if kind == "function" && parent_kind == "impl" {
+        "method"
+    } else {
+        kind
+    };
+    let mut name = first_identifier(value.syntax, node).map(|token| token.text).unwrap_or("0");
+    let mut public = documentation_public(value.syntax, node);
+    if parent_kind == "trait" || parent_kind == "enum" || parent_kind == "variant" || inherited {
+        public = true;
+    }
+    let signature = documentation_signature(value.syntax, node);
+    let mut target = "";
+    let mut trait_impl = false;
+    if kind == "impl" {
+        let info = documentation_impl(value, node);
+        target = info.0;
+        public = info.2;
+        trait_impl = info.1 != "";
+        name = signature;
+    }
+    if !public && !include_private {
+        return Option::None
+    }
+    let qualified_name = if kind == "impl" {
+        owner + "::impl::" + hash::sha256_hex(doc_comment::signature_identity(signature))
+    } else {
+        owner + "::" + name
+    };
+    let start = documentation_start(value.syntax, node);
+    let documentation = if generated {
+        ""
+    } else {
+        documentation_text(value, node)
+    };
+    let mut line = 1;
+    for character in value.source.byte_slice(0, start).chars() {
+        if character == '\n' {
+            line += 1;
+        }
+    }
+    let members = Vec::new();
+    for child in documentation_children(value, node) {
+        if let Some(member) = documentation_item(
+            value,
+            child,
+            root,
+            qualified_name,
+            kind,
+            trait_impl,
+            include_private,
+            generated,
+            warnings,
+        ) {
+            if child.kind == cst::NodeKind::ENUM_TUPLE_FIELD
+                || child.kind == cst::NodeKind::NEWTYPE_FIELD {
+                let name = members.len().to_string();
+                let qualified_name = qualified_name + "::" + name;
+                members.push(DocItem { name, id: qualified_name, qualified_name, ..member })
+            } else if kind == "impl" {
+                members.push(DocItem { qualified_name: target + "::" + member.name, ..member })
+            } else {
+                members.push(member)
+            }
+        }
+    }
+    if kind == "impl" && members.is_empty() && !trait_impl {
+        return Option::None
+    }
+    let source = if value.source_path.starts_with(root + "/") {
+        value.source_path.byte_slice(root.byte_len() + 1, value.source_path.byte_len())
+    } else {
+        ""
+    };
+    Option::Some(
+        DocItem {
+            id: qualified_name,
+            name,
+            qualified_name,
+            kind,
+            public,
+            signature,
+            documentation,
+            source,
+            line: if generated {
+                0
+            } else {
+                line
+            },
+            generated,
+            target,
+            links: documentation_links(value, documentation, warnings),
+            members,
+        },
+    )
+}
+
+pub fn documentation_items(
+    value: Analysis,
+    root: string,
+    include_private: bool,
+    generated: bool,
+    warnings: Vec[string],
+) -> Vec[DocItem] {
+    let result = Vec::new();
+    for node in value.syntax.nodes {
+        if node.parent == Option::Some(0) && documentation_kind(node.kind) != ""
+            && node.kind != cst::NodeKind::USE {
+            if let Some(item) = documentation_item(
+                value,
+                node,
+                root,
+                value.package_name,
+                "",
+                false,
+                include_private,
+                generated,
+                warnings,
+            ) {
+                result.push(item)
+            }
+        }
+    }
+    if !generated {
+        documentation_reexports(value, root, result, warnings);
+    }
+    result
+}

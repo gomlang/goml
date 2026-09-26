@@ -100,6 +100,8 @@ first
 
 `//` comment text and order are preserved. A same-line comment stays attached to the preceding syntax and is emitted at the end of that line. A standalone comment remains on its own line. At most one blank line is retained between standalone comments.
 
+Attached `///` documentation blocks stay with the following declaration, including across attributes. Formatting preserves their attachment to fields, variants, trait members, and methods and does not insert a blank line between a documentation block and its declaration. `//!` package documentation stays at the file header. See [documentation](documentation.md).
+
 Comments inside a list force a line break. A trailing comment is not wrapped or rewritten.
 
 Literal token text is preserved byte for byte, including radix prefixes, numeric separators, escapes, and interpolated-string text. A multiline string starts on a new line, all of its `\\` markers are aligned, and the terminating syntax returns to the enclosing indentation. Only spaces and tabs before a `\\` marker are rewritten; content after the marker is preserved byte for byte.
