@@ -12,7 +12,7 @@ From the repository root, build the self-hosted language server and extension:
 just vscode-ext
 ```
 
-Open `editors/vscode` as the VS Code workspace and press F5 to launch the Extension Development Host. The checked-in launch task uses `pnpm run compile`, so debugging also requires pnpm; the `just` build and packaging recipes use npm.
+Open `editors/vscode` as the VS Code workspace and press F5 to launch the Extension Development Host. The launch task runs `npm run compile`.
 
 Use **GoML: Show Expanded Derive** to inspect the current document's AST after derive expansion. **GoML: Show Language Server Output** opens the server log. Test code lenses save the source and invoke `goml test` with the selected test name and kind; the project driver must be on `PATH`, and the workspace folder must be inside the GoML module containing the test.
 
