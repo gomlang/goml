@@ -34,6 +34,11 @@ test "$("$smoke_root/$package/bin/goml" run)" = "std/works"
 "$smoke_root/$package/bin/gomlfmt" -w ./*.gom
 "$smoke_root/$package/bin/gomlfmt" --check ./*.gom
 "$smoke_root/$package/bin/goml" fmt --check
+"$smoke_root/$package/bin/goml" doc --format json
+jq -e '.schema_version == 1 and (.packages | length) > 0' _artifact/doc/module.json >/dev/null
+"$smoke_root/$package/bin/gomldoc" --output _artifact/doc-html
+test -f _artifact/doc-html/index.html
+test -f _artifact/doc-html/style.css
 bash "$repository_root/tools/release/lsp_smoke.sh" "$smoke_root/$package/bin/gomllsp" "$release_version"
 mkdir -p "$smoke_root/ffi/gen"
 cat > "$smoke_root/ffi/go.mod" <<'GOMOD'
