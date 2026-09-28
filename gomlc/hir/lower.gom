@@ -2,6 +2,7 @@ package hir;
 
 use module::ast;
 use module::cst;
+use module::consts;
 use std::collections;
 use std::text;
 
@@ -29,6 +30,7 @@ struct LowerCtx {
     package_id: isize,
     definitions: Vec[(string, DefId)],
     constants: Vec[(string, DefId)],
+    constant_expressions: Vec[(string, ast::Expr)],
     enums: Vec[EnumInfo],
     nominal_types: Vec[string],
     traits: Vec[string],
@@ -585,7 +587,27 @@ fn lower_type(ctx: LowerCtx, value: ast::TypeExpr, type_params: Vec[string]) -> 
             TypeExpr::Tuple { items: result }
         },
         Con { path } => {
+            if path.segments.len() == 1 {
+                let name = path.segments[0].ident;
+                if name.starts_with("$const_expr:") {
+                    return lower_const_source(
+                        ctx,
+                        name.byte_slice(12, name.byte_len()),
+                        type_params,
+                        Vec::new(),
+                    )
+                }
+                if type_params.contains(consts::parameter(name)) {
+                    return TypeExpr::Con { name: consts::parameter(name) }
+                }
+            }
             let parts = qualified_segments(ctx, path);
+            let name = join_segments(parts);
+            for entry in ctx.constant_expressions {
+                if entry.0 == name || entry.0 == full_name(ctx.package_name, name) {
+                    return lower_const_source(ctx, name, type_params, Vec::new())
+                }
+            }
             if parts.len() >= 2 && (parts[0] == "Self" || type_params.contains(parts[0])) {
                 let result: Ref[TypeExpr] = Ref::new(TypeExpr::Con { name: parts[0] });
                 for index in 1..parts.len() {
@@ -627,7 +649,24 @@ fn lower_type(ctx: LowerCtx, value: ast::TypeExpr, type_params: Vec[string]) -> 
             TypeExpr::App { ty: lower_type(ctx, base, type_params), args: result }
         },
         Array { len: length, elem: element } => {
-            TypeExpr::Array { len: length, elem: lower_type(ctx, element, type_params) }
+            let length_type = lower_const_source(ctx, length, type_params, Vec::new());
+            let elem = lower_type(ctx, element, type_params);
+            match hir_const_value(length_type) {
+                Some(length) if length >= 0 => TypeExpr::Array { len: length.to_string(), elem },
+                Some(_) => {
+                    ctx.diagnostics.push(
+                        Diagnostic {
+                            message: "array length must be nonnegative",
+                            span: Option::None,
+                        },
+                    );
+                    TypeExpr::Array { len: "0", elem }
+                },
+                _ => TypeExpr::App {
+                    ty: TypeExpr::Con { name: "$array" },
+                    args: Vec::from_array([length_type, elem]),
+                },
+            }
         },
         Func { params, ret_ty } => {
             let result: Vec[TypeExpr] = Vec::new();
@@ -1038,6 +1077,13 @@ fn lower_expr_value(
                     Some(constructor) => ExprKind::ConstructorValue { constructor },
                     None => {
                         if path.segments.len() == 1 {
+                            if type_params.contains(consts::parameter(path.segments[0].ident)) {
+                                return ExprKind::NameRef {
+                                    name_ref: NameRef::Other(
+                                        consts::parameter(path.segments[0].ident),
+                                    ),
+                                }
+                            }
                             if let Some(local) = find_binding(env, path.segments[0].ident) {
                                 return ExprKind::NameRef { name_ref: NameRef::Local(local) }
                             }
@@ -1095,6 +1141,10 @@ fn lower_expr_value(
         Char { value, span: _ } => ExprKind::Char { value },
         Byte { value, span: _ } => ExprKind::Byte { value },
         ByteString { values, span: _ } => ExprKind::ByteString { values },
+        ConstructorValue { constructor: path, span: _ } if path.segments.len() == 1
+            && type_params.contains(consts::parameter(path.segments[0].ident)) => ExprKind::NameRef {
+            name_ref: NameRef::Other(consts::parameter(path.segments[0].ident)),
+        },
         ConstructorValue { constructor: path, span: _ } => match constant_ref(ctx, path) {
             Some(reference) => ExprKind::NameRef { name_ref: reference },
             None => ExprKind::ConstructorValue { constructor: unresolved_constructor(ctx, path) },
@@ -1652,6 +1702,7 @@ fn make_context(files: Vec[ast::File], canonical_package_name: string, qualify_i
     let id = package_id(canonical_package_name);
     let definitions: Vec[(string, DefId)] = Vec::new();
     let constants: Vec[(string, DefId)] = Vec::new();
+    let constant_expressions: Vec[(string, ast::Expr)] = Vec::new();
     let enums: Vec[EnumInfo] = Vec::new();
     let nominal_types: Vec[string] = Vec::new();
     let traits: Vec[string] = Vec::new();
@@ -1664,6 +1715,9 @@ fn make_context(files: Vec[ast::File], canonical_package_name: string, qualify_i
             }
             match item {
                 Constant(value) => {
+                    constant_expressions.push(
+                        (full_name(canonical_package_name, value.name), value.value),
+                    );
                     constants.push((full_name(canonical_package_name, value.name), def_id))
                 },
                 Static(value) => {
@@ -1676,6 +1730,22 @@ fn make_context(files: Vec[ast::File], canonical_package_name: string, qualify_i
                         variants.push(variant.name)
                     }
                     enums.push(EnumInfo { name: value.name, def_id, variants })
+                },
+                ImplBlock(value) if value.trait_ref.is_none() && value.generics.is_empty() => {
+                    if let ast::TypeExpr::Con { path } = value.for_type {
+                        let owner = join_segments(path_segments(path));
+                        for method in value.methods {
+                            if method.name.starts_with("$associated_const:") {
+                                if let Some(expression) = method.body.tail {
+                                    let name = owner + "::"
+                                        + method.name.byte_slice(18, method.name.byte_len());
+                                    constant_expressions.push(
+                                        (full_name(canonical_package_name, name), expression),
+                                    )
+                                }
+                            }
+                        }
+                    }
                 },
                 StructDef(value) => nominal_types.push(value.name),
                 TypeAlias(value) => nominal_types.push(value.name),
@@ -1691,6 +1761,7 @@ fn make_context(files: Vec[ast::File], canonical_package_name: string, qualify_i
         package_id: id,
         definitions,
         constants,
+        constant_expressions,
         enums,
         nominal_types,
         traits,
@@ -1725,6 +1796,7 @@ fn file_context(base: LowerCtx, resolved: ResolvedUses, diagnostics: Vec[Diagnos
         package_id: base.package_id,
         definitions: base.definitions,
         constants: base.constants,
+        constant_expressions: base.constant_expressions,
         enums: base.enums,
         nominal_types: base.nominal_types,
         traits: base.traits,

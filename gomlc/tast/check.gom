@@ -823,6 +823,9 @@ fn check_name_ref_inner(ctx: Checker, value: hir::NameRef) -> Expr {
             },
         },
         Other(name) => {
+            if name.starts_with("$const_param:") && ctx.type_params.contains(name) {
+                return Expr::Var { name, ty: Type::Uint }
+            }
             match find_constant_by_name(ctx, name) {
                 Some(value) => Expr::Var { name: value.name, ty: value.ty },
                 None => {
@@ -890,6 +893,13 @@ fn check_constructor_value_expr(
     constructor: hir::ConstructorRef,
     expected: Option[Type],
 ) -> Expr {
+    if let hir::ConstructorRef::Unresolved(name) = constructor {
+        if let Some(parts) = split_constructor_name(name) {
+            if let Some(value) = associated_constant_value(ctx, parts.0, parts.1, Vec::new()) {
+                return value
+            }
+        }
+    }
     let constant = match constructor {
         Unresolved(name) => find_constant_by_name(ctx, name),
         Resolved { enum_def: _, variant_index: _ } => Option::None,
@@ -920,6 +930,12 @@ fn check_static_member(
     member_type_args: Vec[hir::TypeExpr],
     report_inference: bool,
 ) -> Expr {
+    if let Some(value) = associated_constant_value(ctx, owner, member, owner_type_args) {
+        if !member_type_args.is_empty() {
+            push_diagnostic(ctx, "associated constants do not accept member type arguments")
+        }
+        return value
+    }
     let constant_name = owner + "::" + member;
     match find_constant_by_name(ctx, constant_name) {
         Some(value) => {
@@ -1241,6 +1257,9 @@ fn check_struct_expr(
     fields: Vec[(string, hir::Expr)],
     expected: Option[Type],
 ) -> Expr {
+    if let Some(value) = check_external_struct_expr(ctx, name, fields, expected) {
+        return value
+    }
     match resolve_named_field_constructor(ctx, name) {
         Found(info) => {
             if info.has_hidden_fields {
@@ -1438,6 +1457,9 @@ fn check_byte_string_expr(
         items.push(hir::Expr { kind: hir::ExprKind::Byte { value }, span: value_span })
     }
     if let Some(ty) = expected {
+        if symbolic_array(ty).is_some() {
+            return check_array_expr(ctx, items, expected)
+        }
         if let Array { len: _, elem: _ } = prune(ty) {
             return check_array_expr(ctx, items, expected)
         }
@@ -3837,6 +3859,10 @@ fn check_index_expr(ctx: Checker, base_source: hir::Expr, index_source: hir::Exp
             Array { len: _, elem } | VecType { elem } | Slice { elem } | MutSlice { elem } => {
                 (Type::Int, elem)
             },
+            value if symbolic_array(value).is_some() => {
+                let parts = symbolic_array(value).unwrap_or((Type::Error, Type::Error));
+                (Type::Int, parts.1)
+            },
             HashMap { key, value } => (
                 key,
                 nominal_type(ctx.builtin, ctx.builtin.option.name, one_type(value)),
@@ -3882,6 +3908,14 @@ fn check_assign_target(ctx: Checker, target: hir::Expr, compound: bool) -> (Expr
             let local_root = array_assignment_local_root(base_source);
             let base = check_expr(ctx, base_source, Option::None);
             let parts = match prune(expr_type(base)) {
+                other if symbolic_array(other).is_some() => {
+                    validate_array_assignment_root(ctx, local_root, base, target_span);
+                    (
+                        Type::Int,
+                        Type::Unit,
+                        symbolic_array(other).unwrap_or((Type::Error, Type::Error)).1,
+                    )
+                },
                 Array { len: _, elem } => {
                     validate_array_assignment_root(ctx, local_root, base, target_span);
                     (Type::Int, Type::Unit, elem)
@@ -4064,6 +4098,9 @@ fn projected_into_iterator_item(ctx: Checker, iterator_ty: Type, preserve_projec
 
 fn into_iterator_item_type(ctx: Checker, iterator_ty: Type) -> Type {
     let iterator_ty = normalize_type(ctx, iterator_ty);
+    if let Some(parts) = symbolic_array(iterator_ty) {
+        return parts.1
+    }
     match prune(iterator_ty) {
         Array { len: _, elem } => elem,
         Param { name: _ } | Projection { for_ty: _, name: _, trait_ref: _ } => {
@@ -4089,10 +4126,11 @@ fn check_for_expr(
     let into_iterator_trait = ctx.builtin.into_iterator.name;
     let into_iterator_type = ctx.builtin.into_iterator.into_iter_type;
     let into_iterator_ref = TraitRef { name: into_iterator_trait, args: Vec::new() };
-    let fixed_array = match normalize_type(ctx, source_ty) {
-        Array { len: _, elem: _ } => true,
-        _ => false,
-    };
+    let fixed_array = symbolic_array(source_ty).is_some()
+        || match normalize_type(ctx, source_ty) {
+            Array { len: _, elem: _ } => true,
+            _ => false,
+        };
     if !fixed_array && !trait_bound_satisfied_at(ctx, source_ty, into_iterator_ref, Vec::new()) {
         push_diagnostic_at(
             ctx,

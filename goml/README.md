@@ -42,9 +42,12 @@ Package-management commands are:
 goml update
 goml add owner::module
 goml add owner::module@1.2.3
+goml add owner::module --path ../module
 goml remove owner::module
 ```
 
 `update`, `add`, and `remove` accept `--local-registry <path>`. Registry state is stored under `$GOML_HOME/cache/registry`, defaulting to `~/.goml/cache/registry`.
+
+Local path dependencies and root `[replace]` entries support simultaneous library and application development. A `goml.work` file with `[workspace].members` makes declared member dependencies resolve from their working trees. Use `--workspace` for all-member check/build/test/fmt/doc/clean, or `-p owner::module` to select one member. See the language guide's module section for precedence, source validation and `GOML_WORKSPACE`.
 
 CLI integration tests live in `cmd/goml/*_test.gom`, with shared helpers in `test_support/`; other packages also contain their own unit tests. Their isolated integration workspaces are written below `goml/_artifact/test-work` relative to the repository root.

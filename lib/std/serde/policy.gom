@@ -1,0 +1,222 @@
+package serde;
+
+pub fn require_readable(readable: bool, policy: string) -> Result[(), string] {
+    if readable {
+        Result::Ok(())
+    } else {
+        Result::Err("serde " + policy + " requires a self-describing human-readable format")
+    }
+}
+
+pub fn policy_fields_new() -> Vec[(string, Value)] {
+    Vec::new()
+}
+
+pub fn policy_push_field(fields: Vec[(string, Value)], name: string, value: Value) -> Result[
+    (),
+    string,
+] {
+    for field in fields {
+        if field.0 == name {
+            return Result::Err("duplicate flattened field `" + name + "`")
+        }
+    }
+    fields.push((name, value));
+    Result::Ok(())
+}
+
+pub fn policy_flatten(fields: Vec[(string, Value)], value: Value) -> Result[(), string] {
+    match value {
+        Value::Struct(values) => {
+            for entry in values {
+                policy_push_field(fields, entry.0, entry.1)?
+            }
+            Result::Ok(())
+        },
+        Value::Map(entries) => {
+            for entry in entries {
+                let name = match entry.0 {
+                    Value::String(value) => value,
+                    Value::Char(value) => value.to_string(),
+                    _ => return Result::Err("flattened map keys must be strings or chars"),
+                };
+                policy_push_field(fields, name, entry.1)?;
+            }
+            Result::Ok(())
+        },
+        Value::Optional(values) => if values.is_empty() {
+            Result::Ok(())
+        } else if values.len() == 1 {
+            policy_flatten(fields, values[0])
+        } else {
+            Result::Err("invalid flattened optional value")
+        },
+        _ => Result::Err("flatten requires a struct or a string-keyed map"),
+    }
+}
+
+pub fn policy_capture_field[D: Deserializer](
+    deserializer: D,
+    key: Option[FieldKey],
+    fields: Vec[(string, Value)],
+) -> Result[(), string] {
+    match key {
+        Some(FieldKey::Name(name)) => policy_push_field(
+            fields,
+            name,
+            deserializer.deserialize_any()?,
+        ),
+        _ => Result::Err(deserializer.error("flatten requires named fields")),
+    }
+}
+
+pub fn policy_take_flatten[T: Deserialize](fields: Vec[(string, Value)]) -> Result[T, string] {
+    let deserializer = ValueDeserializer {
+        current: Ref::new(Option::Some(Value::Struct(fields.copy()))),
+        frames: Vec::new(),
+        track_unused: true,
+        unused_fields: Vec::new(),
+    };
+    let value: T = Deserialize::deserialize(deserializer)?;
+    finish_value_deserializer(deserializer)?;
+    fields.truncate(0);
+    for field in deserializer.unused_fields {
+        fields.push(field)
+    }
+    Result::Ok(value)
+}
+
+fn policy_variant_payload(kind: isize, fields: Vec[(string, Value)]) -> Result[Value, string] {
+    if kind == 0 {
+        Result::Ok(Value::Unit)
+    } else if kind == 2 {
+        Result::Ok(Value::Struct(fields))
+    } else if kind == 1 {
+        if fields.len() == 1 {
+            return Result::Ok(fields[0].1)
+        }
+        let values: Vec[Value] = Vec::new();
+        for field in fields {
+            values.push(field.1)
+        }
+        Result::Ok(Value::Sequence(values))
+    } else {
+        Result::Err("invalid enum variant shape")
+    }
+}
+
+pub fn serialize_tagged_value[S: Serializer](
+    value: Value,
+    tag: string,
+    content: string,
+    serializer: S,
+) -> Result[(), string] {
+    let (name, kind, fields) = variant_parts(value)?;
+    let payload = policy_variant_payload(kind, fields)?;
+    if tag == "" {
+        return serialize_value_into(payload, serializer)
+    }
+    let output = policy_fields_new();
+    policy_push_field(output, tag, Value::String(name))?;
+    if content != "" {
+        if kind != 0 {
+            policy_push_field(output, content, payload)?
+        }
+    } else if kind != 0 {
+        policy_flatten(output, payload)?
+    }
+    serialize_value_into(Value::Struct(output), serializer)
+}
+
+fn policy_named_fields(value: Value) -> Result[Vec[(string, Value)], string] {
+    let fields = policy_fields_new();
+    policy_flatten(fields, value)?;
+    Result::Ok(fields)
+}
+
+pub fn policy_take_field(fields: Vec[(string, Value)], name: string, index: isize) -> Option[Value] {
+    if index >= 0 {
+        if index < fields.len() {
+            Option::Some(fields[index].1)
+        } else {
+            Option::None
+        }
+    } else {
+        let mut found = Option::None;
+        let mut write = 0;
+        for position in 0..fields.len() {
+            let entry = fields[position];
+            if entry.0 == name {
+                found = Option::Some(entry.1);
+            } else {
+                fields[write] = entry;
+                write += 1;
+            }
+        }
+        fields.truncate(write);
+        found
+    }
+}
+
+pub fn policy_tagged_parts(value: Value, tag: string, content: string) -> Result[
+    (string, Value),
+    string,
+] {
+    let fields = policy_named_fields(value)?;
+    let name = match policy_take_field(fields, tag, -1) {
+        Some(Value::String(value)) => value,
+        Some(_) => return Result::Err("enum tag must be a string"),
+        None => return Result::Err("missing enum tag `" + tag + "`"),
+    };
+    let payload = if content == "" {
+        Value::Struct(fields)
+    } else {
+        policy_take_field(fields, content, -1).unwrap_or(Value::Unit)
+    };
+    Result::Ok((name, payload))
+}
+
+pub fn policy_payload_fields(payload: Value, kind: isize, count: isize) -> Result[
+    Vec[(string, Value)],
+    string,
+] {
+    if kind == 0 {
+        match payload {
+            Value::Unit => Result::Ok(policy_fields_new()),
+            Value::Struct(fields) if fields.is_empty() => Result::Ok(policy_fields_new()),
+            _ => Result::Err("expected unit enum payload"),
+        }
+    } else if kind == 2 {
+        policy_named_fields(payload)
+    } else if kind == 1 && count == 1 {
+        Result::Ok(Vec::from_array([("", payload)]))
+    } else if kind == 1 {
+        match payload {
+            Value::Sequence(values) | Value::Tuple(values) => if values.len() != count {
+                Result::Err("enum tuple payload has the wrong length")
+            } else {
+                let fields = policy_fields_new();
+                for value in values {
+                    fields.push(("", value));
+                }
+                Result::Ok(fields)
+            },
+            _ => Result::Err("expected enum tuple payload"),
+        }
+    } else {
+        Result::Err("invalid enum variant shape")
+    }
+}
+
+pub fn policy_tag_name(parts: (string, Value)) -> string {
+    parts.0
+}
+
+pub fn policy_tag_payload(parts: (string, Value)) -> Value {
+    parts.1
+}
+
+pub fn policy_push_positional(fields: Vec[(string, Value)], value: Value) -> Result[(), string] {
+    fields.push(("", value));
+    Result::Ok(())
+}

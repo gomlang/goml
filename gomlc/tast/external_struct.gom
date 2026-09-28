@@ -1,0 +1,217 @@
+package tast;
+
+use module::ffi;
+use module::hir;
+
+pub struct ExternalStructInfo {
+    pub fields: Vec[(string, Type)],
+    pub pointer: bool,
+}
+
+fn external_struct_info(metadata: ffi::TypeDeclarations, name: string, generics: Vec[string]) -> Result[
+    Option[ExternalStructInfo],
+    string,
+] {
+    let Some(shape) = ffi::resolve_go_struct_shape(metadata, name)? else {
+        return Result::Ok(Option::None)
+    };
+    let fields = Vec::new();
+    for field in shape.fields {
+        let ty = field.identity.and_then(|identity| external_identity_type(identity, generics));
+        fields.push((field.name, ty.unwrap_or(Type::Error)))
+    }
+    Result::Ok(Option::Some(ExternalStructInfo { fields, pointer: shape.pointer }))
+}
+
+fn external_struct_substitutions(template: Type, parameters: Vec[string], target: Type) -> Option[
+    Vec[TypeSubst],
+] {
+    let renamed = Vec::new();
+    for index in 0..parameters.len() {
+        renamed.push(
+            TypeSubst {
+                name: parameters[index],
+                ty: Type::Param { name: "external/field/" + index.to_string() },
+            },
+        )
+    }
+    let template = substitute_type(template, renamed);
+    let matched = Vec::new();
+    if !unify_parameter_aliases(template, target, matched)
+        || !types_equal(substitute_type(template, matched), target) {
+        return Option::None
+    }
+    let result = Vec::new();
+    for item in renamed {
+        result.push(TypeSubst { name: item.name, ty: substitute_type(item.ty, matched) })
+    }
+    Option::Some(result)
+}
+
+fn resolve_external_field_type(ctx: Checker, receiver: Type, name: string) -> Option[Type] {
+    let target = match prune(receiver) {
+        GoPointer { elem } => match prune(elem) {
+            External { .. } => elem,
+            _ => return Option::None,
+        },
+        External { .. } => receiver,
+        _ => return Option::None,
+    };
+    for alias in ctx.type_aliases {
+        if let Some(shape) = alias.go_struct {
+            let template = match prune(alias.ty) {
+                GoPointer { elem } => elem,
+                value => value,
+            };
+            let Some(substitutions) = external_struct_substitutions(
+                template,
+                alias.generics,
+                target,
+            ) else {
+                continue
+            };
+            for field in shape.fields {
+                if field.0 == name {
+                    if type_contains_error(field.1) {
+                        push_diagnostic(ctx, "Go field " + name + " has an unsupported Go type")
+                    }
+                    return Option::Some(substitute_type(field.1, substitutions))
+                }
+            }
+        }
+    }
+    Option::None
+}
+
+fn external_struct_for_type(ctx: Checker, target: Type) -> Option[ExternalStructInfo] {
+    for alias in ctx.type_aliases {
+        if let Some(shape) = alias.go_struct {
+            if let Some(substitutions) = external_struct_substitutions(
+                alias.ty,
+                alias.generics,
+                target,
+            ) {
+                let fields = Vec::new();
+                for field in shape.fields {
+                    fields.push((field.0, substitute_type(field.1, substitutions)))
+                }
+                return Option::Some(ExternalStructInfo { fields, pointer: shape.pointer })
+            }
+        }
+    }
+    Option::None
+}
+
+fn imported_external_struct(metadata: ffi::ForeignTypeMetadata, alias: TypeAliasInfo) -> Result[
+    Option[ExternalStructInfo],
+    string,
+] {
+    match prune(alias.ty) {
+        External { .. } => (),
+        GoPointer { elem } => match prune(elem) {
+            External { .. } => (),
+            _ => return Result::Ok(Option::None),
+        },
+        _ => return Result::Ok(Option::None),
+    }
+    for query in metadata.queries {
+        let template = ffi::resolve_go_type_template(metadata.declarations, query.type_id)?;
+        let parameters = Vec::new();
+        for index in 0..template.parameter_constraints.len() {
+            parameters.push("external/struct/" + index.to_string())
+        }
+        let target = external_identity_type(template.identity, parameters)?;
+        if let Some(substitutions) = external_struct_substitutions(target, parameters, alias.ty) {
+            if let Some(shape) = external_struct_info(
+                metadata.declarations,
+                query.type_id,
+                parameters,
+            )? {
+                let fields = Vec::new();
+                for field in shape.fields {
+                    fields.push((field.0, substitute_type(field.1, substitutions)))
+                }
+                return Result::Ok(
+                    Option::Some(ExternalStructInfo { fields, pointer: shape.pointer }),
+                )
+            }
+        }
+    }
+    Result::Ok(Option::None)
+}
+
+fn check_external_struct_expr(
+    ctx: Checker,
+    name: string,
+    fields: Vec[(string, hir::Expr)],
+    expected: Option[Type],
+) -> Option[Expr] {
+    let alias = find_type_alias(ctx, name)?;
+    let substitutions = instantiate_substitutions(ctx.counter, alias.generics, Vec::new());
+    let ty = normalize_type(ctx, substitute_type(alias.ty, substitutions));
+    let shape = match alias.go_struct {
+        Some(shape) => shape,
+        None => external_struct_for_type(ctx, ty)?,
+    };
+    if shape.pointer {
+        push_diagnostic(ctx, "Go pointer aliases cannot be constructed with a struct literal");
+        for field in fields {
+            let _ = check_expr(ctx, field.1, Option::None);
+        }
+        return Option::Some(Expr::Prim { value: Primitive::Unit, ty: Type::Error })
+    }
+    if let Some(target) = propagated_expected(expected) {
+        expect_type(ctx, ty, target)
+    }
+    let args = Vec::new();
+    let names = Vec::new();
+    for index in 0..fields.len() {
+        let field = fields[index];
+        if named_expr_field_before(fields, index, field.0) {
+            push_diagnostic_at(
+                ctx,
+                "Duplicate Go field " + field.0 + " in struct literal " + name,
+                Option::Some(field.1.span),
+            )
+        }
+        let field_ty = match named_type_field(shape.fields, field.0) {
+            Some(value) => {
+                if type_contains_error(value) {
+                    push_diagnostic(ctx, "Go field " + field.0 + " has an unsupported Go type")
+                }
+                substitute_type(value, substitutions)
+            },
+            None => {
+                push_diagnostic_at(
+                    ctx,
+                    "Unknown or private Go field " + field.0 + " on " + name,
+                    Option::Some(field.1.span),
+                );
+                Type::Error
+            },
+        };
+        args.push(check_expr(ctx, field.1, Option::Some(field_ty)));
+        names.push(field.0)
+    }
+    let arguments = Vec::new();
+    for generic in alias.generics {
+        arguments.push(find_substitution(substitutions, generic).unwrap_or(Type::Error))
+    }
+    record_external_type_application(ctx, alias, arguments);
+    Option::Some(
+        coerce_expr(
+            ctx,
+            Expr::Constr {
+                constructor: Constructor {
+                    name: alias.name,
+                    fields: names,
+                    is_struct: true,
+                    tag: Option::None,
+                },
+                args,
+                ty,
+            },
+            expected,
+        ),
+    )
+}

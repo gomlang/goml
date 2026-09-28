@@ -86,7 +86,7 @@ Ordinary identifiers only use ASCII and are of the form:
 
 The single `_` is a wildcard character, not an ordinary variable name. The current syntax enforces the first letter case of name categories:
 
-- Package names, package aliases in `use package as alias`, functions, methods, parameters, local bindings and fields must start with a lowercase letter or `_`; imported item aliases may follow the naming convention of the imported item;
+- Package names, package aliases in `use package as alias`, functions, methods, parameters, local bindings and GoML field declarations must start with a lowercase letter or `_`; imported item aliases may follow the naming convention of the imported item. External Go fields preserve their exported names, including in keyed struct literals;
 - Structures, enumerations, traits, enumeration variants, generic parameters, and associated types must start with a capital letter;
 - The fixed-width vector and mask type spellings listed under [Portable SIMD](#portable-simd), including `u8x16`, `i32x8`, `f32x4`, `f64x4`, and `mask32x4`, are also accepted as structure and type-alias names and in type positions. They are ordinary scoped names, supplied by `std::simd`, rather than globally reserved keywords;
 - Paths retain the appropriate case for the referenced name.
@@ -206,6 +206,33 @@ target-dir = "_artifact"
 ```
 
 Dependency versions must use the strict `X.Y.Z` form. A dependency version is a minimum version requirement resolved using MVS; there is currently no `goml.lock`.
+
+Local development dependencies can use an inline table. Paths are relative to the declaring module, and the dependency name must match the target's canonical `[module].path`:
+
+```toml
+[dependencies]
+"alice::http" = { path = "../http" }
+"alice::model" = { path = "../model", version = "1.2.0" }
+
+[replace]
+"alice::codec" = { path = "../codec" }
+```
+
+`goml add alice::http --path ../http` validates the target and writes a module-relative path. Local modules use their working sources, including transitive local dependencies, without requiring a registry cache. An optional version retains a registry requirement for later publication; local development does not check a version against the working tree. Registry modules cannot declare local path dependencies. Only the invoking module's `[replace]` table applies to its whole dependency graph; dependency-local replacements are ignored. Conflicting local sources, mismatched identities and dependency cycles are errors. Artifacts stay under the consuming project's target directory, and local source edits invalidate cached outputs.
+
+A `goml.work` file groups independent modules:
+
+```toml
+[workspace]
+members = ["app", "http", "model"]
+
+[replace]
+"alice::codec" = "../codec"
+```
+
+Members retain their own manifests and file-scoped imports. Membership provides a local source for a declared dependency; it does not make undeclared dependencies visible. Selection prefers workspace replacements, invoking-module replacements, workspace members, explicit path dependencies, then registry versions. Member paths and replacement paths are relative to `goml.work`; duplicate canonical member paths or module identities are rejected. An ancestor workspace applies only to its listed members. `GOML_WORKSPACE` selects a workspace directory explicitly, and `GOML_WORKSPACE=off` disables discovery.
+
+`goml check --workspace`, `build --workspace`, `test --workspace`, `fmt --workspace`, `doc --workspace` and `clean --workspace` run for each member in declaration order, stopping on failure. From a workspace directory without an enclosing module, these commands select all members automatically. `-p alice::app` or `--package alice::app` selects one module; `goml run` requires this selection when multiple members exist. Commands invoked inside a member operate on that member unless `--workspace` is supplied. Compiler queries and LSP dependency navigation resolve the same local sources and replacements.
 
 `[build]` can be omitted; `build.target-dir` defaults to `_artifact` under the module root. The manifest value must be a non-empty relative path and cannot contain a `..` segment. `goml check`, `goml build`, `goml run`, and `goml test` can temporarily override it with `--target-dir <path>`; command-line overrides may be relative or absolute. `goml clean` removes the configured target directory. Its optional `--target-dir <path>` override must stay inside the module.
 
@@ -449,10 +476,12 @@ An expression of type `never` does not produce a value and can appear where anot
 
 `A -> B -> C` is parsed by right associative analysis. It is recommended to always write function argument lists in parentheses, especially for higher-order functions: `(A) -> (B) -> C`.
 
-The array length must be a non-negative decimal integer in the source code, not a constant expression:
+Array lengths are nonnegative integer constant expressions. They accept integer literals in the usual bases, named integer constants, const generic parameters, parentheses, unary `+`, `-`, `~`, and `+`, `-`, `*`, `/`, `%`, `<<`, `>>`, `&`, `|`, `^`. Integer overflow, division by zero, invalid shifts, negative lengths, and cyclic constant references are diagnostics. Lengths fit the target signed indexing range. These expressions do not execute function calls:
 
 ```goml
-let pair: [string; 2] = ["left", "right"];
+const WIDTH: usize = 2;
+let pair: [string; WIDTH] = ["left", "right"];
+let bytes: [byte; WIDTH * 2] = [1, 2, 3, 4];
 ```
 
 The number of array literal elements must match the array type. Empty arrays and empty generic containers usually require type annotations.
@@ -578,7 +607,7 @@ A top-level constant initializer is an implicit compile-time context, so `const 
 
 Compile-time code may use local bindings and assignment, blocks, `if`, `match`, `while`, `loop`, restricted `for`, `break`, `continue`, `return`, recursion, direct calls, integer conversion methods, integer `to_string()`, and supported operators. A compile-time `for` accepts only a fixed array or the builtin `isize` ranges `start..end` and `start..=end`; its source and range endpoints are evaluated once, and its pattern must be irrefutable. The deterministic string methods `len`, `byte_len`, `get`, `byte_get`, `byte_slice`, `is_char_boundary`, `starts_with`, `ends_with`, and `contains` are also available. String indexes and slices use byte offsets and reject invalid UTF-8 character boundaries. Integer formatting accepts signed and unsigned 8-, 16-, 32-, and 64-bit values, including `byte`, `isize`, and `usize`, and produces decimal text with the full range preserved. This is restricted to the builtin `ToString` implementation; a user trait with the same short name does not become a compile-time intrinsic. For example, `const BITS: u64 = 18446744073709551615; const MASK: string = BITS.to_string();` evaluates without runtime formatting.
 
-Compile-time code cannot capture a surrounding runtime parameter or local. Closures, indirect calls, generic functions, methods other than the integer conversions, integer `to_string`, and string whitelist, trait or dynamic dispatch, general iterators, floating-point computation, `Ref`, `Vec`, `HashMap`, channels, goroutines, extern calls, host I/O, environment access, time, randomness, network access, general type reflection, arbitrary declaration generation, compile-time parameters, value generics, and type-level computation are not supported. The constrained programmable derive interface described below is the only reflection and code-generation facility.
+Compile-time code cannot capture a surrounding runtime parameter or local. Closures, indirect calls, generic functions, methods other than the integer conversions, integer `to_string`, and string whitelist, trait or dynamic dispatch, general iterators, floating-point computation, `Ref`, `Vec`, `HashMap`, channels, goroutines, extern calls, host I/O, environment access, time, randomness, network access, general type reflection, arbitrary declaration generation, compile-time function parameters and general type-level computation are not supported. The constrained programmable derive interface described below is the only reflection and code-generation facility.
 
 `compile_error` is accepted only in a `#[comptime]` function, a `comptime` block, or a top-level constant initializer. It terminates compile-time evaluation with its message. If runtime execution of a `#[comptime]` function reaches it, the program traps:
 
@@ -777,6 +806,32 @@ A free function may use a type parameter only in its body, with no occurrence in
 GoML monomorphizes generic calls. Recursive generic code must produce a limited number of concrete instances and cannot continually change to a new nested type with each recursive call.
 
 ## Blocks, bindings and assignments
+
+### Const generic parameters
+
+Functions, structs, enums, aliases, traits and implementations can declare `const N: usize` alongside type parameters. A const parameter is a value in an expression and an integer argument in a generic application; it cannot be used as an element type. Each concrete argument participates in monomorphization and nominal type identity.
+
+```goml
+struct Buffer[T, const N: usize] {
+    values: [T; N],
+}
+
+fn first[T, const N: usize](values: [T; N]) -> T {
+    values[0]
+}
+
+fn count[const N: usize](values: [i32; N]) -> usize {
+    N
+}
+
+fn use_buffers() -> () {
+    let buffer: Buffer[i32, 3] = Buffer { values: [4, 5, 6] };
+    let first_value = first(buffer.values);
+    let capacity = count::[3](buffer.values);
+}
+```
+
+A direct length parameter can be inferred from an array argument or expected type. For a length expression such as `N + 1`, provide `N` explicitly; inference does not solve arithmetic equations. Generic arguments use literals or names, and compound integer arguments use braces, such as `Buffer[i32, {2 + 1}]`. Const parameters currently have type `usize`, have no defaults, and use values in `0..=9223372036854775807`. Array repetition syntax and type-dependent associated constants in array lengths are not supported.
 
 ### Block values and semicolons
 
@@ -1746,6 +1801,33 @@ let text = Convert::[string]::convert(token, "");
 
 Trait bounds make the corresponding methods available on generic values. Imported short trait names, renamed imports, and public re-exports retain the defining trait identity in generic bounds and `where` predicates through specialization. Supertraits and associated type bounds also participate in method resolution as implied constraints.
 
+### Associated constants
+
+Traits can require constants or provide defaults. Inherent constants follow method visibility rules; trait implementation constants inherit trait visibility. Read a constant through `Type::NAME`, `Type::[Arguments]::NAME`, or a bound parameter such as `T::NAME`.
+
+```goml
+trait Capacity {
+    const LIMIT: usize;
+    const LABEL: string = "buffer";
+}
+
+struct FixedBuffer {}
+
+impl FixedBuffer {
+    pub const HEADER: usize = 2;
+}
+
+impl Capacity for FixedBuffer {
+    const LIMIT: usize = 16;
+}
+
+fn capacity[T: Capacity]() -> usize {
+    T::LIMIT
+}
+```
+
+Initializers support literals, constant paths, unary and binary operations, casts, and composite constant construction. They cannot perform ordinary function or method calls or access runtime locals. A generic implementation can use its const parameters in the initializer. Non-generic inherent integer constants can also supply array lengths. Associated constant patterns and trait-associated constants in length expressions are not supported. Traits with associated constants cannot be used as `dyn` traits.
+
 ## `dyn Trait`
 
 Use `as dyn Trait` to convert a concrete value that satisfies a dyn-safe trait into a trait object:
@@ -1882,9 +1964,9 @@ A public `#[comptime_derive(Name)]` handler exports the derive name `Name`, inde
 
 Derive names have their own namespace, but ordinary `use` declarations populate it alongside the type and trait namespaces. For example, after `use std::serde;`, `use serde::Serialize;` makes both the `Serialize` trait and a derive export named `Serialize` available as `Serialize`, so `#[derive(Serialize)]` works without another import form. An import alias applies to both namespaces: `use serde::Serialize as DataSerialize;` permits `#[derive(DataSerialize)]`. A package import permits the qualified spelling `#[derive(serde::Serialize)]`. Public re-exports preserve the derive handler's definition identity, so facade packages can use `pub use` to expose a standard-library or third-party derive without copying its implementation.
 
-`std::serde` owns the format-independent `Serialize`, `Deserialize`, `Serializer`, and `Deserializer` traits and the two derives. Typed formats use `Serialize::serialize` and `Deserialize::deserialize`: the format handle is a method-level generic parameter, so monomorphization produces ordinary static calls without a runtime serializer trait object, Go interface dispatch, or runtime reflection. A derived struct emits fields directly and a derived enum emits its declaration index, wire name, shape, and payload directly. Derived named-field decoding accepts arbitrary field order, skips unknown fields, and rejects duplicate or missing fields. Struct fields, enum variants, and named variant fields support `#[serde(rename = "wire_name")]`.
+`std::serde` owns the format-independent `Serialize`, `Deserialize`, `Serializer`, and `Deserializer` traits and the two derives. Typed formats use `Serialize::serialize` and `Deserialize::deserialize`: the format handle is a method-level generic parameter, so monomorphization produces ordinary static calls without a runtime serializer trait object, Go interface dispatch, or runtime reflection. A derived struct emits fields directly and a derived enum emits its declaration index, wire name, shape, and payload directly. Derived named-field decoding accepts arbitrary field order, skips unknown fields, and rejects duplicate fields and required fields that are missing. Struct fields, enum variants, and named variant fields support `#[serde(rename = "wire_name")]`. Field defaults, omission, flattening, and enum representation are selected with the Serde attributes below.
 
-`serde::Value` remains the explicit dynamic data model. It retains exact signed and unsigned integer widths, floating-point widths, enum declaration indexes, field order, and variant shape. `Binary(Vec[byte])`, `Map(Vec[(Value, Value)])`, and `Extension { tag: i8, data: Vec[byte] }` preserve binary payloads, ordered arbitrary-key map entries (including duplicates), and opaque extension data. `Sequence`, `Tuple`, and `Optional` are distinct, and `Value::Number(string)` represents a textual number whose destination type is not yet known. `serde::to_value` and `serde::from_value` connect typed values to this model through `ValueSerializer` and `ValueDeserializer`; both return `Result`, and using them intentionally constructs or consumes a complete value tree. Unit, booleans, strings, chars, numeric primitives, `Value`, `Vec[T]`, `Option[T]`, and two- or three-element tuples have standard direct implementations.
+`serde::Value` remains the explicit dynamic data model. It retains exact signed and unsigned integer widths, floating-point widths, enum declaration indexes, field order, and variant shape. `Binary(Vec[byte])`, `Map(Vec[(Value, Value)])`, and `Extension { tag: i8, data: Vec[byte] }` preserve binary payloads, ordered arbitrary-key map entries (including duplicates), and opaque extension data. `Sequence`, `Tuple`, and `Optional` are distinct, and `Value::Number(string)` represents a textual number whose destination type is not yet known. `serde::to_value` and `serde::from_value` connect typed values to this model through `ValueSerializer` and `ValueDeserializer`; both return `Result`, and using them intentionally constructs or consumes a complete value tree. Unit, booleans, strings, chars, numeric primitives, `Value`, `Vec[T]`, `Option[T]`, `HashMap[K, V]`, and two- or three-element tuples have standard direct implementations.
 
 `Serializer::serialize_extension(tag, data)` and `Deserializer::deserialize_extension()` are optional events with recoverable unsupported defaults. Format implementations opt in explicitly. The value serializer copies binary and extension payloads and retains maps as `Value::Map`; the value deserializer also accepts the legacy sequence-of-key/value-tuples map representation. JSON and TOML reject extension events, and Bincode has no extension representation. TOML preserves its previous value-bridge encoding of binary as integer arrays and maps as arrays of key/value pairs. `json::try_from_serde_value` rejects extensions recursively. The older infallible `json::from_serde_value` remains a lossy projection: binary becomes an integer array, maps become arrays of pairs, and extensions become `{ "tag": ..., "data": [...] }`. Prefer checked conversion for format validation.
 
@@ -1904,6 +1986,56 @@ struct User {
 }
 ```
 
+Serde field policies apply to struct fields and named enum-variant fields:
+
+| Attribute | Encoding | Decoding |
+| --- | --- | --- |
+| `#[serde(default)]` | Ordinary field | Calls `Default::default()` only when absent |
+| `#[serde(default = "function_path")]` | Ordinary field | Calls the zero-argument function only when absent |
+| `#[serde(skip)]` | Omits the field | Ignores input and uses the field default |
+| `#[serde(skip_serializing)]` | Omits the field | Ordinary field; add `default` if absence is permitted |
+| `#[serde(skip_deserializing)]` | Ordinary field | Ignores input and uses the field default |
+| `#[serde(skip_serializing_if = "predicate_path")]` | Omits the field when the predicate returns `true` | Ordinary field; add `default` to decode omitted values |
+| `#[serde(flatten)]` | Merges a struct or string/char-keyed map into the enclosing object | Decodes remaining named fields into the flattened value |
+
+Function and predicate paths may be quoted strings or unquoted paths, resolve in the deriving file's scope, and are checked as ordinary calls. The predicate takes the field value and returns `bool`; it is evaluated once per serialization. Attributes may share one list, such as `#[serde(default, skip_serializing_if = "Option::is_none")]`. A skipped field implicitly uses `Default` unless a custom `default` function is provided. Derive infers only the relevant field bounds: a field skipped in both directions needs no `Serialize` or `Deserialize` implementation, while a generic field using its ordinary default needs `Default`. Defaults do not recover from malformed present values or duplicate fields. An `Option` field remains required unless given `default` or a decoding skip policy.
+
+Flattened fields consume remaining keys in declaration order after ordinary fields have been decoded. Nested flattened structs preserve keys they do not consume, so a later catch-all map can receive them. `Deserializer::preserve_unknown_fields` is an optional adapter hook with a no-op default; the value adapter uses it to retain these keys across nested flattening. Place catch-all maps after flattened structs. `HashMap[K, V]` implements the shared map protocol when its keys and values implement the appropriate Serde traits and its keys implement `Eq + Hash`; duplicate input keys are rejected. Map entry order follows the map's iteration order. Flattening rejects duplicate output keys, non-string/char map keys, and non-object values. `flatten` cannot be combined with `rename`, `default`, or either skip direction on the same field. Unknown attributes, repeated attributes, duplicate wire names, and conflicting policies are compile-time diagnostics.
+
+Enums retain their externally tagged default representation. Container attributes select these alternatives:
+
+| Enum attribute | JSON examples |
+| --- | --- |
+| `#[serde(tag = "kind")]` | `{"kind":"Ready"}`, `{"kind":"Record","id":3}` |
+| `#[serde(tag = "kind", content = "data")]` | `{"kind":"Ready"}`, `{"kind":"Number","data":3}`, `{"kind":"Pair","data":[3,true]}` |
+| `#[serde(untagged)]` | `3`, `[3,true]`, `{"id":3}`, `null` |
+
+Internally tagged enums support unit variants, named variants, and single-field variants whose value encodes as an object. Other tuple variants are rejected at compile time. A tag colliding with a named field is rejected; collisions from flattened values are runtime errors. Adjacent and untagged single-field variants use the field's value directly; multi-field tuple variants use an array, named variants use an object, and untagged unit variants use `null`. Untagged decoding tries variants in declaration order and returns an error if none accepts the complete payload. Internal and adjacent tags may appear in any field order, must be strings, and cannot be repeated. `content` requires `tag`, the two keys must differ, and neither may be combined with `untagged`.
+
+Ordinary derivation, defaults, and fixed field skipping retain the direct protocol. Fixed skipping also uses contiguous positional indexes for Bincode. Conditional omission, flattening, and custom enum representations require a self-describing human-readable format; Bincode returns a recoverable error for these policies. Flattening buffers the flattened fields as `serde::Value`; custom enum representations buffer the enum payload so tag order and untagged retries can be handled. These opt-in policies therefore do not have the allocation behavior of the ordinary streaming path. They work with JSON, TOML where its data model permits the value, and the explicit Serde value adapters.
+
+```gom
+use std::json;
+use json::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+struct ApiOptions {
+    #[serde(default)]
+    retries: isize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option[string],
+    #[serde(skip)]
+    cached: string,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data")]
+enum ApiReply {
+    Ready,
+    Options(ApiOptions),
+}
+```
+
 `Serializer::is_human_readable()` and `Deserializer::is_human_readable()` default to `true`. JSON, TOML, and the generic value adapters use this default; Bincode overrides it with `false`. Custom formats should override both sides consistently. A custom Serde implementation can choose readable names for text formats and an integer representation for binary formats without depending on a particular encoder. This query does not change ordinary derived serialization.
 
 `std::json` supports two deliberately separate modes. The value mode uses `json::Value`, `json::parse`, and `json::encode` for schema-free inspection and editing. JSON numbers remain their exact source text in `Value::Number`. In the typed mode, `json::try_to_string` and `from_string` write and consume JSON directly through the streaming serde traits; neither operation first builds a `json::Value` or `serde::Value` tree. `json::to_value` and `from_value` return `Result` and are the explicit bridge to the dynamic JSON model. Numeric range and destination-width checks happen while deserializing into the requested type.
@@ -1914,7 +2046,7 @@ zeros for this accessor, while parse still requires JSON number syntax. Invalid
 literal prefixes containing multibyte characters produce recoverable parse
 errors rather than slicing inside a UTF-8 scalar.
 
-`json` publicly re-exports the shared `Serialize` and `Deserialize` traits and derive handlers, so either `use serde::Serialize` or `use json::Serialize` selects the same implementation identity. The JSON serializer emits struct fields in source order. Direct maps use JSON objects and therefore require keys whose direct representation is a string or char; `try_to_string` returns a recoverable error for other key types. The deserializer accepts any field order, recursively skips unknown values, rejects duplicate and missing fields, and rejects trailing input. Typed errors retain the byte offset and nested struct, sequence, map, or enum path. JSON uses externally tagged enums: a unit variant is a string, a tuple variant is an object whose value is an array, and a struct-like variant is an object whose value is another object.
+`json` publicly re-exports the shared `Serialize` and `Deserialize` traits and derive handlers, so either `use serde::Serialize` or `use json::Serialize` selects the same implementation identity. The JSON serializer emits struct fields in source order. Direct maps use JSON objects and therefore require keys whose direct representation is a string or char; `try_to_string` returns a recoverable error for other key types. The deserializer accepts any field order, recursively skips unknown values, rejects duplicate and missing fields, and rejects trailing input. Typed errors retain the byte offset and nested struct, sequence, map, or enum path. JSON uses externally tagged enums by default: a unit variant is a string, a tuple variant is an object whose value is an array, and a struct-like variant is an object whose value is another object. Serde container attributes opt into internal, adjacent, or untagged representations as described above.
 
 #### Bounded JSON streaming and typed serde
 
@@ -2234,7 +2366,7 @@ fn example() -> string {
 
 The first attribute argument is the Go import path and the second is an exported ASCII Go identifier. The GoML function name is local and may differ from the Go symbol. Add `pub` before `extern fn` to expose the binding through another GoML package; interface and Core artifacts preserve the Go import path and symbol.
 
-Bind a Go type with `#[go_type("time", "Duration")] pub extern type Duration;`. The GoML name may differ from the Go object name. Declarations cannot have a body or an `= Type` target. Go defined types retain their identity: `Duration` differs from `i64`, while two GoML packages binding `time.Duration` share the same type. Go aliases normalize to their target type. Values can pass through ordinary GoML functions and typed Go foreign calls; generated Go uses the original type and preserves its method set. GoML field access, struct construction and pointer dereferencing are not yet supported for these values.
+Bind a Go type with `#[go_type("time", "Duration")] pub extern type Duration;`. The GoML name may differ from the Go object name. Declarations cannot have a body or an `= Type` target. Go defined types retain their identity: `Duration` differs from `i64`, while two GoML packages binding `time.Duration` share the same type. Go aliases normalize to their target type. Values can pass through ordinary GoML functions and typed Go foreign calls; generated Go uses the original type and preserves its method set. Exported fields with supported bridge representations are readable with ordinary field syntax, including through a raw Go pointer. Keyed struct literals construct Go struct values; omitted fields retain their Go zero value, including private fields. Unknown, private, duplicate and unsupported fields produce diagnostics. Field names use their original exported ASCII Go spelling. Embedded fields can be accessed by their declared name; promoted field lookup, field assignment, struct updates and explicit pointer dereferencing remain unsupported.
 
 ```goml
 #[go_type("time", "Duration")]
@@ -2247,6 +2379,23 @@ fn wait(duration: Duration) -> () {
     sleep(duration)
 }
 ```
+
+For example, a Go `type Point struct { X, Y int64 }` declaration supports:
+
+```goml
+#[go_type("example.com/geometry", "Point")]
+extern type Point;
+
+fn horizontal(x: i64) -> Point {
+    Point { X: x }
+}
+
+fn magnitude_squared(point: Point) -> i64 {
+    point.X * point.X + point.Y * point.Y
+}
+```
+
+Go struct literals preserve value semantics and do not allocate a raw pointer. A pointer alias cannot be constructed with this syntax. Go string fields keep the raw `ffi::String` representation and require explicit text conversion; fields do not silently convert Unicode strings or callbacks.
 
 A Go alias such as `type Handle = *Cell` can be bound with `#[go_type("example.com/shim", "Handle")] extern type Handle;`. The generated type is `*Cell`, including its nil value and pointer identity. Passing it through functions, closures or containers does not copy the pointed-to object. `Option::Some` containing a nil pointer remains distinct from `Option::None`. GoML cannot construct such a value from an integer or a `Ref`, or use struct layout syntax to create it. `use std::ffi;` exposes `ffi::Ptr[T]`, a transparent spelling for a raw Go pointer to T. `ffi::null()` constructs a nil pointer with its type inferred from context, and `ffi::is_nil(value)` tests it. Non-null pointers enter through explicit Go function bindings. For example, `let empty: ffi::Ptr[Cell] = ffi::null();` and `ffi::is_nil(empty)` use the same representation as a Go alias of `*Cell`. These functions are also ordinary function values. This uses the existing external type declaration grammar, with no `*T` source type syntax.
 
@@ -2288,7 +2437,7 @@ Reverse conversion is also explicit. `ffi::Outcome::from_raw_result(result, fail
 
 `NonNilError::message_bytes()` invokes the original Go `Error()` method and returns a fresh `std::bytes::Bytes` copy of its bytes. `message()` returns `Result[string, std::utf8::Utf8Error]`, accepting valid UTF-8 and rejecting invalid bytes without replacement. Message access does not replace the stored error. Typed-nil interfaces can enter the checked wrapper, so the underlying Go method's nil handling, side effects and panics remain its own. These APIs do not catch Go panics or implicitly convert errors to strings.
 
-Package compilation queries Go metadata for every declaration, including private and unused declarations. Interface and Core artifacts preserve this metadata, and cached inputs are rechecked against the current Go declarations. Changed declarations require rebuilding the GoML package from source. `--ffi-check off` cannot skip external type resolution or artifact type revalidation. Generic declarations such as `#[go_type("example.com/shim", "Box")] extern type Box[T];` accept concrete applications such as `Box[i64]`. The Go type checker validates the original Go constraints, including constraints on alias parameters that disappear when the alias is expanded. Imported applications are checked too, and concrete instance requests are saved for artifact revalidation. Concrete instance validation requires that a variable of the resolved Go type is legal. Constraint-only interfaces can be described in declaration metadata but cannot be used as runtime instances. Applications involving unresolved GoML generic parameters currently report that specialization is required; using `Box[T]` inside a generic GoML function or alias is not yet supported. Aliases to Go pointers are supported when their pointee has a supported representation. Aliases requiring other unsupported raw representations, such as raw Go channels, produce diagnostics. Query and LSP checking also resolve external type declarations and validate concrete instances, including cross-package references and unsaved GoML source changes. The language server uses its adjacent `goml-go-meta` helper and the GoML module root as its Go build context, with the same offline, read-only Go loading policy. Missing tools and metadata failures produce recoverable diagnostics. Native foreign-call signatures, interface adapters, and exports still receive their complete validation during module compilation.
+Package compilation queries Go metadata for every declaration, including private and unused declarations. Interface and Core artifacts preserve this metadata, and cached inputs are rechecked against the current Go declarations. Changed declarations require rebuilding the GoML package from source. `--ffi-check off` cannot skip external type resolution or artifact type revalidation. Generic declarations such as `#[go_type("example.com/shim", "Box")] extern type Box[T];` accept concrete applications such as `Box[i64]`. The Go type checker validates the original Go constraints, including constraints on alias parameters that disappear when the alias is expanded. Imported applications are checked too, and concrete instance requests are saved for artifact revalidation. Concrete instance validation requires that a variable of the resolved Go type is legal. Constraint-only interfaces can be described in declaration metadata but cannot be used as runtime instances. Symbolic applications such as `Box[T]` are supported in generic GoML functions and aliases. Source checking records their original Go declaration and arguments, including parameters erased by alias expansion. Public aliases retain these requirements in interfaces. Linking substitutes each reachable function specialization and validates its concrete instance with the Go type checker before Go emission, including with `--ffi-check off`. Unused generic functions do not require a concrete instantiation. Query and LSP analysis validates concrete applications and defers symbolic Go constraints until linking. Aliases to Go pointers are supported when their pointee has a supported representation. Aliases requiring other unsupported raw representations, such as raw Go channels, produce diagnostics. Query and LSP checking also resolve external type declarations and validate concrete instances, including cross-package references and unsaved GoML source changes. The language server uses its adjacent `goml-go-meta` helper and the GoML module root as its Go build context, with the same offline, read-only Go loading policy. Missing tools and metadata failures produce recoverable diagnostics. Native foreign-call signatures, interface adapters, and exports still receive their complete validation during module compilation.
 
 The foreign-call ABI supports values whose generated Go representations are directly assignable. Raw boundary types and adapters are detailed in the following sections:
 
@@ -2726,7 +2875,7 @@ Each test is executed in a separate runner process, and failure to exit and time
 
 The LSP analyzes production files, internal tests, and black-box tests in their corresponding package contexts, so diagnostics, completion, hover, and go-to-definition follow the same visibility rules as compilation. Test code lenses appear on ordinary tests and parameterized test cases. The VS Code extension saves the file and invokes module-level `goml test` with the selected test display name and kind.
 
-Package analysis caches parsed/lowered sources and successful checked packages within a query context. Source contents, package membership, canonical module identity, and transitive dependency fingerprints determine reuse. Editing a package rechecks it and its dependents while independent packages remain reusable; a function-body edit in a dependency conservatively invalidates its dependents too. Open document overrides participate in the same fingerprints. Packages with external Go types and their dependents revalidate native metadata on each analysis. Watched source and manifest changes invalidate cached document analyses; the VS Code extension also watches Go sources, `go.mod`, and `go.sum`.
+Package analysis caches parsed/lowered sources and successful checked packages within a query context. Source contents, package membership, canonical module identity, and transitive dependency fingerprints determine reuse. Editing a package rechecks it and its dependents while independent packages remain reusable; a function-body edit in a dependency conservatively invalidates its dependents too. Open document overrides participate in the same fingerprints. Packages with external Go types and their dependents revalidate native metadata on each analysis. Watched source and manifest changes invalidate cached document analyses; the VS Code extension also watches `goml.work`, Go sources, `go.mod`, and `go.sum`.
 
 The custom `goml/expandedDerive` request returns the formatted AST after built-in and programmable derives have run for the requested document. It uses the same package aliases, explicit derive imports, ambiguity checks, dependency interfaces, CTIR verifier, and resource limits as `goml check`. The VS Code command `GoML: Show Expanded Derive` opens that result beside the source file.
 
@@ -6288,6 +6437,12 @@ fn connect_example() -> Result[tls::TlsStream, io::Error] {
 }
 ```
 
+### HTTP ecosystem packages
+
+The separate [`ecosystem::request`](../../gomlang/request/README.md) client provides scoped `send_stream` downloads, `send_reader` uploads from `io::Read`, cancellation-aware variants, bounded chunks and copying, and incremental SSE decoding. Response handles expire when the callback returns. Streaming uses HTTP/1.1 over TCP or verified TLS, including CONNECT proxies; the existing buffered client retains its HTTP/2 path. Streamed uploads cannot be automatically replayed for redirects that preserve the body. Compression and SSE reconnection behavior are explicit in the client README.
+
+The [`ecosystem::web`](../../gomlang/web/README.md) server supplies a TLS listener, WebSocket response upgrades, incremental multipart extraction, bounded static file serving, CORS and buffered gzip negotiation. TLS uses a managed Go standard-library adapter and requires a minimal consumer `go.mod`; no cgo or third-party Go module is needed. The listener supports HTTP/1.0 and HTTP/1.1. Multipart fields and upgraded connections follow request lifetime and cancellation rules. Static files reject symlinks and traversal and support ETags, HEAD and single byte ranges. These library APIs use ordinary imports and do not add language grammar.
+
 ### Filesystem ecosystem packages
 
 Recursive directory traversal and filesystem notifications are independent
@@ -6350,7 +6505,7 @@ fn round_trip(value: Message) -> Result[Message, string] {
 }
 ```
 
-Typed bincode supports the shared serde primitives, byte slices through custom direct implementations, `Vec`, `Option`, two- and three-element tuples, and derived structs and enums. Fixed arrays are not yet supported because GoML does not yet have const-generic serde implementations. Dynamic `serde::Value`, `json::Value`, and `toml::Value` do not describe the concrete binary layout needed by typed bincode decode.
+Typed bincode supports the shared serde primitives, byte slices through custom direct implementations, `Vec`, `Option`, two- and three-element tuples, and derived structs and enums. Fixed arrays still require explicit serde implementations; the standard library has not yet migrated to const-generic array implementations because its bootstrap compiler must remain compatible. Dynamic `serde::Value`, `json::Value`, and `toml::Value` do not describe the concrete binary layout needed by typed bincode decode.
 
 ### TOML values and typed documents
 
@@ -6501,6 +6656,9 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | `Vec<isize>` | `Vec[isize]` |
 | `Simd[T, N]` or vector `a + b` | Import `std::simd`, select a fixed 128/256-bit vector type, and use `a.add(b)` |
 | `fn id<T>(x: T) -> T` | `fn id[T](x: T) -> T` |
+| `fn count[N](values: [i32; N])` | Declare the value parameter as `fn count[const N: usize](values: [i32; N]) -> usize` |
+| `Buffer[i32, N + 1]` | `Buffer[i32, {N + 1}]` |
+| `Type::LIMIT()` for an associated constant | `Type::LIMIT` |
 | `id::<i32>(1)` | `id::[i32](1)` |
 | Ordinary function `id[i32](1)` | `id::[i32](1)`, or rely on parameter/result type inference |
 | `1i32`, `1u64`, `1.0f32` | Use the expected type, such as `let value: u64 = 1;` |
@@ -6525,8 +6683,9 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | Use `type UserId = u64;` when `UserId` must be distinct | Use `struct UserId(u64);` and construct it explicitly |
 | `use pkg::*` | List the required public items explicitly with `use pkg::{A, B};` |
 | `mod`, `crate::`, `super::` | Directory packages, `module::path` for the current module, and canonical paths for dependencies |
+| Develop several modules together | `goml.work` lists members; dependency `{ path = "../library" }` and root `[replace]` select local sources while preserving declared dependencies and canonical identities; `--workspace` or `-p` selects modules |
 | `fn helper` inside function | Top-level function or local closure |
-| Go external type | `#[go_type("pkg", "Name")] extern type Name[T];` retains Go identity and validates concrete instances across packages and artifacts; `std::ffi::Ptr[T]` and Go pointer aliases preserve nullable pointer values, with explicit `ffi::null()` and `ffi::is_nil`; method bindings use `#[go_method("Method")]`; symbolic instances remain unsupported |
+| Go external type | `#[go_type("pkg", "Name")] extern type Name[T];` retains Go identity and validates concrete instances across packages and artifacts; `std::ffi::Ptr[T]` and Go pointer aliases preserve nullable pointer values, with explicit `ffi::null()` and `ffi::is_nil`; method bindings use `#[go_method("Method")]`; public fields and keyed struct construction use ordinary syntax, and symbolic function/alias instances are checked after specialization |
 | Go interface adapter | `#[go_interface(RawType, Wrapper, method = "GoMethod")]` generates a checked native-interface wrapper and trait implementation; `from_trait` explicitly creates a typed Go bridge retaining the supplied dyn object; nil/typed-nil and multiple results are preserved |
 | Go binding generator | `goml bind-go <CONFIG>` selects explicit package/symbol allowlists and finite Go-checked generic arguments; emits raw bindings with protected deterministic output |
 | C binding generator | `goml bind-c <CONFIG>` checks C declarations with Clang and emits typed handles, copied strings/buffers, output adapters and compile-time integer constants; supports cgo and a first-party dynamic C ABI backend with `CGO_ENABLED=0` |
@@ -6535,6 +6694,8 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | Manipulate logical slash paths or shell patterns | `std::path::slash` for pure lexical operations and bounded Unicode matching; keep host paths in `std::path` |
 | Watch a directory tree for changes | Use the `ecosystem::notify` dependency and its `watch_recursive` or `WatchSet` on Linux amd64, prune ignored paths through `Options`, consume timed reads or scoped subscriptions, handle `Event.rescan`, and close the handle |
 | TCP and UDP networking | `std::net` sockets, DNS resolution, shared epoll readiness, explicit close, and context-aware waits; `std::net::tls` for verified TLS clients |
+| Stream HTTP requests or consume SSE | `ecosystem::request` scoped streaming callbacks, `io::Read` uploads, bounded response chunks and incremental SSE decoding over HTTP/1.1 |
+| Serve HTTPS, WebSockets or uploaded files | `ecosystem::web` TLS listener, explicit WebSocket upgrades, multipart fields, static files, CORS and bounded buffered gzip middleware |
 | Escape URL segments or query parameters | `std::net::url` bounded component/query codecs preserve decoded bytes; full URL parsing is separate |
 | Resolve a raw URL reference | `url::Reference::parse` and `base.resolve` preserve component markers and remove literal dot segments; authority validation and ASCII serialization are explicit separate operations |
 | Inspect a URL host or hide its password | `url::Authority::parse` validates user information, host literals and decimal port syntax; `redacted` hides only passwords, not query or other secrets |
@@ -6669,7 +6830,7 @@ constant      = "const" ident ":" type "=" expression ";"
 static        = "static" ident ":" type "=" expression ";"
 method        = visibility? "fn" lower_ident generic_params? param_list return_type? where_clause? block
 generic_params = "[" generic_param ("," generic_param)* "]"
-generic_param = upper_ident (":" trait_set)?
+generic_param = upper_ident (":" trait_set)? | "const" upper_ident ":" "usize"
 param_list    = "(" (parameter ("," parameter)*)? ")"
 parameter     = lower_ident ":" type | "self"
 return_type   = "->" type
@@ -6685,19 +6846,21 @@ variant       = upper_ident
               | upper_ident "(" type_list? ")"
               | upper_ident "{" variant_fields? "}"
 variant_fields = lower_ident ":" type ("," lower_ident ":" type)* ","?
-type_names    = "[" upper_ident ("," upper_ident)* "]"
+type_names    = "[" type_parameter ("," type_parameter)* "]"
+type_parameter = upper_ident | "const" upper_ident ":" "usize"
 
 trait_def     = "trait" upper_ident generic_params? (":" trait_set)? where_clause?
                 "{" trait_member* "}"
 trait_member  = "type" upper_ident (":" trait_set)? ";"
+              | "const" ident ":" type ("=" constant_expression)? ";"
               | "fn" lower_ident generic_params? param_list return_type? where_clause?
                 (";" | block)
 
 impl_def      = "impl" generic_params? trait_ref "for" type where_clause?
                 "{" impl_member* "}"
               | "impl" generic_params? type where_clause?
-                "{" method* "}"
-impl_member   = "type" upper_ident "=" type ";" | method
+                "{" (method | visibility? constant)* "}"
+impl_member   = "type" upper_ident "=" type ";" | method | constant
 
 trait_set     = trait_ref ("+" trait_ref)*
 trait_ref     = path type_args?
@@ -6707,13 +6870,20 @@ where_predicate = type ":" trait_set | type "=" type
 type          = primitive_type
               | path type_args?
               | dyn_type
-              | "[" type ";" integer_literal "]"
+              | "[" type ";" integer_constant_expression "]"
               | "(" type_list ")"
               | type "->" type
 primitive_type = "()" | "never" | "bool" | "isize" | "i8" | "i16" | "i32" | "i64"
                | "usize" | "u8" | "u16" | "u32" | "u64" | "f32" | "f64"
                | "string" | "char"
-type_args     = "[" type_list "]"
+type_args     = "[" generic_argument ("," generic_argument)* ","? "]"
+generic_argument = type | integer_literal | "{" integer_constant_expression "}"
+integer_constant_expression = integer_literal | path
+              | "(" integer_constant_expression ")"
+              | ("+" | "-" | "~") integer_constant_expression
+              | integer_constant_expression integer_operator integer_constant_expression
+integer_operator = "+" | "-" | "*" | "/" | "%" | "<<" | ">>" | "&" | "|" | "^"
+constant_expression = expression
 type_list     = type ("," type)* ","?
 dyn_bound     = path dyn_args?
 dyn_args      = "[" (type ",")* dyn_assoc ("," dyn_assoc)* ","? "]"
@@ -6750,7 +6920,7 @@ raw_byte_string = "br\"...\"" | "br#\"...\"#" | "br##\"...\"##" | ...
 raw_string    = "r" raw_hashes? "\"" raw_text "\"" raw_hashes?
 struct_literal = path "{" (struct_literal_field ("," struct_literal_field)*
                  ("," ".." expression)? ","? | ".." expression ","?)? "}"
-struct_literal_field = lower_ident (":" expression)?
+struct_literal_field = ident (":" expression)?
 
 unlabeled_control_expression = if_expression | match_expression | select_expression
                    | "while" expression block | "while" "let" pattern "=" expression block
@@ -6825,7 +6995,7 @@ goml test
 goml run
 ```
 
-`goml check`, `goml build`, `goml test`, and `goml fmt` always operate on the complete module and do not accept package or file targets. `goml run [TARGET]` accepts an optional entry package file or directory when a module has multiple executable packages.
+`goml check`, `goml build`, `goml test`, and `goml fmt` operate on complete modules and do not accept package or file targets. In a workspace, use `--workspace` for all members or `-p <module-path>` for one member. `goml run [TARGET]` accepts an optional entry package file or directory when a module has multiple executable packages.
 
 When you need to inspect a compilation phase, add `--dump-ast`, `--dump-expanded-ast`, `--dump-hir`, `--dump-tast`, `--dump-ctir`, `--dump-core`, `--dump-mono`, `--dump-lift`, `--dump-anf`, or `--dump-go` to `gomlc run-single`. `--dump-ast` shows source lowering before derive expansion, while `--dump-expanded-ast` includes every generated implementation.
 

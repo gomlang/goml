@@ -1,6 +1,7 @@
 package ast;
 
 use module::cst;
+use module::consts;
 use module::lexer;
 
 struct LowerCtx {
@@ -208,31 +209,6 @@ fn lower_type_list(ctx: LowerCtx, node: LocatedNode) -> Vec[TypeExpr] {
     result
 }
 
-fn normalized_array_length(value: string) -> Option[string] {
-    let mut index = 0;
-    while index + 1 < value.byte_len() && value.byte_get(index) == b'0' {
-        index += 1;
-    }
-    let normalized = value.byte_slice(index, value.byte_len());
-    let maximum = "9223372036854775807";
-    if normalized.byte_len() < maximum.byte_len() {
-        Option::Some(normalized)
-    } else if normalized.byte_len() > maximum.byte_len() {
-        Option::None
-    } else {
-        for cursor in 0..normalized.byte_len() {
-            let left = normalized.byte_get(cursor);
-            let right = maximum.byte_get(cursor);
-            if left < right {
-                return Option::Some(normalized)
-            } else if left > right {
-                return Option::None
-            }
-        }
-        Option::Some(normalized)
-    }
-}
-
 fn lower_ty(ctx: LowerCtx, node: LocatedNode) -> Option[TypeExpr] {
     if ctx.type_depth.get() >= 256 {
         push_error(ctx, node_span(node), "type is too deeply nested");
@@ -267,6 +243,18 @@ fn lower_ty(ctx: LowerCtx, node: LocatedNode) -> Option[TypeExpr] {
                     }
                 },
                 None => Option::None,
+            },
+            TYPE_TAPP if !expr_children(node).is_empty() => {
+                let expression = node_text(expr_children(node)[0]);
+                match consts::parse(expression) {
+                    Ok(_) => Option::Some(
+                        TypeExpr::Con { path: path_from_single_ident("$const_expr:" + expression) },
+                    ),
+                    Err(message) => {
+                        push_error(ctx, node_span(node), message);
+                        Option::None
+                    },
+                }
             },
             TYPE_TAPP => match first_child(node, cst::NodeKind::PATH) {
                 Some(path_node) => match lower_path(ctx, path_node) {
@@ -334,31 +322,41 @@ fn lower_ty(ctx: LowerCtx, node: LocatedNode) -> Option[TypeExpr] {
             },
             TYPE_ARRAY => {
                 let types = type_children(node);
-                match first_token(node, lexer::TokenKind::IntLit) {
-                    Some(length_token) => match normalized_array_length(
-                        strip_suffix(length_token.token.text, ""),
-                    ) {
-                        Some(length) => if !types.is_empty() {
-                            lower_ty(ctx, types[0]).map(
-                                |element| TypeExpr::Array { len: length, elem: element },
-                            )
-                        } else {
-                            push_error(ctx, node_span(node), "Array type missing element type");
-                            Option::None
+                let expressions = expr_children(node);
+                if types.is_empty() {
+                    push_error(ctx, node_span(node), "Array type missing element type");
+                    Option::None
+                } else if expressions.is_empty() {
+                    match first_token(node, lexer::TokenKind::IntLit) {
+                        Some(token) => match consts::integer(token.token.text) {
+                            Some(length) => lower_ty(ctx, types[0]).map(
+                                |elem| TypeExpr::Array { len: length.to_string(), elem },
+                            ),
+                            None => {
+                                push_error(
+                                    ctx,
+                                    token_span(token),
+                                    "Invalid array length: " + token.token.text,
+                                );
+                                Option::None
+                            },
                         },
                         None => {
-                            push_error(
-                                ctx,
-                                token_span(length_token),
-                                "Invalid array length: " + length_token.token.text,
-                            );
+                            push_error(ctx, node_span(node), "Array type missing length");
                             Option::None
                         },
-                    },
-                    None => {
-                        push_error(ctx, node_span(node), "Array type missing length");
-                        Option::None
-                    },
+                    }
+                } else {
+                    let length = node_text(expressions[0]);
+                    match consts::parse(length) {
+                        Ok(_) => lower_ty(ctx, types[0]).map(
+                            |elem| TypeExpr::Array { len: length, elem },
+                        ),
+                        Err(message) => {
+                            push_error(ctx, node_span(expressions[0]), message);
+                            Option::None
+                        },
+                    }
                 }
             },
             TYPE_FUNC => {
@@ -435,7 +433,11 @@ fn lower_generics(ctx: LowerCtx, node: LocatedNode) -> (Vec[string], Vec[(string
     if let Some(list) = first_child(node, cst::NodeKind::GENERIC_LIST) {
         for generic in children_of_kind(list, cst::NodeKind::GENERIC) {
             if let Some(token) = first_token(generic, lexer::TokenKind::Ident) {
-                let name = token.token.text;
+                let name = if first_token(generic, lexer::TokenKind::ConstKeyword).is_some() {
+                    consts::parameter(token.token.text)
+                } else {
+                    token.token.text
+                };
                 generics.push(name);
                 if let Some(set) = first_child(generic, cst::NodeKind::TRAIT_SET) {
                     bounds.push((name, lower_trait_set(ctx, set)))
@@ -552,6 +554,7 @@ fn lower_result(result: cst::ParseResult) -> LowerResult {
                 items.push(value)
             }
         }
+        validate_associated_constant_cycles(ctx, items);
         let ast = if ctx.diagnostics.is_empty() {
             Option::Some(
                 File {

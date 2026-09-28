@@ -1,0 +1,203 @@
+package ast;
+
+use module::cst;
+use module::lexer;
+
+fn matches_public_visibility(value: Visibility) -> bool {
+    match value {
+        Public => true,
+        Private => false,
+    }
+}
+
+fn associated_constant_expressions(values: Vec[Expr]) -> bool {
+    for value in values {
+        if !associated_constant_expression(value) {
+            return false
+        }
+    }
+    true
+}
+
+fn associated_constant_expression(value: Expr) -> bool {
+    match value {
+        Unit { .. } | Bool { .. } | Int { .. } | Float { .. } | String { .. } | Char { .. } | Byte {
+            ..,
+        } | ByteString { .. } | Path { .. } | ConstructorValue { .. } => true,
+        Unary { expr, .. } | Cast { expr, .. } => associated_constant_expression(expr),
+        Binary { lhs, rhs, .. } => associated_constant_expression(lhs)
+            && associated_constant_expression(rhs),
+        Array { items, .. } | Tuple { items, .. } => associated_constant_expressions(items),
+        Constr { args, .. } => associated_constant_expressions(args),
+        StructLiteral { fields, base, .. } => {
+            for field in fields {
+                if !associated_constant_expression(field.1) {
+                    return false
+                }
+            }
+            match base {
+                Some(value) => associated_constant_expression(value),
+                None => true,
+            }
+        },
+        _ => false,
+    }
+}
+
+fn lower_associated_constant_signature(ctx: LowerCtx, node: LocatedNode) -> Option[
+    TraitMethodSignature,
+] {
+    let name = first_token(node, lexer::TokenKind::Ident)?;
+    let types = type_children(node);
+    if types.is_empty() {
+        return Option::None
+    }
+    let ret_ty = lower_ty(ctx, types[0])?;
+    let expressions = expr_children(node);
+    let body = if expressions.is_empty() {
+        Option::None
+    } else {
+        let value = lower_expr(ctx, expressions[0])?;
+        if !associated_constant_expression(value) {
+            push_error(
+                ctx,
+                node_span(node),
+                "associated constant initializer must be a constant expression",
+            )
+        }
+        Option::Some(Block { stmts: Vec::new(), tail: Option::Some(value), span: node_span(node) })
+    };
+    Option::Some(
+        TraitMethodSignature {
+            name: "$associated_const:" + name.token.text,
+            has_receiver: false,
+            generics: Vec::new(),
+            generic_bounds: Vec::new(),
+            predicates: Vec::new(),
+            params: Vec::new(),
+            ret_ty,
+            body,
+        },
+    )
+}
+
+struct AssociatedConstantNode {
+    name: string,
+    owner: string,
+    value: Expr,
+    span: Span,
+}
+
+fn constant_owner(value: TypeExpr) -> string {
+    match value {
+        App { ty, .. } => constant_owner(ty),
+        _ => type_text(value),
+    }
+}
+
+fn associated_constant_path(path: Path, owner: string) -> string {
+    let parts: Vec[string] = Vec::new();
+    for segment in path.segments {
+        parts.push(segment.ident)
+    }
+    if !parts.is_empty() && parts[0] == "Self" {
+        parts[0] = owner;
+    }
+    parts.join("::")
+}
+
+fn associated_constant_dependencies(value: Expr, owner: string, output: Vec[string]) -> () {
+    match value {
+        Path { path, .. } | ConstructorValue { constructor: path, .. } => output.push(
+            associated_constant_path(path, owner),
+        ),
+        Unary { expr, .. } | Cast { expr, .. } => associated_constant_dependencies(
+            expr,
+            owner,
+            output,
+        ),
+        Binary { lhs, rhs, .. } => {
+            associated_constant_dependencies(lhs, owner, output);
+            associated_constant_dependencies(rhs, owner, output)
+        },
+        Array { items, .. } | Tuple { items, .. } | Constr { args: items, .. } => for item in items {
+            associated_constant_dependencies(item, owner, output)
+        },
+        StructLiteral { fields, base, .. } => {
+            for field in fields {
+                associated_constant_dependencies(field.1, owner, output)
+            }
+            if let Some(value) = base {
+                associated_constant_dependencies(value, owner, output)
+            }
+        },
+        _ => (),
+    }
+}
+
+fn associated_constant_cycle(nodes: Vec[AssociatedConstantNode], index: isize, active: Vec[string]) -> bool {
+    let node = nodes[index];
+    if active.contains(node.name) || active.len() >= 128 {
+        return true
+    }
+    active.push(node.name);
+    let dependencies: Vec[string] = Vec::new();
+    associated_constant_dependencies(node.value, node.owner, dependencies);
+    for dependency in dependencies {
+        for candidate in 0..nodes.len() {
+            if nodes[candidate].name == dependency
+                && associated_constant_cycle(nodes, candidate, active) {
+                return true
+            }
+        }
+    }
+    let _ = active.pop();
+    false
+}
+
+fn validate_associated_constant_cycles(ctx: LowerCtx, items: Vec[Item]) -> () {
+    let nodes: Vec[AssociatedConstantNode] = Vec::new();
+    for item in items {
+        match item {
+            ImplBlock(block) => for method in block.methods {
+                if method.name.starts_with("$associated_const:") {
+                    if let Some(value) = method.body.tail {
+                        let owner = constant_owner(block.for_type);
+                        nodes.push(
+                            AssociatedConstantNode {
+                                name: owner + "::"
+                                    + method.name.byte_slice(18, method.name.byte_len()),
+                                owner,
+                                value,
+                                span: method.name_span,
+                            },
+                        )
+                    }
+                }
+            },
+            TraitDef(definition) => for method in definition.method_sigs {
+                if method.name.starts_with("$associated_const:") {
+                    if let Some(body) = method.body {
+                        if let Some(value) = body.tail {
+                            nodes.push(
+                                AssociatedConstantNode {
+                                    name: definition.name + "::"
+                                        + method.name.byte_slice(18, method.name.byte_len()),
+                                    owner: definition.name,
+                                    value,
+                                    span: body.span,
+                                },
+                            )
+                        }
+                    }
+                }
+            },
+            _ => (),
+        }
+    }
+    for index in 0..nodes.len() {
+        if associated_constant_cycle(nodes, index, Vec::new()) {
+            push_error(ctx, nodes[index].span, "cyclic associated constant " + nodes[index].name)
+        }
+    }
+}

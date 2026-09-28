@@ -610,6 +610,9 @@ fn substitutions_for_nominal(params: Vec[string], value: Type) -> Vec[TypeSubst]
 
 fn resolve_field_type(ctx: Checker, receiver: Type, name: string) -> Option[Type] {
     let receiver = normalize_type(ctx, receiver);
+    if let Some(ty) = resolve_external_field_type(ctx, receiver, name) {
+        return Option::Some(ty)
+    }
     match type_constructor_name(ctx.builtin, receiver) {
         Some(owner) => match find_struct_by_name(ctx, owner) {
             Some(info) => {
@@ -688,6 +691,14 @@ fn variable_accepts_type(variable: Ref[TypeVar], value: Type) -> bool {
 }
 
 fn call_types_compatible(left: Type, right: Type) -> bool {
+    if let (Some(parts), Array { len, elem }) = (symbolic_array(left), prune(right)) {
+        return (len < 0 || call_types_compatible(parts.0, const_type(len)))
+            && call_types_compatible(parts.1, elem)
+    }
+    if let (Array { len, elem }, Some(parts)) = (prune(left), symbolic_array(right)) {
+        return (len < 0 || call_types_compatible(parts.0, const_type(len)))
+            && call_types_compatible(elem, parts.1)
+    }
     match (prune(left), prune(right)) {
         (Error, _) | (_, Error) => true,
         (Var(variable), value) => variable_accepts_type(variable, value),
@@ -781,6 +792,7 @@ fn validate_explicit_method_type_arguments(
     params: Vec[string],
     explicit: Vec[Type],
 ) -> () {
+    validate_generic_arguments(ctx, params, explicit);
     if !explicit.is_empty() && explicit.len() != params.len() {
         push_diagnostic(
             ctx,
@@ -1243,6 +1255,9 @@ fn resolve_required_predicates(ctx: Checker) -> bool {
 }
 
 fn structural_trait_satisfied(ctx: Checker, bound_ty: Type, reference: TraitRef, goals: Vec[string]) -> bool {
+    if let Some(parts) = symbolic_array(bound_ty) {
+        return trait_bound_satisfied_at(ctx, parts.1, reference, goals)
+    }
     match bound_ty {
         Tuple { items: values } => {
             for value in values {
@@ -2278,6 +2293,15 @@ fn nominal_application_has_wrong_arity(ctx: Checker, value: Type) -> bool {
 }
 
 fn validate_nominal_application(ctx: Checker, name: string, args: Vec[Type]) -> () {
+    if name == "$array" && args.len() == 2 {
+        validate_const_argument(ctx, args[0]);
+        validate_signature_type(ctx, args[1]);
+        return
+    }
+    if name.starts_with("$const_") {
+        push_diagnostic(ctx, "integer constant cannot be used as a value type");
+        return
+    }
     if derive::is_meta_type(name) {
         match ctx.comptime_capability {
             ComptimeCapability::Derive => (),
@@ -2321,9 +2345,7 @@ fn validate_nominal_application(ctx: Checker, name: string, args: Vec[Type]) -> 
         },
     }
     validate_nominal_map_arguments(ctx, name, args);
-    for arg in args {
-        validate_signature_type(ctx, arg)
-    }
+    validate_generic_arguments(ctx, nominal_parameters(ctx, name), args)
 }
 
 fn validate_trait_reference(ctx: Checker, reference: TraitRef) -> () {
@@ -2336,9 +2358,7 @@ fn validate_trait_reference(ctx: Checker, reference: TraitRef) -> () {
         },
         None => push_diagnostic(ctx, f"Unknown trait {reference.name}"),
     }
-    for arg in reference.args {
-        validate_signature_type(ctx, arg)
-    }
+    validate_generic_arguments(ctx, nominal_parameters(ctx, reference.name), reference.args)
 }
 
 fn type_contains_parameter(value: Type, expected: string) -> bool {
@@ -2524,6 +2544,10 @@ fn validate_dyn_trait(ctx: Checker, info: TraitInfo, associated_types: Vec[(stri
 
 fn validate_signature_type(ctx: Checker, value: Type) -> () {
     match prune(value) {
+        Param { name } if name.starts_with("$const_param:") => push_diagnostic(
+            ctx,
+            "const parameter cannot be used as a value type",
+        ),
         Con { name } => validate_nominal_application(ctx, name, Vec::new()),
         App { ty: base, args } => match prune(base) {
             Con { name } => validate_nominal_application(ctx, name, args),
@@ -2625,6 +2649,32 @@ fn find_type_alias(ctx: Checker, name: string) -> Option[TypeAliasInfo] {
 }
 
 fn expand_type_alias_inner(ctx: Checker, value: Type, stack: Vec[string], report: bool) -> Type {
+    if let Con { name } = value {
+        if !name.starts_with("$const_") {
+            if let Some(constant) = find_constant_by_name(ctx, name) {
+                if let Some(primitive) = constant.value {
+                    if let Some(number) = integer_constant_value(primitive) {
+                        return const_type(number)
+                    }
+                }
+            }
+        }
+        if name.starts_with("$const_name:") {
+            let constant_name = name.byte_slice(12, name.byte_len());
+            if let Some(constant) = find_constant_by_name(ctx, constant_name) {
+                if let Some(primitive) = constant.value {
+                    if let Some(number) = integer_constant_value(primitive) {
+                        return const_type(number)
+                    }
+                }
+            }
+            if report {
+                push_diagnostic(ctx, "unknown integer constant " + constant_name);
+                return Type::Error
+            }
+            return value
+        }
+    }
     match prune(value) {
         Con { name } => match find_type_alias(ctx, name) {
             Some(alias) => if stack.contains(alias.name) {
@@ -2852,7 +2902,7 @@ fn expand_type_alias_predicates(ctx: Checker, values: Vec[TypePredicate], report
 }
 
 fn normalized_type_alias_target(ctx: Checker, value: TypeAliasInfo) -> Type {
-    expand_type_alias_inner(ctx, value.ty, Vec::from_array([value.name]), false)
+    normalize_external_alias_target(ctx, value)
 }
 
 fn resolve_signature_type(ctx: Checker, value: Type, predicates: Vec[TypePredicate], report: bool) -> Type {
@@ -2879,7 +2929,8 @@ fn resolve_trait_reference_method(
         Some(info) => if info.generics.len() == reference.args.len() {
             match find_trait_method(info, name) {
                 Some(method) => {
-                    if self_ty.is_some() && !method.has_receiver {
+                    if self_ty.is_some() && !method.has_receiver
+                        && !name.starts_with("$associated_const:") {
                         return Option::None
                     }
                     validate_explicit_method_type_arguments(
@@ -3053,9 +3104,7 @@ fn resolve_trait_static(
     match find_trait(ctx, owner) {
         Some(info) => {
             let diagnostics_start = ctx.diagnostics.len();
-            for value in explicit {
-                validate_signature_type(ctx, value)
-            }
+            validate_generic_arguments(ctx, info.generics, explicit);
             if explicit.len() != info.generics.len() {
                 push_diagnostic(
                     ctx,
@@ -3134,12 +3183,24 @@ fn resolve_trait_static(
 fn explicit_types(ctx: Checker, values: Vec[hir::TypeExpr]) -> Vec[Type] {
     let result: Vec[Type] = Vec::new();
     for value in values {
-        result.push(type_from_hir(ctx.builtin, value, ctx.type_params, ctx.self_ty))
+        result.push(
+            expand_type_aliases(
+                ctx,
+                type_from_hir(ctx.builtin, value, ctx.type_params, ctx.self_ty),
+                false,
+            ),
+        )
     }
     result
 }
 
 fn static_owner_type(ctx: Checker, owner: string, explicit: Vec[Type]) -> Type {
+    if owner == "Self" {
+        return ctx.self_ty.unwrap_or(Type::Param { name: owner })
+    }
+    if ctx.type_params.contains(owner) {
+        return Type::Param { name: owner }
+    }
     let arity = match nominal_arity(ctx, owner) {
         Some(arity) => arity,
         None => return nominal_type(ctx.builtin, owner, explicit),
@@ -3186,7 +3247,10 @@ fn resolve_static_member(
             Some(value) => Option::Some(value),
             None => {
                 let owner_ty = static_owner_type(ctx, owner, owner_explicit);
-                resolve_user_method(ctx, owner_ty, member, method_explicit, expected)
+                match resolve_predicate_method(ctx, owner_ty, member, method_explicit) {
+                    Some(value) => Option::Some(value),
+                    None => resolve_user_method(ctx, owner_ty, member, method_explicit, expected),
+                }
             },
         },
     }

@@ -288,34 +288,211 @@ pub fn cached_root() -> Result[string, string] {
     Result::Ok(path::join(path::join(home, "cache"), "registry"))
 }
 
+fn override_root(overrides: Vec[manifest::LocalModule], name: string) -> Option[string] {
+    for value in overrides {
+        if value.name == name {
+            return Option::Some(value.root)
+        }
+    }
+    Option::None
+}
+
+fn collect_local_dependencies(
+    owner: string,
+    dependencies: Vec[manifest::Dependency],
+    overrides: Vec[manifest::LocalModule],
+    sources: HashMap[string, string],
+    hints: HashMap[string, string],
+    visited: collections::HashSet[string],
+    registry_root: string,
+) -> () {
+    if !visited.insert(owner) {
+        return
+    }
+    for dependency in dependencies {
+        let replacement = override_root(overrides, dependency.name);
+        let declared = replacement.is_some() || dependency.path.is_some();
+        let local = match replacement {
+            Some(value) => Option::Some(value),
+            None => match dependency.path {
+                Some(value) => Option::Some(manifest::relative_local_path(owner, value)),
+                None => hints.get(dependency.name),
+            },
+        };
+        if let Some(directory) = local {
+            let Ok(directory) = fs::canonicalize(directory) else {
+                continue
+            };
+            let Ok(manifest) = manifest::load(path::join(directory, manifest::FILENAME)) else {
+                continue
+            };
+            if manifest.module_path != dependency.name {
+                continue
+            }
+            if declared && sources.get(dependency.name).is_none() {
+                sources.set(dependency.name, directory);
+            }
+            collect_local_dependencies(
+                directory,
+                manifest.dependencies,
+                overrides,
+                sources,
+                hints,
+                visited,
+                registry_root,
+            );
+        } else if let Ok(version) = select_version(
+            registry_root,
+            dependency.name,
+            dependency.version,
+        ) {
+            let directory = module_directory_unchecked(registry_root, dependency.name, version);
+            if let Ok(manifest) = manifest::load(path::join(directory, manifest::FILENAME)) {
+                if manifest.module_path == dependency.name {
+                    let dependencies: Vec[manifest::Dependency] = Vec::new();
+                    for requirement in manifest.dependencies {
+                        if requirement.path.is_none() {
+                            dependencies.push(requirement)
+                        }
+                    }
+                    collect_local_dependencies(
+                        directory,
+                        dependencies,
+                        overrides,
+                        sources,
+                        hints,
+                        visited,
+                        registry_root,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn discover_local_sources(
+    owner: string,
+    dependencies: Vec[manifest::Dependency],
+    overrides: Vec[manifest::LocalModule],
+    registry_root: string,
+) -> Result[HashMap[string, string], string] {
+    let mut hints: HashMap[string, string] = HashMap::new();
+    for _ in 0..128 {
+        let sources: HashMap[string, string] = HashMap::new();
+        collect_local_dependencies(
+            owner,
+            dependencies,
+            overrides,
+            sources,
+            hints,
+            collections::HashSet::new(),
+            registry_root,
+        );
+        let mut stable = sources.len() == hints.len();
+        for (name, directory) in sources.entries() {
+            if hints.get(name) != Option::Some(directory) {
+                stable = false;
+            }
+        }
+        if stable {
+            return Result::Ok(sources)
+        }
+        hints = sources;
+    }
+    Result::Err("local dependency source selection did not stabilize")
+}
+
+fn verify_module_dependencies(
+    name: string,
+    selected: collections::IndexMap[string, ResolvedModule],
+    visiting: collections::HashSet[string],
+    done: collections::HashSet[string],
+) -> Result[(), string] {
+    if done.contains(name) {
+        return Result::Ok(())
+    }
+    if !visiting.insert(name) {
+        return Result::Err("dependency cycle involving " + name)
+    }
+    if let Some(module) = selected.get(name) {
+        for dependency in module.dependencies {
+            verify_module_dependencies(dependency.name, selected, visiting, done)?;
+        }
+    }
+    let _ = visiting.remove(name);
+    let _ = done.insert(name);
+    Result::Ok(())
+}
+
 pub fn resolve_at(module_root: string, root: string) -> Result[Vec[ResolvedModule], string] {
+    let module_root = fs::canonicalize(module_root).map_err(|error| error.to_string())?;
     let root_manifest = manifest::load(path::join(module_root, manifest::FILENAME))?;
-    let queue: collections::Deque[manifest::Dependency] = collections::Deque::with_capacity(
-        root_manifest.dependencies.len(),
-    );
+    let overrides = manifest::local_overrides(module_root, root_manifest)?;
+    let queue: collections::Deque[(manifest::Dependency, string, bool)] = collections::Deque::new();
     for dependency in root_manifest.dependencies {
-        queue.push_back(dependency)
+        queue.push_back((dependency, module_root, true))
     }
     let selected: collections::IndexMap[string, ResolvedModule] = collections::IndexMap::new();
+    let local_sources = discover_local_sources(
+        module_root,
+        root_manifest.dependencies,
+        overrides,
+        root,
+    )?;
     while !queue.is_empty() {
-        let Some(requirement) = queue.pop_front() else {
+        let Some((requirement, owner, local_owner)) = queue.pop_front() else {
             break;
         };
-        let version = select_version(root, requirement.name, requirement.version)?;
-        let parsed = parse_sem_version(version)?;
+        let _ = parse_sem_version(requirement.version)?;
+        if requirement.name == root_manifest.module_path {
+            return Result::Err("dependency cycle involving " + requirement.name)
+        }
+        if !local_owner && requirement.path.is_some() {
+            return Result::Err(
+                "registry module cannot declare a local path dependency " + requirement.name,
+            )
+        }
+        let replacement = override_root(overrides, requirement.name);
+        let local = match replacement {
+            Some(value) => Option::Some(value),
+            None => match requirement.path {
+                Some(value) => Option::Some(manifest::relative_local_path(owner, value)),
+                None => local_sources.get(requirement.name),
+            },
+        };
+        let (version, directory) = match local {
+            Some(directory) => {
+                let directory = fs::canonicalize(directory).map_err(|error| error.to_string())?;
+                if replacement.is_none() {
+                    if let Some(previous) = local_sources.get(requirement.name) {
+                        if previous != directory {
+                            return Result::Err("conflicting local sources for " + requirement.name)
+                        }
+                    }
+                }
+                local_sources.set(requirement.name, directory);
+                ("local", directory)
+            },
+            None => {
+                let version = select_version(root, requirement.name, requirement.version)?;
+                (version, module_directory_unchecked(root, requirement.name, version))
+            },
+        };
         let update = match selected.get(requirement.name) {
-            Some(current) => {
-                let current = parse_sem_version(current.version)?;
-                version_less(current, parsed)
+            Some(current) => if version == "local" {
+                current.version != "local" || current.root != directory
+            } else if current.version == "local" {
+                false
+            } else {
+                version_less(parse_sem_version(current.version)?, parse_sem_version(version)?)
             },
             None => true,
         };
         if update {
-            let directory = module_directory_unchecked(root, requirement.name, version);
             let module_manifest = manifest::load(path::join(directory, manifest::FILENAME))?;
             if module_manifest.module_path != requirement.name {
                 return Result::Err(
-                    "registry module " + requirement.name + " declares module path "
+                    "dependency " + requirement.name + " declares module path "
                         + module_manifest.module_path,
                 )
             }
@@ -327,19 +504,20 @@ pub fn resolve_at(module_root: string, root: string) -> Result[Vec[ResolvedModul
             };
             let _ = selected.insert(requirement.name, resolved);
             for dependency in module_manifest.dependencies {
-                queue.push_back(dependency)
+                queue.push_back((dependency, directory, version == "local"))
             }
         }
+    }
+    let visiting = collections::HashSet::new();
+    let done = collections::HashSet::new();
+    for (name, _) in selected {
+        verify_module_dependencies(name, selected, visiting, done)?;
     }
     Result::Ok(selected.values())
 }
 
 pub fn resolve(module_root: string) -> Result[Vec[ResolvedModule], string] {
-    let root = cached_root()?;
-    if !fs::is_dir(root) {
-        return Result::Err("registry cache not found at " + root + "; run `goml update` first")
-    }
-    resolve_at(module_root, root)
+    resolve_at(module_root, cached_root()?)
 }
 
 pub fn module_matches_package(module_name: string, package_name: string) -> bool {
@@ -362,9 +540,9 @@ pub fn package_directory(module: ResolvedModule, package_name: string) -> Option
 }
 
 pub fn artifact_prefix(module: ResolvedModule) -> string {
-    let parts = text::split(module.name, "::");
-    path::join(
-        path::join(path::join(path::join("deps", parts[0]), parts[1]), module.version),
-        "pkg",
-    )
+    let mut result = "deps";
+    for part in text::split(module.name, "::") {
+        result = path::join(result, part);
+    }
+    path::join(path::join(result, module.version), "pkg")
 }
