@@ -159,22 +159,22 @@ type Option__isize struct {
     _tag uint8
 }
 
-type dyn__Source_vtable struct {
-    get func(any) int
+type _goml_m_dyn_____d_dyn_k_dynSource_l_Item_x3d_isize_r___vtable struct {
+    _goml_m_Source_i_get func(any) int
 }
 
-type dyn__Source struct {
+type _goml_m_dyn_____d_dyn_k_dynSource_l_Item_x3d_isize_r_ struct {
     data any
-    vtable *dyn__Source_vtable
+    vtable *_goml_m_dyn_____d_dyn_k_dynSource_l_Item_x3d_isize_r___vtable
 }
 
-func dyn__Source__wrap__NumberSource__get(self any) int {
+func _goml_m_dyn_____d_dyn_k_dynSou_hc69dcce890a35dc5ab423c17e048d164____Source_i_get(self any) int {
     return _goml_m_trait__impl_i_Source_i_NumberSource_i_get(self.(NumberSource))
 }
 
-func dyn__Source__vtable__NumberSource() *dyn__Source_vtable {
-    return &dyn__Source_vtable{
-        get: dyn__Source__wrap__NumberSource__get,
+func _goml_m_dyn_____d_dyn_k_dynSource_l_Item_x3d_isize_r_____vtable____NumberSource() *_goml_m_dyn_____d_dyn_k_dynSource_l_Item_x3d_isize_r___vtable {
+    return &_goml_m_dyn_____d_dyn_k_dynSource_l_Item_x3d_isize_r___vtable{
+        _goml_m_Source_i_get: _goml_m_dyn_____d_dyn_k_dynSou_hc69dcce890a35dc5ab423c17e048d164____Source_i_get,
     }
 }
 
@@ -205,12 +205,12 @@ func main0() struct{} {
     var t0 NumberSource = NumberSource{
         value: 11,
     }
-    var t1 dyn__Source = dyn__Source{
+    var t1 _goml_m_dyn_____d_dyn_k_dynSource_l_Item_x3d_isize_r_ = _goml_m_dyn_____d_dyn_k_dynSource_l_Item_x3d_isize_r_{
         data: t0,
-        vtable: dyn__Source__vtable__NumberSource(),
+        vtable: _goml_m_dyn_____d_dyn_k_dynSource_l_Item_x3d_isize_r_____vtable____NumberSource(),
     }
     var t2 int
-    var inline26 int = t1.vtable.get(t1.data)
+    var inline26 int = t1.vtable._goml_m_Source_i_get(t1.data)
     t2 = inline26
     var inline24 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(t2)
     _goml_runtime_core_string_println(inline24)

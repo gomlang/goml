@@ -78,13 +78,23 @@ type dyn__Display struct {
     vtable *dyn__Display_vtable
 }
 
-type dyn__Source_vtable struct {
-    get func(any) int
+type _goml_m_dyn_____d_dyn_k_dynSource_l_Item_x3d_isize_r___vtable struct {
+    _goml_m_Source_i_get func(any) int
 }
 
-type dyn__Source struct {
+type _goml_m_dyn_____d_dyn_k_dynSource_l_Item_x3d_isize_r_ struct {
     data any
-    vtable *dyn__Source_vtable
+    vtable *_goml_m_dyn_____d_dyn_k_dynSource_l_Item_x3d_isize_r___vtable
+}
+
+func _goml_m_dyn_____d_dyn_k_dynSou_h6aa6e687a03d41d06284de45c4274b7f____Source_i_get(self any) int {
+    return _goml_m_trait__impl_i_Source_i_Number_i_get(self.(Number))
+}
+
+func _goml_m_dyn_____d_dyn_k_dynSource_l_Item_x3d_isize_r_____vtable____Number() *_goml_m_dyn_____d_dyn_k_dynSource_l_Item_x3d_isize_r___vtable {
+    return &_goml_m_dyn_____d_dyn_k_dynSource_l_Item_x3d_isize_r___vtable{
+        _goml_m_Source_i_get: _goml_m_dyn_____d_dyn_k_dynSou_h6aa6e687a03d41d06284de45c4274b7f____Source_i_get,
+    }
 }
 
 func dyn__Display__wrap__Number__display(self any) string {
@@ -94,16 +104,6 @@ func dyn__Display__wrap__Number__display(self any) string {
 func dyn__Display__vtable__Number() *dyn__Display_vtable {
     return &dyn__Display_vtable{
         display: dyn__Display__wrap__Number__display,
-    }
-}
-
-func dyn__Source__wrap__Number__get(self any) int {
-    return _goml_m_trait__impl_i_Source_i_Number_i_get(self.(Number))
-}
-
-func dyn__Source__vtable__Number() *dyn__Source_vtable {
-    return &dyn__Source_vtable{
-        get: dyn__Source__wrap__Number__get,
     }
 }
 
@@ -144,11 +144,11 @@ func main0() struct{} {
     var t4 Number = Number{
         value: 11,
     }
-    var source__0 dyn__Source = dyn__Source{
+    var source__0 _goml_m_dyn_____d_dyn_k_dynSource_l_Item_x3d_isize_r_ = _goml_m_dyn_____d_dyn_k_dynSource_l_Item_x3d_isize_r_{
         data: t4,
-        vtable: dyn__Source__vtable__Number(),
+        vtable: _goml_m_dyn_____d_dyn_k_dynSource_l_Item_x3d_isize_r_____vtable____Number(),
     }
-    var t5 int = source__0.vtable.get(source__0.data)
+    var t5 int = source__0.vtable._goml_m_Source_i_get(source__0.data)
     var inline2 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(t5)
     _goml_runtime_core_string_println(inline2)
     var t6 Number = Number{

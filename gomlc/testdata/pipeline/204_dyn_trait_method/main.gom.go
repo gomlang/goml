@@ -69,28 +69,28 @@ type Point struct {
 
 type Ordering uint8
 
-type dyn__Display_vtable struct {
-    show func(any, string) string
-    name func(any) string
+type _goml_m_dyn_____d_dyn_k_dynDisplay_u_Named__vtable struct {
+    _goml_m_Display_i_show func(any, string) string
+    _goml_m_Named_i_name func(any) string
 }
 
-type dyn__Display struct {
+type _goml_m_dyn_____d_dyn_k_dynDisplay_u_Named struct {
     data any
-    vtable *dyn__Display_vtable
+    vtable *_goml_m_dyn_____d_dyn_k_dynDisplay_u_Named__vtable
 }
 
-func dyn__Display__wrap__Point__show(self any, p0 string) string {
+func _goml_m_dyn_____d_dyn_k_dynDisplay_u_Named____wrap____Point____Display_i_show(self any, p0 string) string {
     return _goml_m_trait__impl_i_Display_i_Point_i_show(self.(Point), p0)
 }
 
-func dyn__Display__wrap__Point__name(self any) string {
+func _goml_m_dyn_____d_dyn_k_dynDisplay_u_Named____wrap____Point____Named_i_name(self any) string {
     return _goml_m_trait__impl_i_Named_i_Point_i_name(self.(Point))
 }
 
-func dyn__Display__vtable__Point() *dyn__Display_vtable {
-    return &dyn__Display_vtable{
-        show: dyn__Display__wrap__Point__show,
-        name: dyn__Display__wrap__Point__name,
+func _goml_m_dyn_____d_dyn_k_dynDisplay_u_Named____vtable____Point() *_goml_m_dyn_____d_dyn_k_dynDisplay_u_Named__vtable {
+    return &_goml_m_dyn_____d_dyn_k_dynDisplay_u_Named__vtable{
+        _goml_m_Display_i_show: _goml_m_dyn_____d_dyn_k_dynDisplay_u_Named____wrap____Point____Display_i_show,
+        _goml_m_Named_i_name: _goml_m_dyn_____d_dyn_k_dynDisplay_u_Named____wrap____Point____Named_i_name,
     }
 }
 
@@ -111,15 +111,15 @@ func main0() struct{} {
     var t0 Point = Point{
         value: 7,
     }
-    var value__0 dyn__Display = dyn__Display{
+    var value__0 _goml_m_dyn_____d_dyn_k_dynDisplay_u_Named = _goml_m_dyn_____d_dyn_k_dynDisplay_u_Named{
         data: t0,
-        vtable: dyn__Display__vtable__Point(),
+        vtable: _goml_m_dyn_____d_dyn_k_dynDisplay_u_Named____vtable____Point(),
     }
-    var inline0 string = value__0.vtable.show(value__0.data, "value=")
+    var inline0 string = value__0.vtable._goml_m_Display_i_show(value__0.data, "value=")
     println__T_string(inline0)
-    var inline2 string = value__0.vtable.name(value__0.data)
+    var inline2 string = value__0.vtable._goml_m_Named_i_name(value__0.data)
     println__T_string(inline2)
-    var inline4 string = value__0.vtable.show(value__0.data, "again=")
+    var inline4 string = value__0.vtable._goml_m_Display_i_show(value__0.data, "again=")
     println__T_string(inline4)
     return struct{}{}
 }
