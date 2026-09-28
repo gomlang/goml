@@ -163,6 +163,10 @@ type _goml_vec__goml_m_std_p_serde_p_ValueDeserializeFrame struct {
     items []_goml_m_std_p_serde_p_ValueDeserializeFrame
 }
 
+type _goml_vec__goml_m_Tuple2__6string__17std_p_serde_p_Value struct {
+    items []Tuple2_6string_27_goml_m_std_p_serde_p_Value
+}
+
 type _goml_vec__goml_m_std_p_serde_p_ValueSerializeFrame struct {
     items []_goml_m_std_p_serde_p_ValueSerializeFrame
 }
@@ -201,10 +205,6 @@ type _goml_vec__goml_m_Tuple2__17std_p_serde_p_Value__17std_p_serde_p_Value stru
 
 type _goml_vec__goml_m_std_p_serde_p_Value struct {
     items []_goml_m_std_p_serde_p_Value
-}
-
-type _goml_vec__goml_m_Tuple2__6string__17std_p_serde_p_Value struct {
-    items []Tuple2_6string_27_goml_m_std_p_serde_p_Value
 }
 
 type _goml_vec__goml_m_std_p_serde_p_Schema struct {
@@ -308,6 +308,11 @@ type Tuple2_6string_28_goml_m_std_p_serde_p_Schema struct {
     _1 _goml_m_std_p_serde_p_Schema
 }
 
+type Tuple2_6string_27_goml_m_std_p_serde_p_Value struct {
+    _0 string
+    _1 _goml_m_std_p_serde_p_Value
+}
+
 type Tuple2_6string_6string struct {
     _0 string
     _1 string
@@ -315,11 +320,6 @@ type Tuple2_6string_6string struct {
 
 type Tuple2_27_goml_m_std_p_serde_p_Value_27_goml_m_std_p_serde_p_Value struct {
     _0 _goml_m_std_p_serde_p_Value
-    _1 _goml_m_std_p_serde_p_Value
-}
-
-type Tuple2_6string_27_goml_m_std_p_serde_p_Value struct {
-    _0 string
     _1 _goml_m_std_p_serde_p_Value
 }
 
@@ -507,6 +507,8 @@ type _goml_m_std_p_serde_p_VariantSchema struct {
 type _goml_m_std_p_serde_p_ValueDeserializer struct {
     current *ref__goml_m_Option____std_p_serde_p_Value_x
     frames *_goml_vec__goml_m_std_p_serde_p_ValueDeserializeFrame
+    track_unused bool
+    unused_fields *_goml_vec__goml_m_Tuple2__6string__17std_p_serde_p_Value
 }
 
 type _goml_m_std_p_serde_p_ValueSerializer struct {
