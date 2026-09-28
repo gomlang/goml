@@ -66,6 +66,8 @@ enum Pair[T] {
 - Prefix operators have no space before their operand.
 - Parentheses and brackets have no inner edge padding.
 
+Array repetition keeps the semicolon between its initializer and length, as in `[value; N]`. Let-chain separators and trait-bound separators receive normal operator spacing: `if let Some(x) = value && x > 0`, `impl Source[Item = T] + Label`, and `dyn Consumer[string] + Close`.
+
 The formatter preserves the CST's parentheses and associativity. It does not insert or remove grouping parentheses.
 
 ## Lists and expressions

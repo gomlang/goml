@@ -334,6 +334,37 @@ fn resolve_constructor(ctx: Checker, value: hir::ConstructorRef) -> Option[Resol
     }
 }
 
+fn resolve_expression_constructor(ctx: Checker, value: hir::ConstructorRef, expected: Option[Type]) -> Option[
+    ResolvedConstructor,
+] {
+    if let Some(info) = resolve_constructor(ctx, value) {
+        return Option::Some(info)
+    }
+    if let (hir::ConstructorRef::Unresolved(name), Some(expected_ty)) = (value, expected) {
+        if !name.contains("::") && resolve_struct(ctx, name).is_none() {
+            let target = match normalized_pattern_expected(ctx, expected_ty) {
+                Func { ret_ty, .. } => ret_ty,
+                other => other,
+            };
+            return resolve_contextual_constructor(ctx, name, target)
+        }
+    }
+    Option::None
+}
+
+fn resolve_expression_named_constructor(ctx: Checker, name: string, expected: Option[Type]) -> NamedFieldConstructorResolution {
+    if !name.contains("::") && resolve_struct(ctx, name).is_none() {
+        if let Some(expected_ty) = expected {
+            if let Some(owner) = pattern_expected_owner(ctx, expected_ty) {
+                if let Some(info) = find_expected_enum(ctx, owner) {
+                    return resolve_named_variant_in(ctx, info, name)
+                }
+            }
+        }
+    }
+    resolve_named_field_constructor(ctx, name)
+}
+
 fn pattern_head_span(value: hir::PatternHead) -> ast::Span {
     match value {
         Resolved { enum_def: _, variant_index: _, span } | Qualified { name: _, span } | Contextual {
@@ -1399,6 +1430,11 @@ fn impl_traits_match(ctx: Checker, left: ImplInfo, right: ImplInfo) -> bool {
 }
 
 fn trait_bound_satisfied_at(ctx: Checker, bound_ty: Type, reference: TraitRef, goals: Vec[string]) -> bool {
+    for application in dyn_applications(ctx, opaque_bounds(bound_ty)) {
+        if trait_ref_equal(application, reference) {
+            return true
+        }
+    }
     let bound_ty = normalize_type(ctx, bound_ty);
     let reference = normalize_trait_ref(ctx, reference);
     if types_equal(bound_ty, Type::Error) {
@@ -1793,56 +1829,40 @@ fn resolve_dyn_method(
     name: string,
     method_explicit: Vec[Type],
 ) -> Option[ResolvedCallable] {
-    let applications = trait_ref_closure(ctx, TraitRef { name: owner, args: Vec::new() });
-    if applications.is_empty() {
-        Option::None
+    let applications = dyn_applications(ctx, receiver);
+    let resolved: Vec[ResolvedCallable] = Vec::new();
+    let candidates: Vec[string] = Vec::new();
+    for application in applications {
+        if !dyn_method_shadowed(ctx, application, applications, name) {
+            if let Some(value) = resolve_trait_reference_method(
+                ctx,
+                application,
+                name,
+                Option::Some(receiver),
+                method_explicit,
+            ) {
+                candidates.push(short_name(application.name));
+                resolved.push(dyn_method_callable(owner, name, value))
+            }
+        }
+    }
+    if resolved.len() == 1 {
+        Option::Some(resolved[0])
     } else {
-        match resolve_trait_reference_method(
-            ctx,
-            applications[0],
-            name,
-            Option::Some(receiver),
-            method_explicit,
-        ) {
-            Some(value) => Option::Some(dyn_method_callable(owner, name, value)),
-            None => {
-                let resolved: Vec[ResolvedCallable] = Vec::new();
-                let candidates: Vec[string] = Vec::new();
-                for index in 1..applications.len() {
-                    if let Some(value) = resolve_trait_reference_method(
-                        ctx,
-                        applications[index],
-                        name,
-                        Option::Some(receiver),
-                        method_explicit,
-                    ) {
-                        candidates.push(short_name(applications[index].name));
-                        resolved.push(dyn_method_callable(owner, name, value))
-                    }
-                }
-                if resolved.len() == 1 {
-                    Option::Some(resolved[0])
-                } else {
-                    if resolved.len() > 1 {
-                        push_diagnostic(
-                            ctx,
-                            f"Ambiguous method {name} for type {type_text(receiver)} (candidates: {text::join(candidates, ", ")}). Use UFCS like Trait::{name}(...) to disambiguate",
-                        );
-                        Option::Some(
-                            ResolvedCallable {
-                                callable: Callable::Function("<error>"),
-                                ty: Type::Func {
-                                    params: Vec::from_array([receiver]),
-                                    ret_ty: Type::Error,
-                                },
-                                predicates: Vec::new(),
-                            },
-                        )
-                    } else {
-                        Option::None
-                    }
-                }
-            },
+        if resolved.len() > 1 {
+            push_diagnostic(
+                ctx,
+                f"Ambiguous method {name} for type {type_text(receiver)} (candidates: {text::join(candidates, ", ")}). Use UFCS like Trait::{name}(...) to disambiguate",
+            );
+            Option::Some(
+                ResolvedCallable {
+                    callable: Callable::Function("<error>"),
+                    ty: Type::Func { params: Vec::from_array([receiver]), ret_ty: Type::Error },
+                    predicates: Vec::new(),
+                },
+            )
+        } else {
+            Option::None
         }
     }
 }
@@ -1855,6 +1875,9 @@ fn resolve_method(
     expected: Option[Type],
     method_explicit: Vec[Type],
 ) -> Option[ResolvedCallable] {
+    if opaque_parts(receiver).is_some() {
+        return resolve_opaque_method(ctx, receiver, name, method_explicit)
+    }
     let receiver = normalize_type(ctx, receiver);
     match receiver {
         Dyn { trait_name: owner, .. } => {
@@ -2098,6 +2121,12 @@ fn resolve_projection_type(
     candidates: Vec[ProjectionCandidate],
     report: bool,
 ) -> Type {
+    if opaque_parts(value).is_some() {
+        return map_child_types(
+            value,
+            |child| resolve_projection_type(ctx, child, candidates, report),
+        )
+    }
     match resolve_type(value) {
         Projection { for_ty, name, trait_ref } => {
             let for_ty = resolve_projection_type(ctx, for_ty, candidates, report);
@@ -2140,6 +2169,10 @@ fn resolve_projection_type(
             };
             Type::Projection { for_ty, name, trait_ref }
         },
+        Dyn { .. } => normalize_type(
+            ctx,
+            map_child_types(value, |child| resolve_projection_type(ctx, child, candidates, report)),
+        ),
         External { import_path, name, args: values } => Type::External {
             import_path,
             name,
@@ -2543,6 +2576,16 @@ fn validate_dyn_trait(ctx: Checker, info: TraitInfo, associated_types: Vec[(stri
 }
 
 fn validate_signature_type(ctx: Checker, value: Type) -> () {
+    if let App { ty: Type::Con { name }, .. } = value {
+        if name == "$impl_trait" {
+            push_diagnostic(ctx, "impl Trait is only supported as a complete function return type");
+            return
+        }
+    }
+    if opaque_parts(value).is_some() {
+        validate_opaque_type(ctx, value);
+        return
+    }
     match prune(value) {
         Param { name } if name.starts_with("$const_param:") => push_diagnostic(
             ctx,
@@ -2559,28 +2602,7 @@ fn validate_signature_type(ctx: Checker, value: Type) -> () {
                 }
             },
         },
-        Dyn { trait_name: name, args, associated_types, additional_bounds } => {
-            if !additional_bounds.is_empty() {
-                push_diagnostic_at(ctx, "Multiple dyn bounds are not supported", Option::None)
-            }
-            match find_trait(ctx, name) {
-                Some(info) => if !info.generics.is_empty() || !args.is_empty() {
-                    push_diagnostic_at(
-                        ctx,
-                        f"Generic trait {short_name(name)} cannot be used as dyn",
-                        Option::None,
-                    )
-                } else {
-                    validate_dyn_trait(ctx, info, associated_types)
-                },
-                None => push_diagnostic(ctx, f"Unknown trait {name}"),
-            }
-            for bound in additional_bounds {
-                if let None = find_trait(ctx, bound.trait_name) {
-                    push_diagnostic(ctx, f"Unknown trait {bound.trait_name}")
-                }
-            }
-        },
+        Dyn { .. } => validate_dyn_bounds(ctx, value),
         Projection { for_ty: base, name: _, trait_ref: qualifier } => {
             validate_signature_type(ctx, base);
             if let Some(reference) = qualifier {
@@ -2674,6 +2696,9 @@ fn expand_type_alias_inner(ctx: Checker, value: Type, stack: Vec[string], report
             }
             return value
         }
+    }
+    if opaque_parts(value).is_some() {
+        return map_child_types(value, |child| expand_type_alias_inner(ctx, child, stack, report))
     }
     match prune(value) {
         Con { name } => match find_type_alias(ctx, name) {

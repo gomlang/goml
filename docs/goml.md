@@ -24,7 +24,7 @@ Build and installation instructions are in the [repository README](../README.md)
 6. `if`, `match`, and `select` are expressions. `if` without `else` must return `()`; `match` must be exhaustive.
 7. The last semicolon-free expression of a block is the block value; adding a semicolon discards the value.
 8. `let` and assignment statements must end with a semicolon. Mutable bindings may be introduced with `let mut pattern` or precisely inside a pattern with `mut name`; the semicolon can be omitted for `if`, `match`, `select`, and unlabeled `while`, `loop` and `for` statements. Labeled loop statements require a semicolon before a following statement.
-9. Enumeration construction uses full names such as `Option::Some(value)`. In patterns, the enum qualifier may be omitted when the matched type determines it, such as `Some(value)` and `None`.
+9. Enumeration construction uses full names such as `Option::Some(value)`, or contextual names such as `Some(value)` and `None` when the expected type determines the enum. Patterns also permit contextual variant names.
 10. For cross-package calls, write `alias::item`. Top-level items, struct fields, and inherent methods must all be marked with `pub` as required.
 11. Before using trait method syntax across packages, import the package and trait with `use alias::Trait;` or a braced import; when in doubt, use UFCS: `Trait::method(value)`.
 12. Use `module::path` for a package below the current module root. Do not generate `mod`, `crate::`, `self::`, `super::`, root paths `::x`, Rust references, or Go `var` / `:=`. A user `extern fn` is valid only with the typed Go FFI attribute described below.
@@ -91,7 +91,7 @@ The single `_` is a wildcard character, not an ordinary variable name. The curre
 - The fixed-width vector and mask type spellings listed under [Portable SIMD](#portable-simd), including `u8x16`, `i32x8`, `f32x4`, `f64x4`, and `mask32x4`, are also accepted as structure and type-alias names and in type positions. They are ordinary scoped names, supplied by `std::simd`, rather than globally reserved keywords;
 - Paths retain the appropriate case for the referenced name.
 
-Enumeration construction should use `Enum::Variant`. Patterns may omit `Enum::` because their expected type determines the variant owner.
+Enumeration construction and patterns may omit `Enum::` when their expected type determines the variant owner. Use `Enum::Variant` when there is insufficient type context.
 
 Common keywords include:
 
@@ -456,7 +456,8 @@ All files in the same package can use private top-level items. The trait impl me
 | function | `(i32, string) -> bool` | parameter type list to return type |
 | Generic application | `Option[i32]`, `pkg::Box[string]` | Use square brackets |
 | channel | `Channel[isize]`, `Sender[isize]`, `Receiver[isize]` | Bidirectional and directional Go channel backends |
-| trait object | `dyn Render`, `dyn Iterator[Item = isize]` | A single, non-generic dyn-safe trait; associated types must be bound |
+| trait object | `dyn Render`, `dyn Consumer[string] + Close` | One or more dyn-safe trait bounds; associated types must be bound |
+| opaque return | `impl Iterator[Item = isize]` | A function's single hidden concrete return type, exposed through its trait bounds |
 | Associated type projection | `I::Item`, `Self::Output`, `I::IntoIter::Item` | There must be corresponding trait constraints; projections may be chained |
 
 Example of function type:
@@ -485,6 +486,19 @@ let bytes: [byte; WIDTH * 2] = [1, 2, 3, 4];
 ```
 
 The number of array literal elements must match the array type. Empty arrays and empty generic containers usually require type annotations.
+
+`[value; N]` constructs a fixed array by evaluating `value` once and copying that result into every element. Its length follows the same integer constant-expression rules as array types and can be a const generic parameter:
+
+```goml
+let zeros: [byte; 16] = [0; 16];
+let labels = ["ready"; WIDTH * 2];
+
+fn filled[T, const N: usize](value: T) -> [T; N] {
+    [value; N]
+}
+```
+
+The value is evaluated even when `N` is zero. Repetition uses ordinary value copying, so repeating a `Ref`, `Vec`, or another shared handle preserves shared storage; it does not clone that storage or call the initializer once per element. Array repetition is also available in `comptime` and constant initializers when its value is supported there.
 
 ### Type aliases
 
@@ -516,7 +530,7 @@ GoML has no Rust reference or lifetime syntax, pointer arithmetic, slice literal
 
 On Linux amd64, `std::os::linux::syscall` accepts numeric machine words, scoped byte-buffer arguments, and explicit pointer fields between byte buffers for low-level kernel calls. It does not add pointer casts, pointer arithmetic, or native struct layout to the language.
 
-`A + B` is only usable as a trait bound or supertrait list. The parser reserves `dyn A + B`, but the type checker deliberately rejects multiple dyn bounds in the current object model.
+`A + B` combines trait bounds in generic constraints, supertrait lists, `dyn A + B` objects, and `impl A + B` returns. It is not a general intersection type for concrete values.
 
 `Self` is only used in the trait signature and the type position of impl; ordinary top-level functions cannot use `Self` as an implicit type parameter.
 
@@ -720,6 +734,21 @@ Tuple variant constructors are also available as first-class function values:
 let some: (i32) -> Option[i32] = Option::Some;
 ```
 
+An expected enum type also permits an unqualified constructor in an expression:
+
+```goml
+let none: Option[i32] = None;
+let nested: Option[Result[i32, string]] = Some(Ok(42));
+let message: Message[string] = Named { value: "ready" };
+let some: (i32) -> Option[i32] = Some;
+
+fn success(value: i32) -> Result[i32, string] {
+    Ok(value)
+}
+```
+
+Annotations, function parameters, return types, and enclosing constructor payloads can provide this context. It works for unit, tuple-like, and struct-like variants, including public variants from imported enums and enums reached through a type alias. An expected constructor function type uses its return type to select the enum. Ordinary name resolution takes precedence; an existing local value or struct is not replaced with an enum constructor. A unique variant declared in the current package remains usable without expected type information. When neither ordinary name resolution nor the expected type selects a variant, qualify it with `Enum::Variant`.
+
 Structural variants use field constructs and field patterns:
 
 ```goml
@@ -746,6 +775,42 @@ fn log(message: string) {
 ```
 
 The parameter type cannot be omitted. Omitting `-> ...` is equivalent to `-> ()`. The top-level function name must be unique in the same package, and overloading by parameter type is not supported.
+
+### Opaque return types
+
+A function can expose trait bounds while hiding the concrete return type with `-> impl Trait`. Bounds may contain generic arguments, associated type bindings, and `+`:
+
+```goml
+trait Source {
+    type Item;
+    fn get(self) -> Self::Item;
+}
+
+struct Stored[T] {
+    value: T,
+}
+
+impl[T] Source for Stored[T] {
+    type Item = T;
+
+    fn get(self) -> T {
+        self.value
+    }
+}
+
+fn source[T](value: T) -> impl Source[Item = T] {
+    Stored { value }
+}
+
+let number = source(42);
+let value: isize = number.get();
+```
+
+Every return path of one function must produce the same concrete type for a given generic instantiation, and that type must satisfy all declared bounds. Different generic instantiations may use different concrete types. A public function may hide a private type, including across package boundaries. Callers can use the declared trait bounds and associated type bindings, but cannot access the hidden type's fields or additional inherent methods. Each function defines its own opaque type even if two functions return the same concrete type.
+
+Dispatch remains static and participates in monomorphization; `impl Trait` does not create a trait object or require dyn-safe bounds. Use an explicit `as dyn Trait` conversion when a trait object is needed. `impl Trait` is supported only as the complete return type of a top-level function or inherent method. It cannot appear in parameters, type aliases, local type annotations, nested return types such as `Option[impl Trait]`, or trait method declarations.
+
+Opaque bounds currently accept positional type arguments and associated type bindings, but not integer const arguments such as `impl Fixed[4]`.
 
 ### Generic functions
 
@@ -831,7 +896,7 @@ fn use_buffers() -> () {
 }
 ```
 
-A direct length parameter can be inferred from an array argument or expected type. For a length expression such as `N + 1`, provide `N` explicitly; inference does not solve arithmetic equations. Generic arguments use literals or names, and compound integer arguments use braces, such as `Buffer[i32, {2 + 1}]`. Const parameters currently have type `usize`, have no defaults, and use values in `0..=9223372036854775807`. Array repetition syntax and type-dependent associated constants in array lengths are not supported.
+A direct length parameter can be inferred from an array argument or expected type. For a length expression such as `N + 1`, provide `N` explicitly; inference does not solve arithmetic equations. Generic arguments use literals or names, and compound integer arguments use braces, such as `Buffer[i32, {2 + 1}]`. Const parameters currently have type `usize`, have no defaults, and use values in `0..=9223372036854775807`. Array repetition accepts these parameters, for example `[value; N]`. Type-dependent associated constants in array lengths are not supported.
 
 ### Block values and semicolons
 
@@ -1129,6 +1194,20 @@ if let Option::Some(value) = candidate {
 
 When you need to get values from two branches, you must write `else` explicitly.
 
+Conditions can chain boolean expressions and `let` matches with `&&`:
+
+```goml
+fn combine(left: Option[isize], right: Option[isize]) -> Option[isize] {
+    if let Some(a) = left && a > 0 && let Some(b) = right && b > a {
+        Some(a + b)
+    } else {
+        None
+    }
+}
+```
+
+Terms run from left to right and stop at the first false condition or failed pattern. Every reached initializer is evaluated once. A `let` binding is visible to later terms and the successful branch, but not to earlier terms, the `else` branch, or code after the `if`. A binding may shadow an outer name; `else` still resolves that name in the outer scope. Non-pattern terms must have type `bool`. A let chain cannot contain top-level `||`; parenthesize a boolean disjunction within one term, for example `if let Some(x) = value && (x == 1 || x == 2) { ... }`.
+
 ### `match`
 
 ```goml
@@ -1236,7 +1315,18 @@ while let Option::Some(value) = iterator.next() {
 }
 ```
 
-The loop body must return `()`. Pattern binding is only visible within the loop body.
+The loop body must return `()`. A single `while let` binding is only visible within the loop body. `while` also supports the same short-circuit let chains as `if`:
+
+```goml
+while remaining > 0 && let Some(value) = iterator.next() && value > 0 {
+    println(value);
+    remaining -= 1;
+}
+```
+
+Each iteration evaluates the chain again from its first term. A false boolean or failed pattern exits the loop. Pattern bindings are visible to later terms and the body of that iteration, and are recreated for the next iteration.
+
+`break` and `continue` cannot directly exit a `while` condition, including a `while let` initializer or a term in a let chain. A loop nested inside the condition may use its own `break` and `continue` normally.
 
 ### `loop`
 
@@ -1417,7 +1507,7 @@ match value {
 }
 ```
 
-Pattern binding is only visible in the corresponding `let` subsequent scope, `for` / `while let` loop body, `if let` then branch, or `match` branch guard and branch body.
+Pattern binding is only visible in the corresponding `let` subsequent scope, `for` / `while let` loop body, `if let` then branch, or `match` branch guard and branch body. In an `if` or `while` let chain, it is also visible to subsequent terms in that chain.
 
 ### Groups, tuples, structures and enumerations
 
@@ -1870,19 +1960,54 @@ fn read(source: dyn Source[Item = isize]) -> isize {
 
 Type inference rejects recursive types, including cycles through a trait object’s associated type bindings. A rejected cycle produces a type diagnostic instead of creating a self-referential inference variable. Generic substitution and inference resolution traverse nested type constructors, including trait-object arguments, associated type bindings, and additional bounds.
 
-Every associated type declared by the trait must be bound exactly once. The bracket grammar reserves positional trait arguments followed by associated bindings, such as `dyn Consumer[string, Error = IoError]`; positional arguments after the first `Name = Type` binding are rejected. Generic trait objects are still rejected, so the positional form is reserved for forward compatibility rather than enabled today.
+Generic traits accept positional type arguments before associated type bindings, such as `dyn Consumer[string, Error = IoError]`. Every required generic argument must be supplied, and every associated type must be bound exactly once. Positional arguments after the first `Name = Type` binding are rejected:
+
+```goml
+trait Consumer[T] {
+    fn consume(self, value: T) -> string;
+}
+
+fn send(value: dyn Consumer[string]) -> string {
+    value.consume("hello")
+}
+```
+
+Combine dyn-safe traits with `+` to expose their methods through one object. The concrete value must implement every bound with the specified arguments and associated types:
+
+```goml
+trait Close {
+    fn close(self) -> ();
+}
+
+fn erase[T: Consumer[string] + Close](value: T) -> dyn Consumer[string] + Close {
+    value as dyn Consumer[string] + Close
+}
+
+fn finish(value: dyn Consumer[string] + Close) -> string {
+    let result = value.consume("done");
+    value.close();
+    result
+}
+```
+
+Supertrait methods remain available. If different component traits provide the same method name, use UFCS to choose the trait, for example `A::render(value)` or `B::render(value)`. For a generic trait, use `Consumer::[string]::consume(value, "hello")`.
+
+The order of bounds does not change the object type: `dyn A + B` and `dyn B + A` are compatible. Repeating a trait name is rejected, even with different generic arguments. Supertrait paths must agree on a trait's generic arguments. A child trait's method takes precedence over a method inherited from its parent; unrelated methods with the same name require UFCS.
+
+An inherited associated type with a unique name may be bound on the child, for example `dyn Child[Item = isize]`, or on its declaring trait with `dyn Child + Parent[Item = isize]`. When different parent traits declare the same associated type name, bind each on its declaring trait, such as `dyn Child + A[Item = isize] + B[Item = string]`.
 
 Current dyn-safe conditions:
 
-- Traits cannot have type parameters;
 - Each method must have a first receiver parameter of exactly type `Self`;
 - Direct `Self` cannot appear in other parameters or return types, while a bound projection such as `Self::Item` is allowed;
-- Methods cannot declare type parameters.
+- Methods cannot declare type parameters;
+- Traits cannot declare associated constants;
+- Every component trait and supertrait must satisfy these rules.
 
 Current limitations:
 
-- Generic trait object is not supported;
-- Multiple bounds such as `dyn Read + Close` are parsed for forward compatibility but rejected by the type checker;
+- Integer const arguments such as `dyn Fixed[4]` are not supported in dyn argument lists;
+- Conversion from one dyn object type to another, including dropping a bound, is not supported;
 - Pattern matching on `dyn Trait` is not supported.
 
 ## Attributes and derive
@@ -6675,11 +6800,17 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | A loop with a condition | `while condition { ... }` |
 | `for i := 0; ...` | `while`, or `for i in start..end` |
 | `switch` | `match` |
-| `null`, `nil` | `Option::None` for optional values; `ffi::null()` for raw Go pointers; `ffi::nil_error()` for Go errors |
+| `null`, `nil` | `None` with an expected `Option` type, or `Option::None`; `ffi::null()` for raw Go pointers; `ffi::nil_error()` for Go errors |
 | `throw`, exception | `Result` and `?` for expected errors; `std::panic::catch` for an explicit runtime-panic boundary |
 | `float_value.to_i32()` | Import `std::num::TryToInt` and use `float_value.try_to_i32()`; handle nonfinite and range errors |
-| `dyn A + B` | Use one dyn-safe trait; multiple bounds are reserved syntax but not yet supported |
+| Implicit conversion to `dyn A + B` | Write `value as dyn A + B`; the value must implement every bound |
+| `dyn Consumer` for `trait Consumer[T]` | Supply trait arguments, for example `dyn Consumer[string]` |
 | `dyn TraitWithAssociatedType` | Bind every associated type, for example `dyn Iterator[Item = isize]` |
+| Different concrete return types under `-> impl Trait` | Return one concrete type from every branch, or explicitly return `dyn Trait` |
+| `fn consume(value: impl Trait)` | Use a named generic parameter, for example `fn consume[T: Trait](value: T)` |
+| `[initializer(); count]` for a runtime `count` | Repeat lengths are compile-time integers; use a `Vec` and a loop for runtime lengths |
+| Expect `[initializer(); N]` to call once per element | The initializer runs once, including for zero length; use a loop for per-element work |
+| `if let Some(x) = value || ready` | Use nested control flow, or `&& (first || second)` for a boolean term within a let chain |
 | Use `type UserId = u64;` when `UserId` must be distinct | Use `struct UserId(u64);` and construct it explicitly |
 | `use pkg::*` | List the required public items explicitly with `use pkg::{A, B};` |
 | `mod`, `crate::`, `super::` | Directory packages, `module::path` for the current module, and canonical paths for dependencies |
@@ -6833,7 +6964,7 @@ generic_params = "[" generic_param ("," generic_param)* "]"
 generic_param = upper_ident (":" trait_set)? | "const" upper_ident ":" "usize"
 param_list    = "(" (parameter ("," parameter)*)? ")"
 parameter     = lower_ident ":" type | "self"
-return_type   = "->" type
+return_type   = "->" (type | opaque_return)
 
 struct_def    = "struct" type_ident type_names?
                 ("{" struct_fields? "}" | "(" newtype_field ","? ")" ";")
@@ -6890,6 +7021,7 @@ dyn_args      = "[" (type ",")* dyn_assoc ("," dyn_assoc)* ","? "]"
               | "[" type_list "]"
 dyn_assoc     = upper_ident "=" type
 dyn_type      = "dyn" dyn_bound ("+" dyn_bound)*
+opaque_return = "impl" dyn_bound ("+" dyn_bound)*
 
 block         = "{" statement* expression? "}"
 statement     = "let" "mut"? pattern (":" type)? "=" expression ("else" block)? ";"
@@ -6918,16 +7050,19 @@ interpolated_string = "f\"" (string_text | "{{" | "}}" | "{" expression "}")* "\
 byte_string   = "b\"" byte_string_content* "\""
 raw_byte_string = "br\"...\"" | "br#\"...\"#" | "br##\"...\"##" | ...
 raw_string    = "r" raw_hashes? "\"" raw_text "\"" raw_hashes?
+array         = "[" (expression ("," expression)* ","?)? "]"
+              | "[" expression ";" integer_constant_expression "]"
 struct_literal = path "{" (struct_literal_field ("," struct_literal_field)*
                  ("," ".." expression)? ","? | ".." expression ","?)? "}"
 struct_literal_field = ident (":" expression)?
 
 unlabeled_control_expression = if_expression | match_expression | select_expression
-                   | "while" expression block | "while" "let" pattern "=" expression block
+                   | "while" condition block
                    | "loop" block | "for" pattern "in" expression block
-if_expression = "if" expression block ("else" (block | if_expression))?
-              | "if" "let" pattern "=" expression block
-                ("else" (block | if_expression))?
+if_expression = "if" condition block ("else" (block | if_expression))?
+condition     = expression | "let" pattern "=" expression
+              | condition_term ("&&" condition_term)+
+condition_term = boolean_term | "let" pattern "=" initializer_term
 match_expression = "match" expression
                    "{" (match_arm ",")* match_arm? "}"
 match_arm     = pattern ("if" expression)? "=>" (expression | block)
@@ -6939,8 +7074,7 @@ select_arm    = "recv" "(" expression ")" select_guard? receive_continuation
 select_guard  = "when" expression
 receive_continuation = "as" (lower_ident | "_") "=>" (expression | block)
               | "match" "{" (match_arm ",")* match_arm? "}"
-while_expression = loop_label_decl? "while" expression block
-              | loop_label_decl? "while" "let" pattern "=" expression block
+while_expression = loop_label_decl? "while" condition block
 loop_expression = loop_label_decl? "loop" block
 for_expression = loop_label_decl? "for" pattern "in" expression block
 loop_label_decl = loop_label ":"
@@ -6975,6 +7109,8 @@ array_pattern_item = pattern | ".." | ident "@" ".."
 ```
 
 The parser will do some error recovery for commas and semicolons, but the code agent should always generate the above canonical form: list items separated by commas, `let`, assignments and ordinary non-tail expressions with semicolons, unlabeled control-flow statements without unnecessary semicolons, labeled loop statements with semicolons before following statements, and trait method signatures with semicolons. The sequence pattern contains at most one rest; the `..` in the structure pattern appears at most once and must be at the end.
+
+In a condition chain containing `let`, `boolean_term` and `initializer_term` are expressions without top-level `&&` or `||`; grouping parentheses permit a boolean disjunction inside one term. `opaque_return` is restricted to complete top-level function and inherent method returns, even though trait signatures share the abbreviated `return_type` rule above. An unqualified enum variant uses the ordinary `path`, call, or struct-literal grammar and is resolved using its expected type.
 
 ## Verify generated code
 

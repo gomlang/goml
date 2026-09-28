@@ -1,0 +1,286 @@
+package tast;
+
+fn dyn_bounds(value: Type) -> Vec[DynTraitBound] {
+    let result: Vec[DynTraitBound] = Vec::new();
+    if let Dyn { trait_name, args, associated_types, additional_bounds } = prune(value) {
+        result.push(DynTraitBound { trait_name, args, associated_types });
+        for bound in additional_bounds {
+            result.push(bound)
+        }
+    }
+    result
+}
+
+fn dyn_applications(ctx: Checker, value: Type) -> Vec[TraitRef] {
+    let result: Vec[TraitRef] = Vec::new();
+    for bound in dyn_bounds(value) {
+        for reference in trait_ref_closure(
+            ctx,
+            TraitRef { name: bound.trait_name, args: bound.args },
+        ) {
+            let mut found = false;
+            for existing in result {
+                if trait_ref_equal(existing, reference) {
+                    found = true;
+                }
+            }
+            if !found {
+                result.push(reference)
+            }
+        }
+    }
+    result
+}
+
+fn dyn_trait_declares_associated(info: TraitInfo, name: string) -> bool {
+    for associated in info.associated_types {
+        if associated.name == name {
+            return true
+        }
+    }
+    false
+}
+
+fn dyn_associated_bindings(ctx: Checker, value: Type, reference: TraitRef) -> Vec[(string, Type)] {
+    let result: Vec[(string, Type)] = Vec::new();
+    let Some(info) = find_trait(ctx, reference.name) else {
+        return result
+    };
+    for bound in dyn_bounds(value) {
+        if contains_trait_ref(
+            trait_ref_closure(ctx, TraitRef { name: bound.trait_name, args: bound.args }),
+            reference,
+        ) {
+            for binding in bound.associated_types {
+                if dyn_trait_declares_associated(info, binding.0) {
+                    let mut found = false;
+                    for existing in result {
+                        if existing.0 == binding.0 && types_equal(existing.1, binding.1) {
+                            found = true;
+                        }
+                    }
+                    if !found {
+                        let mut index = 0;
+                        while index < result.len() && result[index].0 < binding.0 {
+                            index += 1;
+                        }
+                        result.insert(index, binding)
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+fn dyn_expanded_bounds(ctx: Checker, value: Type) -> Vec[DynTraitBound] {
+    let result: Vec[DynTraitBound] = Vec::new();
+    for reference in dyn_applications(ctx, value) {
+        let mut index = 0;
+        while index < result.len() && result[index].trait_name < reference.name {
+            index += 1;
+        }
+        result.insert(
+            index,
+            DynTraitBound {
+                trait_name: reference.name,
+                args: reference.args,
+                associated_types: dyn_associated_bindings(ctx, value, reference),
+            },
+        )
+    }
+    result
+}
+
+fn canonical_dyn_type(ctx: Checker, value: Type) -> Type {
+    let bounds = dyn_expanded_bounds(ctx, value);
+    if bounds.is_empty() {
+        return value
+    }
+    let additional_bounds: Vec[DynTraitBound] = Vec::new();
+    for index in 1..bounds.len() {
+        additional_bounds.push(bounds[index])
+    }
+    let primary = bounds[0];
+    Type::Dyn {
+        trait_name: primary.trait_name,
+        args: primary.args,
+        associated_types: primary.associated_types,
+        additional_bounds,
+    }
+}
+
+fn validate_dyn_bounds(ctx: Checker, value: Type) -> () {
+    let names: Vec[string] = Vec::new();
+    for bound in dyn_bounds(value) {
+        if names.contains(bound.trait_name) {
+            push_diagnostic(ctx, "Duplicate dyn trait bound " + bound.trait_name)
+        }
+        names.push(bound.trait_name);
+        let reference = TraitRef { name: bound.trait_name, args: bound.args };
+        validate_trait_reference(ctx, reference);
+        let binding_names: Vec[string] = Vec::new();
+        for binding in bound.associated_types {
+            if binding_names.contains(binding.0) {
+                push_diagnostic(ctx, "Duplicate dyn associated type binding " + binding.0)
+            }
+            binding_names.push(binding.0);
+            let mut declarations = 0;
+            for application in trait_ref_closure(ctx, reference) {
+                if let Some(info) = find_trait(ctx, application.name) {
+                    if dyn_trait_declares_associated(info, binding.0) {
+                        declarations += 1;
+                    }
+                }
+            }
+            if declarations == 0 {
+                push_diagnostic(
+                    ctx,
+                    "Trait " + short_name(reference.name) + " has no associated type " + binding.0,
+                )
+            } else if declarations > 1 {
+                push_diagnostic(
+                    ctx,
+                    "Ambiguous dyn associated type binding " + binding.0
+                        + "; bind it on the declaring trait",
+                )
+            }
+        }
+    }
+    let applications = dyn_expanded_bounds(ctx, value);
+    let inherited_names: Vec[string] = Vec::new();
+    for bound in applications {
+        if inherited_names.contains(bound.trait_name) {
+            push_diagnostic(ctx, "Conflicting dyn trait arguments for " + bound.trait_name)
+        }
+        inherited_names.push(bound.trait_name);
+        if let Some(info) = find_trait(ctx, bound.trait_name) {
+            validate_dyn_trait(ctx, info, bound.associated_types);
+            if info.generics.len() == bound.args.len() {
+                let substitutions = trait_substitutions(
+                    ctx,
+                    info,
+                    TraitRef { name: bound.trait_name, args: bound.args },
+                    Option::Some(value),
+                );
+                for predicate in substitute_predicates(info.predicates, substitutions) {
+                    require_predicate(
+                        ctx,
+                        predicate,
+                        "dyn trait argument does not satisfy its bounds",
+                    )
+                }
+                for associated in info.associated_types {
+                    for binding in bound.associated_types {
+                        if binding.0 == associated.name {
+                            for reference in associated.bounds {
+                                require_predicate(
+                                    ctx,
+                                    TypePredicate::Trait {
+                                        for_ty: binding.1,
+                                        trait_ref: substitute_trait_ref(reference, substitutions),
+                                    },
+                                    "dyn associated type does not satisfy its bounds",
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn dyn_method_shadowed(
+    ctx: Checker,
+    application: TraitRef,
+    applications: Vec[TraitRef],
+    name: string,
+) -> bool {
+    for candidate in applications {
+        if !trait_ref_equal(candidate, application)
+            && contains_trait_ref(trait_ref_closure(ctx, candidate), application) {
+            if let Some(info) = find_trait(ctx, candidate.name) {
+                if find_trait_method(info, name).is_some() {
+                    return true
+                }
+            }
+        }
+    }
+    false
+}
+
+fn dyn_numeric_candidate_satisfies(ctx: Checker, candidate: Type, target: Type) -> bool {
+    for bound in dyn_bounds(target) {
+        let trait_ref = TraitRef { name: bound.trait_name, args: bound.args };
+        if !trait_bound_satisfied_at(ctx, candidate, trait_ref, Vec::new()) {
+            return false
+        }
+        for binding in bound.associated_types {
+            let associated = normalize_type(
+                ctx,
+                Type::Projection {
+                    for_ty: candidate,
+                    name: binding.0,
+                    trait_ref: Option::Some(trait_ref),
+                },
+            );
+            if !call_types_compatible(associated, binding.1) {
+                return false
+            }
+        }
+    }
+    true
+}
+
+fn infer_dyn_numeric_type(ctx: Checker, actual: Type, target: Type) -> () {
+    let preferred = match prune(actual) {
+        Var(variable) => match variable.get() {
+            Unbound { kind: Integer, .. } => Type::Int,
+            Unbound { kind: Float, .. } => Type::Float64,
+            _ => return,
+        },
+        _ => return,
+    };
+    if dyn_numeric_candidate_satisfies(ctx, preferred, target) {
+        let _ = unify(actual, preferred);
+        return
+    }
+    for impl_info in ctx.impls {
+        if ctx.invalid_impl_origins.contains(impl_info.origin) {
+            continue
+        }
+        let candidate = prune(impl_info.for_type);
+        if is_numeric_type(candidate) && !contains_unbound_type_variable(candidate)
+            && call_types_compatible(actual, candidate)
+            && dyn_numeric_candidate_satisfies(ctx, candidate, target) {
+            let _ = unify(actual, candidate);
+            return
+        }
+    }
+}
+
+fn require_dyn_bounds(ctx: Checker, actual: Type, target: Type) -> () {
+    for bound in dyn_bounds(target) {
+        let trait_ref = TraitRef { name: bound.trait_name, args: bound.args };
+        require_predicate(
+            ctx,
+            TypePredicate::Trait { for_ty: actual, trait_ref },
+            "Type " + type_text(actual) + " does not implement trait " + bound.trait_name,
+        );
+        for binding in bound.associated_types {
+            require_predicate(
+                ctx,
+                TypePredicate::Equality {
+                    lhs: Type::Projection {
+                        for_ty: actual,
+                        name: binding.0,
+                        trait_ref: Option::Some(trait_ref),
+                    },
+                    rhs: binding.1,
+                },
+                "Associated type " + binding.0 + " does not match dyn binding",
+            )
+        }
+    }
+}

@@ -557,38 +557,8 @@ fn coerce_to_dyn(ctx: Checker, value: Expr, expected_ty: Type) -> Expr {
             value
         },
         actual => {
-            match find_trait(ctx, trait_name) {
-                Some(_) => if trait_bound_satisfied_at(
-                    ctx,
-                    actual,
-                    TraitRef { name: trait_name, args: Vec::new() },
-                    Vec::new(),
-                ) {} else {
-                    require_predicate(
-                        ctx,
-                        TypePredicate::Trait {
-                            for_ty: actual,
-                            trait_ref: TraitRef { name: trait_name, args: Vec::new() },
-                        },
-                        "Type " + type_text(actual) + " does not implement trait " + trait_name,
-                    )
-                },
-                None => expect_type(ctx, actual, expected_ty),
-            }
-            for binding in associated_types {
-                require_predicate(
-                    ctx,
-                    TypePredicate::Equality {
-                        lhs: Type::Projection {
-                            for_ty: actual,
-                            name: binding.0,
-                            trait_ref: Option::Some(TraitRef { name: trait_name, args: Vec::new() }),
-                        },
-                        rhs: binding.1,
-                    },
-                    "Associated type " + binding.0 + " does not match dyn binding",
-                )
-            }
+            infer_dyn_numeric_type(ctx, actual, expected_ty);
+            require_dyn_bounds(ctx, actual, expected_ty);
             Expr::ToDyn { trait_name, for_ty: actual, expr: value, ty: expected_ty }
         },
     }
@@ -906,7 +876,7 @@ fn check_constructor_value_expr(
     };
     match constant {
         Some(value) => Expr::Var { name: value.name, ty: value.ty },
-        None => match resolve_constructor(ctx, constructor) {
+        None => match resolve_expression_constructor(ctx, constructor, expected) {
             Some(info) => resolved_constructor_value_expr(ctx, info),
             None => missing_constructor_expr(
                 ctx,
@@ -930,6 +900,26 @@ fn check_static_member(
     member_type_args: Vec[hir::TypeExpr],
     report_inference: bool,
 ) -> Expr {
+    if owner == "$array" && member == "repeat" && owner_type_args.len() == 1 {
+        let length = normalize_type(
+            ctx,
+            expand_type_aliases(
+                ctx,
+                type_from_hir(ctx.builtin, owner_type_args[0], ctx.type_params, ctx.self_ty),
+                true,
+            ),
+        );
+        validate_const_argument(ctx, length);
+        let elem = fresh_type(ctx.counter, VarKind::Any);
+        let ret_ty = const_application(
+            Type::Con { name: "$array" },
+            Vec::from_array([length, elem]),
+        );
+        return Expr::Callable {
+            callable: Callable::Intrinsic("array.repeat"),
+            ty: Type::Func { params: Vec::from_array([elem]), ret_ty },
+        }
+    }
     if let Some(value) = associated_constant_value(ctx, owner, member, owner_type_args) {
         if !member_type_args.is_empty() {
             push_diagnostic(ctx, "associated constants do not accept member type arguments")
@@ -1093,7 +1083,7 @@ fn check_constructor_expr(
     args: Vec[hir::Expr],
     expected: Option[Type],
 ) -> Expr {
-    match resolve_constructor(ctx, constructor) {
+    match resolve_expression_constructor(ctx, constructor, expected) {
         Some(info) => check_resolved_constructor_expr(ctx, info, args, expected),
         None => match constructor {
             Unresolved(name) => match resolve_struct(ctx, name) {
@@ -1260,7 +1250,7 @@ fn check_struct_expr(
     if let Some(value) = check_external_struct_expr(ctx, name, fields, expected) {
         return value
     }
-    match resolve_named_field_constructor(ctx, name) {
+    match resolve_expression_named_constructor(ctx, name, expected) {
         Found(info) => {
             if info.has_hidden_fields {
                 for field in fields {
@@ -1957,39 +1947,23 @@ fn apply_typed_call(
                 },
                 ty,
             } => {
-                if reference.args.is_empty() {
-                    match prune(expr_type(values[0])) {
-                        Dyn { trait_name: owner, .. } => if trait_bound_satisfied_at(
-                            ctx,
-                            Type::Dyn {
+                match prune(expr_type(values[0])) {
+                    Dyn { trait_name: owner, .. } => if trait_bound_satisfied_at(
+                        ctx,
+                        expr_type(values[0]),
+                        reference,
+                        Vec::new(),
+                    ) {
+                        Expr::Callable {
+                            callable: Callable::DynTraitMethod {
                                 trait_name: owner,
-                                args: Vec::new(),
-                                associated_types: Vec::new(),
-                                additional_bounds: Vec::new(),
+                                dispatch_name: reference.name,
+                                method_name: name,
                             },
-                            reference,
-                            Vec::new(),
-                        ) {
-                            Expr::Callable {
-                                callable: Callable::DynTraitMethod {
-                                    trait_name: owner,
-                                    dispatch_name: reference.name,
-                                    method_name: name,
-                                },
-                                ty,
-                            }
-                        } else {
-                            Expr::Callable {
-                                callable: Callable::TraitMethod {
-                                    trait_ref: reference,
-                                    method_name: name,
-                                    for_ty,
-                                    has_receiver,
-                                },
-                                ty,
-                            }
-                        },
-                        _ => Expr::Callable {
+                            ty,
+                        }
+                    } else {
+                        Expr::Callable {
                             callable: Callable::TraitMethod {
                                 trait_ref: reference,
                                 method_name: name,
@@ -1997,10 +1971,9 @@ fn apply_typed_call(
                                 has_receiver,
                             },
                             ty,
-                        },
-                    }
-                } else {
-                    Expr::Callable {
+                        }
+                    },
+                    _ => Expr::Callable {
                         callable: Callable::TraitMethod {
                             trait_ref: reference,
                             method_name: name,
@@ -2008,7 +1981,7 @@ fn apply_typed_call(
                             has_receiver,
                         },
                         ty,
-                    }
+                    },
                 }
             },
             other => other,
@@ -2279,6 +2252,17 @@ fn call_comptime_capability(ctx: Checker, result: Expr) -> ComptimeCapability {
     }
 }
 
+fn check_while_condition_term(ctx: Checker, source: hir::Expr, expected: Option[Type]) -> Expr {
+    let previous_condition_depth = ctx.condition_depth.get();
+    let previous_condition_loop_depth = ctx.condition_loop_depth.get();
+    ctx.condition_depth.set(previous_condition_depth + 1);
+    ctx.condition_loop_depth.set(ctx.loop_depth.get());
+    let result = check_expr(ctx, source, expected);
+    ctx.condition_depth.set(previous_condition_depth);
+    ctx.condition_loop_depth.set(previous_condition_loop_depth);
+    result
+}
+
 fn check_call_expr(
     ctx: Checker,
     call_span: ast::Span,
@@ -2286,6 +2270,13 @@ fn check_call_expr(
     args: Vec[hir::Expr],
     expected: Option[Type],
 ) -> Expr {
+    if args.len() == 1 {
+        if let NameRef { name_ref: hir::NameRef::Other(name) } = function.kind {
+            if name == "$while_condition" {
+                return check_while_condition_term(ctx, args[0], expected)
+            }
+        }
+    }
     let function_span = function.span;
     let function_source = function;
     let argument_spans: Vec[ast::Span] = Vec::new();
@@ -4747,10 +4738,37 @@ fn check_expr_inner(ctx: Checker, value: hir::Expr, expected: Option[Type]) -> E
     }
 }
 
+fn contextual_expression_reference(ctx: Checker, source: hir::Expr, result: Expr) -> () {
+    let name = match source.kind {
+        ConstructorValue { constructor: hir::ConstructorRef::Unresolved(name) } | Constr {
+            constructor: hir::ConstructorRef::Unresolved(name),
+            ..,
+        } | StructLiteral { name, .. } => name,
+        _ => return,
+    };
+    if name.contains("::") {
+        return
+    }
+    let constructor = match result {
+        Constr { constructor, .. } => constructor,
+        Closure { body: Expr::Constr { constructor, .. }, .. } => constructor,
+        _ => return,
+    };
+    ctx.typeck_results.references.push(
+        ReferenceFact {
+            source_path: ctx.source_path,
+            span: ast::span(source.span.start, source.span.start + name.byte_len()),
+            target: ReferenceTarget::Constructor(constructor),
+            ty: expr_type(result),
+        },
+    )
+}
+
 fn check_expr(ctx: Checker, value: hir::Expr, expected: Option[Type]) -> Expr {
     let previous = ctx.current_span.get();
     ctx.current_span.set(Option::Some(value.span));
     let result = check_expr_inner(ctx, value, expected);
+    contextual_expression_reference(ctx, value, result);
     let ty = expr_type(result);
     ctx.typeck_results.exprs.push(ExprFact { source_path: ctx.source_path, span: value.span, ty });
     if let NameRef { name_ref: reference } = value.kind {

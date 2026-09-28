@@ -1,0 +1,167 @@
+package tast;
+
+use module::hir;
+
+pub fn opaque_parts(value: Type) -> Option[(string, Vec[Type])] {
+    match prune(value) {
+        App { ty: Type::Con { name }, args } if name.starts_with("$opaque:") && args.len() >= 2 => Option::Some(
+            (name, args),
+        ),
+        _ => Option::None,
+    }
+}
+
+fn opaque_return_type(name: string, generics: Vec[string], raw: Type, definition: hir::DefId) -> Type {
+    if let App { ty: Type::Con { name: marker }, args } = raw {
+        if marker == "$impl_trait" && args.len() == 1 {
+            let parameters: Vec[Type] = Vec::new();
+            for generic in generics {
+                parameters.push(Type::Param { name: generic })
+            }
+            let values = Vec::from_array(
+                [
+                    Type::Func {
+                        params: parameters,
+                        ret_ty: Type::Var(
+                            Ref::new(
+                                TypeVar::Unbound { id: -definition.index - 1, kind: VarKind::Any },
+                            ),
+                        ),
+                    },
+                    args[0],
+                ],
+            );
+            for parameter in parameters {
+                values.push(parameter)
+            }
+            return Type::App {
+                ty: Type::Con {
+                    name: "$opaque:" + name + "#" + definition.pkg.to_string() + "#"
+                        + definition.index.to_string(),
+                },
+                args: values,
+            }
+        }
+    }
+    raw
+}
+
+pub fn opaque_hidden(value: Type) -> Option[Type] {
+    let (_, args) = opaque_parts(value)?;
+    let Func { params, ret_ty } = args[0] else {
+        return Option::None
+    };
+    let substitutions: Vec[TypeSubst] = Vec::new();
+    for index in 0..params.len() {
+        if index + 2 < args.len() {
+            if let Param { name } = params[index] {
+                substitutions.push(TypeSubst { name, ty: args[index + 2] })
+            }
+        }
+    }
+    Option::Some(substitute_type(ret_ty, substitutions))
+}
+
+fn opaque_bounds(value: Type) -> Type {
+    match opaque_parts(value) {
+        Some((_, args)) => args[1],
+        None => value,
+    }
+}
+
+fn opaque_definition_matches(value: Option[hir::DefId], definition: hir::DefId) -> bool {
+    match value {
+        Some(value) => same_def(value, definition),
+        None => false,
+    }
+}
+
+fn opaque_function_return(ctx: Checker, definition: hir::DefId) -> Option[Type] {
+    for function in ctx.functions {
+        if opaque_definition_matches(function.def_id, definition)
+            && opaque_parts(function.ret_ty).is_some() {
+            return Option::Some(function.ret_ty)
+        }
+    }
+    for method in ctx.methods {
+        if opaque_definition_matches(method.function.def_id, definition)
+            && opaque_parts(method.function.ret_ty).is_some() {
+            return Option::Some(method.function.ret_ty)
+        }
+    }
+    Option::None
+}
+
+fn share_opaque_type(value: Type, templates: HashMap[string, Type]) -> Type {
+    let Some((name, args)) = opaque_parts(value) else {
+        return value
+    };
+    let shared = match templates.get(name) {
+        Some(template) => template,
+        None => {
+            templates.set(name, args[0]);
+            args[0]
+        },
+    };
+    let values: Vec[Type] = Vec::new();
+    values.push(shared);
+    for index in 1..args.len() {
+        values.push(args[index])
+    }
+    Type::App { ty: Type::Con { name }, args: values }
+}
+
+fn share_opaque_signatures(ctx: Checker, templates: HashMap[string, Type]) -> () {
+    for index in 0..ctx.functions.len() {
+        let function = ctx.functions[index];
+        ctx.functions[index] = FunctionScheme {
+            ret_ty: share_opaque_type(function.ret_ty, templates),
+            ..function,
+        };
+    }
+    for index in 0..ctx.methods.len() {
+        let method = ctx.methods[index];
+        let function = method.function;
+        ctx.methods[index] = MethodInfo {
+            function: FunctionScheme {
+                ret_ty: share_opaque_type(function.ret_ty, templates),
+                ..function,
+            },
+            ..method,
+        };
+    }
+}
+
+fn validate_opaque_type(ctx: Checker, value: Type) -> () {
+    for bound in dyn_bounds(opaque_bounds(value)) {
+        validate_trait_reference(ctx, TraitRef { name: bound.trait_name, args: bound.args });
+        for associated in bound.associated_types {
+            validate_signature_type(ctx, associated.1)
+        }
+    }
+}
+
+fn resolve_opaque_method(ctx: Checker, receiver: Type, name: string, explicit: Vec[Type]) -> Option[
+    ResolvedCallable,
+] {
+    let results: Vec[ResolvedCallable] = Vec::new();
+    for reference in dyn_applications(ctx, opaque_bounds(receiver)) {
+        if let Some(result) = resolve_trait_reference_method(
+            ctx,
+            reference,
+            name,
+            Option::Some(receiver),
+            explicit,
+        ) {
+            results.push(result)
+        }
+    }
+    if results.len() == 1 {
+        Option::Some(results[0])
+    } else {
+        if results.len() > 1 {
+            push_diagnostic(ctx, "Ambiguous method " + name + " on opaque return type; use UFCS")
+        }
+        Option::None
+    }
+}

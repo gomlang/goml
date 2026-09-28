@@ -1043,6 +1043,93 @@ fn current_lexical_scope(ctx: LowerCtx) -> Option[LexicalScope] {
     ctx.lexical_scopes.peek()
 }
 
+fn while_condition_term(value: Expr) -> Expr {
+    synthetic_expr(
+        ExprKind::Call {
+            func: synthetic_expr(
+                ExprKind::NameRef { name_ref: NameRef::Other("$while_condition") },
+                value.span,
+            ),
+            args: Vec::from_array([value]),
+        },
+        value.span,
+    )
+}
+
+fn lower_condition_chain(
+    ctx: LowerCtx,
+    conditions: Vec[(Option[ast::Pat], ast::Expr)],
+    index: isize,
+    then_branch: ast::Expr,
+    else_branch: Expr,
+    env: Vec[(string, LocalId)],
+    type_params: Vec[string],
+    span: ast::Span,
+    is_while: bool,
+) -> Expr {
+    if index == conditions.len() {
+        return lower_expr(ctx, then_branch, env, type_params)
+    }
+    let term = conditions[index];
+    let lowered_condition = lower_expr(ctx, term.1, env, type_params);
+    let condition = if is_while {
+        while_condition_term(lowered_condition)
+    } else {
+        lowered_condition
+    };
+    let next_env = copy_bindings(env);
+    let kind = match term.0 {
+        Some(pattern) => {
+            let pat = lower_pattern(ctx, pattern, next_env, true);
+            let body = lower_condition_chain(
+                ctx,
+                conditions,
+                index + 1,
+                then_branch,
+                else_branch,
+                next_env,
+                type_params,
+                span,
+                is_while,
+            );
+            ExprKind::Match {
+                expr: condition,
+                arms: Vec::from_array(
+                    [
+                        Arm { pat, guard: Option::None, body },
+                        Arm {
+                            pat: lower_pattern(
+                                ctx,
+                                ast::Pat::Wild { span },
+                                copy_bindings(env),
+                                true,
+                            ),
+                            guard: Option::None,
+                            body: else_branch,
+                        },
+                    ],
+                ),
+            }
+        },
+        None => ExprKind::If {
+            cond: condition,
+            then_branch: lower_condition_chain(
+                ctx,
+                conditions,
+                index + 1,
+                then_branch,
+                else_branch,
+                next_env,
+                type_params,
+                span,
+                is_while,
+            ),
+            else_branch,
+        },
+    };
+    synthetic_expr(kind, span)
+}
+
 fn lower_expr_value(
     ctx: LowerCtx,
     value: ast::Expr,
@@ -1174,6 +1261,23 @@ fn lower_expr_value(
             }
             ExprKind::Tuple { items: result }
         },
+        ArrayRepeat { value, len, span } => {
+            let length = lower_const_source(ctx, len, type_params, Vec::new());
+            ExprKind::Call {
+                func: synthetic_expr(
+                    ExprKind::StaticMember {
+                        owner: "$array",
+                        member: "repeat",
+                        owner_type_args: Vec::from_array([length]),
+                        owner_type_arg_spans: Vec::from_array([Option::Some(span)]),
+                        member_type_args: Vec::new(),
+                        member_type_arg_spans: Vec::new(),
+                    },
+                    span,
+                ),
+                args: Vec::from_array([lower_expr(ctx, value, env, type_params)]),
+            }
+        },
         Array { items: values, span: _ } => {
             let result: Vec[Expr] = Vec::new();
             for item in values {
@@ -1258,15 +1362,55 @@ fn lower_expr_value(
             }
             ExprKind::Select { mode, arms: lowered_arms }
         },
+        IfChain { conditions, then_branch, else_branch, span } => {
+            let otherwise = lower_expr(ctx, else_branch, copy_bindings(env), type_params);
+            lower_condition_chain(
+                ctx,
+                conditions,
+                0,
+                then_branch,
+                otherwise,
+                copy_bindings(env),
+                type_params,
+                span,
+                false,
+            ).kind
+        },
         If { cond, then_branch, else_branch, span: _ } => ExprKind::If {
             cond: lower_expr(ctx, cond, env, type_params),
             then_branch: lower_expr(ctx, then_branch, copy_bindings(env), type_params),
             else_branch: lower_expr(ctx, else_branch, copy_bindings(env), type_params),
         },
-        While { label, cond, body, span: _ } => ExprKind::While {
-            label,
-            cond: lower_expr(ctx, cond, env, type_params),
-            body: lower_expr(ctx, body, copy_bindings(env), type_params),
+        While { label, cond, body, span: _ } => {
+            let lowered_cond = lower_expr(ctx, cond, env, type_params);
+            let lowered_body = match body {
+                IfChain { conditions, then_branch, else_branch, span } => {
+                    let otherwise = lower_expr(ctx, else_branch, copy_bindings(env), type_params);
+                    lower_condition_chain(
+                        ctx,
+                        conditions,
+                        0,
+                        then_branch,
+                        otherwise,
+                        copy_bindings(env),
+                        type_params,
+                        span,
+                        true,
+                    )
+                },
+                Match { .. } => {
+                    let lowered = lower_expr(ctx, body, copy_bindings(env), type_params);
+                    match lowered.kind {
+                        Match { expr, arms } => synthetic_expr(
+                            ExprKind::Match { expr: while_condition_term(expr), arms },
+                            lowered.span,
+                        ),
+                        _ => lowered,
+                    }
+                },
+                _ => lower_expr(ctx, body, copy_bindings(env), type_params),
+            };
+            ExprKind::While { label, cond: lowered_cond, body: lowered_body }
         },
         Loop { label, body, span: _ } => ExprKind::Loop {
             label,
