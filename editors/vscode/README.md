@@ -2,6 +2,8 @@
 
 The extension provides syntax highlighting, diagnostics, hover, completion, go-to-definition, signature help, inlay hints, formatting, test code lenses, and quick fixes.
 
+Unused `Result` and invalid `?` diagnostics expose stable codes and handling suggestions. Propagation errors link to the enclosing return type. The unused-Result quick fix makes ignoring the error explicit with `let _ = ...`; review that choice before applying it. Fixes from an older document version are discarded.
+
 The status bar shows whether the language server is starting, ready, stopped, or busy. While it is busy, it shows the current server operation and elapsed time. Hover over the status item to see queued client requests, or click it to open the language server output. Operations taking at least two seconds are recorded there as warnings.
 
 Diagnostics run after editing pauses, while completion reuses the latest checked types immediately. Saving requests diagnostics without waiting for the edit delay. Package checks reuse unchanged dependencies across edits. External Go types and concrete generic instances use the bundled `goml-go-meta` helper; Go 1.26 or newer must be installed for these checks. Changes to Go sources and module files invalidate analysis alongside GoML changes.

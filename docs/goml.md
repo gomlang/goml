@@ -22,7 +22,7 @@ Build and installation instructions are in the [repository README](../README.md)
 4. Generics use square brackets: `Vec[i32]`, `fn id[T](x: T) -> T`, not `<...>`.
 5. Generic calls usually rely on type inference; when explicit type arguments are required, write `id::[i32](1)`, not `id[i32](1)` or Rust's `id::<i32>(1)`.
 6. `if`, `match`, and `select` are expressions. `if` without `else` must return `()`; `match` must be exhaustive.
-7. The last semicolon-free expression of a block is the block value; adding a semicolon discards the value.
+7. The last semicolon-free expression of a block is the block value; adding a semicolon discards the value. Directly discarding a built-in `Result` warns; use `let _ = ...` to explicitly ignore it.
 8. `let` and assignment statements must end with a semicolon. Mutable bindings may be introduced with `let mut pattern` or precisely inside a pattern with `mut name`; the semicolon can be omitted for `if`, `match`, `select`, and unlabeled `while`, `loop` and `for` statements. Labeled loop statements require a semicolon before a following statement.
 9. Enumeration construction uses full names such as `Option::Some(value)`, or contextual names such as `Some(value)` and `None` when the expected type determines the enum. Patterns also permit contextual variant names.
 10. For cross-package calls, write `alias::item`. Top-level items, struct fields, and inherent methods must all be marked with `pub` as required.
@@ -1426,6 +1426,25 @@ fn platform_exit() -> () {
 
 The `unused_function` lint warns about private top-level functions that are not reachable from a public function, `main`, a test, a language item, a top-level initializer, or any method body. The analysis follows calls transitively, so a recursive function or a group of private functions that only call each other is still unused. Public functions are treated as externally reachable API. Use `#[allow(unused_function)]` on an intentionally unused private function to suppress the warning.
 
+The `unused_result` lint warns when an expression statement directly discards a built-in `Result[T, E]`. The check uses the resolved type, including aliases, generic call results, and cross-package return types. It also checks statements in nested blocks and closures. Warnings do not fail the build.
+
+```goml
+fn save() -> Result[(), string] {
+    Result::Err("save failed")
+}
+
+fn main() -> () {
+    save();
+    let _ = save();
+}
+```
+
+The first call warns; the second explicitly ignores the result. Prefer handling the error or propagating it with `?` when the enclosing return type permits it. A free function or an `impl` block can suppress the lint with `#[allow(unused_result)]`; methods within that impl and nested closures inherit the setting. To explicitly ignore a particular result inside a method, use `let _ = ...`.
+
+This warning has diagnostic code `unused_result`. Its quick fix inserts `let _ = ` and, when needed, a terminating semicolon. The fix requires review because ignoring an error is a deliberate choice; it is not a preferred automatic fix. The compiler does not suggest inserting `?` automatically.
+
+This lint only checks values whose outer type is the built-in `Result`. It does not warn for `Option`, other ordinary return values, user-defined types named `Result`, or a `Result` nested in a tuple or container. It does not track unused bindings or specialize an unconstrained generic parameter to inspect its callers. Returned values and values consumed by another expression are not directly discarded. There is no general `#[must_use]` attribute.
+
 ### `?`
 
 The suffix `?` only supports the built-in semantics `Option[T]` and `Result[T, E]`:
@@ -1442,6 +1461,8 @@ fn read_number(flag: bool) -> Result[i32, string] {
 ```
 
 When using `?` with `Option[T]`, the nearest function or closure must return `Option[_]`. Use of `Result[T, E]` must return `Result[_, E]` with the same error type; there is currently no Rust `From`-style error conversion. `?` will evaluate the operand once.
+
+Diagnostics distinguish an unsupported operand (`try_invalid_operand`), an incompatible enclosing return type (`try_invalid_return`), and different `Result` error types (`try_error_mismatch`). They highlight `?`; propagation failures also identify the enclosing return annotation, or the function name or closure expression when no annotation is available. Error-type mismatches show both types and suggest `map_err` before `?` or changing the enclosing error type. These suggestions do not add implicit conversions.
 
 ### `go`
 
@@ -3006,6 +3027,8 @@ The custom `goml/expandedDerive` request returns the formatted AST after built-i
 
 `gomllsp` supports full-document formatting through `textDocument/formatting`. Formatting uses the latest unsaved document text and the fixed rules described in [formatting.md](formatting.md). Invalid documents are left unchanged.
 
+CLI and LSP diagnostics share a model with optional stable codes, notes, help, and suggested edits. The CLI displays codes as `error[typer/try_error_mismatch]` or `warning[typer/unused_result]`; the LSP exposes the same identifier in `Diagnostic.code` and secondary locations in `relatedInformation`. Notes and help appear in the displayed message and separately in diagnostic `data`, alongside fixes and the document version. Fixes carry a title, one or more ranged edits, and `machine-applicable` or `requires-review` applicability. Code actions reject fixes from an older document version. Codes are currently assigned to the unused-Result warning and the three `?` diagnostics above; other diagnostics may omit them. This changes diagnostic output, not language syntax or propagation rules.
+
 ## Built-in prelude
 
 The toolchain library has three separate layers. `builtin` is the hidden compiler and runtime contract: it owns primitive and built-in type identities, runtime hooks, language items, built-in implementations, and derive handlers. `prelude` is an independently compiled package that depends on `builtin` and defines the public names automatically placed in ordinary source scope. `std` contains normal standard-library packages and is available only through explicit imports.
@@ -3383,7 +3406,7 @@ Public APIs include:
 - `encoding::hex` lowercase and uppercase hexadecimal encoding plus checked decoding
 - `encoding::base32` RFC 4648 standard and extended-hex encoding with padded and unpadded variants and checked canonical decoding
 - `encoding::base64` RFC 4648 standard and URL-safe encoding with padded and unpadded variants
-- `error::Error`, `ErrorKind`, `Details`, and stable error-kind code conversion
+- `error::Error`, `ErrorKind`, `Details`, typed `Report[E]`, `ResultExt`, `ReportContext`, and stable error-kind code conversion
 - `env::args`, current-directory and executable queries, and environment-variable reads
 - `ffi::String`, `Rune`, `Ptr`, `Error`, `Func`, `RawSlice`, `RawMap`, and explicit Go boundary adapters
 - `fs::read_file_structured`, `write_file_structured`, structured byte I/O, directory operations, path inspection, and `sha256_file`
@@ -3432,13 +3455,25 @@ Public APIs include:
 
 Reports compose with `Result::map_err` and `?` without losing domain variants or standard I/O error fields. A domain enum can hold `io::Error` alongside application validation failures; `find_map` can project the I/O variant back to its original typed error, including its kind and OS code. Reusing one subtree in multiple aggregate positions visits it once per occurrence, in order; there is no identity-based deduplication. Callback work and output size are not budgeted by Report, and callbacks may observe mutable leaf handles, so callers must bound externally controlled error trees and avoid concurrent payload mutation.
 
-Report implements ToString and Debug when E implements ToString, and therefore participates in the Error protocol. Display uses `message + ": " + cause` for context and newline-separated children for aggregation, including empty messages and duplicate causes. Display is not a serialization format. Search and display use iterative stacks, not recursive calls; work is proportional to visited nodes plus rendered bytes, with allocations for traversal and output. No arbitrary depth limit is imposed. This adds no syntax or runtime error interface.
+`.map(convert)` transforms `Report[E]` into `Report[F]` without requiring either leaf type to implement Error or ToString. It calls `convert` once per leaf occurrence, depth-first and left-to-right, retaining every context message, group boundary, singleton group, duplicate and child order. The source tree is unchanged; returned leaf values follow their usual copy/shared-handle semantics. Mapping uses an iterative stack, including for deeply nested contexts; time and temporary storage are proportional to the visited tree. Shared subtrees are mapped separately at each occurrence.
+
+Import `error::ResultExt` to call `.into_report()` on `Result[T, E]`. It leaves Ok unchanged and turns Err into a report leaf. Import `error::ReportContext` to call `.context(message)` or `.with_context(make_message)` on `Result[T, Report[E]]`. The latter evaluates its zero-argument closure exactly once on Err and never on Ok. Both methods add a context parent to the existing report, so repeated context calls keep the same `Report[E]` error type and preserve aggregates. The eager `.context` argument follows ordinary argument evaluation, including on Ok.
+
+Conversion is explicit: use `result.into_report().with_context(...)` for ordinary errors and `result.with_context(...)` when errors are already reports. `into_report` always wraps its error as a leaf; calling it again would deliberately create `Report[Report[E]]`. There is no automatic flattening or overlapping blanket specialization. These helpers do not convert leaf types for `?`; use `map_err(|report| report.map(convert))` to adapt a report to a domain error.
+
+Report implements ToString and Debug when E implements ToString, and therefore participates in the Error protocol. Display uses `message + ": " + cause` for context and newline-separated children for aggregation, including empty messages and duplicate causes. Display is not a serialization format. Search and display use iterative stacks, not recursive calls; work is proportional to visited nodes plus rendered bytes, with allocations for traversal and output. No arbitrary depth limit is imposed. Mapping and context helpers use ordinary generic methods and extension traits; they add no syntax, grammar production, or runtime error interface.
 
 ```goml
 use std::error;
+use error::ResultExt;
+use error::ReportContext;
 
 fn with_context[T](result: Result[T, error::Details]) -> Result[T, error::Report[error::Details]] {
-    result.map_err(|cause: error::Details| error::Report::new(cause).context("load settings"))
+    result.into_report().with_context(|| "load settings")
+}
+
+fn adapt_report[E, F](report: error::Report[E], convert: (E) -> F) -> error::Report[F] {
+    report.map(convert)
 }
 
 fn missing_file(report: error::Report[error::Details]) -> bool {
@@ -6794,6 +6829,7 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | `let Option::Some(x) = value;` | `let Some(x) = value else { return };`, `if let`, or `match` |
 | `let Point { x } = point;` | `let Point { x, .. } = point;` |
 | Non-exhaustive `match` | Cover every possible variant or add a `_` branch |
+| Discard a `Result` with `operation();` | Handle it, propagate with a compatible `?`, or explicitly ignore it with `let _ = operation();` |
 | `x++`, `x--` | `x += 1;`, `x -= 1;` |
 | Assign through an immutable structure binding | Declare the binding with `let mut`, or create a new value with `Point { field: value, ..point }` |
 | `var x = 1`, `x := 1` | `let x = 1;` |
@@ -6880,6 +6916,8 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | Detect a double-width division overflow | Use `std::math::bits::div32/64`, which returns `Result` rather than panicking |
 | Draw reproducible random samples | `std::rand::Generator` wraps explicit PCG or ChaCha8 state and checks bounded ranges; the older splitmix64-v1 functions retain their outputs |
 | Preserve action and cleanup errors | `std::resource::{with_cleanup, scope, ScopeError}` or `io::with_resource` |
+| Add typed error context | Import `std::error::{ResultExt, ReportContext}`; call `.into_report().with_context(...)` once at the reporting boundary, then append contexts directly |
+| Adapt library error reports | `Report::map` converts leaves while retaining contexts, aggregate boundaries and traversal order |
 | Isolate a runtime panic | `std::panic::catch`, with lexical `defer` cleanup; `raise` and `resume` return `never` |
 | Generate public inherent methods | `derive_output_inherent` and `derive_output_add_public_method` |
 | Create and supervise a Linux child | `std::os::linux::process::Command` with runtime-coordinated spawn, stable pidfd signals, and shared wait results |
@@ -6913,6 +6951,8 @@ C bindings and `std::c` use existing structs, constants, `#[comptime]`, extern a
 Linux syscall buffers, `Pointer` descriptors, `Errno` values, ABI codecs, descriptor/process/memory/IPC wrappers use the ordinary struct, enum, array, slice, and call forms below. Native kernel layouts are encoded into bytes; there is no pointer-cast, native-layout, or `unsafe` grammar.
 
 Panic boundaries use ordinary function calls, closures, `Result`, and the existing `never` type. There is no `try/catch`, `throw`, or bare Go-style `recover()` syntax; panic cleanup extends the semantics of the existing lexical `defer` statement.
+
+`Report::map`, `ResultExt::into_report`, and `ReportContext::{context, with_context}` use the existing generic-method, trait-import and closure forms. They add no grammar production or implicit error conversion.
 
 I/O traits, cancellation contexts, DNS/TLS, scalar conversion traits, and Serde extension events use the existing imports, generic bounds, enums, methods, and calls. They introduce no new grammar. Explicit generic calls retain the `::[Type]` form even when their type arguments do not appear in the function signature.
 
@@ -7107,6 +7147,8 @@ struct_pattern_field = ident (":" pattern)?
 array_pattern = "[" (array_pattern_item ("," array_pattern_item)* ","?)? "]"
 array_pattern_item = pattern | ".." | ident "@" ".."
 ```
+
+The expression-statement grammar also permits a built-in `Result` value, but discarding it triggers `unused_result`. The existing `let` statement with wildcard pattern `_` provides explicit ignoring; this lint adds no syntax.
 
 The parser will do some error recovery for commas and semicolons, but the code agent should always generate the above canonical form: list items separated by commas, `let`, assignments and ordinary non-tail expressions with semicolons, unlabeled control-flow statements without unnecessary semicolons, labeled loop statements with semicolons before following statements, and trait method signatures with semicolons. The sequence pattern contains at most one rest; the `..` in the structure pattern appears at most once and must be at the end.
 

@@ -14,6 +14,7 @@ fn function_context(
     predicates: Vec[TypePredicate],
     allow_unstructured_go: bool,
     allow_unreachable_code: bool,
+    allow_unused_result: bool,
     comptime: ComptimeCapability,
 ) -> Checker {
     let predicates = expand_implied_predicates(base, predicates);
@@ -25,6 +26,7 @@ fn function_context(
         counter: base.counter,
         diagnostics: base.diagnostics,
         typeck_results: base.typeck_results,
+        discarded_exprs: Vec::new(),
         package_name: base.package_name,
         source_path: base.source_path,
         current_span: base.current_span,
@@ -68,6 +70,8 @@ fn function_context(
         suppress_unresolved_ref_diagnostic: Ref::new(0),
         mutable_locals: Vec::new(),
         return_ty: ret_ty,
+        return_span: Option::None,
+        return_is_closure: false,
         self_ty,
         type_params,
         loop_depth: Ref::new(0),
@@ -83,6 +87,7 @@ fn function_context(
         comptime_capability: comptime,
         allow_unstructured_go,
         allow_unreachable_code,
+        allow_unused_result,
     }
 }
 
@@ -93,6 +98,7 @@ fn closure_context(base: Checker, ret_ty: Type) -> Checker {
         counter: base.counter,
         diagnostics: base.diagnostics,
         typeck_results: base.typeck_results,
+        discarded_exprs: base.discarded_exprs,
         package_name: base.package_name,
         source_path: base.source_path,
         current_span: base.current_span,
@@ -136,6 +142,8 @@ fn closure_context(base: Checker, ret_ty: Type) -> Checker {
         suppress_unresolved_ref_diagnostic: base.suppress_unresolved_ref_diagnostic,
         mutable_locals: base.mutable_locals,
         return_ty: ret_ty,
+        return_span: base.current_span.get(),
+        return_is_closure: true,
         self_ty: base.self_ty,
         type_params: base.type_params,
         loop_depth: Ref::new(0),
@@ -146,6 +154,7 @@ fn closure_context(base: Checker, ret_ty: Type) -> Checker {
         comptime_capability: base.comptime_capability,
         allow_unstructured_go: base.allow_unstructured_go,
         allow_unreachable_code: base.allow_unreachable_code,
+        allow_unused_result: base.allow_unused_result,
     }
 }
 
@@ -338,7 +347,7 @@ fn report_unresolved_block(ctx: Checker, value: hir::Block, report_all: bool) ->
                 report_unresolved_expr(ctx, target, report_all);
                 report_unresolved_expr(ctx, value, report_all)
             },
-            Expr { expr } => report_unresolved_expr(ctx, expr, report_all),
+            Expr { expr, .. } => report_unresolved_expr(ctx, expr, report_all),
         }
     }
     if let Some(expr) = value.tail {
@@ -538,6 +547,7 @@ fn check_function_inner(
         predicates,
         false,
         false,
+        false,
         comptime,
     );
     let previous_span = base.current_span.get();
@@ -548,7 +558,7 @@ fn check_function_inner(
         resolve_signature_type(signature_ctx, raw_ret_ty, predicates, true)
     };
     base.current_span.set(previous_span);
-    let ctx = function_context(
+    let mut ctx = function_context(
         base,
         ret_ty,
         self_ty,
@@ -556,8 +566,10 @@ fn check_function_inner(
         predicates,
         attribute_allows(value.attrs, "unstructured_go"),
         attribute_allows(value.attrs, "unreachable_code"),
+        base.allow_unused_result || attribute_allows(value.attrs, "unused_result"),
         comptime,
     );
+    ctx.return_span = Option::Some(value.ret_ty_span.unwrap_or(value.name_span));
     let comptime_origin_start = base.typeck_results.exprs.len();
     let params: Vec[(string, Type)] = Vec::new();
     for param in value.params {
@@ -597,6 +609,7 @@ fn check_function_inner(
         }
     }
     let body = resolve_deferred_block(ctx, checked_body.0);
+    warn_unused_results(ctx);
     for index in comptime_origin_start..base.typeck_results.exprs.len() {
         let fact = base.typeck_results.exprs[index];
         if let Some(error) = invalid_go_function_signature(ctx, fact.ty) {
@@ -786,6 +799,7 @@ fn check_constant(base: Checker, value: hir::Constant) -> (
         Vec::new(),
         false,
         false,
+        false,
         ComptimeCapability::Capable,
     );
     let comptime_origin_start = base.typeck_results.exprs.len();
@@ -794,6 +808,7 @@ fn check_constant(base: Checker, value: hir::Constant) -> (
     resolve_coercion_constraints(ctx);
     resolve_numeric_literal_constraints(ctx);
     let checked = resolve_deferred_expr(ctx, checked);
+    warn_unused_results(ctx);
     let comptime_origins: Vec[ast::Span] = Vec::new();
     for index in comptime_origin_start..base.typeck_results.exprs.len() {
         comptime_origins.push(base.typeck_results.exprs[index].span)
@@ -882,6 +897,7 @@ fn check_static(base: Checker, value: hir::Static) -> Static {
         Vec::new(),
         false,
         false,
+        false,
         ComptimeCapability::RuntimeOnly,
     );
     let checked = check_expr(ctx, value.value, Option::Some(ty));
@@ -889,6 +905,7 @@ fn check_static(base: Checker, value: hir::Static) -> Static {
     resolve_coercion_constraints(ctx);
     resolve_numeric_literal_constraints(ctx);
     let _ = resolve_deferred_expr(ctx, checked);
+    warn_unused_results(ctx);
     if !once_cell_type(base.builtin, ty) || !valid_initializer {
         push_diagnostic(base, "static initializer must be `OnceCell::new()`")
     }
@@ -1267,9 +1284,11 @@ fn check_impl(base: Checker, value: hir::ImplBlock) -> ImplBlock {
         base.current_span.set(validation_span)
     }
     let methods: Vec[Function] = Vec::new();
+    let mut method_base = base;
+    method_base.allow_unused_result = attribute_allows(value.attrs, "unused_result");
     for method in value.methods {
         methods.push(
-            check_function(base, method, value.generics, predicates, Option::Some(for_type)),
+            check_function(method_base, method, value.generics, predicates, Option::Some(for_type)),
         )
     }
     match trait_ref {
@@ -1808,6 +1827,7 @@ fn validate_trait_impl_definition_requirements(
             Option::Some(for_type),
             Vec::new(),
             predicates,
+            false,
             false,
             false,
             ComptimeCapability::RuntimeOnly,
@@ -2878,6 +2898,10 @@ fn attach_diagnostic_span(ctx: Checker, message: string, span: Option[ast::Span]
                 ctx.diagnostics.set(
                     index,
                     Diagnostic {
+                        code: value.code,
+                        notes: value.notes,
+                        help: value.help,
+                        fixes: value.fixes,
                         severity: value.severity,
                         stage: value.stage,
                         message: value.message,
@@ -2971,7 +2995,7 @@ fn attach_block_diagnostic_spans(ctx: Checker, value: hir::Block) -> () {
                 attach_expr_diagnostic_spans(ctx, target);
                 attach_expr_diagnostic_spans(ctx, value)
             },
-            Expr { expr } => attach_expr_diagnostic_spans(ctx, expr),
+            Expr { expr, .. } => attach_expr_diagnostic_spans(ctx, expr),
         }
     }
     if let Some(expr) = value.tail {
