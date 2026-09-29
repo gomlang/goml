@@ -254,10 +254,6 @@ func DefaultCall(id CallID, arguments []ValueRef) CallResult {
 	return DefaultRegistry().Call(id, arguments)
 }
 
-func DefaultCallSlice(id CallID, arguments []ValueRef) CallResult {
-	return DefaultRegistry().CallSlice(id, arguments)
-}
-
 func NewInvocation(id int, slice bool) any {
 	return reflect.ValueOf(&Invocation{id: CallID(id), slice: slice, done: make(chan struct{})})
 }
