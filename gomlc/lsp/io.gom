@@ -4,56 +4,86 @@ use std::bytes;
 use std::io;
 use std::json;
 use std::utf8;
+use std::error;
+use error::{ResultExt, ReportContext};
 use utf8::BytesUtf8;
 
-fn read_stdin_line() -> Result[bytes::Bytes, string] {
+pub enum LspIoError {
+    Io(io::Error),
+    Utf8(utf8::Utf8Error),
+    Protocol(string),
+}
+
+impl ToString for LspIoError {
+    fn to_string(self: LspIoError) -> string {
+        match self {
+            Io(value) => value.to_string(),
+            Utf8(value) => value.to_string(),
+            Protocol(value) => value,
+        }
+    }
+}
+
+pub type LspFailure = error::Report[LspIoError];
+
+fn protocol_failure(message: string) -> LspFailure {
+    error::Report::new(LspIoError::Protocol(message))
+}
+
+fn read_header_line(read_exact: (isize) -> Result[bytes::Bytes, io::Error]) -> Result[
+    bytes::Bytes,
+    LspFailure,
+] {
     let data = bytes::Bytes::new();
     loop {
-        match io::read_stdin_exact_structured(1) {
+        match read_exact(1) {
             Ok(chunk) => {
                 let value = chunk.get(0);
                 data.push(value);
                 if value == 10 {
-                    return Result::Ok(data)
+                    return Ok(data)
                 }
             },
-            Err(error) => if !data.is_empty() {
-                return Result::Ok(data)
+            Err(cause) => if !data.is_empty() && cause.kind() == io::ErrorKind::UnexpectedEof {
+                return Ok(data)
             } else {
-                return Result::Err(error.to_string())
+                return Err(error::Report::new(cause).map(LspIoError::Io).context("read RPC header"))
             },
         }
     }
 }
 
-pub fn read_rpc_payload() -> Result[string, string] {
-    let mut length: Option[isize] = Option::None;
-    let length = loop {
-        let line = read_stdin_line()?.to_string_utf8().map_err(|error| error.to_string())?;
+fn read_payload(read_exact: (isize) -> Result[bytes::Bytes, io::Error]) -> Result[
+    string,
+    LspFailure,
+] {
+    let mut length: Option[isize] = None;
+    loop {
+        let line = read_header_line(read_exact)?.to_string_utf8().map_err(LspIoError::Utf8).into_report().context(
+            "decode RPC header",
+        )?;
         if header_line_content(line) == "" {
-            break length
+            break
         } else if is_content_length_header(line) {
-            match length {
-                Some(_) => {
-                    return Result::Err("duplicate Content-Length header")
-                },
-                None => {
-                    length = Option::Some(content_length(line)?);
-                },
+            if length.is_some() {
+                return Err(protocol_failure("duplicate Content-Length header"))
             }
+            length = Some(content_length(line).map_err(protocol_failure)?);
         }
-    };
-    match length {
-        Some(length) => match io::read_stdin_exact_structured(length) {
-            Ok(data) => data.to_string_utf8().map_err(|error| error.to_string()),
-            Err(error) => Result::Err(error.to_string()),
-        },
-        None => Result::Err("missing Content-Length header"),
     }
+    let length = length.ok_or(protocol_failure("missing Content-Length header"))?;
+    let data = read_exact(length).map_err(LspIoError::Io).into_report().with_context(
+        || f"read RPC payload ({length} bytes)",
+    )?;
+    data.to_string_utf8().map_err(LspIoError::Utf8).into_report().context("decode RPC payload")
 }
 
-pub fn write_rpc_message(value: json::Value) -> Result[(), string] {
+pub fn read_rpc_payload() -> Result[string, LspFailure] {
+    read_payload(io::read_stdin_exact_structured)
+}
+
+pub fn write_rpc_message(value: json::Value) -> Result[(), LspFailure] {
     io::write_stdout_structured(bytes::Bytes::from_string(framed_json(value))).map_err(
-        |error| error.to_string(),
-    )
+        LspIoError::Io,
+    ).into_report().context("write RPC message")
 }

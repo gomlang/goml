@@ -1,5 +1,7 @@
 package project;
 
+use module::failure;
+use failure::DriverResult;
 use module::util;
 use std::collections;
 use std::fs;
@@ -39,8 +41,8 @@ fn build_lock_is_stale(path_value: string) -> bool {
     }
 }
 
-fn acquire_build_lock(context: Context) -> Result[BuildLock, string] {
-    fs::create_dir_all(context.artifact_root).map_err(|error| error.to_string())?;
+fn acquire_build_lock(context: Context) -> Result[BuildLock, failure::Failure] {
+    fs::create_dir_all(context.artifact_root).driver_result()?;
     let lock_path = build_lock_path(context);
     let started = time::Instant::now();
     loop {
@@ -48,24 +50,29 @@ fn acquire_build_lock(context: Context) -> Result[BuildLock, string] {
             Ok(()) => return Result::Ok(BuildLock { path: lock_path }),
             Err(error) => if error.kind() == io::ErrorKind::AlreadyExists {
                 if build_lock_is_stale(lock_path) {
-                    fs::remove_dir_all(lock_path).map_err(|error| error.to_string())?
+                    fs::remove_dir_all(lock_path).driver_result()?
                 } else if started.elapsed().as_seconds() >= 30 {
-                    return Result::Err("timed out waiting for build lock " + lock_path)
+                    return Result::Err(
+                        failure::convert("timed out waiting for build lock " + lock_path),
+                    )
                 } else {
                     time::sleep(time::Duration::from_milliseconds(1))
                 }
             } else {
-                return Result::Err(error.to_string())
+                return Result::Err(failure::convert(error))
             },
         }
     }
 }
 
-fn release_build_lock(lock: BuildLock) -> Result[(), string] {
-    fs::remove_dir_all(lock.path).map_err(|error| error.to_string())
+fn release_build_lock(lock: BuildLock) -> Result[(), failure::Failure] {
+    fs::remove_dir_all(lock.path).map_err(failure::convert)
 }
 
-pub fn with_build_lock[T](context: Context, action: () -> Result[T, string]) -> Result[T, string] {
+pub fn with_build_lock[T](context: Context, action: () -> Result[T, failure::Failure]) -> Result[
+    T,
+    failure::Failure,
+] {
     let lock = acquire_build_lock(context)?;
     let result = action();
     match result {
@@ -73,9 +80,9 @@ pub fn with_build_lock[T](context: Context, action: () -> Result[T, string]) -> 
             Ok(()) => Result::Ok(value),
             Err(error) => Result::Err(error),
         },
-        Err(error) => {
-            let _ = release_build_lock(lock);
-            Result::Err(error)
+        Err(error) => match release_build_lock(lock) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(failure::combine(error, cleanup.context("release build lock"))),
         },
     }
 }
@@ -123,10 +130,10 @@ fn executable_path_for(context: Context, entry_package: string) -> string {
 
 fn collect_dependencies(graph: Graph, package_name: string, result: collections::BTreeSet[string]) -> Result[
     (),
-    string,
+    failure::Failure,
 ] {
     let Some(package_value) = package_by_name(graph, package_name) else {
-        return Result::Err(f"missing package {package_name}")
+        return Result::Err(failure::convert(f"missing package {package_name}"))
     };
     for dependency in package_value.imports {
         if result.insert(dependency) {
@@ -138,13 +145,13 @@ fn collect_dependencies(graph: Graph, package_name: string, result: collections:
 
 fn mark_reachable(graph: Graph, package_name: string, seen: collections::HashSet[string]) -> Result[
     (),
-    string,
+    failure::Failure,
 ] {
     if !seen.insert(package_name) {
         return Result::Ok(())
     }
     let Some(package_value) = package_by_name(graph, package_name) else {
-        return Result::Err(f"missing package {package_name}")
+        return Result::Err(failure::convert(f"missing package {package_name}"))
     };
     for dependency in package_value.imports {
         mark_reachable(graph, dependency, seen)?
@@ -152,7 +159,7 @@ fn mark_reachable(graph: Graph, package_name: string, seen: collections::HashSet
     Result::Ok(())
 }
 
-fn reachable_packages(graph: Graph, entries: Vec[string]) -> Result[Vec[string], string] {
+fn reachable_packages(graph: Graph, entries: Vec[string]) -> Result[Vec[string], failure::Failure] {
     let seen: collections::HashSet[string] = collections::HashSet::new();
     for entry in entries {
         mark_reachable(graph, entry, seen)?
@@ -168,7 +175,7 @@ fn reachable_packages(graph: Graph, entries: Vec[string]) -> Result[Vec[string],
 
 fn dependency_interfaces(graph: Graph, package_name: string, output_root: string) -> Result[
     Vec[string],
-    string,
+    failure::Failure,
 ] {
     let names: collections::BTreeSet[string] = collections::BTreeSet::new();
     collect_dependencies(graph, package_name, names)?;
@@ -185,7 +192,7 @@ fn compile_commands(
     entry_command: string,
     dependency_command: string,
     packages: Vec[string],
-) -> Result[Vec[Command], string] {
+) -> Result[Vec[Command], failure::Failure] {
     let result: Vec[Command] = Vec::new();
     for package_name in packages {
         let command = if package_name == context.graph.entry_package {
@@ -222,9 +229,9 @@ fn compile_package_command(
     output_root: string,
     command: string,
     world: Option[string],
-) -> Result[Command, string] {
+) -> Result[Command, failure::Failure] {
     let Some(package_value) = package_by_name(graph, package_name) else {
-        return Result::Err(f"missing package {package_name}")
+        return Result::Err(failure::convert(f"missing package {package_name}"))
     };
     let inputs: Vec[string] = Vec::new();
     for file in package_value.files {
@@ -259,7 +266,7 @@ fn compile_test_package_command(
     output_root: string,
     production_interface: bool,
     world: Option[string],
-) -> Result[Command, string] {
+) -> Result[Command, failure::Failure] {
     let compiled = compile_package_command(
         graph,
         module_dir,
@@ -302,7 +309,7 @@ fn compile_test_package_command(
                 },
             )
         },
-        _ => Result::Err("test package did not produce a compile command"),
+        _ => Result::Err(failure::convert("test package did not produce a compile command")),
     }
 }
 
@@ -319,7 +326,7 @@ fn core_outputs(context: Context, output_root: string, packages: Vec[string]) ->
     result
 }
 
-pub fn check_plan(context: Context, include_tests: bool) -> Result[Plan, string] {
+pub fn check_plan(context: Context, include_tests: bool) -> Result[Plan, failure::Failure] {
     let output_root = path::join(context.artifact_root, CHECK_SUBCOMMAND);
     let commands = compile_commands(
         context,
@@ -373,12 +380,12 @@ pub fn check_plan(context: Context, include_tests: bool) -> Result[Plan, string]
     Result::Ok(Plan { commands, executable: Option::None, test_groups: Vec::new() })
 }
 
-pub fn build_plan(context: Context) -> Result[Plan, string] {
+pub fn build_plan(context: Context) -> Result[Plan, failure::Failure] {
     let output_root = path::join(context.artifact_root, BUILD_SUBCOMMAND);
     let entries: Vec[string] = Vec::new();
     for package_name in context.graph.order {
         let Some(package_value) = package_by_name(context.graph, package_name) else {
-            return Result::Err(f"missing package {package_name}")
+            return Result::Err(failure::convert(f"missing package {package_name}"))
         };
         if package_value.declared_name == "main" {
             entries.push(package_name)
@@ -418,7 +425,7 @@ pub fn build_plan(context: Context) -> Result[Plan, string] {
     Result::Ok(Plan { commands, executable: Option::None, test_groups: Vec::new() })
 }
 
-pub fn load_toolchain_context(prefix: string, compiler: string) -> Result[Context, string] {
+pub fn load_toolchain_context(prefix: string, compiler: string) -> Result[Context, failure::Failure] {
     let lib_dir = path::join(prefix, "lib");
     let artifact_root = path::join(path::join(lib_dir, "compiler"), "build");
     let graph = discover_toolchain_graph(compiler, lib_dir, artifact_root)?;
@@ -433,14 +440,14 @@ pub fn load_toolchain_context(prefix: string, compiler: string) -> Result[Contex
     )
 }
 
-pub fn toolchain_world_plan(context: Context, output: string) -> Result[Plan, string] {
+pub fn toolchain_world_plan(context: Context, output: string) -> Result[Plan, failure::Failure] {
     let commands: Vec[Command] = Vec::new();
     let package_outputs: Vec[string] = Vec::new();
     let source_files: Vec[string] = Vec::new();
     let counter_output = path::join(context.artifact_root, "builtin-counter");
     for package_name in context.graph.order {
         let Some(package_value) = package_by_name(context.graph, package_name) else {
-            return Result::Err("missing toolchain package " + package_name)
+            return Result::Err(failure::convert("missing toolchain package " + package_name))
         };
         let output = package_artifact_base(context.artifact_root, context.graph, package_name);
         let inputs: Vec[string] = Vec::new();
@@ -483,7 +490,7 @@ pub fn toolchain_world_plan(context: Context, output: string) -> Result[Plan, st
     Result::Ok(Plan { commands, executable: Option::None, test_groups: Vec::new() })
 }
 
-fn target_build_plan(context: Context, build_executable: bool) -> Result[Plan, string] {
+fn target_build_plan(context: Context, build_executable: bool) -> Result[Plan, failure::Failure] {
     let output_root = path::join(context.artifact_root, BUILD_SUBCOMMAND);
     let packages = reachable_packages(context.graph, Vec::from_array([context.graph.entry_package]))?;
     let commands = compile_commands(
@@ -525,11 +532,11 @@ fn target_build_plan(context: Context, build_executable: bool) -> Result[Plan, s
     )
 }
 
-pub fn build_target_artifacts_plan(context: Context) -> Result[Plan, string] {
+pub fn build_target_artifacts_plan(context: Context) -> Result[Plan, failure::Failure] {
     target_build_plan(context, false)
 }
 
-pub fn run_plan(context: Context) -> Result[Plan, string] {
+pub fn run_plan(context: Context) -> Result[Plan, failure::Failure] {
     target_build_plan(context, true)
 }
 
@@ -540,7 +547,7 @@ fn append_test_package(
     output_root: string,
     compiled_dependencies: collections::HashSet[string],
     commands: Vec[Command],
-) -> Result[(), string] {
+) -> Result[(), failure::Failure] {
     for package_name in graph.order {
         if package_name == graph.entry_package || compiled_dependencies.contains(package_name) {} else {
             let compiled = compile_package_command(
@@ -638,7 +645,7 @@ fn append_test_group(
     groups.push(TestGroup { kind, manifest, runner });
 }
 
-pub fn test_plan(context: Context, kind: string) -> Result[Plan, string] {
+pub fn test_plan(context: Context, kind: string) -> Result[Plan, failure::Failure] {
     let dependency_root = path::join(path::join(context.artifact_root, "test"), "base");
     let commands = compile_commands(
         context,
@@ -883,7 +890,7 @@ fn progress_label(value: Command) -> string {
     }
 }
 
-fn ensure_output_parent(value: Command, module_dir: string) -> Result[(), string] {
+fn ensure_output_parent(value: Command, module_dir: string) -> Result[(), failure::Failure] {
     let output = match value {
         Compile { output, .. } | ToolchainCompile { output, .. } | PackToolchainWorld { output, .. } | Link {
             output,
@@ -896,14 +903,14 @@ fn ensure_output_parent(value: Command, module_dir: string) -> Result[(), string
         path::join(module_dir, output)
     };
     match path::parent(absolute) {
-        Some(parent) => fs::create_dir_all(parent).map_err(|error| error.to_string()),
+        Some(parent) => fs::create_dir_all(parent).map_err(failure::convert),
         None => Result::Ok(()),
     }
 }
 
 fn execute_command(cancel: task::CancelToken, context: Context, value: Command) -> Result[
     (),
-    string,
+    failure::Failure,
 ] {
     ensure_output_parent(value, context.graph.module_dir)?;
     if let Link { .. } | TestLink { .. } = value {
@@ -939,12 +946,12 @@ fn execute_command(cancel: task::CancelToken, context: Context, value: Command) 
         Ok(status) => if process::ExitStatus::success(status) {
             Result::Ok(())
         } else {
-            Result::Err(f"{display_command(value)} failed")
+            Result::Err(failure::convert(f"{display_command(value)} failed"))
         },
         Err(error) => if error.kind() == io::ErrorKind::Interrupted {
-            Result::Err("build cancelled")
+            Result::Err(failure::convert("build cancelled"))
         } else {
-            Result::Err(error.to_string())
+            Result::Err(failure::convert(error))
         },
     }
 }
@@ -964,7 +971,7 @@ fn prepare_cached_command(
     context: Context,
     command: Command,
     identity: string,
-) -> Result[CachePreparation, string] {
+) -> Result[CachePreparation, failure::Failure] {
     match command {
         GoBuild { .. } => return Result::Ok(CachePreparation::Execute(Option::None)),
         _ => (),
@@ -992,14 +999,14 @@ fn execute_prepared_command(
     context: Context,
     command: Command,
     cache: Option[PreparedCache],
-) -> Result[(), string] {
+) -> Result[(), failure::Failure] {
     match execute_command(cancel, context, command) {
         Ok(()) => Result::Ok(()),
         Err(message) => {
             if let Some(value) = cache {
                 let _ = prepare_cache_execution(context, value.spec);
             }
-            Result::Err(message)
+            Result::Err(failure::convert(message))
         },
     }
 }
@@ -1009,7 +1016,7 @@ fn finish_prepared_command(
     context: Context,
     identity: string,
     cache: Option[PreparedCache],
-) -> Result[(), string] {
+) -> Result[(), failure::Failure] {
     match cache {
         Some(value) => store_cache(digests, context, value.spec, identity, value.fingerprint),
         None => Result::Ok(()),
@@ -1022,7 +1029,7 @@ fn abandon_prepared_command(context: Context, cache: Option[PreparedCache]) -> (
     }
 }
 
-fn build_graph(commands: Vec[Command]) -> Result[BuildGraph, string] {
+fn build_graph(commands: Vec[Command]) -> Result[BuildGraph, failure::Failure] {
     let producers: HashMap[string, Vec[isize]] = HashMap::new();
     for index in 0..commands.len() {
         if let Some(spec) = cache_spec(commands[index]) {
@@ -1095,13 +1102,13 @@ fn build_node_ready(node: BuildNode, completed: collections::BitSet) -> bool {
 
 fn take_ready_build_node(nodes: Vec[BuildNode], pending: Vec[isize], completed: collections::BitSet) -> Result[
     Option[BuildNode],
-    string,
+    failure::Failure,
 ] {
     let mut position = 0;
     while position < pending.len() {
         let index = pending[position];
         let Some(node) = build_node(nodes, index) else {
-            return Result::Err(f"build graph omitted node {index}")
+            return Result::Err(failure::convert(f"build graph omitted node {index}"))
         };
         if build_node_ready(node, completed) {
             let _ = pending.remove(position);
@@ -1122,7 +1129,7 @@ struct BuildWork {
 struct BuildWorkResult {
     index: isize,
     cache: Option[PreparedCache],
-    result: Result[(), string],
+    result: Result[(), failure::Failure],
     completion: Option[Channel[bool]],
 }
 
@@ -1134,10 +1141,10 @@ fn accept_build_result(
     received: Option[BuildWorkResult],
     completed_nodes: collections::BitSet,
     completed: Ref[isize],
-) -> Result[(), string] {
+) -> Result[(), failure::Failure] {
     let Some(value) = received else {
         scope.cancel();
-        return Result::Err("build result channel closed early")
+        return Result::Err(failure::convert("build result channel closed early"))
     };
     completed.set(completed.get() + 1);
     match value.result {
@@ -1154,12 +1161,12 @@ fn accept_build_result(
                     completion.send(false)
                 }
                 scope.cancel();
-                Result::Err(message)
+                Result::Err(failure::convert(message))
             },
         },
         Err(message) => {
             scope.cancel();
-            Result::Err(message)
+            Result::Err(failure::convert(message))
         },
     }
 }
@@ -1169,7 +1176,7 @@ fn execute_plan_worker(
     context: Context,
     work: Channel[BuildWork],
     results: Channel[BuildWorkResult],
-) -> Result[(), string] {
+) -> Result[(), failure::Failure] {
     loop {
         match task::recv_with(cancel, work) {
             task::WaitResult::Completed(Some(value)) => {
@@ -1211,7 +1218,7 @@ fn execute_plan_concurrently(
     total: isize,
     jobs: isize,
     completed: Ref[isize],
-) -> Result[(), string] {
+) -> Result[(), failure::Failure] {
     let initial: Vec[isize] = Vec::new();
     for node in graph.nodes {
         initial.push(node.index)
@@ -1238,7 +1245,7 @@ fn execute_plan_concurrently(
                 Ok(value) => value,
                 Err(message) => {
                     scope.cancel();
-                    return Result::Err(message)
+                    return Result::Err(failure::convert(message))
                 },
             };
             let Some(node) = next else {
@@ -1253,7 +1260,7 @@ fn execute_plan_concurrently(
                         node.command,
                     ) {
                         scope.cancel();
-                        return Result::Err(message)
+                        return Result::Err(failure::convert(message))
                     }
                     let _ = completed_nodes.insert(node.index);
                     completed.set(completed.get() + 1);
@@ -1265,7 +1272,7 @@ fn execute_plan_concurrently(
                 },
                 Err(message) => {
                     scope.cancel();
-                    return Result::Err(message)
+                    return Result::Err(failure::convert(message))
                 },
             }
         }
@@ -1278,7 +1285,7 @@ fn execute_plan_concurrently(
                     },
                     task::WaitResult::Cancelled => {
                         abandon_prepared_command(context, value.cache);
-                        return Result::Err("build cancelled")
+                        return Result::Err(failure::convert("build cancelled"))
                     },
                 }
             } else if scope.token().is_cancelled() {
@@ -1296,7 +1303,7 @@ fn execute_plan_concurrently(
                     },
                     Err(message) => {
                         abandon_prepared_command(context, value.cache);
-                        return Result::Err(message)
+                        return Result::Err(failure::convert(message))
                     },
                 }
             } else {
@@ -1319,7 +1326,7 @@ fn execute_plan_concurrently(
                         },
                         Err(message) => {
                             abandon_prepared_command(context, value.cache);
-                            return Result::Err(message)
+                            return Result::Err(failure::convert(message))
                         },
                     },
                 }
@@ -1337,7 +1344,7 @@ fn execute_plan_concurrently(
                 running -= 1;
             } else if !pending.is_empty() {
                 scope.cancel();
-                return Result::Err("build plan contains a dependency cycle")
+                return Result::Err(failure::convert("build plan contains a dependency cycle"))
             },
         }
     }
@@ -1346,9 +1353,12 @@ fn execute_plan_concurrently(
     Result::Ok(())
 }
 
-pub fn execute_plan(context: Context, plan: Plan, dry_run: bool, jobs: isize) -> Result[(), string] {
+pub fn execute_plan(context: Context, plan: Plan, dry_run: bool, jobs: isize) -> Result[
+    (),
+    failure::Failure,
+] {
     if !dry_run && jobs < 1 {
-        return Result::Err("build jobs must be greater than zero")
+        return Result::Err(failure::convert("build jobs must be greater than zero"))
     }
     let total = plan.commands.len();
     let completed = Ref::new(0);
@@ -1378,7 +1388,7 @@ pub fn execute_plan(context: Context, plan: Plan, dry_run: bool, jobs: isize) ->
             ),
         );
         if let Err(message) = execution {
-            return Result::Err(message)
+            return Result::Err(failure::convert(message))
         }
     }
     if dry_run {} else {
@@ -1389,7 +1399,7 @@ pub fn execute_plan(context: Context, plan: Plan, dry_run: bool, jobs: isize) ->
 
 pub fn run_executable(context: Context, executable: string, args: Vec[string], dry_run: bool) -> Result[
     (),
-    string,
+    failure::Failure,
 ] {
     let relative = module_relative(context.graph.module_dir, executable);
     if dry_run {
@@ -1401,11 +1411,13 @@ pub fn run_executable(context: Context, executable: string, args: Vec[string], d
                 Result::Ok(())
             } else {
                 match process::ExitStatus::code(status) {
-                    Some(code) => Result::Err(f"program exited with status {code}"),
-                    None => Result::Err("program terminated by signal"),
+                    Some(code) => Result::Err(
+                        failure::convert(f"program exited with status {code}"),
+                    ),
+                    None => Result::Err(failure::convert("program terminated by signal")),
                 }
             },
-            Err(error) => Result::Err(error.to_string()),
+            Err(error) => Result::Err(failure::convert(error)),
         }
     }
 }

@@ -39,7 +39,9 @@ The bootstrap downloads the checksum-pinned stage0 release recorded in [bootstra
 
 Use `stage2/bin` for local development. Toolchain prefixes under `stage0`, `stage2`, and `stage3` contain `bin`, library projects under `lib`, and the finalized compiler world under `lib/compiler`. Downloaded archives are cached in `_bootstrap/cache`; compiler and driver bootstrap products live in their module-local `_bootstrap` directories. Generated outputs are ignored by Git.
 
-`just install` installs and finalizes the tools under `${GOML_HOME:-$HOME/.goml}`; add its `bin` directory to `PATH`. `just clean` removes the root and compiler/driver build caches and generated development stages, while retaining the downloaded `stage0` toolchain.
+The root `goml.work` groups `gomlc`, `goml`, `gomlgo`, and the internal `toolchain/manifest` module. The compiler and driver share local dependency and workspace manifest parsing through explicit path dependencies on that module. It is compiled into the tools; installed toolchains do not need the repository sources. Run `stage2/bin/goml fmt --check --workspace` to check workspace formatting, or run `goml test` from `toolchain/manifest` to test the shared parser. Library modules under `lib/` are formatted and tested separately.
+
+`just install` installs and finalizes the tools under `${GOML_HOME:-$HOME/.goml}`; add its `bin` directory to `PATH`. `just clean` removes the root, compiler/driver, and shared manifest build caches and generated development stages, while retaining the downloaded `stage0` toolchain.
 
 Explore [gomlc/testdata/pipeline](gomlc/testdata/pipeline) for source programs and every compiler-stage golden file. Use `just verify-golden` to check the corpus or `just update-golden` to regenerate it through the self-hosted compiler.
 

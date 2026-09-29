@@ -1,224 +1,46 @@
 package query;
 
-use std::env;
-use std::fs;
-use std::path;
-use std::text;
+use gomlang::toolchain_manifest as config;
 use std::toml;
+use std::path;
+use std::fs;
 
-struct LocalModule {
-    name: string,
-    root: string,
-}
-
-struct Workspace {
-    root: string,
-    members: Vec[LocalModule],
-    replacements: Vec[LocalModule],
-}
+type LocalModule = config::LocalModule;
 
 fn parse_document(source: string) -> Result[toml::Value, string] {
-    let output = text::StringBuilder::new();
-    let mut depth = 0;
-    let mut quote = 0.to_u8();
-    let mut escaped = false;
-    for original in source.lines() {
-        let mut end = original.byte_len();
-        for index in 0..original.byte_len() {
-            let byte = original.byte_get(index);
-            if escaped {
-                escaped = false;
-            } else if quote == b'"' && byte == b'\\' {
-                escaped = true;
-            } else if quote != 0 {
-                if byte == quote {
-                    quote = 0;
-                }
-            } else if byte == b'"' || byte == b'\'' {
-                quote = byte;
-            } else if byte == b'#' {
-                end = index;
-                break;
-            } else if byte == b'[' || byte == b'{' {
-                depth += 1;
-            } else if byte == b']' || byte == b'}' {
-                depth -= 1;
-            }
-        }
-        if quote != 0 || depth < 0 {
-            return Result::Err("invalid manifest string or collection")
-        }
-        output.write_string(original.byte_slice(0, end));
-        output.write_string(
-            if depth == 0 {
-                "\n"
-            } else {
-                " "
-            },
-        );
-    }
-    if depth != 0 {
-        return Result::Err("unterminated manifest collection")
-    }
-    toml::parse(output.finish())
-}
-
-fn table_entries(document: toml::Value, name: string) -> Result[Vec[(string, toml::Value)], string] {
-    match toml::field(document, name) {
-        Some(value) => toml::as_table(value).ok_or(name + " must be a table"),
-        None => Result::Ok(Vec::new()),
-    }
-}
-
-fn local_path(value: toml::Value) -> Result[string, string] {
-    let value = toml::as_string(value).ok_or("local dependency path must be a string")?;
-    if value == "" {
-        Result::Err("local dependency path cannot be empty")
-    } else {
-        Result::Ok(value)
-    }
+    config::parse_document(source)
 }
 
 fn parse_dependencies(document: toml::Value) -> Result[Vec[DependencyRequirement], string] {
-    let result = Vec::new();
-    for (name, value) in table_entries(document, "dependencies")? {
-        let (version, local) = match value {
-            toml::Value::String(version) => (version, Option::None),
-            toml::Value::Table(fields) => {
-                let mut version = Option::None;
-                let mut local = Option::None;
-                for (key, field) in fields {
-                    match key {
-                        "version" => {
-                            version = Option::Some(
-                                toml::as_string(field).ok_or("dependency version must be a string")?,
-                            );
-                        },
-                        "path" => {
-                            local = Option::Some(local_path(field)?);
-                        },
-                        _ => return Result::Err("unknown dependency field " + key),
-                    }
-                }
-                if version.is_none() && local.is_none() {
-                    return Result::Err("dependency " + name + " requires version or path")
-                };
-                (version.unwrap_or("0.0.0"), local)
-            },
-            _ => return Result::Err("dependency " + name + " must be a version or table"),
-        };
-        result.push(DependencyRequirement { name, version, path: local });
-    }
-    Result::Ok(result)
+    config::parse_dependencies(document)
+}
+
+fn validate_dependency_name(value: string) -> Result[(), string] {
+    validate_module_path(value, false)
 }
 
 fn relative_local_path(root: string, value: string) -> string {
-    if path::is_absolute(value) {
-        path::clean(value)
-    } else {
-        path::join(root, value)
-    }
+    config::relative_local_path(root, value)
 }
 
 fn parse_replacements(document: toml::Value, root: string) -> Result[Vec[LocalModule], string] {
-    let result = Vec::new();
-    for (name, value) in table_entries(document, "replace")? {
-        validate_module_path(name, false)?;
-        let value = match value {
-            toml::Value::Table(fields) => {
-                if fields.len() != 1 || fields[0].0 != "path" {
-                    return Result::Err("replacement requires only a path")
-                }
-                local_path(fields[0].1)?
-            },
-            _ => local_path(value)?,
-        };
-        result.push(LocalModule { name, root: relative_local_path(root, value) });
-    }
-    Result::Ok(result)
+    config::parse_replacements(document, root, validate_dependency_name)
 }
 
-fn load_workspace(root: string) -> Result[Workspace, string] {
-    let root = fs::canonicalize(root).map_err(|error| error.to_string())?;
-    let source = fs::read_file_structured(path::join(root, "goml.work")).map_err(
-        |error| error.to_string(),
-    )?;
-    let document = parse_document(source)?;
-    let workspace = toml::field(document, "workspace").ok_or("goml.work requires [workspace]")?;
-    let values = toml::field(workspace, "members").and_then(toml::as_array).ok_or(
-        "workspace.members must be an array",
-    )?;
-    let members: Vec[LocalModule] = Vec::new();
-    for value in values {
-        let directory = relative_local_path(root, local_path(value)?);
-        let directory = fs::canonicalize(directory).map_err(|error| error.to_string())?;
-        let member = load_dependency_manifest(path::join(directory, MANIFEST_FILENAME))?;
-        for previous in members {
-            if previous.root == directory || previous.name == member.module_path {
-                return Result::Err("duplicate workspace member " + member.module_path)
-            }
-        }
-        members.push(LocalModule { name: member.module_path, root: directory });
-    }
-    if members.is_empty() {
-        return Result::Err("workspace.members cannot be empty")
-    }
-    Result::Ok(Workspace { root, members, replacements: parse_replacements(document, root)? })
-}
-
-fn find_workspace(start: string) -> Result[Option[Workspace], string] {
-    if let Ok(value) = env::var_structured("GOML_WORKSPACE") {
-        if value == "off" {
-            return Result::Ok(Option::None)
-        }
-        if value != "" {
-            return load_workspace(value).map(Option::Some)
-        }
-    }
-    let mut current = fs::canonicalize(start).map_err(|error| error.to_string())?;
-    loop {
-        if fs::is_file(path::join(current, "goml.work")) {
-            return load_workspace(current).map(Option::Some)
-        }
-        match path::parent(current) {
-            Some(parent) => if parent == current {
-                break;
-            } else {
-                current = parent;
-            },
-            None => break,
-        }
-    }
-    Result::Ok(Option::None)
+fn workspace_member(filename: string) -> Result[string, string] {
+    load_dependency_manifest(filename).map(|manifest| manifest.module_path)
 }
 
 fn local_overrides(module_root: string, manifest: DependencyManifest) -> Result[
     Vec[LocalModule],
     string,
 ] {
-    let result: Vec[LocalModule] = Vec::new();
-    if let Some(workspace) = find_workspace(module_root)? {
-        let module_root = fs::canonicalize(module_root).map_err(|error| error.to_string())?;
-        let mut member = false;
-        for value in workspace.members {
-            if value.root == module_root {
-                member = true;
-            }
-        }
-        if member {
-            for value in workspace.replacements {
-                result.push(value)
-            }
-            for value in manifest.replacements {
-                result.push(value)
-            }
-            for value in workspace.members {
-                result.push(value)
-            }
-            return Result::Ok(result)
-        }
-    }
-    Result::Ok(manifest.replacements)
+    config::local_overrides(
+        module_root,
+        manifest.replacements,
+        workspace_member,
+        validate_dependency_name,
+    )
 }
 
 struct DependencyManifest {
