@@ -11,6 +11,7 @@ GoML is statically typed and garbage-collected, with Rust-like syntax, monomorph
 ## Documentation
 
 - [Language guide](docs/goml.md): syntax, semantics, packages, tests, and standard-library APIs
+- [Library boundaries](docs/library-boundaries.md): standard-library and ecosystem ownership
 - [Formatting](docs/formatting.md): formatter rules and CLI
 - [Compiler](gomlc/README.md) and [project driver](goml/README.md): local tools and development commands
 - [Compile-time evaluation](docs/comptime.md): CTIR and programmable derive architecture

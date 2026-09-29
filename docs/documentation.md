@@ -53,8 +53,6 @@ Consecutive standalone `///` lines attach to the next declaration, including its
 
 `//!` is package documentation when it appears before the first source token. Descriptions from several package files are combined in relative path order. The formatter preserves documentation attachment. The lexer continues to treat these spellings as ordinary comments, so previous toolchains can compile sources containing them.
 
-The repository's restriction on implementation comments remains applicable. Extraction tests keep documented source examples in string fixtures; this change does not add documentation comments throughout the compiler or libraries.
-
 ## Rendering and links
 
 The supported Markdown subset includes paragraphs, ATX headings, flat `-` or `*` bullet lists, single-backtick inline code, triple-backtick fenced code blocks, and links. Raw HTML is escaped. Tables, emphasis, nested lists, images, and full CommonMark semantics are not implemented.

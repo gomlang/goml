@@ -2,15 +2,8 @@
 
 `goml` is the self-hosted project driver. It provides project creation, package discovery, check/build/run/test plans, dependency resolution, registry cache management, incremental artifact fingerprints, native linking, and parallel test execution.
 
-Generated programs and Go FFI target Go 1.26. Install Go 1.26 or newer for native builds, test runners, and Go metadata validation.
-
-From the repository root, build the toolchain and run compiler, driver, and Go metadata tests:
-
-```sh
-just all
-```
-
-`just test` includes the same tests. `just ci` additionally checks the bootstrap fixed point, scripts, extension, and release packaging.
+See [repository development](../README.md#development) for requirements,
+toolchain builds and repository checks.
 
 Starting at the repository root, enter the driver module to use stage2 directly:
 
