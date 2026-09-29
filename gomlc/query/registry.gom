@@ -1,8 +1,7 @@
 package query;
 
 use gomlang::toolchain_manifest as config;
-use std::cmp;
-use std::collections;
+use gomlang::toolchain_manifest::resolver;
 use std::env;
 use std::fs;
 use std::path;
@@ -10,18 +9,7 @@ use std::text;
 
 type DependencyRequirement = config::Dependency;
 
-struct SemVersion {
-    major: isize,
-    minor: isize,
-    patch: isize,
-}
-
-struct ResolvedModule {
-    name: string,
-    version: string,
-    root: string,
-    dependencies: Vec[DependencyRequirement],
-}
+type ResolvedModule = resolver::ResolvedModule;
 
 fn quoted_values(value: string) -> Vec[string] {
     let result: Vec[string] = Vec::new();
@@ -44,62 +32,6 @@ fn quoted_values(value: string) -> Vec[string] {
 
 fn manifest_dependencies(source: string) -> Vec[DependencyRequirement] {
     parse_document(source).and_then(parse_dependencies).unwrap_or(Vec::new())
-}
-
-fn decimal_number(value: string) -> Option[isize] {
-    let length = value.byte_len();
-    if length == 0 {
-        Option::None
-    } else {
-        let mut result = 0;
-        for index in 0..length {
-            let byte = value.byte_get(index);
-            if byte < b'0' || byte > b'9' {
-                return Option::None
-            } else {
-                result = result * 10 + (byte - b'0').to_isize();
-            }
-        }
-        Option::Some(result)
-    }
-}
-
-fn parse_sem_version(value: string) -> Option[SemVersion] {
-    let parts: Vec[string] = Vec::new();
-    let mut start = 0;
-    for index in 0..value.byte_len() + 1 {
-        if index == value.byte_len() || value.byte_get(index) == b'.' {
-            parts.push(value.byte_slice(start, index));
-            start = index + 1;
-        }
-    }
-    if parts.len() != 3 {
-        Option::None
-    } else {
-        match decimal_number(parts[0]) {
-            Some(major) => match decimal_number(parts[1]) {
-                Some(minor) => decimal_number(parts[2]).map(
-                    |patch| SemVersion { major, minor, patch },
-                ),
-                None => Option::None,
-            },
-            None => Option::None,
-        }
-    }
-}
-
-fn sem_version_compare(left: SemVersion, right: SemVersion) -> cmp::Ordering {
-    cmp::compare(left.major, right.major).then(cmp::compare(left.minor, right.minor)).then(
-        cmp::compare(left.patch, right.patch),
-    )
-}
-
-fn sem_version_less(left: SemVersion, right: SemVersion) -> bool {
-    sem_version_compare(left, right).is_lt()
-}
-
-fn sem_version_at_least(left: SemVersion, right: SemVersion) -> bool {
-    !sem_version_less(left, right)
 }
 
 fn registry_home() -> Result[string, string] {
@@ -170,26 +102,11 @@ fn select_registry_version(root: string, requirement: DependencyRequirement) -> 
     string,
     string,
 ] {
-    let Some(minimum) = parse_sem_version(requirement.version) else {
+    let Some(minimum) = resolver::parse_sem_version(requirement.version) else {
         return Result::Err(f"invalid semver `{requirement.version}`")
     };
     let versions = registry_versions(root, requirement.name)?;
-    let mut selected: Option[string] = Option::None;
-    let mut selected_version: Option[SemVersion] = Option::None;
-    for version in versions {
-        match parse_sem_version(version) {
-            Some(parsed) => if sem_version_at_least(parsed, minimum)
-                && match selected_version {
-                    Some(current) => sem_version_less(parsed, current),
-                    None => true,
-                } {
-                selected = Option::Some(version);
-                selected_version = Option::Some(parsed);
-            },
-            None => return Result::Err(f"invalid registry semver `{version}`"),
-        }
-    }
-    selected.ok_or(
+    resolver::minimum_version(versions, minimum, |version| f"invalid registry semver `{version}`")?.ok_or(
         f"registry has no version for {requirement.name} satisfying >= {requirement.version}",
     )
 }
@@ -215,141 +132,6 @@ fn module_directory(registry: string, module_name: string, version: string) -> R
     }
 }
 
-fn override_root(overrides: Vec[LocalModule], name: string) -> Option[string] {
-    for value in overrides {
-        if value.name == name {
-            return Option::Some(value.root)
-        }
-    }
-    Option::None
-}
-
-fn collect_local_dependencies(
-    owner: string,
-    dependencies: Vec[DependencyRequirement],
-    overrides: Vec[LocalModule],
-    sources: HashMap[string, string],
-    hints: HashMap[string, string],
-    visited: collections::HashSet[string],
-    registry_root: string,
-) -> () {
-    if !visited.insert(owner) {
-        return
-    }
-    for dependency in dependencies {
-        let replacement = override_root(overrides, dependency.name);
-        let declared = replacement.is_some() || dependency.path.is_some();
-        let local = match replacement {
-            Some(value) => Option::Some(value),
-            None => match dependency.path {
-                Some(value) => Option::Some(relative_local_path(owner, value)),
-                None => hints.get(dependency.name),
-            },
-        };
-        if let Some(directory) = local {
-            let Ok(directory) = fs::canonicalize(directory) else {
-                continue
-            };
-            let Ok(manifest) = load_dependency_manifest(path::join(directory, MANIFEST_FILENAME)) else {
-                continue
-            };
-            if manifest.module_path != dependency.name {
-                continue
-            }
-            if declared && sources.get(dependency.name).is_none() {
-                sources.set(dependency.name, directory);
-            }
-            collect_local_dependencies(
-                directory,
-                manifest.dependencies,
-                overrides,
-                sources,
-                hints,
-                visited,
-                registry_root,
-            );
-        } else if let Ok(version) = select_registry_version(registry_root, dependency) {
-            let directory = path::join(
-                path::join(registry_root, dependency.name.replace("::", "/")),
-                version,
-            );
-            if let Ok(manifest) = load_dependency_manifest(path::join(directory, MANIFEST_FILENAME)) {
-                if manifest.module_path == dependency.name {
-                    let dependencies: Vec[DependencyRequirement] = Vec::new();
-                    for requirement in manifest.dependencies {
-                        if requirement.path.is_none() {
-                            dependencies.push(requirement)
-                        }
-                    }
-                    collect_local_dependencies(
-                        directory,
-                        dependencies,
-                        overrides,
-                        sources,
-                        hints,
-                        visited,
-                        registry_root,
-                    );
-                }
-            }
-        }
-    }
-}
-
-fn discover_local_sources(
-    owner: string,
-    dependencies: Vec[DependencyRequirement],
-    overrides: Vec[LocalModule],
-    registry_root: string,
-) -> Result[HashMap[string, string], string] {
-    let mut hints: HashMap[string, string] = HashMap::new();
-    for _ in 0..128 {
-        let sources: HashMap[string, string] = HashMap::new();
-        collect_local_dependencies(
-            owner,
-            dependencies,
-            overrides,
-            sources,
-            hints,
-            collections::HashSet::new(),
-            registry_root,
-        );
-        let mut stable = sources.len() == hints.len();
-        for (name, directory) in sources.entries() {
-            if hints.get(name) != Option::Some(directory) {
-                stable = false;
-            }
-        }
-        if stable {
-            return Result::Ok(sources)
-        }
-        hints = sources;
-    }
-    Result::Err("local dependency source selection did not stabilize")
-}
-
-fn verify_module_dependencies(
-    name: string,
-    selected: collections::IndexMap[string, ResolvedModule],
-    visiting: collections::HashSet[string],
-    done: collections::HashSet[string],
-) -> Result[(), string] {
-    if done.contains(name) {
-        return Result::Ok(())
-    }
-    if !visiting.insert(name) {
-        return Result::Err("dependency cycle involving " + name)
-    }
-    if let Some(module) = selected.get(name) {
-        for dependency in module.dependencies {
-            verify_module_dependencies(dependency.name, selected, visiting, done)?;
-        }
-    }
-    let _ = visiting.remove(name);
-    let _ = done.insert(name);
-    Result::Ok(())
-}
-
 fn resolve_external_modules_at(module_root: string, root: string) -> Result[
     Vec[ResolvedModule],
     string,
@@ -357,97 +139,16 @@ fn resolve_external_modules_at(module_root: string, root: string) -> Result[
     let module_root = fs::canonicalize(module_root).map_err(|error| error.to_string())?;
     let root_manifest = load_dependency_manifest(path::join(module_root, MANIFEST_FILENAME))?;
     let overrides = local_overrides(module_root, root_manifest)?;
-    let queue: collections::Deque[(DependencyRequirement, string, bool)] = collections::Deque::new();
-    for dependency in root_manifest.dependencies {
-        queue.push_back((dependency, module_root, true))
-    }
-    let selected: collections::IndexMap[string, ResolvedModule] = collections::IndexMap::new();
-    let local_sources = discover_local_sources(
+    resolver::resolve(
+        RegistryProvider {},
         module_root,
-        root_manifest.dependencies,
+        resolver::Manifest {
+            module_path: root_manifest.module_path,
+            dependencies: root_manifest.dependencies,
+        },
         overrides,
         root,
-    )?;
-    while !queue.is_empty() {
-        let Some((requirement, owner, local_owner)) = queue.pop_front() else {
-            break;
-        };
-        let _ = parse_sem_version(requirement.version).ok_or(
-            "invalid dependency semver " + requirement.version,
-        )?;
-        if requirement.name == root_manifest.module_path {
-            return Result::Err("dependency cycle involving " + requirement.name)
-        }
-        if !local_owner && requirement.path.is_some() {
-            return Result::Err(
-                "registry module cannot declare a local path dependency " + requirement.name,
-            )
-        }
-        let replacement = override_root(overrides, requirement.name);
-        let local = match replacement {
-            Some(value) => Option::Some(value),
-            None => match requirement.path {
-                Some(value) => Option::Some(relative_local_path(owner, value)),
-                None => local_sources.get(requirement.name),
-            },
-        };
-        let (version, directory) = match local {
-            Some(directory) => {
-                let directory = fs::canonicalize(directory).map_err(|error| error.to_string())?;
-                if replacement.is_none() {
-                    if let Some(previous) = local_sources.get(requirement.name) {
-                        if previous != directory {
-                            return Result::Err("conflicting local sources for " + requirement.name)
-                        }
-                    }
-                }
-                local_sources.set(requirement.name, directory);
-                ("local", directory)
-            },
-            None => {
-                let version = select_registry_version(root, requirement)?;
-                (version, module_directory(root, requirement.name, version)?)
-            },
-        };
-        let update = match selected.get(requirement.name) {
-            Some(current) => if version == "local" {
-                current.version != "local" || current.root != directory
-            } else if current.version == "local" {
-                false
-            } else {
-                sem_version_less(
-                    parse_sem_version(current.version).ok_or("invalid selected version")?,
-                    parse_sem_version(version).ok_or("invalid selected version")?,
-                )
-            },
-            None => true,
-        };
-        if update {
-            let module_manifest = load_dependency_manifest(path::join(directory, MANIFEST_FILENAME))?;
-            if module_manifest.module_path != requirement.name {
-                return Result::Err(
-                    "dependency " + requirement.name + " declares module path "
-                        + module_manifest.module_path,
-                )
-            }
-            let resolved = ResolvedModule {
-                name: requirement.name,
-                version,
-                root: directory,
-                dependencies: module_manifest.dependencies,
-            };
-            let _ = selected.insert(requirement.name, resolved);
-            for dependency in module_manifest.dependencies {
-                queue.push_back((dependency, directory, version == "local"))
-            }
-        }
-    }
-    let visiting = collections::HashSet::new();
-    let done = collections::HashSet::new();
-    for (name, _) in selected {
-        verify_module_dependencies(name, selected, visiting, done)?;
-    }
-    Result::Ok(selected.values())
+    )
 }
 
 fn resolve_external_modules(module_root: string) -> Result[Vec[ResolvedModule], string] {

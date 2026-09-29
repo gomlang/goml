@@ -1,0 +1,284 @@
+package resolver;
+
+use gomlang::toolchain_manifest as config;
+use std::collections;
+use std::path;
+
+pub struct Manifest {
+    pub module_path: string,
+    pub dependencies: Vec[config::Dependency],
+}
+
+pub struct ResolvedModule {
+    pub name: string,
+    pub version: string,
+    pub root: string,
+    pub dependencies: Vec[config::Dependency],
+}
+
+pub enum VersionUse {
+    Dependency,
+    Selected,
+}
+
+pub trait Provider {
+    type Error;
+    fn load(self, filename: string) -> Result[Manifest, Self::Error];
+    fn canonicalize(self, directory: string) -> Result[string, Self::Error];
+    fn select(self, root: string, dependency: config::Dependency) -> Result[
+        (string, string),
+        Self::Error,
+    ];
+    fn version_error(self, version: string, usage: VersionUse) -> Self::Error;
+    fn failure(self, message: string) -> Self::Error;
+}
+
+fn checked_version[P: Provider](provider: P, version: string, usage: VersionUse) -> Result[
+    SemVersion,
+    P::Error,
+] {
+    match parse_sem_version(version) {
+        Some(value) => Ok(value),
+        None => Err(provider.version_error(version, usage)),
+    }
+}
+
+fn override_root(overrides: Vec[config::LocalModule], name: string) -> Option[string] {
+    for value in overrides {
+        if value.name == name {
+            return Option::Some(value.root)
+        }
+    }
+    Option::None
+}
+
+fn collect_local_dependencies[P: Provider](
+    provider: P,
+    owner: string,
+    dependencies: Vec[config::Dependency],
+    overrides: Vec[config::LocalModule],
+    sources: HashMap[string, string],
+    hints: HashMap[string, string],
+    visited: collections::HashSet[string],
+    registry_root: string,
+) -> () {
+    if !visited.insert(owner) {
+        return
+    }
+    for dependency in dependencies {
+        let replacement = override_root(overrides, dependency.name);
+        let declared = replacement.is_some() || dependency.path.is_some();
+        let local = match replacement {
+            Some(value) => Option::Some(value),
+            None => match dependency.path {
+                Some(value) => Option::Some(config::relative_local_path(owner, value)),
+                None => hints.get(dependency.name),
+            },
+        };
+        if let Some(directory) = local {
+            let Ok(directory) = provider.canonicalize(directory) else {
+                continue
+            };
+            let Ok(manifest) = provider.load(path::join(directory, config::FILENAME)) else {
+                continue
+            };
+            if manifest.module_path != dependency.name {
+                continue
+            }
+            if declared && sources.get(dependency.name).is_none() {
+                sources.set(dependency.name, directory);
+            }
+            collect_local_dependencies(
+                provider,
+                directory,
+                manifest.dependencies,
+                overrides,
+                sources,
+                hints,
+                visited,
+                registry_root,
+            );
+        } else if let Ok((_, directory)) = provider.select(registry_root, dependency) {
+            if let Ok(manifest) = provider.load(path::join(directory, config::FILENAME)) {
+                if manifest.module_path == dependency.name {
+                    let dependencies: Vec[config::Dependency] = Vec::new();
+                    for requirement in manifest.dependencies {
+                        if requirement.path.is_none() {
+                            dependencies.push(requirement)
+                        }
+                    }
+                    collect_local_dependencies(
+                        provider,
+                        directory,
+                        dependencies,
+                        overrides,
+                        sources,
+                        hints,
+                        visited,
+                        registry_root,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn discover_local_sources[P: Provider](
+    provider: P,
+    owner: string,
+    dependencies: Vec[config::Dependency],
+    overrides: Vec[config::LocalModule],
+    registry_root: string,
+) -> Result[HashMap[string, string], P::Error] {
+    let mut hints: HashMap[string, string] = HashMap::new();
+    for _ in 0..128 {
+        let sources: HashMap[string, string] = HashMap::new();
+        collect_local_dependencies(
+            provider,
+            owner,
+            dependencies,
+            overrides,
+            sources,
+            hints,
+            collections::HashSet::new(),
+            registry_root,
+        );
+        let mut stable = sources.len() == hints.len();
+        for (name, directory) in sources.entries() {
+            if hints.get(name) != Option::Some(directory) {
+                stable = false;
+            }
+        }
+        if stable {
+            return Result::Ok(sources)
+        }
+        hints = sources;
+    }
+    Result::Err(provider.failure("local dependency source selection did not stabilize"))
+}
+
+fn verify_module_dependencies[P: Provider](
+    provider: P,
+    name: string,
+    selected: collections::IndexMap[string, ResolvedModule],
+    visiting: collections::HashSet[string],
+    done: collections::HashSet[string],
+) -> Result[(), P::Error] {
+    if done.contains(name) {
+        return Result::Ok(())
+    }
+    if !visiting.insert(name) {
+        return Result::Err(provider.failure("dependency cycle involving " + name))
+    }
+    if let Some(module) = selected.get(name) {
+        for dependency in module.dependencies {
+            verify_module_dependencies(provider, dependency.name, selected, visiting, done)?;
+        }
+    }
+    let _ = visiting.remove(name);
+    let _ = done.insert(name);
+    Result::Ok(())
+}
+
+pub fn resolve[P: Provider](
+    provider: P,
+    module_root: string,
+    root_manifest: Manifest,
+    overrides: Vec[config::LocalModule],
+    root: string,
+) -> Result[Vec[ResolvedModule], P::Error] {
+    let queue: collections::Deque[(config::Dependency, string, bool)] = collections::Deque::new();
+    for dependency in root_manifest.dependencies {
+        queue.push_back((dependency, module_root, true))
+    }
+    let selected: collections::IndexMap[string, ResolvedModule] = collections::IndexMap::new();
+    let local_sources = discover_local_sources(
+        provider,
+        module_root,
+        root_manifest.dependencies,
+        overrides,
+        root,
+    )?;
+    while let Some((requirement, owner, local_owner)) = queue.pop_front() {
+        let _ = checked_version(provider, requirement.version, VersionUse::Dependency)?;
+        if requirement.name == root_manifest.module_path {
+            return Result::Err(provider.failure("dependency cycle involving " + requirement.name))
+        }
+        if !local_owner && requirement.path.is_some() {
+            return Result::Err(
+                provider.failure(
+                    "registry module cannot declare a local path dependency " + requirement.name,
+                ),
+            )
+        }
+        let replacement = override_root(overrides, requirement.name);
+        let local = match replacement {
+            Some(value) => Option::Some(value),
+            None => match requirement.path {
+                Some(value) => Option::Some(config::relative_local_path(owner, value)),
+                None => local_sources.get(requirement.name),
+            },
+        };
+        let (version, directory) = match local {
+            Some(directory) => {
+                let directory = provider.canonicalize(directory)?;
+                if replacement.is_none() {
+                    if let Some(previous) = local_sources.get(requirement.name) {
+                        if previous != directory {
+                            return Result::Err(
+                                provider.failure(
+                                    "conflicting local sources for " + requirement.name,
+                                ),
+                            )
+                        }
+                    }
+                }
+                local_sources.set(requirement.name, directory);
+                ("local", directory)
+            },
+            None => {
+                provider.select(root, requirement)?
+            },
+        };
+        let update = match selected.get(requirement.name) {
+            Some(current) => if version == "local" {
+                current.version != "local" || current.root != directory
+            } else if current.version == "local" {
+                false
+            } else {
+                compare_versions(
+                    checked_version(provider, current.version, VersionUse::Selected)?,
+                    checked_version(provider, version, VersionUse::Selected)?,
+                ).is_lt()
+            },
+            None => true,
+        };
+        if update {
+            let module_manifest = provider.load(path::join(directory, config::FILENAME))?;
+            if module_manifest.module_path != requirement.name {
+                return Result::Err(
+                    provider.failure(
+                        "dependency " + requirement.name + " declares module path "
+                            + module_manifest.module_path,
+                    ),
+                )
+            }
+            let resolved = ResolvedModule {
+                name: requirement.name,
+                version,
+                root: directory,
+                dependencies: module_manifest.dependencies,
+            };
+            let _ = selected.insert(requirement.name, resolved);
+            for dependency in module_manifest.dependencies {
+                queue.push_back((dependency, directory, version == "local"))
+            }
+        }
+    }
+    let visiting = collections::HashSet::new();
+    let done = collections::HashSet::new();
+    for (name, _) in selected {
+        verify_module_dependencies(provider, name, selected, visiting, done)?;
+    }
+    Result::Ok(selected.values())
+}
