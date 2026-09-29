@@ -1,0 +1,186 @@
+package resolver;
+
+use gomlang::toolchain_manifest as config;
+use std::path;
+use std::testing;
+
+#[derive(Debug, PartialEq)]
+enum TestError {
+    Missing(string),
+    InvalidVersion(string),
+    Message(string),
+}
+
+struct MemoryProvider {
+    manifests: HashMap[string, Manifest],
+    versions: HashMap[string, Vec[string]],
+}
+
+impl Provider for MemoryProvider {
+    type Error = TestError;
+
+    fn load(self: MemoryProvider, filename: string) -> Result[Manifest, TestError] {
+        self.manifests.get(filename).ok_or(TestError::Missing(filename))
+    }
+
+    fn canonicalize(self: MemoryProvider, directory: string) -> Result[string, TestError] {
+        Ok(path::clean(directory))
+    }
+
+    fn select(self: MemoryProvider, root: string, dependency: config::Dependency) -> Result[
+        (string, string),
+        TestError,
+    ] {
+        let minimum = parse_sem_version(dependency.version).ok_or(
+            TestError::InvalidVersion(dependency.version),
+        )?;
+        let versions = self.versions.get(dependency.name).unwrap_or(Vec::new());
+        let version = minimum_version(versions, minimum, TestError::InvalidVersion)?.ok_or(
+            TestError::Missing(dependency.name),
+        )?;
+        Ok((version, path::join(path::join(root, dependency.name.replace("::", "/")), version)))
+    }
+
+    fn version_error(self: MemoryProvider, version: string, usage: VersionUse) -> TestError {
+        TestError::InvalidVersion(version)
+    }
+
+    fn failure(self: MemoryProvider, message: string) -> TestError {
+        TestError::Message(message)
+    }
+}
+
+fn memory_provider() -> MemoryProvider {
+    MemoryProvider { manifests: HashMap::new(), versions: HashMap::new() }
+}
+
+fn requirement(name: string, version: string, local: Option[string]) -> config::Dependency {
+    config::Dependency { name, version, path: local }
+}
+
+fn store_module(
+    provider: MemoryProvider,
+    root: string,
+    name: string,
+    dependencies: Vec[config::Dependency],
+) -> () {
+    provider.manifests.set(
+        path::join(root, config::FILENAME),
+        Manifest { module_path: name, dependencies },
+    );
+}
+
+#[test]
+fn selects_lowest_satisfying_version_and_rejects_invalid_entries() -> () {
+    let minimum = testing::expect_some(parse_sem_version("1.2.3"), "minimum");
+    let versions = Vec::from_array(["2.0.0", "1.2.4", "1.2.2", "1.2.3", "1.2.3"]);
+    testing::assert(
+        testing::expect_ok(
+            minimum_version(versions, minimum, TestError::InvalidVersion),
+            "selection",
+        )
+            == Option::Some("1.2.3"),
+    );
+    testing::assert(
+        testing::expect_ok(
+            minimum_version(Vec::from_array(["1.2.2"]), minimum, TestError::InvalidVersion),
+            "no match",
+        ).is_none(),
+    );
+    testing::assert_eq(
+        testing::expect_err(
+            minimum_version(Vec::from_array(["1.2.3", "bad"]), minimum, TestError::InvalidVersion),
+            "invalid version",
+        ),
+        TestError::InvalidVersion("bad"),
+    );
+}
+
+#[test]
+fn upgrades_shared_dependencies_and_preserves_discovery_order() -> () {
+    let provider = memory_provider();
+    provider.versions.set("demo::dep", Vec::from_array(["2.0.0", "1.0.0"]));
+    provider.versions.set("demo::consumer", Vec::from_array(["1.0.0"]));
+    store_module(provider, "/registry/demo/dep/1.0.0", "demo::dep", Vec::new());
+    store_module(provider, "/registry/demo/dep/2.0.0", "demo::dep", Vec::new());
+    store_module(
+        provider,
+        "/registry/demo/consumer/1.0.0",
+        "demo::consumer",
+        Vec::from_array([requirement("demo::dep", "2.0.0", None)]),
+    );
+    let root = Manifest {
+        module_path: "demo::app",
+        dependencies: Vec::from_array(
+            [requirement("demo::dep", "1.0.0", None), requirement("demo::consumer", "1.0.0", None)],
+        ),
+    };
+    let modules = testing::expect_ok(
+        resolve(provider, "/app", root, Vec::new(), "/registry"),
+        "resolve diamond",
+    );
+    testing::assert_eq(modules.len(), 2);
+    testing::assert_eq(modules[0].name, "demo::dep");
+    testing::assert_eq(modules[0].version, "2.0.0");
+    testing::assert_eq(modules[1].name, "demo::consumer");
+}
+
+#[test]
+fn finds_transitive_local_sources_before_selecting_versions() -> () {
+    let provider = memory_provider();
+    store_module(
+        provider,
+        "/middle",
+        "demo::middle",
+        Vec::from_array([requirement("demo::leaf", "0.0.0", Some("../leaf"))]),
+    );
+    store_module(provider, "/leaf", "demo::leaf", Vec::new());
+    let root = Manifest {
+        module_path: "demo::app",
+        dependencies: Vec::from_array(
+            [
+                requirement("demo::leaf", "9.0.0", None),
+                requirement("demo::middle", "0.0.0", Some("../middle")),
+            ],
+        ),
+    };
+    let modules = testing::expect_ok(
+        resolve(provider, "/app", root, Vec::new(), "/registry"),
+        "resolve local graph",
+    );
+    testing::assert_eq(modules.len(), 2);
+    testing::assert_eq(modules[0].root, "/leaf");
+    testing::assert_eq(modules[0].version, "local");
+}
+
+#[test]
+fn retains_provider_errors_and_detects_nonroot_cycles() -> () {
+    let provider = memory_provider();
+    let root = Manifest {
+        module_path: "demo::app",
+        dependencies: Vec::from_array([requirement("demo::one", "0.0.0", Some("../one"))]),
+    };
+    testing::assert_eq(
+        testing::expect_err(
+            resolve(provider, "/app", root, Vec::new(), "/registry"),
+            "missing manifest",
+        ),
+        TestError::Missing("/one/goml.toml"),
+    );
+    store_module(
+        provider,
+        "/one",
+        "demo::one",
+        Vec::from_array([requirement("demo::two", "0.0.0", Some("../two"))]),
+    );
+    store_module(
+        provider,
+        "/two",
+        "demo::two",
+        Vec::from_array([requirement("demo::one", "0.0.0", Some("../one"))]),
+    );
+    testing::assert_eq(
+        testing::expect_err(resolve(provider, "/app", root, Vec::new(), "/registry"), "cycle"),
+        TestError::Message("dependency cycle involving demo::one"),
+    );
+}
