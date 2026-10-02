@@ -62,26 +62,26 @@ goml-X.Y.Z-linux-amd64/
 └── lib/
     ├── builtin/
     │   ├── goml.toml
-    │   ├── contract.gom
-    │   ├── runtime.gom
-    │   ├── impls.gom
-    │   ├── intrinsics.gom
-    │   ├── language.gom
-    │   ├── derive.gom
-    │   ├── ordering.gom
-    │   └── numeric.gom
+    │   ├── contract.goml
+    │   ├── runtime.goml
+    │   ├── impls.goml
+    │   ├── intrinsics.goml
+    │   ├── language.goml
+    │   ├── derive.goml
+    │   ├── ordering.goml
+    │   └── numeric.goml
     ├── cabi/
     │   ├── go.mod
     │   └── ...
     ├── prelude/
     │   ├── goml.toml
-    │   └── prelude.gom
+    │   └── prelude.goml
     └── std/
         ├── goml.toml
         └── ...
 ```
 
-The compiler resolves `lib` relative to its executable. The archive must preserve this layout exactly. `builtin`, `prelude`, and `std` are separate GoML projects; flat `builtin_*.gom` files must not be packaged.
+The compiler resolves `lib` relative to its executable. The archive must preserve this layout exactly. `builtin`, `prelude`, and `std` are separate GoML projects; flat `builtin_*.goml` files must not be packaged.
 
 The packaged `lib/cabi` module contains the first-party dynamic C ABI runtime. Keep its Go and assembly sources together; `goml-c-bind --runtime-dir` resolves this directory relative to the installed helper. Release smoke tests check this path after archive relocation.
 

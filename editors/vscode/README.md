@@ -1,5 +1,7 @@
 # GoML VS Code extension
 
+The canonical GoML source suffix is `.goml`. The extension also recognizes legacy `.gom` files during the transition. Both suffixes receive the same language services and file watching.
+
 The extension provides syntax highlighting, diagnostics, hover, completion, go-to-definition, signature help, inlay hints, formatting, test code lenses, and quick fixes.
 
 Unused `Result` and invalid `?` diagnostics expose stable codes and handling suggestions. Propagation errors link to the enclosing return type. The unused-Result quick fix makes ignoring the error explicit with `let _ = ...`; review that choice before applying it. Fixes from an older document version are discarded.

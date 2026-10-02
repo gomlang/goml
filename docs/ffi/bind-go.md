@@ -8,7 +8,7 @@ The configuration uses versioned JSON and explicitly selects each native functio
 {
   "version": 1,
   "package": "bindings",
-  "output": "bindings/generated.gom",
+  "output": "bindings/generated.goml",
   "go_package": "native_bindings",
   "go_output": "native_bindings/generated.go",
   "go_import_path": "example.com/host/native_bindings",

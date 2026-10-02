@@ -1,6 +1,6 @@
 # GoML language guide
 
-This guide describes the GoML syntax, type rules, tools, and public library APIs implemented in this repository. Use it when writing, modifying, and reviewing `.gom` source. Similarities to Rust, Go, or OCaml do not imply that their syntax or APIs are supported.
+This guide describes the GoML syntax, type rules, tools, and public library APIs implemented in this repository. Use it when writing, modifying, and reviewing `.goml` source. Similarities to Rust, Go, or OCaml do not imply that their syntax or APIs are supported.
 
 GoML is a statically typed language with garbage collection. Its syntax is close to Rust, while its semantics are closer to ML. The compiler monomorphizes generics and lambda-lifts GoML closures before emitting Go. Explicit Go FFI can preserve native generic types and function values. GoML has no ownership, borrowing, lifetimes, or manual memory management.
 
@@ -16,7 +16,7 @@ Build and installation instructions are in the [repository README](../README.md)
 
 ## Essential rules
 
-1. The project source code uses `.gom`; the project root directory uses `goml.toml` to declare the canonical module path.
+1. The canonical source suffix is `.goml`; `.gom` remains accepted during the transition (including mixed packages and legacy `*_test.gom` files). New projects and packaged toolchain sources use `.goml`; the project root directory uses `goml.toml` to declare the canonical module path.
 2. Each source file in the project first writes `package name;`, then writes the file's own `use`, and finally writes the top-level definition.
 3. Parameters of top-level functions must have types; the return type is fixed to `()` when omitted and is not inferred from the function body.
 4. Generics use square brackets: `Vec[i32]`, `fn id[T](x: T) -> T`, not `<...>`.
@@ -28,7 +28,7 @@ Build and installation instructions are in the [repository README](../README.md)
 10. For cross-package calls, write `alias::item`. Top-level items, struct fields, and inherent methods must all be marked with `pub` as required.
 11. Before using trait method syntax across packages, import the package and trait with `use alias::Trait;` or a braced import; when in doubt, use UFCS: `Trait::method(value)`.
 12. Use `module::path` for a package below the current module root. Do not generate `mod`, `crate::`, `self::`, `super::`, root paths `::x`, Rust references, or Go `var` / `:=`. A user `extern fn` is valid only with the typed Go FFI attribute described below.
-13. The test function uses `#[test]`, which must have no parameters, no type parameters and return `()`; the white-box test is placed in `*_test.gom` of the same package, and the black-box test is placed in the `tests/` directory of the package under test.
+13. The test function uses `#[test]`, which must have no parameters, no type parameters and return `()`; the white-box test is placed in `*_test.goml` of the same package, and the black-box test is placed in the `tests/` directory of the package under test.
 
 ## Minimal program
 
@@ -207,7 +207,7 @@ target-dir = "_artifact"
 
 Dependency versions must use the strict `X.Y.Z` form. A dependency version is a minimum version requirement resolved using MVS; there is currently no `goml.lock`.
 
-`[dev-dependencies]` uses the same version and path forms. These dependencies are available to the invoking module's `*_test.gom` files, `tests/` packages and root `examples/` tree. Production sources cannot import them, even during a test build. Dependencies of another module do not inherit its development dependencies. Test and example commands resolve the union of normal and development requirements through MVS; ordinary check/build/run commands resolve only normal requirements. A development helper may depend back on the current library: that edge uses the current source without introducing a second copy. Production dependency cycles remain errors, including cycles introduced by a version selected for development. A helper that imports the package under test must be used from black-box tests or examples; importing it from that same package's white-box tests still creates an unsupported package cycle.
+`[dev-dependencies]` uses the same version and path forms. These dependencies are available to the invoking module's `*_test.goml` files, `tests/` packages and root `examples/` tree. Production sources cannot import them, even during a test build. Dependencies of another module do not inherit its development dependencies. Test and example commands resolve the union of normal and development requirements through MVS; ordinary check/build/run commands resolve only normal requirements. A development helper may depend back on the current library: that edge uses the current source without introducing a second copy. Production dependency cycles remain errors, including cycles introduced by a version selected for development. A helper that imports the package under test must be used from black-box tests or examples; importing it from that same package's white-box tests still creates an unsupported package cycle.
 
 ```toml
 [dev-dependencies]
@@ -250,16 +250,16 @@ Each module path segment must be non-empty and may contain ASCII letters, digits
 
 ### Examples and downstream verification
 
-Named examples share the module-root manifest and use both normal and development dependencies. Put each executable in `examples/<name>/main.gom`, declaring `package main;` and `fn main() -> ()`. Names contain ASCII letters, digits, `_`, or `-`. An example can contain helper packages, white-box tests and direct `tests/` packages. An example directory containing its own `goml.toml` is an independent module, not a named example.
+Named examples share the module-root manifest and use both normal and development dependencies. Put each executable in `examples/<name>/main.goml`, declaring `package main;` and `fn main() -> ()`. Names contain ASCII letters, digits, `_`, or `-`. An example can contain helper packages, white-box tests and direct `tests/` packages. An example directory containing its own `goml.toml` is an independent module, not a named example.
 
 ```text
 library/
 ├── goml.toml
-├── library.gom
-├── tests/api_test.gom
+├── library.goml
+├── tests/api_test.goml
 └── examples/basic/
-    ├── main.gom
-    └── tests/example_test.gom
+    ├── main.goml
+    └── tests/example_test.goml
 ```
 
 For a library with module path `alice::library`, the example package is `alice::library::examples::basic`. Production packages and other modules cannot import example packages. Examples use the existing GoML source grammar; no target declarations or extra manifests are needed.
@@ -349,7 +349,7 @@ The configured production directory will not participate in package discovery an
 
 ### Directory packages
 
-Each directory containing a `.gom` file is a package. All source files in the same directory must declare the same package name:
+Each directory containing a `.goml` file is a package. All source files in the same directory must declare the same package name:
 
 ```goml
 package utils;
@@ -361,11 +361,11 @@ A typical project could be:
 
 ```text
 goml.toml
-main.gom
-utils/utils.gom
+main.goml
+utils/utils.goml
 ```
 
-`utils/utils.gom`:
+`utils/utils.goml`:
 
 ```goml
 package utils;
@@ -375,7 +375,7 @@ pub fn message() -> string {
 }
 ```
 
-`main.gom`:
+`main.goml`:
 
 ```goml
 package main;
@@ -2973,15 +2973,15 @@ fn is_left(value: string, expected: bool) -> () {
 
 ### White-box and black-box tests
 
-The white-box test file and the source code under test are located in the same package directory. The file name must end with `_test.gom` and declare the same package name:
+The white-box test file and the source code under test are located in the same package directory. The file name must end with `_test.goml` and declare the same package name:
 
 ```text
 math/
-├── math.gom
-└── math_test.gom
+├── math.goml
+└── math_test.goml
 ```
 
-`math_test.gom`:
+`math_test.goml`:
 
 ```goml
 package math;
@@ -2994,19 +2994,19 @@ fn private_helper_works() -> () {
 }
 ```
 
-The test build will merge the production source code and all `*_test.gom` in the same directory into a single package, so white-box testing can access the private top-level items of the package. These files will not participate in compilation when executing normal `goml check`, `goml build` or `goml run` for production targets.
+The test build will merge the production source code and all `*_test.goml` in the same directory into a single package, so white-box testing can access the private top-level items of the package. These files will not participate in compilation when executing normal `goml check`, `goml build` or `goml run` for production targets.
 
 Black-box tests are located in the `tests/` directory of the package under test. This directory as a whole constitutes a package named `tests`. The package under test should be imported explicitly and only its public API can be accessed; nested test suites cannot be created under `tests/`:
 
 ```text
 math/
-├── math.gom
+├── math.goml
 └── tests/
-    ├── api_test.gom
-    └── smoke_test.gom
+    ├── api_test.goml
+    └── smoke_test.goml
 ```
 
-`math/tests/api_test.gom`:
+`math/tests/api_test.goml`:
 
 ```goml
 package tests;
@@ -7207,7 +7207,7 @@ In a condition chain containing `let`, `boolean_term` and `initializer_term` are
 After running `just make`, verify a standalone source file from the repository root:
 
 ```sh
-stage2/bin/gomlc run-single path/to/main.gom
+stage2/bin/gomlc run-single path/to/main.goml
 ```
 
 For a project, run the installed driver from anywhere inside its module:

@@ -12,9 +12,9 @@ toolchain layout, builds and bootstrap verification.
 Run a single source or inspect an IR stage:
 
 ```sh
-stage2/bin/gomlc run-single file.gom
-stage2/bin/gomlc anf file.gom
-stage2/bin/gomlc run-single --dump-go file.gom
+stage2/bin/gomlc run-single file.goml
+stage2/bin/gomlc anf file.goml
+stage2/bin/gomlc run-single --dump-go file.goml
 ```
 
 The regression corpus and every generated golden file live in `gomlc/testdata`. Verify or update them with:

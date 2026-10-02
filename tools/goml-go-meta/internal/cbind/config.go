@@ -341,7 +341,7 @@ func Load(file string) (Project, error) {
 		return Project{}, err
 	}
 	goml, err := checkedPath(root, directory, c.Output)
-	if err != nil || filepath.Ext(goml) != ".gom" {
+	if err != nil || (filepath.Ext(goml) != ".goml" && filepath.Ext(goml) != ".gom") {
 		return Project{}, fmt.Errorf("invalid GoML output: %v", err)
 	}
 	goFile, err := checkedPath(root, directory, c.GoOutput)

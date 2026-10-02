@@ -135,14 +135,14 @@ With no file, or with a single `-`, the formatter reads stdin and writes stdout.
 
 `--check` exits 0 when every file is formatted, 1 when a change is needed, and 2 for argument, I/O, or parse errors.
 
-From anywhere inside a module, use the project driver to format every `.gom` file:
+From anywhere inside a module, use the project driver to format every `.goml` file (and legacy `.gom` files during the transition):
 
 ```text
 goml fmt
 goml fmt --check
 ```
 
-`goml fmt` searches upward for `goml.toml` and uses the same package graphs as module builds and tests. It formats the current module's production files, internal `*_test.gom` files, black-box `tests` packages, and named `examples/` with their tests, while excluding external dependencies. Development dependencies are resolved for test and example imports. Package discovery excludes `testdata`, the configured build target directory, hidden directories, and nested modules. `--check` does not write files.
+`goml fmt` searches upward for `goml.toml` and uses the same package graphs as module builds and tests. It formats the current module's production files, internal `*_test.goml` files, black-box `tests` packages, and named `examples/` with their tests, while excluding external dependencies. Development dependencies are resolved for test and example imports. Package discovery excludes `testdata`, the configured build target directory, hidden directories, and nested modules. `--check` does not write files.
 
 The formatter executable is resolved from `--formatter`, `GOMLFMT`, the directory containing `goml`, `GOML_HOME/bin`, then `PATH`.
 
