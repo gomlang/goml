@@ -102,7 +102,6 @@ if "$temporary/bin/gomlc" __builtin-interface > "$temporary/stdout" 2> "$tempora
 fi
 
 grep -F "could not read builtin resource $temporary/lib/builtin/contract.goml" "$temporary/stderr" >/dev/null
-grep -F "builtin/contract.gom" "$temporary/stderr" >/dev/null
 
 cd "$temporary"
 cp -R "$prefix/lib" "$temporary/lib"
@@ -115,8 +114,14 @@ if "$temporary/bin/gomlc" __prelude-interface > "$temporary/prelude-stdout" 2> "
 fi
 grep -F "could not read prelude resource $temporary/lib/prelude/prelude.goml" "$temporary/prelude-stderr" >/dev/null
 mv "$temporary/lib/prelude/prelude.goml.missing" "$temporary/lib/prelude/prelude.goml"
-while IFS= read -r -d '' source; do
-    mv -- "$source" "${source%l}"
-done < <(find "$temporary/lib/builtin" "$temporary/lib/prelude" "$temporary/lib/std" -type f -name '*.goml' -print0)
-"$temporary/bin/gomlc" __builtin-interface >/dev/null
-"$temporary/bin/gomlc" __prelude-interface >/dev/null
+mv "$temporary/lib/builtin/contract.goml" "$temporary/lib/builtin/contract.gom"
+if "$temporary/bin/gomlc" __builtin-interface > "$temporary/legacy-stdout" 2> "$temporary/legacy-stderr"; then
+    exit 1
+fi
+grep -F "could not read builtin resource $temporary/lib/builtin/contract.goml" "$temporary/legacy-stderr" >/dev/null
+mv "$temporary/lib/builtin/contract.gom" "$temporary/lib/builtin/contract.goml"
+mv "$temporary/lib/prelude/prelude.goml" "$temporary/lib/prelude/prelude.gom"
+if "$temporary/bin/gomlc" __prelude-interface > "$temporary/legacy-stdout" 2> "$temporary/legacy-stderr"; then
+    exit 1
+fi
+grep -F "could not read prelude resource $temporary/lib/prelude/prelude.goml" "$temporary/legacy-stderr" >/dev/null

@@ -182,3 +182,18 @@ func TestConfigurationRejectsAmbiguityAndUnsafePaths(t *testing.T) {
 		t.Fatal("followed manifest symlink")
 	}
 }
+
+func TestRejectsLegacyGoMLOutput(t *testing.T) {
+	p, _ := fixture(t)
+	p.Config.Output = "bindings/generated.gom"
+	data, err := json.Marshal(p.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p.File, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p.File); err == nil || !strings.Contains(err.Error(), "GoML output must end in .goml") {
+		t.Fatal(err)
+	}
+}
