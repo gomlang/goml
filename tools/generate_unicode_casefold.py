@@ -54,7 +54,7 @@ lines.extend([
 ])
 
 root = pathlib.Path(__file__).resolve().parents[1]
-target = root / "lib/std/unicode/casefold.gom"
+target = root / "lib/std/unicode/casefold.goml"
 formatter = os.environ.get("GOMLFMT", str(root / "stage2/bin/gomlfmt"))
 generated = subprocess.run(
     [formatter],

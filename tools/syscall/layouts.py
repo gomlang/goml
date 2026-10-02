@@ -6,7 +6,7 @@ import subprocess
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 MANIFEST = pathlib.Path(__file__).with_name("linux-amd64-layouts.json")
-TARGET = ROOT / "lib/std/os/linux/abi/records.gom"
+TARGET = ROOT / "lib/std/os/linux/abi/records.goml"
 WIDTHS = {"i16": 2, "u16": 2, "i32": 4, "u32": 4, "i64": 8, "u64": 8, "usize": 8}
 
 

@@ -1,0 +1,2422 @@
+package query;
+
+use module::ast;
+use module::cst;
+use module::ctir;
+use module::hir;
+use module::lexer;
+use module::parser;
+use module::tast;
+use std::fs;
+use std::testing;
+use std::text;
+
+fn assert_no_diagnostics(value: Analysis) -> () {
+    if !value.checked.diagnostics.is_empty() {
+        testing::fail(value.checked.diagnostics.get(0).message)
+    }
+}
+
+fn last_substring(value: string, expected: string) -> Option[isize] {
+    value.rfind(expected)
+}
+
+#[test]
+fn navigation_test_search_preserves_utf8_boundaries() -> () {
+    testing::assert(last_substring("界界name界name", "name") == Option::Some(13));
+    testing::assert(last_substring("界界name界name", "界") == Option::Some(10));
+    testing::assert(last_substring("界界name界name", "") == Option::Some(17));
+    testing::assert(last_substring("界", "missing").is_none());
+    testing::assert(last_substring("", "") == Option::Some(0));
+}
+
+fn has_completion(values: Vec[CompletionItem], expected: string) -> bool {
+    let found = Ref::new(false);
+    for value in values {
+        if value.label == expected {
+            found.set(true)
+        }
+    }
+    found.get()
+}
+
+fn assert_local_navigation(value: Analysis, source: string, name: string) -> () {
+    match last_substring(source, name) {
+        Some(offset) => {
+            let definitions = goto_definitions(value, offset);
+            testing::assert_eq(definitions.len(), 1);
+            testing::assert_eq(
+                source.byte_slice(definitions[0].span.start, definitions[0].span.end),
+                name,
+            );
+            match hover(value, offset) {
+                Some(result) => testing::assert_eq(result.contents, "isize"),
+                None => testing::fail("expected local hover for " + name),
+            }
+        },
+        None => testing::fail("expected local use for " + name),
+    }
+}
+
+fn completion_labels(values: Vec[CompletionItem]) -> string {
+    let builder = text::StringBuilder::new();
+    let count = Ref::new(0);
+    for value in values {
+        if count.get() > 0 {
+            builder.write_string(", ")
+        }
+        builder.write_string(value.label);
+        count.set(count.get() + 1)
+    }
+    builder.finish()
+}
+
+fn write_query_fixture(path: string, source: string) -> () {
+    if let Err(error) = fs::write_file_structured(path, source) {
+        testing::fail(error.to_string())
+    }
+}
+
+fn required_builtin_comptime_module() -> ctir::CtModule {
+    match builtin_comptime_module() {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            testing::fail("expected builtin comptime derive module");
+            ctir::empty_module("builtin")
+        },
+        Err(error) => {
+            testing::fail(error.to_string());
+            ctir::empty_module("builtin")
+        },
+    }
+}
+
+fn builtin_source_derive_expansion(source: string) -> string {
+    let expanded = hir::expand_derives_with_environment(
+        ast::lower(parser::parse(source)),
+        hir::DeriveEnvironment {
+            builtin: Option::Some(required_builtin_comptime_module()),
+            dependencies: Vec::new(),
+            reexports: Vec::new(),
+        },
+    );
+    if expanded.diagnostics.is_empty() {} else {
+        testing::fail(expanded.diagnostics[0].message)
+    }
+    let formatted = ast::pretty(expanded);
+    let inputs: Vec[(ast::LowerResult, string)] = Vec::from_array([(expanded, "derive_test.goml")]);
+    let files: Vec[hir::File] = Vec::new();
+    for lowered in hir::lower_expanded_package_files(inputs, "derive_test") {
+        if lowered.diagnostics.is_empty() {} else {
+            testing::fail(lowered.diagnostics[0].message)
+        }
+        match lowered.hir {
+            Some(file) => files.push(file),
+            None => testing::fail("expected expanded derive HIR"),
+        }
+    }
+    let checked = match builtin_hir_files() {
+        Ok(builtin_files) => match tast::builtin_dependency_environment(builtin_files) {
+            Ok(environment) => tast::check_package_files_for_link_with_environments(
+                files,
+                Vec::from_array([environment]),
+            ),
+            Err(error) => {
+                testing::fail(error.to_string());
+                tast::check_package_files_for_link_with_dependencies(files, Vec::new())
+            },
+        },
+        Err(error) => {
+            testing::fail(error.to_string());
+            tast::check_package_files_for_link_with_dependencies(files, Vec::new())
+        },
+    };
+    if checked.diagnostics.is_empty() {} else {
+        testing::fail(checked.diagnostics[0].message)
+    }
+    formatted
+}
+
+#[test]
+fn expands_builtin_derives_from_toolchain_source_handlers() -> () {
+    let expanded = builtin_source_derive_expansion(
+        \\#[derive(ToString, Debug, PartialEq, Eq, Hash)]
+        \\struct Pair[T] { left: T, label: string }
+        \\
+        \\#[derive(ToString, Debug, PartialEq, Eq, Hash)]
+        \\enum State[T] { Idle, One(T), Named { value: T, label: string } }
+        ,
+    );
+    testing::assert(expanded.contains("impl[T] ToString for Pair[T]"));
+    testing::assert(expanded.contains("impl[T] Debug for Pair[T]"));
+    testing::assert(expanded.contains("impl[T] PartialEq for Pair[T]"));
+    testing::assert(expanded.contains("impl[T] Eq for Pair[T]"));
+    testing::assert(expanded.contains("impl[T] Hash for Pair[T]"));
+    testing::assert(expanded.contains("impl[T] ToString for State[T]"));
+    testing::assert(expanded.contains("impl[T] Debug for State[T]"));
+    testing::assert(expanded.contains("impl[T] PartialEq for State[T]"));
+    testing::assert(expanded.contains("impl[T] Eq for State[T]"));
+    testing::assert(expanded.contains("impl[T] Hash for State[T]"));
+    testing::assert(expanded.contains("14695981039346656037"));
+    testing::assert(expanded.contains("1099511628211"))
+}
+
+#[test]
+fn builtin_derives_require_builtin_source_exports() -> () {
+    let expanded = hir::expand_derives_with_environment(
+        ast::lower(parser::parse("#[derive(Eq)] struct Key { value: isize }")),
+        hir::DeriveEnvironment {
+            builtin: Option::None,
+            dependencies: Vec::new(),
+            reexports: Vec::new(),
+        },
+    );
+    testing::assert_eq(expanded.diagnostics.len(), 1);
+    testing::assert(expanded.diagnostics[0].message.contains("derive name `Eq` is not in scope"))
+}
+
+#[test]
+fn parses_module_paths_and_package_names() -> () {
+    match manifest_module_path(
+        \\[build]
+        \\target-dir = "out"
+        \\
+        \\[module]
+        \\path = "alice::tools"
+        \\
+        ,
+    ) {
+        Some(value) => testing::assert_eq(value, "alice::tools"),
+        None => testing::fail("expected module path"),
+    }
+    match package_name("/workspace/tools", "alice::tools", "/workspace/tools/lsp/server") {
+        Ok(value) => {
+            testing::assert_eq(value, "alice::tools::lsp::server")
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn parses_module_paths_with_inline_comments() -> () {
+    match manifest_module_path(
+        \\[build] # output settings
+        \\
+        \\[module] # package identity
+        \\path = "alice::tools" # canonical path
+        \\
+        ,
+    ) {
+        Some(value) => testing::assert_eq(value, "alice::tools"),
+        None => testing::fail("expected module path"),
+    }
+}
+
+#[test]
+fn parses_only_exact_module_path_keys() -> () {
+    testing::assert(
+        manifest_module_path(
+            \\[module]
+            \\pathology = "wrong::path"
+            \\
+            ,
+        ).is_none(),
+    );
+    testing::assert(
+        manifest_module_path(
+            \\[module]
+            \\path_suffix = "wrong::suffix"
+            \\
+            ,
+        ).is_none(),
+    );
+    match manifest_module_path(
+        \\[module]
+        \\pathology = "wrong::path"
+        \\path_suffix = "wrong::suffix"
+        \\path = "alice::tools" # canonical path
+        \\
+        ,
+    ) {
+        Some(value) => testing::assert_eq(value, "alice::tools"),
+        None => testing::fail("expected exact module path"),
+    }
+}
+
+#[test]
+fn analyzes_package_files_with_unsaved_overrides() -> () {
+    let root = "../gomlc/testdata/module/project033_cross_file_pattern_constructor";
+    let main_path = root + "/main.goml";
+    let types_path = root + "/types.goml";
+    let source = "package main; pub fn answer() -> i32 { helper() }";
+    let overrides = Vec::new();
+    overrides.push(
+        SourceOverride { path: types_path, source: "package main; fn helper() -> i32 { 42 }" },
+    );
+    let analysis = analyze_with_overrides(main_path, source, overrides);
+    testing::assert_eq(analysis.package_name, "test::cross_file_pattern_constructor");
+    testing::assert_eq(analysis.checked.diagnostics.len(), 0);
+    match fs::read_file_structured(main_path) {
+        Ok(on_disk) => testing::assert(on_disk != source),
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn analyzes_local_package_dependencies() -> () {
+    let root = "../gomlc/testdata/module/project001";
+    let main_path = root + "/main.goml";
+    match fs::read_file_structured(main_path) {
+        Ok(source) => {
+            let analysis = analyze(main_path, source);
+            testing::assert_eq(analysis.package_name, "project001");
+            assert_no_diagnostics(analysis)
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn analyzes_and_navigates_module_root_imports() -> () {
+    let root = "../gomlc/testdata/module/project067_module_root";
+    let main_path = root + "/main.goml";
+    let source = match fs::read_file_structured(main_path) {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.to_string());
+            ""
+        },
+    };
+    let analysis = analyze(main_path, source);
+    testing::assert_eq(analysis.module_path, "test::module_root");
+    assert_no_diagnostics(analysis);
+    let use_path = "module::service";
+    match last_substring(source, use_path) {
+        Some(offset) => match goto_definition(analysis, offset + use_path.byte_len() - 1) {
+            Some(definition) => testing::assert(
+                definition.source_path.ends_with("/service/service.goml"),
+            ),
+            None => testing::fail("expected module-relative package definition"),
+        },
+        None => testing::fail("expected module-relative use path"),
+    }
+    for completion_source in Vec::from_array(
+        [
+            \\package main;
+            \\use module::
+            ,
+            "package main;\nuse\tmodule::",
+            \\package main;
+            \\use  module::
+            ,
+            \\package main;
+            \\use
+            \\module::
+            ,
+            \\package main;
+            \\use // package path
+            \\module::
+            ,
+            \\package main;
+            \\use module ::
+            ,
+            \\package main;
+            \\pub use module::
+            ,
+        ],
+    ) {
+        let completion_analysis = analyze(main_path, completion_source);
+        let items = completions(completion_analysis, completion_source.byte_len());
+        testing::assert(has_completion(items, "data"));
+        testing::assert(has_completion(items, "service"))
+    }
+    let scope_source =
+        \\package main;
+        \\use module::service; fn main() -> () { pri }
+    ;
+    match last_substring(scope_source, "pri") {
+        Some(offset) => testing::assert(
+            has_completion(completions(analyze(main_path, scope_source), offset + 3), "println"),
+        ),
+        None => testing::fail("expected scope completion prefix"),
+    }
+    let package_scope_source =
+        \\package main;
+        \\use module::service; fn main() -> () { ser }
+    ;
+    match last_substring(package_scope_source, "ser") {
+        Some(offset) => testing::assert(
+            has_completion(
+                completions(analyze(main_path, package_scope_source), offset + 3),
+                "service",
+            ),
+        ),
+        None => testing::fail("expected package scope completion prefix"),
+    }
+}
+
+#[test]
+fn analyzes_cross_package_comptime_derives() -> () {
+    let root = "../gomlc/testdata/module/project050_comptime_derive";
+    let main_path = root + "/main.goml";
+    match fs::read_file_structured(main_path) {
+        Ok(source) => assert_no_diagnostics(analyze(main_path, source)),
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn returns_cross_package_expanded_derive_source() -> () {
+    let root = "../gomlc/testdata/module/project050_comptime_derive";
+    let main_path = root + "/main.goml";
+    match fs::read_file_structured(main_path) {
+        Ok(source) => {
+            let analysis = analyze(main_path, source);
+            assert_no_diagnostics(analysis);
+            let expanded = expanded_derive(analysis);
+            testing::assert(
+                expanded.contains("impl[T] tests::comptime_derive::macros::Label for Box[T]"),
+            );
+            testing::assert(expanded.contains("fn label(self: Box[T]) -> string"));
+            testing::assert(expanded.contains("impl std::serde::Serialize for Record"));
+            testing::assert(expanded.contains("fn serialize[S"));
+            testing::assert(expanded.contains("self: Record, serializer: S"))
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn navigates_hovers_and_completes_comptime_derives() -> () {
+    let root = "../gomlc/testdata/module/project050_comptime_derive";
+    let main_path = root + "/main.goml";
+    match fs::read_file_structured(main_path) {
+        Ok(source) => {
+            let analysis = analyze(main_path, source);
+            assert_no_diagnostics(analysis);
+            match last_substring(source, "macros::Label") {
+                Some(start) => {
+                    let offset = start + "macros::".byte_len();
+                    let definitions = goto_definitions(analysis, offset);
+                    if definitions.len() != 1 {
+                        testing::fail(
+                            f"expected one qualified comptime derive definition, found {definitions.len()}",
+                        )
+                    }
+                    testing::assert(definitions[0].source_path.ends_with("/macros/macros.goml"));
+                    match fs::read_file_structured(definitions[0].source_path) {
+                        Ok(definition_source) => testing::assert_eq(
+                            definition_source.byte_slice(
+                                definitions[0].span.start,
+                                definitions[0].span.end,
+                            ),
+                            "derive_label",
+                        ),
+                        Err(error) => testing::fail(error.to_string()),
+                    }
+                    match hover(analysis, offset) {
+                        Some(result) => testing::assert_eq(result.contents, "comptime derive Label"),
+                        None => testing::fail("expected comptime derive hover"),
+                    }
+                    testing::assert(
+                        has_completion(
+                            completions(analysis, start + "macros::Lab".byte_len()),
+                            "Label",
+                        ),
+                    )
+                },
+                None => testing::fail("expected qualified comptime derive"),
+            }
+            match last_substring(source, "FacadeLabel") {
+                Some(offset) => {
+                    let definitions = goto_definitions(analysis, offset);
+                    if definitions.len() != 1 {
+                        testing::fail(
+                            f"expected one reexported comptime derive definition, found {definitions.len()}",
+                        )
+                    }
+                    testing::assert(definitions[0].source_path.ends_with("/macros/macros.goml"))
+                },
+                None => testing::fail("expected reexported comptime derive"),
+            }
+            match last_substring(source, "Serialize") {
+                Some(offset) => match hover(analysis, offset) {
+                    Some(result) => {
+                        testing::assert_eq(result.contents, "comptime derive Serialize")
+                    },
+                    None => testing::fail("expected standard library comptime derive hover"),
+                },
+                None => testing::fail("expected standard library comptime derive"),
+            }
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn analyzes_toolchain_standard_library_dependencies() -> () {
+    let root = "../gomlc/testdata/module/project032_std_host_api";
+    let main_path = root + "/main.goml";
+    let source = "package main; use std::path; pub fn clean(value: string) -> string { path::clean(value) }";
+    let analysis = analyze(main_path, source);
+    testing::assert_eq(analysis.package_name, "host_api");
+    assert_no_diagnostics(analysis)
+}
+
+#[test]
+fn resolves_qualified_type_without_short_name_collision() -> () {
+    let root = "../gomlc/testdata/module/project011_complex_dependency_graph";
+    let main_path = root + "/main.goml";
+    let source = "package main; use project011_complex_dependency_graph::core; pub fn inspect(value: core::Task[isize]) -> () { () } fn main() -> () { () }";
+    let overrides = Vec::from_array(
+        [
+            SourceOverride {
+                path: root + "/core/core.goml",
+                source: "package core; use project011_complex_dependency_graph::math; pub struct Task[T] { pub value: T } pub fn marker(value: math::Marker) -> math::Marker { value }",
+            },
+            SourceOverride {
+                path: root + "/math/math.goml",
+                source: "package math; enum Task { Pending } pub struct Marker {}",
+            },
+        ],
+    );
+    let analysis = analyze_with_overrides(main_path, source, overrides);
+    assert_no_diagnostics(analysis)
+}
+
+#[test]
+fn resolves_local_and_function_definitions() -> () {
+    let local_source = "fn main() -> i32 { let value = 42; value }";
+    let local_analysis = analyze("main.goml", local_source);
+    match goto_definition(local_analysis, local_source.byte_len() - 3) {
+        Some(definition) => testing::assert_eq(
+            local_source.byte_slice(definition.span.start, definition.span.end),
+            "value",
+        ),
+        None => testing::fail("expected local definition"),
+    }
+    let function_source = "fn helper() -> i32 { 42 } fn main() -> i32 { helper() }";
+    let function_analysis = analyze("main.goml", function_source);
+    match last_substring(function_source, "helper") {
+        Some(offset) => match goto_definition(function_analysis, offset) {
+            Some(definition) => testing::assert_eq(
+                function_source.byte_slice(definition.span.start, definition.span.end),
+                "helper",
+            ),
+            None => testing::fail("expected function definition"),
+        },
+        None => testing::fail("expected helper call"),
+    }
+}
+
+#[test]
+fn resolves_definitions_in_local_dependencies() -> () {
+    let root = "../gomlc/testdata/module/project001";
+    let main_path = root + "/main.goml";
+    match fs::read_file_structured(main_path) {
+        Ok(source) => match last_substring(source, "sum_point") {
+            Some(offset) => {
+                let analysis = analyze(main_path, source);
+                match goto_definition(analysis, offset) {
+                    Some(definition) => {
+                        testing::assert(definition.source_path.ends_with("/lib/lib.goml"));
+                        match fs::read_file_structured(definition.source_path) {
+                            Ok(target_source) => testing::assert_eq(
+                                target_source.byte_slice(definition.span.start, definition.span.end),
+                                "sum_point",
+                            ),
+                            Err(error) => testing::fail(error.to_string()),
+                        }
+                    },
+                    None => {
+                        testing::fail("expected dependency definition")
+                    },
+                }
+            },
+            None => testing::fail("expected sum_point call"),
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn resolves_package_type_variant_and_field_definitions() -> () {
+    let root = "../gomlc/testdata/module/project001";
+    let main_path = root + "/main.goml";
+    let source = match fs::read_file_structured(main_path) {
+        Ok(source) => source,
+        Err(error) => {
+            testing::fail(error.to_string());
+            ""
+        },
+    };
+    let analysis = analyze(main_path, source);
+    match last_substring(source, "lib::Point") {
+        Some(offset) => match goto_definition(analysis, offset + "lib::".byte_len()) {
+            Some(definition) => match source_by_path(analysis.sources, definition.source_path) {
+                Some(target) => testing::assert_eq(
+                    target.source.byte_slice(definition.span.start, definition.span.end),
+                    "Point",
+                ),
+                None => testing::fail("expected type source"),
+            },
+            None => testing::fail("expected type definition"),
+        },
+        None => testing::fail("expected Point path"),
+    }
+    match last_substring(source, "Green") {
+        Some(offset) => match goto_definition(analysis, offset) {
+            Some(definition) => match source_by_path(analysis.sources, definition.source_path) {
+                Some(target) => testing::assert_eq(
+                    target.source.byte_slice(definition.span.start, definition.span.end),
+                    "Green",
+                ),
+                None => testing::fail("expected variant source"),
+            },
+            None => testing::fail("expected variant definition"),
+        },
+        None => testing::fail("expected Green path"),
+    }
+    match last_substring(source, "x: 20") {
+        Some(offset) => match goto_definition(analysis, offset) {
+            Some(definition) => match source_by_path(analysis.sources, definition.source_path) {
+                Some(target) => testing::assert_eq(
+                    target.source.byte_slice(definition.span.start, definition.span.end),
+                    "x",
+                ),
+                None => testing::fail("expected field source"),
+            },
+            None => testing::fail("expected field definition"),
+        },
+        None => testing::fail("expected struct field"),
+    }
+    let use_path = "use project001::lib";
+    match last_substring(source, use_path) {
+        Some(offset) => match goto_definition(analysis, offset + use_path.byte_len() - 1) {
+            Some(definition) => {
+                testing::assert(definition.source_path.byte_len() >= "lib.goml".byte_len());
+                testing::assert_eq(definition.span.start, 0)
+            },
+            None => testing::fail("expected package definition"),
+        },
+        None => testing::fail("expected use path"),
+    }
+}
+
+#[test]
+fn resolves_contextual_pattern_variant_definitions() -> () {
+    let root = "../gomlc/testdata/module/project041_contextual_enum_patterns";
+    let main_path = root + "/main.goml";
+    let source = match fs::read_file_structured(main_path) {
+        Ok(source) => source,
+        Err(error) => {
+            testing::fail(error.to_string());
+            ""
+        },
+    };
+    let analysis = analyze(main_path, source);
+    assert_no_diagnostics(analysis);
+    match last_substring(source, "Ready(number)") {
+        Some(offset) => {
+            match goto_definition(analysis, offset) {
+                Some(definition) => {
+                    if definition.source_path.ends_with("/events/events.goml") {} else {
+                        testing::fail(
+                            "unexpected contextual variant source " + definition.source_path,
+                        )
+                    }
+                    match source_by_path(analysis.sources, definition.source_path) {
+                        Some(target) => testing::assert_eq(
+                            target.source.byte_slice(definition.span.start, definition.span.end),
+                            "Ready",
+                        ),
+                        None => {
+                            testing::fail("expected contextual variant source")
+                        },
+                    }
+                },
+                None => {
+                    testing::fail("expected contextual variant definition")
+                },
+            }
+            match hover(analysis, offset) {
+                Some(result) => if result.contents.contains("Event") {} else {
+                    testing::fail("unexpected contextual variant hover " + result.contents)
+                },
+                None => testing::fail("expected contextual variant hover"),
+            }
+        },
+        None => testing::fail("expected contextual Ready pattern"),
+    }
+}
+
+#[test]
+fn resolves_builtin_method_definitions() -> () {
+    let source = "fn main() -> string { let value = 1; value.to_string() }";
+    match last_substring(source, "to_string") {
+        Some(offset) => match goto_definition(analyze("main.goml", source), offset) {
+            Some(definition) => match source_by_path(
+                analyze("main.goml", source).sources,
+                definition.source_path,
+            ) {
+                Some(target) => testing::assert_eq(
+                    target.source.byte_slice(definition.span.start, definition.span.end),
+                    "to_string",
+                ),
+                None => testing::fail("expected builtin source"),
+            },
+            None => testing::fail("expected builtin method definition"),
+        },
+        None => testing::fail("expected builtin method"),
+    }
+    let string_source = "fn main() -> bool { \"abc\".contains(\"b\") }";
+    match last_substring(string_source, "contains") {
+        Some(offset) => match goto_definition(analyze("main.goml", string_source), offset) {
+            Some(definition) => match source_by_path(
+                analyze("main.goml", string_source).sources,
+                definition.source_path,
+            ) {
+                Some(target) => testing::assert_eq(
+                    target.source.byte_slice(definition.span.start, definition.span.end),
+                    "contains",
+                ),
+                None => testing::fail("expected builtin source"),
+            },
+            None => testing::fail("expected string method definition"),
+        },
+        None => testing::fail("expected string method"),
+    }
+    let numeric_source = "fn main() -> u8 { let value: i16 = 257; value.to_u8() }";
+    match last_substring(numeric_source, "to_u8") {
+        Some(offset) => {
+            let analysis = analyze("main.goml", numeric_source);
+            match goto_definition(analysis, offset) {
+                Some(definition) => {
+                    if definition.source_path.ends_with("/builtin/numeric.goml") {} else {
+                        testing::fail("expected numeric builtin source")
+                    }
+                    match source_by_path(analysis.sources, definition.source_path) {
+                        Some(target) => testing::assert_eq(
+                            target.source.byte_slice(definition.span.start, definition.span.end),
+                            "to_u8",
+                        ),
+                        None => testing::fail("expected numeric builtin source"),
+                    }
+                },
+                None => testing::fail("expected numeric builtin method definition"),
+            }
+        },
+        None => testing::fail("expected numeric builtin method"),
+    }
+    let static_source = "fn main() -> Vec[i32] { Vec::new() }";
+    match last_substring(static_source, "new") {
+        Some(offset) => {
+            let analysis = analyze("main.goml", static_source);
+            let definitions = goto_definitions(analysis, offset);
+            testing::assert_eq(definitions.len(), 1);
+            let expected = Ref::new(Option::None);
+            for symbol in build_symbol_index(analysis).symbols {
+                if symbol.qualified_name == "builtin::Vec::new" {
+                    expected.set(Option::Some(symbol.span))
+                }
+            }
+            match expected.get() {
+                Some(span) => {
+                    testing::assert_eq(definitions.get(0).span.start, span.start);
+                    testing::assert_eq(definitions.get(0).span.end, span.end)
+                },
+                None => testing::fail("expected Vec new symbol"),
+            }
+        },
+        None => testing::fail("expected builtin static method"),
+    }
+    let ref_source = "fn main() -> i32 { let value = Ref::new(1.to_i32()); value.get() }";
+    match last_substring(ref_source, "get") {
+        Some(offset) => {
+            let analysis = analyze("main.goml", ref_source);
+            let definitions = goto_definitions(analysis, offset);
+            testing::assert_eq(definitions.len(), 1);
+            let expected = Ref::new(Option::None);
+            for symbol in build_symbol_index(analysis).symbols {
+                if symbol.qualified_name == "builtin::Ref::get" {
+                    expected.set(Option::Some(symbol.span))
+                }
+            }
+            match expected.get() {
+                Some(span) => {
+                    testing::assert_eq(definitions.get(0).span.start, span.start);
+                    testing::assert_eq(definitions.get(0).span.end, span.end)
+                },
+                None => testing::fail("expected Ref get symbol"),
+            }
+        },
+        None => testing::fail("expected Ref get method"),
+    }
+}
+
+#[test]
+fn resolves_collection_from_array_definitions() -> () {
+    let source = "fn main() -> Vec[isize] { Vec::from_array([1, 2]) }";
+    let analysis = analyze("main.goml", source);
+    assert_no_diagnostics(analysis);
+    match last_substring(source, "from_array") {
+        Some(offset) => {
+            let definitions = goto_definitions(analysis, offset);
+            testing::assert_eq(definitions.len(), 1);
+            let expected = Ref::new(Option::None);
+            for symbol in build_symbol_index(analysis).symbols {
+                if symbol.qualified_name == "builtin::Vec::from_array" {
+                    expected.set(Option::Some(symbol.span))
+                }
+            }
+            match expected.get() {
+                Some(span) => {
+                    testing::assert_eq(definitions[0].span.start, span.start);
+                    testing::assert_eq(definitions[0].span.end, span.end)
+                },
+                None => testing::fail("expected Vec from_array symbol"),
+            }
+        },
+        None => testing::fail("expected Vec from_array call"),
+    }
+    let map_source = "fn main() -> HashMap[string, isize] { HashMap::from_array([(\"a\", 1)]) }";
+    let map_analysis = analyze("main.goml", map_source);
+    assert_no_diagnostics(map_analysis);
+    match last_substring(map_source, "from_array") {
+        Some(offset) => match goto_definition(map_analysis, offset) {
+            Some(definition) => {
+                let found = Ref::new(false);
+                for symbol in build_symbol_index(map_analysis).symbols {
+                    if symbol.qualified_name == "builtin::HashMap::from_array"
+                        && symbol.span.start == definition.span.start
+                        && symbol.span.end == definition.span.end {
+                        found.set(true)
+                    }
+                }
+                testing::assert(found.get())
+            },
+            None => testing::fail("expected HashMap from_array definition"),
+        },
+        None => testing::fail("expected HashMap from_array call"),
+    }
+}
+
+#[test]
+fn resolves_prelude_function_definitions() -> () {
+    let source = "fn main() -> () { println(\"hello\") }";
+    match last_substring(source, "println") {
+        Some(offset) => {
+            let analysis = analyze("main.goml", source);
+            match goto_definition(analysis, offset) {
+                Some(definition) => {
+                    testing::assert(definition.source_path.ends_with("/prelude/prelude.goml"));
+                    match source_by_path(analysis.sources, definition.source_path) {
+                        Some(target) => {
+                            testing::assert_eq(target.package_name, "prelude");
+                            testing::assert_eq(
+                                target.source.byte_slice(definition.span.start, definition.span.end),
+                                "println",
+                            )
+                        },
+                        None => testing::fail("expected prelude source"),
+                    }
+                },
+                None => testing::fail("expected prelude function definition"),
+            }
+        },
+        None => testing::fail("expected println call"),
+    }
+}
+
+#[test]
+fn resolves_qualified_standard_library_definitions() -> () {
+    let source = "use std::io; fn main() -> () { io::println(\"x\") }";
+    match last_substring(source, "println") {
+        Some(offset) => {
+            let analysis = analyze("/tmp/qualified-std.goml", source);
+            assert_no_diagnostics(analysis);
+            let definitions = goto_definitions(analysis, offset);
+            testing::assert_eq(definitions.len(), 1);
+            match source_by_path(analysis.sources, definitions.get(0).source_path) {
+                Some(target) => {
+                    testing::assert_eq(target.package_name, "std::io");
+                    testing::assert_eq(
+                        target.source.byte_slice(
+                            definitions.get(0).span.start,
+                            definitions.get(0).span.end,
+                        ),
+                        "println",
+                    )
+                },
+                None => testing::fail("expected std source"),
+            }
+        },
+        None => testing::fail("expected println call"),
+    }
+}
+
+#[test]
+fn resolves_index_map_standard_library_definitions() -> () {
+    let source = "use std::collections; fn main() -> () { let values: collections::IndexMap[string, isize] = collections::IndexMap::new(); values.insert(\"key\", 1); }";
+    match last_substring(source, "insert") {
+        Some(offset) => {
+            let analysis = analyze("/tmp/index-map-std.goml", source);
+            assert_no_diagnostics(analysis);
+            let definitions = goto_definitions(analysis, offset);
+            testing::assert_eq(definitions.len(), 1);
+            match source_by_path(analysis.sources, definitions.get(0).source_path) {
+                Some(target) => {
+                    testing::assert_eq(target.package_name, "std::collections");
+                    testing::assert_eq(
+                        target.source.byte_slice(
+                            definitions.get(0).span.start,
+                            definitions.get(0).span.end,
+                        ),
+                        "insert",
+                    )
+                },
+                None => testing::fail("expected IndexMap source"),
+            }
+        },
+        None => testing::fail("expected IndexMap insert call"),
+    }
+}
+
+#[test]
+fn returns_signature_help_for_active_arguments() -> () {
+    let source = "fn combine(left: i32, right: string) -> bool { true } fn main() -> bool { combine(1, \"x\") }";
+    let analysis = analyze("main.goml", source);
+    match last_substring(source, "\"x\"") {
+        Some(offset) => match signature_help(analysis, offset + 1) {
+            Some(signature) => {
+                testing::assert_eq(signature.label, "(left: i32, right: string) -> bool");
+                testing::assert_eq(signature.parameters.len(), 2);
+                testing::assert_eq(signature.active_parameter, 1)
+            },
+            None => testing::fail("expected signature help"),
+        },
+        None => testing::fail("expected second argument"),
+    }
+}
+
+#[test]
+fn keeps_signature_names_for_canonical_cross_package_targets() -> () {
+    let root = "/tmp/goml-query-signature-owner-collision";
+    let left_dir = root + "/left";
+    let right_dir = root + "/right";
+    for directory in Vec::from_array([root, left_dir, right_dir]) {
+        if let Err(error) = fs::create_dir_all(directory) {
+            testing::fail(error.to_string())
+        }
+    }
+    let left_path = left_dir + "/item.goml";
+    let right_path = right_dir + "/item.goml";
+    let main_path = root + "/main.goml";
+    let left_source = "package shared; pub struct Item {} pub trait Choose { fn choose(self: Self, trait_value: string) -> string; } impl Choose for Item { fn choose(self: Item, implementation_value: string) -> string { implementation_value } } impl Item { pub fn choose(self: Item, left_method_value: isize) -> isize { left_method_value } } pub fn call(left_function_value: isize) -> isize { left_function_value } #[go_ffi(\"strings\", \"ToUpper\")] pub extern fn external_call(extern_value: string) -> string;";
+    let right_source = "package shared; pub struct Item {} impl Item { pub fn choose(self: Item, right_method_value: isize) -> isize { right_method_value } } pub fn call(right_function_value: isize) -> isize { right_function_value }";
+    let main_source = "package main; use module::left as left; use module::right as right; fn main() -> () { let left_value = left::Item {}; let right_value = right::Item {}; println(left_value.choose(1)); println(right_value.choose(2)); println(left::call(3)); println(right::call(4)); println(left::external_call(\"value\")); println(left::Choose::choose(left_value, \"trait\")) }";
+    write_query_fixture(
+        root + "/goml.toml",
+        \\[module]
+        \\path = "query::signature_owner_collision"
+        \\
+        ,
+    );
+    write_query_fixture(left_path, left_source);
+    write_query_fixture(right_path, right_source);
+    write_query_fixture(main_path, main_source);
+    let analysis = analyze(main_path, main_source);
+    assert_no_diagnostics(analysis);
+    for expected in Vec::from_array(
+        [
+            ("left_value.choose(", "(left_method_value: isize) -> isize"),
+            ("right_value.choose(", "(right_method_value: isize) -> isize"),
+            ("left::call(", "(left_function_value: isize) -> isize"),
+            ("right::call(", "(right_function_value: isize) -> isize"),
+            ("left::external_call(", "(extern_value: string) -> string"),
+        ],
+    ) {
+        match last_substring(main_source, expected.0) {
+            Some(offset) => match signature_help(analysis, offset + expected.0.byte_len()) {
+                Some(signature) => testing::assert_eq(signature.label, expected.1),
+                None => testing::fail("expected signature help for " + expected.0),
+            },
+            None => testing::fail("expected call " + expected.0),
+        }
+    }
+    match last_substring(main_source, "left::Choose::choose(") {
+        Some(offset) => match signature_help(analysis, offset + "left::Choose::choose(".byte_len()) {
+            Some(signature) => {
+                testing::assert(signature.label.contains("trait_value: string"));
+                testing::assert(!signature.label.contains("implementation_value"));
+                testing::assert(!signature.label.contains("left_method_value"))
+            },
+            None => testing::fail("expected trait UFCS signature help"),
+        },
+        None => testing::fail("expected trait UFCS call"),
+    }
+}
+
+#[test]
+fn hides_method_receivers_in_signature_help() -> () {
+    let source = "fn main() -> string { let value = 1; value.to_string() }";
+    match last_substring(source, "to_string()") {
+        Some(offset) => match signature_help(
+            analyze("main.goml", source),
+            offset + "to_string(".byte_len(),
+        ) {
+            Some(signature) => {
+                testing::assert_eq(signature.label, "() -> string");
+                testing::assert_eq(signature.parameters.len(), 0)
+            },
+            None => testing::fail("expected method signature"),
+        },
+        None => testing::fail("expected method call"),
+    }
+}
+
+#[test]
+fn shows_collection_from_array_signature_help() -> () {
+    let source = "fn main() -> Vec[isize] { Vec::from_array([1, 2]) }";
+    let analysis = analyze("main.goml", source);
+    assert_no_diagnostics(analysis);
+    match last_substring(source, "from_array(") {
+        Some(offset) => {
+            match hover(analysis, offset) {
+                Some(result) => {
+                    testing::assert(result.contents.contains("[isize; 2]"));
+                    testing::assert(result.contents.contains("Vec[isize]"))
+                },
+                None => testing::fail("expected Vec from_array hover"),
+            }
+            match signature_help(analysis, offset + "from_array(".byte_len()) {
+                Some(signature) => {
+                    testing::assert_eq(signature.label, "(values: [isize; 2]) -> Vec[isize]");
+                    testing::assert_eq(signature.parameters.len(), 1)
+                },
+                None => testing::fail("expected Vec from_array signature"),
+            }
+        },
+        None => testing::fail("expected Vec from_array call"),
+    }
+}
+
+#[test]
+fn returns_inlay_hints_for_unannotated_let_bindings() -> () {
+    let source = "fn main() -> isize { let value = 42; let named: isize = value; named }";
+    let analysis = analyze("main.goml", source);
+    let hints = inlay_hints(analysis);
+    testing::assert_eq(hints.len(), 1);
+    testing::assert_eq(hints.get(0).label, ": isize");
+    testing::assert_eq(source.byte_slice(hints.get(0).span.start, hints.get(0).span.end), "value")
+}
+
+#[test]
+fn filters_inlay_hints_to_source_ranges() -> () {
+    let source =
+        \\fn main() -> () {
+        \\    let first = 1;
+        \\    let second = 2;
+        \\    ()
+        \\}
+    ;
+    match last_substring(source, "second") {
+        Some(start) => {
+            let hints = inlay_hints_in_range(analyze("main.goml", source), start, source.byte_len());
+            testing::assert_eq(hints.len(), 1);
+            testing::assert_eq(
+                source.byte_slice(hints.get(0).span.start, hints.get(0).span.end),
+                "second",
+            )
+        },
+        None => testing::fail("expected second binding"),
+    }
+}
+
+#[test]
+fn returns_inlay_hints_for_closure_parameters() -> () {
+    let source = "fn main() -> () { let f = |value| value + 1; () }";
+    let hints = inlay_hints(analyze("main.goml", source));
+    let found = Ref::new(false);
+    for hint in hints {
+        if source.byte_slice(hint.span.start, hint.span.end) == "value" && hint.label == ": isize" {
+            found.set(true)
+        }
+    }
+    testing::assert(found.get())
+}
+
+#[test]
+fn completes_scope_and_struct_members() -> () {
+    let scope_source = "fn main() -> i32 { let value = 42; value }";
+    let scope_analysis = analyze("main.goml", scope_source);
+    testing::assert(
+        has_completion(completions(scope_analysis, scope_source.byte_len() - 3), "value"),
+    );
+    let member_source = "struct Point { x: i32, y: i32 } fn main() -> i32 { let point = Point { x: 1, y: 2 }; point.x }";
+    let member_analysis = analyze("main.goml", member_source);
+    match last_substring(member_source, "point.x") {
+        Some(offset) => testing::assert(
+            has_completion(completions(member_analysis, offset + "point.x".byte_len()), "x"),
+        ),
+        None => testing::fail("expected member expression"),
+    }
+}
+
+#[test]
+fn keeps_member_completion_on_the_semantic_receiver() -> () {
+    let source = "struct A {} impl A { fn only_a(self: A) -> () { () } } struct B {} impl B { fn only_b(self: B) -> () { () } } #[allow(unused_function)] fn first(value: A) -> () { value.only_a() } #[allow(unused_function)] fn second(value: B) -> () { () }";
+    let analysis = analyze("main.goml", source);
+    assert_no_diagnostics(analysis);
+    match last_substring(source, "value.only_a") {
+        Some(offset) => {
+            let items = completions(analysis, offset + "value.".byte_len());
+            testing::assert(has_completion(items, "only_a"));
+            testing::assert(!has_completion(items, "only_b"))
+        },
+        None => testing::fail("expected member access"),
+    }
+}
+
+#[test]
+fn separates_members_for_same_named_types_across_packages() -> () {
+    let root = "/tmp/goml-query-owner-collision";
+    let left_dir = root + "/left";
+    let right_dir = root + "/right";
+    for directory in Vec::from_array([root, left_dir, right_dir]) {
+        if let Err(error) = fs::create_dir_all(directory) {
+            testing::fail(error.to_string())
+        }
+    }
+    let left_path = left_dir + "/item.goml";
+    let right_path = right_dir + "/item.goml";
+    let main_path = root + "/main.goml";
+    let left_source = "package shared; use module::right as right; pub struct Item { pub left_only: isize, } impl Item { pub fn left_method(self: Item) -> isize { self.left_only } pub fn common(self: Item, value: isize) -> isize { value } } pub fn accept_right(value: right::Item) -> () { () }";
+    let right_source = "package shared; pub struct Item { pub right_only: isize, } impl Item { pub fn right_method(self: Item) -> isize { self.right_only } pub fn common(self: Item, value: string) -> string { value } }";
+    let main_source = "package main; use module::left as left; use module::right as right; fn main() -> () { let left_value = left::Item { left_only: 1 }; let right_value = right::Item { right_only: 2 }; println(left_value.left_only); println(right_value.right_only) }";
+    write_query_fixture(
+        root + "/goml.toml",
+        \\[module]
+        \\path = "query::owner_collision"
+        \\
+        ,
+    );
+    write_query_fixture(left_path, left_source);
+    write_query_fixture(right_path, right_source);
+    write_query_fixture(main_path, main_source);
+    let analysis = analyze(main_path, main_source);
+    assert_no_diagnostics(analysis);
+    match last_substring(main_source, "left_value.left_only") {
+        Some(offset) => {
+            let items = completions(analysis, offset + "left_value.".byte_len());
+            testing::assert(has_completion(items, "left_only"));
+            testing::assert(has_completion(items, "left_method"));
+            testing::assert(!has_completion(items, "right_only"));
+            testing::assert(!has_completion(items, "right_method"))
+        },
+        None => testing::fail("expected left member access"),
+    }
+    match last_substring(main_source, "right_value.right_only") {
+        Some(offset) => {
+            let items = completions(analysis, offset + "right_value.".byte_len());
+            testing::assert(has_completion(items, "right_only"));
+            testing::assert(has_completion(items, "right_method"));
+            testing::assert(!has_completion(items, "left_only"));
+            testing::assert(!has_completion(items, "left_method"))
+        },
+        None => testing::fail("expected right member access"),
+    }
+    let invalid_source = "package main; use module::left as left; use module::right as right; fn main() -> () { let left_value = left::Item { left_only: 1 }; println(left_value.right_only); println(left_value.right_method()) }";
+    match last_substring(invalid_source, "left_value.right_only") {
+        Some(offset) => testing::assert_eq(
+            goto_definitions(
+                analyze(main_path, invalid_source),
+                offset + "left_value.".byte_len() + 1,
+            ).len(),
+            0,
+        ),
+        None => testing::fail("expected invalid member access"),
+    }
+    match last_substring(invalid_source, "left_value.right_method") {
+        Some(offset) => testing::assert_eq(
+            goto_definitions(
+                analyze(main_path, invalid_source),
+                offset + "left_value.".byte_len() + 1,
+            ).len(),
+            0,
+        ),
+        None => testing::fail("expected invalid method access"),
+    }
+    let left_analysis = analyze(left_path, left_source);
+    assert_no_diagnostics(left_analysis);
+    match last_substring(left_source, "fn common") {
+        Some(offset) => match hover(left_analysis, offset + "fn ".byte_len()) {
+            Some(result) => testing::assert_eq(
+                result.contents,
+                "(query::owner_collision::left::Item, isize) -> isize",
+            ),
+            None => testing::fail("expected left method hover"),
+        },
+        None => testing::fail("expected left method definition"),
+    }
+}
+
+#[test]
+fn filters_member_completion_visibility_and_receivers() -> () {
+    let root = "/tmp/goml-query-member-visibility";
+    let lib_dir = root + "/lib";
+    for directory in Vec::from_array([root, lib_dir]) {
+        if let Err(error) = fs::create_dir_all(directory) {
+            testing::fail(error.to_string())
+        }
+    }
+    let lib_path = lib_dir + "/lib.goml";
+    let main_path = root + "/main.goml";
+    let lib_source = "package lib; pub struct Item { pub shown: isize, hidden: isize, } impl Item { pub fn new() -> Item { Item { shown: 1, hidden: 2 } } pub fn shown_method(self: Item) -> isize { self.shown } fn hidden_method(self: Item) -> isize { self.hidden } } pub trait Describe { fn describe(self: Self) -> string; fn kind() -> string; } impl Describe for Item { fn describe(self: Item) -> string { self.shown.to_string() } fn kind() -> string { \"item\" } } #[allow(unused_function)] fn inspect(value: Item) -> () { println(value.shown); println(value.describe()) }";
+    let main_source = "package main; use module::lib; use lib::Describe; fn main() -> () { let value = lib::Item::new(); println(value.shown); println(value.shown_method()); println(value.describe()); let _ = lib::Item::new(); () }";
+    write_query_fixture(
+        root + "/goml.toml",
+        \\[module]
+        \\path = "query::member_visibility"
+        \\
+        ,
+    );
+    write_query_fixture(lib_path, lib_source);
+    write_query_fixture(main_path, main_source);
+    let external = analyze(main_path, main_source);
+    assert_no_diagnostics(external);
+    match last_substring(main_source, "value.shown") {
+        Some(offset) => {
+            let items = completions(external, offset + "value.".byte_len());
+            testing::assert(has_completion(items, "shown"));
+            testing::assert(has_completion(items, "shown_method"));
+            testing::assert(has_completion(items, "describe"));
+            testing::assert(!has_completion(items, "hidden"));
+            testing::assert(!has_completion(items, "hidden_method"));
+            testing::assert(!has_completion(items, "new"));
+            testing::assert(!has_completion(items, "kind"))
+        },
+        None => testing::fail("expected external member access"),
+    }
+    match last_substring(main_source, "lib::Item::new") {
+        Some(offset) => {
+            let items = completions(external, offset + "lib::Item::".byte_len());
+            testing::assert(has_completion(items, "new"));
+            testing::assert(has_completion(items, "shown_method"));
+            testing::assert(has_completion(items, "describe"));
+            testing::assert(has_completion(items, "kind"));
+            testing::assert(!has_completion(items, "hidden_method"))
+        },
+        None => testing::fail("expected external static access"),
+    }
+    let local = analyze(lib_path, lib_source);
+    assert_no_diagnostics(local);
+    match last_substring(lib_source, "value.shown") {
+        Some(offset) => {
+            let items = completions(local, offset + "value.".byte_len());
+            testing::assert(has_completion(items, "shown"));
+            testing::assert(has_completion(items, "hidden"));
+            testing::assert(has_completion(items, "shown_method"));
+            testing::assert(has_completion(items, "hidden_method"));
+            testing::assert(has_completion(items, "describe"));
+            testing::assert(!has_completion(items, "new"));
+            testing::assert(!has_completion(items, "kind"))
+        },
+        None => testing::fail("expected local member access"),
+    }
+}
+
+#[test]
+fn completes_incomplete_member_and_enum_paths() -> () {
+    let member_source = "struct Point { x: i32 } fn main() -> () { let point = Point { x: 1 }; let _ = point.; () }";
+    testing::assert(
+        has_completion(
+            completions(analyze("main.goml", member_source), member_source.byte_len() - 6),
+            "x",
+        ),
+    );
+    let enum_source = "enum Color { Red, Green } fn main() -> () { let value = Color::; () }";
+    match last_substring(enum_source, "Color::") {
+        Some(offset) => {
+            let items = completions(
+                analyze("main.goml", enum_source),
+                offset + "Color::".byte_len(),
+            );
+            testing::assert(has_completion(items, "Red"));
+            testing::assert(has_completion(items, "Green"))
+        },
+        None => testing::fail("expected enum path"),
+    }
+    let argument_source = "struct Point { x: i32 } fn consume(value: i32) -> () { () } fn main() -> () { let point = Point { x: 1 }; consume(point.); () }";
+    match last_substring(argument_source, "point.") {
+        Some(offset) => testing::assert(
+            has_completion(
+                completions(analyze("main.goml", argument_source), offset + "point.".byte_len()),
+                "x",
+            ),
+        ),
+        None => testing::fail("expected argument member expression"),
+    }
+}
+
+#[test]
+fn completes_standard_library_import_paths() -> () {
+    let root_source =
+        \\package main;
+        \\use st
+    ;
+    testing::assert(
+        has_completion(
+            completions(analyze("/tmp/import-main.goml", root_source), root_source.byte_len()),
+            "std",
+        ),
+    );
+    let child_source =
+        \\package main;
+        \\use std::
+    ;
+    let children = completions(
+        analyze("/tmp/import-main.goml", child_source),
+        child_source.byte_len(),
+    );
+    testing::assert(has_completion(children, "io"));
+    testing::assert(has_completion(children, "path"));
+    let item_source =
+        \\package main;
+        \\use std::io::pri
+    ;
+    testing::assert(
+        has_completion(
+            completions(analyze("/tmp/import-main.goml", item_source), item_source.byte_len()),
+            "println",
+        ),
+    )
+}
+
+#[test]
+fn completes_builtin_and_dyn_trait_members() -> () {
+    let static_source = "fn main() -> () { let _ = Vec::with_; () }";
+    match last_substring(static_source, "with_") {
+        Some(offset) => if has_completion(
+            completions(analyze("main.goml", static_source), offset + "with_".byte_len()),
+            "with_capacity",
+        ) {} else {
+            testing::fail("expected Vec with_capacity completion")
+        },
+        None => testing::fail("expected Vec static member"),
+    }
+    let from_array_source = "fn main() -> () { let _ = Vec::from_; () }";
+    match last_substring(from_array_source, "from_") {
+        Some(offset) => if has_completion(
+            completions(analyze("main.goml", from_array_source), offset + "from_".byte_len()),
+            "from_array",
+        ) {} else {
+            testing::fail("expected Vec from_array completion")
+        },
+        None => testing::fail("expected Vec from_array static member"),
+    }
+    let map_from_array_source = "fn main() -> () { let _ = HashMap::from_; () }";
+    match last_substring(map_from_array_source, "from_") {
+        Some(offset) => if has_completion(
+            completions(analyze("main.goml", map_from_array_source), offset + "from_".byte_len()),
+            "from_array",
+        ) {} else {
+            testing::fail("expected HashMap from_array completion")
+        },
+        None => testing::fail("expected HashMap from_array static member"),
+    }
+    let int_source = "fn main() -> string { let value = 1; value.to_ }";
+    match last_substring(int_source, "to_") {
+        Some(offset) => {
+            let values = completions(analyze("main.goml", int_source), offset + 3);
+            if has_completion(values, "to_string") {} else {
+                testing::fail("expected isize to_string completion")
+            }
+            if has_completion(values, "to_u8") {} else {
+                testing::fail("expected isize to_u8 completion")
+            }
+            if has_completion(values, "to_isize") {
+                testing::fail("unexpected isize identity conversion completion")
+            }
+        },
+        None => testing::fail("expected isize member"),
+    }
+    let string_source = "fn main(value: string) -> () { value.con }";
+    match last_substring(string_source, "value.con") {
+        Some(offset) => if has_completion(
+            completions(analyze("main.goml", string_source), offset + "value.con".byte_len()),
+            "contains",
+        ) {} else {
+            testing::fail("expected string contains completion")
+        },
+        None => testing::fail("expected string member"),
+    }
+    let vec_source = "fn main() -> () { let values: Vec[i32] = Vec::new(); values.p }";
+    match last_substring(vec_source, "values.p") {
+        Some(offset) => if has_completion(
+            completions(analyze("main.goml", vec_source), offset + "values.p".byte_len()),
+            "push",
+        ) {} else {
+            testing::fail("expected Vec push completion")
+        },
+        None => testing::fail("expected Vec member"),
+    }
+    let dyn_source = "trait Showable { fn show(self: Self) -> string; } fn render(value: dyn Showable) -> string { value.sh }";
+    match last_substring(dyn_source, "value.sh") {
+        Some(offset) => {
+            let analysis = analyze("main.goml", dyn_source);
+            match explicit_receiver_type(analysis, offset + "value".byte_len()) {
+                Some(name) => testing::assert_eq(name, "Showable"),
+                None => testing::fail("expected explicit dyn type"),
+            }
+            let method_found = Ref::new(false);
+            for symbol in build_symbol_index(analysis).symbols {
+                if symbol.name == "show" {
+                    method_found.set(true)
+                }
+            }
+            testing::assert(method_found.get());
+            let items = completions(analysis, offset + "value.sh".byte_len());
+            if has_completion(items, "show") {} else {
+                testing::fail("expected dyn show completion, got " + completion_labels(items))
+            }
+        },
+        None => testing::fail("expected dyn member"),
+    }
+}
+
+#[test]
+fn completes_only_the_public_prelude_surface() -> () {
+    let print_source = "fn main() -> () { pri }";
+    match last_substring(print_source, "pri") {
+        Some(offset) => {
+            let items = completions(analyze("main.goml", print_source), offset + 3);
+            testing::assert(has_completion(items, "print"));
+            testing::assert(has_completion(items, "println"))
+        },
+        None => testing::fail("expected prelude completion prefix"),
+    }
+    let string_source = "fn main() -> () { string_ }";
+    match last_substring(string_source, "string_") {
+        Some(offset) => {
+            let items = completions(analyze("main.goml", string_source), offset + 7);
+            testing::assert(has_completion(items, "string_get"));
+            testing::assert(!has_completion(items, "string_get_raw"))
+        },
+        None => testing::fail("expected builtin completion prefix"),
+    }
+    let derive_source = "fn main() -> () { derive_ }";
+    match last_substring(derive_source, "derive_") {
+        Some(offset) => {
+            let items = completions(analyze("main.goml", derive_source), offset + 7);
+            testing::assert(!has_completion(items, "derive_output_new"))
+        },
+        None => testing::fail("expected derive completion prefix"),
+    }
+}
+
+#[test]
+fn completes_imported_package_namespaces() -> () {
+    let root = "../gomlc/testdata/module/project001";
+    let main_path = root + "/main.goml";
+    match fs::read_file_structured(main_path) {
+        Ok(source) => match last_substring(source, "sum_point") {
+            Some(offset) => {
+                let analysis = analyze(main_path, source);
+                testing::assert(has_completion(completions(analysis, offset + 2), "sum_point"))
+            },
+            None => testing::fail("expected sum_point"),
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn filters_completion_scope_and_suggests_keywords() -> () {
+    let source =
+        \\fn first() -> i32 { let hidden = 1; hidden }
+        \\fn second() -> i32 { let visible = 2; vis }
+    ;
+    match last_substring(source, "vis") {
+        Some(offset) => {
+            let items = completions(analyze("main.goml", source), offset + 3);
+            testing::assert(has_completion(items, "visible"));
+            testing::assert(!has_completion(items, "hidden"))
+        },
+        None => testing::fail("expected completion prefix"),
+    }
+    let keyword_source = "fn main() -> () { ma }";
+    match last_substring(keyword_source, "ma") {
+        Some(offset) => testing::assert(
+            has_completion(completions(analyze("main.goml", keyword_source), offset + 2), "match"),
+        ),
+        None => testing::fail("expected keyword prefix"),
+    }
+    let loop_source = "fn main() -> () { lo }";
+    match last_substring(loop_source, "lo") {
+        Some(offset) => testing::assert(
+            has_completion(completions(analyze("main.goml", loop_source), offset + 2), "loop"),
+        ),
+        None => testing::fail("expected loop keyword prefix"),
+    }
+    let call_source = "fn use_value(value: i32) -> () { () } fn main() -> () { use_value( }";
+    match last_substring(call_source, "use_value(") {
+        Some(offset) => testing::assert_eq(
+            completions(analyze("main.goml", call_source), offset + "use_value(".byte_len()).len(),
+            0,
+        ),
+        None => testing::fail("expected call"),
+    }
+}
+
+#[test]
+fn completes_select_syntax_contextually() -> () {
+    let expression = "fn main() -> () { sel }";
+    let expression_offset = last_substring(expression, "sel").unwrap_or(0) + 3;
+    testing::assert(
+        has_completion(completions(analyze("main.goml", expression), expression_offset), "select"),
+    );
+    let priority = "fn main() -> () { select pri }";
+    let priority_offset = last_substring(priority, "pri").unwrap_or(0) + 3;
+    testing::assert(
+        has_completion(completions(analyze("main.goml", priority), priority_offset), "priority"),
+    );
+    let receive = "fn main() -> () { select { re } }";
+    let receive_offset = last_substring(receive, "re").unwrap_or(0) + 2;
+    testing::assert(
+        has_completion(completions(analyze("main.goml", receive), receive_offset), "recv"),
+    );
+    let guard = "fn main() -> () { let channel: Channel[isize] = Channel::new(0); select { recv(channel) wh } }";
+    let guard_offset = last_substring(guard, "wh").unwrap_or(0) + 2;
+    testing::assert(has_completion(completions(analyze("main.goml", guard), guard_offset), "when"));
+    let binding = "fn main() -> () { let channel: Channel[isize] = Channel::new(0); select { recv(channel) a } }";
+    let binding_offset = last_substring(binding, " a").unwrap_or(0) + 2;
+    testing::assert(
+        has_completion(completions(analyze("main.goml", binding), binding_offset), "as"),
+    );
+    let matching = "fn main() -> () { let channel: Channel[isize] = Channel::new(0); select { recv(channel) m } }";
+    let matching_offset = last_substring(matching, " m").unwrap_or(0) + 2;
+    testing::assert(
+        has_completion(completions(analyze("main.goml", matching), matching_offset), "match"),
+    )
+}
+
+#[test]
+fn indexes_syntax_with_absolute_ranges_and_parents() -> () {
+    let analysis = analyze("main.goml", "fn main() -> i32 { let value = 42; value }");
+    testing::assert(analysis.syntax.nodes.len() > 1);
+    testing::assert(analysis.syntax.tokens.len() > 1);
+    match token_at(analysis.syntax, 3) {
+        Some(token) => {
+            testing::assert(lexer::token_kind_equal(token.kind, lexer::TokenKind::Ident));
+            testing::assert_eq(token.text, "main")
+        },
+        None => testing::fail("expected token"),
+    }
+    match node_at(analysis.syntax, 3) {
+        Some(node) => {
+            testing::assert(!cst::node_kind_equal(node.kind, cst::NodeKind::FILE));
+            if let None = parent_node(analysis.syntax, node) {
+                testing::fail("expected parent node")
+            }
+        },
+        None => testing::fail("expected node"),
+    }
+}
+
+#[test]
+fn indexes_attributed_declarations_by_declared_names() -> () {
+    let source = "#[test] fn works() -> () { () } #[derive(Eq)] struct Key { value: isize }";
+    let index = build_symbol_index(analyze("main.goml", source));
+    let works = Ref::new(false);
+    let key = Ref::new(false);
+    for symbol in index.symbols {
+        if symbol.name == "works" {
+            works.set(true)
+        } else if symbol.name == "Key" {
+            key.set(true)
+        } else {
+            testing::assert(symbol.name != "test" && symbol.name != "derive")
+        }
+    }
+    testing::assert(works.get());
+    testing::assert(key.get())
+}
+
+#[test]
+fn navigates_bindings_across_pattern_and_closure_syntax() -> () {
+    let source = "struct Pair { left: isize, right: isize } enum Maybe { Some(Pair), None } fn main() -> isize { let Pair { left: left_value, right: right_value } = Pair { left: 1, right: 2 }; let if_result = if let Some(Pair { left: if_value, right: _ }) = Some(Pair { left: 3, right: 4 }) { if_value } else { 0 }; let match_result = match Some(Pair { left: 5, right: 6 }) { Some(Pair { left: match_value, right: _ }) => match_value, None => 0 }; let total = Ref::new(0); for (for_left, for_right) in Vec::from_array([(7, 8)]) { total.set(total.get() + for_left + for_right) }; let closure = |closure_value: isize| closure_value + left_value; closure(right_value) + if_result + match_result + total.get() }";
+    let analysis = analyze("main.goml", source);
+    assert_no_diagnostics(analysis);
+    for name in Vec::from_array(
+        [
+            "left_value",
+            "right_value",
+            "if_value",
+            "match_value",
+            "for_left",
+            "for_right",
+            "closure_value",
+        ],
+    ) {
+        assert_local_navigation(analysis, source, name)
+    }
+}
+
+#[test]
+fn returns_hover_from_typecheck_facts() -> () {
+    let source = "fn main() -> i32 { let value = 42; value }";
+    let analysis = analyze("main.goml", source);
+    testing::assert_eq(analysis.checked.diagnostics.len(), 0);
+    match hover(analysis, source.byte_len() - 3) {
+        Some(result) => {
+            testing::assert_eq(result.contents, "i32");
+            testing::assert_eq(source.byte_slice(result.span.start, result.span.end), "value")
+        },
+        None => testing::fail("expected hover"),
+    }
+}
+
+#[test]
+fn returns_function_hover_on_declarations_and_calls() -> () {
+    let source =
+        \\fn add(x: i32, y: i32) -> i32 { x + y }
+        \\fn main() -> i32 { add(1, 2) }
+    ;
+    match hover(analyze("main.goml", source), 3) {
+        Some(result) => {
+            testing::assert_eq(result.contents, "(i32, i32) -> i32")
+        },
+        None => testing::fail("expected declaration hover"),
+    }
+    match last_substring(source, "add") {
+        Some(offset) => match hover(analyze("main.goml", source), offset) {
+            Some(result) => testing::assert_eq(result.contents, "(i32, i32) -> i32"),
+            None => testing::fail("expected call hover"),
+        },
+        None => testing::fail("expected function call"),
+    }
+}
+
+#[test]
+fn shows_comptime_capability_in_function_hover() -> () {
+    let source = "#[comptime] fn value() -> isize { 42 } fn main() -> isize { value() }";
+    let analysis = analyze("main.goml", source);
+    assert_no_diagnostics(analysis);
+    match last_substring(source, "value") {
+        Some(offset) => match hover(analysis, offset) {
+            Some(result) => testing::assert_eq(result.contents, "comptime () -> isize"),
+            None => testing::fail("expected comptime function hover"),
+        },
+        None => testing::fail("expected comptime function call"),
+    }
+}
+
+#[test]
+fn reports_comptime_evaluation_failures_during_analysis() -> () {
+    let source = "#[comptime] fn fail() -> isize { compile_error(\"query failure\") } fn main() -> isize { comptime { fail() } }";
+    let analysis = analyze("main.goml", source);
+    let found = Ref::new(false);
+    for diagnostic in analysis.checked.diagnostics {
+        if diagnostic.message.contains("query failure") {
+            testing::assert_eq(diagnostic.stage, "comptime");
+            found.set(true)
+        }
+    }
+    testing::assert(found.get())
+}
+
+#[test]
+fn navigates_calls_inside_comptime_blocks() -> () {
+    let source = "#[comptime] fn answer() -> isize { 42 } fn main() -> isize { comptime { answer() } }";
+    let analysis = analyze("main.goml", source);
+    assert_no_diagnostics(analysis);
+    match last_substring(source, "answer") {
+        Some(offset) => {
+            let definitions = goto_definitions(analysis, offset);
+            testing::assert_eq(definitions.len(), 1);
+            testing::assert_eq(
+                source.byte_slice(definitions[0].span.start, definitions[0].span.end),
+                "answer",
+            );
+            match hover(analysis, offset) {
+                Some(result) => testing::assert_eq(result.contents, "comptime () -> isize"),
+                None => testing::fail("expected comptime call hover"),
+            }
+        },
+        None => testing::fail("expected comptime call"),
+    }
+}
+
+#[test]
+fn shows_generic_method_parameters_in_hover_and_concrete_signature_help() -> () {
+    let source = "struct Box[T] { value: T } impl[T] Box[T] { fn map[U](self: Box[T], convert: (T) -> U) -> Box[U] { Box { value: convert(self.value) } } } struct Other {} impl Other { fn map[V](self: Other, value: V) -> V { let _ = self; value } } fn main() -> Box[string] { let value = Box { value: 1 }; value.map(|item: isize| item.to_string()) }";
+    let analysis = analyze("main.goml", source);
+    assert_no_diagnostics(analysis);
+    match last_substring(source, "map[U]") {
+        Some(offset) => match hover(analysis, offset) {
+            Some(result) => testing::assert_eq(
+                result.contents,
+                "[U] (gomlc::Box[T], (T) -> U) -> gomlc::Box[U]",
+            ),
+            None => testing::fail("expected generic method hover"),
+        },
+        None => testing::fail("expected method declaration"),
+    }
+    match last_substring(source, "map(") {
+        Some(offset) => match signature_help(analysis, offset + "map(".byte_len()) {
+            Some(signature) => testing::assert_eq(
+                signature.label,
+                "(convert: (isize) -> string) -> gomlc::Box[string]",
+            ),
+            None => testing::fail("expected generic method signature"),
+        },
+        None => testing::fail("expected method call"),
+    }
+}
+
+#[test]
+fn keeps_hover_types_for_canonical_declarations() -> () {
+    let root = "/tmp/goml-query-hover-owner-collision";
+    let left_dir = root + "/left";
+    let right_dir = root + "/right";
+    for directory in Vec::from_array([root, left_dir, right_dir]) {
+        if let Err(error) = fs::create_dir_all(directory) {
+            testing::fail(error.to_string())
+        }
+    }
+    let left_path = left_dir + "/left.goml";
+    let right_path = right_dir + "/right.goml";
+    let left_source = "package left; use module::right; type Label = isize; const answer: Label = 1; trait Choose { fn choose(self: Self, trait_value: string) -> string; } struct Item {} impl Choose for Item { fn choose(self: Item, implementation_value: string) -> string { implementation_value } } impl Item { fn choose(self: Item, inherent_value: isize) -> isize { inherent_value } } struct TraitOnly {} impl Choose for TraitOnly { fn choose(self: TraitOnly, trait_only_value: string) -> string { trait_only_value } } pub fn select(value: isize) -> isize { value } pub fn use_right(value: string) -> string { right::select(value) } #[allow(unused_function)] fn use_item(value: Item) -> isize { value.choose(1) } #[allow(unused_function)] fn use_trait(value: TraitOnly) -> string { value.choose(\"trait\") }";
+    let right_source = "package right; pub type Label = string; pub const answer: Label = \"right\"; pub fn select(value: string) -> string { value }";
+    write_query_fixture(
+        root + "/goml.toml",
+        \\[module]
+        \\path = "query::hover_owner_collision"
+        \\
+        ,
+    );
+    write_query_fixture(left_path, left_source);
+    write_query_fixture(right_path, right_source);
+    let analysis = analyze(left_path, left_source);
+    assert_no_diagnostics(analysis);
+    for expected in Vec::from_array(
+        [
+            ("type Label", "type ".byte_len(), "isize"),
+            ("const answer", "const ".byte_len(), "isize"),
+            ("fn select(value: isize)", "fn ".byte_len(), "(isize) -> isize"),
+        ],
+    ) {
+        match last_substring(left_source, expected.0) {
+            Some(offset) => match hover(analysis, offset + expected.1) {
+                Some(result) => testing::assert_eq(result.contents, expected.2),
+                None => testing::fail("expected declaration hover for " + expected.0),
+            },
+            None => testing::fail("expected declaration " + expected.0),
+        }
+    }
+    for expected in Vec::from_array(
+        [
+            ("fn choose(self: Self", "string", "isize"),
+            ("fn choose(self: Item, implementation", "string", "isize"),
+            ("fn choose(self: Item, inherent", "isize", "string"),
+        ],
+    ) {
+        match last_substring(left_source, expected.0) {
+            Some(offset) => match hover(analysis, offset + "fn ".byte_len()) {
+                Some(result) => {
+                    testing::assert(result.contents.contains(expected.1));
+                    testing::assert(!result.contents.contains(expected.2))
+                },
+                None => testing::fail("expected method hover for " + expected.0),
+            },
+            None => testing::fail("expected method " + expected.0),
+        }
+    }
+    for expected in Vec::from_array(
+        [
+            ("value.choose(1)", "fn choose(self: Item, inherent"),
+            ("value.choose(\"trait\")", "fn choose(self: Self"),
+        ],
+    ) {
+        match (last_substring(left_source, expected.0), last_substring(left_source, expected.1)) {
+            (Some(call), Some(declaration)) => {
+                let definitions = goto_definitions(analysis, call + "value.".byte_len());
+                testing::assert_eq(definitions.len(), 1);
+                testing::assert_eq(definitions[0].span.start, declaration + "fn ".byte_len())
+            },
+            _ => testing::fail("expected method definition fixture"),
+        }
+    }
+}
+
+#[test]
+fn indexes_completes_and_hovers_type_aliases_and_constants() -> () {
+    let source = "type Count = i32; const answer: Count = 42; fn main() -> i32 { answer }";
+    let analysis = analyze("main.goml", source);
+    assert_no_diagnostics(analysis);
+    let alias_found = Ref::new(false);
+    let constant_found = Ref::new(false);
+    for symbol in build_symbol_index(analysis).symbols {
+        match symbol.kind {
+            TypeAlias => if symbol.name == "Count" {
+                alias_found.set(true)
+            },
+            Constant => if symbol.name == "answer" {
+                constant_found.set(true)
+            },
+            _ => (),
+        }
+    }
+    testing::assert(alias_found.get());
+    testing::assert(constant_found.get());
+    match last_substring(source, "ans") {
+        Some(offset) => testing::assert(has_completion(completions(analysis, offset + 3), "answer")),
+        None => testing::fail("expected constant prefix"),
+    }
+    match last_substring(source, "answer") {
+        Some(offset) => match hover(analysis, offset) {
+            Some(value) => testing::assert_eq(value.contents, "i32"),
+            None => testing::fail("expected constant hover"),
+        },
+        None => testing::fail("expected constant declaration"),
+    }
+    match hover(analysis, "type ".byte_len()) {
+        Some(value) => testing::assert_eq(value.contents, "i32"),
+        None => testing::fail("expected type alias hover"),
+    }
+}
+
+#[test]
+fn discovers_internal_and_external_test_items() -> () {
+    let source =
+        \\package value;
+        \\#[test]
+        \\fn works() -> () { () }
+        \\
+    ;
+    let internal = test_items("/tmp/value_test.goml", source);
+    testing::assert_eq(internal.len(), 1);
+    testing::assert_eq(internal.get(0).name, "works");
+    match internal.get(0).kind {
+        Internal => (),
+        External => testing::fail("expected internal test"),
+    }
+    let external = test_items("/tmp/project/tests/api_test.goml", source);
+    testing::assert_eq(external.len(), 1);
+    match external.get(0).kind {
+        External => (),
+        Internal => testing::fail("expected external test"),
+    }
+    testing::assert_eq(test_items("/tmp/value.goml", source).len(), 0)
+}
+
+#[test]
+fn resolves_external_registry_packages_with_mvs() -> () {
+    let root = "/tmp/goml-bootstrap-query-registry";
+    let registry = root + "/registry";
+    let project = root + "/project";
+    let http = registry + "/alice/http/1.0.0";
+    let shared_one = registry + "/alice/shared/1.0.0";
+    let shared_two = registry + "/alice/shared/2.0.0";
+    for directory in Vec::from_array([project, http, shared_one, shared_two]) {
+        if let Err(error) = fs::create_dir_all(directory) {
+            testing::fail(error.to_string())
+        }
+    }
+    write_query_fixture(
+        registry + "/index.toml",
+        \\[modules."alice::http"]
+        \\latest = "1.0.0"
+        \\versions = ["1.0.0"]
+        \\
+        \\[modules."alice::shared"]
+        \\latest = "2.0.0"
+        \\versions = ["1.0.0", "2.0.0"]
+        \\
+        ,
+    );
+    write_query_fixture(
+        project + "/goml.toml",
+        \\[module]
+        \\path = "test::app"
+        \\
+        \\[dependencies]
+        \\"alice::http" = "1.0.0"
+        \\"alice::shared" = "1.0.0"
+        \\
+        ,
+    );
+    write_query_fixture(
+        http + "/goml.toml",
+        \\[module]
+        \\path = "alice::http"
+        \\
+        \\[dependencies]
+        \\"alice::shared" = "2.0.0"
+        \\
+        ,
+    );
+    write_query_fixture(http + "/http.goml", "package http; pub fn status() -> i32 { 200 }");
+    write_query_fixture(
+        shared_one + "/goml.toml",
+        \\[module]
+        \\path = "alice::shared"
+        \\
+        ,
+    );
+    write_query_fixture(
+        shared_two + "/goml.toml",
+        \\[module]
+        \\path = "alice::shared"
+        \\
+        ,
+    );
+    write_query_fixture(
+        shared_one + "/shared.goml",
+        "package shared; pub fn version() -> i32 { 1 }",
+    );
+    write_query_fixture(
+        shared_two + "/shared.goml",
+        "package shared; pub fn version() -> i32 { 2 }",
+    );
+    let modules = testing::expect_ok(
+        resolve_external_modules_at(project, registry),
+        "resolve registry modules",
+    );
+    let owner = testing::expect_some(import_owner(modules, "alice::http"), "http module");
+    let dependency = testing::expect_ok(
+        dependency_project(owner.root, owner.name, "alice::http", Vec::new()),
+        "load http package",
+    );
+    testing::assert_eq(dependency.files.len(), 1);
+    testing::assert_eq(dependency.files[0].package_name, "alice::http");
+    let shared = testing::expect_some(import_owner(modules, "alice::shared"), "shared module");
+    testing::assert_eq(shared.version, "2.0.0")
+}
+
+#[test]
+fn resolves_c_literal_comptime_and_navigation() -> () {
+    let source = "use std::c; const NAME: string = c::literal(\"name\"); fn main() -> () { let _ = c::CString::new(NAME); }";
+    let analysis = analyze("/tmp/qualified-c.goml", source);
+    assert_no_diagnostics(analysis);
+    let offset = testing::expect_some(last_substring(source, "literal"), "C literal call");
+    let definitions = goto_definitions(analysis, offset);
+    testing::assert_eq(definitions.len(), 1);
+    let target = testing::expect_some(
+        source_by_path(analysis.sources, definitions[0].source_path),
+        "C source",
+    );
+    testing::assert_eq(target.package_name, "std::c");
+}
+
+#[test]
+fn resolves_public_ffi_pointer_operations() -> () {
+    let source = "use std::ffi; fn main() -> () { let value: ffi::Ptr[i64] = ffi::null(); let _ = ffi::is_nil(value); }";
+    let analysis = analyze("/tmp/qualified-ffi.goml", source);
+    assert_no_diagnostics(analysis);
+    for name in Vec::from_array(["null", "is_nil"]) {
+        match last_substring(source, name) {
+            Some(offset) => {
+                let definitions = goto_definitions(analysis, offset);
+                testing::assert_eq(definitions.len(), 1);
+                match source_by_path(analysis.sources, definitions.get(0).source_path) {
+                    Some(target) => {
+                        testing::assert_eq(target.package_name, "std::ffi");
+                        testing::assert_eq(
+                            target.source.byte_slice(
+                                definitions.get(0).span.start,
+                                definitions.get(0).span.end,
+                            ),
+                            name,
+                        )
+                    },
+                    None => testing::fail("expected ffi source"),
+                }
+            },
+            None => testing::fail("expected ffi operation"),
+        }
+    }
+}
+
+#[test]
+fn resolves_checked_error_result_adapter() -> () {
+    let source = "use std::ffi; fn main() -> () { let value: Result[i64, ffi::Error] = Result::Err(ffi::nil_error()); let _ = ffi::Outcome::from_raw_result(value, 0); }";
+    let analysis = analyze("/tmp/ffi-error-result.goml", source);
+    assert_no_diagnostics(analysis);
+    match last_substring(source, "from_raw_result") {
+        Some(offset) => {
+            let definitions = goto_definitions(analysis, offset);
+            testing::assert_eq(definitions.len(), 1);
+            match source_by_path(analysis.sources, definitions.get(0).source_path) {
+                Some(target) => {
+                    testing::assert_eq(target.package_name, "std::ffi");
+                    testing::assert_eq(
+                        target.source.byte_slice(
+                            definitions.get(0).span.start,
+                            definitions.get(0).span.end,
+                        ),
+                        "from_raw_result",
+                    )
+                },
+                None => testing::fail("expected ffi source"),
+            }
+        },
+        None => testing::fail("expected checked result adapter"),
+    }
+}
+
+#[test]
+fn resolves_public_error_message_and_matching_apis() -> () {
+    let source = "use std::ffi; pub fn inspect(value: ffi::NonNilError) -> () { let _ = value.message_bytes(); let _ = value.message(); let _ = ffi::error_matches(value.as_error(), ffi::nil_error()); } fn main() -> () {}";
+    let analysis = analyze("/tmp/ffi-error-messages.goml", source);
+    assert_no_diagnostics(analysis);
+    for name in Vec::from_array(["message_bytes", "message", "error_matches"]) {
+        match last_substring(source, name) {
+            Some(offset) => {
+                let definitions = goto_definitions(analysis, offset);
+                testing::assert_eq(definitions.len(), 1);
+                match source_by_path(analysis.sources, definitions.get(0).source_path) {
+                    Some(target) => {
+                        testing::assert_eq(target.package_name, "std::ffi");
+                        testing::assert_eq(
+                            target.source.byte_slice(
+                                definitions.get(0).span.start,
+                                definitions.get(0).span.end,
+                            ),
+                            name,
+                        )
+                    },
+                    None => testing::fail("expected ffi source"),
+                }
+            },
+            None => testing::fail("expected error API"),
+        }
+    }
+}
+
+#[test]
+fn resolves_public_raw_string_conversion_apis() -> () {
+    let source = "use std::ffi; pub fn inspect(value: ffi::String) -> () { let _ = ffi::string_bytes(value); let _ = ffi::string_text(value); let _ = ffi::string_from_bytes(ffi::string_bytes(value)); let _ = ffi::string_from_text(\"text\"); } fn main() -> () {}";
+    let analysis = analyze("/tmp/ffi-raw-string.goml", source);
+    assert_no_diagnostics(analysis);
+    for name in Vec::from_array(
+        ["string_bytes", "string_text", "string_from_bytes", "string_from_text"],
+    ) {
+        match last_substring(source, name) {
+            Some(offset) => {
+                let definitions = goto_definitions(analysis, offset);
+                testing::assert_eq(definitions.len(), 1);
+                match source_by_path(analysis.sources, definitions.get(0).source_path) {
+                    Some(target) => {
+                        testing::assert_eq(target.package_name, "std::ffi");
+                        testing::assert_eq(
+                            target.source.byte_slice(
+                                definitions.get(0).span.start,
+                                definitions.get(0).span.end,
+                            ),
+                            name,
+                        )
+                    },
+                    None => testing::fail("expected ffi source"),
+                }
+            },
+            None => testing::fail("expected error API"),
+        }
+    }
+}
+
+#[test]
+fn resolves_public_rune_and_raw_slice_apis() -> () {
+    let source = "use std::ffi; pub fn inspect(value: ffi::Rune, buffer: Vec[i64]) -> () { let _ = ffi::rune_char(value); let _ = ffi::rune_from_char('a'); let raw = ffi::slice_shared(buffer); let _ = ffi::slice_capacity(raw); let _ = ffi::slice_append(raw, 1); let _ = ffi::slice_trusted_readonly(raw); } fn main() -> () {}";
+    let analysis = analyze("/tmp/ffi-rune-slice.goml", source);
+    assert_no_diagnostics(analysis);
+    for name in Vec::from_array(
+        [
+            "rune_char",
+            "rune_from_char",
+            "slice_shared",
+            "slice_capacity",
+            "slice_append",
+            "slice_trusted_readonly",
+        ],
+    ) {
+        match last_substring(source, name) {
+            Some(offset) => {
+                let definitions = goto_definitions(analysis, offset);
+                testing::assert_eq(definitions.len(), 1);
+                match source_by_path(analysis.sources, definitions.get(0).source_path) {
+                    Some(target) => {
+                        testing::assert_eq(target.package_name, "std::ffi");
+                        testing::assert_eq(
+                            target.source.byte_slice(
+                                definitions.get(0).span.start,
+                                definitions.get(0).span.end,
+                            ),
+                            name,
+                        )
+                    },
+                    None => testing::fail("expected ffi source"),
+                }
+            },
+            None => testing::fail("expected error API"),
+        }
+    }
+}
+
+#[test]
+fn resolves_public_raw_map_nil_apis() -> () {
+    let source = "use std::ffi; pub fn inspect() -> bool { let value: ffi::RawMap[i64, i64] = ffi::map_new(); let _ = ffi::map_len(value); let _ = ffi::map_get(value, 1); ffi::map_set(value, 1, 2); ffi::map_delete(value, 1); let _ = ffi::map_copy(value); ffi::map_is_nil(value) } fn main() -> () {}";
+    let analysis = analyze("/tmp/ffi-raw-map.goml", source);
+    assert_no_diagnostics(analysis);
+    for name in Vec::from_array(
+        ["map_new", "map_len", "map_get", "map_set", "map_delete", "map_copy"],
+    ) {
+        match last_substring(source, name) {
+            Some(offset) => {
+                let definitions = goto_definitions(analysis, offset);
+                testing::assert_eq(definitions.len(), 1);
+                match source_by_path(analysis.sources, definitions.get(0).source_path) {
+                    Some(target) => {
+                        testing::assert_eq(target.package_name, "std::ffi");
+                        testing::assert_eq(
+                            target.source.byte_slice(
+                                definitions.get(0).span.start,
+                                definitions.get(0).span.end,
+                            ),
+                            name,
+                        )
+                    },
+                    None => testing::fail("expected ffi source"),
+                }
+            },
+            None => testing::fail("expected error API"),
+        }
+    }
+}
+
+#[test]
+fn rejects_known_uncomparable_raw_map_keys_after_inference() -> () {
+    for body in Vec::from_array(
+        [
+            "pub fn bad(value: ffi::RawMap[Slice[i64], i64]) -> () {}",
+            "pub fn bad() -> () { let value: ffi::RawMap[ffi::RawSlice[i64], i64] = ffi::map_new(); }",
+            "pub fn bad() -> () { let value: ffi::RawMap[ffi::RawMap[i64, i64], i64] = ffi::map_nil(); }",
+            "pub fn bad() -> () { let value: ffi::RawMap[[Slice[i64]; 0], i64] = ffi::map_new(); }",
+            "pub fn bad() -> () { let value: ffi::RawMap[(i64, Slice[i64]), i64] = ffi::map_new(); }",
+            "struct Key[T] { value: T } pub fn bad() -> () { let value: ffi::RawMap[Key[Slice[i64]], i64] = ffi::map_new(); }",
+            "struct Key[T] { value: T } pub fn bad(value: ffi::RawMap[Key[Key[Slice[i64]]], i64]) -> () {}",
+            "struct Key[T] { value: T } pub fn bad(value: ffi::RawMap[Key[[Key[ffi::RawSlice[i64]]; 0]], i64]) -> () {}",
+            "struct Key[T] { value: T } pub fn bad(value: ffi::RawMap[Key[(i64, Key[Slice[i64]])], i64]) -> () {}",
+            "fn make[K]() -> ffi::RawMap[K, i64] { ffi::map_new() } pub fn bad() -> () { let key: ffi::RawSlice[i64] = ffi::slice_nil(); let value = make(); ffi::map_set(value, key, 1); }",
+            "type Key = Slice[i64]; pub fn bad() -> () { let value: ffi::RawMap[Key, i64] = ffi::map_new(); }",
+        ],
+    ) {
+        let source = "use std::ffi; " + body + " fn main() -> () {}";
+        let analysis = analyze("/tmp/ffi-invalid-map-key.goml", source);
+        let mut found = false;
+        for diagnostic in analysis.checked.diagnostics {
+            if diagnostic.message.contains("Go map key is not comparable") {
+                found = true;
+            }
+        }
+        if !found {
+            testing::fail("missing map key diagnostic for " + body)
+        }
+    }
+    let source = "use std::ffi; pub fn valid() -> () { let integers: ffi::RawMap[i64, i64] = ffi::map_new(); let pointers: ffi::RawMap[ffi::Ptr[ffi::RawSlice[i64]], i64] = ffi::map_new(); let arrays: ffi::RawMap[[i64; 2], i64] = ffi::map_new(); let _ = ffi::map_len(integers) + ffi::map_len(pointers) + ffi::map_len(arrays); } fn main() -> () {}";
+    assert_no_diagnostics(analyze("/tmp/ffi-valid-map-key.goml", source));
+}
+
+#[test]
+fn accepts_nested_comparable_struct_map_keys() -> () {
+    for key in Vec::from_array(
+        [
+            "Key[Key[i64]]",
+            "Key[Key[ffi::Ptr[Slice[i64]]]]",
+            "Key[PtrKey[Slice[i64]]]",
+            "Key[Phantom[Slice[i64]]]",
+        ],
+    ) {
+        let source = "use std::ffi; struct Key[T] { value: T } struct PtrKey[T] { value: ffi::Ptr[T] } struct Phantom[T] { value: i64 } pub fn valid(value: ffi::RawMap["
+            + key
+            + ", i64]) -> isize { ffi::map_len(value) } fn main() -> () {}";
+        assert_no_diagnostics(analyze("/tmp/ffi-nested-comparable-map-key.goml", source));
+    }
+}
+
+#[test]
+fn rejects_recursive_struct_map_key_layouts_without_expansion() -> () {
+    for field in Vec::from_array(["Loop[T]", "Loop[(T, T)]"]) {
+        let source = "use std::ffi; struct Loop[T] { value: " + field
+            + " } pub fn bad(value: ffi::RawMap[Loop[i64], i64]) -> () {} fn main() -> () {}";
+        let analysis = analyze("/tmp/ffi-recursive-map-key.goml", source);
+        let mut found = false;
+        for diagnostic in analysis.checked.diagnostics {
+            if diagnostic.message.contains("Go map key has a recursive struct layout") {
+                found = true;
+            }
+        }
+        testing::assert(found);
+    }
+}
+
+#[test]
+fn bounds_nested_struct_map_key_comparability() -> () {
+    let mut key = "i64";
+    for _ in 0..65 {
+        key = "Key[" + key + "]";
+    }
+    let source = "use std::ffi; struct Key[T] { value: T } pub fn bad(value: ffi::RawMap[" + key
+        + ", i64]) -> () {} fn main() -> () {}";
+    let analysis = analyze("/tmp/ffi-deep-map-key.goml", source);
+    let mut found = false;
+    for diagnostic in analysis.checked.diagnostics {
+        if diagnostic.message.contains(
+            "Go map key comparability exceeds the structural depth limit",
+        ) {
+            found = true;
+        }
+    }
+    testing::assert(found);
+}
+
+#[test]
+fn resolves_public_raw_function_nil_apis() -> () {
+    let source = "use std::ffi; pub fn inspect() -> bool { let value: ffi::Func[(i64) -> i64] = ffi::func_nil(); let echo: (i64) -> i64 = |x| x; let raw = ffi::func_from_closure(echo); ffi::func_to_closure(raw).is_some() && ffi::func_is_nil(value) } fn main() -> () {}";
+    let analysis = analyze("/tmp/ffi-raw-function.goml", source);
+    assert_no_diagnostics(analysis);
+    for name in Vec::from_array(["func_nil", "func_is_nil", "func_from_closure", "func_to_closure"]) {
+        let offset = last_substring(source, name).unwrap_or(0);
+        let definitions = goto_definitions(analysis, offset);
+        testing::assert_eq(definitions.len(), 1);
+        match source_by_path(analysis.sources, definitions[0].source_path) {
+            Some(target) => {
+                testing::assert_eq(target.package_name, "std::ffi");
+                testing::assert_eq(
+                    target.source.byte_slice(definitions[0].span.start, definitions[0].span.end),
+                    name,
+                );
+            },
+            None => testing::fail("expected raw function API definition"),
+        }
+    }
+}
+
+#[test]
+fn infers_map_key_requirements_from_generic_function_and_method_bodies() -> () {
+    for entry in Vec::from_array(
+        [
+            (
+                "fn leaf[T](value: T) -> isize { let map: ffi::RawMap[T, i64] = ffi::map_new(); ffi::map_len(map) } fn relay[T](value: T) -> isize { let call = leaf; call(value) }",
+                "relay(key)",
+            ),
+            (
+                "struct Holder[T] { value: T } impl[T] Holder[T] { fn size(self: Holder[T]) -> isize { let map: ffi::RawMap[T, i64] = ffi::map_new(); ffi::map_len(map) } }",
+                "Holder { value: key }.size()",
+            ),
+        ],
+    ) {
+        for invalid in Vec::from_array([false, true]) {
+            let source = "use std::ffi; " + entry.0 + " fn main() -> () { "
+                + if invalid {
+                    "let key: ffi::RawSlice[i64] = ffi::slice_nil();"
+                } else {
+                    "let key: i64 = 1;"
+                }
+                + " let _ = "
+                + entry.1
+                + "; }";
+            let analysis = analyze("/tmp/ffi-inferred-map-key.goml", source);
+            if invalid {
+                let mut found = false;
+                for diagnostic in analysis.checked.diagnostics {
+                    if diagnostic.message.contains("Go map key is not comparable") {
+                        found = true;
+                    }
+                }
+                if !found {
+                    testing::fail("missing inferred map requirement for " + entry.1)
+                }
+            } else {
+                assert_no_diagnostics(analysis)
+            }
+        }
+    }
+}
+
+#[test]
+fn infers_map_key_requirements_through_source_dependencies_and_overrides() -> () {
+    let root = "/tmp/goml-query-inferred-map-dependencies";
+    for directory in Vec::from_array([root, root + "/library", root + "/bridge"]) {
+        if let Err(error) = fs::create_dir_all(directory) {
+            testing::fail(error.to_string())
+        }
+    }
+    write_query_fixture(root + "/goml.toml", "[module]\npath = \"query::maps\"\n");
+    let main_path = root + "/main.goml";
+    let leaf_path = root + "/library/z.goml";
+    write_query_fixture(main_path, "package main; fn main() -> () {}\n");
+    write_query_fixture(
+        root + "/library/a.goml",
+        "package library; pub fn invoke[T](value: T) -> isize { let call = leaf; let nested = || call(value); nested() }\n",
+    );
+    write_query_fixture(
+        root + "/bridge/bridge.goml",
+        "package bridge; use module::library; pub fn relay[T](value: T) -> isize { library::invoke(value) }\n",
+    );
+    for declaration in Vec::from_array(
+        [
+            "fn leaf[T](value: T) -> isize { let map: ffi::RawMap[T, i64] = ffi::map_new(); ffi::map_len(map) }",
+            "struct Holder[T] { value: T } impl[T] Holder[T] { fn size(self: Holder[T]) -> isize { let map: ffi::RawMap[T, i64] = ffi::map_new(); ffi::map_len(map) } } struct Empty[T] { value: T } impl[T] Empty[T] { fn size(self: Empty[T]) -> isize { 0 } } fn leaf[T](value: T) -> isize { Holder { value }.size() + Empty { value }.size() } pub fn harmless(value: ffi::RawSlice[i64]) -> isize { Empty { value }.size() }",
+        ],
+    ) {
+        write_query_fixture(leaf_path, "package library; use std::ffi; " + declaration);
+        for invalid in Vec::from_array([false, true]) {
+            let source = "package main; use std::ffi; use module::bridge; fn main() -> () { "
+                + if invalid {
+                    "let key: ffi::RawSlice[i64] = ffi::slice_nil();"
+                } else {
+                    "let key: i64 = 1;"
+                }
+                + " let _ = bridge::relay(key); }";
+            let analysis = analyze(main_path, source);
+            if invalid {
+                let mut found = false;
+                for diagnostic in analysis.checked.diagnostics {
+                    if diagnostic.message.contains("Go map key is not comparable") {
+                        found = true;
+                    }
+                }
+                if !found {
+                    testing::fail("missing map requirement from source dependency")
+                }
+                let overrides = Vec::from_array(
+                    [
+                        SourceOverride {
+                            path: leaf_path,
+                            source: "package library; fn leaf[T](value: T) -> isize { 0 }",
+                        },
+                    ],
+                );
+                assert_no_diagnostics(analyze_with_overrides(main_path, source, overrides));
+            } else {
+                assert_no_diagnostics(analysis)
+            }
+        }
+    }
+}
+
+#[test]
+fn validates_nominal_map_storage_without_expanding_recursive_applications() -> () {
+    for declaration in Vec::from_array(
+        [
+            "struct Table[T] { storage: ffi::RawMap[T, i64] }",
+            "enum Table[T] { Entry(ffi::RawMap[T, i64]) }",
+            "struct Table[T] { next: ffi::Ptr[Table[(T, T)]], storage: ffi::RawMap[T, i64] }",
+        ],
+    ) {
+        for valid in Vec::from_array([true, false]) {
+            let source = "use std::ffi; " + declaration + " pub fn accept(value: Option[Table["
+                + if valid {
+                    "i64"
+                } else {
+                    "ffi::RawSlice[i64]"
+                }
+                + "]]) -> () {}";
+            let analysis = analyze("/tmp/goml-nominal-map-recursion.goml", source);
+            if valid {
+                assert_no_diagnostics(analysis)
+            } else {
+                let mut found = false;
+                for diagnostic in analysis.checked.diagnostics {
+                    if diagnostic.message.contains("Go map key is not comparable") {
+                        found = true;
+                    }
+                }
+                if !found {
+                    testing::fail("missing nominal map requirement diagnostic")
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn validates_default_method_map_requirements_in_source_dependencies() -> () {
+    let root = "/tmp/goml-query-default-map-dependencies";
+    if let Err(error) = fs::create_dir_all(root + "/behavior") {
+        testing::fail(error.to_string());
+    }
+    write_query_fixture(root + "/goml.toml", "[module]\npath = \"query::defaults\"\n");
+    let main_path = root + "/main.goml";
+    let trait_path = root + "/behavior/behavior.goml";
+    write_query_fixture(main_path, "package main; fn main() -> () {}\n");
+    for associated in Vec::from_array([false, true]) {
+        let prefix = "package behavior; use std::ffi; pub trait Size { "
+            + if associated {
+                "type Item; "
+            } else {
+                ""
+            }
+            + "fn size(self: Self) -> isize { ";
+        write_query_fixture(
+            trait_path,
+            prefix + "let map: ffi::RawMap["
+                + if associated {
+                    "Self::Item"
+                } else {
+                    "Self"
+                }
+                + ", i64] = ffi::map_new(); ffi::map_len(map) } }",
+        );
+        for valid in Vec::from_array([true, false]) {
+            for override in Vec::from_array([false, true]) {
+                let key = if valid {
+                    "ffi::Ptr[ffi::RawSlice[i64]]"
+                } else {
+                    "ffi::RawSlice[i64]"
+                };
+                let source = "package main; use std::ffi; use module::behavior; use behavior::Size; struct Key { "
+                    + if associated {
+                        ""
+                    } else {
+                        "value: " + key
+                    }
+                    + " } impl Size for Key { "
+                    + if associated {
+                        "type Item = " + key + "; "
+                    } else {
+                        ""
+                    }
+                    + if override {
+                        "fn size(self: Key) -> isize { 42 }"
+                    } else {
+                        ""
+                    }
+                    + " } fn main() -> () {}";
+                let analysis = analyze(main_path, source);
+                if valid || override {
+                    assert_no_diagnostics(analysis)
+                } else {
+                    let mut found = false;
+                    for diagnostic in analysis.checked.diagnostics {
+                        if diagnostic.message.contains("Go map key is not comparable") {
+                            found = true;
+                        }
+                    }
+                    testing::assert(found);
+                    assert_no_diagnostics(
+                        analyze_with_overrides(
+                            main_path,
+                            source,
+                            Vec::from_array(
+                                [SourceOverride { path: trait_path, source: prefix + "0 } }" }],
+                            ),
+                        ),
+                    );
+                }
+            }
+        }
+    }
+}

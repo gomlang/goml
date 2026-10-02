@@ -1,0 +1,231 @@
+package main;
+
+use module::test_support;
+use std::fs;
+use std::path;
+use std::process;
+use std::testing;
+
+#[test]
+fn spawning_after_scope_exit_fails() -> () {
+    let root = test_support::workspace("closed_task_scope");
+    test_support::write_file(
+        path::join(root, "goml.toml"),
+        \\[module]
+        \\path = "closed_task_scope"
+        \\
+        ,
+    );
+    test_support::write_file(
+        path::join(root, "main.goml"),
+        \\package main;
+        \\
+        \\use std::task;
+        \\
+        \\fn main() -> () {
+        \\    let escaped = task::scope(|scope: task::Scope| scope);
+        \\    let _ = escaped.spawn(|_: task::CancelToken| ());
+        \\}
+        \\
+        ,
+    );
+    let output = test_support::project_command("run", "", Vec::new(), root);
+    test_support::assert_failure(output);
+    test_support::assert_contains(test_support::stderr(output), "task scope is closed")
+}
+
+#[test]
+fn cancelling_command_stops_its_process_group() -> () {
+    let root = test_support::workspace("cancelled_process_group");
+    test_support::write_file(
+        path::join(root, "goml.toml"),
+        \\[module]
+        \\path = "cancelled_process_group"
+        \\
+        ,
+    );
+    test_support::write_file(
+        path::join(root, "main.goml"),
+        \\package main;
+        \\
+        \\use std::fs;
+        \\use std::process;
+        \\use std::task;
+        \\
+        \\fn main() -> () {
+        \\    let result: Result[(), string] = task::try_scope(
+        \\        |scope: task::Scope| {
+        \\            let _ = scope.spawn(
+        \\                |token: task::CancelToken| {
+        \\                    let _ = process::Command::new("sh").args(Vec::from_array(["-c", "sleep 30 & echo $! > child.pid; wait"])).output_cancel_structured(token);
+        \\                },
+        \\            );
+        \\            while !fs::is_file("child.pid") {};
+        \\            Result::Err("stop")
+        \\        },
+        \\    );
+        \\    println(result.is_err())
+        \\}
+        \\
+        ,
+    );
+    let output = test_support::project_command("run", "", Vec::new(), root);
+    test_support::assert_success(output);
+    testing::assert_eq(test_support::stdout(output), "true\n");
+    let check = match process::Command::new("sh").args(
+        Vec::from_array(
+            [
+                "-c",
+                "for attempt in 1 2 3 4 5 6 7 8 9 10; do if ! kill -0 \"$(cat child.pid)\" 2>/dev/null; then exit 0; fi; sleep 0.1; done; exit 1",
+            ],
+        ),
+    ).current_dir(root).output_structured() {
+        Ok(value) => value,
+        Err(message) => {
+            testing::fail(message.to_string());
+            output
+        },
+    };
+    test_support::assert_success(check)
+}
+
+#[test]
+fn task_scope_handles_spawn_finish_races() -> () {
+    let root = test_support::workspace("task_scope_races");
+    test_support::write_file(
+        path::join(root, "goml.toml"),
+        \\[module]
+        \\path = "task_scope_races"
+        \\
+        ,
+    );
+    test_support::write_file(
+        path::join(root, "main.goml"),
+        \\package main;
+        \\
+        \\use std::task;
+        \\
+        \\fn main() -> () {
+        \\    for _ in 0..100 {
+        \\        let gate: Channel[()] = Channel::new(0);
+        \\        let outcomes: Channel[bool] = Channel::new(32);
+        \\        task::scope(
+        \\            |scope: task::Scope| {
+        \\                for _ in 0..32 {
+        \\                    let _ = scope.spawn(
+        \\                        |_: task::CancelToken| {
+        \\                            let _ = gate.recv();
+        \\                            match scope.try_spawn(|_: task::CancelToken| ()) {
+        \\                                Some(child) => {
+        \\                                    child.join();
+        \\                                    outcomes.send(true)
+        \\                                },
+        \\                                None => outcomes.send(false),
+        \\                            }
+        \\                        },
+        \\                    );
+        \\                };
+        \\                gate.close()
+        \\            },
+        \\        );
+        \\        for _ in 0..32 {
+        \\            let _ = outcomes.recv();
+        \\        }
+        \\    };
+        \\    println("ok")
+        \\}
+        \\
+        ,
+    );
+    let output = test_support::project_command("run", "", Vec::new(), root);
+    test_support::assert_success(output);
+    testing::assert_eq(test_support::stdout(output), "ok\n")
+}
+
+#[test]
+fn child_panic_cancels_waits_and_reraises_in_scope_owner() -> () {
+    let root = test_support::workspace("task_child_panic");
+    test_support::write_file(
+        path::join(root, "goml.toml"),
+        \\[module]
+        \\path = "task_child_panic"
+        \\
+        ,
+    );
+    test_support::write_file(
+        path::join(root, "main.goml"),
+        \\package main;
+        \\
+        \\use std::fs;
+        \\use std::task;
+        \\
+        \\fn main() -> () {
+        \\    task::scope(
+        \\        |scope: task::Scope| {
+        \\            let started: Channel[()] = Channel::new(1);
+        \\            let _ = scope.spawn(
+        \\                |token: task::CancelToken| {
+        \\                    started.send(());
+        \\                    while !token.is_cancelled() {};
+        \\                    let _ = fs::write_file_structured("cleaned", "yes");
+        \\                },
+        \\            );
+        \\            let _ = started.recv();
+        \\            let _ = scope.spawn(
+        \\                |_: task::CancelToken| {
+        \\                    let values = [1];
+        \\                    let _ = values[2];
+        \\                },
+        \\            );
+        \\        },
+        \\    );
+        \\}
+        \\
+        ,
+    );
+    let output = test_support::project_command("run", "", Vec::new(), root);
+    test_support::assert_failure(output);
+    testing::assert(fs::is_file(path::join(root, "cleaned")))
+}
+
+#[test]
+fn scope_body_panic_cancels_waits_and_removes_scope() -> () {
+    let root = test_support::workspace("task_body_panic");
+    test_support::write_file(
+        path::join(root, "goml.toml"),
+        \\[module]
+        \\path = "task_body_panic"
+        \\
+        ,
+    );
+    test_support::write_file(
+        path::join(root, "main.goml"),
+        \\package main;
+        \\
+        \\use std::fs;
+        \\use std::task;
+        \\
+        \\fn main() -> () {
+        \\    task::scope(
+        \\        |scope: task::Scope| {
+        \\            let started: Channel[()] = Channel::new(1);
+        \\            let _ = scope.spawn(
+        \\                |token: task::CancelToken| {
+        \\                    started.send(());
+        \\                    while !token.is_cancelled() {};
+        \\                    let _ = fs::write_file_structured("cleaned", "yes");
+        \\                },
+        \\            );
+        \\            let _ = started.recv();
+        \\            let values = [1];
+        \\            let _ = values[2];
+        \\        },
+        \\    );
+        \\}
+        \\
+        ,
+    );
+    let output = test_support::project_command("run", "", Vec::new(), root);
+    test_support::assert_failure(output);
+    testing::assert(fs::is_file(path::join(root, "cleaned")))
+}

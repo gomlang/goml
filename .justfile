@@ -88,9 +88,9 @@ gomlgo-mutate-diff limit="25": gomlgo-build
 all: test
 
 cloc:
-    find ./goml -type f -name '*.gom' -exec cat {} + | wc -l | awk '{ print "goml:", $1 }'
-    find ./gomlc -type f -name '*.gom' -exec cat {} + | wc -l | awk '{ print "gomlc:", $1 }'
-    find ./lib -type f -name '*.gom' -exec cat {} + | wc -l | awk '{ print "lib:", $1 }'
+    find ./goml -type f -name '*.goml' -exec cat {} + | wc -l | awk '{ print "goml:", $1 }'
+    find ./gomlc -type f -name '*.goml' -exec cat {} + | wc -l | awk '{ print "gomlc:", $1 }'
+    find ./lib -type f -name '*.goml' -exec cat {} + | wc -l | awk '{ print "lib:", $1 }'
 
 clean:
     rm -rf _artifact _bootstrap

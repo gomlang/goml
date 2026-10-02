@@ -19,8 +19,8 @@ version_greater() {
 check_version() {
     parse_version "$1"
     expected="$release_major.$release_minor.$release_patch"
-    goml_version="$(sed -n -E 's/^[[:space:]]*"([0-9]+\.[0-9]+\.[0-9]+)"[[:space:]]*$/\1/p' goml/version/version.gom)"
-    gomlc_version="$(sed -n -E 's/^[[:space:]]*"([0-9]+\.[0-9]+\.[0-9]+)"[[:space:]]*$/\1/p' gomlc/version/version.gom)"
+    goml_version="$(sed -n -E 's/^[[:space:]]*"([0-9]+\.[0-9]+\.[0-9]+)"[[:space:]]*$/\1/p' goml/version/version.goml)"
+    gomlc_version="$(sed -n -E 's/^[[:space:]]*"([0-9]+\.[0-9]+\.[0-9]+)"[[:space:]]*$/\1/p' gomlc/version/version.goml)"
     vscode_version="$(sed -n -E 's/^[[:space:]]*"version": "([^"]+)",?$/\1/p' editors/vscode/package.json | head -n 1)"
     lock_versions="$(sed -n -E 's/^[[:space:]]*"version": "([^"]+)",?$/\1/p' editors/vscode/package-lock.json | head -n 2)"
     test "$(cat VERSION)" = "$expected"
@@ -79,8 +79,8 @@ set_version() {
     parse_version "$1"
     value="$release_major.$release_minor.$release_patch"
     printf '%s\n' "$value" > VERSION
-    sed -i -E "s/^([[:space:]]*)\"[0-9]+\\.[0-9]+\\.[0-9]+\"[[:space:]]*$/\\1\"$value\"/" goml/version/version.gom
-    sed -i -E "s/^([[:space:]]*)\"[0-9]+\\.[0-9]+\\.[0-9]+\"[[:space:]]*$/\\1\"$value\"/" gomlc/version/version.gom
+    sed -i -E "s/^([[:space:]]*)\"[0-9]+\\.[0-9]+\\.[0-9]+\"[[:space:]]*$/\\1\"$value\"/" goml/version/version.goml
+    sed -i -E "s/^([[:space:]]*)\"[0-9]+\\.[0-9]+\\.[0-9]+\"[[:space:]]*$/\\1\"$value\"/" gomlc/version/version.goml
 }
 
 set_stage0() {

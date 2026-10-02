@@ -1,0 +1,663 @@
+package mono;
+
+use module::ast;
+use module::core;
+use module::hir;
+use module::parser;
+use std::text;
+use module::tast;
+use std::testing;
+
+fn test_builtins(counter: Ref[isize]) -> core::File {
+    match core::lower_builtins(counter) {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.to_string());
+            core::File {
+                functions: Vec::new(),
+                enums: Vec::new(),
+                structs: Vec::new(),
+                type_instances: Vec::new(),
+                constants: Vec::new(),
+                statics: Vec::new(),
+            }
+        },
+    }
+}
+
+fn test_prelude(builtins: core::File, counter: Ref[isize]) -> core::File {
+    match core::lower_prelude(builtins, counter) {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.to_string());
+            core::File {
+                functions: Vec::new(),
+                enums: Vec::new(),
+                structs: Vec::new(),
+                type_instances: Vec::new(),
+                constants: Vec::new(),
+                statics: Vec::new(),
+            }
+        },
+    }
+}
+
+fn lower_source(source: string) -> File {
+    lower(core::lower(tast::check(hir::lower(ast::lower(parser::parse(source)), "main.goml"))))
+}
+
+fn lower_linked_source(source: string) -> File {
+    let counter = Ref::new(0);
+    let builtins = test_builtins(counter);
+    let prelude = test_prelude(builtins, counter);
+    let user = core::lower_with_counter_and_types(
+        tast::check_for_link(hir::lower(ast::lower(parser::parse(source)), "main.goml")),
+        counter,
+        core::enum_defs_to_tast(builtins.enums),
+        core::struct_defs_to_tast(builtins.structs),
+    );
+    lower(core::link_with_dependencies(builtins, Vec::from_array([prelude]), user))
+}
+
+fn lower_checked_source(source: string) -> LowerResult {
+    lower_checked(
+        core::lower(tast::check(hir::lower(ast::lower(parser::parse(source)), "main.goml"))),
+    )
+}
+
+#[test]
+fn snapshot_names_restart_for_each_function() -> () {
+    let output = encode_snapshot(
+        lower_source("fn first(value: i32) -> i32 { value } fn second(value: i32) -> i32 { value }"),
+    );
+    testing::assert(output.contains("fn first(value/0: i32)"));
+    testing::assert(output.contains("fn second(value/0: i32)"))
+}
+
+fn core_file_with_residual_type(ty: core::Type) -> core::File {
+    let file = core::lower(
+        tast::check(hir::lower(ast::lower(parser::parse("fn main() -> () { () }")), "main.goml")),
+    );
+    let function = file.functions[0];
+    let stmts: Vec[core::LetStmt] = Vec::from_array(
+        [
+            core::LetStmt {
+                name: "residual",
+                value: core::Expr::Prim { value: core::Primitive::Unit, ty },
+                ty,
+            },
+        ],
+    );
+    core::File {
+        functions: Vec::from_array(
+            [
+                core::Function {
+                    name: function.name,
+                    origin: function.origin,
+                    root: function.root,
+                    trait_impl: function.trait_impl,
+                    generics: function.generics,
+                    predicates: function.predicates,
+                    params: function.params,
+                    ret_ty: function.ret_ty,
+                    body: core::Block { stmts, tail: function.body.tail },
+                },
+            ],
+        ),
+        enums: file.enums,
+        structs: file.structs,
+        type_instances: file.type_instances,
+        constants: file.constants,
+        statics: file.statics,
+    }
+}
+
+fn string_contains(value: string, expected: string) -> bool {
+    value.contains(expected)
+}
+
+fn string_index(value: string, expected: string) -> isize {
+    text::find(value, expected).unwrap_or(-1)
+}
+
+#[test]
+fn preserves_monomorphic_core_programs() -> () {
+    testing::assert_eq(
+        encode(lower_source("fn main() -> i32 { 1 }")),
+        \\fn main() -> i32 {
+        \\  1
+        \\}
+        ,
+    )
+}
+
+#[test]
+fn eliminates_dead_monomorphic_locals() -> () {
+    let value = lower_source(
+        "fn effect() -> i32 { 1 } fn main() -> () { let dead = (1, 2); let kept = effect(); () }",
+    );
+    let output = encode(dce(value));
+    testing::assert(!string_contains(output, "dead/"));
+    testing::assert(string_contains(output, "let kept/"))
+}
+
+#[test]
+fn rejects_invalid_mono_nominal_types() -> () {
+    let file = lower_source("fn main() -> () { () }");
+    if let Err(message) = validate(file) {
+        testing::fail(message)
+    }
+    let function = file.functions[0];
+    let functions = Vec::from_array(
+        [
+            Function {
+                name: function.name,
+                origin: function.origin,
+                root: function.root,
+                trait_impl: function.trait_impl,
+                params: Vec::from_array([("value", Type::Named { name: "" })]),
+                ret_ty: function.ret_ty,
+                body: function.body,
+            },
+        ],
+    );
+    match validate(
+        File {
+            functions,
+            enums: file.enums,
+            structs: file.structs,
+            type_instances: file.type_instances,
+            constants: file.constants,
+            statics: file.statics,
+        },
+    ) {
+        Ok(_) => testing::fail("expected invalid Mono IR"),
+        Err(message) => testing::assert(message.contains("empty nominal type name")),
+    }
+}
+
+#[test]
+fn rejects_open_types_at_the_mono_boundary() -> () {
+    let parameter = lower_checked(core_file_with_residual_type(core::Type::Param { name: "T" }));
+    match parameter.error {
+        Some(message) => testing::assert(message.contains("generic parameter T remained")),
+        None => testing::fail("expected residual generic parameter rejection"),
+    }
+    let projection = lower_checked(
+        core_file_with_residual_type(
+            core::Type::Projection {
+                for_ty: core::Type::Con { name: "Source" },
+                name: "Item",
+                trait_ref: Option::None,
+            },
+        ),
+    );
+    match projection.error {
+        Some(message) => testing::assert(message.contains("projection remained")),
+        None => testing::fail("expected residual projection rejection"),
+    }
+    let nested = lower_checked(
+        core_file_with_residual_type(
+            core::Type::Dyn {
+                trait_name: "Display",
+                args: Vec::from_array([core::Type::Param { name: "T" }]),
+                associated_types: Vec::new(),
+                additional_bounds: Vec::new(),
+            },
+        ),
+    );
+    match nested.error {
+        Some(message) => testing::assert(message.contains("generic parameter T remained")),
+        None => testing::fail("expected nested generic parameter rejection"),
+    }
+}
+
+#[test]
+fn resolves_static_trait_calls() -> () {
+    testing::assert_eq(
+        encode(lower_source("fn main() -> string { true.to_string() }")),
+        \\fn main() -> string {
+        \\  trait_impl#ToString#bool#to_string(true)
+        \\}
+        ,
+    )
+}
+
+#[test]
+fn retains_linked_monomorphic_trait_impls() -> () {
+    let output = encode(lower_linked_source("fn main() -> () { print(true) }"));
+    testing::assert(string_contains(output, "fn print__T_bool"));
+    testing::assert(string_contains(output, "fn trait_impl#ToString#bool#to_string"))
+}
+
+#[test]
+fn specializes_generic_functions_for_matching_dyn_bounds() -> () {
+    let output = encode(
+        lower_linked_source(
+            "fn main() -> () { let value: dyn ToString = 1 as dyn ToString; println(value) }",
+        ),
+    );
+    testing::assert(string_contains(output, "fn println__T_dynToString"));
+    testing::assert(string_contains(output, "dyn_call[ToString::to_string]"))
+}
+
+#[test]
+fn retains_linked_monomorphic_inherent_methods() -> () {
+    let output = encode(
+        lower_linked_source("fn main() -> string { let value: i32 = 42; value.to_string() }"),
+    );
+    testing::assert(string_contains(output, "fn inherent#i32#i32#to_string"));
+    testing::assert(string_contains(output, "fn __goml_builtin_int32_to_string"))
+}
+
+#[test]
+fn queues_inherent_callees_after_call_arguments() -> () {
+    let output = encode(
+        lower_linked_source(
+            "fn main() -> () { let value = Ref::new(0); let iterator: FnIterator[isize] = FnIterator::from_fn(|| { let _ = value.get(); Option::None }); let _ = iterator; }",
+        ),
+    );
+    let get_index = string_index(output, "fn inherent#Ref#Ref[T]#get__T_isize");
+    let from_fn_index = string_index(
+        output,
+        "fn inherent#FnIterator#FnIterator[T]#from_fn__T_isize",
+    );
+    testing::assert(get_index >= 0);
+    testing::assert(from_fn_index > get_index)
+}
+
+#[test]
+fn resolves_vec_for_loop_iterator_receiver() -> () {
+    let output = encode(
+        lower_source(
+            "fn iterate(values: Vec[i32]) -> () { for value in values { println(value.to_string()) } }",
+        ),
+    );
+    testing::assert(string_contains(output, "trait_impl#Iterator#FnIterator__i32#next"));
+    testing::assert(!string_contains(output, "trait_impl#Iterator#Vec[i32]#next"))
+}
+
+#[test]
+fn infers_generic_arguments_from_trait_predicates() -> () {
+    let source = "trait Parent[T] { fn parent(self: Self) -> T; } trait Child[T: ToString]: Parent[T] { fn child(self: Self) -> string; } struct Box[T] { value: T } impl[T] Parent[T] for Box[T] { fn parent(self: Box[T]) -> T { self.value } } impl[T: ToString] Child[T] for Box[T] { fn child(self: Box[T]) -> string { \"child\" } } fn describe[T, B: Child[T]](value: B) -> string { value.parent().to_string() + value.child() } fn main() -> () { println(describe(Box { value: 5 })) }";
+    let output = encode(lower_source(source));
+    testing::assert(string_contains(output, "describe__B_Box[isize]__T_isize"));
+    testing::assert(string_contains(output, "trait_impl#Child#[isize]@Box__isize#child"));
+    testing::assert(!string_contains(output, "trait_impl#Child#[T]"))
+}
+
+#[test]
+fn sorts_inferred_generic_instance_bindings() -> () {
+    let source = "trait Convert[T] { fn convert(self: Self) -> T; } struct Token {} impl Convert[i32] for Token { fn convert(self: Token) -> i32 { 7 } } fn convert_to[T, V: Convert[T]](value: V) -> T { value.convert() } fn main() -> () { let value: i32 = convert_to(Token {}); println(value) }";
+    let output = encode(lower_source(source));
+    testing::assert(string_contains(output, "convert_to__T_i32__V_Token"));
+    testing::assert(!string_contains(output, "convert_to__V_Token__T_i32"))
+}
+
+#[test]
+fn normalizes_nested_associated_iterator_types() -> () {
+    let source = "trait Batch { type Items: IntoIterator; fn items(self: Self) -> Self::Items; } struct Numbers { values: Vec[i32] } impl Batch for Numbers { type Items = Vec[i32]; fn items(self: Numbers) -> Vec[i32] { self.values } } fn count[B: Batch](batch: B) -> i32 { let total = Ref::new(0); for _ in Batch::items(batch) { total.set(total.get() + 1); }; total.get() } fn main() -> () { let values: Vec[i32] = Vec::new(); println(count(Numbers { values })) }";
+    let output = encode(lower_source(source));
+    testing::assert(string_contains(output, "trait_impl#IntoIterator#Vec[i32]#into_iter"));
+    testing::assert(string_contains(output, "trait_impl#Iterator#FnIterator__i32#next"));
+    testing::assert(!string_contains(output, "Numbers::Items"))
+}
+
+#[test]
+fn specializes_forwarded_associated_type_bounds_through_nested_receivers() -> () {
+    let definitions = "trait Read { fn read(self: Self) -> i32; } trait File: Read { fn stat(self: Self) -> i32; } trait FileSystem { type Handle: File; fn open(self: Self) -> Self::Handle; } struct Handle {} impl Read for Handle { fn read(self: Handle) -> i32 { 7 } } impl File for Handle { fn stat(self: Handle) -> i32 { 9 } } struct Provider {} impl FileSystem for Provider { type Handle = Handle; fn open(self: Provider) -> Handle { Handle {} } } struct SubFs[F] { inner: F } impl[F: FileSystem] FileSystem for SubFs[F] { type Handle = F::Handle; fn open(self: SubFs[F]) -> F::Handle { self.inner.open() } } fn inspect[F: FileSystem](filesystem: F) -> i32 { let handle = filesystem.open(); handle.stat() + handle.read() } ";
+    for receiver in[
+        "SubFs { inner: Provider {} }",
+        "SubFs { inner: SubFs { inner: SubFs { inner: Provider {} } } }",
+    ] {
+        let source = definitions + "fn main() -> i32 { inspect(" + receiver + ") }";
+        let checked = tast::check(hir::lower(ast::lower(parser::parse(source)), "main.goml"));
+        testing::assert_eq(checked.diagnostics.len(), 0);
+        let result = lower_checked(core::lower(checked));
+        match result.error {
+            Some(message) => testing::fail(message),
+            None => (),
+        }
+    }
+}
+
+#[test]
+fn normalizes_supertrait_associated_projections() -> () {
+    let source = "trait Child: Parent { fn child(self: Self) -> (); } trait Parent { type Item; fn get(self: Self) -> Self::Item; } struct Count { value: i32, } impl Parent for Count { type Item = i32; fn get(self: Count) -> i32 { self.value } } impl Child for Count { fn child(self: Count) -> () { () } } fn get_from_child[C: Child](value: C) -> C::Item { Parent::get(value) } fn main() -> () { println(get_from_child(Count { value: 42 })); }";
+    let file = lower_source(source);
+    let found = Ref::new(false);
+    for function in file.functions {
+        if function.name == "get_from_child__C_Count" {
+            found.set(true);
+            match function.body.tail {
+                Some(expr) => match expr_type(expr) {
+                    Int32 => (),
+                    _ => testing::fail("expected normalized associated type"),
+                },
+                None => testing::fail("expected function tail"),
+            }
+        }
+    }
+    testing::assert(found.get())
+}
+
+#[test]
+fn transfers_projection_equalities_between_generic_parameters() -> () {
+    let source = "trait Mark { fn marked(self: Self) -> string; } trait Source { type Item; fn get(self: Self) -> Self::Item; } struct Left { value: i32 } struct Right { value: i32 } impl Mark for i32 { fn marked(self: i32) -> string { self.to_string() } } impl Source for Left { type Item = i32; fn get(self: Left) -> i32 { self.value } } impl Source for Right { type Item = i32; fn get(self: Right) -> i32 { self.value } } fn combine[A: Source, B: Source](left: A, right: B) -> string where A::Item = B::Item, B::Item: Mark { Source::get(left).marked() + Source::get(right).marked() } fn main() -> () { println(combine(Left { value: 1 }, Right { value: 2 })) }";
+    let output = encode(lower_source(source));
+    testing::assert(string_contains(output, "combine__A_Left__B_Right"));
+    testing::assert(string_contains(output, "trait_impl#Mark#i32#marked"));
+    testing::assert(!string_contains(output, "combine(Left"))
+}
+
+#[test]
+fn normalizes_projected_trait_impl_calls() -> () {
+    let source = "trait Source { type Item; fn get(self: Self) -> Self::Item; } trait Pick[T] { fn pick(self: Self) -> T; } impl[S: Source] Pick[S::Item] for S { fn pick(self: S) -> S::Item { Source::get(self) } } struct Value { value: i32 } impl Source for Value { type Item = i32; fn get(self: Value) -> i32 { self.value } } fn main() -> () { let direct: i32 = (Value { value: 41 }).pick(); println(direct) }";
+    let output = encode(lower_source(source));
+    testing::assert(string_contains(output, "trait_impl#Pick#[i32]@Value#pick"));
+    testing::assert(!string_contains(output, "Value::Item"))
+}
+
+#[test]
+fn filters_unsatisfied_blanket_impls() -> () {
+    let source = "trait Mark { fn mark(self: Self) -> string; } trait Label { fn label(self: Self) -> string; } struct Box[T] { value: T } impl Mark for i32 { fn mark(self: i32) -> string { self.to_string() } } impl[T: Mark] Label for Box[T] { fn label(self: Box[T]) -> string { \"blanket:\" + self.value.mark() } } impl Label for Box[string] { fn label(self: Box[string]) -> string { \"string:\" + self.value } } fn main() -> () { println((Box { value: \"text\" }).label()); println((Box { value: 7 }).label()) }";
+    let output = encode(lower_source(source));
+    testing::assert(string_contains(output, "trait_impl#Label#Box__i32#label"));
+    testing::assert(!string_contains(output, "trait_impl#Mark#string#mark"));
+    testing::assert(!string_contains(output, "label__mono"))
+}
+
+#[test]
+fn resolves_trait_arguments_from_generic_impls() -> () {
+    let source = "trait ItemSource { type Item; fn item(self: Self) -> Self::Item; } trait Select[T] { fn select(self: Self) -> T; } impl[S: ItemSource, T] Select[T] for S where S::Item = T { fn select(self: S) -> T { ItemSource::item(self) } } struct Selected { value: i32 } impl ItemSource for Selected { type Item = i32; fn item(self: Selected) -> i32 { self.value } } fn invoke[T, S: Select[T]](source: S) -> T { source.select() } fn select_item[S: ItemSource](source: S) -> S::Item { invoke(source) } fn main() -> () { println(select_item(Selected { value: 9 })) }";
+    let output = encode(lower_source(source));
+    testing::assert(string_contains(output, "invoke__S_Selected__T_i32"));
+    testing::assert(string_contains(output, "trait_impl#Select#[i32]@Selected#select"));
+    testing::assert(!string_contains(output, "invoke(source"))
+}
+
+#[test]
+fn satisfies_builtin_into_iterator_predicates() -> () {
+    let source = "fn consume[S: IntoIterator](source: S) -> () { for _ in source {} } fn main() -> () { let values: Vec[i32] = Vec::new(); consume(values); consume(values.slice(0, 0)) }";
+    let output = encode(lower_source(source));
+    testing::assert(string_contains(output, "consume__S_Vec[i32]"));
+    testing::assert(string_contains(output, "consume__S_Slice[i32]"))
+}
+
+#[test]
+fn filters_unsatisfied_blanket_into_iterator_impls() -> () {
+    let source = "struct Numbers { values: Vec[i32] } impl IntoIterator for Numbers { type Item = i32; type IntoIter = FnIterator[i32]; fn into_iter(self: Numbers) -> FnIterator[i32] { self.values.iter() } } fn consume[S: IntoIterator](source: S) -> () where S::Item = i32 { for _ in source {} } fn main() -> () { let values: Vec[i32] = Vec::new(); consume(Numbers { values }) }";
+    let output = encode(lower_source(source));
+    testing::assert(string_contains(output, "consume__S_Numbers"));
+    testing::assert(string_contains(output, "trait_impl#IntoIterator#Numbers#into_iter"));
+    testing::assert(!string_contains(output, "consume(Numbers"))
+}
+
+#[test]
+fn retains_generic_eq_hash_impls_for_runtime_keys() -> () {
+    let source = "struct Wrap[T] { value: T } impl[T: PartialEq] PartialEq for Wrap[T] { fn eq(self: Wrap[T], other: Wrap[T]) -> bool { PartialEq::eq(self.value, other.value) } } impl[T: Eq] Eq for Wrap[T] {} impl[T: Hash] Hash for Wrap[T] { fn hash(self: Wrap[T]) -> u64 { Hash::hash(self.value) } } fn main() -> () { let map: HashMap[Wrap[i32], string] = HashMap::new(); let _ = map; }";
+    let output = encode(lower_source(source));
+    testing::assert(string_contains(output, "trait_impl#PartialEq#Wrap__i32#eq"));
+    testing::assert(string_contains(output, "trait_impl#Hash#Wrap__i32#hash"))
+}
+
+#[test]
+fn specializes_generic_enum_constructors() -> () {
+    let source = "enum Weird[T] { Next(Ref[Weird[(i32) -> i32]]), Done(T) } fn main() -> () { let x: Weird[i32] = Weird::Done(1); match x { Weird::Done(v) => println(v.to_string()), Weird::Next(_) => println(\"next\"), } }";
+    testing::assert_eq(
+        encode(lower_source(source)),
+        \\fn main() -> () {
+        \\  let x/0 = Weird__i32::Done(1) in
+        \\  match x/0 {
+        \\    Weird__i32::Next(x0) => {
+        \\      {
+        \\        let x0 = Weird__i32::Next._0(x/0) in
+        \\        println("next")
+        \\      }
+        \\    },
+        \\    Weird__i32::Done(x1) => {
+        \\      {
+        \\        let x1 = Weird__i32::Done._0(x/0) in
+        \\        {
+        \\          let v/1 = x1 in
+        \\          println(inherent#i32#i32#to_string(v/1))
+        \\        }
+        \\      }
+        \\    },
+        \\  }
+        \\}
+        ,
+    )
+}
+
+#[test]
+fn specializes_generic_functions_with_collision_safe_names() -> () {
+    let source = "fn id[T](x: T) -> T { x } fn id__T_i32(x: i32) -> i32 { x + 1 } fn main() -> () { println(id(10)); println(id__T_i32(10)) }";
+    testing::assert_eq(
+        encode(lower_source(source)),
+        \\fn id__T_i32(x/1: i32) -> i32 {
+        \\  (x/1 + 1)
+        \\}
+        \\
+        \\fn main() -> () {
+        \\  let _wild0 = println(id__T_isize(10)) in
+        \\  println(id__T_i32(10))
+        \\}
+        \\
+        \\fn id__T_isize(x/0: isize) -> isize {
+        \\  x/0
+        \\}
+        ,
+    )
+}
+
+#[test]
+fn prints_monomorphic_closures_without_parameter_types() -> () {
+    let source = "enum MaybeFn { Some((i32) -> i32), None } fn next(flag: bool) -> MaybeFn { if flag { MaybeFn::Some(|x| x + 1) } else { MaybeFn::None } } fn main() -> () { match next(true) { MaybeFn::Some(f) => println(f(41).to_string()), MaybeFn::None => println(\"none\"), } }";
+    testing::assert_eq(
+        encode(lower_source(source)),
+        \\fn next(flag/0: bool) -> MaybeFn {
+        \\  if flag/0 {
+        \\      {
+        \\        MaybeFn::Some(|x/1| (x/1 + 1))
+        \\      }
+        \\  } else {
+        \\      {
+        \\        MaybeFn::None
+        \\      }
+        \\  }
+        \\}
+        \\
+        \\fn main() -> () {
+        \\  {
+        \\    let mtmp0 = next(true) in
+        \\    match mtmp0 {
+        \\      MaybeFn::Some(x1) => {
+        \\        {
+        \\          let x1 = MaybeFn::Some._0(mtmp0) in
+        \\          {
+        \\            let f/2 = x1 in
+        \\            println(inherent#i32#i32#to_string(f/2(41)))
+        \\          }
+        \\        }
+        \\      },
+        \\      MaybeFn::None => {
+        \\        println("none")
+        \\      },
+        \\    }
+        \\  }
+        \\}
+        ,
+    )
+}
+
+#[test]
+fn retains_generic_trait_impls_for_dyn_coercions() -> () {
+    let source = "struct Box[T] { value: T } trait Printable { fn print_me(self: Self) -> string; } impl Printable for i32 { fn print_me(self: i32) -> string { self.to_string() } } impl[T: Printable] Printable for Box[T] { fn print_me(self: Box[T]) -> string { \"Box(\" + Printable::print_me(self.value) + \")\" } } fn show(value: dyn Printable) -> string { Printable::print_me(value) } fn main() -> () { let value: Box[i32] = Box { value: 42 }; println(show(value as dyn Printable)) }";
+    let output = encode(lower_source(source));
+    testing::assert(string_contains(output, "trait_impl#Printable#Box__i32#print_me"));
+    testing::assert(string_contains(output, "trait_impl#Printable#i32#print_me"))
+}
+
+#[test]
+fn specializes_generic_types_with_collision_safe_names() -> () {
+    let source = "struct Box[T] { value: T } struct Box__i32 { value: i32 } fn main() -> () { let a = Box { value: 10 }; let b = Box__i32 { value: 20 }; println(a.value + b.value) }";
+    testing::assert_eq(
+        encode(lower_source(source)),
+        \\fn main() -> () {
+        \\  let a/0 = Box__i32__mono1 { value: 10 } in
+        \\  let b/1 = Box__i32 { value: 20 } in
+        \\  println((Box__i32__mono1.value(a/0) + Box__i32.value(b/1)))
+        \\}
+        ,
+    )
+}
+
+#[test]
+fn specializes_generic_inherent_methods() -> () {
+    let source = "struct Point[U, V] { x: U, y: V } impl[U, V] Point[U, V] { fn new(x: U, y: V) -> Point[U, V] { Point { x, y } } fn swap(self: Point[U, V]) -> Point[V, U] { Point { x: self.y, y: self.x } } fn get_x(self: Point[U, V]) -> U { self.x } } fn main() -> () { let p1: Point[i32, string] = Point::new(10, \"hello\"); let p2: Point[string, string] = Point::new(\"goml\", \"lang\"); let p3: Point[string, i32] = p1.swap(); let x: i32 = p3.y; println(x.to_string()); let x2: string = p2.get_x(); println(x2) }";
+    testing::assert_eq(
+        encode(lower_source(source)),
+        \\fn main() -> () {
+        \\  let p1/4 = inherent#Point#Point[U,V]#new__U_i32__V_string(10, "hello") in
+        \\  let p2/5 = inherent#Point#Point[U,V]#new__U_string__V_string("goml", "lang") in
+        \\  let p3/6 = inherent#Point#Point[U,V]#swap__U_i32__V_string(p1/4) in
+        \\  let x/7 = Point__string__i32.y(p3/6) in
+        \\  let _wild0 = println(inherent#i32#i32#to_string(x/7)) in
+        \\  let x2/8 = inherent#Point#Point[U,V]#get_x__U_string__V_string(p2/5) in
+        \\  println(x2/8)
+        \\}
+        \\
+        \\fn inherent#Point#Point[U,V]#new__U_i32__V_string(x/0: i32, y/1: string) -> Point__i32__string {
+        \\  Point__i32__string { x: x/0, y: y/1 }
+        \\}
+        \\
+        \\fn inherent#Point#Point[U,V]#new__U_string__V_string(
+        \\  x/0: string,
+        \\  y/1: string
+        \\) -> Point__string__string {
+        \\  Point__string__string { x: x/0, y: y/1 }
+        \\}
+        \\
+        \\fn inherent#Point#Point[U,V]#swap__U_i32__V_string(
+        \\  self/2: Point__i32__string
+        \\) -> Point__string__i32 {
+        \\  Point__string__i32 { x: Point__i32__string.y(self/2), y: Point__i32__string.x(self/2) }
+        \\}
+        \\
+        \\fn inherent#Point#Point[U,V]#get_x__U_string__V_string(self/3: Point__string__string) -> string {
+        \\  Point__string__string.x(self/3)
+        \\}
+        ,
+    )
+}
+
+#[test]
+fn specializes_associated_type_functions_and_impls() -> () {
+    let source = "trait Provider { type Item: ToString; fn get(self: Self) -> Self::Item; } struct Number { value: i32 } struct Box[T] { value: T } impl Provider for Number { type Item = i32; fn get(self: Number) -> i32 { self.value } } impl[T: ToString] Provider for Box[T] { type Item = T; fn get(self: Box[T]) -> T { self.value } } fn read[P: Provider](provider: P) -> P::Item { provider.get() } fn read_as[P, T](provider: P) -> T where P: Provider, P::Item = T { provider.get() } fn main() -> () { println(read(Number { value: 42 }).to_string()); let value: i32 = read_as(Number { value: 7 }); println(value.to_string()); println(read(Box { value: \"generic\" })); println(Provider::get(Number { value: 11 }).to_string()) }";
+    testing::assert_eq(
+        encode(lower_source(source)),
+        \\fn trait_impl#Provider#Number#get(self/0: Number) -> i32 {
+        \\  Number.value(self/0)
+        \\}
+        \\
+        \\fn main() -> () {
+        \\  let _wild0 = println(inherent#i32#i32#to_string(read__P_Number(Number { value: 42 }))) in
+        \\  let value/4 = read_as__P_Number__T_i32(Number { value: 7 }) in
+        \\  let _wild1 = println(inherent#i32#i32#to_string(value/4)) in
+        \\  let _wild2 = println(read__P_Box[string](Box__string { value: "generic" })) in
+        \\  println(inherent#i32#i32#to_string(trait_impl#Provider#Number#get(Number { value: 11 })))
+        \\}
+        \\
+        \\fn read__P_Number(provider/2: Number) -> i32 {
+        \\  trait_impl#Provider#Number#get(provider/2)
+        \\}
+        \\
+        \\fn read_as__P_Number__T_i32(provider/3: Number) -> i32 {
+        \\  trait_impl#Provider#Number#get(provider/3)
+        \\}
+        \\
+        \\fn read__P_Box[string](provider/2: Box__string) -> string {
+        \\  trait_impl#Provider#Box__string#get(provider/2)
+        \\}
+        \\
+        \\fn trait_impl#Provider#Box__string#get(self/1: Box__string) -> string {
+        \\  Box__string.value(self/1)
+        \\}
+        ,
+    )
+}
+
+#[test]
+fn orders_nested_associated_calls_by_resolved_callees() -> () {
+    let source = "trait Source { type Item; fn get(self: Self) -> Self::Item; } struct Box[T] { value: T } impl[T] Source for Box[T] { type Item = T; fn get(self: Box[T]) -> T { self.value } } fn boxed[T](value: T) -> Box[T] { Box { value } } fn read[S: Source](source: S) -> S::Item { source.get() } fn main() -> i32 { read(boxed(99)) }";
+    testing::assert_eq(
+        encode(lower_source(source)),
+        \\fn main() -> i32 {
+        \\  read__S_Box[i32](boxed__T_i32(99))
+        \\}
+        \\
+        \\fn boxed__T_i32(value/1: i32) -> Box__i32 {
+        \\  Box__i32 { value: value/1 }
+        \\}
+        \\
+        \\fn read__S_Box[i32](source/2: Box__i32) -> i32 {
+        \\  trait_impl#Source#Box__i32#get(source/2)
+        \\}
+        \\
+        \\fn trait_impl#Source#Box__i32#get(self/0: Box__i32) -> i32 {
+        \\  Box__i32.value(self/0)
+        \\}
+        ,
+    )
+}
+
+#[test]
+fn rejects_recursive_generic_function_specialization() -> () {
+    let result = lower_checked_source(
+        "fn blow[T](value: T) -> () { blow((value, value)) } fn main() -> () { blow(0) }",
+    );
+    match result.error {
+        Some(error) => testing::assert_eq(
+            error,
+            "Infinite monomorphization detected for generic function blow: recursive specialization grows type parameter T from (isize, isize) to ((isize, isize), (isize, isize))",
+        ),
+        None => testing::fail("expected recursive function specialization error"),
+    }
+}
+
+#[test]
+fn rejects_recursive_generic_type_specialization() -> () {
+    let enum_result = lower_checked_source(
+        "enum Bad[T] { End(T), More(Bad[Option[T]]) } fn use_bad(value: Bad[i32]) -> () {} fn main() -> () {}",
+    );
+    match enum_result.error {
+        Some(error) => testing::assert_eq(
+            error,
+            "Infinite monomorphization detected for generic type Bad: recursive specialization grows type parameter T from Option[i32] to Option[Option[i32]]",
+        ),
+        None => testing::fail("expected recursive enum specialization error"),
+    }
+    let struct_result = lower_checked_source(
+        "struct Bad[T] { value: T, next: Ref[Option[Bad[Option[T]]]] } fn use_bad(value: Bad[i32]) -> () {} fn main() -> () {}",
+    );
+    match struct_result.error {
+        Some(error) => testing::assert_eq(
+            error,
+            "Infinite monomorphization detected for generic type Bad: recursive specialization grows type parameter T from Option[i32] to Option[Option[i32]]",
+        ),
+        None => testing::fail("expected recursive struct specialization error"),
+    }
+}
+
+#[test]
+fn keeps_associated_methods_with_identical_signatures_on_their_owner() -> () {
+    let output = encode(
+        lower_source(
+            "struct Small {} struct Large {} impl Small { fn size() -> isize { 16 } } impl Large { fn size() -> isize { 144 } } fn main() -> isize { Small::size() + Large::size() }",
+        ),
+    );
+    testing::assert(
+        string_contains(output, "inherent#Small#Small#size() + inherent#Large#Large#size()"),
+    );
+}

@@ -31,8 +31,8 @@ cd "$smoke_root/project"
 "$smoke_root/$package/bin/goml" build
 test "$("$smoke_root/$package/bin/goml" run)" = "std/works"
 "$smoke_root/$package/bin/goml" test
-"$smoke_root/$package/bin/gomlfmt" -w ./*.gom
-"$smoke_root/$package/bin/gomlfmt" --check ./*.gom
+"$smoke_root/$package/bin/gomlfmt" -w ./*.goml
+"$smoke_root/$package/bin/gomlfmt" --check ./*.goml
 "$smoke_root/$package/bin/goml" fmt --check
 "$smoke_root/$package/bin/goml" doc --format json
 jq -e '.schema_version == 1 and (.packages | length) > 0' _artifact/doc/module.json >/dev/null
@@ -73,13 +73,13 @@ export GOWORK=off GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off
 sha256sum gen/calclib/goml_generated.go gen/calclib/goml_exports.json > export-digests
 "$smoke_root/$package/bin/goml" export-go . --compiler "$smoke_root/$package/bin/gomlc" --import-path example.com/host/gen/calclib --out ./gen/calclib
 sha256sum -c export-digests
-rm calc.gom goml.toml
+rm calc.goml goml.toml
 export PATH="$(dirname "$(command -v go)"):/usr/bin:/bin"
 go test ./...
 test "$(go run .)" = "42 4 7 8"
 test ! -e go.sum
 mkdir -p "$smoke_root/file-read"
-for source in goml.toml go.mod main.gom data.txt; do
+for source in goml.toml go.mod main.goml data.txt; do
     cp "$repository_root/examples/ffi-file-read/$source" "$smoke_root/file-read/$source"
 done
 cp -R "$repository_root/examples/ffi-file-read/shim" "$smoke_root/file-read/shim"
@@ -105,7 +105,7 @@ for attempt in 1 2; do
 done
 test ! -e go.sum
 mkdir -p "$smoke_root/callbacks/shim"
-for source in goml.toml go.mod main.gom shim/shim.go; do
+for source in goml.toml go.mod main.goml shim/shim.go; do
     cp "$repository_root/examples/ffi-callbacks/$source" "$smoke_root/callbacks/$source"
 done
 cd "$smoke_root/callbacks"
@@ -130,7 +130,7 @@ for attempt in 1 2; do
 done
 test ! -e go.sum
 mkdir -p "$smoke_root/bind-go"
-for source in goml.toml go.mod main.gom bindings.json; do
+for source in goml.toml go.mod main.goml bindings.json; do
     cp "$repository_root/examples/ffi-bind-go/$source" "$smoke_root/bind-go/$source"
 done
 cd "$smoke_root/bind-go"
@@ -138,7 +138,7 @@ cd "$smoke_root/bind-go"
 test ! -e bindings
 test ! -e native
 "$smoke_root/$package/bin/goml" bind-go bindings.json
-sha256sum bindings/generated.gom native/generated.go bindings.json.goml-bind.json > binding-digests
+sha256sum bindings/generated.goml native/generated.go bindings.json.goml-bind.json > binding-digests
 "$smoke_root/$package/bin/goml" bind-go bindings.json
 sha256sum -c binding-digests
 "$smoke_root/$package/bin/goml" fmt --check
@@ -150,7 +150,7 @@ true
 OUTPUT
 )"
 test "$("$smoke_root/$package/bin/goml" run)" = "$expected_bindings"
-printf '\nfn handwritten() -> () {}\n' >> bindings/generated.gom
+printf '\nfn handwritten() -> () {}\n' >> bindings/generated.goml
 if "$smoke_root/$package/bin/goml" bind-go bindings.json > binding-rejected.log 2>&1; then
     exit 1
 fi

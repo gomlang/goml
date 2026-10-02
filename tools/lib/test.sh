@@ -88,7 +88,7 @@ cp -R "$repo_root/tools/release/testdata/smoke" "$temporary/project"
 grep -F -- "--world $temporary/toolchain/lib/compiler/compiler-world-v2.gaf" "$temporary/project-plan" >/dev/null
 "$temporary/toolchain/bin/gomlc" build \
     --package tests::toml \
-    --input "$repo_root/gomlc/testdata/module/project055_toml/main.gom" \
+    --input "$repo_root/gomlc/testdata/module/project055_toml/main.goml" \
     --output "$temporary/toolchain/smoke/main" \
     --world "$temporary/toolchain/lib/compiler/compiler-world-v2.gaf"
 test -f "$temporary/toolchain/smoke/main.interface"

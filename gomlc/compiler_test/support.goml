@@ -1,0 +1,689 @@
+package compiler_test;
+
+use module::cmd::gomlc as compiler_driver;
+use module::go_backend;
+use std::bytes;
+use std::collections;
+use std::env;
+use std::fs;
+use std::path;
+use std::process;
+use std::testing;
+use std::text;
+use std::utf8;
+use utf8::BytesUtf8;
+
+pub fn repository_root() -> string {
+    match env::var_structured("GOML_REPO") {
+        Ok(value) => value,
+        Err(_) => match path::absolute_structured("..") {
+            Ok(value) => value,
+            Err(message) => {
+                testing::fail(message.to_string());
+                ".."
+            },
+        },
+    }
+}
+
+pub fn compiler_tests_root() -> string {
+    path::join(repository_root(), "gomlc/testdata")
+}
+
+pub fn read_file(file: string) -> string {
+    match fs::read_file_structured(file) {
+        Ok(value) => value,
+        Err(message) => {
+            testing::fail(f"failed to read {file}: {message}");
+            ""
+        },
+    }
+}
+
+fn read_directory(directory: string) -> Vec[string] {
+    match fs::read_dir(directory) {
+        Ok(value) => value,
+        Err(message) => {
+            testing::fail(f"failed to read directory {directory}: {message}");
+            Vec::new()
+        },
+    }
+}
+
+pub fn collect_main_sources(directory: string, result: Vec[string]) -> () {
+    for name in read_directory(directory) {
+        let entry = path::join(directory, name);
+        if fs::is_dir(entry) {
+            collect_main_sources(entry, result)
+        } else if name == "main.goml"
+            && (fs::is_file(entry + ".out") || (update_expected() && fs::is_file(entry + ".update"))) {
+            result.push(entry)
+        }
+    }
+}
+
+pub fn collect_diagnostic_sources(directory: string) -> Vec[string] {
+    let result = Vec::new();
+    for name in read_directory(directory) {
+        let entry = path::join(directory, name);
+        if fs::is_dir(entry) {
+            for source in collect_diagnostic_sources(entry) {
+                result.push(source)
+            }
+        } else if fs::is_file(entry) {
+            if let Some(extension) = path::extension(entry) {
+                if extension == "goml" {
+                    if fs::is_file(entry + ".diag") || update_expected() {
+                        result.push(entry)
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+fn bytes_text(value: bytes::Bytes) -> string {
+    match value.to_string_utf8() {
+        Ok(value) => value,
+        Err(message) => {
+            testing::fail(message.to_string());
+            ""
+        },
+    }
+}
+
+fn assert_bytes(actual: bytes::Bytes, expected: Vec[u8]) -> () {
+    let values = actual.to_vec();
+    testing::assert(values.len() == expected.len());
+    for index in 0..expected.len() {
+        testing::assert(values[index] == expected[index])
+    }
+}
+
+fn create_directory(directory: string) -> () {
+    if let Err(message) = fs::create_dir_all(directory) {
+        testing::fail(f"failed to create directory {directory}: {message}")
+    }
+}
+
+fn copy_directory(source: string, target: string) -> () {
+    if fs::exists(target) {
+        testing::expect_ok(fs::remove_dir_all(target), "clear copied fixture");
+    }
+    create_directory(target);
+    for name in read_directory(source) {
+        let source_entry = path::join(source, name);
+        let target_entry = path::join(target, name);
+        if fs::is_dir(source_entry) {
+            copy_directory(source_entry, target_entry)
+        } else {
+            match fs::read_bytes_structured(source_entry) {
+                Ok(value) => match fs::write_bytes_structured(target_entry, value) {
+                    Ok(()) => (),
+                    Err(message) => testing::fail(message.to_string()),
+                },
+                Err(message) => testing::fail(message.to_string()),
+            }
+        }
+    }
+}
+
+fn execute_go(source: string, expected: string, suite: string, shard: isize, index: isize) -> string {
+    let directory = path::join(
+        path::join(path::join(repository_root(), "gomlc/_artifact/test-work/compiler"), suite),
+        f"{shard}-{index}",
+    );
+    create_directory(directory);
+    let main_file = path::join(directory, "main.go");
+    let executable = path::join(directory, "main");
+    let source_current = if fs::is_file(main_file) {
+        match fs::read_file_structured(main_file) {
+            Ok(value) => value == source,
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
+    if source_current {} else {
+        if let Err(message) = fs::write_file_structured(main_file, source) {
+            testing::fail(f"failed to write {main_file}: {message}");
+            return ""
+        }
+        if fs::is_file(executable) {
+            if let Err(message) = fs::remove_file(executable) {
+                testing::fail(f"failed to remove stale executable {executable}: {message}");
+                return ""
+            }
+        }
+    }
+    let interpreted = if source_current && fs::is_file(executable)
+        || !go_backend::yaegi_compatible(source) {
+        Option::None
+    } else {
+        match process::Command::new("yaegi").arg("main.go").current_dir(directory).env("TZ", "UTC").output_structured() {
+            Ok(output) => if process::ExitStatus::success(process::Output::status(output)) {
+                match process::Output::stdout(output).to_string_utf8() {
+                    Ok(value) => if value == expected {
+                        Option::Some(value)
+                    } else {
+                        Option::None
+                    },
+                    Err(_) => Option::None,
+                }
+            } else {
+                Option::None
+            },
+            Err(_) => Option::None,
+        }
+    };
+    if let Some(value) = interpreted {
+        return value
+    }
+    if source_current && fs::is_file(executable) {} else {
+        match process::Command::new("go").arg("build").arg("-o").arg("main").arg("main.go").current_dir(
+            directory,
+        ).env("GOWORK", "off").env("GO111MODULE", "off").output_structured() {
+            Ok(output) => if process::ExitStatus::success(process::Output::status(output)) {} else {
+                testing::fail(
+                    "go build failed\nstdout:\n" + bytes_text(process::Output::stdout(output))
+                        + "\nstderr:\n"
+                        + bytes_text(process::Output::stderr(output)),
+                );
+                return ""
+            },
+            Err(message) => {
+                testing::fail(f"failed to build Go source: {message}");
+                return ""
+            },
+        }
+    }
+    match process::Command::new(executable).current_dir(directory).env("TZ", "UTC").output_structured() {
+        Ok(output) => if process::ExitStatus::success(process::Output::status(output)) {
+            bytes_text(process::Output::stdout(output))
+        } else {
+            testing::fail(
+                "generated program failed\nstdout:\n" + bytes_text(process::Output::stdout(output))
+                    + "\nstderr:\n"
+                    + bytes_text(process::Output::stderr(output)),
+            );
+            ""
+        },
+        Err(message) => {
+            testing::fail(f"failed to execute generated program: {message}");
+            ""
+        },
+    }
+}
+
+fn update_expected() -> bool {
+    env::var_structured("UPDATE_EXPECT").is_ok()
+}
+
+fn assert_text(actual: string, expected_path: string, source: string) -> () {
+    if update_expected() {
+        if let Err(message) = fs::write_file_structured(expected_path, actual) {
+            testing::fail(f"failed to write {expected_path}: {message}")
+        }
+        return ()
+    }
+    let expected = read_file(expected_path);
+    if actual == expected {} else {
+        testing::fail(
+            "output mismatch for " + source + "\nactual:\n" + actual + "\nexpected:\n" + expected,
+        )
+    }
+}
+
+pub fn assert_e2e_suite(kind: string, shard: isize, shard_count: isize) -> () {
+    let directory = path::join(path::join(compiler_tests_root(), "e2e"), kind);
+    let sources = Vec::new();
+    collect_main_sources(directory, sources);
+    let compiler_sources = Vec::new();
+    let compiler_index = Ref::new(0);
+    for source_path in sources {
+        let current = compiler_index.get();
+        compiler_index.set(current + 1);
+        if current % shard_count == shard {
+            compiler_sources.push(read_file(source_path))
+        }
+    }
+    let compiler = compiler_driver::source_compiler_for_sources(compiler_sources);
+    let index = Ref::new(0);
+    for source_path in sources {
+        let current = index.get();
+        index.set(current + 1);
+        if current % shard_count == shard {
+            let source = read_file(source_path);
+            let expected = if update_expected() {
+                ""
+            } else {
+                read_file(source_path + ".out")
+            };
+            let actual = match compiler_driver::compile_source_or_diagnostics_with(
+                compiler,
+                source_path,
+                source,
+            ) {
+                Compiled(compilation) => execute_go(
+                    go_backend::encode(compilation.go_value),
+                    expected,
+                    "e2e-" + kind,
+                    shard,
+                    current,
+                ),
+                Diagnostics(value) => value,
+            };
+            assert_text(actual, source_path + ".out", source_path)
+        }
+    }
+}
+
+pub fn assert_e2e_counts() -> () {
+    let good = Vec::new();
+    let bad = Vec::new();
+    let root = path::join(compiler_tests_root(), "e2e");
+    collect_main_sources(path::join(root, "good"), good);
+    collect_main_sources(path::join(root, "bad"), bad);
+    testing::assert_eq(good.len(), 560);
+    testing::assert_eq(bad.len(), 80)
+}
+
+pub fn assert_diagnostic_suite(name: string, expected_count: isize) -> () {
+    let sources = collect_diagnostic_sources(path::join(compiler_tests_root(), name));
+    testing::assert_eq(sources.len(), expected_count);
+    let compiler = compiler_driver::source_compiler_without_standard();
+    for source_path in sources {
+        let actual = compiler_driver::diagnostic_output_with(
+            compiler,
+            source_path,
+            read_file(source_path),
+        );
+        assert_text(actual, source_path + ".diag", source_path)
+    }
+}
+
+fn diagnostic_location_prefix(value: string) -> bool {
+    if value == "" {
+        return false
+    }
+    for index in 0..value.byte_len() {
+        let byte = value.byte_get(index);
+        if (byte >= b'0' && byte <= b'9') || byte == b':' {} else {
+            return false
+        }
+    }
+    true
+}
+
+fn diagnostic_kind(value: string) -> string {
+    match text::split_once(value, ": ") {
+        Some(parts) => if diagnostic_location_prefix(parts.0) {
+            parts.1
+        } else {
+            value
+        },
+        None => value,
+    }
+}
+
+fn collect_diagnostic_kinds(name: string, result: collections::HashSet[string]) -> () {
+    for source in collect_diagnostic_sources(path::join(compiler_tests_root(), name)) {
+        let snapshot = source + ".diag";
+        if fs::is_file(snapshot) {
+            for line in text::lines(read_file(snapshot)) {
+                if line == "" {} else {
+                    let _ = result.insert(diagnostic_kind(line));
+                }
+            }
+        }
+    }
+}
+
+pub fn assert_distinct_type_diagnostic_count(minimum: isize) -> () {
+    let kinds: collections::HashSet[string] = collections::HashSet::new();
+    collect_diagnostic_kinds("typer", kinds);
+    collect_diagnostic_kinds("trait_impl", kinds);
+    testing::assert(kinds.len() >= minimum)
+}
+
+fn bootstrap_goml_binary() -> string {
+    match env::var_structured("GOML_TEST_GOML") {
+        Ok(value) => match path::absolute_structured(value) {
+            Ok(value) => value,
+            Err(message) => {
+                testing::fail(message.to_string());
+                value
+            },
+        },
+        Err(_) => path::join(repository_root(), "stage1/bin/goml"),
+    }
+}
+
+fn bootstrap_gomlc_binary() -> string {
+    match env::var_structured("GOML_TEST_GOMLC") {
+        Ok(value) => match path::absolute_structured(value) {
+            Ok(value) => value,
+            Err(message) => {
+                testing::fail(message.to_string());
+                value
+            },
+        },
+        Err(_) => path::join(repository_root(), "stage1/bin/gomlc"),
+    }
+}
+
+fn assert_command_success(output: process::Output, label: string) -> () {
+    if process::ExitStatus::success(process::Output::status(output)) {} else {
+        testing::fail(
+            label + " failed\nstdout:\n" + bytes_text(process::Output::stdout(output))
+                + "\nstderr:\n"
+                + bytes_text(process::Output::stderr(output)),
+        )
+    }
+}
+
+fn project_command(command: string, project: string, target: string) -> process::Output {
+    match process::Command::new(bootstrap_goml_binary()).arg(command).arg("--compiler").arg(
+        bootstrap_gomlc_binary(),
+    ).arg("--target-dir").arg(target).current_dir(project).output_structured() {
+        Ok(value) => value,
+        Err(message) => {
+            testing::fail(message.to_string());
+            process::Output {
+                status_value: process::ExitStatus { code_value: -1 },
+                stdout_value: bytes::Bytes::new(),
+                stderr_value: bytes::Bytes::new(),
+            }
+        },
+    }
+}
+
+fn module_projects() -> Vec[string] {
+    let directory = path::join(compiler_tests_root(), "module");
+    let result = Vec::new();
+    for name in read_directory(directory) {
+        let project = path::join(directory, name);
+        if fs::is_dir(project)
+            && (fs::is_file(path::join(project, "main.goml.out"))
+                || (update_expected() && fs::is_file(path::join(project, "goml.toml")))) {
+            result.push(project)
+        }
+    }
+    result
+}
+
+pub fn assert_module_count() -> () {
+    testing::assert_eq(module_projects().len(), 99)
+}
+
+pub fn assert_module_shard(shard: isize, shard_count: isize) -> () {
+    let index = Ref::new(0);
+    for source_project in module_projects() {
+        let current = index.get();
+        index.set(current + 1);
+        if current % shard_count == shard {
+            let name = match path::file_name(source_project) {
+                Some(value) => value,
+                None => f"project-{current}",
+            };
+            let project = path::join(
+                path::join(repository_root(), "gomlc/_artifact/test-work/compiler/module-source"),
+                name,
+            );
+            copy_directory(source_project, project);
+            // Mirrors the default target-dir layout: a real project run has an
+            // _artifact directory in the project root, and fixtures like
+            // project060_std_error rely on it when writing files.
+            create_directory(path::join(project, "_artifact"));
+            let target = path::join(
+                path::join(repository_root(), "gomlc/_artifact/test-work/compiler/module"),
+                name,
+            );
+            let executed = project_command("run", project, target);
+            assert_command_success(executed, "module run for " + project);
+            assert_text(
+                bytes_text(process::Output::stdout(executed)),
+                path::join(source_project, "main.goml.out"),
+                source_project,
+            )
+        }
+    }
+}
+
+fn module_diagnostic_projects() -> Vec[string] {
+    let directory = path::join(compiler_tests_root(), "module_diagnostics");
+    let result = Vec::new();
+    for name in read_directory(directory) {
+        let project = path::join(directory, name);
+        if fs::is_dir(project)
+            && (fs::is_file(path::join(project, "main.goml.expect"))
+                || fs::is_file(path::join(project, "main.goml.ok"))
+                || fs::is_file(path::join(project, "main.goml.build"))) {
+            result.push(project)
+        }
+    }
+    result
+}
+
+fn assert_module_diagnostic(source_project: string) -> () {
+    let name = path::file_name(source_project).unwrap_or("module-diagnostic");
+    let project = path::join(
+        path::join(
+            repository_root(),
+            "gomlc/_artifact/test-work/compiler/module-diagnostics-source",
+        ),
+        name,
+    );
+    copy_directory(source_project, project);
+    let target = path::join(
+        path::join(repository_root(), "gomlc/_artifact/test-work/compiler/module-diagnostics"),
+        name,
+    );
+    let command = if fs::is_file(path::join(source_project, "main.goml.build")) {
+        "build"
+    } else {
+        "check"
+    };
+    let checked = project_command(command, project, target);
+    if fs::is_file(path::join(source_project, "main.goml.ok")) {
+        assert_command_success(checked, "module check for " + project)
+    } else if fs::is_file(path::join(source_project, "main.goml.build")) {
+        assert_command_success(checked, "module build for " + project)
+    } else {
+        if process::ExitStatus::success(process::Output::status(checked)) {
+            testing::fail("expected module diagnostic for " + name)
+        }
+        let expected = read_file(path::join(source_project, "main.goml.expect"));
+        if expected == "" {} else {
+            let output = bytes_text(process::Output::stdout(checked))
+                + bytes_text(process::Output::stderr(checked));
+            if !output.contains(expected) {
+                testing::fail(
+                    "module diagnostic " + name + " did not contain " + expected + "\n" + output,
+                )
+            }
+        }
+    }
+}
+
+pub fn assert_module_diagnostics() -> () {
+    let projects = module_diagnostic_projects();
+    testing::assert_eq(projects.len(), 61);
+    for source_project in projects {
+        assert_module_diagnostic(source_project)
+    }
+}
+
+pub fn assert_standard_binary_stdio() -> () {
+    let project = path::join(repository_root(), "gomlc/_artifact/test-work/compiler/stdio");
+    if fs::exists(project) {
+        testing::expect_ok(fs::remove_dir_all(project), "clear stdio test project");
+    }
+    create_directory(project);
+    if let Err(message) = fs::write_file_structured(
+        path::join(project, "goml.toml"),
+        \\[module]
+        \\path = "stdio_test"
+        \\
+        ,
+    ) {
+        testing::fail(message.to_string())
+    }
+    if let Err(message) = fs::write_file_structured(
+        path::join(project, "main.goml"),
+        \\package main;
+        \\
+        \\use std::bytes;
+        \\use std::env;
+        \\use std::io;
+        \\use std::io::{Read, Write};
+        \\use std::process;
+        \\
+        \\fn main() -> () {
+        \\    match env::var_structured("GOML_EMPTY") {
+        \\        Result::Ok(value) => if value != "" { process::exit(1) } else { () },
+        \\        Result::Err(_) => process::exit(1),
+        \\    };
+        \\    match env::var_structured("GOML_MISSING_ENVIRONMENT_VALUE") {
+        \\        Result::Ok(_) => process::exit(1),
+        \\        Result::Err(_) => (),
+        \\    };
+        \\    let prefix = bytes::Bytes::from_vec(Vec::from_array([0, 0]));
+        \\    if io::stdin().read_exact(prefix.as_mut_slice()).is_err() { process::exit(1); }
+        \\    if io::stdout().write_all(prefix.as_slice()).is_err() { process::exit(1); }
+        \\    match io::stdin().read_to_end(4096) {
+        \\        Result::Ok(data) => {
+        \\            match io::write_stdout_structured(data) {
+        \\                Result::Ok(()) => (),
+        \\                Result::Err(_) => process::exit(1),
+        \\            };
+        \\            match io::write_stderr_structured(bytes::Bytes::from_string("binary stderr")) {
+        \\                Result::Ok(()) => (),
+        \\                Result::Err(_) => process::exit(1),
+        \\            }
+        \\        },
+        \\        Result::Err(_) => process::exit(1),
+        \\    }
+        \\}
+        \\
+        ,
+    ) {
+        testing::fail(message.to_string())
+    }
+    let target = path::join(project, "_artifact");
+    let built = project_command("build", project, target);
+    assert_command_success(built, "stdio project build");
+    let input: Vec[u8] = Vec::new();
+    input.push(0);
+    input.push(127);
+    input.push(128);
+    input.push(255);
+    let executed = match process::Command::new(path::join(path::join(target, "bin"), "stdio_test")).env(
+        "GOML_EMPTY",
+        "",
+    ).input(bytes::Bytes::from_vec(input)).output_structured() {
+        Ok(value) => value,
+        Err(message) => {
+            testing::fail(message.to_string());
+            process::Output {
+                status_value: process::ExitStatus { code_value: -1 },
+                stdout_value: bytes::Bytes::new(),
+                stderr_value: bytes::Bytes::new(),
+            }
+        },
+    };
+    assert_command_success(executed, "stdio binary execution");
+    assert_bytes(process::Output::stdout(executed), input);
+    testing::assert_eq(bytes_text(process::Output::stderr(executed)), "binary stderr")
+}
+
+fn collect_crasher_sources(directory: string, extension: string, result: Vec[string]) -> () {
+    for name in read_directory(directory) {
+        let entry = path::join(directory, name);
+        if fs::is_dir(entry) {
+            collect_crasher_sources(entry, extension, result)
+        } else if name == "main.goml" && fs::is_file(entry + extension) {
+            result.push(entry)
+        }
+    }
+}
+
+fn crasher_sources(extension: string) -> Vec[string] {
+    let result = Vec::new();
+    collect_crasher_sources(path::join(compiler_tests_root(), "crashers"), extension, result);
+    result
+}
+
+pub fn assert_crasher_counts() -> () {
+    testing::assert_eq(crasher_sources(".diag").len(), 45);
+    testing::assert_eq(crasher_sources(".out").len(), 57)
+}
+
+pub fn assert_crasher_diagnostic_shard(shard: isize, shard_count: isize) -> () {
+    let compiler = compiler_driver::source_compiler_without_standard();
+    let index = Ref::new(0);
+    for source_path in crasher_sources(".diag") {
+        let current = index.get();
+        index.set(current + 1);
+        if current % shard_count == shard {
+            assert_text(
+                compiler_driver::diagnostic_output_with(
+                    compiler,
+                    source_path,
+                    read_file(source_path),
+                ),
+                source_path + ".diag",
+                source_path,
+            )
+        }
+    }
+}
+
+pub fn assert_crasher_runtime_shard(shard: isize, shard_count: isize) -> () {
+    let compiler = compiler_driver::source_compiler_without_standard();
+    let index = Ref::new(0);
+    for source_path in crasher_sources(".out") {
+        let current = index.get();
+        index.set(current + 1);
+        if current % shard_count == shard {
+            let source = read_file(source_path);
+            let expected = read_file(source_path + ".out");
+            let compilation = match compiler_driver::compile_source_or_diagnostics_with(
+                compiler,
+                source_path,
+                source,
+            ) {
+                Compiled(value) => value,
+                Diagnostics(value) => {
+                    testing::fail("unexpected diagnostics for " + source_path + "\n" + value);
+                    compiler_driver::compile_source_with(compiler, source_path, source)
+                },
+            };
+            assert_text(
+                execute_go(
+                    go_backend::encode(compilation.go_value),
+                    expected,
+                    "crashers",
+                    shard,
+                    current,
+                ),
+                source_path + ".out",
+                source_path,
+            )
+        }
+    }
+}
+
+pub fn assert_package_crasher() -> () {
+    let project = path::join(compiler_tests_root(), "crashers/local_std_host_extern_shadow");
+    let target = path::join(
+        repository_root(),
+        "gomlc/_artifact/test-work/compiler/crashers/host-shadow",
+    );
+    let output = project_command("check", project, target);
+    testing::assert(!process::ExitStatus::success(process::Output::status(output)));
+    let combined = bytes_text(process::Output::stdout(output))
+        + bytes_text(process::Output::stderr(output));
+    testing::assert(combined.contains("extern args_raw is not permitted in this source"))
+}

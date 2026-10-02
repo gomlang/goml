@@ -14,7 +14,7 @@ Select the backend and library sonames in the binding configuration:
   "backend": "dynamic",
   "libraries": ["libsqlite3.so.0"],
   "package": "sqlite",
-  "output": "sqlite/generated.gom",
+  "output": "sqlite/generated.goml",
   "go_package": "native",
   "go_output": "native/generated.go",
   "headers": ["sqlite3.h"],
@@ -62,7 +62,7 @@ The fingerprint covers configuration, Clang identity, Go target, and preprocesse
 {
   "version": 1,
   "package": "sqlite",
-  "output": "sqlite/generated.gom",
+  "output": "sqlite/generated.goml",
   "go_package": "native",
   "go_output": "native/generated.go",
   "headers": ["sqlite3.h"],

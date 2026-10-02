@@ -1,0 +1,996 @@
+package anf;
+
+use module::ast;
+use module::core;
+use module::hir;
+use module::lift;
+use module::mono;
+use module::parser;
+use module::repr;
+use std::text;
+use module::tast;
+use std::testing;
+
+fn lower_source(source: string) -> File {
+    lower(
+        lift::lower(
+            mono::lower(
+                core::lower(tast::check(hir::lower(ast::lower(parser::parse(source)), "main.goml"))),
+            ),
+        ),
+    )
+}
+
+#[test]
+fn snapshot_names_restart_for_each_function() -> () {
+    let output = encode_snapshot(
+        lower_source("fn first(value: i32) -> i32 { value } fn second(value: i32) -> i32 { value }"),
+    );
+    testing::assert(output.contains("fn first(value/0: i32)"));
+    testing::assert(output.contains("fn second(value/0: i32)"))
+}
+
+fn verifier_file(body: Block, ret_ty: repr::Type) -> File {
+    let functions: Vec[Function] = Vec::new();
+    functions.push(
+        Function {
+            name: "verify_test",
+            origin: FunctionOrigin::Source,
+            root: true,
+            trait_impl: Option::None,
+            params: Vec::new(),
+            ret_ty,
+            body,
+        },
+    );
+    File {
+        functions,
+        enums: Vec::new(),
+        structs: Vec::new(),
+        type_instances: Vec::new(),
+        constants: Vec::new(),
+        statics: Vec::new(),
+        closure_defs: Vec::new(),
+    }
+}
+
+fn verifier_error_contains(result: Result[(), string], expected: string) -> () {
+    match result {
+        Ok(_) => testing::fail("expected ANF verification failure"),
+        Err(message) => testing::assert(message.contains(expected)),
+    }
+}
+
+#[test]
+fn requires_explicit_external_function_scope() -> () {
+    let ty = repr::Type::Func { params: Vec::new(), ret_ty: repr::Type::Unit };
+    let file = verifier_file(
+        Block { binds: Vec::new(), term: Term::Return(Imm::Var { name: "external", ty }) },
+        ty,
+    );
+    verifier_error_contains(verify(file), "reference to out-of-scope variable external");
+    if let Err(message) = verify_with_external_functions(file, Vec::from_array(["external"])) {
+        testing::fail(message)
+    }
+    verifier_error_contains(
+        verify_with_external_functions(file, Vec::from_array(["different"])),
+        "reference to out-of-scope variable external",
+    );
+    let scalar = verifier_file(
+        Block {
+            binds: Vec::new(),
+            term: Term::Return(Imm::Var { name: "external", ty: repr::Type::Int32 }),
+        },
+        repr::Type::Int32,
+    );
+    verifier_error_contains(
+        verify_with_external_functions(scalar, Vec::from_array(["external"])),
+        "reference to out-of-scope variable external",
+    )
+}
+
+#[test]
+fn verifies_lowered_anf() -> () {
+    if let Err(message) = verify(
+        lower_source("fn choose(flag: bool) -> i32 { if flag { 1 } else { 2 } }"),
+    ) {
+        testing::fail(message)
+    }
+}
+
+#[test]
+fn preserves_explicit_closure_packs_and_metadata() -> () {
+    let file = dce(
+        lower_source(
+            "fn consume(value: (i32) -> i32) -> i32 { value(1) } fn main() -> () { println(consume(|x: i32| x + 1)) }",
+        ),
+    );
+    testing::assert_eq(file.closure_defs.len(), 1);
+    testing::assert(encode(file).contains("pack_closure["));
+    if let Err(message) = verify_with_external_functions(file, Vec::from_array(["println"])) {
+        testing::fail(message)
+    }
+}
+
+#[test]
+fn rejects_invalid_closure_pack_signatures() -> () {
+    let file = lower_source(
+        "fn consume(value: (i32) -> i32) -> i32 { value(1) } fn main() -> () { println(consume(|x: i32| x + 1)) }",
+    );
+    let definition = file.closure_defs[0];
+    let invalid = File {
+        functions: file.functions,
+        enums: file.enums,
+        structs: file.structs,
+        type_instances: file.type_instances,
+        constants: file.constants,
+        statics: file.statics,
+        closure_defs: Vec::from_array(
+            [
+                repr::ClosureDef {
+                    environment: definition.environment,
+                    apply: definition.apply,
+                    signature: repr::Type::Unit,
+                },
+            ],
+        ),
+    };
+    verifier_error_contains(verify(invalid), "closure pack signature does not match")
+}
+
+#[test]
+fn eliminates_dead_anf_locals_without_dropping_calls() -> () {
+    let value = dce(
+        lower_source(
+            "fn effect() -> i32 { println(\"kept\"); 1 } fn main() -> () { let dead = (1, 2); let kept = effect(); () }",
+        ),
+    );
+    if let Err(message) = verify_with_external_functions(value, Vec::from_array(["println"])) {
+        testing::fail(message)
+    }
+    let output = encode(value);
+    testing::assert(!output.contains("dead/"));
+    testing::assert(output.contains("println"))
+}
+
+#[test]
+fn eliminates_unreachable_recursive_join_members() -> () {
+    let unit_value = Imm::Prim { value: repr::Primitive::Unit, ty: repr::Type::Unit };
+    let live = JoinBind {
+        name: "live",
+        role: JoinRole::Continuation,
+        params: Vec::new(),
+        ret_ty: repr::Type::Unit,
+        body: Block { binds: Vec::new(), term: Term::Return(unit_value) },
+    };
+    let dead = JoinBind {
+        name: "dead",
+        role: JoinRole::Continuation,
+        params: Vec::new(),
+        ret_ty: repr::Type::Unit,
+        body: Block {
+            binds: Vec::new(),
+            term: Term::Jump { target: "dead", args: Vec::new(), ret_ty: repr::Type::Unit },
+        },
+    };
+    let binds: Vec[Bind] = Vec::new();
+    binds.push(Bind::JoinRec(Vec::from_array([live, dead])));
+    let value = dce(
+        verifier_file(
+            Block {
+                binds,
+                term: Term::Jump { target: "live", args: Vec::new(), ret_ty: repr::Type::Unit },
+            },
+            repr::Type::Unit,
+        ),
+    );
+    if let Err(message) = verify(value) {
+        testing::fail(message)
+    }
+    let output = encode(value);
+    testing::assert(output.contains("join live"));
+    testing::assert(!output.contains("join dead"))
+}
+
+#[test]
+fn eliminates_unreferenced_nonrecursive_joins() -> () {
+    let join = JoinBind {
+        name: "dead",
+        role: JoinRole::Continuation,
+        params: Vec::new(),
+        ret_ty: repr::Type::Unit,
+        body: Block {
+            binds: Vec::new(),
+            term: Term::Return(Imm::Prim { value: repr::Primitive::Unit, ty: repr::Type::Unit }),
+        },
+    };
+    let binds: Vec[Bind] = Vec::new();
+    binds.push(Bind::Join(join));
+    let value = dce(
+        verifier_file(
+            Block {
+                binds,
+                term: Term::Return(Imm::Prim { value: repr::Primitive::Unit, ty: repr::Type::Unit }),
+            },
+            repr::Type::Unit,
+        ),
+    );
+    if let Err(message) = verify(value) {
+        testing::fail(message)
+    }
+    testing::assert(!encode(value).contains("join dead"))
+}
+
+#[test]
+fn rejects_out_of_scope_join_jumps() -> () {
+    verifier_error_contains(
+        verify(
+            verifier_file(
+                Block {
+                    binds: Vec::new(),
+                    term: Term::Jump {
+                        target: "missing",
+                        args: Vec::new(),
+                        ret_ty: repr::Type::Unit,
+                    },
+                },
+                repr::Type::Unit,
+            ),
+        ),
+        "jump to out-of-scope join missing",
+    )
+}
+
+#[test]
+fn rejects_nonrecursive_self_jumps() -> () {
+    let join = JoinBind {
+        name: "again",
+        role: JoinRole::Continuation,
+        params: Vec::new(),
+        ret_ty: repr::Type::Unit,
+        body: Block {
+            binds: Vec::new(),
+            term: Term::Jump { target: "again", args: Vec::new(), ret_ty: repr::Type::Unit },
+        },
+    };
+    let binds: Vec[Bind] = Vec::new();
+    binds.push(Bind::Join(join));
+    verifier_error_contains(
+        verify(
+            verifier_file(
+                Block {
+                    binds,
+                    term: Term::Jump { target: "again", args: Vec::new(), ret_ty: repr::Type::Unit },
+                },
+                repr::Type::Unit,
+            ),
+        ),
+        "jump to out-of-scope join again",
+    )
+}
+
+#[test]
+fn rejects_join_argument_mismatches() -> () {
+    let params: Vec[(string, repr::Type)] = Vec::new();
+    params.push(("value", repr::Type::Int32));
+    let join = JoinBind {
+        name: "done",
+        role: JoinRole::Continuation,
+        params,
+        ret_ty: repr::Type::Int32,
+        body: Block {
+            binds: Vec::new(),
+            term: Term::Return(Imm::Var { name: "value", ty: repr::Type::Int32 }),
+        },
+    };
+    let binds: Vec[Bind] = Vec::new();
+    binds.push(Bind::Join(join));
+    verifier_error_contains(
+        verify(
+            verifier_file(
+                Block {
+                    binds,
+                    term: Term::Jump { target: "done", args: Vec::new(), ret_ty: repr::Type::Int32 },
+                },
+                repr::Type::Int32,
+            ),
+        ),
+        "jump argument count does not match join done",
+    )
+}
+
+#[test]
+fn accepts_recursive_self_jumps() -> () {
+    let joins: Vec[JoinBind] = Vec::new();
+    joins.push(
+        JoinBind {
+            name: "loop",
+            role: JoinRole::Continuation,
+            params: Vec::new(),
+            ret_ty: repr::Type::Unit,
+            body: Block {
+                binds: Vec::new(),
+                term: Term::Jump { target: "loop", args: Vec::new(), ret_ty: repr::Type::Unit },
+            },
+        },
+    );
+    let binds: Vec[Bind] = Vec::new();
+    binds.push(Bind::JoinRec(joins));
+    if let Err(message) = verify(
+        verifier_file(
+            Block {
+                binds,
+                term: Term::Jump { target: "loop", args: Vec::new(), ret_ty: repr::Type::Unit },
+            },
+            repr::Type::Unit,
+        ),
+    ) {
+        testing::fail(message)
+    }
+}
+
+#[test]
+fn preserves_loop_exit_joins() -> () {
+    let join = JoinBind {
+        name: "exit",
+        role: JoinRole::LoopExit,
+        params: Vec::new(),
+        ret_ty: repr::Type::Unit,
+        body: Block {
+            binds: Vec::new(),
+            term: Term::Return(Imm::Prim { value: repr::Primitive::Unit, ty: repr::Type::Unit }),
+        },
+    };
+    let binds: Vec[Bind] = Vec::new();
+    binds.push(Bind::Join(join));
+    let optimized = simplify(
+        verifier_file(
+            Block {
+                binds,
+                term: Term::Jump { target: "exit", args: Vec::new(), ret_ty: repr::Type::Unit },
+            },
+            repr::Type::Unit,
+        ),
+    );
+    match optimized.functions[0].body.binds.get(0) {
+        Join(value) => match value.role {
+            LoopExit => (),
+            _ => testing::fail("expected loop exit join"),
+        },
+        _ => testing::fail("expected loop exit join"),
+    }
+}
+
+#[test]
+fn rejects_bare_closure_environment_join_arguments() -> () {
+    let function_ty = repr::Type::Func { params: Vec::new(), ret_ty: repr::Type::String };
+    let params: Vec[(string, repr::Type)] = Vec::new();
+    params.push(("result", function_ty));
+    let join = JoinBind {
+        name: "return",
+        role: JoinRole::Return,
+        params,
+        ret_ty: function_ty,
+        body: Block {
+            binds: Vec::new(),
+            term: Term::Return(Imm::Var { name: "result", ty: function_ty }),
+        },
+    };
+    let binds: Vec[Bind] = Vec::new();
+    binds.push(Bind::Join(join));
+    let args: Vec[Imm] = Vec::new();
+    args.push(
+        Imm::Var {
+            name: "environment",
+            ty: repr::Type::ClosureEnvironment { name: "closure_env_test_0" },
+        },
+    );
+    let optimized = simplify(
+        verifier_file(
+            Block { binds, term: Term::Jump { target: "return", args, ret_ty: function_ty } },
+            function_ty,
+        ),
+    );
+    verifier_error_contains(verify(optimized), "jump argument type does not match join")
+}
+
+#[test]
+fn does_not_propagate_assigned_bindings() -> () {
+    let binds: Vec[Bind] = Vec::new();
+    binds.push(
+        Bind::Let(
+            LetBind {
+                name: "value",
+                value: Value::Imm(
+                    Imm::Prim {
+                        value: repr::Primitive::Int32 { value: "1" },
+                        ty: repr::Type::Int32,
+                    },
+                ),
+                ty: repr::Type::Int32,
+            },
+        ),
+    );
+    binds.push(
+        Bind::Let(
+            LetBind {
+                name: "assigned",
+                value: Value::Assign {
+                    name: "value",
+                    value: Imm::Prim {
+                        value: repr::Primitive::Int32 { value: "2" },
+                        ty: repr::Type::Int32,
+                    },
+                    target_ty: repr::Type::Int32,
+                    ty: repr::Type::Unit,
+                },
+                ty: repr::Type::Unit,
+            },
+        ),
+    );
+    let optimized = simplify(
+        verifier_file(
+            Block { binds, term: Term::Return(Imm::Var { name: "value", ty: repr::Type::Int32 }) },
+            repr::Type::Int32,
+        ),
+    );
+    match optimized.functions[0].body.term {
+        Return(Var { name, ty: _ }) => testing::assert_eq(name, "value"),
+        _ => testing::fail("expected assigned binding reference"),
+    }
+}
+
+#[test]
+fn advances_shared_counter_before_simplification() -> () {
+    let lowered = lift::lower(
+        mono::lower(
+            core::lower(
+                tast::check(
+                    hir::lower(
+                        ast::lower(parser::parse("fn main() -> () { println(1) }")),
+                        "main.goml",
+                    ),
+                ),
+            ),
+        ),
+    );
+    let counter = Ref::new(61);
+    let _ = lower_with_counter(lowered, counter);
+    testing::assert_eq(counter.get(), 63)
+}
+
+#[test]
+fn simplifies_linear_aliases_and_tuple_projections() -> () {
+    let source = "fn main() { let _ = (); let a = (true, false, (true, false)); let b = match a { (x, y, (z, w)) => w }; let _ = print(b); () }";
+    testing::assert_eq(
+        encode(lower_source(source)),
+        \\fn main() -> () {
+        \\  let mtmp0 = () in
+        \\  let t8 = (true, false) in
+        \\  let a/0 = (true, false, t8) in
+        \\  let x1 = true in
+        \\  let x2 = false in
+        \\  let x3 = t8 in
+        \\  let x4 = true in
+        \\  let x5 = false in
+        \\  let w/4 = x5 in
+        \\  let z/3 = x4 in
+        \\  let y/2 = x2 in
+        \\  let x/1 = x1 in
+        \\  let b/5 = x5 in
+        \\  let mtmp6 = print(x5) in
+        \\  ()
+        \\}
+        ,
+    )
+}
+
+#[test]
+fn simplifies_if_joins_after_inlining() -> () {
+    let source = "fn choose(flag: bool, x: i32, y: i32) -> i32 { if flag { x } else { y } } fn main() { let yes = choose(true, 10, 99); let no = choose(false, 10, 99); let _ = println(\"yes=\" + yes.to_string()); let _ = println(\"no=\" + no.to_string()); () }";
+    testing::assert_eq(
+        encode(lower_source(source)),
+        \\fn choose(flag/0: bool, x/1: i32, y/2: i32) -> i32 {
+        \\  if flag/0 {
+        \\    x/1
+        \\  } else {
+        \\    y/2
+        \\  }
+        \\}
+        \\
+        \\fn main() -> () {
+        \\  join inline_cont15(yes/3: i32) -> () {
+        \\    join inline_cont11(no/4: i32) -> () {
+        \\      let t7 = inherent#i32#i32#to_string(yes/3) in
+        \\      let t8 = ("yes=" + t7) in
+        \\      let mtmp0 = println(t8) in
+        \\      let t9 = inherent#i32#i32#to_string(no/4) in
+        \\      let t10 = ("no=" + t9) in
+        \\      let mtmp1 = println(t10) in
+        \\      ()
+        \\    } in
+        \\    let inline12 = false in
+        \\    let inline13 = 10 in
+        \\    let inline14 = 99 in
+        \\    if inline12 {
+        \\      jump inline_cont11(inline13)
+        \\    } else {
+        \\      jump inline_cont11(inline14)
+        \\    }
+        \\  } in
+        \\  let inline16 = true in
+        \\  let inline17 = 10 in
+        \\  let inline18 = 99 in
+        \\  if inline16 {
+        \\    jump inline_cont15(inline17)
+        \\  } else {
+        \\    jump inline_cont15(inline18)
+        \\  }
+        \\}
+        ,
+    )
+}
+
+#[test]
+fn simplifies_known_constructor_matches_and_projections() -> () {
+    let source = "enum T { A, B(bool, ()) } fn main() { let t = B(true, ()); match t { A => println((1).to_string()), B(true, ()) => println((2).to_string()), B(false, ()) => println((3).to_string()), } }";
+    testing::assert_eq(
+        encode(lower_source(source)),
+        \\fn main() -> () {
+        \\  let t/0 = T::B(true, ()) in
+        \\  let x0 = true in
+        \\  let x1 = () in
+        \\  match x1 {
+        \\    () => {
+        \\      match x0 {
+        \\        true => {
+        \\          let t8 = inherent#isize#isize#to_string(2) in
+        \\          let t9 = println(t8) in
+        \\          ()
+        \\        },
+        \\        false => {
+        \\          let t10 = inherent#isize#isize#to_string(3) in
+        \\          let t11 = println(t10) in
+        \\          ()
+        \\        },
+        \\      }
+        \\    },
+        \\  }
+        \\}
+        ,
+    )
+}
+
+#[test]
+fn scalar_replaces_local_enum_constructors() -> () {
+    let source = "enum Local { None, Some(i32), } fn value() -> i32 { let local = Local::Some(41); match local { Local::None => 0, Local::Some(value) => value + 1, } }";
+    let output = encode(scalar_replace(lower_source(source)));
+    testing::assert(!output.contains("Local::Some"));
+    testing::assert(!output.contains("match local"));
+    testing::assert(output.contains(" + 1)"))
+}
+
+#[test]
+fn lowers_while_loops_through_recursive_joins() -> () {
+    let source = "fn main() { let i = Ref::new(0); while i.get() < 10 { if i.get() == 5 { break } else { () }; let _ = println(i.get()); i.set(i.get() + 1); }; let _ = println(\"done\"); }";
+    testing::assert_eq(
+        encode(lower_source(source)),
+        \\fn main() -> () {
+        \\  let i/0 = inherent#Ref#Ref[isize]#new(0) in
+        \\  join exit6() -> () {
+        \\    let _wild3 = () in
+        \\    let mtmp4 = println("done") in
+        \\    ()
+        \\  } in
+        \\  joinrec {
+        \\    join loop7() -> () {
+        \\      let t8 = inherent#Ref#Ref[isize]#get(i/0) in
+        \\      let t9 = (t8 < 10) in
+        \\      if t9 {
+        \\        let t14 = inherent#Ref#Ref[isize]#get(i/0) in
+        \\        let t15 = (t14 == 5) in
+        \\        join k10() -> () {
+        \\          let _wild0 = () in
+        \\          let t11 = inherent#Ref#Ref[isize]#get(i/0) in
+        \\          let mtmp1 = println(t11) in
+        \\          let t12 = inherent#Ref#Ref[isize]#get(i/0) in
+        \\          let t13 = (t12 + 1) in
+        \\          let _wild2 = inherent#Ref#Ref[isize]#set(i/0, t13) in
+        \\          jump loop7()
+        \\        } in
+        \\        if t15 {
+        \\          jump exit6()
+        \\        } else {
+        \\          jump k10()
+        \\        }
+        \\      } else {
+        \\        jump exit6()
+        \\      }
+        \\    } in
+        \\  } in
+        \\  jump loop7()
+        \\}
+        ,
+    )
+}
+
+#[test]
+fn uses_unreachable_continuations_for_exiting_branches() -> () {
+    let source = "fn f(flag: i32) -> i32 { while true { if flag == 0 { return 1 } else { break }; }; 2 } fn main() -> () { println(f(0).to_string()); println(f(1).to_string()); }";
+    testing::assert_eq(
+        encode(lower_source(source)),
+        \\fn f(flag/0: i32) -> i32 {
+        \\  join exit6() -> i32 {
+        \\    let _wild1 = () in
+        \\    2
+        \\  } in
+        \\  let t9 = (flag/0 == 0) in
+        \\  joinrec {
+        \\    join loop7() -> i32 {
+        \\      if t9 {
+        \\        1
+        \\      } else {
+        \\        jump exit6()
+        \\      }
+        \\    } in
+        \\  } in
+        \\  jump loop7()
+        \\}
+        \\
+        \\fn main() -> () {
+        \\  let t11 = f(0) in
+        \\  let t12 = inherent#i32#i32#to_string(t11) in
+        \\  let _wild2 = println(t12) in
+        \\  let t13 = f(1) in
+        \\  let t14 = inherent#i32#i32#to_string(t13) in
+        \\  let _wild3 = println(t14) in
+        \\  ()
+        \\}
+        ,
+    )
+}
+
+#[test]
+fn preserves_typed_exiting_loop_conditions() -> () {
+    let source = "fn loop_return_unit(flag: bool) -> () { while if flag { return } else { return } { println(\"unreachable\"); }; } fn loop_return() -> i32 { while match 0 { _ => return 5, } { println(\"unreachable\"); }; 0 } fn main() -> () { loop_return_unit(true); println(loop_return()); }";
+    testing::assert_eq(
+        encode(lower_source(source)),
+        \\fn loop_return_unit(flag/0: bool) -> () {
+        \\  joinrec {
+        \\    join loop9() -> () {
+        \\      if flag/0 {
+        \\        ()
+        \\      } else {
+        \\        ()
+        \\      }
+        \\    } in
+        \\  } in
+        \\  jump loop9()
+        \\}
+        \\
+        \\fn loop_return() -> i32 {
+        \\  joinrec {
+        \\    join loop15() -> i32 {
+        \\      let mtmp2 = 0 in
+        \\      5
+        \\    } in
+        \\  } in
+        \\  jump loop15()
+        \\}
+        \\
+        \\fn main() -> () {
+        \\  let _wild5 = loop_return_unit(true) in
+        \\  let t17 = loop_return() in
+        \\  let _wild6 = println(t17) in
+        \\  ()
+        \\}
+        ,
+    )
+}
+
+#[test]
+fn retains_failed_linear_probe_names() -> () {
+    let source = "fn main() { let x = Ref::new(0); let result = Ref::new(\"\"); while x.get() < 5 { let current = x.get(); result.set(result.get() + match current { 0 => \"zero\", 1 => \"one\", 2 => \"two\", _ => \"many\", } + \" \" ); x.set(current + 1); }; println(result.get()); }";
+    testing::assert_eq(
+        encode(lower_source(source)),
+        \\fn main() -> () {
+        \\  let x/0 = inherent#Ref#Ref[isize]#new(0) in
+        \\  let result/1 = inherent#Ref#Ref[string]#new("") in
+        \\  join exit5() -> () {
+        \\    let _wild2 = () in
+        \\    let t6 = inherent#Ref#Ref[string]#get(result/1) in
+        \\    let _wild3 = println(t6) in
+        \\    ()
+        \\  } in
+        \\  joinrec {
+        \\    join loop7() -> () {
+        \\      let t8 = inherent#Ref#Ref[isize]#get(x/0) in
+        \\      let t9 = (t8 < 5) in
+        \\      if t9 {
+        \\        let current/2 = inherent#Ref#Ref[isize]#get(x/0) in
+        \\        let t11 = inherent#Ref#Ref[string]#get(result/1) in
+        \\        join k12(jp13: string) -> () {
+        \\          let t14 = (t11 + jp13) in
+        \\          let t15 = (t14 + " ") in
+        \\          let _wild0 = inherent#Ref#Ref[string]#set(result/1, t15) in
+        \\          let t16 = (current/2 + 1) in
+        \\          let _wild1 = inherent#Ref#Ref[isize]#set(x/0, t16) in
+        \\          jump loop7()
+        \\        } in
+        \\        match current/2 {
+        \\          0 => {
+        \\            jump k12("zero")
+        \\          },
+        \\          1 => {
+        \\            jump k12("one")
+        \\          },
+        \\          2 => {
+        \\            jump k12("two")
+        \\          },
+        \\          _ => {
+        \\            jump k12("many")
+        \\          },
+        \\        }
+        \\      } else {
+        \\        jump exit5()
+        \\      }
+        \\    } in
+        \\  } in
+        \\  jump loop7()
+        \\}
+        ,
+    )
+}
+
+#[test]
+fn inlines_small_static_calls() -> () {
+    let file = lower_source(
+        "fn id(value: string) -> string { value } fn main() -> () { let value = id(\"ok\"); println(value) }",
+    );
+    if let Err(message) = verify_with_external_functions(file, Vec::from_array(["println"])) {
+        testing::fail(message)
+    }
+    let output = encode(file);
+    testing::assert(!output.contains("let value/1 = id("));
+    testing::assert(output.contains("jump inline_cont"))
+}
+
+#[test]
+fn respects_static_inline_limits() -> () {
+    let source = "fn recurse(value: i32) -> i32 { if value == 0 { 0 } else { recurse(value - 1) } } fn large(value: i32) -> i32 { let a0 = value + 1; let a1 = a0 + 1; let a2 = a1 + 1; let a3 = a2 + 1; let a4 = a3 + 1; let a5 = a4 + 1; let a6 = a5 + 1; let a7 = a6 + 1; let a8 = a7 + 1; let a9 = a8 + 1; let a10 = a9 + 1; let a11 = a10 + 1; let a12 = a11 + 1; let a13 = a12 + 1; let a14 = a13 + 1; let a15 = a14 + 1; a15 } fn main() -> () { println(recurse(3)); println(large(0)); }";
+    let output = encode(lower_source(source));
+    testing::assert(output.contains("recurse(3)"));
+    testing::assert(output.contains("large(0)"))
+}
+
+#[test]
+fn exhausts_static_inline_budget() -> () {
+    let file = lower_source("fn id(value: string) -> string { value }");
+    let functions = inline_function_index(file.functions);
+    let Some(callee) = functions["id"] else {
+        return testing::fail("missing inline candidate");
+    };
+    let args: Vec[Imm] = Vec::new();
+    args.push(Imm::Prim { value: repr::Primitive::String { value: "x" }, ty: repr::Type::String });
+    let budget = Ref::new(2);
+    for _ in 0..2 {
+        if let None = indexed_inline_candidate(
+            functions,
+            "caller",
+            "id",
+            args,
+            repr::Type::String,
+            repr::Type::String,
+            false,
+            budget,
+        ) {
+            testing::fail("expected inline candidate")
+        }
+    }
+    testing::assert_eq(budget.get(), 0);
+    if let Some(_) = indexed_inline_candidate(
+        functions,
+        "caller",
+        "id",
+        args,
+        repr::Type::String,
+        repr::Type::String,
+        false,
+        budget,
+    ) {
+        testing::fail("expected exhausted inline budget")
+    }
+    testing::assert_eq(inline_block_cost(callee.body), 1)
+}
+
+#[test]
+fn commutes_known_constructor_continuations() -> () {
+    let source = "enum Maybe { Some(i32), None } fn make(flag: bool) -> Maybe { if flag { Some(7) } else { None } } fn consume(value: Maybe) -> i32 { match value { Some(item) => item, None => 0 } } fn combined(flag: bool) -> i32 { consume(make(flag)) }";
+    let lowered = lower_source(source);
+    if let Err(message) = verify(lowered) {
+        testing::fail(message)
+    }
+    let output = encode(lowered);
+    testing::assert(output.contains("join commute_arm"));
+    testing::assert(!output.contains("match mtmp"))
+}
+
+#[test]
+fn preserves_continuations_with_unknown_entries() -> () {
+    let source = "enum Maybe { Some(i32), None } fn consume(value: Maybe) -> i32 { match value { Some(item) => item, None => 0 } } fn combined(flag: bool, fallback: Maybe) -> i32 { consume(if flag { Some(1) } else { fallback }) }";
+    let lowered = lower_source(source);
+    if let Err(message) = verify(lowered) {
+        testing::fail(message)
+    }
+    let output = encode(lowered);
+    testing::assert(output.contains("join k"));
+    testing::assert(!output.contains("join commute_arm"))
+}
+
+#[test]
+fn invalidates_commuting_constructors_after_assignment() -> () {
+    let known: Vec[CommuteBinding] = Vec::new();
+    record_commute_binding(
+        known,
+        LetBind {
+            name: "field",
+            value: Value::Imm(
+                Imm::Prim { value: repr::Primitive::Int32 { value: "1" }, ty: repr::Type::Int32 },
+            ),
+            ty: repr::Type::Int32,
+        },
+    );
+    let fields: Vec[Imm] = Vec::new();
+    fields.push(Imm::Var { name: "field", ty: repr::Type::Int32 });
+    record_commute_binding(
+        known,
+        LetBind {
+            name: "value",
+            value: Value::Constr {
+                constructor: repr::Constructor {
+                    name: "Maybe::Some",
+                    fields: Vec::new(),
+                    is_struct: false,
+                    tag: Option::Some(0),
+                },
+                args: fields,
+                ty: repr::Type::Named { name: "Maybe" },
+            },
+            ty: repr::Type::Named { name: "Maybe" },
+        },
+    );
+    record_commute_binding(
+        known,
+        LetBind {
+            name: "assigned",
+            value: Value::Assign {
+                name: "field",
+                value: Imm::Prim {
+                    value: repr::Primitive::Int32 { value: "2" },
+                    ty: repr::Type::Int32,
+                },
+                target_ty: repr::Type::Int32,
+                ty: repr::Type::Unit,
+            },
+            ty: repr::Type::Unit,
+        },
+    );
+    match known_dispatch(Imm::Var { name: "value", ty: repr::Type::Named { name: "Maybe" } }, known) {
+        Unknown => (),
+        Dispatch { .. } => testing::fail("expected invalidated constructor"),
+    }
+}
+
+fn encoded_function(output: string, name: string) -> string {
+    let marker = "fn " + name + "(";
+    let Some(start) = text::find(output, marker) else {
+        return "";
+    };
+    let suffix = output.byte_slice(start, output.byte_len());
+    let end = match text::find(suffix, "\n}\n\n") {
+        Some(value) => value + 2,
+        None => suffix.byte_len(),
+    };
+    suffix.byte_slice(0, end)
+}
+
+#[test]
+fn fuses_recursive_join_consumers() -> () {
+    let source = "fn find(wanted: isize) -> Option[isize] { let current = Ref::new(0); loop { let value = current.get(); if value >= 5 { return Option::None; } else if value == wanted { return Option::Some(value); } else { current.set(value + 1); }; }; Option::None } fn any(wanted: isize) -> bool { match find(wanted) { Some(_) => true, None => false } }";
+    let lowered = lower_source(source);
+    if let Err(message) = verify(lowered) {
+        testing::fail(message)
+    }
+    let any = encoded_function(encode(lowered), "any");
+    testing::assert(any.contains("joinrec"));
+    testing::assert(!any.contains("find("));
+    testing::assert(!any.contains("match "));
+    testing::assert(!any.contains("commute_field"))
+}
+
+#[test]
+fn rejects_recursive_inlining_into_jumping_consumers() -> () {
+    let arms: Vec[Arm] = Vec::new();
+    arms.push(
+        Arm {
+            lhs: Imm::Tag { index: 0, ty: repr::Type::Named { name: "Option__int" } },
+            body: Block {
+                binds: Vec::new(),
+                term: Term::Return(
+                    Imm::Prim {
+                        value: repr::Primitive::Bool { value: false },
+                        ty: repr::Type::Bool,
+                    },
+                ),
+            },
+        },
+    );
+    arms.push(
+        Arm {
+            lhs: Imm::Tag { index: 1, ty: repr::Type::Named { name: "Option__int" } },
+            body: Block {
+                binds: Vec::new(),
+                term: Term::Jump {
+                    target: "outer_loop",
+                    args: Vec::new(),
+                    ret_ty: repr::Type::Bool,
+                },
+            },
+        },
+    );
+    testing::assert(
+        !inline_block_consumes(
+            Block {
+                binds: Vec::new(),
+                term: Term::Match {
+                    scrutinee: Imm::Var {
+                        name: "result",
+                        ty: repr::Type::Named { name: "Option__int" },
+                    },
+                    arms,
+                    default: Option::None,
+                    ret_ty: repr::Type::Bool,
+                },
+            },
+            "result",
+        ),
+    )
+}
+
+fn required_position(value: string, expected: string) -> isize {
+    match text::find(value, expected) {
+        Some(position) => position,
+        None => {
+            testing::fail("missing " + expected);
+            0
+        },
+    }
+}
+
+#[test]
+fn hoists_safe_loop_invariants() -> () {
+    let source = "fn work(base: isize, count: isize) -> isize { let mut index = 0; let mut result = 0; while index < count { let square = base * base; let scaled = square * 17; let offset = scaled + base; result = result + offset; index = index + 1; }; result }";
+    let lowered = lower_source(source);
+    if let Err(message) = verify(lowered) {
+        testing::fail(message)
+    }
+    let output = encoded_function(encode(lowered), "work");
+    let loop_position = required_position(output, "joinrec");
+    testing::assert(required_position(output, "let square/4 = (base/0 * base/0)") < loop_position);
+    testing::assert(required_position(output, "let scaled/5 = (square/4 * 17)") < loop_position);
+    testing::assert(required_position(output, "let offset/6 = (scaled/5 + base/0)") < loop_position);
+    testing::assert(required_position(output, "let t") > loop_position)
+}
+
+#[test]
+fn preserves_trapping_and_mutable_loop_values() -> () {
+    let source = "fn work(divisor: isize, count: isize) -> isize { let mut index = 0; let mut changing = 1; let mut result = 0; while index < count { let quotient = 100 / divisor; let derived = changing + 1; result = result + quotient + derived; changing = changing + 1; index = index + 1; }; result }";
+    let lowered = lower_source(source);
+    if let Err(message) = verify(lowered) {
+        testing::fail(message)
+    }
+    let output = encoded_function(encode(lowered), "work");
+    let loop_position = required_position(output, "joinrec");
+    testing::assert(required_position(output, "let quotient/5 = (100 / divisor/0)") > loop_position);
+    testing::assert(required_position(output, "let derived/6 = (changing/3 + 1)") > loop_position)
+}

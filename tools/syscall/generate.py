@@ -8,7 +8,7 @@ import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 MANIFEST = pathlib.Path(__file__).with_name("linux-amd64.json")
-TARGET = ROOT / "lib/std/os/linux/syscall/constants.gom"
+TARGET = ROOT / "lib/std/os/linux/syscall/constants.goml"
 
 
 def verify_sources(manifest):

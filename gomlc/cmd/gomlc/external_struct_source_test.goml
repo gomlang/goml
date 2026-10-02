@@ -1,0 +1,243 @@
+package main;
+
+use module::ffi;
+use module::test_support;
+use std::fs;
+use std::json;
+use std::path;
+use std::testing;
+use std::utf8;
+use utf8::BytesUtf8;
+
+fn external_struct_link_arguments(directory: string, mode: string) -> Vec[string] {
+    let arguments = go_library_cli_args(
+        path::join(directory, "build.core"),
+        path::join(directory, "gen/goml_generated.go"),
+        "gen",
+    );
+    for argument in Vec::from_array(
+        [
+            "--ffi-check",
+            mode,
+            "--context",
+            path::join(directory, "context.json"),
+            "--caller-mode",
+            "package",
+            "--caller-directory",
+            path::join(directory, "gen"),
+            "--caller-import-path",
+            "example.com/host/gen",
+            "--caller-package",
+            "gen",
+        ],
+    ) {
+        arguments.push(argument)
+    }
+    arguments
+}
+
+fn exercise_external_struct_source(directory: string) -> Result[(), string] {
+    ffi_driver_fixture(directory)?;
+    fs::write_file_structured(
+        path::join(directory, "shim/fields.go"),
+        "package shim\ntype Detail struct { FieldWithANameLongEnoughToExceedTheEightyCharacterLimitForOrdinaryCompilerIdentifierCompaction int64; hidden int64; Unsupported chan int }\ntype DetailPointer = *Detail\nfunc DetailAddress() DetailPointer { return &Detail{FieldWithANameLongEnoughToExceedTheEightyCharacterLimitForOrdinaryCompilerIdentifierCompaction: 5} }\n",
+    ).map_err(|error| error.to_string())?;
+    let context = resolve_foreign_build_context("go", directory)?;
+    let context_path = path::join(directory, "context.json");
+    fs::write_file_structured(context_path, json::encode(ffi::build_context_json(context))).map_err(
+        |error| error.to_string(),
+    )?;
+    let source =
+        \\package calc;
+        \\use std::ffi;
+        \\#[go_type("example.com/host/shim", "Box")] pub extern type Box[T];
+        \\#[go_type("example.com/host/shim", "Numeric")] extern type Numeric[T];
+        \\#[go_type("example.com/host/shim", "Detail")] extern type Detail;
+        \\#[go_type("example.com/host/shim", "DetailPointer")] extern type DetailPointer;
+        \\#[go_ffi("example.com/host/shim", "DetailAddress")] extern fn detail_pointer() -> DetailPointer;
+        \\pub type Wrapped[T] = Box[T];
+        \\fn read[T](value: Wrapped[T]) -> T { value.Value }
+        \\fn constrained[T](value: T) -> T {
+        \\    let box: Numeric[T] = Numeric { Value: value };
+        \\    box.Value
+        \\}
+        \\#[go_export("Value")] pub fn value() -> i64 {
+        \\    let box: Box[i64] = Box { Value: 41 };
+        \\    let detail = Detail { FieldWithANameLongEnoughToExceedTheEightyCharacterLimitForOrdinaryCompilerIdentifierCompaction: 3 };
+        \\    if !ffi::is_nil(box.Next) { return 0 }
+        \\    read(box) + constrained::[i64](1) + detail.FieldWithANameLongEnoughToExceedTheEightyCharacterLimitForOrdinaryCompilerIdentifierCompaction + detail_pointer().FieldWithANameLongEnoughToExceedTheEightyCharacterLimitForOrdinaryCompilerIdentifierCompaction - 8
+        \\}
+    ;
+    fs::write_file_structured(path::join(directory, "calc.goml"), source).map_err(
+        |error| error.to_string(),
+    )?;
+    let output = foreign_package_cli_output(directory, "build", "required", context_path)?;
+    if !output.status().success() {
+        return Result::Err(
+            output.stderr().to_string_utf8().unwrap_or("external source build failed"),
+        )
+    }
+    let unit = artifact_read_core_unit(path::join(directory, "build.core"))?;
+    testing::assert(!unit.external_applications.is_empty());
+    for mode in Vec::from_array(["required", "off"]) {
+        let output = test_support::compiler_command(external_struct_link_arguments(directory, mode))?.output_structured().map_err(
+            |error| error.to_string(),
+        )?;
+        if !output.status().success() {
+            return Result::Err(
+                output.stderr().to_string_utf8().unwrap_or("external source link failed"),
+            )
+        }
+    }
+    fs::write_file_structured(
+        path::join(directory, "gen/generated_test.go"),
+        "package gen\nimport \"testing\"\nfunc TestExternalSource(t *testing.T) { if Value() != 42 { t.Fatal(Value()) } }\n",
+    ).map_err(|error| error.to_string())?;
+    let output = foreign_go_process(context, Vec::from_array(["test", "./gen"])).output_structured().map_err(
+        |error| error.to_string(),
+    )?;
+    if !output.status().success() {
+        return Result::Err(
+            output.stderr().to_string_utf8().unwrap_or("external source execution failed"),
+        )
+    }
+    let private_field = source.replace(
+        "FieldWithANameLongEnoughToExceedTheEightyCharacterLimitForOrdinaryCompilerIdentifierCompaction: 3",
+        "hidden: 3",
+    );
+    fs::write_file_structured(path::join(directory, "calc.goml"), private_field).map_err(
+        |error| error.to_string(),
+    )?;
+    let output = foreign_package_cli_output(directory, "build", "required", context_path)?;
+    testing::assert(!output.status().success());
+    testing::assert(output.stderr().to_string_utf8().unwrap_or("").contains("private Go field"));
+    let invalid = source.replace("constrained::[i64](1)", "if constrained(false) { 1 } else { 0 }");
+    fs::write_file_structured(path::join(directory, "calc.goml"), invalid).map_err(
+        |error| error.to_string(),
+    )?;
+    let output = foreign_package_cli_output(directory, "build", "required", context_path)?;
+    if !output.status().success() {
+        return Result::Err(
+            output.stderr().to_string_utf8().unwrap_or("symbolic source build failed"),
+        )
+    }
+    let output = test_support::compiler_command(external_struct_link_arguments(directory, "off"))?.output_structured().map_err(
+        |error| error.to_string(),
+    )?;
+    testing::assert(!output.status().success());
+    let diagnostic = output.stderr().to_string_utf8().unwrap_or("");
+    testing::assert(diagnostic.contains("Numeric"));
+    testing::assert(diagnostic.contains("constraint") || diagnostic.contains("satisfy"));
+    Result::Ok(())
+}
+
+#[test]
+fn external_struct_source_constructs_projects_and_specializes_with_go_constraints() -> () {
+    let temporary = temp_go_path("external-struct.goml", "source");
+    let result = exercise_external_struct_source(path::parent(temporary).unwrap_or(""));
+    cleanup_temp_directory(temporary);
+    if let Err(error) = result {
+        testing::fail(error)
+    }
+}
+
+fn external_alias_package_arguments(directory: string, name: string) -> Vec[string] {
+    Vec::from_array(
+        [
+            "build",
+            "--package",
+            "demo::" + name,
+            "--module",
+            "demo",
+            "--input",
+            path::join(directory, name + ".goml"),
+            "--output",
+            path::join(directory, name),
+            "--context",
+            path::join(directory, "context.json"),
+            "--caller-directory",
+            path::join(directory, "gen"),
+            "--caller-import-path",
+            "command-line-arguments",
+            "--caller-mode",
+            "files",
+            "--caller-package",
+            "main",
+            "--ffi-check",
+            "required",
+        ],
+    )
+}
+
+fn exercise_external_alias_source(directory: string) -> Result[(), string] {
+    ffi_driver_fixture(directory)?;
+    let context = resolve_foreign_build_context("go", directory)?;
+    fs::write_file_structured(
+        path::join(directory, "context.json"),
+        json::encode(ffi::build_context_json(context)),
+    ).map_err(|error| error.to_string())?;
+    fs::write_file_structured(
+        path::join(directory, "shim/erased.go"),
+        "package shim\ntype Erased[T ~int64] = int64\n",
+    ).map_err(|error| error.to_string())?;
+    fs::write_file_structured(
+        path::join(directory, "helpers.goml"),
+        "package helpers; #[go_type(\"example.com/host/shim\", \"Erased\")] extern type Erased[T]; pub type Visible[T] = Erased[T]; #[go_type(\"example.com/host/shim\", \"Box\")] extern type PrivateBox[T]; pub type VisibleBox[T] = PrivateBox[T];",
+    ).map_err(|error| error.to_string())?;
+    let output = test_support::compiler_command(
+        external_alias_package_arguments(directory, "helpers"),
+    )?.current_dir(directory).output_structured().map_err(|error| error.to_string())?;
+    if !output.status().success() {
+        return Result::Err(
+            output.stderr().to_string_utf8().unwrap_or("alias provider build failed"),
+        )
+    }
+    fs::remove_file(path::join(directory, "helpers.goml")).map_err(|error| error.to_string())?;
+    let prefix = "package calc; use demo::helpers; fn preserve[T](value: T) -> T { let witness: helpers::Visible[T] = 0; let _ = witness; value } #[go_export(\"Value\")] pub fn value() -> i64 { ";
+    for valid in Vec::from_array([true, false]) {
+        fs::write_file_structured(
+            path::join(directory, "calc.goml"),
+            prefix
+                + if valid {
+                    "let box: helpers::VisibleBox[i64] = helpers::VisibleBox { Value: 42 }; preserve(box.Value) }"
+                } else {
+                    "if preserve(false) { 1 } else { 0 } }"
+                },
+        ).map_err(|error| error.to_string())?;
+        let arguments = external_alias_package_arguments(directory, "calc");
+        arguments.push("--interface-path");
+        arguments.push(path::join(directory, "helpers.interface"));
+        let output = test_support::compiler_command(arguments)?.current_dir(directory).output_structured().map_err(
+            |error| error.to_string(),
+        )?;
+        if !output.status().success() {
+            return Result::Err(
+                output.stderr().to_string_utf8().unwrap_or("alias consumer build failed"),
+            )
+        }
+        let output = test_support::compiler_command(
+            specialized_library_args(directory, path::join(directory, "calc.core"), "off"),
+        )?.current_dir(directory).output_structured().map_err(|error| error.to_string())?;
+        let diagnostic = output.stderr().to_string_utf8().unwrap_or("");
+        if valid {
+            if !output.status().success() {
+                return Result::Err(diagnostic)
+            }
+        } else {
+            testing::assert(!output.status().success());
+            testing::assert(diagnostic.contains("Erased"));
+            testing::assert(diagnostic.contains("constraint") || diagnostic.contains("satisfy"));
+        }
+    }
+    Result::Ok(())
+}
+
+#[test]
+fn exported_generic_alias_retains_erased_go_constraints_without_provider_sources() -> () {
+    let temporary = temp_go_path("external-alias.goml", "source");
+    let result = exercise_external_alias_source(path::parent(temporary).unwrap_or(""));
+    cleanup_temp_directory(temporary);
+    if let Err(error) = result {
+        testing::fail(error)
+    }
+}

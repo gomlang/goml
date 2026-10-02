@@ -1,6 +1,6 @@
 # Repository Guidelines
 
-goml is a statically typed, garbage-collected language with Rust-like syntax that compiles to Go. Sources use `.gom`; there is no ownership system or lifetime syntax. The compiler monomorphizes generics and lambda-lifts GoML closures.
+goml is a statically typed, garbage-collected language with Rust-like syntax that compiles to Go. Sources use `.goml`; there is no ownership system or lifetime syntax. The compiler monomorphizes generics and lambda-lifts GoML closures.
 
 ## Documentation and Source Map
 
@@ -45,9 +45,9 @@ Run recipes from the repository root; [.justfile](.justfile) is the command refe
 | `just gomlgo-test` | Run the independent gomlgo test suite |
 | `just clean` | Remove root and compiler/driver build caches and generated development stages; retain stage0 |
 
-- After editing `.gom` files, run `goml fmt` from every affected module before tests or commits. Modules include `gomlc/`, `goml/`, `gomlgo/`, and the separate library projects under `lib/`.
+- After editing `.goml` files, run `goml fmt` from every affected module before tests or commits. Modules include `gomlc/`, `goml/`, `gomlgo/`, and the separate library projects under `lib/`.
 - Use the repository formatter, for example `cd gomlc && ../stage2/bin/goml fmt`; `fmt --check` verifies formatting.
-- Run a focused fixture with `stage2/bin/gomlc run-single <file.gom>`. Add `--dump-ast`, `--dump-expanded-ast`, `--dump-hir`, `--dump-tast`, `--dump-ctir`, `--dump-core`, `--dump-mono`, `--dump-lift`, `--dump-anf`, or `--dump-go` to inspect lowering.
+- Run a focused fixture with `stage2/bin/gomlc run-single <file.goml>`. Add `--dump-ast`, `--dump-expanded-ast`, `--dump-hir`, `--dump-tast`, `--dump-ctir`, `--dump-core`, `--dump-mono`, `--dump-lift`, `--dump-anf`, or `--dump-go` to inspect lowering.
 - `goml check`, `goml build`, and `goml test` discover the enclosing `goml.toml` and operate on the complete module, without package targets. `--dry-run` prints planned commands.
 - The driver finds `gomlc` through `--compiler`, `GOMLC`, a sibling binary, `GOML_HOME/bin`, then `PATH`, and verifies the driver protocol.
 - Run checks relevant to the change. Run `just ci` locally for changes affecting bootstrap compatibility, toolchain construction, or packaging, for release preparation, or when explicitly requested. Read-only reviews and documentation-only changes require only applicable checks.
@@ -64,8 +64,8 @@ Run recipes from the repository root; [.justfile](.justfile) is the command refe
 - Ambiguity, missing lookups, invalid caches, and dependency failures must produce recoverable diagnostics. Environment and lookup code must return failure values instead of terminating the compiler.
 - `lib/builtin/` alone owns compiler runtime externs and language items. Keep this contract distinct from ordinary user Go FFI; see the language guide and FFI docs for supported bindings.
 - Reuse `gomlc/query/` for LSP features. Preserve file-scoped imports, canonical package identities, dependency navigation, and existing document-analysis caching.
-- ANF join points are local continuations reached in tail position through `Jump`; recursive joins represent loops. Preserve lexical scope and jump arguments. Consult [ANF definitions](gomlc/anf/model.gom), [verification](gomlc/anf/verify.gom), and [Go lowering](gomlc/go_backend/lower.gom) when changing control flow.
-- Go lowering emits structured control flow without `goto`; labeled loop breaks/continues are supported. Preserve continuation merging, recursive-loop handling, and the post-emission [Go DCE pass](gomlc/go_backend/dce.gom).
+- ANF join points are local continuations reached in tail position through `Jump`; recursive joins represent loops. Preserve lexical scope and jump arguments. Consult [ANF definitions](gomlc/anf/model.goml), [verification](gomlc/anf/verify.goml), and [Go lowering](gomlc/go_backend/lower.goml) when changing control flow.
+- Go lowering emits structured control flow without `goto`; labeled loop breaks/continues are supported. Preserve continuation merging, recursive-loop handling, and the post-emission [Go DCE pass](gomlc/go_backend/dce.goml).
 
 ## Packages and Dependencies
 
@@ -80,8 +80,8 @@ Run recipes from the repository root; [.justfile](.justfile) is the command refe
 ## Tests and Golden Files
 
 - Prefer fast, deterministic tests and minimal fixtures covering relevant parsing, typing, and runtime edges.
-- Compiler CLI tests that need a package world should use `gomlc/test_support/compiler.gom`'s `compiler_command` to reuse `GOML_TEST_COMPILER_WORLD`, including when changing the child process directory. Use direct commands only when specifically testing source-world construction or commands that do not accept `--world`.
-- Pipeline cases live in `gomlc/testdata/pipeline/NNN[_description]/main.gom`. Add or edit the source, then run `just update-golden` to generate IR snapshots and execution output.
+- Compiler CLI tests that need a package world should use `gomlc/test_support/compiler.goml`'s `compiler_command` to reuse `GOML_TEST_COMPILER_WORLD`, including when changing the child process directory. Use direct commands only when specifically testing source-world construction or commands that do not accept `--world`.
+- Pipeline cases live in `gomlc/testdata/pipeline/NNN[_description]/main.goml`. Add or edit the source, then run `just update-golden` to generate IR snapshots and execution output.
 - Multi-package cases live in `gomlc/testdata/module/projectNNN[_description]/`. Include a root `goml.toml`, explicit package declarations/imports, public cross-package APIs, and a `package main` entry. Generate their `.out` files with `just update-golden`; these cases do not produce IR snapshots.
 - Visibility and package-diagnostic fixtures belong in `gomlc/testdata/module_diagnostics/`.
 - Never hand-edit generated golden files, including `.cst`, `.ast`, `.hir`, `.tast`, `.core`, `.mono`, `.lift`, `.anf`, `.go`, and `.out`. Use only `just update-golden` to update snapshots.

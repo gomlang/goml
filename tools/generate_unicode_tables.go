@@ -112,7 +112,7 @@ func main() {
 			if err != nil {
 				panic(err)
 			}
-			path := filepath.Join("lib", "std", "unicode", "tables_"+family+".gom")
+			path := filepath.Join("lib", "std", "unicode", "tables_"+family+".goml")
 			if os.Args[1] == "--write" {
 				if err := os.WriteFile(path, expected, 0644); err != nil {
 					panic(err)

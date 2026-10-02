@@ -1,6 +1,6 @@
 # Unicode data
 
-All public tables are pinned to Unicode 15.0.0. The seven tables_*.gom files are
+All public tables are pinned to Unicode 15.0.0. The seven tables_*.goml files are
 generated from the Go 1.26 unicode package by tools/generate_unicode_tables.go.
 The generator rejects any other Unicode version, sorts named tables and emits
 canonical GoML using stage2/bin/gomlfmt (overridable with GOMLFMT).
@@ -14,7 +14,7 @@ go run tools/generate_unicode_tables.go --write
 
 Check mode compares generated, formatted output without modifying sources and
 runs in the script CI gate. Write mode regenerates the seven derived files.
-The existing full casefold.gom uses tools/generate_unicode_casefold.py instead;
+The existing full casefold.goml uses tools/generate_unicode_casefold.py instead;
 it requires Python Unicode data 15.0.0 and supports multi-scalar folds. Both
 generators support non-mutating `--check`, canonical formatting and the GOMLFMT
 override; both checks run in the script CI gate. Regenerate full folds with

@@ -16,20 +16,20 @@ suite('GoML Module Tests', () => {
         assert.ok(vscode.extensions.getExtension('goml.goml'));
     });
 
-    test('Should activate on .gom files', async () => {
+    test('Should activate on .goml files', async () => {
         const ext = vscode.extensions.getExtension('goml.goml');
         assert.ok(ext, 'Extension should be present');
 
         const projectDirs = getProjectDirs();
         if (projectDirs.length > 0) {
-            const mainGom = path.join(projectDirs[0], 'main.gom');
+            const mainGom = path.join(projectDirs[0], 'main.goml');
             if (fs.existsSync(mainGom)) {
                 const doc = await vscode.workspace.openTextDocument(mainGom);
                 await vscode.window.showTextDocument(doc);
 
                 await new Promise(resolve => setTimeout(resolve, 2000));
 
-                assert.ok(ext.isActive, 'Extension should be active after opening .gom file');
+                assert.ok(ext.isActive, 'Extension should be active after opening .goml file');
             }
         }
     });
@@ -84,7 +84,7 @@ suite('GoML Module Tests', () => {
             return;
         }
 
-        const mainGom = path.join(projectDirs[0], 'main.gom');
+        const mainGom = path.join(projectDirs[0], 'main.goml');
         if (!fs.existsSync(mainGom)) {
             this.skip();
             return;
@@ -132,7 +132,7 @@ suite('GoML Module Tests', () => {
             return;
         }
 
-        const mainGom = path.join(projectDirs[0], 'main.gom');
+        const mainGom = path.join(projectDirs[0], 'main.goml');
         if (!fs.existsSync(mainGom)) {
             this.skip();
             return;

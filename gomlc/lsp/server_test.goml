@@ -1,0 +1,588 @@
+package lsp;
+
+use module::version;
+use std::json;
+use std::path;
+use std::testing;
+
+fn response_result(value: json::Value) -> Option[json::Value] {
+    json::field(value, "result")
+}
+
+fn response_has_label(value: json::Value, expected: string) -> bool {
+    if let Some(result) = response_result(value) {
+        if let Some(items) = json::as_array(result) {
+            for item in items {
+                if let Some(label) = json::field(item, "label") {
+                    if let Some(label) = json::as_string(label) {
+                        if label == expected {
+                            return true
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn response_has_snippet(value: json::Value, expected: string) -> bool {
+    if let Some(result) = response_result(value) {
+        if let Some(items) = json::as_array(result) {
+            for item in items {
+                let label_matches = match json::field(item, "label") {
+                    Some(label) => match json::as_string(label) {
+                        Some(label) => label == expected,
+                        None => false,
+                    },
+                    None => false,
+                };
+                if label_matches {
+                    if let Some(json::Value::Number(value)) = json::field(item, "insertTextFormat") {
+                        if value == "2" {
+                            return true
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+#[test]
+fn identifies_status_operations() -> () {
+    let hover = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"textDocument/hover\",\"params\":{}}";
+    match status_operation(hover) {
+        Some(operation) => testing::assert_eq(operation, "Hover"),
+        None => testing::fail("expected hover status"),
+    }
+    let check = "{\"jsonrpc\":\"2.0\",\"method\":\"goml/checkDiagnostics\",\"params\":{}}";
+    match status_operation(check) {
+        Some(operation) => testing::assert_eq(operation, "Checking diagnostics"),
+        None => testing::fail("expected diagnostics status"),
+    }
+    let change = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{}}";
+    if let Some(_) = status_operation(change) {
+        testing::fail("unexpected change status")
+    }
+    let initialize = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{}}";
+    if let Some(_) = status_operation(initialize) {
+        testing::fail("unexpected initialize status")
+    }
+    let notification = status_notification("busy", "Hover");
+    match json::field(notification, "method") {
+        Some(method) => match json::as_string(method) {
+            Some(method) => testing::assert_eq(method, "goml/status"),
+            None => testing::fail("expected status method"),
+        },
+        None => testing::fail("expected status method"),
+    }
+}
+
+#[test]
+fn initializes_and_answers_hover_requests() -> () {
+    let server = new_server();
+    match handle_payload(
+        server,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+    ) {
+        Ok(messages) => {
+            testing::assert_eq(messages.len(), 1);
+            match response_result(messages.get(0)) {
+                Some(result) => match json::field(result, "serverInfo") {
+                    Some(info) => match json::field(info, "name") {
+                        Some(name) => match json::as_string(name) {
+                            Some(name) => {
+                                testing::assert_eq(name, "gomllsp");
+                                match json::field(info, "version") {
+                                    Some(value) => match json::as_string(value) {
+                                        Some(value) => testing::assert_eq(value, version::current()),
+                                        None => testing::fail("expected server version"),
+                                    },
+                                    None => testing::fail("expected server version"),
+                                }
+                            },
+                            None => testing::fail("expected server name"),
+                        },
+                        None => testing::fail("expected server name"),
+                    },
+                    None => testing::fail("expected server info"),
+                },
+                None => testing::fail("expected initialize result"),
+            }
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+    let open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/gomllsp-test.goml\",\"languageId\":\"goml\",\"version\":1,\"text\":\"fn main() -> i32 { let value = 42; value }\"}}}";
+    match handle_payload(server, open) {
+        Ok(messages) => testing::assert_eq(messages.len(), 1),
+        Err(error) => testing::fail(error.to_string()),
+    }
+    let hover = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/gomllsp-test.goml\"},\"position\":{\"line\":0,\"character\":38}}}";
+    match handle_payload(server, hover) {
+        Ok(messages) => {
+            testing::assert_eq(messages.len(), 1);
+            match response_result(messages.get(0)) {
+                Some(result) => match json::field(result, "contents") {
+                    Some(contents) => match json::field(contents, "value") {
+                        Some(value) => match json::as_string(value) {
+                            Some(value) => {
+                                testing::assert_eq(
+                                    value,
+                                    \\```goml
+                                    \\i32
+                                    \\```
+                                    ,
+                                )
+                            },
+                            None => testing::fail("expected hover text"),
+                        },
+                        None => testing::fail("expected hover value"),
+                    },
+                    None => testing::fail("expected hover contents"),
+                },
+                None => testing::fail("expected hover result"),
+            }
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn returns_expanded_derive_source() -> () {
+    let server = new_server();
+    let source = "#[derive(PartialEq, Eq)] struct Key { value: isize } fn main() -> () { () }";
+    let open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/expanded.goml\",\"languageId\":\"goml\",\"version\":1,\"text\":\""
+        + source
+        + "\"}}}";
+    if let Err(error) = handle_payload(server, open) {
+        testing::fail(error.to_string())
+    }
+    let request = "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"goml/expandedDerive\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/expanded.goml\"}}}";
+    match handle_payload(server, request) {
+        Ok(messages) => match response_result(messages.get(0)) {
+            Some(result) => match json::as_string(result) {
+                Some(value) => {
+                    testing::assert(value.contains("impl PartialEq for Key"));
+                    testing::assert(value.contains("impl Eq for Key"))
+                },
+                None => testing::fail("expected expanded derive source"),
+            },
+            None => testing::fail("expected expanded derive result"),
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn applies_full_document_changes_and_stops_on_exit() -> () {
+    let server = new_server();
+    let open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/gomllsp-change.goml\",\"languageId\":\"goml\",\"version\":1,\"text\":\"fn main() -> i32 { 1 }\"}}}";
+    if let Err(error) = handle_payload(server, open) {
+        testing::fail(error.to_string())
+    }
+    let change = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/gomllsp-change.goml\",\"version\":2},\"contentChanges\":[{\"text\":\"fn main() -> i32 { 2 }\"}]}}";
+    match handle_payload(server, change) {
+        Ok(_) => match server_document(server, "file:///tmp/gomllsp-change.goml") {
+            Some(document) => {
+                testing::assert_eq(document.version, 2);
+                testing::assert_eq(document.text, "fn main() -> i32 { 2 }")
+            },
+            None => testing::fail("expected changed document"),
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+    let _ = handle_payload(server, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}");
+    testing::assert(!server_running(server))
+}
+
+#[test]
+fn completes_from_cached_analysis_after_document_changes() -> () {
+    let server = new_server();
+    let source = "struct Point { x: i32 } fn consume(value: i32) -> () { () } fn main() -> () { let point = Point { x: 1 }; consume(point.x); () }";
+    let open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/completion-change.goml\",\"languageId\":\"goml\",\"version\":1,\"text\":\""
+        + source
+        + "\"}}}";
+    match handle_payload(server, open) {
+        Ok(messages) => testing::assert_eq(messages.len(), 1),
+        Err(error) => testing::fail(error.to_string()),
+    }
+    let changed = "struct Point { x: i32 } fn consume(value: i32) -> () { () } fn main() -> () { let point = Point { x: 1 }; consume(point.); () }";
+    let change = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/completion-change.goml\",\"version\":2},\"contentChanges\":[{\"text\":\""
+        + changed
+        + "\"}]}}";
+    match handle_payload(server, change) {
+        Ok(messages) => testing::assert_eq(messages.len(), 0),
+        Err(error) => testing::fail(error.to_string()),
+    }
+    let position = changed.byte_len() - "); () }".byte_len();
+    let completion = f"{{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"textDocument/completion\",\"params\":{{\"textDocument\":{{\"uri\":\"file:///tmp/completion-change.goml\"}},\"position\":{{\"line\":0,\"character\":{position}}}}}}}";
+    match handle_payload(server, completion) {
+        Ok(messages) => {
+            testing::assert_eq(messages.len(), 1);
+            testing::assert(response_has_label(messages.get(0), "x"))
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+    let check = "{\"jsonrpc\":\"2.0\",\"method\":\"goml/checkDiagnostics\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/completion-change.goml\"}}}";
+    match handle_payload(server, check) {
+        Ok(messages) => testing::assert_eq(messages.len(), 1),
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn refreshes_completion_analysis_after_dependency_changes() -> () {
+    let server = new_server();
+    let root = "../gomlc/testdata/module/project001";
+    let main_path = path::join(root, "main.goml");
+    let lib_path = path::join(root, "lib/lib.goml");
+    let main_uri = path_to_uri(main_path);
+    let lib_uri = path_to_uri(lib_path);
+    let main_source = "package main; use project001::lib; fn main() -> () { lib:: }";
+    let old_lib_source = "package lib; pub fn old_value() -> isize { 1 }";
+    let new_lib_source = "package lib; pub fn new_value() -> isize { 2 }";
+    let main_document = Document {
+        uri: main_uri,
+        path: main_path,
+        text: main_source,
+        version: 1,
+        line_index: line_index(main_source),
+    };
+    open_document(server, main_document);
+    open_document(
+        server,
+        Document {
+            uri: lib_uri,
+            path: lib_path,
+            text: old_lib_source,
+            version: 1,
+            line_index: line_index(old_lib_source),
+        },
+    );
+    let _ = document_analysis(server, main_document);
+    let position = main_source.byte_len() - " }".byte_len();
+    let completion = f"{{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"textDocument/completion\",\"params\":{{\"textDocument\":{{\"uri\":\"{main_uri}\"}},\"position\":{{\"line\":0,\"character\":{position}}}}}}}";
+    match handle_payload(server, completion) {
+        Ok(messages) => {
+            testing::assert_eq(messages.len(), 1);
+            testing::assert(response_has_label(messages.get(0), "old_value"))
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+    change_document(server, lib_uri, new_lib_source, 2);
+    match handle_payload(server, completion) {
+        Ok(messages) => {
+            testing::assert_eq(messages.len(), 1);
+            testing::assert(response_has_label(messages.get(0), "new_value"));
+            testing::assert(!response_has_label(messages.get(0), "old_value"))
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn completes_select_with_snippets() -> () {
+    let server = new_server();
+    let source = "fn main() -> () { sel }";
+    let open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/select-completion.goml\",\"languageId\":\"goml\",\"version\":1,\"text\":\""
+        + source
+        + "\"}}}";
+    if let Err(error) = handle_payload(server, open) {
+        testing::fail(error.to_string())
+    }
+    let completion = "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/select-completion.goml\"},\"position\":{\"line\":0,\"character\":23}}}";
+    match handle_payload(server, completion) {
+        Ok(messages) => {
+            testing::assert_eq(messages.len(), 1);
+            testing::assert(response_has_snippet(messages.get(0), "select"))
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn keeps_cached_analysis_when_an_open_document_is_saved() -> () {
+    let server = new_server();
+    let open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/gomllsp-save.goml\",\"languageId\":\"goml\",\"version\":1,\"text\":\"fn main() -> isize { 1 }\"}}}";
+    if let Err(error) = handle_payload(server, open) {
+        testing::fail(error.to_string())
+    }
+    testing::assert_eq(server.analyses.len(), 1);
+    let generation = server.generation.get();
+    let save = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didSave\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/gomllsp-save.goml\"}}}";
+    if let Err(error) = handle_payload(server, save) {
+        testing::fail(error.to_string())
+    }
+    testing::assert_eq(server.analyses.len(), 1);
+    testing::assert_eq(server.generation.get(), generation)
+}
+
+#[test]
+fn returns_run_test_code_lenses() -> () {
+    let server = new_server();
+    let open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/value_test.goml\",\"languageId\":\"goml\",\"version\":1,\"text\":\"package value;\\n#[test]\\nfn works() -> () { () }\\n\"}}}";
+    if let Err(error) = handle_payload(server, open) {
+        testing::fail(error.to_string())
+    }
+    let request = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/codeLens\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/value_test.goml\"}}}";
+    match handle_payload(server, request) {
+        Ok(messages) => match response_result(messages.get(0)) {
+            Some(result) => match json::as_array(result) {
+                Some(lenses) => {
+                    testing::assert_eq(lenses.len(), 1);
+                    match json::field(lenses.get(0), "command") {
+                        Some(command) => match json::field(command, "command") {
+                            Some(value) => match json::as_string(value) {
+                                Some(value) => {
+                                    testing::assert_eq(value, "goml.runTest")
+                                },
+                                None => {
+                                    testing::fail("expected command name")
+                                },
+                            },
+                            None => testing::fail("expected command"),
+                        },
+                        None => testing::fail("expected code lens command"),
+                    }
+                },
+                None => testing::fail("expected code lenses"),
+            },
+            None => testing::fail("expected code lens result"),
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn converts_diagnostic_fixes_to_code_actions() -> () {
+    let server = new_server();
+    let request = "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"textDocument/codeAction\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/main.goml\"},\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":1}},\"context\":{\"diagnostics\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":1}},\"message\":\"replace\",\"data\":{\"fixes\":[{\"uri\":\"file:///tmp/main.goml\",\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":1}},\"replacement\":\"x\",\"title\":\"Replace value\",\"preferred\":true}]}}]}}}";
+    match handle_payload(server, request) {
+        Ok(messages) => match response_result(messages.get(0)) {
+            Some(result) => match json::as_array(result) {
+                Some(actions) => {
+                    testing::assert_eq(actions.len(), 1);
+                    match json::field(actions.get(0), "title") {
+                        Some(value) => match json::as_string(value) {
+                            Some(value) => {
+                                testing::assert_eq(value, "Replace value")
+                            },
+                            None => testing::fail("expected title"),
+                        },
+                        None => testing::fail("expected action title"),
+                    }
+                },
+                None => testing::fail("expected code actions"),
+            },
+            None => testing::fail("expected code action result"),
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn returns_null_when_no_code_actions_apply() -> () {
+    let server = new_server();
+    let request = "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"textDocument/codeAction\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/main.goml\"},\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":1}},\"context\":{\"diagnostics\":[]}}}";
+    match handle_payload(server, request) {
+        Ok(messages) => match response_result(messages.get(0)) {
+            Some(Null) => (),
+            Some(_) => testing::fail("expected null code actions"),
+            None => testing::fail("expected code action result"),
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn reports_json_rpc_parse_and_invalid_request_errors() -> () {
+    let server = new_server();
+    match handle_payload(server, "{") {
+        Ok(messages) => {
+            testing::assert_eq(messages.len(), 1);
+            match json::field(messages.get(0), "error") {
+                Some(error) => match json::field(error, "code") {
+                    Some(code) => match json::as_int(code) {
+                        Some(code) => testing::assert_eq(code, -32700),
+                        None => testing::fail("expected parse code"),
+                    },
+                    None => testing::fail("expected parse error code"),
+                },
+                None => testing::fail("expected parse error"),
+            }
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+    match handle_payload(server, "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"initialize\"}") {
+        Ok(messages) => match json::field(messages.get(0), "error") {
+            Some(error) => match json::field(error, "code") {
+                Some(code) => match json::as_int(code) {
+                    Some(code) => testing::assert_eq(code, -32600),
+                    None => testing::fail("expected request code"),
+                },
+                None => testing::fail("expected request error code"),
+            },
+            None => testing::fail("expected invalid request error"),
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn filters_inlay_hints_to_the_requested_range() -> () {
+    let server = new_server();
+    let open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/inlay.goml\",\"languageId\":\"goml\",\"version\":1,\"text\":\"fn main() -> () {\\n    let first = 1;\\n    let second = 2;\\n    ()\\n}\"}}}";
+    if let Err(error) = handle_payload(server, open) {
+        testing::fail(error.to_string())
+    }
+    let request = "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/inlayHint\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/inlay.goml\"},\"range\":{\"start\":{\"line\":2,\"character\":0},\"end\":{\"line\":3,\"character\":0}}}}";
+    match handle_payload(server, request) {
+        Ok(messages) => match response_result(messages.get(0)) {
+            Some(result) => match json::as_array(result) {
+                Some(hints) => {
+                    testing::assert_eq(hints.len(), 1);
+                    match json::field(hints.get(0), "label") {
+                        Some(label) => match json::as_string(label) {
+                            Some(label) => {
+                                testing::assert_eq(label, ": isize")
+                            },
+                            None => testing::fail("expected hint label"),
+                        },
+                        None => testing::fail("expected hint"),
+                    }
+                },
+                None => testing::fail("expected inlay hints"),
+            },
+            None => testing::fail("expected inlay result"),
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn rejects_requests_after_shutdown() -> () {
+    let server = new_server();
+    let shutdown = "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"shutdown\"}";
+    match handle_payload(server, shutdown) {
+        Ok(messages) => testing::assert_eq(messages.len(), 1),
+        Err(error) => testing::fail(error.to_string()),
+    }
+    let request = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"initialize\"}";
+    match handle_payload(server, request) {
+        Ok(messages) => match json::field(messages.get(0), "error") {
+            Some(error) => match json::field(error, "code") {
+                Some(code) => match json::as_int(code) {
+                    Some(code) => testing::assert_eq(code, -32600),
+                    None => testing::fail("expected shutdown code"),
+                },
+                None => testing::fail("expected shutdown error code"),
+            },
+            None => testing::fail("expected shutdown error"),
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn includes_diagnostics_in_hover() -> () {
+    let server = new_server();
+    let open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/hover-error.goml\",\"languageId\":\"goml\",\"version\":1,\"text\":\"fn main() -> i32 { missing }\"}}}";
+    if let Err(error) = handle_payload(server, open) {
+        testing::fail(error.to_string())
+    }
+    let request = "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/hover-error.goml\"},\"position\":{\"line\":0,\"character\":21}}}";
+    match handle_payload(server, request) {
+        Ok(messages) => match response_result(messages.get(0)) {
+            Some(result) => match json::field(result, "contents") {
+                Some(contents) => match json::field(contents, "value") {
+                    Some(value) => match json::as_string(value) {
+                        Some(value) => testing::assert(value.contains("**Diagnostics**")),
+                        None => testing::fail("expected hover text"),
+                    },
+                    None => testing::fail("expected hover value"),
+                },
+                None => testing::fail("expected hover contents"),
+            },
+            None => testing::fail("expected hover result"),
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn publishes_recovered_parser_diagnostics_at_utf16_positions() -> () {
+    let server = new_server();
+    let open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/recovery.goml\",\"languageId\":\"goml\",\"version\":1,\"text\":\"fn main() -> () {\\r\\n    let text = \\\"中\\\"\\r\\n    println(text);\\r\\n}\\r\\n\"}}}";
+    match handle_payload(server, open) {
+        Ok(messages) => {
+            testing::assert_eq(messages.len(), 1);
+            let encoded = json::encode(messages.get(0));
+            testing::assert(encoded.contains("expect \\\";\\\""));
+            testing::assert(
+                encoded.contains(
+                    "\"start\":{\"line\":1,\"character\":18},\"end\":{\"line\":1,\"character\":18}",
+                ),
+            );
+            testing::assert(!encoded.contains("Unknown value text"))
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn publishes_unreachable_code_as_a_warning() -> () {
+    let server = new_server();
+    let open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/unreachable.goml\",\"languageId\":\"goml\",\"version\":1,\"text\":\"fn main() -> () {\\n    return;\\n    println(\\\"dead\\\")\\n}\\n\"}}}";
+    match handle_payload(server, open) {
+        Ok(messages) => {
+            testing::assert_eq(messages.len(), 1);
+            let encoded = json::encode(messages[0]);
+            testing::assert(encoded.contains("unreachable_code: unreachable code"));
+            testing::assert(encoded.contains("\"severity\":2"))
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn publishes_unused_function_as_a_warning() -> () {
+    let server = new_server();
+    let open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/unused.goml\",\"languageId\":\"goml\",\"version\":1,\"text\":\"fn dead() -> () {}\\nfn main() -> () {}\\n\"}}}";
+    match handle_payload(server, open) {
+        Ok(messages) => {
+            testing::assert_eq(messages.len(), 1);
+            let encoded = json::encode(messages[0]);
+            testing::assert(encoded.contains("unused_function: function dead is never used"));
+            testing::assert(encoded.contains("\"severity\":2"));
+            testing::assert(
+                encoded.contains(
+                    "\"start\":{\"line\":0,\"character\":3},\"end\":{\"line\":0,\"character\":7}",
+                ),
+            )
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+#[test]
+fn publishes_unused_result_as_a_warning() -> () {
+    let server = new_server();
+    let open = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///tmp/unused-result.goml\",\"languageId\":\"goml\",\"version\":1,\"text\":\"fn main() -> () {\\n    let value: Result[(), string] = Err(\\\"failed\\\");\\n    value;\\n}\\n\"}}}";
+    match handle_payload(server, open) {
+        Ok(messages) => {
+            testing::assert_eq(messages.len(), 1);
+            let encoded = json::encode(messages[0]);
+            testing::assert(encoded.contains("\"code\":\"unused_result\""));
+            testing::assert(encoded.contains("let _ = ..."));
+            testing::assert(encoded.contains("\"severity\":2"));
+            testing::assert(
+                encoded.contains(
+                    "\"start\":{\"line\":2,\"character\":4},\"end\":{\"line\":2,\"character\":9}",
+                ),
+            );
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}

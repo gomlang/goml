@@ -81,6 +81,6 @@ Output ordering is deterministic. Generated contents contain neither timestamps 
 
 `just make` builds `stage2/bin/gomldoc`; `just install` and release archives include it. It uses the compiler version module and executable-relative library resources.
 
-The implementation lives in `gomlc/doc_comment`, `gomlc/query/documentation*`, `gomlc/doc`, and `gomlc/cmd/gomldoc`. Project integration lives in `goml/commands/doc.gom` and `goml/cmd/goml/doc.gom`. Tests cover attachment, visibility, imports, output, errors, and CLI integration. Toolchain and packaging changes require `just ci`, including fixed-point and relocated archive checks.
+The implementation lives in `gomlc/doc_comment`, `gomlc/query/documentation*`, `gomlc/doc`, and `gomlc/cmd/gomldoc`. Project integration lives in `goml/commands/doc.goml` and `goml/cmd/goml/doc.goml`. Tests cover attachment, visibility, imports, output, errors, and CLI integration. Toolchain and packaging changes require `just ci`, including fixed-point and relocated archive checks.
 
 Dependency documentation sites, search, an HTTP server, automatic browser launch, and doctests are future work.
