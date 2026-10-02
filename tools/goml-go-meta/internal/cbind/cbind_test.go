@@ -26,7 +26,7 @@ func fixture(t *testing.T) (Project, context.Context) {
 	write("goml.toml", "[module]\npath = \"test\"\n")
 	write("go.mod", "module example.com/test\n\ngo 1.26.0\n")
 	write("api.h", "#include <stdint.h>\n#define MASK UINT64_C(18446744073709551615)\nstatic int answer(void) { return 42; }\n")
-	config := Config{Version: 1, Package: "bindings", Output: "bindings/generated.gom", GoPackage: "native", GoOutput: "native/generated.go", Headers: []string{"api.h"}, Functions: []Function{{Name: "answer", Symbol: "answer"}}, Constants: []Constant{{Name: "MASK", Symbol: "MASK"}}}
+	config := Config{Version: 1, Package: "bindings", Output: "bindings/generated.goml", GoPackage: "native", GoOutput: "native/generated.go", Headers: []string{"api.h"}, Functions: []Function{{Name: "answer", Symbol: "answer"}}, Constants: []Constant{{Name: "MASK", Symbol: "MASK"}}}
 	data, _ := json.Marshal(config)
 	write("bindings.json", string(data))
 	p, err := Load(filepath.Join(root, "bindings.json"))

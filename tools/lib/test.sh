@@ -9,14 +9,14 @@ prefix="$(cd "$1" && pwd)"
 temporary="$(mktemp -d)"
 trap 'rm -rf "$temporary"' EXIT
 
-test -f "$prefix/lib/builtin/contract.gom"
+test -f "$prefix/lib/builtin/contract.goml"
 test -f "$prefix/lib/builtin/goml.toml"
-test -f "$prefix/lib/builtin/runtime.gom"
-test -f "$prefix/lib/builtin/impls.gom"
-test -f "$prefix/lib/builtin/language.gom"
-test -f "$prefix/lib/builtin/numeric.gom"
-test -f "$prefix/lib/builtin/derive.gom"
-test -f "$prefix/lib/prelude/prelude.gom"
+test -f "$prefix/lib/builtin/runtime.goml"
+test -f "$prefix/lib/builtin/impls.goml"
+test -f "$prefix/lib/builtin/language.goml"
+test -f "$prefix/lib/builtin/numeric.goml"
+test -f "$prefix/lib/builtin/derive.goml"
+test -f "$prefix/lib/prelude/prelude.goml"
 test -f "$prefix/lib/prelude/goml.toml"
 test -f "$prefix/lib/std/goml.toml"
 test -f "$prefix/lib/cabi/go.mod"
@@ -28,16 +28,18 @@ test ! -e "$prefix/lib/builtin_derive.gom"
 
 mkdir -p "$temporary/install/lib/std/obsolete" "$temporary/install/lib/std/fs" \
     "$temporary/install/lib/compiler" "$temporary/install/lib/custom"
-printf '%s\n' stale > "$temporary/install/lib/std/obsolete/old.gom"
-printf '%s\n' stale > "$temporary/install/lib/std/fs/removed.gom"
+printf '%s\n' stale > "$temporary/install/lib/std/obsolete/old.goml"
+printf '%s\n' stale > "$temporary/install/lib/std/fs/removed.goml"
 printf '%s\n' retained > "$temporary/install/lib/compiler/retained"
 printf '%s\n' retained > "$temporary/install/lib/custom/retained"
+printf '%s\n' retained > "$temporary/install/lib/custom/retained.gom"
 bash "$repo_root/tools/lib/install.sh" "$temporary/install"
 test ! -e "$temporary/install/lib/std/obsolete"
-test ! -e "$temporary/install/lib/std/fs/removed.gom"
-test -f "$temporary/install/lib/std/fs/fs.gom"
+test ! -e "$temporary/install/lib/std/fs/removed.goml"
+test -f "$temporary/install/lib/std/fs/fs.goml"
 test -f "$temporary/install/lib/compiler/retained"
 test -f "$temporary/install/lib/custom/retained"
+test -f "$temporary/install/lib/custom/retained.gom"
 if bash "$repo_root/tools/lib/install.sh" "$repo_root" > "$temporary/install-stdout" 2> "$temporary/install-stderr"; then
     exit 1
 fi
@@ -99,7 +101,7 @@ if "$temporary/bin/gomlc" __builtin-interface > "$temporary/stdout" 2> "$tempora
     exit 1
 fi
 
-grep -F "could not read builtin resource $temporary/lib/builtin/contract.gom" "$temporary/stderr" >/dev/null
+grep -F "could not read builtin resource $temporary/lib/builtin/contract.goml" "$temporary/stderr" >/dev/null
 grep -F "builtin/contract.gom" "$temporary/stderr" >/dev/null
 
 cd "$temporary"
@@ -107,8 +109,14 @@ cp -R "$prefix/lib" "$temporary/lib"
 "$temporary/bin/gomlc" __builtin-interface >/dev/null
 "$temporary/bin/gomlc" __prelude-interface >/dev/null
 
-mv "$temporary/lib/prelude/prelude.gom" "$temporary/lib/prelude/prelude.gom.missing"
+mv "$temporary/lib/prelude/prelude.goml" "$temporary/lib/prelude/prelude.goml.missing"
 if "$temporary/bin/gomlc" __prelude-interface > "$temporary/prelude-stdout" 2> "$temporary/prelude-stderr"; then
     exit 1
 fi
-grep -F "could not read prelude resource $temporary/lib/prelude/prelude.gom" "$temporary/prelude-stderr" >/dev/null
+grep -F "could not read prelude resource $temporary/lib/prelude/prelude.goml" "$temporary/prelude-stderr" >/dev/null
+mv "$temporary/lib/prelude/prelude.goml.missing" "$temporary/lib/prelude/prelude.goml"
+while IFS= read -r -d '' source; do
+    mv -- "$source" "${source%l}"
+done < <(find "$temporary/lib/builtin" "$temporary/lib/prelude" "$temporary/lib/std" -type f -name '*.goml' -print0)
+"$temporary/bin/gomlc" __builtin-interface >/dev/null
+"$temporary/bin/gomlc" __prelude-interface >/dev/null
