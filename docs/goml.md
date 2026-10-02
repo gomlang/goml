@@ -207,6 +207,16 @@ target-dir = "_artifact"
 
 Dependency versions must use the strict `X.Y.Z` form. A dependency version is a minimum version requirement resolved using MVS; there is currently no `goml.lock`.
 
+`[dev-dependencies]` uses the same version and path forms. These dependencies are available to the invoking module's `*_test.gom` files, `tests/` packages and root `examples/` tree. Production sources cannot import them, even during a test build. Dependencies of another module do not inherit its development dependencies. Test and example commands resolve the union of normal and development requirements through MVS; ordinary check/build/run commands resolve only normal requirements. A development helper may depend back on the current library: that edge uses the current source without introducing a second copy. Production dependency cycles remain errors, including cycles introduced by a version selected for development. A helper that imports the package under test must be used from black-box tests or examples; importing it from that same package's white-box tests still creates an unsupported package cycle.
+
+```toml
+[dev-dependencies]
+"alice::proptest" = "0.1.0"
+"alice::test_support" = { path = "../test_support" }
+```
+
+Use `goml add alice::proptest --dev`, `goml add alice::test_support --dev --path ../test_support`, and `goml remove alice::proptest --dev` to edit this section. Production dependencies stay in `[dependencies]`.
+
 Local development dependencies can use an inline table. Paths are relative to the declaring module, and the dependency name must match the target's canonical `[module].path`:
 
 ```toml
@@ -232,11 +242,45 @@ members = ["app", "http", "model"]
 
 Members retain their own manifests and file-scoped imports. Membership provides a local source for a declared dependency; it does not make undeclared dependencies visible. Selection prefers workspace replacements, invoking-module replacements, workspace members, explicit path dependencies, then registry versions. Member paths and replacement paths are relative to `goml.work`; duplicate canonical member paths or module identities are rejected. An ancestor workspace applies only to its listed members. `GOML_WORKSPACE` selects a workspace directory explicitly, and `GOML_WORKSPACE=off` disables discovery.
 
-`goml check --workspace`, `build --workspace`, `test --workspace`, `fmt --workspace`, `doc --workspace` and `clean --workspace` run for each member in declaration order, stopping on failure. From a workspace directory without an enclosing module, these commands select all members automatically. `-p alice::app` or `--package alice::app` selects one module; `goml run` requires this selection when multiple members exist. Commands invoked inside a member operate on that member unless `--workspace` is supplied. Compiler queries and LSP dependency navigation resolve the same local sources and replacements.
+`goml check --workspace`, `build --workspace`, `test --workspace`, `verify --workspace`, `fmt --workspace`, `doc --workspace` and `clean --workspace` run for each member in declaration order, stopping on failure. From a workspace directory without an enclosing module, these commands select all members automatically. `-p alice::app` or `--package alice::app` selects one module; `goml run` requires this selection when multiple members exist. Commands invoked inside a member operate on that member unless `--workspace` is supplied. Compiler queries and LSP dependency navigation resolve the same local sources and replacements.
 
 `[build]` can be omitted; `build.target-dir` defaults to `_artifact` under the module root. The manifest value must be a non-empty relative path and cannot contain a `..` segment. `goml check`, `goml build`, `goml run`, and `goml test` can temporarily override it with `--target-dir <path>`; command-line overrides may be relative or absolute. `goml clean` removes the configured target directory. Its optional `--target-dir <path>` override must stay inside the module.
 
 Each module path segment must be non-empty and may contain ASCII letters, digits, `_`, and `-`. Paths rooted at `builtin` or `prelude` are reserved for the toolchain and cannot be used as a module path or dependency. The `[module]` section currently has no `name`, `kind`, `root`, or similar fields.
+
+### Examples and downstream verification
+
+Named examples share the module-root manifest and use both normal and development dependencies. Put each executable in `examples/<name>/main.gom`, declaring `package main;` and `fn main() -> ()`. Names contain ASCII letters, digits, `_`, or `-`. An example can contain helper packages, white-box tests and direct `tests/` packages. An example directory containing its own `goml.toml` is an independent module, not a named example.
+
+```text
+library/
+├── goml.toml
+├── library.gom
+├── tests/api_test.gom
+└── examples/basic/
+    ├── main.gom
+    └── tests/example_test.gom
+```
+
+For a library with module path `alice::library`, the example package is `alice::library::examples::basic`. Production packages and other modules cannot import example packages. Examples use the existing GoML source grammar; no target declarations or extra manifests are needed.
+
+```sh
+goml run --example basic -- argument
+goml build --example basic
+goml check --examples
+goml test --example basic
+goml verify
+```
+
+`check`, `build` and `test` accept `--example <name>` or `--examples`; these options select only the named example or all examples. `run` accepts one `--example` and cannot also take a positional target. Ordinary check/build commands exclude the root `examples/` tree. Ordinary `goml test` runs module tests, builds all examples and runs their tests; it does not execute example `main` functions. `goml fmt` includes examples and their tests. The binary for `basic` is `<target-dir>/bin/examples/basic/basic`. Test processes run from the module root, including example tests.
+
+`goml verify` builds and tests examples as independent downstream modules against an isolated registry snapshot of the library and its selected dependency closure. The temporary registry retains only production requirements for each published module; path dependencies become snapshot version requirements. The current library and local dependencies receive the synthetic version `0.0.0`. Registry requirements retain their selected versions. Child commands disable workspace discovery and use only the snapshot registry. Generated projects and artifacts stay under `<target-dir>/verify/<content-hash>/`; repeat verification reuses them. Snapshot modules must use registry coordinates of the form `owner::module`.
+
+Verified examples retain their canonical package path as their generated module path. Use canonical imports such as `use alice::library;` and `use alice::library::examples::basic;` in their sources and tests. Verification rejects `module::` imports because their root would change when materialized as an independent module. Relative data paths in verified tests are relative to the copied example directory. Example programs are built but never automatically run. A generated minimal `go.mod` supports declared native adapters; examples needing additional Go module settings can supply their own `go.mod`.
+
+Special downstream scenarios can retain independent manifests under `testdata/downstream/<name>/goml.toml`. Verification copies these fixture modules and normalizes their normal and development requirements to snapshot versions. Fixture-only dependencies must also appear in the library's root development dependencies. Fixture module paths must differ from the library path. Nested modules, symbolic links, `.git`, `_artifact`, `_bootstrap`, `__pycache__` and configured build outputs are excluded from source snapshots; verification never follows links outside a source tree. Other files, including test data and Go sources, are copied.
+
+`goml verify --example basic` selects one example; `--examples` omits explicit fixtures. Test filters and test execution options have the same meaning as in `goml test`. `--dry-run` lists cases without creating a snapshot or building them. `GOML_VERIFY_BINARY` in child tests names the built root executable, and `GOML_VERIFY_DRIVER` names the driver. Verification reports an error when no cases exist. It validates the current source snapshot; it does not publish a registry version or validate a remote release archive.
 
 ### Native dependencies
 
@@ -2980,7 +3024,7 @@ If the identity of the package under test is `alice::myapp::math`, the canonical
 
 ### Check and run tests
 
-`goml check`, `goml build` and `goml test` always process complete modules discovered from the current directory upwards, and do not accept package or file targets. `goml check` only checks the production source code by default; using `--tests` will also check all white-box and black-box tests after the production package check is successful:
+`goml check`, `goml build` and `goml test` discover the module from the current directory upwards. They process complete modules unless an example selector is supplied, and do not accept package or file targets. `goml check` only checks the production source code by default; using `--tests` will also check all white-box and black-box tests after the production package check is successful:
 
 ```sh
 goml check
@@ -2992,7 +3036,7 @@ goml fmt --check
 
 Test source code cannot be used to fix a production package that itself fails inspection.
 
-`goml fmt` formats the current module's production files, internal tests, and black-box test packages using the same package graphs as builds and tests. It can be run from any nested package directory. Package discovery excludes `testdata`, build output, hidden directories, nested modules, and external dependencies. `goml fmt --check` only checks formatting and exits unsuccessfully when any source file would change.
+`goml fmt` formats the current module's production files, internal tests, black-box test packages, and examples with their tests using the same package graphs as builds and tests. It can be run from any nested package directory. Package discovery excludes `testdata`, build output, hidden directories, nested modules, and external dependencies. `goml fmt --check` only checks formatting and exits unsuccessfully when any source file would change.
 
 Run the test using:
 
@@ -6851,6 +6895,8 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | `use pkg::*` | List the required public items explicitly with `use pkg::{A, B};` |
 | `mod`, `crate::`, `super::` | Directory packages, `module::path` for the current module, and canonical paths for dependencies |
 | Develop several modules together | `goml.work` lists members; dependency `{ path = "../library" }` and root `[replace]` select local sources while preserving declared dependencies and canonical identities; `--workspace` or `-p` selects modules |
+| Put test-only helpers in production dependencies | Use root `[dev-dependencies]`; tests and `examples/<name>/` can import them |
+| Create a separate consumer manifest for every example | Use `goml run --example <name>` and `goml verify`; reserve `testdata/downstream/` modules for special dependency or native configurations |
 | `fn helper` inside function | Top-level function or local closure |
 | Go external type | `#[go_type("pkg", "Name")] extern type Name[T];` retains Go identity and validates concrete instances across packages and artifacts; `std::ffi::Ptr[T]` and Go pointer aliases preserve nullable pointer values, with explicit `ffi::null()` and `ffi::is_nil`; method bindings use `#[go_method("Method")]`; public fields and keyed struct construction use ordinary syntax, and symbolic function/alias instances are checked after specialization |
 | Go interface adapter | `#[go_interface(RawType, Wrapper, method = "GoMethod")]` generates a checked native-interface wrapper and trait implementation; `from_trait` explicitly creates a typed Go bridge retaining the supplied dyn object; nil/typed-nil and multiple results are preserved |
@@ -6933,6 +6979,8 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 The documentation spelling `////` is an ordinary comment, not an item documentation block. A blank line between `///` and a declaration leaves that comment unattached; use a bare `///` line to separate paragraphs within a block.
 
 ## Informal Grammar Quick Facts
+
+Development dependencies, named examples and downstream verification affect manifests, directory discovery and CLI commands. They add no GoML source grammar productions; examples use ordinary package declarations and imports.
 
 Lexical comment conventions (comments are trivia in the grammar below):
 

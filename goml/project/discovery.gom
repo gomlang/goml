@@ -7,6 +7,7 @@ use error::ReportContext;
 use module::manifest;
 use module::registry;
 use module::util;
+use gomlang::toolchain_manifest as config;
 use std::bytes;
 use std::collections;
 use std::env;
@@ -348,6 +349,14 @@ fn module_sources(module_dir: string, module_manifest: manifest::Manifest) -> Re
     Vec[ModuleSource],
     failure::Failure,
 ] {
+    module_sources_with_development(module_dir, module_manifest, false)
+}
+
+fn module_sources_with_development(
+    module_dir: string,
+    module_manifest: manifest::Manifest,
+    development: bool,
+) -> Result[Vec[ModuleSource], failure::Failure] {
     let result: Vec[ModuleSource] = Vec::new();
     result.push(
         ModuleSource {
@@ -355,12 +364,22 @@ fn module_sources(module_dir: string, module_manifest: manifest::Manifest) -> Re
             directory: module_dir,
             artifact_prefix: "pkg",
             dependencies: dependency_names(module_manifest.dependencies),
+            dev_dependencies: if development {
+                dependency_names(module_manifest.dev_dependencies)
+            } else {
+                Vec::new()
+            },
         },
     );
-    if module_manifest.dependencies.is_empty() {
+    if module_manifest.dependencies.is_empty()
+        && (!development || module_manifest.dev_dependencies.is_empty()) {
         return Result::Ok(result)
     }
-    let resolved = registry::resolve(module_dir).driver_result()?;
+    let resolved = registry::resolve_at_with_development(
+        module_dir,
+        registry::cached_root()?,
+        development,
+    )?;
     for module in resolved {
         match source_by_name(result, module.name) {
             Some(_) => return Result::Err(
@@ -372,6 +391,7 @@ fn module_sources(module_dir: string, module_manifest: manifest::Manifest) -> Re
                     directory: module.root,
                     artifact_prefix: registry::artifact_prefix(module),
                     dependencies: dependency_names(module.dependencies),
+                    dev_dependencies: Vec::new(),
                 },
             ),
         }
@@ -383,10 +403,12 @@ fn package_directory_in_source(source: ModuleSource, package_name: string) -> Op
     directory_for_package(source.directory, source.name, package_name)
 }
 
-fn local_import(sources: Vec[ModuleSource], current_module: string, import_path: string) -> Result[
-    Option[string],
-    failure::Failure,
-] {
+fn local_import(
+    sources: Vec[ModuleSource],
+    current_module: string,
+    import_path: string,
+    development: bool,
+) -> Result[Option[string], failure::Failure] {
     let import_path = if import_path.starts_with("module::") {
         current_module + import_path.byte_slice("module".byte_len(), import_path.byte_len())
     } else {
@@ -401,7 +423,8 @@ fn local_import(sources: Vec[ModuleSource], current_module: string, import_path:
         let Some(source) = source_for_package(sources, import_path) else {
             return Result::Ok(Option::None)
         };
-        if source.name != current_module && !current.dependencies.contains(source.name) {
+        if source.name != current_module && !current.dependencies.contains(source.name)
+            && !(development && current.dev_dependencies.contains(source.name)) {
             return Result::Err(
                 failure::convert(
                     "module " + current_module + " must declare a direct dependency on "
@@ -414,6 +437,15 @@ fn local_import(sources: Vec[ModuleSource], current_module: string, import_path:
         let prefix = source.name + "::";
         if import_path.starts_with(prefix) {
             let suffix = import_path.byte_slice(prefix.byte_len(), import_path.byte_len());
+            if (suffix == "examples" || suffix.starts_with("examples::"))
+                && (!development || source.name != current_module) {
+                return Result::Err(
+                    failure::convert(
+                        "example package " + import_path
+                            + " cannot be imported by production code or other modules",
+                    ),
+                )
+            }
             for segment in text::split(suffix, "::") {
                 if segment == "tests" {
                     return Result::Err(
@@ -462,7 +494,15 @@ fn package_from_info(
             return Result::Err(failure::convert("package declaration mismatch in " + file.path))
         }
         for use_decl in file.uses {
-            if let Some(value) = local_import(sources, source.name, use_decl.path)? {
+            if let Some(value) = local_import(
+                sources,
+                source.name,
+                use_decl.path,
+                config::development_source(
+                    source.directory,
+                    path::join(directory, path::file_name(file.path).unwrap_or("")),
+                ),
+            )? {
                 imports.push(value)
             }
         }
@@ -628,7 +668,8 @@ fn collect_package_directories(
         } else if fs::is_dir(value) && value != artifact_root {
             if name == "tests" {
                 test_directories.push(value)
-            } else if name != "testdata" && !name.starts_with(".") {
+            } else if name != "testdata" && !(directory == module_dir && name == "examples")
+                && !name.starts_with(".") {
                 children.push(value)
             }
         }
@@ -736,6 +777,7 @@ fn toolchain_module_source(lib_dir: string, module_name: string) -> Result[
             directory,
             artifact_prefix: "pkg",
             dependencies: util::sorted_unique(dependencies),
+            dev_dependencies: Vec::new(),
         },
     )
 }
@@ -945,12 +987,20 @@ pub fn load_context(target_dir_override: Option[string], compiler_override: Opti
     Context,
     failure::Failure,
 ] {
+    load_context_with_development(target_dir_override, compiler_override, false)
+}
+
+pub fn load_context_with_development(
+    target_dir_override: Option[string],
+    compiler_override: Option[string],
+    development: bool,
+) -> Result[Context, failure::Failure] {
     let current = env::current_dir_structured().driver_result()?;
     let module_dir = find_module_root(current)?;
     let module_manifest = manifest::load(path::join(module_dir, manifest::FILENAME)).driver_result()?;
     let resolved_compiler = resolve_compiler(compiler_override)?;
     let compiler = resolved_compiler.path;
-    let sources = module_sources(module_dir, module_manifest)?;
+    let sources = module_sources_with_development(module_dir, module_manifest, development)?;
     let artifact_root = match target_dir_override {
         Some(value) => if path::is_absolute(value) {
             path::clean(value)
@@ -1101,7 +1151,7 @@ pub fn internal_test_graphs(context: Context) -> Result[Vec[Graph], failure::Fai
     let result: Vec[Graph] = Vec::new();
     let names: Vec[string] = Vec::new();
     for package_value in context.graph.packages {
-        if package_value.module_name == context.graph.module_path {
+        if owns_test_package(context.graph, package_value) {
             let files = source_files(package_value.directory, true)?;
             if files.len() > package_value.files.len() {
                 names.push(package_value.name)
@@ -1150,7 +1200,7 @@ pub fn external_test_graphs(context: Context) -> Result[Vec[ExternalTest], failu
     let result: Vec[ExternalTest] = Vec::new();
     let names: Vec[string] = Vec::new();
     for package_value in context.graph.packages {
-        if package_value.module_name == context.graph.module_path {
+        if owns_test_package(context.graph, package_value) {
             names.push(package_value.name)
         }
     }
