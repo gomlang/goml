@@ -136,7 +136,8 @@ _ci-scripts:
     bash tools/release/test.sh
     bash tools/lib/test.sh stage2
     bash tools/release/release.sh check-version "$(cat VERSION)"
-    bash -n bootstrap/bootstrap.sh
+    bash -n bootstrap/bootstrap.sh bootstrap/test.sh
+    bash bootstrap/test.sh
 
 _ci-gomlc-test:
     bash tools/lib/install.sh _artifact/gomlc-test/test
