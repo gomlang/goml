@@ -46,6 +46,8 @@ stage0_extracted="$(mktemp -d)"
 trap 'rm -rf "$stage0_extracted"' EXIT
 tar -xzf "$stage0_archive" --strip-components=1 -C "$stage0_extracted"
 
+rm -rf -- "$stage0_output/lib/builtin" "$stage0_output/lib/prelude" \
+    "$stage0_output/lib/std" "$stage0_output/lib/cabi" "$stage0_output/lib/compiler"
 cp -R "$stage0_extracted/bin/." "$stage0_output/bin/"
 cp -R "$stage0_extracted/lib/." "$stage0_output/lib/"
 
