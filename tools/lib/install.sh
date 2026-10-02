@@ -20,6 +20,3 @@ rm -f \
     "$prefix/lib/builtin_derive.gom"
 rm -rf -- "$prefix/lib/builtin" "$prefix/lib/prelude" "$prefix/lib/std" "$prefix/lib/cabi"
 cp -R "$repo_root/lib/." "$prefix/lib/"
-while IFS= read -r -d '' source; do
-    mv -- "$source" "${source}l"
-done < <(find "$prefix/lib/builtin" "$prefix/lib/prelude" "$prefix/lib/std" -type f -name '*.gom' -print0)

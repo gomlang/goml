@@ -131,11 +131,11 @@ gomlfmt [OPTIONS] [FILE...]
 --version
 ```
 
-With no file, or with a single `-`, the formatter reads stdin and writes stdout. `-w` cannot be used with stdin. A single file without a mode is formatted to stdout. Multiple files require `-w`, `-l`, or `--check`.
+File arguments must use the `.goml` suffix. With no file, or with a single `-`, the formatter reads stdin and writes stdout. `-w` cannot be used with stdin. A single file without a mode is formatted to stdout. Multiple files require `-w`, `-l`, or `--check`.
 
 `--check` exits 0 when every file is formatted, 1 when a change is needed, and 2 for argument, I/O, or parse errors.
 
-From anywhere inside a module, use the project driver to format every `.goml` file (and legacy `.gom` files during the transition):
+From anywhere inside a module, use the project driver to format every `.goml` file:
 
 ```text
 goml fmt

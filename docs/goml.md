@@ -16,7 +16,7 @@ Build and installation instructions are in the [repository README](../README.md)
 
 ## Essential rules
 
-1. The canonical source suffix is `.goml`; `.gom` remains accepted during the transition (including mixed packages and legacy `*_test.gom` files). New projects and packaged toolchain sources use `.goml`; the project root directory uses `goml.toml` to declare the canonical module path.
+1. Source files use `.goml`, and internal test files use `*_test.goml`. Legacy `.gom` files must be renamed before compiling or formatting; the project root directory uses `goml.toml` to declare the canonical module path.
 2. Each source file in the project first writes `package name;`, then writes the file's own `use`, and finally writes the top-level definition.
 3. Parameters of top-level functions must have types; the return type is fixed to `()` when omitted and is not inferred from the function body.
 4. Generics use square brackets: `Vec[i32]`, `fn id[T](x: T) -> T`, not `<...>`.
