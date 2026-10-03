@@ -1,13 +1,13 @@
 set -euo pipefail
 
-test "$#" = 1
+test "$#" = 1 || test "$#" = 3
 repository_root="$(cd "$(dirname "$0")/../.." && pwd)"
-output_prefix="$(realpath -m "$1")"
-mkdir -p "$output_prefix/bin"
-host_goos="$(go env GOHOSTOS)"
-host_goarch="$(go env GOHOSTARCH)"
+mkdir -p "$1/bin"
+output_prefix="$(cd "$1" && pwd -P)"
+target_goos="${2:-$(go env GOHOSTOS)}"
+target_goarch="${3:-$(go env GOHOSTARCH)}"
 (
     cd "$repository_root/tools/goml-go-meta"
-    GOWORK=off GO111MODULE=on GOFLAGS= CGO_ENABLED=0 GOOS="$host_goos" GOARCH="$host_goarch" go build -mod=readonly -trimpath -o "$output_prefix/bin/goml-go-meta" .
-    GOWORK=off GO111MODULE=on GOFLAGS= CGO_ENABLED=0 GOOS="$host_goos" GOARCH="$host_goarch" go build -mod=readonly -trimpath -o "$output_prefix/bin/goml-c-bind" ./cmd/goml-c-bind
+    GOWORK=off GO111MODULE=on GOFLAGS= CGO_ENABLED=0 GOOS="$target_goos" GOARCH="$target_goarch" go build -mod=readonly -trimpath -o "$output_prefix/bin/goml-go-meta" .
+    GOWORK=off GO111MODULE=on GOFLAGS= CGO_ENABLED=0 GOOS="$target_goos" GOARCH="$target_goarch" go build -mod=readonly -trimpath -o "$output_prefix/bin/goml-c-bind" ./cmd/goml-c-bind
 )

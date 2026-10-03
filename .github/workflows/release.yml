@@ -7,15 +7,18 @@ on:
 
 permissions:
   actions: read
-  contents: write
+  contents: read
 
 concurrency:
   group: release
   cancel-in-progress: false
 
 jobs:
-  release:
+  prepare:
     runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.validate.outputs.version }}
+      previous_tag: ${{ steps.validate.outputs.previous_tag }}
     env:
       RELEASE_TAG: ${{ github.ref_name }}
     steps:
@@ -30,6 +33,7 @@ jobs:
         with:
           just-version: '1.40.0'
       - name: Validate release version
+        id: validate
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -37,23 +41,25 @@ jobs:
           test "$GITHUB_REF_TYPE" = "tag"
           release_version="${RELEASE_TAG#v}"
           test "$RELEASE_TAG" = "v$release_version"
+          test "${release_version%.*}" = "0.1"
           bash tools/release/release.sh check-version "$release_version"
+          release_sha="$(git rev-parse HEAD)"
           ci_run="$(gh run list \
             --repo "$GITHUB_REPOSITORY" \
             --workflow CI \
             --branch main \
-            --commit "$GITHUB_SHA" \
+            --commit "$release_sha" \
             --event push \
             --limit 1 \
             --json status,conclusion,url \
             --jq 'if length == 0 then "" else .[0] | "\(.status)|\(.conclusion)|\(.url)" end')"
           if test -z "$ci_run"; then
-            echo "main CI run not found for $GITHUB_SHA" >&2
+            echo "main CI run not found for $release_sha" >&2
             exit 1
           fi
           IFS='|' read -r ci_status ci_conclusion ci_url <<< "$ci_run"
           if test "$ci_status" != "completed" || test "$ci_conclusion" != "success"; then
-            echo "main CI has not succeeded for $GITHUB_SHA: $ci_status $ci_conclusion $ci_url" >&2
+            echo "main CI has not succeeded for $release_sha: $ci_status $ci_conclusion $ci_url" >&2
             exit 1
           fi
           release_tags="$(gh release list \
@@ -72,21 +78,81 @@ jobs:
             --json isDraft \
             --jq .isDraft 2>/dev/null || true)"
           test "$release_state" != "false"
-          echo "RELEASE_VERSION=$release_version" >> "$GITHUB_ENV"
-          echo "PREVIOUS_TAG=$previous_tag" >> "$GITHUB_ENV"
+          echo "version=$release_version" >> "$GITHUB_OUTPUT"
+          echo "previous_tag=$previous_tag" >> "$GITHUB_OUTPUT"
       - name: Build stage2
         run: just make-tools
-      - name: Build release archive
-        run: bash tools/release/package.sh "$RELEASE_VERSION"
-      - name: Smoke test release archive
-        run: bash tools/release/smoke.sh "$RELEASE_VERSION"
+      - name: Export release sources
+        run: bash tools/release/sources.sh _artifact/release-sources.tar.gz
       - uses: actions/upload-artifact@v7
         with:
-          name: goml-${{ github.ref_name }}
+          name: release-sources
+          path: _artifact/release-sources.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  archives:
+    name: ${{ matrix.goos }}/${{ matrix.goarch }} archive
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+          - runner: macos-15
+            goos: darwin
+            goarch: arm64
+    env:
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+      RELEASE_GOOS: ${{ matrix.goos }}
+      RELEASE_GOARCH: ${{ matrix.goarch }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-sources
+      - name: Unpack release sources
+        run: tar -xzf release-sources.tar.gz
+      - name: Build release archive
+        run: bash tools/release/package.sh "$RELEASE_VERSION" "$RELEASE_GOOS" "$RELEASE_GOARCH"
+      - name: Smoke test release archive
+        run: bash tools/release/smoke.sh "$RELEASE_VERSION" "$RELEASE_GOOS" "$RELEASE_GOARCH"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: goml-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
             dist/*.tar.gz
-            dist/SHA256SUMS
+            dist/*.tar.gz.sha256
           if-no-files-found: error
+
+  publish:
+    needs:
+      - prepare
+      - archives
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+      PREVIOUS_TAG: ${{ needs.prepare.outputs.previous_tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: goml-*
+          path: dist
+          merge-multiple: true
+      - name: Verify archives and collect checksums
+        run: bash tools/release/checksums.sh "$RELEASE_VERSION"
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -96,6 +162,7 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --json isDraft \
             --jq .isDraft 2>/dev/null || true)"
+          test "$release_state" != "false"
           if test "$release_state" = ""; then
             gh release create "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
@@ -107,7 +174,8 @@ jobs:
           fi
           gh release upload "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            dist/*.tar.gz \
+            "dist/goml-$RELEASE_VERSION-linux-amd64.tar.gz" \
+            "dist/goml-$RELEASE_VERSION-darwin-arm64.tar.gz" \
             dist/SHA256SUMS \
             --clobber
           gh release edit "$RELEASE_TAG" \

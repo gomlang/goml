@@ -8,6 +8,8 @@ goml aims to empower gophers with a more powerful type system but without leavin
 
 GoML is statically typed and garbage-collected, with Rust-like syntax, monomorphized generics, and no ownership or lifetime system. The compiler, project driver, tests, formatter, and language server are implemented in GoML and compile to Go. Generated Go code and Go interoperability target Go 1.26.
 
+Toolchain releases provide Linux amd64 and macOS arm64 archives. See [installation and platform support](docs/releasing.md#installation) for checksum verification, required installation finalization, and platform-specific library limitations. macOS archives are tested on macOS 15 with Apple Silicon; source bootstrap still starts on Linux amd64.
+
 ## Documentation
 
 - [Language guide](docs/goml.md): syntax, semantics, packages, tests, and standard-library APIs
