@@ -66,7 +66,7 @@ _ci-scripts:
     python3 tools/generate_unicode_casefold.py --check
     python3 tools/syscall/generate.py --check
     python3 tools/syscall/layouts.py --check --verify-headers
-    bash -n tools/release/release.sh tools/release/test.sh tools/release/package.sh tools/release/smoke.sh tools/release/lsp_smoke.sh
+    bash -n tools/release/release.sh tools/release/test.sh tools/release/common.sh tools/release/sources.sh tools/release/checksums.sh tools/release/package.sh tools/release/smoke.sh tools/release/lsp_smoke.sh
     bash -n tools/lib/install.sh tools/lib/test.sh tools/lib/finalize-toolchain.sh tools/goml-go-meta/build.sh
     cd tools/goml-go-meta && go test -race ./...
     cd lib/cabi && CGO_ENABLED=0 go test -gcflags=all=-d=checkptr=2 ./...

@@ -2,15 +2,33 @@
 
 set -euo pipefail
 
-test "$#" = 1
+test "$#" = 1 || test "$#" = 3
 
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 release_version="$1"
-package="goml-$release_version-linux-amd64"
+source "$repository_root/tools/release/common.sh"
+target_goos="${2:-$(go env GOHOSTOS)}"
+target_goarch="${3:-$(go env GOHOSTARCH)}"
+platform="$(release_platform "$target_goos" "$target_goarch")"
+test "$(go env GOHOSTOS)" = "$target_goos"
+test "$(go env GOHOSTARCH)" = "$target_goarch"
+export GOOS="$target_goos" GOARCH="$target_goarch"
+package="goml-$release_version-$platform"
 smoke_root="$(mktemp -d)"
+smoke_root="$(cd "$smoke_root" && pwd -P)"
 trap 'rm -rf "$smoke_root"' EXIT
+export GOML_HOME="$smoke_root/home"
+
+(
+    cd "$repository_root/dist"
+    release_sha256 -c "$package.tar.gz.sha256"
+)
 
 tar -xzf "$repository_root/dist/$package.tar.gz" -C "$smoke_root"
+test "$("$smoke_root/$package/bin/goml" version)" = "goml $release_version"
+test "$("$smoke_root/$package/bin/gomlc" version --format json | jq -r .version)" = "$release_version"
+test "$("$smoke_root/$package/bin/gomlfmt" --version)" = "gomlfmt $release_version"
+test "$("$smoke_root/$package/bin/gomldoc" --version)" = "gomldoc $release_version"
 test -f "$smoke_root/$package/lib/builtin/contract.goml"
 test -f "$smoke_root/$package/lib/builtin/goml.toml"
 test -f "$smoke_root/$package/lib/builtin/runtime.goml"
@@ -51,9 +69,11 @@ jq -n \
     --arg toolchain "$(GOTOOLCHAIN=local go env GOVERSION)" \
     --arg module_dir "$smoke_root/ffi" \
     --arg caller_dir "$smoke_root/ffi/gen" \
+    --arg goos "$target_goos" \
+    --arg goarch "$target_goarch" \
     '{protocol_version: 1,
       build_context: {go_executable: $go_executable, toolchain: $toolchain,
-        module_dir: $module_dir, goos: "linux", goarch: "amd64", cgo_enabled: "0",
+        module_dir: $module_dir, goos: $goos, goarch: $goarch, cgo_enabled: "0",
         goflags: "", build_tags: [], go111module: "on", gowork: "off",
         dependencies: "readonly", network: "off"},
       caller_context: {load_mode: "package", import_path: "example.com/ffi-smoke/gen", directory: $caller_dir, package: "gen"},
@@ -66,17 +86,18 @@ test ! -e "$smoke_root/ffi/go.sum"
 test ! -e "$smoke_root/ffi/gen/goml_ffi_witness_0.go"
 cp -R "$repository_root/tools/release/testdata/go-export" "$smoke_root/go-export"
 cd "$smoke_root/go-export"
-export GOML_HOME="$smoke_root/export-home"
 export GOWORK=off GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off
 "$smoke_root/$package/bin/goml" check --compiler "$smoke_root/$package/bin/gomlc" --ffi-check required
 "$smoke_root/$package/bin/goml" export-go . --compiler "$smoke_root/$package/bin/gomlc" --import-path example.com/host/gen/calclib --out ./gen/calclib
-sha256sum gen/calclib/goml_generated.go gen/calclib/goml_exports.json > export-digests
+release_sha256 gen/calclib/goml_generated.go gen/calclib/goml_exports.json > export-digests
 "$smoke_root/$package/bin/goml" export-go . --compiler "$smoke_root/$package/bin/gomlc" --import-path example.com/host/gen/calclib --out ./gen/calclib
-sha256sum -c export-digests
+release_sha256 -c export-digests
 rm calc.goml goml.toml
-export PATH="$(dirname "$(command -v go)"):/usr/bin:/bin"
-go test ./...
-test "$(go run .)" = "42 4 7 8"
+(
+    export PATH="$(dirname "$(command -v go)"):/usr/bin:/bin"
+    go test ./...
+    test "$(go run .)" = "42 4 7 8"
+)
 test ! -e go.sum
 mkdir -p "$smoke_root/file-read"
 for source in goml.toml go.mod main.goml data.txt; do
@@ -98,9 +119,9 @@ OUTPUT
 for attempt in 1 2; do
     test "$("$smoke_root/$package/bin/goml" run --ffi-check required)" = "$expected_file_read"
     if test "$attempt" = 1; then
-        sha256sum _artifact/build/pkg/ffi_file_read/goml_generated.go > file-read-digests
+        release_sha256 _artifact/build/pkg/ffi_file_read/goml_generated.go > file-read-digests
     else
-        sha256sum -c file-read-digests
+        release_sha256 -c file-read-digests
     fi
 done
 test ! -e go.sum
@@ -123,9 +144,9 @@ OUTPUT
 for attempt in 1 2; do
     test "$("$smoke_root/$package/bin/goml" run --ffi-check required)" = "$expected_callbacks"
     if test "$attempt" = 1; then
-        sha256sum _artifact/build/pkg/ffi_callbacks/goml_generated.go > callback-digests
+        release_sha256 _artifact/build/pkg/ffi_callbacks/goml_generated.go > callback-digests
     else
-        sha256sum -c callback-digests
+        release_sha256 -c callback-digests
     fi
 done
 test ! -e go.sum
@@ -138,9 +159,9 @@ cd "$smoke_root/bind-go"
 test ! -e bindings
 test ! -e native
 "$smoke_root/$package/bin/goml" bind-go bindings.json
-sha256sum bindings/generated.goml native/generated.go bindings.json.goml-bind.json > binding-digests
+release_sha256 bindings/generated.goml native/generated.go bindings.json.goml-bind.json > binding-digests
 "$smoke_root/$package/bin/goml" bind-go bindings.json
-sha256sum -c binding-digests
+release_sha256 -c binding-digests
 "$smoke_root/$package/bin/goml" fmt --check
 "$smoke_root/$package/bin/goml" check
 expected_bindings="$(cat <<'OUTPUT'
@@ -158,3 +179,24 @@ test ! -e go.sum
 test ! -e .goml-bind-go-lock
 "$smoke_root/$package/bin/goml" bind-c --help > "$smoke_root/bind-c-help.txt"
 "$smoke_root/$package/bin/goml-c-bind" --help > "$smoke_root/bind-c-helper-help.txt"
+mkdir -p "$smoke_root/bind-c"
+for source in goml.toml go.mod main.goml bindings_test.goml bindings.json sample.h; do
+    cp "$repository_root/examples/ffi-bind-c/$source" "$smoke_root/bind-c/$source"
+done
+cd "$smoke_root/bind-c"
+export CGO_ENABLED=1
+"$smoke_root/$package/bin/goml" bind-c bindings.json
+"$smoke_root/$package/bin/goml" check --ffi-check required
+"$smoke_root/$package/bin/goml" test
+test "$("$smoke_root/$package/bin/goml" run)" = "$(printf '42\nGoML calls C\n255')"
+
+if test "$platform" = darwin-arm64; then
+    "$smoke_root/$package/bin/gomlc" run-single "$repository_root/tools/release/testdata/unsupported-linux.goml"
+    jq '.backend = "dynamic" | .libraries = ["libc.so.6"] |
+        .package = "dynamic_bindings" | .output = "dynamic_bindings/generated.goml" |
+        .go_package = "dynamic_native" | .go_output = "dynamic_native/generated.go"' bindings.json > dynamic.json
+    if CGO_ENABLED=0 "$smoke_root/$package/bin/goml" bind-c dynamic.json > dynamic.log 2>&1; then
+        exit 1
+    fi
+    grep -q 'dynamic C bindings require a Linux amd64 host' dynamic.log
+fi
