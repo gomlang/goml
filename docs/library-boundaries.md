@@ -29,7 +29,7 @@ filepath operations.
 Public APIs and limitations are documented in the [language guide](goml.md) and
 individual ecosystem READMEs. The ownership table is not a claim of Go API
 compatibility. Go source comment tooling belongs to `go_doc`, independently of
-GoML documentation and the `gomlgo` frontend.
+GoML documentation and the independent [gomlgo frontend](https://github.com/gomlang/gomlgo).
 
 ## Dependency direction
 
