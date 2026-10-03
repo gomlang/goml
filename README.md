@@ -25,7 +25,7 @@ Toolchain releases provide Linux amd64 and macOS arm64 archives. See [installati
 
 ## Development
 
-Run recipes from the repository root. The toolchain build requires Linux amd64, Go 1.26+, `just`, Bash, curl, tar, and sha256sum. Tests require a C compiler for Go's race detector; full CI also uses Node 20+, npm, jq, Python 3, and Linux development headers for checking the generated syscall ABI and record layouts. See [.justfile](.justfile) for all commands. The independent [gomlgo frontend and interpreter](https://github.com/gomlang/gomlgo) targets Go 1.26 and requires Go 1.26.x for execution and differential tests.
+Run recipes from the repository root. The toolchain build requires Linux amd64, Go 1.26+, `just`, Bash, curl, tar, and sha256sum. Tests require a C compiler for Go's race detector; full CI also uses Node 20+, npm, jq, Python 3, Clang 15+ for C binding smoke tests, Perl's `shasum` for checksum portability tests, and Linux development headers for checking the generated syscall ABI and record layouts. See [.justfile](.justfile) for all commands. The independent [gomlgo frontend and interpreter](https://github.com/gomlang/gomlgo) targets Go 1.26 and requires Go 1.26.x for execution and differential tests.
 
 ```sh
 just make
