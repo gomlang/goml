@@ -117,10 +117,10 @@ TEXT ·_goml_simd_fma_fma_sse(SB), 4, $0-64
     VZEROUPPER
     RET
 
-TEXT ·_goml_simd_avx2_fma__goml_m_in_hc4bab3c933044b7ff22af4f65b1c3002_64x4_i_mul__add(SB), 4, $0-128
-    VMOVUPS self__0+0(FP), Y0
-    VMOVUPS other__0+32(FP), Y1
-    VMOVUPS addend__0+64(FP), Y2
+TEXT ·_goml_simd_avx2_fma_fma_avx(SB), 4, $0-128
+    VMOVUPS a__0+0(FP), Y0
+    VMOVUPS b__0+32(FP), Y1
+    VMOVUPS c__0+64(FP), Y2
     VMOVUPS Y0, Y3
     VFMADD213PD Y2, Y1, Y3
     VMOVUPS Y3, ret+96(FP)
@@ -131,13 +131,6 @@ TEXT ·_goml_m_inherent_i_std_p_simd_p_f64x2_i_std_p_simd_p_f64x2_i_splat(SB), 4
     MOVSD value__0+0(FP), X0
     PSHUFD $68, X0, X0
     MOVUPS X0, ret+8(FP)
-    RET
-
-TEXT ·_goml_simd_avx2__goml_m_inhere_h3bdddb550d8be6e65f616b40ae26c68b_p_f64x4_i_splat(SB), 4, $0-40
-    MOVSD value__0+0(FP), X0
-    VPBROADCASTQ X0, Y0
-    VMOVUPS Y0, ret+8(FP)
-    VZEROUPPER
     RET
 
 TEXT ·_goml_simd_avx2__goml_m_trait__he138df98c53aa348801ec381be0cda07__i_select__mask(SB), 4, $0-104

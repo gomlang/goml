@@ -242,6 +242,77 @@ DATA _goml_simd_avx2_floats_permute_constant_0<>+24(SB)/4, $4
 DATA _goml_simd_avx2_floats_permute_constant_0<>+28(SB)/4, $0
 GLOBL _goml_simd_avx2_floats_permute_constant_0<>(SB), 24, $32
 
+TEXT ·_goml_simd_avx2_words_widen(SB), 4, $0-64
+    VMOVUPS a__0+0(FP), X0
+    VMOVUPS b__0+16(FP), Y1
+    VPMOVSXWD X0, Y2
+    VPADDD Y1, Y2, Y2
+    PXOR X0, X0
+    VMOVUPS X2, X14
+    MOVQ X14, AX
+    MOVL AX, AX
+    ANDL $65535, AX
+    MOVQ AX, X14
+    POR X14, X0
+    VMOVUPS X2, X14
+    PSRLDQ $4, X14
+    MOVQ X14, AX
+    MOVL AX, AX
+    ANDL $65535, AX
+    MOVQ AX, X14
+    PSLLDQ $2, X14
+    POR X14, X0
+    VMOVUPS X2, X14
+    PSRLDQ $8, X14
+    MOVQ X14, AX
+    MOVL AX, AX
+    ANDL $65535, AX
+    MOVQ AX, X14
+    PSLLDQ $4, X14
+    POR X14, X0
+    VMOVUPS X2, X14
+    PSRLDQ $12, X14
+    MOVQ X14, AX
+    MOVL AX, AX
+    ANDL $65535, AX
+    MOVQ AX, X14
+    PSLLDQ $6, X14
+    POR X14, X0
+    VEXTRACTF128 $1, Y2, X14
+    MOVQ X14, AX
+    MOVL AX, AX
+    ANDL $65535, AX
+    MOVQ AX, X14
+    PSLLDQ $8, X14
+    POR X14, X0
+    VEXTRACTF128 $1, Y2, X14
+    PSRLDQ $4, X14
+    MOVQ X14, AX
+    MOVL AX, AX
+    ANDL $65535, AX
+    MOVQ AX, X14
+    PSLLDQ $10, X14
+    POR X14, X0
+    VEXTRACTF128 $1, Y2, X14
+    PSRLDQ $8, X14
+    MOVQ X14, AX
+    MOVL AX, AX
+    ANDL $65535, AX
+    MOVQ AX, X14
+    PSLLDQ $12, X14
+    POR X14, X0
+    VEXTRACTF128 $1, Y2, X14
+    PSRLDQ $12, X14
+    MOVQ X14, AX
+    MOVL AX, AX
+    ANDL $65535, AX
+    MOVQ AX, X14
+    PSLLDQ $14, X14
+    POR X14, X0
+    VMOVUPS X0, ret+48(FP)
+    VZEROUPPER
+    RET
+
 TEXT ·numbers_convert(SB), 4, $0-32
     MOVUPS a__0+0(FP), X0
     CVTTPS2PL X0, X1
@@ -269,135 +340,25 @@ DATA numbers_convert_constant_1<>+8(SB)/4, $2147483647
 DATA numbers_convert_constant_1<>+12(SB)/4, $2147483647
 GLOBL numbers_convert_constant_1<>(SB), 24, $16
 
-TEXT ·_goml_simd_avx2__goml_m_inhere_h4f568bffef1abd73c3ab50c32ba9ae51_i16x8_i_to__i32(SB), 4, $0-48
-    VMOVUPS self__0+0(FP), X0
-    VPMOVSXWD X0, Y1
-    VMOVUPS Y1, ret+16(FP)
+TEXT ·_goml_simd_avx2_double_convert(SB), 4, $0-64
+    VMOVUPS a__0+0(FP), X0
+    VMOVUPS b__0+16(FP), Y1
+    VCVTPS2PD X0, Y2
+    VADDPD Y1, Y2, Y2
+    VCVTPD2PSY Y2, X0
+    VMOVUPS X0, ret+48(FP)
     VZEROUPPER
     RET
 
-TEXT ·_goml_simd_avx2__goml_m_inherent_i_std_p_simd_p_i32x8_i_std_p_simd_p_i32x8_i_add(SB), 4, $0-96
-    VMOVUPS self__0+0(FP), Y0
-    VMOVUPS other__0+32(FP), Y1
-    VPADDD Y1, Y0, Y0
-    VMOVUPS Y0, ret+64(FP)
-    VZEROUPPER
-    RET
-
-TEXT ·_goml_simd_avx2__goml_m_inhere_hea4a7d4a5b82e3193a5f8fcb19c2a782_i32x8_i_to__i16(SB), 4, $0-48
-    VMOVUPS self__0+0(FP), Y0
-    PXOR X1, X1
-    VMOVUPS X0, X14
-    MOVQ X14, AX
-    MOVL AX, AX
-    ANDL $65535, AX
-    MOVQ AX, X14
-    POR X14, X1
-    VMOVUPS X0, X14
-    PSRLDQ $4, X14
-    MOVQ X14, AX
-    MOVL AX, AX
-    ANDL $65535, AX
-    MOVQ AX, X14
-    PSLLDQ $2, X14
-    POR X14, X1
-    VMOVUPS X0, X14
-    PSRLDQ $8, X14
-    MOVQ X14, AX
-    MOVL AX, AX
-    ANDL $65535, AX
-    MOVQ AX, X14
-    PSLLDQ $4, X14
-    POR X14, X1
-    VMOVUPS X0, X14
-    PSRLDQ $12, X14
-    MOVQ X14, AX
-    MOVL AX, AX
-    ANDL $65535, AX
-    MOVQ AX, X14
-    PSLLDQ $6, X14
-    POR X14, X1
-    VEXTRACTF128 $1, Y0, X14
-    MOVQ X14, AX
-    MOVL AX, AX
-    ANDL $65535, AX
-    MOVQ AX, X14
-    PSLLDQ $8, X14
-    POR X14, X1
-    VEXTRACTF128 $1, Y0, X14
-    PSRLDQ $4, X14
-    MOVQ X14, AX
-    MOVL AX, AX
-    ANDL $65535, AX
-    MOVQ AX, X14
-    PSLLDQ $10, X14
-    POR X14, X1
-    VEXTRACTF128 $1, Y0, X14
-    PSRLDQ $8, X14
-    MOVQ X14, AX
-    MOVL AX, AX
-    ANDL $65535, AX
-    MOVQ AX, X14
-    PSLLDQ $12, X14
-    POR X14, X1
-    VEXTRACTF128 $1, Y0, X14
-    PSRLDQ $12, X14
-    MOVQ X14, AX
-    MOVL AX, AX
-    ANDL $65535, AX
-    MOVQ AX, X14
-    PSLLDQ $14, X14
-    POR X14, X1
-    VMOVUPS X1, ret+32(FP)
-    VZEROUPPER
-    RET
-
-TEXT ·_goml_simd_avx2__goml_m_inhere_h4c1feee106c01c1c4f6820cb164c4b5a_f32x4_i_to__f64(SB), 4, $0-48
-    VMOVUPS self__0+0(FP), X0
-    VCVTPS2PD X0, Y1
-    VMOVUPS Y1, ret+16(FP)
-    VZEROUPPER
-    RET
-
-TEXT ·_goml_simd_avx2__goml_m_inherent_i_std_p_simd_p_f64x4_i_std_p_simd_p_f64x4_i_add(SB), 4, $0-96
-    VMOVUPS self__0+0(FP), Y0
-    VMOVUPS other__0+32(FP), Y1
-    VADDPD Y1, Y0, Y0
-    VMOVUPS Y0, ret+64(FP)
-    VZEROUPPER
-    RET
-
-TEXT ·_goml_simd_avx2__goml_m_inhere_hc1a8801d14877eba1f367724106405e6_f64x4_i_to__f32(SB), 4, $0-48
-    VMOVUPS self__0+0(FP), Y0
-    VCVTPD2PSY Y0, X1
-    VMOVUPS X1, ret+32(FP)
-    VZEROUPPER
-    RET
-
-TEXT ·_goml_m_inherent_i_std_p_simd_p_f64x2_i_std_p_simd_p_f64x2_i_to__bits(SB), 4, $0-32
-    MOVUPS self__0+0(FP), X0
+TEXT ·double_bits(SB), 4, $0-32
+    MOVUPS a__0+0(FP), X0
     MOVUPS X0, X1
-    MOVUPS X1, ret+16(FP)
-    RET
-
-TEXT ·_goml_m_inherent_i_std_p_simd_p_u64x2_i_std_p_simd_p_u64x2_i_splat(SB), 4, $0-24
-    MOVQ value__0+0(FP), AX
+    MOVQ $9223372036854775808, AX
     MOVQ AX, X0
     PSHUFD $68, X0, X0
-    MOVUPS X0, ret+8(FP)
-    RET
-
-TEXT ·_goml_m_inherent_i_std_p_simd_p_u64x2_i_std_p_simd_p_u64x2_i_bitxor(SB), 4, $0-48
-    MOVUPS self__0+0(FP), X0
-    MOVUPS other__0+16(FP), X1
-    XORPS X1, X0
-    MOVUPS X0, ret+32(FP)
-    RET
-
-TEXT ·_goml_m_inherent_i_std_p_simd_p_f64x2_i_std_p_simd_p_f64x2_i_from__bits(SB), 4, $0-32
-    MOVUPS value__0+0(FP), X0
-    MOVUPS X0, X1
-    MOVUPS X1, ret+16(FP)
+    XORPS X0, X1
+    MOVUPS X1, X0
+    MOVUPS X0, ret+16(FP)
     RET
 
 TEXT ·_goml_m_inherent_i_std_p_simd_p_u8x16_i_std_p_simd_p_u8x16_i_splat(SB), 4, $0-24
@@ -407,29 +368,6 @@ TEXT ·_goml_m_inherent_i_std_p_simd_p_u8x16_i_std_p_simd_p_u8x16_i_splat(SB), 4
     PSHUFLW $0, X0, X0
     PSHUFD $0, X0, X0
     MOVUPS X0, ret+8(FP)
-    RET
-
-TEXT ·_goml_simd_avx2__goml_m_inhere_hbf308f0da68aabac491becc7e3ab5729_p_f32x8_i_splat(SB), 4, $0-40
-    MOVSS value__0+0(FP), X0
-    VPBROADCASTD X0, Y0
-    VMOVUPS Y0, ret+8(FP)
-    VZEROUPPER
-    RET
-
-TEXT ·_goml_m_inherent_i_std_p_simd_p_i16x8_i_std_p_simd_p_i16x8_i_splat(SB), 4, $0-24
-    MOVWLZX value__0+0(FP), AX
-    MOVQ AX, X0
-    PSHUFLW $0, X0, X0
-    PSHUFD $0, X0, X0
-    MOVUPS X0, ret+8(FP)
-    RET
-
-TEXT ·_goml_simd_avx2__goml_m_inhere_h7e54adbd4efb4e3a51b52447f975fdf6_p_i32x8_i_splat(SB), 4, $0-40
-    MOVL value__0+0(FP), AX
-    MOVQ AX, X0
-    VPBROADCASTD X0, Y0
-    VMOVUPS Y0, ret+8(FP)
-    VZEROUPPER
     RET
 
 TEXT ·_goml_simd_avx2_supported(SB), 4, $0-1

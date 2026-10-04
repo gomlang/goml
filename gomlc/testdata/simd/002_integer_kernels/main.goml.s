@@ -90,9 +90,9 @@ TEXT ·_goml_simd_avx2_words_avx(SB), 4, $0-96
     VZEROUPPER
     RET
 
-TEXT ·_goml_m_inherent_i_std_p_simd_p_i32x4_i_std_p_simd_p_i32x4_i_mul(SB), 4, $0-48
-    MOVUPS self__0+0(FP), X0
-    MOVUPS other__0+16(FP), X1
+TEXT ·dwords_sse(SB), 4, $0-48
+    MOVUPS a__0+0(FP), X0
+    MOVUPS b__0+16(FP), X1
     MOVUPS X0, X14
     PMULULQ X1, X14
     MOVUPS X0, X15
@@ -104,34 +104,23 @@ TEXT ·_goml_m_inherent_i_std_p_simd_p_i32x4_i_std_p_simd_p_i32x4_i_mul(SB), 4, 
     PSHUFD $136, X2, X2
     PUNPCKLLQ X2, X14
     MOVUPS X14, X2
-    MOVUPS X2, ret+32(FP)
-    RET
-
-TEXT ·_goml_m_inherent_i_std_p_simd_p_i32x4_i_std_p_simd_p_i32x4_i_min(SB), 4, $0-48
-    MOVUPS self__0+0(FP), X0
-    MOVUPS other__0+16(FP), X1
-    MOVUPS X1, X2
-    PCMPGTL X0, X2
-    MOVUPS X2, X14
-    MOVUPS X2, X15
-    ANDPS X0, X14
-    ANDNPS X1, X15
-    MOVUPS X14, X2
-    ORPS X15, X2
-    MOVUPS X2, ret+32(FP)
-    RET
-
-TEXT ·_goml_m_inherent_i_std_p_simd_p_i32x4_i_std_p_simd_p_i32x4_i_bitnot(SB), 4, $0-32
-    MOVUPS self__0+0(FP), X0
+    MOVUPS X0, X1
+    PCMPGTL X2, X1
+    MOVUPS X1, X14
+    MOVUPS X1, X15
+    ANDPS X2, X14
+    ANDNPS X0, X15
+    MOVUPS X14, X1
+    ORPS X15, X1
     PCMPEQL X15, X15
-    XORPS X15, X0
-    MOVUPS X0, ret+16(FP)
+    XORPS X15, X1
+    MOVUPS X1, ret+32(FP)
     RET
 
-TEXT ·_goml_m_inherent_i_std_p_simd_p_u64x2_i_std_p_simd_p_u64x2_i_simd__le(SB), 4, $0-33
-    MOVUPS self__0+0(FP), X0
-    MOVUPS other__0+16(FP), X1
-    MOVUPS _goml_m_inherent_i_std_p_simd_p_u64x2_i_std_p_simd_p_u64x2_i_simd__le_constant_0<>(SB), X14
+TEXT ·qwords_sse(SB), 4, $0-48
+    MOVUPS a__0+0(FP), X0
+    MOVUPS b__0+16(FP), X1
+    MOVUPS qwords_sse_constant_0<>(SB), X14
     MOVUPS X1, X15
     XORPS X14, X15
     MOVUPS X0, X2
@@ -146,16 +135,6 @@ TEXT ·_goml_m_inherent_i_std_p_simd_p_u64x2_i_std_p_simd_p_u64x2_i_simd__le(SB)
     POR X14, X2
     PCMPEQL X15, X15
     XORPS X15, X2
-    MOVMSKPD X2, AX
-    MOVB AX, ret+32(FP)
-    RET
-DATA _goml_m_inherent_i_std_p_simd_p_u64x2_i_std_p_simd_p_u64x2_i_simd__le_constant_0<>+0(SB)/8, $9223372039002259456
-DATA _goml_m_inherent_i_std_p_simd_p_u64x2_i_std_p_simd_p_u64x2_i_simd__le_constant_0<>+8(SB)/8, $9223372039002259456
-GLOBL _goml_m_inherent_i_std_p_simd_p_u64x2_i_std_p_simd_p_u64x2_i_simd__le_constant_0<>(SB), 24, $16
-
-TEXT ·_goml_m_inherent_i_std_p_simd_p_u64x2_i_std_p_simd_p_u64x2_i_mul(SB), 4, $0-48
-    MOVUPS self__0+0(FP), X0
-    MOVUPS other__0+16(FP), X1
     MOVUPS X0, X14
     PSRLQ $32, X14
     PMULULQ X1, X14
@@ -164,66 +143,46 @@ TEXT ·_goml_m_inherent_i_std_p_simd_p_u64x2_i_std_p_simd_p_u64x2_i_mul(SB), 4, 
     PMULULQ X0, X15
     PADDQ X15, X14
     PSLLQ $32, X14
-    MOVUPS X0, X2
-    PMULULQ X1, X2
-    PADDQ X14, X2
-    MOVUPS X2, ret+32(FP)
-    RET
-
-TEXT ·_goml_m_inherent_i_std_p_simd_p_u64x2_i_std_p_simd_p_u64x2_i_max(SB), 4, $0-48
-    MOVUPS self__0+0(FP), X0
-    MOVUPS other__0+16(FP), X1
-    MOVUPS _goml_m_inherent_i_std_p_simd_p_u64x2_i_std_p_simd_p_u64x2_i_max_constant_0<>(SB), X14
+    MOVUPS X0, X3
+    PMULULQ X1, X3
+    PADDQ X14, X3
+    MOVUPS qwords_sse_constant_1<>(SB), X14
     MOVUPS X0, X15
     XORPS X14, X15
-    MOVUPS X1, X2
-    XORPS X14, X2
-    PCMPGTL X15, X2
-    PSHUFD $160, X2, X14
-    PSHUFD $245, X2, X2
+    MOVUPS X1, X4
+    XORPS X14, X4
+    PCMPGTL X15, X4
+    PSHUFD $160, X4, X14
+    PSHUFD $245, X4, X4
     MOVUPS X0, X15
     PCMPEQL X1, X15
     PSHUFD $245, X15, X15
     PAND X15, X14
-    POR X14, X2
-    MOVUPS X2, X14
-    MOVUPS X2, X15
+    POR X14, X4
+    MOVUPS X4, X14
+    MOVUPS X4, X15
     ANDPS X1, X14
     ANDNPS X0, X15
-    MOVUPS X14, X2
-    ORPS X15, X2
-    MOVUPS X2, ret+32(FP)
+    MOVUPS X14, X4
+    ORPS X15, X4
+    MOVUPS X2, X14
+    MOVUPS X2, X15
+    ANDPS X3, X14
+    ANDNPS X4, X15
+    MOVUPS X14, X0
+    ORPS X15, X0
+    MOVUPS X0, ret+32(FP)
     RET
-DATA _goml_m_inherent_i_std_p_simd_p_u64x2_i_std_p_simd_p_u64x2_i_max_constant_0<>+0(SB)/8, $9223372039002259456
-DATA _goml_m_inherent_i_std_p_simd_p_u64x2_i_std_p_simd_p_u64x2_i_max_constant_0<>+8(SB)/8, $9223372039002259456
-GLOBL _goml_m_inherent_i_std_p_simd_p_u64x2_i_std_p_simd_p_u64x2_i_max_constant_0<>(SB), 24, $16
+DATA qwords_sse_constant_0<>+0(SB)/8, $9223372039002259456
+DATA qwords_sse_constant_0<>+8(SB)/8, $9223372039002259456
+GLOBL qwords_sse_constant_0<>(SB), 24, $16
+DATA qwords_sse_constant_1<>+0(SB)/8, $9223372039002259456
+DATA qwords_sse_constant_1<>+8(SB)/8, $9223372039002259456
+GLOBL qwords_sse_constant_1<>(SB), 24, $16
 
-TEXT ·_goml_m_inherent_i_std_p_simd__h5b1c4d30d5d63db324f03c858eef8d8f__p_simd_p_u64x2(SB), 4, $0-56
-    MOVBLZX self__0+0(FP), AX
-    MOVQ AX, X0
-    PSHUFD $0, X0, X0
-    MOVUPS _goml_m_inherent_i_std_p_simd__h5b1c4d30d5d63db324f03c858eef8d8f__p_simd_p_u64x2_constant_0<>(SB), X15
-    PAND X15, X0
-    PCMPEQL X15, X0
-    MOVUPS if_true__0+8(FP), X1
-    MOVUPS if_false__0+24(FP), X2
-    MOVUPS X0, X14
-    MOVUPS X0, X15
-    ANDPS X1, X14
-    ANDNPS X2, X15
-    MOVUPS X14, X3
-    ORPS X15, X3
-    MOVUPS X3, ret+40(FP)
-    RET
-DATA _goml_m_inherent_i_std_p_simd__h5b1c4d30d5d63db324f03c858eef8d8f__p_simd_p_u64x2_constant_0<>+0(SB)/4, $1
-DATA _goml_m_inherent_i_std_p_simd__h5b1c4d30d5d63db324f03c858eef8d8f__p_simd_p_u64x2_constant_0<>+4(SB)/4, $1
-DATA _goml_m_inherent_i_std_p_simd__h5b1c4d30d5d63db324f03c858eef8d8f__p_simd_p_u64x2_constant_0<>+8(SB)/4, $2
-DATA _goml_m_inherent_i_std_p_simd__h5b1c4d30d5d63db324f03c858eef8d8f__p_simd_p_u64x2_constant_0<>+12(SB)/4, $2
-GLOBL _goml_m_inherent_i_std_p_simd__h5b1c4d30d5d63db324f03c858eef8d8f__p_simd_p_u64x2_constant_0<>(SB), 24, $16
-
-TEXT ·_goml_simd_avx2__goml_m_inherent_i_std_p_simd_p_i64x4_i_std_p_simd_p_i64x4_i_mul(SB), 4, $0-96
-    VMOVUPS self__0+0(FP), Y0
-    VMOVUPS other__0+32(FP), Y1
+TEXT ·_goml_simd_avx2_qwords_avx(SB), 4, $0-72
+    VMOVUPS a__0+0(FP), Y0
+    VMOVUPS b__0+32(FP), Y1
     VPSRLQ $32, Y0, Y14
     VPMULUDQ Y1, Y14, Y14
     VPSRLQ $32, Y1, Y15
@@ -232,12 +191,11 @@ TEXT ·_goml_simd_avx2__goml_m_inherent_i_std_p_simd_p_i64x4_i_std_p_simd_p_i64x
     VPSLLQ $32, Y14, Y14
     VPMULUDQ Y1, Y0, Y2
     VPADDQ Y14, Y2, Y2
-    VMOVUPS Y2, ret+64(FP)
-    VZEROUPPER
-    RET
-
-TEXT ·_goml_simd_avx2__goml_m_inhere_ha0b334929cdf9bd4a4bd368fafaf5cc7_4_i_reduce__sum(SB), 4, $0-40
-    VMOVUPS self__0+0(FP), Y0
+    VPSHUFD $245, Y2, Y15
+    VPSRAD $31, Y15, Y15
+    VPSLLQ $27, Y15, Y15
+    VPSRLQ $37, Y2, Y0
+    VORPS Y15, Y0, Y0
     VMOVUPS X0, X14
     MOVQ X14, AX
     MOVQ AX, R8
@@ -254,7 +212,7 @@ TEXT ·_goml_simd_avx2__goml_m_inhere_ha0b334929cdf9bd4a4bd368fafaf5cc7_4_i_redu
     ADDQ AX, R8
     MOVQ R8, X1
     MOVQ X1, AX
-    MOVQ AX, ret+32(FP)
+    MOVQ AX, ret+64(FP)
     VZEROUPPER
     RET
 
@@ -265,14 +223,6 @@ TEXT ·_goml_m_inherent_i_std_p_simd_p_u8x16_i_std_p_simd_p_u8x16_i_splat(SB), 4
     PSHUFLW $0, X0, X0
     PSHUFD $0, X0, X0
     MOVUPS X0, ret+8(FP)
-    RET
-
-TEXT ·_goml_simd_avx2__goml_m_inhere_h798988c669064201ad8c97c85c826892__i16x16_i_splat(SB), 4, $0-40
-    MOVWLZX value__0+0(FP), AX
-    MOVQ AX, X0
-    VPBROADCASTW X0, Y0
-    VMOVUPS Y0, ret+8(FP)
-    VZEROUPPER
     RET
 
 TEXT ·_goml_m_trait__impl_i_std_p_si_ha54a999764fc0f89c31804f55a4f1184__i_select__mask(SB), 4, $0-56
@@ -404,6 +354,29 @@ TEXT ·_goml_m_trait__impl_i_std_p_si_ha54a999764fc0f89c31804f55a4f1184__i_selec
     ORPS X15, X3
     MOVUPS X3, ret+40(FP)
     RET
+
+TEXT ·_goml_m_trait__impl_i_std_p_si_h5a022265ecd29f5ce64d3fba5cf8ede8__i_select__mask(SB), 4, $0-56
+    MOVUPS self__0+0(FP), X0
+    MOVBLZX mask__0+16(FP), AX
+    MOVQ AX, X1
+    PSHUFD $0, X1, X1
+    MOVUPS _goml_m_trait__impl_i_std_p_si_h5a022265ecd29f5ce64d3fba5cf8ede8__i_select__mask_constant_0<>(SB), X15
+    PAND X15, X1
+    PCMPEQL X15, X1
+    MOVUPS other__0+24(FP), X2
+    MOVUPS X1, X14
+    MOVUPS X1, X15
+    ANDPS X0, X14
+    ANDNPS X2, X15
+    MOVUPS X14, X3
+    ORPS X15, X3
+    MOVUPS X3, ret+40(FP)
+    RET
+DATA _goml_m_trait__impl_i_std_p_si_h5a022265ecd29f5ce64d3fba5cf8ede8__i_select__mask_constant_0<>+0(SB)/4, $1
+DATA _goml_m_trait__impl_i_std_p_si_h5a022265ecd29f5ce64d3fba5cf8ede8__i_select__mask_constant_0<>+4(SB)/4, $1
+DATA _goml_m_trait__impl_i_std_p_si_h5a022265ecd29f5ce64d3fba5cf8ede8__i_select__mask_constant_0<>+8(SB)/4, $2
+DATA _goml_m_trait__impl_i_std_p_si_h5a022265ecd29f5ce64d3fba5cf8ede8__i_select__mask_constant_0<>+12(SB)/4, $2
+GLOBL _goml_m_trait__impl_i_std_p_si_h5a022265ecd29f5ce64d3fba5cf8ede8__i_select__mask_constant_0<>(SB), 24, $16
 
 TEXT ·_goml_simd_avx2_supported(SB), 4, $0-1
     MOVB $0, ret+0(FP)
