@@ -1,0 +1,181 @@
+package ctfe;
+
+use module::ctir;
+
+fn verify_buffer(
+    ctx: VerifyContext,
+    operation: string,
+    args: Vec[ctir::CtExpr],
+    result: ctir::CtType,
+) -> Result[(), string] {
+    let creates = operation == "new" || operation == "with_capacity" || operation == "from_array";
+    let owner = if creates {
+        result
+    } else if !args.is_empty() {
+        args[0].ty
+    } else {
+        return Result::Err("CTIR buffer receiver is missing")
+    };
+    let ctir::CtType::Buffer { kind, elem } = owner else {
+        return Result::Err("CTIR buffer operation requires a buffer type")
+    };
+    let integer = intrinsic_int_type(ctx.module.target);
+    let expected = Vec::new();
+    let mut return_type = ctir::CtType::Unit;
+    if creates {
+        return_type = owner;
+        if operation == "new" && kind == "ref" {
+            expected.push(elem)
+        } else if operation == "with_capacity" && kind == "vec" {
+            expected.push(integer)
+        } else if operation == "from_array" && kind == "vec" {
+            if args.len() != 1 {
+                return Result::Err("CTIR vector constructor expects one array")
+            }
+            let ctir::CtType::Array { len, elem: _ } = args[0].ty else {
+                return Result::Err("CTIR vector constructor requires an array")
+            };
+            expected.push(ctir::CtType::Array { len, elem });
+        } else if operation != "new" {
+            return Result::Err("unsupported CTIR buffer constructor")
+        }
+    } else {
+        expected.push(owner);
+        if operation == "get" || operation == "set" {
+            if kind == "vec" {
+                expected.push(integer)
+            }
+            if operation == "get" {
+                return_type = elem;
+            } else {
+                expected.push(elem)
+            }
+        } else if kind == "vec" {
+            if operation == "push" {
+                expected.push(elem)
+            } else if operation == "len" {
+                return_type = integer;
+            } else if operation == "is_empty" {
+                return_type = ctir::CtType::Bool;
+            } else if operation == "truncate" {
+                expected.push(integer)
+            } else if operation != "clear" {
+                return Result::Err("unsupported CTIR vector operation `" + operation + "`")
+            }
+        } else {
+            return Result::Err("unsupported CTIR reference operation `" + operation + "`")
+        }
+    }
+    if !types_equal(result, return_type) {
+        return Result::Err("CTIR buffer result type mismatch")
+    }
+    verify_expr_list(ctx, args, expected)
+}
+
+fn buffer_integer(state: EvalState, module: ctir::CtModule, origin: isize, value: ctir::CtValue) -> Result[
+    isize,
+    CtError,
+] {
+    let ctir::CtValue::Integer { signed: true, width, bits } = value else {
+        return Result::Err(
+            ct_error(state, module, origin, "comptime buffer index must be an integer"),
+        )
+    };
+    Result::Ok(signed_integer(width, bits).to_isize())
+}
+
+fn eval_buffer(
+    state: EvalState,
+    module: ctir::CtModule,
+    origin: isize,
+    operation: string,
+    args: Vec[ctir::CtValue],
+    ty: ctir::CtType,
+) -> Result[ctir::CtValue, CtError] {
+    if operation == "new" || operation == "with_capacity" || operation == "from_array" {
+        let values = Vec::new();
+        if operation == "with_capacity" {
+            let capacity = buffer_integer(state, module, origin, args[0])?;
+            if capacity < 0 {
+                return Result::Err(
+                    ct_error(state, module, origin, "negative comptime vector capacity"),
+                )
+            }
+            if capacity > state.limits.temporary_bytes / 16 {
+                return Result::Err(
+                    ct_error(state, module, origin, "comptime vector capacity exceeds memory limit"),
+                )
+            }
+            charge_allocation(state, module, origin, capacity, capacity * 16)?;
+        } else if operation == "from_array" {
+            let ctir::CtValue::Array(items) = args[0] else {
+                return Result::Err(
+                    ct_error(state, module, origin, "comptime vector constructor requires an array"),
+                )
+            };
+            charge_allocation(state, module, origin, items.len(), items.len() * 16)?;
+            for item in items {
+                values.push(item)
+            }
+        } else {
+            for argument in args {
+                values.push(argument)
+            }
+        }
+        charge_allocation(state, module, origin, 1, 32)?;
+        let id = state.buffers.len();
+        state.buffers.push(values);
+        return Result::Ok(ctir::CtValue::Buffer { id, ty })
+    }
+    let ctir::CtValue::Buffer { id, ty: owner } = args[0] else {
+        return Result::Err(ct_error(state, module, origin, "invalid comptime buffer handle"))
+    };
+    if id < 0 || id >= state.buffers.len() {
+        return Result::Err(ct_error(state, module, origin, "invalid comptime buffer handle"))
+    }
+    let values = state.buffers[id];
+    if operation == "len" {
+        return Result::Ok(intrinsic_int_value(module.target, values.len()))
+    }
+    if operation == "is_empty" {
+        return Result::Ok(ctir::CtValue::Bool(values.is_empty()))
+    }
+    if operation == "clear" {
+        values.clear();
+    } else if operation == "truncate" {
+        let count = buffer_integer(state, module, origin, args[1])?;
+        if count < 0 {
+            return Result::Err(ct_error(state, module, origin, "negative comptime vector length"))
+        }
+        if count < values.len() {
+            values.truncate(count)
+        }
+    } else if operation == "push" {
+        charge_allocation(state, module, origin, 1, 16)?;
+        values.push(args[1]);
+    } else {
+        let ctir::CtType::Buffer { kind, .. } = owner else {
+            return Result::Err(ct_error(state, module, origin, "invalid comptime buffer type"))
+        };
+        let index = if kind == "ref" {
+            0
+        } else {
+            buffer_integer(state, module, origin, args[1])?
+        };
+        if index < 0 || index >= values.len() {
+            return Result::Err(
+                ct_error(state, module, origin, "comptime buffer index out of bounds"),
+            )
+        }
+        if operation == "get" {
+            return allocate_value(state, module, origin, values[index])
+        }
+        let value_index = if kind == "ref" {
+            1
+        } else {
+            2
+        };
+        values[index] = args[value_index];
+    }
+    Result::Ok(ctir::CtValue::Unit)
+}

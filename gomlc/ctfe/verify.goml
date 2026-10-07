@@ -25,6 +25,23 @@ fn ctir_value_byte_limit() -> isize {
 
 fn types_equal(left: ctir::CtType, right: ctir::CtType) -> bool {
     match left {
+        ctir::CtType::Dynamic(name) => match right {
+            ctir::CtType::Dynamic(other) => name == other,
+            _ => false,
+        },
+        ctir::CtType::Buffer { kind, elem } => match right {
+            ctir::CtType::Buffer { kind: other_kind, elem: other_elem } => kind == other_kind
+                && types_equal(elem, other_elem),
+            _ => false,
+        },
+        ctir::CtType::Function { params, result } => match right {
+            ctir::CtType::Function { params: other_params, result: other_result } => type_lists_equal(
+                params,
+                other_params,
+            )
+                && types_equal(result, other_result),
+            _ => false,
+        },
         ctir::CtType::Unit => match right {
             ctir::CtType::Unit => true,
             _ => false,
@@ -138,6 +155,23 @@ fn type_list_lists_equal(left: Vec[Vec[ctir::CtType]], right: Vec[Vec[ctir::CtTy
 
 fn verify_type(value: ctir::CtType) -> Result[(), string] {
     match value {
+        ctir::CtType::Dynamic(name) => if name == "" {
+            Result::Err("empty CTIR dynamic type")
+        } else {
+            Result::Ok(())
+        },
+        ctir::CtType::Buffer { kind, elem } => {
+            if kind != "ref" && kind != "vec" {
+                return Result::Err("unknown CTIR buffer kind")
+            }
+            verify_type(elem)
+        },
+        ctir::CtType::Function { params, result } => {
+            for param in params {
+                verify_type(param)?
+            }
+            verify_type(result)
+        },
         ctir::CtType::Integer { signed: _, width } => if width == 8 || width == 16 || width == 32
             || width == 64 {
             Result::Ok(())
@@ -184,6 +218,8 @@ fn verify_type(value: ctir::CtType) -> Result[(), string] {
 
 fn value_type(value: ctir::CtValue) -> ctir::CtType {
     match value {
+        ctir::CtValue::Dynamic { name, .. } => ctir::CtType::Dynamic(name),
+        ctir::CtValue::Buffer { ty, .. } | ctir::CtValue::Callable { ty, .. } => ty,
         ctir::CtValue::Unit => ctir::CtType::Unit,
         ctir::CtValue::Bool(_) => ctir::CtType::Bool,
         ctir::CtValue::Integer { signed, width, bits: _ } => {
@@ -264,6 +300,11 @@ fn value_matches_type(value: ctir::CtValue, ty: ctir::CtType) -> bool {
             ctir::CtType::Enum { name: expected_name, variants },
         ) => name == expected_name && variant >= 0 && variant < variants.len()
             && value_list_matches_types(fields, variants[variant]),
+        (ctir::CtValue::Dynamic { name, .. }, ctir::CtType::Dynamic(expected)) => name == expected,
+        (ctir::CtValue::Buffer { ty, .. }, expected) | (
+            ctir::CtValue::Callable { ty, .. },
+            expected,
+        ) => types_equal(ty, expected),
         (ctir::CtValue::Meta { kind, id: _ }, ctir::CtType::Meta(expected)) => {
             kind == expected
         },
@@ -364,6 +405,9 @@ fn verify_value_limits(value: ctir::CtValue, nodes: Ref[isize], bytes: Ref[isize
                 verify_value_limits(value, nodes, bytes)?
             }
         },
+        ctir::CtValue::Dynamic { .. } | ctir::CtValue::Buffer { .. } | ctir::CtValue::Callable {
+            ..,
+        } => return Result::Err("CTIR cannot contain an evaluator function handle"),
         ctir::CtValue::Meta { kind, id: _ } => {
             own_bytes = kind.byte_len() + 8;
         },
@@ -859,6 +903,77 @@ fn verify_expr(ctx: VerifyContext, value: ctir::CtExpr) -> Result[(), string] {
                 },
             }
         },
+        ctir::CtExprKind::Dynamic { value: receiver, methods } => {
+            if let ctir::CtType::Dynamic(_) = value.ty {} else {
+                return Result::Err("CTIR dynamic construction requires a dynamic type")
+            }
+            verify_expr(ctx, receiver)?;
+            let seen = collections::HashSet::new();
+            for method in methods {
+                if method.0 == "" || !seen.insert(method.0) {
+                    return Result::Err("invalid CTIR dynamic method name")
+                }
+                verify_expr(ctx, method.1)?;
+                let ctir::CtType::Function { params, .. } = method.1.ty else {
+                    return Result::Err("CTIR dynamic method requires a function")
+                };
+                if params.is_empty() || !types_equal(params[0], receiver.ty) {
+                    return Result::Err("CTIR dynamic method receiver mismatch")
+                }
+            }
+            Result::Ok(())
+        },
+        ctir::CtExprKind::Dispatch { receiver, method, args } => {
+            verify_expr(ctx, receiver)?;
+            if let ctir::CtType::Dynamic(_) = receiver.ty {} else {
+                return Result::Err("CTIR dispatch requires a dynamic receiver")
+            }
+            if method == "" {
+                return Result::Err("CTIR dispatch method is empty")
+            }
+            for argument in args {
+                verify_expr(ctx, argument)?
+            }
+            Result::Ok(())
+        },
+        ctir::CtExprKind::Buffer { operation, args } => verify_buffer(
+            ctx,
+            operation,
+            args,
+            value.ty,
+        ),
+        ctir::CtExprKind::Closure { parameters, local_start, body } => {
+            let ctir::CtType::Function { params, result } = value.ty else {
+                return Result::Err("CTIR closure requires function type")
+            };
+            if local_start < 0 || local_start > ctx.local_count || parameters.len() != params.len() {
+                return Result::Err("invalid CTIR closure locals")
+            }
+            let seen = collections::HashSet::new();
+            for index in 0..parameters.len() {
+                let slot = parameters[index];
+                if slot < local_start || slot >= ctx.local_count || !seen.insert(slot)
+                    || !types_equal(ctx.local_types[slot], params[index]) {
+                    return Result::Err("invalid CTIR closure parameter")
+                }
+            }
+            let inner = VerifyContext { return_type: result, loop_targets: Vec::new(), ..ctx };
+            verify_expr(inner, body)?;
+            if !expression_type_matches(result, body.ty) {
+                return Result::Err("CTIR closure result type mismatch")
+            }
+            Result::Ok(())
+        },
+        ctir::CtExprKind::Invoke { function, args } => {
+            verify_expr(ctx, function)?;
+            let ctir::CtType::Function { params, result } = function.ty else {
+                return Result::Err("CTIR invocation requires function type")
+            };
+            if !types_equal(value.ty, result) {
+                return Result::Err("CTIR invocation result type mismatch")
+            }
+            verify_expr_list(ctx, args, params)
+        },
         ctir::CtExprKind::Call { target, args } => {
             if let ctir::CtCallTarget::Intrinsic(name) = target {
                 let signature = match value_intrinsic_signature(ctx.module.target, name) {
@@ -1116,9 +1231,7 @@ pub fn verify_module(module: ctir::CtModule, dependencies: Vec[ctir::CtModule]) 
         let Some(function) = verify_find_function(module, entry.function_id) else {
             return Result::Err("invalid CTIR derive entry")
         };
-        if entry.export_name.is_some() && !entry.public {
-            return Result::Err("private CTIR derive entry has an export name")
-        } else if entry.public {
+        if entry.export_name.is_some() || entry.public {
             let export_name = derive_export_name(entry);
             if export_name == "" || export_name.contains("::")
                 || !derive_export_names.insert(export_name) {
