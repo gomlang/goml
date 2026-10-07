@@ -300,6 +300,18 @@ fn nominal_ct_type(ctx: CtLowerContext, name: string, args: Vec[Type]) -> Result
     ctir::CtType,
     string,
 ] {
+    if args.len() == 1 && (name == ctx.builtin.vec.name || name == ctx.builtin.ref_type.name) {
+        return Result::Ok(
+            ctir::CtType::Buffer {
+                kind: if name == ctx.builtin.vec.name {
+                    "vec"
+                } else {
+                    "ref"
+                },
+                elem: lower_ct_type(ctx, args[0])?,
+            },
+        )
+    }
     match find_ct_struct(ctx.file, name) {
         Some(definition) => {
             let fields: Vec[ctir::CtType] = Vec::new();
@@ -345,6 +357,13 @@ fn nominal_ct_type(ctx: CtLowerContext, name: string, args: Vec[Type]) -> Result
 
 fn lower_ct_type(ctx: CtLowerContext, value: Type) -> Result[ctir::CtType, string] {
     match resolve_type(value) {
+        Dyn { .. } => Result::Ok(ctir::CtType::Dynamic(diagnostic_type_text(value))),
+        VecType { elem } => Result::Ok(
+            ctir::CtType::Buffer { kind: "vec", elem: lower_ct_type(ctx, elem)? },
+        ),
+        RefType { elem } => Result::Ok(
+            ctir::CtType::Buffer { kind: "ref", elem: lower_ct_type(ctx, elem)? },
+        ),
         Unit => Result::Ok(ctir::CtType::Unit),
         Never => Result::Ok(ctir::CtType::Never),
         Bool => Result::Ok(ctir::CtType::Bool),
@@ -382,6 +401,15 @@ fn lower_ct_type(ctx: CtLowerContext, value: Type) -> Result[ctir::CtType, strin
         App { ty, args } => match resolve_type(ty) {
             Con { name } => nominal_ct_type(ctx, name, args),
             _ => Result::Err("comptime does not support this applied type"),
+        },
+        Func { params, ret_ty } => {
+            let parameters = Vec::new();
+            for param in params {
+                parameters.push(lower_ct_type(ctx, param)?)
+            }
+            Result::Ok(
+                ctir::CtType::Function { params: parameters, result: lower_ct_type(ctx, ret_ty)? },
+            )
         },
         Float32 | Float64 => Result::Err("comptime floating-point evaluation is not supported"),
         _ => Result::Err("type is not available in comptime"),
@@ -936,9 +964,6 @@ fn lower_ct_array_repeat(ctx: CtLowerContext, args: Vec[Expr], ty: Type) -> Resu
 }
 
 fn lower_ct_expr(ctx: CtLowerContext, value: Expr) -> Result[ctir::CtExpr, string] {
-    if let Closure { .. } = value {
-        return Result::Err("closures are not available in comptime")
-    }
     let ty = lower_ct_type(ctx, expr_type(value))?;
     let kind = match value {
         Var { name, ty: _ } => match find_local_slot(ctx, name) {
@@ -950,9 +975,7 @@ fn lower_ct_expr(ctx: CtLowerContext, value: Expr) -> Result[ctir::CtExpr, strin
                 ),
             },
         },
-        Callable { callable: _, ty: _ } => {
-            return Result::Err("function values are not available in comptime")
-        },
+        Callable { callable, ty } => lower_ct_function_value(ctx, callable, ty)?,
         Prim { value, ty: source_ty } => {
             ctir::CtExprKind::Value(primitive_ct_value(ctx, value, source_ty)?)
         },
@@ -975,7 +998,7 @@ fn lower_ct_expr(ctx: CtLowerContext, value: Expr) -> Result[ctir::CtExpr, strin
         },
         Tuple { items, ty: _ } => ctir::CtExprKind::Tuple(lower_ct_exprs(ctx, items)?),
         Array { items, ty: _ } => ctir::CtExprKind::Array(lower_ct_exprs(ctx, items)?),
-        Closure { .. } => return Result::Err("closures are not available in comptime"),
+        Closure { params, body, .. } => lower_ct_closure(ctx, params, body)?,
         Block { block, ty: _ } => ctir::CtExprKind::Block(lower_ct_block(ctx, block)?),
         Comptime { .. } => return Result::Err("nested comptime expressions are not supported"),
         Match { expr, arms, ty: _, .. } => {
@@ -1055,7 +1078,12 @@ fn lower_ct_expr(ctx: CtLowerContext, value: Expr) -> Result[ctir::CtExpr, strin
         Go { .. } => return Result::Err("go statements are not available in comptime"),
         Call { func, args, ty } => match func {
             Expr::Callable { callable, ty: _ } => match callable {
-                Callable::Intrinsic(name) => if name == "array.repeat" {
+                Callable::Intrinsic(name) => if name == "vec.from_array" {
+                    ctir::CtExprKind::Buffer {
+                        operation: "from_array",
+                        args: lower_ct_exprs(ctx, args)?,
+                    }
+                } else if name == "array.repeat" {
                     lower_ct_array_repeat(ctx, args, ty)?
                 } else if name == "compile_error" {
                     if args.len() != 1 {
@@ -1079,6 +1107,35 @@ fn lower_ct_expr(ctx: CtLowerContext, value: Expr) -> Result[ctir::CtExpr, strin
                     ctir::CtExprKind::Call { target, args: lower_ct_exprs(ctx, args)? }
                 },
                 Callable::InherentMethod { receiver_ty, method_name } => {
+                    if let Some(target) = ct_method_target(
+                        ctx,
+                        receiver_ty,
+                        Option::None,
+                        method_name,
+                    ) {
+                        return Result::Ok(
+                            ctir::CtExpr {
+                                kind: ctir::CtExprKind::Call {
+                                    target,
+                                    args: lower_ct_exprs(ctx, args)?,
+                                },
+                                ty: lower_ct_type(ctx, ty)?,
+                                origin: next_expr_origin(ctx),
+                            },
+                        )
+                    }
+                    if let Ok(ctir::CtType::Buffer { .. }) = lower_ct_type(ctx, receiver_ty) {
+                        return Result::Ok(
+                            ctir::CtExpr {
+                                kind: ctir::CtExprKind::Buffer {
+                                    operation: method_name,
+                                    args: lower_ct_exprs(ctx, args)?,
+                                },
+                                ty: lower_ct_type(ctx, ty)?,
+                                origin: next_expr_origin(ctx),
+                            },
+                        )
+                    }
                     match builtin_numeric_conversion_target(receiver_ty, method_name) {
                         Some(target) => if args.len() == 1 {
                             ctir::CtExprKind::Cast {
@@ -1109,9 +1166,39 @@ fn lower_ct_expr(ctx: CtLowerContext, value: Expr) -> Result[ctir::CtExpr, strin
                     && method_name == ctx.builtin.to_string.method => {
                     integer_string_call(ctx, for_ty, args)?
                 },
+                Callable::TraitMethod { trait_ref, method_name, for_ty, .. } => {
+                    let Some(target) = ct_method_target(
+                        ctx,
+                        for_ty,
+                        Option::Some(trait_ref.name),
+                        method_name,
+                    ) else {
+                        return Result::Err(
+                            "comptime trait call requires a concrete #[comptime] method",
+                        )
+                    };
+                    ctir::CtExprKind::Call { target, args: lower_ct_exprs(ctx, args)? }
+                },
+                Callable::DynTraitMethod { method_name, .. } => {
+                    if args.is_empty() {
+                        return Result::Err("comptime dynamic call is missing its receiver")
+                    }
+                    let arguments = Vec::new();
+                    for index in 1..args.len() {
+                        arguments.push(lower_ct_expr(ctx, args[index])?)
+                    }
+                    ctir::CtExprKind::Dispatch {
+                        receiver: lower_ct_expr(ctx, args[0])?,
+                        method: method_name,
+                        args: arguments,
+                    }
+                },
                 _ => return Result::Err("comptime only supports direct #[comptime] function calls"),
             },
-            _ => return Result::Err("comptime only supports direct function calls"),
+            _ => ctir::CtExprKind::Invoke {
+                function: lower_ct_expr(ctx, func)?,
+                args: lower_ct_exprs(ctx, args)?,
+            },
         },
         Unary { op, expr, ty: _ } => ctir::CtExprKind::Unary {
             op: lower_unary_op(op),
@@ -1166,7 +1253,7 @@ fn lower_ct_expr(ctx: CtLowerContext, value: Expr) -> Result[ctir::CtExpr, strin
                 right: lower_ct_expr(ctx, rhs)?,
             }
         },
-        ToDyn { .. } => return Result::Err("dynamic trait values are not available in comptime"),
+        ToDyn { trait_name, for_ty, expr, .. } => lower_ct_dynamic(ctx, trait_name, for_ty, expr)?,
     };
     let ty = lowered_expr_type(ctx, kind, ty);
     Result::Ok(ctir::CtExpr { kind, ty, origin: next_expr_origin(ctx) })
@@ -1231,7 +1318,11 @@ fn capable_functions(file: File) -> Vec[Function] {
                 ComptimeCapability::Capable | ComptimeCapability::Derive => result.push(value),
                 ComptimeCapability::RuntimeOnly => (),
             },
-            Item::ImplBlock(_) => (),
+            Item::ImplBlock(block) => for method in block.methods {
+                if let ComptimeCapability::Capable = method.comptime {
+                    result.push(Function { name: ct_method_name(block, method.name), ..method })
+                }
+            },
         }
     }
     result
@@ -1913,6 +2004,15 @@ fn reify_ct_value(file: File, value: ctir::CtValue, ty: Type) -> Result[Expr, st
                 },
             )
         },
+        ctir::CtValue::Dynamic { .. } => Result::Err(
+            "compile-time dynamic values cannot escape into runtime values",
+        ),
+        ctir::CtValue::Buffer { .. } => Result::Err(
+            "compile-time references and vectors cannot escape into runtime values",
+        ),
+        ctir::CtValue::Callable { .. } => Result::Err(
+            "compile-time function values cannot escape into runtime values",
+        ),
         ctir::CtValue::Meta { .. } => {
             Result::Err("derive metadata cannot be reified as a runtime value")
         },

@@ -29,6 +29,7 @@ pub struct CtError {
     pub package_name: string,
     pub origin: isize,
     pub stack: Vec[CtStackFrame],
+    pub derive_span: Option[ast::Span],
 }
 
 enum EvalFlow {
@@ -44,7 +45,7 @@ enum EvalFlow {
 }
 
 struct EvalFrame {
-    locals: Vec[Option[ctir::CtValue]],
+    locals: Vec[Ref[Option[ctir::CtValue]]],
 }
 
 struct CtMemoEntry {
@@ -54,7 +55,23 @@ struct CtMemoEntry {
     value: ctir::CtValue,
 }
 
+struct EvalClosure {
+    module: ctir::CtModule,
+    parameters: Vec[isize],
+    local_start: isize,
+    body: ctir::CtExpr,
+    frame: EvalFrame,
+}
+
+struct EvalDynamic {
+    value: ctir::CtValue,
+    methods: Vec[(string, ctir::CtValue)],
+}
+
 struct EvalState {
+    dynamics: Vec[EvalDynamic],
+    buffers: Vec[Vec[ctir::CtValue]],
+    closures: Vec[EvalClosure],
     modules: Vec[ctir::CtModule],
     fuel: Ref[isize],
     call_depth: Ref[isize],
@@ -91,6 +108,10 @@ fn ct_error(state: EvalState, module: ctir::CtModule, origin: isize, message: st
         package_name: module.package_name,
         origin,
         stack: copy_stack(state.stack),
+        derive_span: match state.derive_state {
+            Some(value) => value.error_span.get(),
+            None => Option::None,
+        },
     }
 }
 
@@ -101,6 +122,10 @@ fn missing_constant_error(state: EvalState, module: ctir::CtModule, origin: isiz
         package_name: module.package_name,
         origin,
         stack: copy_stack(state.stack),
+        derive_span: match state.derive_state {
+            Some(value) => value.error_span.get(),
+            None => Option::None,
+        },
     }
 }
 
@@ -159,6 +184,9 @@ fn value_byte_size(value: ctir::CtValue) -> isize {
             result
         },
         ctir::CtValue::Meta { kind, id: _ } => kind.byte_len() + 8,
+        ctir::CtValue::Dynamic { .. } | ctir::CtValue::Buffer { .. } | ctir::CtValue::Callable {
+            ..,
+        } => 16,
     }
 }
 
@@ -176,6 +204,19 @@ fn ensure_allocation(
     } else {
         Result::Ok(())
     }
+}
+
+fn charge_allocation(
+    state: EvalState,
+    module: ctir::CtModule,
+    origin: isize,
+    count: isize,
+    bytes: isize,
+) -> Result[(), CtError] {
+    ensure_allocation(state, module, origin, count, bytes)?;
+    state.value_nodes.set(state.value_nodes.get() + count);
+    state.temporary_bytes.set(state.temporary_bytes.get() + bytes);
+    Result::Ok(())
 }
 
 fn allocate_value(state: EvalState, module: ctir::CtModule, origin: isize, value: ctir::CtValue) -> Result[
@@ -242,6 +283,9 @@ fn integer_index(value: ctir::CtValue) -> Option[isize] {
 
 fn values_equal(left: ctir::CtValue, right: ctir::CtValue) -> bool {
     match left {
+        ctir::CtValue::Dynamic { .. } | ctir::CtValue::Buffer { .. } | ctir::CtValue::Callable {
+            ..,
+        } => false,
         ctir::CtValue::Unit => match right {
             ctir::CtValue::Unit => true,
             _ => false,
@@ -308,32 +352,32 @@ fn value_lists_equal(left: Vec[ctir::CtValue], right: Vec[ctir::CtValue]) -> boo
     }
 }
 
-fn copy_locals(values: Vec[Option[ctir::CtValue]]) -> Vec[Option[ctir::CtValue]] {
+fn copy_locals(values: Vec[Ref[Option[ctir::CtValue]]]) -> Vec[Option[ctir::CtValue]] {
     let result: Vec[Option[ctir::CtValue]] = Vec::with_capacity(values.len());
     for value in values {
-        result.push(value)
+        result.push(value.get())
     }
     result
 }
 
-fn restore_locals(target: Vec[Option[ctir::CtValue]], saved: Vec[Option[ctir::CtValue]]) -> () {
+fn restore_locals(target: Vec[Ref[Option[ctir::CtValue]]], saved: Vec[Option[ctir::CtValue]]) -> () {
     for index in 0..saved.len() {
-        target.set(index, saved[index])
+        target[index].set(saved[index])
     }
 }
 
 fn restore_pattern_local(
-    target: Vec[Option[ctir::CtValue]],
+    target: Vec[Ref[Option[ctir::CtValue]]],
     saved: Vec[Option[ctir::CtValue]],
     slot: isize,
 ) -> () {
     if slot >= 0 && slot < target.len() && slot < saved.len() {
-        target.set(slot, saved[slot])
+        target[slot].set(saved[slot])
     }
 }
 
 fn restore_pattern_locals(
-    target: Vec[Option[ctir::CtValue]],
+    target: Vec[Ref[Option[ctir::CtValue]]],
     saved: Vec[Option[ctir::CtValue]],
     pattern: ctir::CtPattern,
 ) -> () {
@@ -373,7 +417,7 @@ fn set_local(frame: EvalFrame, slot: isize, value: ctir::CtValue) -> bool {
     if slot < 0 || slot >= frame.locals.len() {
         false
     } else {
-        frame.locals.set(slot, Option::Some(value));
+        frame.locals[slot].set(Option::Some(value));
         true
     }
 }
@@ -1027,7 +1071,8 @@ fn eval_function(
             )
         }
     }
-    if let None = state.derive_state {
+    if state.derive_state.is_none() && state.closures.is_empty() && state.buffers.is_empty()
+        && state.dynamics.is_empty() {
         if let Some(value) = find_memoized(state, module.package_name, function.id, args) {
             return Result::Ok(value)
         }
@@ -1040,9 +1085,9 @@ fn eval_function(
             origin: function.origin,
         },
     );
-    let locals: Vec[Option[ctir::CtValue]] = Vec::with_capacity(function.local_count);
+    let locals: Vec[Ref[Option[ctir::CtValue]]] = Vec::with_capacity(function.local_count);
     for _ in 0..function.local_count {
-        locals.push(Option::None)
+        locals.push(Ref::new(Option::None))
     }
     let frame = EvalFrame { locals };
     for index in 0..args.len() {
@@ -1059,7 +1104,8 @@ fn eval_function(
     state.call_depth.set(state.call_depth.get() - 1);
     match result {
         Ok(EvalFlow::Value(value)) | Ok(EvalFlow::Return(value)) => {
-            if let None = state.derive_state {
+            if state.derive_state.is_none() && state.closures.is_empty() && state.buffers.is_empty()
+                && state.dynamics.is_empty() {
                 state.memo.push(
                     CtMemoEntry {
                         package_name: module.package_name,
@@ -1120,7 +1166,7 @@ fn eval_expr(state: EvalState, module: ctir::CtModule, frame: EvalFrame, value: 
         ctir::CtExprKind::Local(slot) => if slot < 0 || slot >= frame.locals.len() {
             Result::Err(ct_error(state, module, value.origin, "invalid comptime local slot"))
         } else {
-            match frame.locals[slot] {
+            match frame.locals[slot].get() {
                 Some(local) => {
                     Result::Ok(EvalFlow::Value(allocate_value(state, module, value.origin, local)?))
                 },
@@ -1502,6 +1548,73 @@ fn eval_expr(state: EvalState, module: ctir::CtModule, frame: EvalFrame, value: 
             };
             Result::Ok(EvalFlow::Return(result))
         },
+        ctir::CtExprKind::Dynamic { value: receiver, methods } => {
+            let receiver = expect_value(
+                state,
+                module,
+                value.origin,
+                eval_expr(state, module, frame, receiver)?,
+            )?;
+            let values = Vec::new();
+            for method in methods {
+                values.push(
+                    (
+                        method.0,
+                        expect_value(
+                            state,
+                            module,
+                            value.origin,
+                            eval_expr(state, module, frame, method.1)?,
+                        )?,
+                    ),
+                )
+            }
+            charge_allocation(state, module, value.origin, values.len() + 1, values.len() * 32 + 32)?;
+            let id = state.dynamics.len();
+            state.dynamics.push(EvalDynamic { value: receiver, methods: values });
+            let ctir::CtType::Dynamic(name) = value.ty else {
+                return Result::Err(
+                    ct_error(state, module, value.origin, "invalid dynamic value type"),
+                )
+            };
+            Result::Ok(EvalFlow::Value(ctir::CtValue::Dynamic { id, name }))
+        },
+        ctir::CtExprKind::Dispatch { receiver, method, args } => {
+            let receiver = expect_value(
+                state,
+                module,
+                value.origin,
+                eval_expr(state, module, frame, receiver)?,
+            )?;
+            let args = eval_values(state, module, frame, args)?;
+            eval_dispatch(state, module, value.origin, receiver, method, args, value.ty).map(
+                |value| EvalFlow::Value(value),
+            )
+        },
+        ctir::CtExprKind::Buffer { operation, args } => {
+            let args = eval_values(state, module, frame, args)?;
+            eval_buffer(state, module, value.origin, operation, args, value.ty).map(
+                |value| EvalFlow::Value(value),
+            )
+        },
+        ctir::CtExprKind::Closure { parameters, local_start, body } => {
+            charge_allocation(state, module, value.origin, 1, 64 + frame.locals.len() * 8)?;
+            let id = state.closures.len();
+            state.closures.push(EvalClosure { module, parameters, local_start, body, frame });
+            Result::Ok(EvalFlow::Value(ctir::CtValue::Callable { id, ty: value.ty }))
+        },
+        ctir::CtExprKind::Invoke { function, args } => {
+            let function = expect_value(
+                state,
+                module,
+                value.origin,
+                eval_expr(state, module, frame, function)?,
+            )?;
+            let args = eval_values(state, module, frame, args)?;
+            eval_closure(state, module, value.origin, function, args).map(
+                |value| EvalFlow::Value(value),
+            )
+        },
         ctir::CtExprKind::Call { target, args } => {
             let args = eval_values(state, module, frame, args)?;
             if let ctir::CtCallTarget::Intrinsic(name) = target {
@@ -1698,6 +1811,9 @@ fn new_state(
     derive_state: Option[derive::DeriveState],
 ) -> EvalState {
     EvalState {
+        dynamics: Vec::new(),
+        buffers: Vec::new(),
+        closures: Vec::new(),
         modules,
         fuel: Ref::new(limits.fuel),
         call_depth: Ref::new(0),
@@ -1734,6 +1850,7 @@ fn invalid_ctir_error(module: ctir::CtModule, message: string) -> CtError {
         package_name: module.package_name,
         origin: 0,
         stack: Vec::new(),
+        derive_span: Option::None,
     }
 }
 
@@ -1754,9 +1871,9 @@ pub fn evaluate_site(
     let state = new_state(modules, limits, Option::None);
     for site in module.sites {
         if site.id == site_id {
-            let locals: Vec[Option[ctir::CtValue]] = Vec::with_capacity(site.local_count);
+            let locals: Vec[Ref[Option[ctir::CtValue]]] = Vec::with_capacity(site.local_count);
             for _ in 0..site.local_count {
-                locals.push(Option::None)
+                locals.push(Ref::new(Option::None))
             }
             let flow = eval_expr(state, module, EvalFrame { locals }, site.expression)?;
             return finish_value(state, module, site.origin, flow)
@@ -1798,7 +1915,7 @@ pub fn evaluate_derive_entry(
     entry_name: string,
     request: derive::DeriveRequest,
     limits: EvalLimits,
-) -> Result[ast::ImplBlock, CtError] {
+) -> Result[Vec[ast::Item], CtError] {
     if let Err(message) = verify_module(module, dependencies) {
         return Result::Err(invalid_ctir_error(module, message))
     }

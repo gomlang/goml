@@ -1,0 +1,160 @@
+package tast;
+
+use module::ast;
+use module::ctir;
+use module::hir;
+
+fn local_derive_function(value: ast::Function) -> bool {
+    for attribute in value.attrs {
+        if attribute.name == "comptime" || attribute.name == "comptime_derive" {
+            return true
+        }
+    }
+    false
+}
+
+fn without_derive_attributes(values: Vec[ast::Attribute]) -> Vec[ast::Attribute] {
+    let result = Vec::new();
+    for value in values {
+        if value.name != "derive" {
+            result.push(value)
+        }
+    }
+    result
+}
+
+pub fn local_derive_module(
+    inputs: Vec[(ast::LowerResult, string)],
+    package_name: string,
+    dependencies: Vec[DependencyEnvironment],
+    external: Vec[ExternalTypeEnvironment],
+) -> Result[Option[ctir::CtModule], string] {
+    let mut has_handler = false;
+    let mut has_use = false;
+    for input in inputs {
+        if let Some(file) = input.0.ast {
+            for item in file.items {
+                match item {
+                    ast::Item::Function(function) => for attr in function.attrs {
+                        if attr.name == "comptime_derive" {
+                            has_handler = true;
+                        }
+                    },
+                    ast::Item::StructDef(value) => for attr in value.attrs {
+                        if attr.name == "derive" {
+                            has_use = true;
+                        }
+                    },
+                    ast::Item::EnumDef(value) => for attr in value.attrs {
+                        if attr.name == "derive" {
+                            has_use = true;
+                        }
+                    },
+                    _ => (),
+                }
+            }
+        }
+    }
+    if !has_handler || !has_use {
+        return Result::Ok(Option::None)
+    }
+    let prepared = Vec::new();
+    for input in inputs {
+        let Some(file) = input.0.ast else {
+            continue
+        };
+        let items = Vec::new();
+        for item in file.items {
+            match item {
+                ast::Item::Function(value) => if local_derive_function(value) {
+                    items.push(item)
+                },
+                ast::Item::StructDef(value) => items.push(
+                    ast::Item::StructDef(
+                        ast::StructDef { attrs: without_derive_attributes(value.attrs), ..value },
+                    ),
+                ),
+                ast::Item::EnumDef(value) => items.push(
+                    ast::Item::EnumDef(
+                        ast::EnumDef { attrs: without_derive_attributes(value.attrs), ..value },
+                    ),
+                ),
+                ast::Item::ImplBlock(block) => {
+                    let mut has_comptime = false;
+                    for method in block.methods {
+                        if local_derive_function(method) {
+                            has_comptime = true;
+                        }
+                    }
+                    if has_comptime {
+                        let methods = Vec::new();
+                        for method in block.methods {
+                            if local_derive_function(method) {
+                                methods.push(method)
+                            } else {
+                                let body = ast::Expr::Loop {
+                                    label: Option::None,
+                                    body: ast::Expr::Unit { span: method.body.span },
+                                    span: method.body.span,
+                                };
+                                methods.push(
+                                    ast::Function {
+                                        body: ast::Block {
+                                            stmts: Vec::new(),
+                                            tail: Option::Some(body),
+                                            span: method.body.span,
+                                        },
+                                        ..method,
+                                    },
+                                );
+                            }
+                        }
+                        items.push(ast::Item::ImplBlock(ast::ImplBlock { methods, ..block }));
+                    }
+                },
+                ast::Item::Static(_) => (),
+                _ => items.push(item),
+            }
+        }
+        prepared.push(
+            (
+                ast::LowerResult {
+                    ast: Option::Some(ast::File { items, ..file }),
+                    diagnostics: Vec::new(),
+                },
+                input.1,
+            ),
+        );
+    }
+    let files = Vec::new();
+    for lowered in hir::lower_expanded_package_files(prepared, package_name) {
+        if !lowered.diagnostics.is_empty() {
+            return Result::Err("local derive preparation: " + lowered.diagnostics[0].message)
+        }
+        if let Some(file) = lowered.hir {
+            files.push(file)
+        }
+    }
+    let aliases = Vec::new();
+    for environment in external {
+        for alias in external_environment_aliases(environment)? {
+            aliases.push(alias)
+        }
+    }
+    let checked = check_package_files_for_link_with_environments_options(
+        files,
+        dependencies,
+        false,
+        false,
+        aliases,
+    );
+    for diagnostic in checked.diagnostics {
+        if let DiagnosticSeverity::Error = diagnostic.severity {
+            return Result::Err(
+                "local derive handlers must compile before generated declarations are available: "
+                    + diagnostic.message,
+            )
+        }
+    }
+    Result::Ok(Option::Some(checked.comptime))
+}

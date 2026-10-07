@@ -659,13 +659,13 @@ fn table() -> [isize; 4] {
 }
 ```
 
-`#[comptime]` marks a non-generic free function as compile-time-capable. The function remains callable at runtime. A compile-time call may call other `#[comptime]` free functions, the builtin operations listed below, or the `compile_error(string) -> never` intrinsic. The compiler validates the complete body of every marked function, including branches not taken by a particular invocation. Attributes with arguments, duplicate attributes, generic functions, methods, extern functions, and other declarations are rejected.
+`#[comptime]` marks a non-generic free function or concrete implementation method as compile-time-capable. The function remains callable at runtime. A compile-time call may call other `#[comptime]` free functions, the builtin operations listed below, or the `compile_error(string) -> never` intrinsic. The compiler validates the complete body of every marked function, including branches not taken by a particular invocation. Attributes with arguments, duplicate attributes, generic functions or implementations, extern functions, and other declarations are rejected.
 
 A top-level constant initializer is an implicit compile-time context, so `const SIX: isize = factorial(3);` and an initializer wrapped in `comptime { ... }` are equivalent. A top-level constant may produce a recursively immutable tuple, fixed array, struct, or enum in addition to scalar values. A `comptime` expression in ordinary code supports the same reifiable value shapes.
 
 Compile-time code may use local bindings and assignment, blocks, `if`, `match`, `while`, `loop`, restricted `for`, `break`, `continue`, `return`, recursion, direct calls, integer conversion methods, integer `to_string()`, and supported operators. A compile-time `for` accepts only a fixed array or the builtin `isize` ranges `start..end` and `start..=end`; its source and range endpoints are evaluated once, and its pattern must be irrefutable. The deterministic string methods `len`, `byte_len`, `get`, `byte_get`, `byte_slice`, `is_char_boundary`, `starts_with`, `ends_with`, and `contains` are also available. String indexes and slices use byte offsets and reject invalid UTF-8 character boundaries. Integer formatting accepts signed and unsigned 8-, 16-, 32-, and 64-bit values, including `byte`, `isize`, and `usize`, and produces decimal text with the full range preserved. This is restricted to the builtin `ToString` implementation; a user trait with the same short name does not become a compile-time intrinsic. For example, `const BITS: u64 = 18446744073709551615; const MASK: string = BITS.to_string();` evaluates without runtime formatting.
 
-Compile-time code cannot capture a surrounding runtime parameter or local. Closures, indirect calls, generic functions, methods other than the integer conversions, integer `to_string`, and string whitelist, trait or dynamic dispatch, general iterators, floating-point computation, `Ref`, `Vec`, `HashMap`, channels, goroutines, extern calls, host I/O, environment access, time, randomness, network access, general type reflection, arbitrary declaration generation, compile-time function parameters and general type-level computation are not supported. The constrained programmable derive interface described below is the only reflection and code-generation facility.
+Compile-time code cannot capture a surrounding runtime parameter or local. Closures, function parameters and indirect calls are supported within one evaluation, including shared mutable captures. Concrete `#[comptime]` methods support static calls and dynamic dispatch through local implementations. `Ref` supports `new`, `get`, and `set`; `Vec` supports `new`, `with_capacity`, `from_array`, `get`, `set`, `push`, `len`, `is_empty`, `clear`, and `truncate`. These operations retain ordinary aliasing and bounds checks. Function values, dynamic objects, references, and vectors cannot escape as runtime constants. Generic compile-time functions and implementations, general iterators, floating-point computation, `HashMap`, channels, goroutines, extern calls, host I/O, environment access, time, randomness, network access, general type reflection, arbitrary declaration generation, and general type-level computation are not supported. The constrained programmable derive interface described below is the only reflection and code-generation facility.
 
 `compile_error` is accepted only in a `#[comptime]` function, a `comptime` block, or a top-level constant initializer. It terminates compile-time evaluation with its message. If runtime execution of a `#[comptime]` function reaches it, the program traps:
 
@@ -2150,9 +2150,31 @@ struct Group {
 }
 ```
 
-A public `#[comptime_derive(Name)]` handler exports the derive name `Name`, independently of its implementation function name. Export names are unique within one package and cannot contain `::`. The named form requires `pub`; private `#[comptime_derive]` functions remain implementation helpers. The unnamed public form remains available and exports the handler function's short name.
+A public `#[comptime_derive(Name)]` handler exports the derive name `Name`, independently of its implementation function name. Export names are unique within one package and cannot contain `::`. Private named handlers can be used in their own package; `pub` is required to import a handler from another package. Private unnamed `#[comptime_derive]` functions can remain implementation helpers. The unnamed public form remains available and exports the handler function's short name.
 
 Derive names have their own namespace, but ordinary `use` declarations populate it alongside the type and trait namespaces. For example, after `use std::serde;`, `use serde::Serialize;` makes both the `Serialize` trait and a derive export named `Serialize` available as `Serialize`, so `#[derive(Serialize)]` works without another import form. An import alias applies to both namespaces: `use serde::Serialize as DataSerialize;` permits `#[derive(DataSerialize)]`. A package import permits the qualified spelling `#[derive(serde::Serialize)]`. Public re-exports preserve the derive handler's definition identity, so facade packages can use `pub use` to expose a standard-library or third-party derive without copying its implementation.
+
+Handlers can also be defined and used in the same package, including across source files. The compiler prepares the package's compile-time functions before expanding derives. The preparation pass cannot use methods or types that depend on that expansion; such cycles produce a diagnostic. Local derive names take precedence over imported derive names.
+
+The generation API includes:
+
+| Capability | Builders |
+| --- | --- |
+| Closures and function types | `meta_expr_closure(params, body)`, `meta_type_function(params, result)`, `meta_expr_invoke(function, args)` |
+| Qualified generic member calls | `meta_expr_type_member(owner_type, member, member_type_args, args)` |
+| Multiple implementations | `derive_output_merge(output, additional_output)` |
+| Associated items | `derive_output_add_associated_type(output, name, type)`, `derive_output_add_constant(output, name, type, value)` |
+| Trait parameters and equalities | `derive_output_set_trait_arguments(output, args)`, `derive_output_add_equality(output, lhs, rhs)` |
+| Private helper declarations | `derive_output_add_function(output, method)`, `derive_output_add_struct(output, name, fields)`, `derive_output_add_type_alias(output, name, type)` |
+| Structured attribute syntax | `meta_attribute_argument_type(attribute, index)`, `meta_attribute_argument_expr(attribute, index)` |
+| Source locations | `derive_span(input)`, `derive_field_span(input, index)`, `derive_variant_field_span(input, variant, field)`, `meta_attribute_span(attribute)`, `meta_attribute_argument_span(attribute, index)` |
+| Precise diagnostics | `derive_error_at(attribute, message)`, `derive_error_at_argument(attribute, index, message)`, `derive_error_span(span, message)` |
+
+`meta_expr_closure` takes a `MetaParamList`; `meta_type_function` takes a `MetaTypeList`. Helper structs take a `MetaParamList` of field names and types. Use `derive_fresh_name` for helper names. Associated constants use the same expression restrictions as handwritten associated constants. `derive_set_span(span)` assigns the given location to subsequently generated syntax.
+
+Structured attribute access preserves named and positional arguments, nested delimiters, and raw strings. Argument value kinds include `ident`, `path`, `string`, `bool`, `integer`, `float`, `char`, and `syntax`. Type and expression accessors validate a single type or expression and resolve names at the derive use site. For example, `#[config(priority = 10, extras = Option[State], callback = make_callback(2))]` has three arguments. Definition-site member builders qualify relative type owners such as `Rule::regex`; explicit call-site builders retain the deriving file's scope.
+
+Static inherent methods can be used as function values: `let callback = Parser::parse;`. Their resolved signature supplies the function value's parameters and return type; generic method values still need enough context to infer their type arguments.
 
 `std::serde` owns the format-independent `Serialize`, `Deserialize`, `Serializer`, and `Deserializer` traits and the two derives. Typed formats use `Serialize::serialize` and `Deserialize::deserialize`: the format handle is a method-level generic parameter, so monomorphization produces ordinary static calls without a runtime serializer trait object, Go interface dispatch, or runtime reflection. A derived struct emits fields directly and a derived enum emits its declaration index, wire name, shape, and payload directly. Derived named-field decoding accepts arbitrary field order, skips unknown fields, and rejects duplicate fields and required fields that are missing. Struct fields, enum variants, and named variant fields support `#[serde(rename = "wire_name")]`. Field defaults, omission, flattening, and enum representation are selected with the Serde attributes below.
 
@@ -2376,9 +2398,9 @@ fn decode_user(input: string) -> Result[User, string] {
 
 A qualified custom derive must have the form `package_alias::export_name`, where `package_alias` is introduced by a `use` in the same source file. A bare library derive must be explicitly imported. Unimported canonical package paths and handlers visible only through a transitive dependency are rejected. If two explicit imports or a prelude derive and an explicit import provide the same bare name, the compiler reports ambiguity and requires a qualified name or import alias.
 
-`#[comptime_derive]` and `#[comptime_derive(Name)]` are valid only on non-generic free functions. A public handler must have the exact signature `(DeriveInput) -> DeriveOutput`. Private functions with the unnamed attribute are compile-time-only helpers and are included in the interface when reachable from a public handler. A derive handler may call those helpers and ordinary `#[comptime]` functions, but it cannot be called from runtime code or ordinary value `comptime`. Derive handlers are not exported as runtime functions.
+`#[comptime_derive]` and `#[comptime_derive(Name)]` are valid only on non-generic free functions. A public or named handler must have the exact signature `(DeriveInput) -> DeriveOutput`. Private functions with the unnamed attribute are compile-time-only helpers and are included in the interface when reachable from a public handler. A derive handler may call those helpers and ordinary `#[comptime]` functions, but it cannot be called from runtime code or ordinary value `comptime`. Derive handlers are not exported as runtime functions.
 
-The compiler resolves handlers from already compiled dependency interfaces. A handler cannot be defined and applied within the same package compilation. Put reusable handlers and their generated traits in a separate package. The target may be a generic struct or enum; the generated impl inherits its type parameters. Explicit owner arguments also specialize static inherent methods whose parameter and return types do not mention those arguments, for example `Record::[string]::type_name()`. `derive_output_add_predicate` and `derive_output_add_call_site_predicate` add the bounds required by generated methods.
+The compiler resolves imported handlers from already compiled dependency interfaces and prepares local handlers before expanding the current package. Reusable handlers and their generated traits may live in a separate package. The target may be a generic struct or enum; the generated impl inherits its type parameters. Explicit owner arguments also specialize static inherent methods whose parameter and return types do not mention those arguments, for example `Record::[string]::type_name()`. `derive_output_add_predicate` and `derive_output_add_call_site_predicate` add the bounds required by generated methods.
 
 The input reflection operations are:
 
@@ -2405,9 +2427,9 @@ derive_fresh_name(input, prefix) -> string
 
 `derive_item_kind` returns zero for a struct and one for an enum. `derive_variant_kind` returns zero for a unit variant, one for a tuple variant, and two for a struct-like variant. The count operation for a nested attribute takes the owner indexes; its name and text operations take one additional attribute index. Field operations require a struct, while variant operations require an enum. Invalid kinds and indexes are compile-time errors at the `#[derive(...)]` site. Attributes may be attached to struct fields, enum variants, and tuple or named variant fields. `name` returns the attribute name and `text` returns its complete source spelling.
 
-The structured attribute handle exposes `meta_attribute_name`, `meta_attribute_text`, `meta_attribute_has_argument_list`, `meta_attribute_argument_count`, `meta_attribute_argument_kind`, `meta_attribute_argument_name`, `meta_attribute_argument_value_kind`, and `meta_attribute_argument_text`. Argument kind is `ident`, `path`, `string`, or `named`. Named arguments use `name = value`, where the value may be an identifier, path, or string. `argument_name` returns the left-hand name, `argument_value_kind` describes the right-hand value, and `argument_text` returns its decoded value.
+The structured attribute handle exposes `meta_attribute_name`, `meta_attribute_text`, `meta_attribute_has_argument_list`, `meta_attribute_argument_count`, `meta_attribute_argument_kind`, `meta_attribute_argument_name`, `meta_attribute_argument_value_kind`, and `meta_attribute_argument_text`. Argument kind is a literal or syntax kind listed above, or `named`. Named arguments use `name = value`, where the value may also be a number, boolean, nested type, or expression. `argument_name` returns the left-hand name, `argument_value_kind` describes the right-hand value, and `argument_text` returns its decoded value.
 
-The structured output API provides opaque `MetaAttribute`, `MetaType`, `MetaExpr`, `MetaPattern`, `MetaArm`, `MetaBlock`, `MetaParamList`, `MetaGenericList`, `MetaMethod`, and list handles. Constructors use the `meta_type_*`, `meta_expr_*`, `meta_pattern_*`, `meta_arm*`, `meta_block_*`, `meta_param_list_*`, and `meta_generic_list_*` families. `meta_method` creates a concrete method; `meta_method_generic` creates a method with explicit type parameters and bounds. A handler creates one trait impl with `derive_output_new` or `derive_output_new_call_site`, or one inherent impl with `derive_output_inherent`. It then adds predicates and methods and returns that output. `derive_output_add_method` preserves private visibility for inherent methods and normal trait visibility for trait implementations. `derive_output_add_public_method` exports an inherent method and rejects trait output.
+The structured output API provides opaque `MetaSpan`, `MetaAttribute`, `MetaType`, `MetaExpr`, `MetaPattern`, `MetaArm`, `MetaBlock`, `MetaParamList`, `MetaGenericList`, `MetaMethod`, and list handles. Constructors use the `meta_type_*`, `meta_expr_*`, `meta_pattern_*`, `meta_arm*`, `meta_block_*`, `meta_param_list_*`, and `meta_generic_list_*` families. `meta_method` creates a concrete method; `meta_method_generic` creates a method with explicit type parameters and bounds. A handler starts with one trait impl with `derive_output_new` or `derive_output_new_call_site`, or one inherent impl with `derive_output_inherent`. It then adds predicates and methods and returns that output. `derive_output_add_method` preserves private visibility for inherent methods and normal trait visibility for trait implementations. `derive_output_add_public_method` exports an inherent method and rejects trait output.
 
 For example, a handler in a separate package can generate a public static method:
 
@@ -2527,9 +2549,9 @@ derive_output_add_public_method(output, method) -> ()
 
 Unqualified names passed to `derive_output_new`, `derive_output_add_predicate`, `meta_type_named`, `meta_expr_call`, and `meta_generic_list_add_bound` resolve in the handler's defining package. Their `_call_site` variants resolve in the target package. `derive_fresh_name` should be used for generated local bindings that must not collide with user names. The `*_target_*` builders construct or match the annotated item by compiler identity and should be preferred over spelling its name manually.
 
-The result is restricted to one trait or inherent `impl` for the annotated type. It cannot create types, traits, free functions, constants, modules, imports, extern declarations, attributes, associated types, or raw tokens. Associated constants and multiple impl blocks in one output remain unsupported. Generated method type parameters and trait bounds are supported. The generated impl is processed by ordinary name resolution, orphan and coherence checks, type checking, monomorphization, and backend lowering. Duplicate or invalid generated implementations are regular compiler diagnostics.
+The result may contain several trait or inherent implementations for the annotated type, associated types and constants, and private helper functions, structs, and aliases. It cannot create traits, modules, imports, extern declarations, attributes, or raw tokens. Generated method type parameters and trait bounds are supported. The generated impl is processed by ordinary name resolution, orphan and coherence checks, type checking, monomorphization, and backend lowering. Duplicate or invalid generated implementations are regular compiler diagnostics.
 
-Handlers are deterministic and have no host access. Imported derive CTIR is verified as untrusted artifact data. Evaluation uses the ordinary compile-time limits plus a limit of 100,000 metadata and syntax-builder operations. Failures are anchored to the requesting derive attribute and include the compile-time derive call stack.
+Handlers are deterministic and have no host access. Imported derive CTIR is verified as untrusted artifact data. Evaluation uses the ordinary compile-time limits plus a limit of 100,000 metadata and syntax-builder operations. Failures default to the requesting derive attribute; span-aware error operations can select a field or attribute argument. Diagnostics include the compile-time derive call stack.
 
 ## Go FFI
 
@@ -6966,6 +6988,9 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | Adapt library error reports | `Report::map` converts leaves while retaining contexts, aggregate boundaries and traversal order |
 | Isolate a runtime panic | `std::panic::catch`, with lexical `defer` cleanup; `raise` and `resume` return `never` |
 | Generate public inherent methods | `derive_output_inherent` and `derive_output_add_public_method` |
+| Generate multiple implementations and helpers | `derive_output_merge`, associated item builders, and private function/type builders |
+| Build runtime callbacks in derive | `meta_expr_closure` and `meta_type_function` |
+| Reuse compile-time computations | Closures, indirect calls, concrete methods, local dynamic dispatch, `Ref`, and `Vec` operations |
 | Create and supervise a Linux child | `std::os::linux::process::Command` with runtime-coordinated spawn, stable pidfd signals, and shared wait results |
 | Access mapped memory | `std::os::linux::memory::Mapping` checked copied access with explicit shared unmap state |
 | Pass descriptors or wait for Linux readiness | `std::os::linux::ipc` Unix messages, eventfd/timerfd, poll, and epoll |
@@ -7078,8 +7103,8 @@ trait_member  = "type" upper_ident (":" trait_set)? ";"
 impl_def      = "impl" generic_params? trait_ref "for" type where_clause?
                 "{" impl_member* "}"
               | "impl" generic_params? type where_clause?
-                "{" (method | visibility? constant)* "}"
-impl_member   = "type" upper_ident "=" type ";" | method | constant
+                "{" (attribute* method | visibility? constant)* "}"
+impl_member   = "type" upper_ident "=" type ";" | attribute* method | constant
 
 trait_set     = trait_ref ("+" trait_ref)*
 trait_ref     = path type_args?

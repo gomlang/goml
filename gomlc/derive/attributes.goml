@@ -1,0 +1,183 @@
+package derive;
+
+use module::ast;
+use module::ctir;
+use module::lexer;
+use module::parser;
+
+struct StructuredArgument {
+    name: string,
+    kind: string,
+    text: string,
+    source: string,
+    value_start: isize,
+    span: ast::Span,
+}
+
+fn parse_argument_expression(source: string) -> Result[ast::Expr, string] {
+    ast::lower_expression_fragment(parser::parse_expression_fragment(source), 0)
+}
+
+fn structured_argument_from_tokens(attribute: ast::Attribute, tokens: Vec[lexer::Token]) -> Result[
+    StructuredArgument,
+    string,
+] {
+    if tokens.is_empty() {
+        return Result::Err("empty attribute argument")
+    }
+    let mut start = 0;
+    let mut name = "";
+    if tokens.len() > 1 && tokens[0].kind == lexer::TokenKind::Ident
+        && tokens[1].kind == lexer::TokenKind::Eq {
+        name = tokens[0].text;
+        start = 2;
+    }
+    if start == tokens.len() {
+        return Result::Err("missing value for attribute argument `" + name + "`")
+    }
+    let source = attribute.text.byte_slice(tokens[start].start, tokens[tokens.len() - 1].end);
+    let mut kind = "syntax";
+    let mut value = source;
+    if tokens.len() - start == 1 {
+        kind = match tokens[start].kind {
+            lexer::TokenKind::Ident => "ident",
+            lexer::TokenKind::TrueKeyword | lexer::TokenKind::FalseKeyword => "bool",
+            lexer::TokenKind::IntLit => "integer",
+            lexer::TokenKind::Float => "float",
+            lexer::TokenKind::Str | lexer::TokenKind::RawStr | lexer::TokenKind::MultilineStr => "string",
+            lexer::TokenKind::CharLit => "char",
+            _ => "syntax",
+        };
+        if kind == "string" {
+            let ast::Expr::String { value: decoded, .. } = parse_argument_expression(source)? else {
+                return Result::Err("expected a literal attribute string")
+            };
+            value = decoded;
+        }
+    } else {
+        let mut is_path = true;
+        for index in start..tokens.len() {
+            let expected = if (index - start) % 2 == 0 {
+                lexer::TokenKind::Ident
+            } else {
+                lexer::TokenKind::ColonColon
+            };
+            if tokens[index].kind != expected {
+                is_path = false;
+            }
+        }
+        if is_path && (tokens.len() - start) % 2 == 1 {
+            kind = "path";
+            value = "";
+            for index in start..tokens.len() {
+                value = value + tokens[index].text;
+            }
+        }
+    }
+    Result::Ok(
+        StructuredArgument {
+            name,
+            kind,
+            text: value,
+            source,
+            value_start: attribute.span.start + tokens[start].start,
+            span: ast::Span {
+                start: attribute.span.start + tokens[0].start,
+                end: attribute.span.start + tokens[tokens.len() - 1].end,
+            },
+        },
+    )
+}
+
+fn structured_arguments(attribute: ast::Attribute) -> Result[Vec[StructuredArgument], string] {
+    let result: Vec[StructuredArgument] = Vec::new();
+    if !attribute.has_argument_list {
+        return Result::Ok(result)
+    }
+    let tokens: Vec[lexer::Token] = Vec::new();
+    let mut started = false;
+    let delimiters: Vec[lexer::TokenKind] = Vec::new();
+    for token in lexer::lex(attribute.text) {
+        if token.error.is_some() {
+            return Result::Err("invalid token in attribute")
+        }
+        if token.kind == lexer::TokenKind::Whitespace || token.kind == lexer::TokenKind::Comment {
+            continue
+        }
+        if !started {
+            if token.kind == lexer::TokenKind::LParen {
+                started = true;
+            }
+            continue
+        }
+        if token.kind == lexer::TokenKind::Pipe {
+            if !delimiters.is_empty() && delimiters[delimiters.len() - 1] == lexer::TokenKind::Pipe {
+                let _ = delimiters.pop();
+            } else if tokens.is_empty()
+                || (tokens.len() == 2 && tokens[1].kind == lexer::TokenKind::Eq) {
+                delimiters.push(lexer::TokenKind::Pipe);
+            }
+            tokens.push(token);
+            continue
+        }
+        if delimiters.is_empty()
+            && (token.kind == lexer::TokenKind::Comma || token.kind == lexer::TokenKind::RParen) {
+            if !tokens.is_empty() {
+                result.push(structured_argument_from_tokens(attribute, tokens)?);
+                tokens.clear();
+            } else if token.kind == lexer::TokenKind::Comma {
+                return Result::Err("empty attribute argument")
+            }
+            if token.kind == lexer::TokenKind::RParen {
+                return Result::Ok(result)
+            }
+            continue
+        }
+        if token.kind == lexer::TokenKind::LParen {
+            delimiters.push(lexer::TokenKind::RParen)
+        } else if token.kind == lexer::TokenKind::LBracket {
+            delimiters.push(lexer::TokenKind::RBracket)
+        } else if token.kind == lexer::TokenKind::LBrace {
+            delimiters.push(lexer::TokenKind::RBrace)
+        } else if token.kind == lexer::TokenKind::RParen || token.kind == lexer::TokenKind::RBracket
+            || token.kind == lexer::TokenKind::RBrace {
+            if delimiters.is_empty() || delimiters[delimiters.len() - 1] != token.kind {
+                return Result::Err("mismatched delimiter in attribute")
+            }
+            let _ = delimiters.pop();
+        }
+        tokens.push(token);
+    }
+    Result::Err("unterminated attribute arguments")
+}
+
+fn structured_argument(attribute: ast::Attribute, index: isize) -> Result[
+    StructuredArgument,
+    string,
+] {
+    let args = structured_arguments(attribute)?;
+    let index = checked_index(index, args.len(), "meta attribute argument")?;
+    Result::Ok(args[index])
+}
+
+fn attribute_syntax_intrinsic(state: DeriveState, name: string, args: Vec[ctir::CtValue]) -> Result[
+    ctir::CtValue,
+    string,
+] {
+    let attribute = attribute_handle(state, args, 0)?;
+    let argument = structured_argument(attribute, int_argument(args, 1)?)?;
+    let result = if name == "meta_attribute_argument_expr" {
+        ast::lower_expression_fragment(
+            parser::parse_expression_fragment(argument.source),
+            argument.value_start,
+        ).map(|value| push_expr(state, value))
+    } else {
+        ast::lower_type_fragment(parser::parse_type_fragment(argument.source), argument.value_start).map(
+            |value| push_type(state, value),
+        )
+    };
+    if result.is_err() {
+        state.error_span.set(Option::Some(argument.span))
+    }
+    result
+}
