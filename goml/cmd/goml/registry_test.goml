@@ -1,0 +1,174 @@
+package main;
+
+use module::test_support;
+use std::fs;
+use std::process;
+use std::testing;
+
+fn commit_registry_fixture(directory: string) -> () {
+    registry_command("git", Vec::from_array(["add", "."]), directory);
+    registry_command(
+        "git",
+        Vec::from_array(
+            [
+                "-c",
+                "user.name=goml",
+                "-c",
+                "user.email=goml@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        ),
+        directory,
+    );
+}
+
+fn git_module(root: string, name: string, dependencies: string, source: string) -> string {
+    let directory = root + "/" + name;
+    test_support::write_file(
+        directory + "/goml.toml",
+        "[module]\npath = \"demo::" + name + "\"\n" + dependencies,
+    );
+    test_support::write_file(directory + "/lib.goml", source);
+    registry_command("git", Vec::from_array(["init"]), directory);
+    commit_registry_fixture(directory);
+    directory
+}
+
+fn central_registry_command(root: string, arguments: Vec[string]) -> process::Output {
+    testing::expect_ok(
+        process::Command::new(test_support::goml_binary()).args(arguments).env(
+            "GOML_HOME",
+            root + "/home",
+        ).env("GOML_WORKSPACE", "off").env("GIT_CONFIG_COUNT", "1").env(
+            "GIT_CONFIG_KEY_0",
+            "url." + root + "/index.insteadOf",
+        ).env("GIT_CONFIG_VALUE_0", "https://github.com/gomlang/registry.git").current_dir(
+            root + "/app",
+        ).output_structured(),
+        "registry command",
+    )
+}
+
+#[test]
+fn default_registry_fetches_required_git_sources_and_updates_cached_builds() -> () {
+    let root = test_support::workspace("central_registry_git_sources");
+    let leaf = git_module(root, "leaf", "", "package leaf; pub fn value() -> isize { 7 }");
+    let parent = git_module(
+        root,
+        "parent",
+        "[dependencies]\n\"demo::leaf\" = true\n[dev-dependencies]\n\"demo::missing\" = true\n",
+        "package parent; use demo::leaf; pub fn value() -> isize { leaf::value() }",
+    );
+    test_support::write_file(
+        root + "/index/index.toml",
+        "[modules.\"demo::parent\"]\ngit = \"" + parent + "\"\n[modules.\"demo::leaf\"]\ngit = \""
+            + leaf
+            + "\"\n[modules.\"demo::unused\"]\ngit = \"file:///missing-unused-source\"\n",
+    );
+    registry_command("git", Vec::from_array(["init"]), root + "/index");
+    commit_registry_fixture(root + "/index");
+    test_support::write_file(
+        root + "/app/goml.toml",
+        "[module]\npath = \"demo::app\"\n[dependencies]\n\"demo::parent\" = { path = \"../parent\" }\n",
+    );
+    test_support::write_file(
+        root + "/app/main.goml",
+        "package main; use demo::parent; fn main() -> () { println(parent::value()) }",
+    );
+    test_support::assert_success(
+        central_registry_command(root, Vec::from_array(["add", "demo::parent"])),
+    );
+    let manifest = test_support::read_file(root + "/app/goml.toml");
+    test_support::assert_contains(manifest, "\"demo::parent\" = true");
+    testing::assert(fs::is_file(root + "/home/cache/registry/sources/demo/leaf/goml.toml"));
+    testing::assert(!fs::exists(root + "/home/cache/registry/sources/demo/unused"));
+    testing::assert(!fs::exists(root + "/home/cache/registry/sources/demo/missing"));
+    let run = Vec::from_array(["run", "--compiler", test_support::gomlc_binary()]);
+    let first = central_registry_command(root, run);
+    test_support::assert_success(first);
+    testing::assert_eq(test_support::stdout(first), "7\n");
+    test_support::write_file(leaf + "/lib.goml", "package leaf; pub fn value() -> isize { 9 }");
+    commit_registry_fixture(leaf);
+    let cached = central_registry_command(root, run);
+    test_support::assert_success(cached);
+    testing::assert_eq(test_support::stdout(cached), "7\n");
+    test_support::assert_success(central_registry_command(root, Vec::from_array(["update"])));
+    let updated = central_registry_command(root, run);
+    test_support::assert_success(updated);
+    testing::assert_eq(test_support::stdout(updated), "9\n");
+    testing::assert(
+        fs::is_file(root + "/app/_artifact/build/deps/demo/leaf/pkg/demo/leaf/leaf.core"),
+    );
+    let versioned = central_registry_command(root, Vec::from_array(["add", "demo::parent@1.0.0"]));
+    test_support::assert_failure(versioned);
+    test_support::assert_contains(test_support::stderr(versioned), "unversioned");
+    testing::assert_eq(test_support::read_file(root + "/app/goml.toml"), manifest);
+    let alternate = git_module(root, "alternate", "", "package alternate;");
+    test_support::write_file(
+        root + "/index/index.toml",
+        "[modules.\"demo::parent\"]\ngit = \"" + parent + "\"\n[modules.\"demo::leaf\"]\ngit = \""
+            + alternate
+            + "\"\n",
+    );
+    commit_registry_fixture(root + "/index");
+    let changed = central_registry_command(root, Vec::from_array(["update"]));
+    test_support::assert_failure(changed);
+    test_support::assert_contains(test_support::stderr(changed), "registry source changed");
+    let stale = central_registry_command(root, run);
+    test_support::assert_failure(stale);
+    test_support::assert_contains(test_support::stderr(stale), "registry source changed");
+}
+
+#[test]
+fn registry_reports_missing_sources_and_identity_mismatches_without_editing_manifest() -> () {
+    let root = test_support::workspace("central_registry_errors");
+    let wrong = git_module(root, "wrong", "", "package wrong;");
+    test_support::write_file(
+        root + "/index/index.toml",
+        "[modules.\"demo::missing\"]\ngit = \"" + root
+            + "/absent\"\n[modules.\"demo::wanted\"]\ngit = \""
+            + wrong
+            + "\"\n",
+    );
+    registry_command("git", Vec::from_array(["init"]), root + "/index");
+    commit_registry_fixture(root + "/index");
+    let manifest = "[module]\npath = \"demo::app\"\n";
+    test_support::write_file(root + "/app/goml.toml", manifest);
+    for (name, expected) in Vec::from_array(
+        [
+            ("demo::missing", "git command failed"),
+            ("demo::wanted", "declares module path demo::wrong"),
+            ("demo::unlisted", "not found in registry index"),
+        ],
+    ) {
+        let output = central_registry_command(root, Vec::from_array(["add", name]));
+        test_support::assert_failure(output);
+        test_support::assert_contains(test_support::stderr(output), expected);
+        testing::assert_eq(test_support::read_file(root + "/app/goml.toml"), manifest);
+    }
+    testing::assert(!fs::exists(root + "/home/cache/registry/sources/demo/missing"));
+}
+
+#[test]
+fn registry_configuration_overrides_the_default_index() -> () {
+    let root = test_support::workspace("central_registry_config");
+    let registry = local_registry(root);
+    test_support::write_basic_project(root + "/project", "demo");
+    test_support::write_file(
+        root + "/home/config.toml",
+        "[registry]\ndefault = \"" + registry + "\" # custom index\n",
+    );
+    test_support::assert_success(
+        run_with_home(Vec::from_array(["add", "alice::http"]), root + "/project", root + "/home"),
+    );
+    test_support::assert_contains(
+        test_support::read_file(root + "/project/goml.toml"),
+        "\"alice::http\" = true",
+    );
+    test_support::write_file(root + "/home/config.toml", "[registry]\ndefault = false\n");
+    let output = run_with_home(Vec::from_array(["update"]), root + "/project", root + "/home");
+    test_support::assert_failure(output);
+    test_support::assert_contains(test_support::stderr(output), "registry.default must be a string");
+}
