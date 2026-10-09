@@ -1,0 +1,143 @@
+package registry;
+
+use gomlang::toolchain_manifest::resolver;
+use gomlang::toolchain_manifest as config;
+use module::failure;
+use failure::DriverResult;
+use module::manifest;
+use std::collections;
+use std::crypto::hash;
+use std::crypto::rand;
+use std::error;
+use error::ReportContext;
+use std::fs;
+use std::path;
+use std::process;
+use std::text;
+use std::utf8;
+use utf8::BytesUtf8;
+
+fn git(arguments: Vec[string]) -> Result[string, failure::Failure] {
+    let output = process::Command::new("git").args(arguments).env("GIT_TERMINAL_PROMPT", "0").output_structured().driver_result().context(
+        "run git for registry",
+    )?;
+    if output.status().success() {
+        Result::Ok(text::trim(output.stdout().to_string_utf8().unwrap_or("")))
+    } else {
+        Result::Err(
+            failure::convert(
+                "git command failed: "
+                    + text::trim(output.stderr().to_string_utf8().unwrap_or("<non-UTF-8 output>")),
+            ),
+        )
+    }
+}
+
+pub fn sync_repository(source: string, directory: string, refresh: bool) -> Result[
+    (),
+    failure::Failure,
+] {
+    if fs::exists(directory) {
+        if !fs::is_dir(path::join(directory, ".git")) {
+            return Result::Err(
+                failure::convert("cached registry path " + directory + " is not a git repository"),
+            )
+        }
+        let origin = git(Vec::from_array(["-C", directory, "config", "--get", "remote.origin.url"]))?;
+        if origin != source {
+            return Result::Err(
+                failure::convert(
+                    "registry source changed for " + directory
+                        + "; remove this cache directory and run `goml update`",
+                ),
+            )
+        }
+        if refresh {
+            let _ = git(Vec::from_array(["-C", directory, "pull", "--ff-only"]))?;
+        }
+        fs::write_file_structured(path::join(directory, ".git/goml-registry-source"), source).driver_result()?;
+        return Result::Ok(())
+    }
+    let parent = path::parent(directory).unwrap_or(".");
+    fs::create_dir_all(parent).driver_result()?;
+    let temporary = path::join(parent, ".fetch-" + hash::sha256(rand::bytes(32).driver_result()?));
+    let clone = || {
+        let _ = git(Vec::from_array(["clone", "--depth", "1", "--", source, temporary]))?;
+        fs::write_file_structured(path::join(temporary, ".git/goml-registry-source"), source).driver_result()?;
+        match fs::rename(temporary, directory) {
+            Ok(()) => Result::Ok(()),
+            Err(error) => if fs::is_dir(path::join(directory, ".git")) {
+                Result::Ok(())
+            } else {
+                Result::Err(failure::convert(error))
+            },
+        }
+    };
+    let result = clone();
+    if fs::exists(temporary) {
+        fs::remove_dir_all(temporary).driver_result()?;
+    }
+    result
+}
+
+pub fn fetch_dependencies(module_root: string, root: string, refresh: bool) -> Result[
+    (),
+    failure::Failure,
+] {
+    let module_root = fs::canonicalize(module_root).driver_result()?;
+    let metadata = manifest::load_structured(path::join(module_root, manifest::FILENAME))?;
+    let overrides = manifest::local_overrides(module_root, metadata).driver_result()?;
+    let _ = resolver::resolve_development(
+        RegistryProvider { fetch: true, refresh, fetched: collections::HashSet::new() },
+        module_root,
+        resolver::Manifest {
+            module_path: metadata.module_path,
+            dependencies: metadata.dependencies,
+        },
+        metadata.dev_dependencies,
+        overrides,
+        root,
+    )?;
+    Result::Ok(())
+}
+
+fn with_registry_dependency(dependencies: Vec[config::Dependency], name: string) -> Vec[
+    config::Dependency,
+] {
+    let result = Vec::new();
+    for dependency in dependencies {
+        if dependency.name != name {
+            result.push(dependency);
+        }
+    }
+    result.push(config::Dependency { name, path: Option::None });
+    result
+}
+
+pub fn fetch_dependency(module_root: string, root: string, name: string, development: bool) -> Result[
+    (),
+    failure::Failure,
+] {
+    let module_root = fs::canonicalize(module_root).driver_result()?;
+    let metadata = manifest::load_structured(path::join(module_root, manifest::FILENAME))?;
+    let overrides = manifest::local_overrides(module_root, metadata).driver_result()?;
+    let dependencies = if development {
+        metadata.dependencies
+    } else {
+        with_registry_dependency(metadata.dependencies, name)
+    };
+    let dev_dependencies = if development {
+        with_registry_dependency(metadata.dev_dependencies, name)
+    } else {
+        metadata.dev_dependencies
+    };
+    let _ = resolver::resolve_development(
+        RegistryProvider { fetch: true, refresh: false, fetched: collections::HashSet::new() },
+        module_root,
+        resolver::Manifest { module_path: metadata.module_path, dependencies },
+        dev_dependencies,
+        overrides,
+        root,
+    )?;
+    Result::Ok(())
+}

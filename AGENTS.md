@@ -72,7 +72,7 @@ Run recipes from the repository root; [.justfile](.justfile) is the command refe
 - Cross-package APIs require `pub`. Struct fields and inherent methods are private by default; trait implementation methods inherit trait visibility and must not declare `pub`.
 - Interfaces and dependency environments expose public API while retaining metadata needed to use it. Current-package codegen must retain private helpers and the full internal environment.
 - Executables come from `package main` packages with `fn main()`. A direct `tests/` directory is one black-box test package for its parent and declares `package tests`; nested test suites are unsupported.
-- Dependencies belong only in the module-root manifest. Registry resolution reads the authoritative `index.toml`; published versions are immutable. Strict `X.Y.Z` requirements are minimums resolved through MVS, and there is no `goml.lock`.
+- Dependencies belong only in the module-root manifest. The default registry is `https://github.com/gomlang/registry.git`. Its authoritative `index.toml` maps modules to Git sources. Dependencies use `true` or local paths; package sources follow default branches without version selection or `goml.lock`. Legacy version strings are accepted only as unversioned migration input.
 - Global state defaults to `~/.goml`, overridden by `GOML_HOME`. Dependency sources stay in its `cache/registry`; generated artifacts go under the project's configured target directory, defaulting to `_artifact/`.
 
 ## Tests and Golden Files

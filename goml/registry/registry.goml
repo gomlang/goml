@@ -4,7 +4,7 @@ use module::failure;
 use failure::DriverResult;
 use module::manifest;
 use gomlang::toolchain_manifest::resolver;
-use std::collections;
+use gomlang::toolchain_manifest::registry as index;
 use std::env;
 use std::error;
 use error::ReportContext;
@@ -12,215 +12,31 @@ use std::fs;
 use std::path;
 use std::text;
 
-pub type SemVersion = resolver::SemVersion;
-
-struct RegistryEntry {
-    name: string,
-    latest: string,
-    versions: Vec[string],
-}
-
 pub type ResolvedModule = resolver::ResolvedModule;
 
-pub fn parse_sem_version(value: string) -> Result[SemVersion, failure::Failure] {
-    resolver::parse_sem_version(value).ok_or(failure::convert("invalid semver `" + value + "`"))
+pub fn validate_coordinate(value: string) -> Result[(), failure::Failure] {
+    index::validate_coordinate(value).driver_result()
 }
 
-fn quoted_values(value: string) -> Vec[string] {
-    let result: Vec[string] = Vec::new();
-    let mut start: Option[isize] = Option::None;
-    for index in 0..value.byte_len() {
-        if value.byte_get(index) == b'"' {
-            match start {
-                Some(offset) => {
-                    result.push(value.byte_slice(offset, index));
-                    start = Option::None;
-                },
-                None => {
-                    start = Option::Some(index + 1);
-                },
-            }
-        }
-    }
-    result
-}
-
-fn load_index(root: string) -> Result[
-    collections::IndexMap[string, RegistryEntry],
-    failure::Failure,
-] {
+fn load_index(root: string) -> Result[Vec[index::Entry], failure::Failure] {
     let source = fs::read_file_structured(path::join(root, "index.toml")).driver_result().with_context(
         || "read registry index " + root,
     )?;
-    let entries: collections::IndexMap[string, RegistryEntry] = collections::IndexMap::new();
-    let mut current: Option[string] = Option::None;
-    for original in text::lines(source) {
-        let line = text::trim(original);
-        if line.starts_with("[modules.") {
-            let values = quoted_values(line);
-            if values.len() != 1 {
-                return Result::Err(failure::convert("invalid registry module table " + line))
-            } else {
-                let name = values[0];
-                if entries.contains(name) {
-                    return Result::Err(failure::convert("duplicate registry module table " + name))
-                }
-                current = Option::Some(name);
-                let _ = entries.insert(
-                    name,
-                    RegistryEntry { name, latest: "", versions: Vec::new() },
-                );
-            }
-        } else {
-            if let Some(name) = current {
-                if line.starts_with("latest") {
-                    let values = quoted_values(line);
-                    if values.len() != 1 {
-                        return Result::Err(failure::convert("invalid registry latest value"))
-                    } else {
-                        let Some(entry) = entries.get(name) else {
-                            return Result::Err(
-                                failure::convert("invalid registry module table " + name),
-                            )
-                        };
-                        let _ = entries.insert(
-                            name,
-                            RegistryEntry {
-                                name: entry.name,
-                                latest: values[0],
-                                versions: entry.versions,
-                            },
-                        );
-                    }
-                } else if line.starts_with("versions") {
-                    let Some(entry) = entries.get(name) else {
-                        return Result::Err(
-                            failure::convert("invalid registry module table " + name),
-                        )
-                    };
-                    let _ = entries.insert(
-                        name,
-                        RegistryEntry {
-                            name: entry.name,
-                            latest: entry.latest,
-                            versions: quoted_values(line),
-                        },
-                    );
-                }
-            }
-        }
-    }
-    Result::Ok(entries)
+    index::parse(source).driver_result()
 }
 
-fn valid_identifier(value: string) -> bool {
-    if value.byte_len() == 0 {
-        return false
-    }
-    let first = value.byte_get(0);
-    if !((first >= b'A' && first <= b'Z') || (first >= b'a' && first <= b'z') || first == b'_') {
-        return false
-    }
-    for index in 1..value.byte_len() {
-        let byte = value.byte_get(index);
-        if (byte >= b'0' && byte <= b'9') || (byte >= b'A' && byte <= b'Z')
-            || (byte >= b'a' && byte <= b'z')
-            || byte == b'_' {} else {
-            return false
-        }
-    }
-    true
-}
-
-pub fn validate_coordinate(value: string) -> Result[(), failure::Failure] {
-    let parts = text::split(value, "::");
-    if parts.len() != 2 || !valid_identifier(parts[0]) || !valid_identifier(parts[1]) {
-        Result::Err(
-            failure::convert("invalid module coordinate `" + value + "`: expected owner::module"),
-        )
-    } else if parts[0] == "std" {
-        Result::Err(
-            failure::convert("invalid module coordinate `" + value + "`: owner std is reserved"),
-        )
-    } else {
-        Result::Ok(())
-    }
-}
-
-fn module_directory_unchecked(root: string, name: string, version: string) -> string {
-    let parts = text::split(name, "::");
-    path::join(path::join(path::join(root, parts[0]), parts[1]), version)
-}
-
-pub fn module_directory(root: string, name: string, version: string) -> Result[
-    string,
-    failure::Failure,
-] {
-    match validate_coordinate(name) {
-        Ok(()) => Result::Ok(module_directory_unchecked(root, name, version)),
-        Err(message) => Result::Err(message),
-    }
+pub fn module_directory(root: string, name: string) -> Result[string, failure::Failure] {
+    let entry = index::find(load_index(root)?, name).driver_result()?;
+    index::cached_directory(root, entry).driver_result()
 }
 
 pub fn validate(root: string) -> Result[(), failure::Failure] {
-    let entries = load_index(root)?;
-    for (_, entry) in entries {
-        validate_coordinate(entry.name)?;
-        let latest = parse_sem_version(entry.latest)?;
-        let mut latest_matches = false;
-        for version in entry.versions {
-            let parsed = parse_sem_version(version)?;
-            if resolver::compare_versions(parsed, latest).is_eq() {
-                latest_matches = true;
-            }
-            let directory = module_directory_unchecked(root, entry.name, version);
-            if !fs::is_dir(directory) {
-                return Result::Err(
-                    failure::convert(
-                        "registry index references missing module directory: " + entry.name + "@"
-                            + version,
-                    ),
-                )
-            }
-        }
-        if !latest_matches {
-            return Result::Err(
-                failure::convert(
-                    "registry index latest version " + entry.latest + " for " + entry.name
-                        + " is not listed in versions",
-                ),
-            )
+    for entry in load_index(root)? {
+        if entry.path.is_some() {
+            let _ = index::cached_directory(root, entry).driver_result()?;
         }
     }
     Result::Ok(())
-}
-
-pub fn latest_version(root: string, name: string) -> Result[string, failure::Failure] {
-    validate_coordinate(name)?;
-    let entries = load_index(root)?;
-    match entries.get(name) {
-        Some(entry) => parse_sem_version(entry.latest).map(|_| entry.latest),
-        None => Result::Err(failure::convert("module " + name + " not found in registry index")),
-    }
-}
-
-pub fn select_version(root: string, name: string, minimum: string) -> Result[
-    string,
-    failure::Failure,
-] {
-    validate_coordinate(name)?;
-    let minimum_value = parse_sem_version(minimum)?;
-    let entries = load_index(root)?;
-    let Some(entry) = entries.get(name) else {
-        return Result::Err(failure::convert("module " + name + " not found in registry index"))
-    };
-    resolver::minimum_version(
-        entry.versions,
-        minimum_value,
-        |version| "invalid semver `" + version + "`",
-    ).driver_result()?.ok_or(
-        failure::convert("registry has no version for " + name + " satisfying >= " + minimum),
-    )
 }
 
 pub fn cached_root() -> Result[string, failure::Failure] {
@@ -273,7 +89,7 @@ pub fn resolve_at_with_development(module_root: string, root: string, developmen
     };
     if development {
         resolver::resolve_development(
-            RegistryProvider {},
+            cached_provider(),
             module_root,
             metadata,
             root_manifest.dev_dependencies,
@@ -281,7 +97,7 @@ pub fn resolve_at_with_development(module_root: string, root: string, developmen
             root,
         )
     } else {
-        resolver::resolve(RegistryProvider {}, module_root, metadata, overrides, root)
+        resolver::resolve(cached_provider(), module_root, metadata, overrides, root)
     }
 }
 
@@ -313,5 +129,5 @@ pub fn artifact_prefix(module: ResolvedModule) -> string {
     for part in text::split(module.name, "::") {
         result = path::join(result, part);
     }
-    path::join(path::join(result, module.version), "pkg")
+    path::join(result, "pkg")
 }

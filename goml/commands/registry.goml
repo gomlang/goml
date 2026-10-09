@@ -4,92 +4,57 @@ use module::failure;
 use failure::DriverResult;
 use module::manifest;
 use module::registry;
-use std::bytes;
+use gomlang::toolchain_manifest as config;
+use gomlang::toolchain_manifest::registry as index;
+use std::toml;
 use std::env;
-use std::error;
-use error::ReportContext;
 use std::fs;
 use std::io;
 use std::path;
-use std::process;
 use std::text;
-use std::utf8;
-use utf8::BytesUtf8;
-
-const REGISTRY_SECTION: string = "registry";
-
-const DEFAULT_REGISTRY_KEY: string = "default";
 
 const LOCAL_REGISTRY_OPTION: string = "--local-registry";
 
-fn command_output(value: bytes::Bytes) -> string {
-    value.to_string_utf8().unwrap_or("<non-UTF-8 output>")
-}
-
-fn run_git(arguments: Vec[string]) -> Result[(), failure::Failure] {
-    let command = process::Command::new("git");
-    for argument in arguments {
-        let _ = command.arg(argument);
-    }
-    let output = command.output_structured().driver_result().context("run git for registry")?;
-    if process::ExitStatus::success(process::Output::status(output)) {
-        Result::Ok(())
-    } else {
-        let message = text::trim(command_output(process::Output::stderr(output)));
-        if message == "" {
-            Result::Err(failure::convert("git command failed"))
-        } else {
-            Result::Err(failure::convert("git command failed: " + message))
-        }
-    }
-}
-
-fn config_path() -> Result[string, failure::Failure] {
-    home_directory().driver_result().map(|home| path::join(home, "config.toml"))
-}
-
 fn config_registry_source() -> Result[string, failure::Failure] {
-    let config = config_path()?;
-    if !fs::is_file(config) {
-        ensure_home_layout().driver_result()?;
-        fs::write_file_structured(
-            config,
-            \\[registry]
-            \\default = ""
-            \\
-            ,
-        ).driver_result()?
+    let config_path = path::join(home_directory().driver_result()?, "config.toml");
+    if !fs::is_file(config_path) {
+        return Result::Ok(index::DEFAULT_SOURCE)
     }
-    let source = fs::read_file_structured(config).driver_result()?;
-    let mut section = "";
-    for original in text::lines(source) {
-        let line = text::trim(original);
-        if line.starts_with("[") && line.ends_with("]") {
-            section = line.byte_slice(1, line.byte_len() - 1);
-        } else if section == REGISTRY_SECTION && line.starts_with(DEFAULT_REGISTRY_KEY) {
-            let mut equals = -1;
-            for index in 0..line.byte_len() {
-                if equals < 0 && line.byte_get(index) == b'=' {
-                    equals = index;
-                }
+    let source = fs::read_file_structured(config_path).driver_result()?;
+    let document = config::parse_document(source).driver_result()?;
+    match toml::field(document, "registry") {
+        Some(section) => {
+            let _ = toml::as_table(section).ok_or(failure::convert("registry must be a table"))?;
+            match toml::field(section, "default") {
+                Some(value) => {
+                    let value = toml::as_string(value).ok_or(
+                        failure::convert("registry.default must be a string"),
+                    )?;
+                    Result::Ok(
+                        if value == "" {
+                            index::DEFAULT_SOURCE
+                        } else {
+                            value
+                        },
+                    )
+                },
+                None => Result::Ok(index::DEFAULT_SOURCE),
             }
-            if equals >= 0 {
-                let value = text::trim(line.byte_slice(equals + 1, line.byte_len()));
-                if value.byte_len() >= 2 && value.byte_get(0) == b'"'
-                    && value.byte_get(value.byte_len() - 1) == b'"' {
-                    let value = value.byte_slice(1, value.byte_len() - 1);
-                    if value != "" {
-                        return Result::Ok(value)
-                    }
-                }
-            }
-        }
+        },
+        None => Result::Ok(index::DEFAULT_SOURCE),
     }
-    Result::Err(
-        failure::convert(
-            f"registry.default is not configured in {config}; set it or use --local-registry",
-        ),
-    )
+}
+
+fn sync_registry(local: Option[string], refresh: bool) -> Result[string, failure::Failure] {
+    let source = match local {
+        Some(value) => fs::canonicalize(value).driver_result()?,
+        None => config_registry_source()?,
+    };
+    ensure_home_layout().driver_result()?;
+    let cache = registry::cached_root()?;
+    registry::sync_repository(source, cache, refresh)?;
+    registry::validate(cache)?;
+    Result::Ok(cache)
 }
 
 fn option_local_registry(args: Vec[string], index: isize) -> Result[
@@ -139,25 +104,22 @@ fn registry_argument(args: Vec[string]) -> Result[Option[string], failure::Failu
 }
 
 pub fn update_registry(args: Vec[string]) -> Result[(), failure::Failure] {
-    let local = registry_argument(args)?;
-    let source = match local {
-        Some(value) => value,
-        None => config_registry_source()?,
-    };
-    ensure_home_layout().driver_result()?;
-    let cache = registry::cached_root()?;
-    if fs::exists(cache) {
-        if !fs::is_dir(path::join(cache, ".git")) {
-            return Result::Err(
-                failure::convert(f"cached registry path {cache} exists but is not a git repository"),
-            )
+    let cache = sync_registry(registry_argument(args)?, true)?;
+    let mut directory = env::current_dir_structured().driver_result()?;
+    loop {
+        if fs::is_file(path::join(directory, manifest::FILENAME)) {
+            registry::fetch_dependencies(directory, cache, true)?;
+            break;
         }
-        run_git(Vec::from_array(["-C", cache, "remote", "set-url", "origin", source]))?;
-        run_git(Vec::from_array(["-C", cache, "pull", "--ff-only"]))?
-    } else {
-        run_git(Vec::from_array(["clone", source, cache]))?
+        match path::parent(directory) {
+            Some(parent) => if parent == directory {
+                break;
+            } else {
+                directory = parent;
+            },
+            None => break,
+        }
     }
-    registry::validate(cache)?;
     io::println("updated registry cache at " + cache);
     Result::Ok(())
 }
@@ -221,11 +183,11 @@ fn section_name(line: string) -> Option[string] {
     Option::None
 }
 
-fn upsert_dependency(manifest_path: string, name: string, version: string, section: string) -> Result[
+fn upsert_dependency(manifest_path: string, name: string, section: string) -> Result[
     (),
     failure::Failure,
 ] {
-    upsert_dependency_entry(manifest_path, name, f"\"{name}\" = \"{version}\"", section)
+    upsert_dependency_entry(manifest_path, name, f"\"{name}\" = true", section)
 }
 
 fn upsert_dependency_entry(
@@ -333,24 +295,6 @@ fn remove_dependency_line(manifest_path: string, name: string, selected_section:
     fs::write_file_structured(manifest_path, text::join(result, "\n") + "\n").driver_result()
 }
 
-fn command_registry_root(local: Option[string]) -> Result[string, failure::Failure] {
-    let root = match local {
-        Some(value) => value,
-        None => registry::cached_root()?,
-    };
-    if !fs::is_dir(root) {
-        return Result::Err(
-            failure::convert(
-                f"registry cache not found at {root}; run `goml update` or use --local-registry",
-            ),
-        )
-    }
-    match registry::validate(root) {
-        Ok(()) => Result::Ok(root),
-        Err(message) => Result::Err(message),
-    }
-}
-
 fn dependency_command_args(args: Vec[string]) -> Result[(string, Option[string]), failure::Failure] {
     let mut dependency: Option[string] = Option::None;
     let mut local: Option[string] = Option::None;
@@ -396,21 +340,22 @@ pub fn add_dependency(args: Vec[string]) -> Result[(), failure::Failure] {
     let parsed = dependency_command_args(args)?;
     let spec = parsed.0;
     let local = parsed.1;
-    let parts = text::split(spec, "@");
-    if parts.len() > 2 {
-        return Result::Err(failure::convert("invalid dependency " + spec))
+    if spec.contains("@") {
+        return Result::Err(
+            failure::convert("dependencies are unversioned; use the module name without @version"),
+        )
     }
-    let name = parts[0];
+    let name = spec;
     registry::validate_coordinate(name)?;
-    let root = command_registry_root(local)?;
-    let version = if parts.len() == 2 {
-        registry::select_version(root, name, parts[1])?
-    } else {
-        registry::latest_version(root, name)?
-    };
     let module = module_root()?;
-    upsert_dependency(path::join(module, manifest::FILENAME), name, version, section)?;
-    io::println(f"added {name} = {version}");
+    let metadata = manifest::load_structured(path::join(module, manifest::FILENAME))?;
+    if metadata.module_path == name {
+        return Result::Err(failure::convert("a module cannot depend on itself"))
+    }
+    let root = sync_registry(local, false)?;
+    registry::fetch_dependency(module, root, name, section == "dev-dependencies")?;
+    upsert_dependency(path::join(module, manifest::FILENAME), name, section)?;
+    io::println("added " + name);
     Result::Ok(())
 }
 

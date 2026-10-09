@@ -1,6 +1,6 @@
 # goml project driver
 
-`goml` is the self-hosted project driver. It provides project creation, package discovery, check/build/run/test plans, named examples, isolated downstream verification, dependency resolution, registry cache management, incremental artifact fingerprints, native linking, and parallel test execution.
+`goml` is the self-hosted project driver. It provides project creation, package discovery, check/build/run/test plans, named examples, dependency resolution, registry cache management, incremental artifact fingerprints, native linking, and parallel test execution.
 
 See [repository development](../README.md#development) for requirements,
 toolchain builds and repository checks.
@@ -34,18 +34,15 @@ Package-management commands are:
 ```sh
 goml update
 goml add owner::module
-goml add owner::module@1.2.3
 goml add owner::module --path ../module
 goml add owner::test_support --dev
 goml remove owner::module
 ```
 
-`update`, `add`, and `remove` accept `--local-registry <path>`. Registry state is stored under `$GOML_HOME/cache/registry`, defaulting to `~/.goml/cache/registry`.
+The default index is [gomlang/registry](https://github.com/gomlang/registry). Dependencies use `"owner::module" = true`; Git sources follow their default branch without version selection. `add` fetches required sources, and `update` refreshes the current module's normal and development dependencies. Builds and LSP queries read the local cache. Registry state is stored under `$GOML_HOME/cache/registry`, defaulting to `~/.goml/cache/registry`, with source checkouts under `sources/<owner>/<module>/`. Override the index through `[registry].default` in the home configuration or `--local-registry <path>` on `update`/`add`. See the [registry documentation](../docs/goml.md#package-registry) for migration and local fixtures.
 
-Local path dependencies and root `[replace]` entries support simultaneous library and application development. A `goml.work` file with `[workspace].members` makes declared member dependencies resolve from their working trees. Use `--workspace` for all-member check/build/test/verify/fmt/doc/clean, or `-p owner::module` to select one member. See the language guide's module section for precedence, source validation and `GOML_WORKSPACE`.
+Local path dependencies and root `[replace]` entries support simultaneous library and application development. A `goml.work` file with `[workspace].members` makes declared member dependencies resolve from their working trees. Use `--workspace` for all-member check/build/test/fmt/doc/clean, or `-p owner::module` to select one member. See the language guide's module section for precedence, source validation and `GOML_WORKSPACE`.
 
 CLI integration tests live in `cmd/goml/*_test.goml`, with shared helpers in `test_support/`; other packages also contain their own unit tests. Their isolated integration workspaces are written below `goml/_artifact/test-work` relative to the repository root.
 
 `[dev-dependencies]` contains test and example dependencies without exposing them to production code or downstream dependents. Put executable examples in `examples/<name>/main.goml`, sharing the root manifest. Use `goml run --example <name>`, `goml build --examples`, or `goml test --example <name>`; ordinary `goml test` also builds and tests all examples.
-
-`goml verify` builds and tests examples as independent modules using a content-addressed, isolated registry snapshot under `_artifact/verify/`. Use canonical imports in these examples. Special module configurations live in `testdata/downstream/<name>/goml.toml`; `--examples` skips those fixtures. Verification accepts test filters/options and `--dry-run`. See the [language guide](../docs/goml.md#examples-and-downstream-verification) for snapshot contents, native configuration and path semantics.

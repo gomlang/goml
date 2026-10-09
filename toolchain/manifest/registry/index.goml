@@ -1,0 +1,131 @@
+package registry;
+
+use gomlang::toolchain_manifest as config;
+use std::fs;
+use std::path;
+use std::toml;
+
+pub const DEFAULT_SOURCE: string = "https://github.com/gomlang/registry.git";
+
+pub struct Entry {
+    pub name: string,
+    pub git: Option[string],
+    pub path: Option[string],
+}
+
+fn valid_identifier(value: string) -> bool {
+    if value == "" {
+        return false
+    }
+    let first = value.byte_get(0);
+    if !((first >= b'A' && first <= b'Z') || (first >= b'a' && first <= b'z') || first == b'_') {
+        return false
+    }
+    for byte in value.to_bytes() {
+        if !((byte >= b'A' && byte <= b'Z') || (byte >= b'a' && byte <= b'z')
+            || (byte >= b'0' && byte <= b'9')
+            || byte == b'_') {
+            return false
+        }
+    }
+    true
+}
+
+pub fn validate_coordinate(value: string) -> Result[(), string] {
+    let parts = value.split("::");
+    if parts.len() != 2 || !valid_identifier(parts[0]) || !valid_identifier(parts[1]) {
+        return Result::Err("invalid module coordinate `" + value + "`: expected owner::module")
+    }
+    if parts[0] == "std" || parts[0] == "builtin" || parts[0] == "prelude" {
+        return Result::Err("invalid module coordinate `" + value + "`: reserved owner")
+    }
+    Result::Ok(())
+}
+
+fn validate_path(value: string) -> Result[(), string] {
+    if value == "" || path::is_absolute(value) {
+        return Result::Err("registry path must be a non-empty relative path")
+    }
+    for segment in value.replace("\\", "/").split("/") {
+        if segment == ".." || segment == ".git" {
+            return Result::Err("registry path must stay inside the source tree")
+        }
+    }
+    Result::Ok(())
+}
+
+pub fn parse(source: string) -> Result[Vec[Entry], string] {
+    let document = config::parse_document(source)?;
+    let table = toml::field(document, "modules").and_then(toml::as_table).ok_or(
+        "registry index requires a modules table",
+    )?;
+    let result = Vec::new();
+    for (name, value) in table {
+        validate_coordinate(name)?;
+        let fields = toml::as_table(value).ok_or("registry module must be a table: " + name)?;
+        let mut git = Option::None;
+        let mut local = Option::None;
+        for (key, value) in fields {
+            let value = toml::as_string(value).ok_or("registry " + key + " must be a string")?;
+            match key {
+                "git" => {
+                    if value == "" || value.starts_with("-") {
+                        return Result::Err("invalid registry git source for " + name)
+                    }
+                    git = Option::Some(value);
+                },
+                "path" => {
+                    validate_path(value)?;
+                    local = Option::Some(value);
+                },
+                _ => return Result::Err("unknown registry field " + key + "; use git or path"),
+            }
+        }
+        if git.is_some() == local.is_some() {
+            return Result::Err("registry module " + name + " requires exactly one of git or path")
+        }
+        result.push(Entry { name, git, path: local });
+    }
+    Result::Ok(result)
+}
+
+pub fn find(entries: Vec[Entry], name: string) -> Result[Entry, string] {
+    validate_coordinate(name)?;
+    for entry in entries {
+        if entry.name == name {
+            return Result::Ok(entry)
+        }
+    }
+    Result::Err("module " + name + " not found in registry index")
+}
+
+pub fn directory(root: string, entry: Entry) -> string {
+    match entry.path {
+        Some(value) => path::join(root, value),
+        None => path::join(path::join(root, "sources"), entry.name.replace("::", "/")),
+    }
+}
+
+pub fn cached_directory(root: string, entry: Entry) -> Result[string, string] {
+    let directory = directory(root, entry);
+    if !fs::is_file(path::join(directory, config::FILENAME)) {
+        return Result::Err("module " + entry.name + " is not cached; run `goml update`")
+    }
+    let canonical_root = fs::canonicalize(root).map_err(|error| error.to_string())?;
+    let canonical_directory = fs::canonicalize(directory).map_err(|error| error.to_string())?;
+    if !canonical_directory.starts_with(canonical_root + "/") {
+        return Result::Err("registry module is outside the source tree: " + entry.name)
+    }
+    if let Some(source) = entry.git {
+        let cached_source = fs::read_file_structured(
+            path::join(directory, ".git/goml-registry-source"),
+        ).map_err(|_| "missing registry source metadata for " + entry.name + "; run `goml update`")?;
+        if cached_source != source {
+            return Result::Err(
+                "registry source changed for " + entry.name + "; remove " + directory
+                    + " and run `goml update`",
+            )
+        }
+    }
+    Result::Ok(canonical_directory)
+}
