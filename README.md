@@ -50,6 +50,8 @@ The root `goml.work` groups `gomlc`, `goml`, and the internal `toolchain/manifes
 
 Explore [gomlc/testdata/pipeline](gomlc/testdata/pipeline) for source programs and every compiler-stage golden file. Use `just verify-golden` to check the corpus or `just update-golden` to regenerate it through the self-hosted compiler.
 
+Basic FFI integration fixtures live under [goml/testdata/ffi](goml/testdata/ffi) and are shared by driver regression tests and release smoke checks. Full SQLite and LLVM integrations are maintained in [gomlang/sqlite](https://github.com/gomlang/sqlite) and [gomlang/llvm](https://github.com/gomlang/llvm).
+
 ## Disclaimer
 
 This project is a **personal project** and is **NOT** affiliated with, endorsed by, or connected to any organization.
