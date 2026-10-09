@@ -1,0 +1,1 @@
+This is a public, test-only Ed25519 key and self-signed certificate for localhost. It is valid from 2000-01-01 through 2100-01-01 and includes both TLS server and client authentication usages. The same certificate acts as the explicitly trusted CA for the local regression test. No runtime certificate generation or Go FFI is required.

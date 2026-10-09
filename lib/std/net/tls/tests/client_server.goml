@@ -1,0 +1,207 @@
+package tests;
+
+use std::context;
+use std::net;
+use std::io;
+use std::io::{Read, Write};
+use std::net::tls;
+use std::task;
+use std::testing;
+use std::time;
+
+fn config() -> tls::ClientConfig {
+    tls::ClientConfig::new("localhost").with_ca_pem(certificate().as_slice()).with_alpn(
+        Vec::from_array(["goml-test"]),
+    )
+}
+
+fn check_verification(scope: task::Scope) -> () {
+    let server = start_echo(scope, false);
+    defer server.stop();
+    let port = server.port;
+    testing::assert(tls::connect("127.0.0.1", port, tls::ClientConfig::new("localhost")).is_err());
+    let wrong = tls::ClientConfig::new("wrong.example").with_ca_pem(certificate().as_slice());
+    testing::assert(tls::connect("127.0.0.1", port, wrong).is_err());
+    testing::assert(
+        tls::connect(
+            "127.0.0.1",
+            port,
+            tls::ClientConfig::new("localhost").with_ca_pem("invalid".to_bytes().as_slice()),
+        ).is_err(),
+    );
+    testing::assert(
+        tls::connect("127.0.0.1", port, config().with_minimum_version(tls::Version::Tls13)).is_err(),
+    );
+    let stream = server.connect(config(), "verified TLS connect");
+    let info = testing::expect_ok(stream.connection_info(), "connection info");
+    testing::assert_eq(info.negotiated_protocol, "goml-test");
+    testing::expect_ok(stream.write_all("hello".to_bytes().as_slice()), "write TLS");
+    let buffer = Vec::from_array([0, 0, 0, 0, 0]);
+    testing::expect_ok(stream.read_exact(buffer.as_mut_slice()), "read TLS");
+    testing::assert(buffer == "hello".to_bytes());
+    testing::expect_ok(stream.close(), "close TLS");
+    testing::expect_ok(stream.close(), "idempotent close");
+    testing::assert(stream.read(buffer.as_mut_slice()).is_err());
+    let stream = server.connect(config(), "EOF stream");
+    server.stop();
+    testing::assert_eq(testing::expect_ok(stream.read(buffer.as_mut_slice()), "remote EOF"), 0);
+    let _ = stream.close();
+    println("verification and echo ok");
+}
+
+fn check_mutual(scope: task::Scope) -> () {
+    let server = start_echo(scope, true);
+    defer server.stop();
+    let port = server.port;
+    let buffer = Vec::from_array([0, 0, 0, 0, 0]);
+    testing::assert(tls::connect("127.0.0.1", port, config()).is_err());
+    let mutual = config().with_client_certificate(
+        certificate().as_slice(),
+        private_key().as_slice(),
+    );
+    let stream = server.connect(mutual, "mutual TLS");
+    testing::expect_ok(
+        stream.write_all_with("hello".to_bytes().as_slice(), context::Context::background()),
+        "mutual write",
+    );
+    testing::expect_ok(
+        stream.read_exact_with(buffer.as_mut_slice(), context::Context::background()),
+        "mutual read",
+    );
+    testing::expect_ok(stream.close(), "mutual close");
+    println("mutual TLS ok");
+}
+
+fn check_cancellation(scope: task::Scope) -> () {
+    let server = start_echo(scope, false);
+    defer server.stop();
+    let buffer = Vec::from_array([0, 0, 0, 0, 0]);
+    let stream = server.connect(config(), "cancel stream");
+    context::with_timeout(
+        context::Context::background(),
+        time::Duration::from_milliseconds(20),
+        |ctx, _| {
+            let failure = testing::expect_err(
+                stream.read_with(buffer.as_mut_slice(), ctx),
+                "read deadline",
+            );
+            testing::assert_eq(failure.kind(), io::ErrorKind::TimedOut);
+        },
+    );
+    if stream.is_closed() {
+        testing::assert(stream.read(buffer.as_mut_slice()).is_err());
+    } else {
+        testing::expect_ok(
+            stream.write_all("hello".to_bytes().as_slice()),
+            "preflight timeout write",
+        );
+        testing::expect_ok(stream.read_exact(buffer.as_mut_slice()), "preflight timeout read");
+        testing::assert(buffer == "hello".to_bytes());
+        testing::expect_ok(stream.close(), "preflight timeout close");
+    }
+    let stream = server.connect(config(), "close wakeup stream");
+    context::with_cancel(
+        context::Context::background(),
+        |ctx, cancel| {
+            cancel.cancel();
+            let failure = testing::expect_err(
+                stream.read_with(buffer.as_mut_slice(), ctx),
+                "preflight cancellation",
+            );
+            testing::assert_eq(failure.kind(), io::ErrorKind::Interrupted);
+            testing::assert_eq(stream.is_closed(), false);
+        },
+    );
+    task::scope(
+        |scope| {
+            let ready: Channel[()] = Channel::new(0);
+            let reader = scope.spawn(
+                |_| {
+                    ready.send(());
+                    let failure = testing::expect_err(
+                        stream.read(buffer.as_mut_slice()),
+                        "local close",
+                    );
+                    failure.kind() == io::ErrorKind::BrokenPipe
+                },
+            );
+            let _ = ready.recv();
+            let _ = stream.close();
+            testing::assert_eq(reader.join(), true);
+        },
+    );
+    println("read cancellation and close wakeup ok");
+}
+
+fn check_handshake(scope: task::Scope) -> () {
+    let listener = testing::expect_ok(
+        net::TcpListener::bind(local_address()),
+        "stalled TCP listener",
+    );
+    let port = testing::expect_ok(listener.local_addr(), "stalled listener address").port;
+    let connections: Channel[Vec[net::TcpStream]] = Channel::new(1);
+    connections.send(Vec::new());
+    defer {
+        testing::expect_ok(listener.close(), "close stalled listener");
+        let streams = testing::expect_some(connections.recv(), "stalled server connections");
+        for stream in streams {
+            let _ = stream.close();
+        }
+        connections.send(Vec::new());
+    };
+    let _ = scope.spawn(
+        |_| {
+            loop {
+                match listener.accept() {
+                    Err(_) => break,
+                    Ok((stream, _)) => {
+                        let streams = testing::expect_some(
+                            connections.recv(),
+                            "record stalled connection",
+                        );
+                        if listener.is_closed() {
+                            let _ = stream.close();
+                        } else {
+                            streams.push(stream);
+                        }
+                        connections.send(streams);
+                    },
+                }
+            }
+        },
+    );
+    context::with_timeout(
+        context::Context::background(),
+        time::Duration::from_milliseconds(20),
+        |ctx, _| {
+            let failure = testing::expect_err(
+                tls::connect_with("127.0.0.1", port, config(), ctx),
+                "handshake deadline",
+            );
+            testing::assert_eq(failure.kind(), io::ErrorKind::TimedOut);
+        },
+    );
+    let failure = testing::expect_err(
+        tls::connect(
+            "127.0.0.1",
+            port,
+            config().with_connect_timeout(time::Duration::from_milliseconds(20)),
+        ),
+        "configured handshake timeout",
+    );
+    testing::assert_eq(failure.kind(), io::ErrorKind::TimedOut);
+    println("handshake cancellation ok");
+}
+
+#[test]
+fn client_server_lifecycle() -> () {
+    task::scope(
+        |scope| {
+            check_verification(scope);
+            check_mutual(scope);
+            check_cancellation(scope);
+            check_handshake(scope);
+            check_server_lifecycle(scope);
+        },
+    );
+}

@@ -1,0 +1,202 @@
+package tests;
+
+use std::bytes;
+use std::io;
+use io::{Read, Write, BufRead};
+use std::testing;
+
+struct CapabilityShortReader {
+    cursor: io::Cursor,
+}
+
+impl Read for CapabilityShortReader {
+    fn read(self: CapabilityShortReader, buffer: MutSlice[byte]) -> Result[isize, io::Error] {
+        self.cursor.read(
+            buffer.sub(
+                0,
+                if buffer.len() < 2 {
+                    buffer.len()
+                } else {
+                    2
+                },
+            ),
+        )
+    }
+}
+
+struct CapabilityFaultWriter {
+    cursor: io::Cursor,
+    calls: Ref[isize],
+    kind: io::ErrorKind,
+    partial_on_error: bool,
+}
+
+impl Write for CapabilityFaultWriter {
+    fn write(self: CapabilityFaultWriter, buffer: Slice[byte]) -> Result[isize, io::Error] {
+        let call = self.calls.get();
+        self.calls.set(call + 1);
+        if call == 1 {
+            if self.partial_on_error {
+                self.cursor.write(buffer.sub(0, 1))?;
+            }
+            Result::Err(
+                io::Error::new(self.kind, "write", Option::None, Option::None, "injected failure"),
+            )
+        } else {
+            self.cursor.write(
+                buffer.sub(
+                    0,
+                    if buffer.len() < 2 {
+                        buffer.len()
+                    } else {
+                        2
+                    },
+                ),
+            )
+        }
+    }
+}
+
+struct CapabilityInvalidStream {
+    count: isize,
+}
+
+impl Read for CapabilityInvalidStream {
+    fn read(self: CapabilityInvalidStream, buffer: MutSlice[byte]) -> Result[isize, io::Error] {
+        Result::Ok(self.count)
+    }
+}
+
+impl Write for CapabilityInvalidStream {
+    fn write(self: CapabilityInvalidStream, buffer: Slice[byte]) -> Result[isize, io::Error] {
+        Result::Ok(self.count)
+    }
+}
+
+#[test]
+fn capabilities_io() -> () {
+    let source = bytes::Bytes::from_string("abc\ndef");
+    let cursor = io::Cursor::new(source);
+    let reader = testing::expect_ok(
+        io::BufReader::with_capacity(CapabilityShortReader { cursor }, 3),
+        "reader",
+    );
+    testing::assert_eq(testing::expect_ok(reader.read_line(4), "first line").unwrap_or(""), "abc\n");
+    testing::assert_eq(testing::expect_ok(reader.read_line(3), "last line").unwrap_or(""), "def");
+    testing::assert(testing::expect_ok(reader.read_line(8), "EOF").is_none());
+    testing::assert(reader.consume(1).is_err());
+    let short = CapabilityShortReader { cursor: io::Cursor::new(source) };
+    let destination = bytes::Bytes::from_vec(Vec::from_array([0, 0, 0]));
+    testing::expect_ok(short.read_exact(destination.as_mut_slice()), "short read exact");
+    testing::assert(destination.to_vec() == Vec::from_array([97, 98, 99]));
+    testing::assert(io::Cursor::new(source).read_to_end(6).is_err());
+    testing::assert_eq(
+        testing::expect_ok(io::Cursor::new(source).read_to_string(7), "bounded text"),
+        "abc\ndef",
+    );
+    let take = testing::expect_ok(io::Take::new(io::Cursor::new(source), 3), "take");
+    testing::assert_eq(testing::expect_ok(take.read_to_string(3), "limited read"), "abc");
+    testing::assert_eq(take.remaining(), 0);
+    check_fault_writes();
+    let copied = io::Cursor::new(bytes::Bytes::new());
+    testing::assert_eq(testing::expect_ok(io::copy(io::Cursor::new(source), copied), "copy"), 7);
+    testing::assert(copied.bytes().to_vec() == source.to_vec());
+    for count in Vec::from_array([-1, 9]) {
+        testing::assert_eq(
+            testing::expect_err(
+                CapabilityInvalidStream { count }.read_exact(destination.as_mut_slice()),
+                "invalid reader count",
+            ).kind(),
+            io::ErrorKind::InvalidData,
+        );
+        testing::assert_eq(
+            testing::expect_err(
+                CapabilityInvalidStream { count }.write_all(destination.as_slice()),
+                "invalid writer count",
+            ).kind(),
+            io::ErrorKind::InvalidData,
+        );
+    }
+    testing::assert_eq(
+        testing::expect_err(
+            CapabilityInvalidStream { count: 0 }.write_all(destination.as_slice()),
+            "zero writer",
+        ).kind(),
+        io::ErrorKind::WriteZero,
+    );
+    testing::assert_eq(
+        testing::expect_err(
+            io::Cursor::new(bytes::Bytes::from_vec(Vec::from_array([255]))).read_to_string(1),
+            "invalid UTF8",
+        ).kind(),
+        io::ErrorKind::InvalidData,
+    );
+    testing::assert(io::BufReader::with_capacity(cursor, 0).is_err());
+    testing::assert(io::Take::new(cursor, -1).is_err());
+    println("io ok")
+}
+
+fn check_fault_writes() -> () {
+    for kind in[io::ErrorKind::Other, io::ErrorKind::Interrupted] {
+        for partial_on_error in[false, true] {
+            let output = io::Cursor::new(bytes::Bytes::new());
+            let calls = Ref::new(0);
+            let writer = testing::expect_ok(
+                io::BufWriter::with_capacity(
+                    CapabilityFaultWriter { cursor: output, calls, kind, partial_on_error },
+                    8,
+                ),
+                "writer",
+            );
+            testing::expect_ok(
+                writer.write_all(bytes::Bytes::from_string("hello").as_slice()),
+                "buffer write",
+            );
+            testing::assert_eq(calls.get(), 0);
+            testing::assert_eq(testing::expect_err(writer.flush(), "buffered failure").kind(), kind);
+            testing::assert_eq(calls.get(), 2);
+            testing::assert_eq(writer.buffered_len(), 3);
+            testing::assert(
+                output.bytes().to_vec()
+                    == if partial_on_error {
+                        "hel".to_bytes()
+                    } else {
+                        "he".to_bytes()
+                    },
+            );
+            if !partial_on_error {
+                testing::expect_ok(writer.flush(), "known side-effect-free flush retry");
+                testing::assert_eq(calls.get(), 4);
+                testing::assert_eq(writer.buffered_len(), 0);
+                testing::assert(output.bytes().to_vec() == "hello".to_bytes());
+            }
+            let output = io::Cursor::new(bytes::Bytes::new());
+            let calls = Ref::new(0);
+            let writer = CapabilityFaultWriter { cursor: output, calls, kind, partial_on_error };
+            testing::assert_eq(
+                testing::expect_err(
+                    writer.write_all(bytes::Bytes::from_string("hello").as_slice()),
+                    "direct failure",
+                ).kind(),
+                kind,
+            );
+            testing::assert_eq(calls.get(), 2);
+            testing::assert(
+                output.bytes().to_vec()
+                    == if partial_on_error {
+                        "hel".to_bytes()
+                    } else {
+                        "he".to_bytes()
+                    },
+            );
+            if !partial_on_error {
+                testing::expect_ok(
+                    writer.write_all(bytes::Bytes::from_string("llo").as_slice()),
+                    "known side-effect-free suffix retry",
+                );
+                testing::assert_eq(calls.get(), 4);
+                testing::assert(output.bytes().to_vec() == "hello".to_bytes());
+            }
+        }
+    }
+}

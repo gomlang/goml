@@ -1,0 +1,117 @@
+package tests;
+
+use std::fs;
+use std::io::{Read, Write};
+use std::net;
+use std::net::tls;
+use std::task;
+use std::testing;
+use std::time;
+
+struct EchoServer {
+    listener: tls::TlsListener,
+    connections: Channel[Vec[tls::TlsStream]],
+    accepted: Channel[()],
+    port: u16,
+}
+
+fn certificate() -> Vec[byte] {
+    testing::expect_ok(
+        fs::read_bytes_structured("net/tls/tests/certificate.pem"),
+        "test certificate",
+    ).to_vec()
+}
+
+fn private_key() -> Vec[byte] {
+    testing::expect_ok(
+        fs::read_bytes_structured("net/tls/tests/private_key.pem"),
+        "test private key",
+    ).to_vec()
+}
+
+fn server_config() -> tls::ServerConfig {
+    tls::ServerConfig::new(certificate().as_slice(), private_key().as_slice()).with_alpn(
+        Vec::from_array(["goml-test"]),
+    ).with_versions(tls::Version::Tls12, tls::Version::Tls12).with_handshake_timeout(
+        time::Duration::from_seconds(3),
+    )
+}
+
+fn local_address() -> net::SocketAddr {
+    testing::expect_ok(net::SocketAddr::parse("127.0.0.1:0"), "loopback address")
+}
+
+fn echo(stream: tls::TlsStream) -> () {
+    defer {
+        let _ = stream.close();
+    };
+    let buffer = Vec::from_array([0, 0, 0, 0, 0]);
+    loop {
+        match stream.read(buffer.as_mut_slice()) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => if stream.write_all(buffer.as_slice().sub(0, count)).is_err() {
+                break;
+            },
+        }
+    }
+}
+
+fn start_echo(scope: task::Scope, require_client: bool) -> EchoServer {
+    let configuration = if require_client {
+        server_config().with_client_ca_pem(certificate().as_slice())
+    } else {
+        server_config()
+    };
+    let listener = testing::expect_ok(
+        tls::TlsListener::bind(local_address(), configuration),
+        "bind TLS server",
+    );
+    let port = testing::expect_ok(listener.local_addr(), "TLS listener address").port;
+    testing::assert(port != 0);
+    let connections: Channel[Vec[tls::TlsStream]] = Channel::new(1);
+    connections.send(Vec::new());
+    let accepted: Channel[()] = Channel::new(16);
+    let _ = scope.spawn(
+        |_| {
+            loop {
+                match listener.accept() {
+                    Err(_) => if listener.is_closed() {
+                        break;
+                    },
+                    Ok(stream) => {
+                        let values = testing::expect_some(
+                            connections.recv(),
+                            "server connection registry",
+                        );
+                        if listener.is_closed() {
+                            let _ = stream.close();
+                        } else {
+                            values.push(stream);
+                            accepted.send(());
+                            let _ = scope.spawn(|_| echo(stream));
+                        }
+                        connections.send(values);
+                    },
+                }
+            }
+        },
+    );
+    EchoServer { listener, connections, accepted, port }
+}
+
+impl EchoServer {
+    fn stop(self: EchoServer) -> () {
+        testing::expect_ok(self.listener.close(), "stop TLS listener");
+        let values = testing::expect_some(self.connections.recv(), "close server connections");
+        for stream in values {
+            let _ = stream.close();
+        }
+        self.connections.send(Vec::new());
+    }
+
+    fn connect(self: EchoServer, configuration: tls::ClientConfig, label: string) -> tls::TlsStream {
+        let stream = testing::expect_ok(tls::connect("127.0.0.1", self.port, configuration), label);
+        let _ = testing::expect_some(self.accepted.recv(), "server completed handshake");
+        stream
+    }
+}

@@ -1,0 +1,159 @@
+package project;
+
+use module::test_support;
+use std::fs;
+use std::path;
+use std::testing;
+
+fn standard_library_plan_context(name: string) -> Context {
+    let root = test_support::workspace(name);
+    let lib_dir = path::join(root, "lib");
+    for module_name in["builtin", "prelude", "std"] {
+        let directory = path::join(lib_dir, module_name);
+        test_support::write_file(
+            path::join(directory, "goml.toml"),
+            "[module]\npath = \"" + module_name + "\"\n",
+        );
+        test_support::write_file(
+            path::join(directory, "main.goml"),
+            "package " + module_name + ";\n",
+        );
+    }
+    let module_dir = path::join(lib_dir, "std");
+    test_support::write_file(
+        path::join(module_dir, "sample/value.goml"),
+        "package sample;\npub fn value() -> isize { 7 }\n",
+    );
+    test_support::write_file(
+        path::join(module_dir, "sample/tests/value.goml"),
+        "package tests;\nuse std::sample;\n#[test]\nfn reads_source() -> () { let _ = sample::value(); }\n",
+    );
+    let artifact_root = path::join(root, "target");
+    let compiler = test_support::gomlc_binary();
+    let source = ModuleSource {
+        name: "std",
+        directory: module_dir,
+        artifact_prefix: "pkg",
+        dependencies: Vec::new(),
+        dev_dependencies: Vec::new(),
+    };
+    let graph = testing::expect_ok(
+        discover_module_graph(compiler, module_dir, "std", artifact_root, Vec::from_array([source])),
+        "discover source standard library",
+    );
+    Context {
+        foreign: Option::None,
+        graph,
+        compiler,
+        compiler_world: CompilerWorld::Installed {
+            path: path::join(root, "stale-installed-world.gaf"),
+        },
+        artifact_root,
+    }
+}
+
+#[test]
+fn standard_library_tests_use_current_source_world_without_duplicate_dependencies() -> () {
+    let context = standard_library_plan_context("stdlib_source_test_plan");
+    let plan = testing::expect_ok(test_plan(context, ALL_TEST_KIND), "standard library test plan");
+    testing::assert_eq(plan.test_groups.len(), 1);
+    testing::assert_eq(plan.test_groups[0].kind, EXTERNAL_TEST_KIND);
+    let expected_world = module_relative(
+        context.graph.module_dir,
+        path::join(context.artifact_root, "test/world/compiler-world-v2.gaf"),
+    );
+    let mut packed_index = -1;
+    let mut test_index = -1;
+    let mut link_index = -1;
+    let mut source_packages = 0;
+    for index in 0..plan.commands.len() {
+        match plan.commands[index] {
+            ToolchainCompile {
+                package_name,
+                input_files,
+                output,
+                builtin_contract,
+                without_roots,
+                ..,
+            } => {
+                source_packages += 1;
+                testing::assert_eq(builtin_contract, package_name == "builtin");
+                testing::assert_eq(without_roots, package_name == "prelude");
+                for input in input_files {
+                    testing::assert(
+                        fs::is_file(absolute_from_module(context.graph.module_dir, input)),
+                    );
+                }
+                testing::assert(
+                    absolute_from_module(context.graph.module_dir, output).starts_with(
+                        context.artifact_root + "/",
+                    ),
+                );
+            },
+            PackToolchainWorld { output, source_files, .. } => {
+                packed_index = index;
+                testing::assert_eq(output, expected_world);
+                testing::assert(source_files.contains("sample/value.goml"));
+                testing::assert(
+                    source_files.contains(
+                        path::join(
+                            path::parent(context.graph.module_dir).unwrap_or(""),
+                            "builtin/main.goml",
+                        ),
+                    ),
+                );
+                testing::assert(
+                    source_files.contains(
+                        path::join(
+                            path::parent(context.graph.module_dir).unwrap_or(""),
+                            "prelude/main.goml",
+                        ),
+                    ),
+                );
+            },
+            Compile { package_name, subcommand, interface_files, world, .. } => {
+                test_index = index;
+                testing::assert_eq(package_name, "std::sample::tests");
+                testing::assert_eq(subcommand, TEST_BUILD_SUBCOMMAND);
+                testing::assert(interface_files.is_empty());
+                testing::assert(world == Option::Some(expected_world));
+            },
+            TestLink { input_cores, packages, world, .. } => {
+                link_index = index;
+                testing::assert(packages == Vec::from_array(["std::sample::tests"]));
+                testing::assert_eq(input_cores.len(), 1);
+                testing::assert(input_cores[0].ends_with("/std/sample/tests/tests.core"));
+                testing::assert(world == Option::Some(expected_world));
+            },
+            GoBuild { .. } => (),
+            _ => testing::fail("unexpected standard-library test command"),
+        }
+    }
+    testing::assert_eq(source_packages, 4);
+    testing::assert(packed_index >= 0 && test_index > packed_index && link_index > test_index);
+    let graph = testing::expect_ok(build_graph(plan.commands), "private world dependency graph");
+    testing::assert(graph.nodes[test_index].dependencies.contains(packed_index));
+    testing::assert(graph.nodes[link_index].dependencies.contains(packed_index));
+    testing::assert(graph.nodes[link_index].dependencies.contains(test_index));
+    testing::assert(!fs::exists(path::join(context.graph.module_dir, "_artifact")));
+    testing::assert(!fs::exists(path::join(context.graph.module_dir, "../compiler")));
+}
+
+#[test]
+fn standard_library_internal_tests_report_recoverable_diagnostic() -> () {
+    let context = standard_library_plan_context("stdlib_internal_test_plan");
+    test_support::write_file(
+        path::join(context.graph.module_dir, "sample/value_test.goml"),
+        "package sample;\n#[test]\nfn internal_value() -> () { let _ = value(); }\n",
+    );
+    let error = testing::expect_err(
+        test_plan(context, ALL_TEST_KIND),
+        "unsupported internal standard-library tests",
+    );
+    testing::assert(error.to_string().contains("internal tests are not supported"));
+    let external = testing::expect_ok(
+        test_plan(context, EXTERNAL_TEST_KIND),
+        "explicit black-box tests",
+    );
+    testing::assert_eq(external.test_groups.len(), 1);
+}

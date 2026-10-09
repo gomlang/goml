@@ -1,0 +1,186 @@
+package tests;
+
+use std::context;
+use std::io;
+use std::net;
+use std::net::tls;
+use std::task;
+use std::testing;
+use std::time;
+
+fn check_invalid_server_config() -> () {
+    let bad = "invalid".to_bytes();
+    let configurations = [
+        tls::ServerConfig::new(bad.as_slice(), private_key().as_slice()),
+        tls::ServerConfig::new(certificate().as_slice(), bad.as_slice()),
+        server_config().with_client_ca_pem(bad.as_slice()),
+        server_config().with_versions(tls::Version::Tls13, tls::Version::Tls12),
+        server_config().with_alpn(Vec::from_array([""])),
+        server_config().with_handshake_timeout(time::Duration::from_milliseconds(0)),
+    ];
+    for index in 0..6 {
+        let configuration = configurations[index];
+        let error = testing::expect_err(
+            tls::TlsListener::bind(local_address(), configuration),
+            "invalid server configuration",
+        );
+        if error.kind() != io::ErrorKind::InvalidInput {
+            testing::fail(f"invalid server configuration {index}: {error}");
+        }
+    }
+}
+
+fn check_server_lifecycle(scope: task::Scope) -> () {
+    check_invalid_server_config();
+    let listener = testing::expect_ok(
+        tls::TlsListener::bind(local_address(), server_config()),
+        "listener lifecycle",
+    );
+    defer {
+        let _ = listener.close();
+    };
+    testing::assert(!listener.is_closed());
+    context::with_cancel(
+        context::Context::background(),
+        |ctx, cancel| {
+            cancel.cancel();
+            let error = testing::expect_err(listener.accept_with(ctx), "cancelled TLS accept");
+            testing::assert_eq(error.kind(), io::ErrorKind::Interrupted);
+            testing::assert(!listener.is_closed());
+        },
+    );
+    context::with_timeout(
+        context::Context::background(),
+        time::Duration::from_milliseconds(20),
+        |ctx, _| {
+            let error = testing::expect_err(listener.accept_with(ctx), "TLS accept deadline");
+            testing::assert_eq(error.kind(), io::ErrorKind::TimedOut);
+            testing::assert(!listener.is_closed());
+        },
+    );
+    let address = testing::expect_ok(listener.local_addr(), "listener still bound");
+    let client = testing::expect_ok(net::TcpStream::connect(address), "unresponsive TLS peer");
+    context::with_timeout(
+        context::Context::background(),
+        time::Duration::from_milliseconds(20),
+        |ctx, _| {
+            let error = testing::expect_err(listener.accept_with(ctx), "server handshake deadline");
+            testing::assert_eq(error.kind(), io::ErrorKind::TimedOut);
+            testing::assert(!listener.is_closed());
+        },
+    );
+    testing::expect_ok(client.close(), "close unresponsive peer");
+    testing::expect_ok(listener.close(), "close deadline listener");
+    let listener = testing::expect_ok(
+        tls::TlsListener::bind(local_address(), server_config()),
+        "close wakeup listener",
+    );
+    defer {
+        let _ = listener.close();
+    };
+    let ready: Channel[()] = Channel::new(0);
+    let waiter = scope.spawn(
+        |_| {
+            ready.send(());
+            testing::expect_err(listener.accept(), "closed pending TLS accept").kind()
+        },
+    );
+    let _ = ready.recv();
+    testing::expect_ok(listener.close(), "close listener");
+    testing::expect_ok(listener.close(), "idempotent listener close");
+    testing::assert(listener.is_closed());
+    testing::assert_eq(waiter.join(), io::ErrorKind::BrokenPipe);
+    testing::assert_eq(
+        testing::expect_err(listener.accept(), "accept on closed listener").kind(),
+        io::ErrorKind::BrokenPipe,
+    );
+    testing::assert(listener.local_addr().is_err());
+    let listener = testing::expect_ok(
+        tls::TlsListener::bind(
+            local_address(),
+            server_config().with_handshake_timeout(time::Duration::from_milliseconds(20)),
+        ),
+        "configured server deadline",
+    );
+    defer {
+        let _ = listener.close();
+    };
+    let client = testing::expect_ok(
+        net::TcpStream::connect(
+            testing::expect_ok(listener.local_addr(), "server deadline address"),
+        ),
+        "server deadline peer",
+    );
+    defer {
+        let _ = client.close();
+    };
+    testing::assert_eq(
+        testing::expect_err(listener.accept(), "configured server handshake timeout").kind(),
+        io::ErrorKind::TimedOut,
+    );
+    testing::assert(!listener.is_closed());
+}
+
+#[test]
+fn listener_close_interrupts_handshake() -> () {
+    task::scope(
+        |scope| {
+            let listener = testing::expect_ok(
+                tls::TlsListener::bind(
+                    local_address(),
+                    server_config().with_handshake_timeout(time::Duration::from_seconds(30)),
+                ),
+                "pending handshake listener",
+            );
+            defer {
+                let _ = listener.close();
+            };
+            let address = testing::expect_ok(listener.local_addr(), "pending handshake address");
+            let client = testing::expect_ok(
+                net::TcpStream::connect(address),
+                "pending handshake client",
+            );
+            defer {
+                let _ = client.close();
+            };
+            let finished: Channel[io::ErrorKind] = Channel::new(1);
+            let waiter = scope.spawn(
+                |_| {
+                    let error = testing::expect_err(
+                        listener.accept(),
+                        "closed pending TLS handshake",
+                    );
+                    finished.send(error.kind());
+                },
+            );
+            let hello = b"\x16\x03\x01\x00\x4f\x01\x00\x00\x4b\x03\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x04\xc0\x2b\xc0\x2f\x01\x00\x00\x1e\x00\x0a\x00\x04\x00\x02\x00\x17\x00\x0b\x00\x02\x01\x00\x00\x0d\x00\x08\x00\x06\x08\x07\x04\x03\x08\x04\x00\x17\x00\x00";
+            let options = net::WaitOptions::new().with_timeout(time::Duration::from_seconds(3));
+            testing::expect_ok(
+                client.write_all_with(hello.as_slice(), options),
+                "write ClientHello",
+            );
+            let header = Vec::from_array([0.to_u8(), 0, 0, 0, 0, 0, 0, 0, 0]);
+            testing::expect_ok(
+                client.read_exact_with(header.as_mut_slice(), options),
+                "read ServerHello header",
+            );
+            testing::assert_eq(header[0], 22.to_u8());
+            testing::assert_eq(header[5], 2.to_u8());
+            testing::expect_ok(listener.close(), "close during TLS handshake");
+            let timer = time::Timer::new(time::Duration::from_seconds(3));
+            defer {
+                let _ = timer.stop();
+            };
+            select {
+                recv(finished) as result => testing::assert_eq(
+                    testing::expect_some(result, "pending handshake completion"),
+                    io::ErrorKind::BrokenPipe,
+                ),
+                recv(timer.done()) as _ => testing::fail(
+                    "listener close did not interrupt pending handshake",
+                ),
+            }
+            waiter.join();
+        },
+    );
+}

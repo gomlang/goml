@@ -27,19 +27,23 @@ test ! -e "$prefix/lib/builtin_numeric.gom"
 test ! -e "$prefix/lib/builtin_derive.gom"
 
 mkdir -p "$temporary/install/lib/std/obsolete" "$temporary/install/lib/std/fs" \
-    "$temporary/install/lib/compiler" "$temporary/install/lib/custom"
+    "$temporary/install/lib/compiler" "$temporary/install/lib/custom/tests"
 printf '%s\n' stale > "$temporary/install/lib/std/obsolete/old.goml"
 printf '%s\n' stale > "$temporary/install/lib/std/fs/removed.goml"
 printf '%s\n' retained > "$temporary/install/lib/compiler/retained"
 printf '%s\n' retained > "$temporary/install/lib/custom/retained"
 printf '%s\n' retained > "$temporary/install/lib/custom/retained.gom"
+printf '%s\n' retained > "$temporary/install/lib/custom/tests/retained"
 bash "$repo_root/tools/lib/install.sh" "$temporary/install"
 test ! -e "$temporary/install/lib/std/obsolete"
 test ! -e "$temporary/install/lib/std/fs/removed.goml"
 test -f "$temporary/install/lib/std/fs/fs.goml"
+test ! -d "$temporary/install/lib/std/net/tls/tests"
+test ! -d "$temporary/install/lib/std/num/tests"
 test -f "$temporary/install/lib/compiler/retained"
 test -f "$temporary/install/lib/custom/retained"
 test -f "$temporary/install/lib/custom/retained.gom"
+test -f "$temporary/install/lib/custom/tests/retained"
 if bash "$repo_root/tools/lib/install.sh" "$repo_root" > "$temporary/install-stdout" 2> "$temporary/install-stderr"; then
     exit 1
 fi
