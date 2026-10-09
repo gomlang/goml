@@ -3062,6 +3062,8 @@ fn public_add_works() -> () {
 
 If the identity of the package under test is `alice::myapp::math`, the canonical identity of the test package in the above example is `alice::myapp::math::tests`. Ordinary package discovery will exclude the `tests` directory, and production packages cannot import black-box test packages.
 
+In the compiler repository, standard-library behavior tests live in `lib/std/<package>/tests/` and use native GoML assertions or fixed known-answer data. Run `just test-stdlib` from the repository root. For this source module, `goml test` first builds a private compiler world from the sibling `builtin`, `prelude`, and `std` sources under the selected target directory, then compiles the black-box tests against it. This tests the current library source. Standard-library white-box tests are currently unsupported and produce a diagnostic. Installed toolchains omit these test sources and data.
+
 ### Check and run tests
 
 `goml check`, `goml build` and `goml test` discover the module from the current directory upwards. They process complete modules unless an example selector is supplied, and do not accept package or file targets. `goml check` only checks the production source code by default; using `--tests` will also check all white-box and black-box tests after the production package check is successful:
@@ -6649,7 +6651,7 @@ UDP receives consume exactly one datagram, including when the buffer is empty. E
 
 `WaitOptions::new()` waits indefinitely. `.with_timeout(time::Duration)` and `.with_cancel(task::CancelToken)` return modified options. `accept_with(options)`, `connect_with(address, options)`, `read_with(buffer, options)`, `read_exact_with(buffer, options)`, `write_with(buffer, options)`, `write_all_with(buffer, options)`, `send_to_with(data, destination, options)`, and `recv_from_with(buffer, options)` apply these settings. A timeout covers the whole operation, including waiting behind another reader or writer and all partial transfers; it does not restart after progress. Zero timeout returns `TimedOut` without attempting I/O. Completed I/O may win a race with cancellation or timeout. After a failed `read_exact` or `write_all`, some bytes may already have transferred; the buffer is not rolled back and the error does not report a partial count. Use individual `read`/`write` calls when tracking progress is required.
 
-Socket values are shared handles. Multiple reads or multiple writes serialize per socket; one reader and one writer can progress concurrently. Concurrent `close()` wakes active and queued operations, releases the socket once, and is idempotent. Failed binds and connects release their descriptors. Always close sockets explicitly or with `defer`; garbage collection does not close them. IPv6 sockets are IPv6-only, so bind separate IPv4 and IPv6 listeners when both are needed. Unix-domain listeners, HTTP, and other platforms are outside this socket API. DNS and TLS clients are provided by the APIs below. It uses existing imports, enums, methods, channels, and tasks and adds no grammar or compile-time networking.
+Socket values are shared handles. Multiple reads or multiple writes serialize per socket; one reader and one writer can progress concurrently. Concurrent `close()` wakes active and queued operations, releases the socket once, and is idempotent. Failed binds and connects release their descriptors. Always close sockets explicitly or with `defer`; garbage collection does not close them. IPv6 sockets are IPv6-only, so bind separate IPv4 and IPv6 listeners when both are needed. Unix-domain listeners, HTTP, and other platforms are outside this socket API. DNS, TLS clients, and TLS listeners are provided by the APIs below. It uses existing imports, enums, methods, channels, and tasks and adds no grammar or compile-time networking.
 
 ```goml
 use std::net;
@@ -6668,13 +6670,33 @@ fn echo_once() -> Result[(), net::Error] {
 }
 ```
 
-### DNS and TLS clients
+### DNS and TLS
 
 `net::resolve(host, port)` and `resolve_with(host, port, context)` return deduplicated numeric `SocketAddr` values using the host resolver; numeric inputs bypass DNS. Empty or NUL-containing names fail with `InvalidInput`. Resolution observes cancellation and deadlines, with a 30-second maximum when the context has no deadline. `TcpStream::connect_host(host, port, context)` resolves once and tries addresses in resolver order under the same context. Supply a deadline to bound the entire connection attempt.
 
 `WaitOptions::with_context(context)` adds parent cancellation and an absolute deadline to TCP/UDP operations. Existing `with_cancel` tokens remain active too; the effective timeout is the earlier of the context deadline and `with_timeout`. Context cancellation reports `Interrupted`, expiration reports `TimedOut`, and a timed-out TCP wait leaves the socket usable.
 
 `std::net::tls` provides `connect(host, port, config)` and `connect_with(host, port, config, context)`. `ClientConfig::new(server_name)` verifies the certificate chain and server name using system roots, requires TLS 1.2 or newer, and limits DNS, dial, and handshake together to 30 seconds. Hosts are bare names or numeric addresses without a port or IPv6 brackets. Configuration builders are `with_ca_pem` (a nonempty PEM bundle replaces system roots; an empty bundle selects system roots), `with_client_certificate(certificate_pem, private_key_pem)`, `with_alpn`, `with_minimum_version(Version::Tls12 / Tls13)`, and `with_connect_timeout`. There is no insecure verification switch. Client certificates and private keys must be supplied together; ALPN identifiers are 1–255 bytes.
+
+`ServerConfig::new(certificate_pem, private_key_pem)` configures a TLS server with a certificate and matching private key, TLS 1.2–1.3, and a 30-second handshake timeout. `with_client_ca_pem(bundle)` requires a verified client certificate rooted in that nonempty bundle. `with_alpn`, `with_versions(minimum, maximum)`, and `with_handshake_timeout` configure negotiation and a positive per-connection handshake limit. Empty or invalid certificates/keys/client roots, reversed version ranges, and empty or oversized ALPN identifiers produce recoverable errors.
+
+`TlsListener::bind(address: net::SocketAddr, config)` creates a listener; port zero selects an available port, returned by `local_addr()`. `accept()` waits for a connection and completes its TLS handshake before returning a `TlsStream`. `accept_with(context)` bounds both waiting and handshaking by the context; the configured handshake timeout starts after TCP acceptance. Accept operations serialize per listener. A cancelled or failed handshake closes that connection, while the listener remains usable. `close()` is shared and idempotent, wakes queued/active accepts, and cancels an in-progress handshake; already accepted streams remain independently owned and must be closed separately. Local listener closure reports `BrokenPipe`; context cancellation and deadline expiry report `Interrupted` and `TimedOut`. TLS servers use the same compiler runtime boundary as TLS clients and need no user Go FFI bindings or consumer `go.mod`.
+
+```goml
+use std::io::Write;
+use std::net;
+use std::net::tls;
+use std::io;
+
+fn serve_one(certificate: Slice[byte], private_key: Slice[byte]) -> Result[(), io::Error] {
+    let address = net::SocketAddr::new(net::IpAddr::V4([127, 0, 0, 1]), 8443);
+    let listener = tls::TlsListener::bind(address, tls::ServerConfig::new(certificate, private_key))?;
+    defer { let _ = listener.close(); };
+    let stream = listener.accept()?;
+    defer { let _ = stream.close(); };
+    stream.write_all("hello".to_bytes().as_slice())
+}
+```
 
 `TlsStream::connection_info()` returns the negotiated version and ALPN protocol. `read_with`, `write_with`, `read_exact_with`, and `write_all_with` accept a `context::Context`; exact/all operations hold their direction's gate and keep one deadline across all partial transfers. A reader and writer can run concurrently, while operations in one direction serialize. Cancelling or timing out active TLS I/O closes the connection to interrupt the native operation; create a new connection afterward. Cancellation detected before native I/O begins, including while waiting for a gate, leaves the connection open. Explicit local close reports `BrokenPipe` to interrupted operations; remote EOF remains a successful zero-byte read. `close()` is explicit, shared, idempotent, and wakes blocked operations. Exact reads report `UnexpectedEof` when the peer closes before filling the buffer. Partial data may already have transferred on failure.
 
@@ -6955,7 +6977,7 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | Traverse a directory tree | `ecosystem::walkdir` dependency for Linux amd64 syscall-backed depth-first iteration with depth bounds, pruning, optional link following, and per-path errors |
 | Manipulate logical slash paths or shell patterns | `std::path::slash` for pure lexical operations and bounded Unicode matching; keep host paths in `std::path` |
 | Watch a directory tree for changes | Use the `ecosystem::notify` dependency and its `watch_recursive` or `WatchSet` on Linux amd64, prune ignored paths through `Options`, consume timed reads or scoped subscriptions, handle `Event.rescan`, and close the handle |
-| TCP and UDP networking | `std::net` sockets, DNS resolution, shared epoll readiness, explicit close, and context-aware waits; `std::net::tls` for verified TLS clients |
+| TCP and UDP networking | `std::net` sockets, DNS resolution, shared epoll readiness, explicit close, and context-aware waits; `std::net::tls` for verified TLS clients and listeners |
 | Stream HTTP requests or consume SSE | `ecosystem::request` scoped streaming callbacks, `io::Read` uploads, bounded response chunks and incremental SSE decoding over HTTP/1.1 |
 | Serve HTTPS, WebSockets or uploaded files | `ecosystem::web` TLS listener, explicit WebSocket upgrades, multipart fields, static files, CORS and bounded buffered gzip middleware |
 | Escape URL segments or query parameters | `std::net::url` bounded component/query codecs preserve decoded bytes; full URL parsing is separate |
@@ -7054,7 +7076,7 @@ Panic boundaries use ordinary function calls, closures, `Result`, and the existi
 
 `Report::map`, `ResultExt::into_report`, and `ReportContext::{context, with_context}` use the existing generic-method, trait-import and closure forms. They add no grammar production or implicit error conversion.
 
-I/O traits, cancellation contexts, DNS/TLS, scalar conversion traits, and Serde extension events use the existing imports, generic bounds, enums, methods, and calls. They introduce no new grammar. Explicit generic calls retain the `::[Type]` form even when their type arguments do not appear in the function signature.
+I/O traits, cancellation contexts, DNS/TLS clients and listeners, scalar conversion traits, and Serde extension events use the existing imports, generic bounds, enums, methods, and calls. They introduce no new grammar. Explicit generic calls retain the `::[Type]` form even when their type arguments do not appear in the function signature.
 
 The following EBNF only describes the canonical form that should be generated; `?` means optional, `*` means repeated, and the terminator is placed in quotes.
 

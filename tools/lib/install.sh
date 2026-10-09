@@ -20,3 +20,5 @@ rm -f \
     "$prefix/lib/builtin_derive.gom"
 rm -rf -- "$prefix/lib/builtin" "$prefix/lib/prelude" "$prefix/lib/std" "$prefix/lib/cabi"
 cp -R "$repo_root/lib/." "$prefix/lib/"
+
+find "$prefix/lib/std" -type d -name tests -prune -exec rm -rf -- {} +

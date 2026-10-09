@@ -20,6 +20,10 @@ test: make-tools
     bash tools/lib/install.sh _artifact/gomlc-test/test
     cd gomlc && GOML_TEST_GOML=../stage2/bin/goml GOML_TEST_GOMLC=../stage2/bin/gomlc GOML_TEST_COMPILER_WORLD=../stage2/lib/compiler/compiler-world-v2.gaf ../stage2/bin/goml test --target-dir ../_artifact/gomlc-test --compiler ../stage2/bin/gomlc --jobs 16 --timeout 10m
     cd goml && GOML_TEST_GOML=../stage2/bin/goml GOML_TEST_GOMLC=../stage2/bin/gomlc ../stage2/bin/goml test --compiler ../stage2/bin/gomlc --jobs 16 --timeout 10m
+    just _ci-stdlib-test
+
+test-stdlib: make
+    just _ci-stdlib-test
 
 all: test
 
@@ -89,6 +93,14 @@ _ci-goml-test-build:
 
 _ci-goml-test-run:
     cd goml && GOML_TEST_GOML=../stage2/bin/goml GOML_TEST_GOMLC=../stage2/bin/gomlc ../stage2/bin/goml test --no-build --compiler ../stage2/bin/gomlc --jobs "${GOML_TEST_JOBS:-4}" --timeout 10m
+
+_ci-stdlib-test: _ci-stdlib-test-build _ci-stdlib-test-run
+
+_ci-stdlib-test-build:
+    cd lib/std && ../../stage2/bin/goml test --no-run --target-dir ../../_artifact/stdlib-test --compiler ../../stage2/bin/gomlc --jobs "${GOML_TEST_JOBS:-16}"
+
+_ci-stdlib-test-run:
+    cd lib/std && ../../stage2/bin/goml test --no-build --target-dir ../../_artifact/stdlib-test --compiler ../../stage2/bin/gomlc --jobs "${GOML_TEST_JOBS:-16}" --timeout 10m
 
 _ci-vscode:
     mkdir -p editors/vscode/bin

@@ -36,7 +36,8 @@ Run recipes from the repository root; [.justfile](.justfile) is the command refe
 | Command | Purpose |
 | --- | --- |
 | `just make` | Incrementally build stage2 from pinned stage0 |
-| `just test` / `just all` | Build and run compiler, driver, and Go metadata tests |
+| `just test` / `just all` | Build and run compiler, driver, standard-library, and Go metadata tests |
+| `just test-stdlib` | Build stage2 and run native standard-library package tests |
 | `just ci` | Full CI, including bootstrap fixed point and packaging |
 | `just bootstrap` | Clean bootstrap and fixed-point verification |
 | `just verify-golden` / `just update-golden` | Verify / regenerate snapshots through self-hosted tests |
@@ -79,6 +80,7 @@ Run recipes from the repository root; [.justfile](.justfile) is the command refe
 
 - Prefer fast, deterministic tests and minimal fixtures covering relevant parsing, typing, and runtime edges.
 - Compiler CLI tests that need a package world should use `gomlc/test_support/compiler.goml`'s `compiler_command` to reuse `GOML_TEST_COMPILER_WORLD`, including when changing the child process directory. Use direct commands only when specifically testing source-world construction or commands that do not accept `--world`.
+- Standard-library behavior tests belong in the corresponding `lib/std/<package>/tests/` directory and declare `package tests`. Use native GoML assertions and fixed known-answer data; reserve user Go FFI for dedicated interoperability tests. `just test-stdlib` runs these tests.
 - Pipeline cases live in `gomlc/testdata/pipeline/NNN[_description]/main.goml`. Add or edit the source, then run `just update-golden` to generate IR snapshots and execution output.
 - Multi-package cases live in `gomlc/testdata/module/projectNNN[_description]/`. Include a root `goml.toml`, explicit package declarations/imports, public cross-package APIs, and a `package main` entry. Generate their `.out` files with `just update-golden`; these cases do not produce IR snapshots.
 - Visibility and package-diagnostic fixtures belong in `gomlc/testdata/module_diagnostics/`.

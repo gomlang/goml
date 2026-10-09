@@ -4,7 +4,7 @@ repository_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repository_root"
 
 if test "${GOML_CI_SEQUENTIAL:-0}" = 1; then
-    for recipe in _ci-gomlc-test _ci-scripts _bootstrap-stage3 _ci-goml-test _ci-vscode _ci-release-smoke; do
+    for recipe in _ci-gomlc-test _ci-scripts _bootstrap-stage3 _ci-goml-test _ci-stdlib-test _ci-vscode _ci-release-smoke; do
         just "$recipe"
     done
     exit 0
@@ -20,7 +20,7 @@ ci_pids+=("$!")
 GOML_BUILD_JOBS=2 just _bootstrap-stage3 &
 ci_pids+=("$!")
 
-for recipe in _ci-goml-test _ci-vscode _ci-release-smoke; do
+for recipe in _ci-goml-test _ci-stdlib-test _ci-vscode _ci-release-smoke; do
     nice -n 10 just "$recipe" &
     ci_pids+=("$!")
 done

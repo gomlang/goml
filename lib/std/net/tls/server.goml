@@ -1,0 +1,223 @@
+package tls;
+
+use module::context;
+use module::io;
+use module::net;
+use module::time;
+
+pub struct ServerConfig {
+    certificate: Vec[byte],
+    private_key: Vec[byte],
+    client_roots: Vec[byte],
+    require_client: bool,
+    protocols: Vec[string],
+    minimum: Version,
+    maximum: Version,
+    handshake_timeout: time::Duration,
+}
+
+impl ServerConfig {
+    pub fn new(certificate: Slice[byte], private_key: Slice[byte]) -> ServerConfig {
+        ServerConfig {
+            certificate: copied(certificate),
+            private_key: copied(private_key),
+            client_roots: Vec::new(),
+            require_client: false,
+            protocols: Vec::new(),
+            minimum: Version::Tls12,
+            maximum: Version::Tls13,
+            handshake_timeout: time::Duration::from_seconds(30),
+        }
+    }
+
+    pub fn with_client_ca_pem(self: ServerConfig, pem: Slice[byte]) -> ServerConfig {
+        ServerConfig { client_roots: copied(pem), require_client: true, ..self }
+    }
+
+    pub fn with_alpn(self: ServerConfig, protocols: Vec[string]) -> ServerConfig {
+        ServerConfig { protocols: protocols.copy(), ..self }
+    }
+
+    pub fn with_versions(self: ServerConfig, minimum: Version, maximum: Version) -> ServerConfig {
+        ServerConfig { minimum, maximum, ..self }
+    }
+
+    pub fn with_handshake_timeout(self: ServerConfig, timeout: time::Duration) -> ServerConfig {
+        ServerConfig { handshake_timeout: timeout, ..self }
+    }
+}
+
+pub struct TlsListener {
+    id: i64,
+    accept_gate: Channel[()],
+    close_gate: Channel[()],
+    closed: Channel[()],
+}
+
+fn version_number(version: Version) -> u16 {
+    match version {
+        Tls12 => 771,
+        Tls13 => 772,
+    }
+}
+
+fn stream_from_runtime(id: i64) -> TlsStream {
+    let read_gate = Channel::new(1);
+    let write_gate = Channel::new(1);
+    let close_gate = Channel::new(1);
+    read_gate.send(());
+    write_gate.send(());
+    close_gate.send(());
+    TlsStream { id, read_gate, write_gate, close_gate, closed: Channel::new(0) }
+}
+
+impl TlsListener {
+    pub fn bind(address: net::SocketAddr, config: ServerConfig) -> Result[TlsListener, io::Error] {
+        if config.certificate.is_empty() || config.private_key.is_empty() {
+            return Result::Err(
+                error(
+                    io::ErrorKind::InvalidInput,
+                    "TLS listen",
+                    "certificate and private key are required",
+                ),
+            )
+        }
+        if config.require_client && config.client_roots.is_empty() {
+            return Result::Err(
+                error(io::ErrorKind::InvalidInput, "TLS listen", "client CA bundle is required"),
+            )
+        }
+        if version_number(config.minimum) > version_number(config.maximum) {
+            return Result::Err(
+                error(
+                    io::ErrorKind::InvalidInput,
+                    "TLS listen",
+                    "minimum TLS version exceeds maximum",
+                ),
+            )
+        }
+        if config.handshake_timeout.as_nanoseconds() <= 0 {
+            return Result::Err(
+                error(
+                    io::ErrorKind::InvalidInput,
+                    "TLS listen",
+                    "handshake timeout must be positive",
+                ),
+            )
+        }
+        for protocol in config.protocols {
+            if protocol.byte_len() == 0 || protocol.byte_len() > 255 {
+                return Result::Err(
+                    error(
+                        io::ErrorKind::InvalidInput,
+                        "TLS listen",
+                        "ALPN identifiers must contain 1 to 255 bytes",
+                    ),
+                )
+            }
+        }
+        let (ok, id, kind, message) = __goml_std_net_tls_listen(
+            address.to_string(),
+            config.certificate.copy(),
+            config.private_key.copy(),
+            config.client_roots.copy(),
+            config.require_client,
+            config.protocols.copy(),
+            version_number(config.minimum),
+            version_number(config.maximum),
+            config.handshake_timeout.as_nanoseconds(),
+        );
+        if !ok {
+            return Result::Err(runtime_error(kind, "TLS listen", message))
+        }
+        let accept_gate = Channel::new(1);
+        let close_gate = Channel::new(1);
+        accept_gate.send(());
+        close_gate.send(());
+        Result::Ok(TlsListener { id, accept_gate, close_gate, closed: Channel::new(0) })
+    }
+
+    pub fn is_closed(self: TlsListener) -> bool {
+        select {
+            recv(self.closed) as _ => true,
+            default => false,
+        }
+    }
+
+    pub fn close(self: TlsListener) -> Result[(), io::Error] {
+        let _ = self.close_gate.recv();
+        defer self.close_gate.send(());
+        if self.is_closed() {
+            return Result::Ok(())
+        }
+        self.closed.close();
+        let message = __goml_std_net_tls_listener_close(self.id);
+        if message.byte_len() == 0 {
+            Result::Ok(())
+        } else {
+            Result::Err(error(io::ErrorKind::Other, "TLS listener close", message))
+        }
+    }
+
+    pub fn local_addr(self: TlsListener) -> Result[net::SocketAddr, io::Error] {
+        if self.is_closed() {
+            return Result::Err(
+                error(io::ErrorKind::BrokenPipe, "TLS local address", "TLS listener is closed"),
+            )
+        }
+        let address = __goml_std_net_tls_listener_address(self.id);
+        if address.byte_len() == 0 {
+            return Result::Err(
+                error(io::ErrorKind::BrokenPipe, "TLS local address", "TLS listener is closed"),
+            )
+        }
+        net::SocketAddr::parse(address)
+    }
+
+    pub fn accept(self: TlsListener) -> Result[TlsStream, io::Error] {
+        self.accept_with(context::Context::background())
+    }
+
+    pub fn accept_with(self: TlsListener, context: context::Context) -> Result[TlsStream, io::Error] {
+        check_context(context, "TLS accept")?;
+        select {
+            recv(self.closed) as _ => return Result::Err(
+                error(io::ErrorKind::BrokenPipe, "TLS accept", "TLS listener is closed"),
+            ),
+            recv(context.done()) as _ => {
+                check_context(context, "TLS accept")?;
+                return Result::Err(
+                    error(io::ErrorKind::Interrupted, "TLS accept", "operation cancelled"),
+                )
+            },
+            recv(self.accept_gate) as _ => (),
+        }
+        defer self.accept_gate.send(());
+        check_context(context, "TLS accept")?;
+        if self.is_closed() {
+            return Result::Err(
+                error(io::ErrorKind::BrokenPipe, "TLS accept", "TLS listener is closed"),
+            )
+        }
+        let (ok, id, kind, message) = __goml_std_net_tls_accept(
+            self.id,
+            cancellation_id(context),
+            operation_timeout(context),
+        );
+        if !ok {
+            check_context(context, "TLS accept")?;
+            if self.is_closed() {
+                return Result::Err(
+                    error(io::ErrorKind::BrokenPipe, "TLS accept", "TLS listener is closed"),
+                )
+            }
+            return Result::Err(runtime_error(kind, "TLS accept", message))
+        }
+        let stream = stream_from_runtime(id);
+        if let Err(failure) = check_context(context, "TLS accept") {
+            let _ = stream.close();
+            return Result::Err(failure)
+        }
+        Result::Ok(stream)
+    }
+}
