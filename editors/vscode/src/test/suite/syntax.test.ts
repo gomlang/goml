@@ -1,6 +1,8 @@
 import * as assert from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
+import { Registry, INITIAL, IGrammar, parseRawGrammar } from 'vscode-textmate';
+import { loadWASM, OnigScanner, OnigString } from 'vscode-oniguruma';
 
 interface GrammarPattern {
     include?: string;
@@ -48,21 +50,6 @@ suite('GoML Syntax Tests', () => {
         assert.ok(regex('associated-type-bindings', 0).test('dyn Iterator[Item = int]'));
     });
 
-    test('Current declarations and builtin types are recognized', () => {
-        const declarations = regex('declarations', 2);
-        const keywords = regex('keywords', 4);
-        const primitives = regex('types', 0);
-        const builtins = regex('types', 1);
-        assert.ok(declarations.test('static cache: OnceCell[string];'));
-        assert.ok(keywords.test('static'));
-        assert.ok(primitives.test('byte'));
-        assert.ok(!primitives.test('unit'));
-        assert.ok(builtins.test('MutSlice[byte]'));
-        assert.ok(builtins.test('HashMapEntry[string, isize]'));
-        assert.ok(builtins.test('OnceCell[string]'));
-        assert.ok(builtins.test('FrozenVec[byte]'));
-    });
-
     test('Task keywords remain contextual', () => {
         const contextual = regex('keywords', 0);
         assert.ok(contextual.test('scope {'));
@@ -90,4 +77,96 @@ suite('GoML Syntax Tests', () => {
         assert.ok(!expressions.test('priority(value)'));
         assert.ok(!arms.test('let when = true;'));
     });
+});
+
+suite('GoML TextMate Tokenization', () => {
+  let registry: Registry;
+  let grammar: IGrammar;
+
+  suiteSetup(async () => {
+    const wasm = fs.readFileSync(require.resolve('vscode-oniguruma/release/onig.wasm'));
+    await loadWASM(wasm.buffer.slice(wasm.byteOffset, wasm.byteOffset + wasm.byteLength));
+    registry = new Registry({
+      onigLib: Promise.resolve({
+        createOnigScanner: patterns => new OnigScanner(patterns),
+        createOnigString: value => new OnigString(value),
+      }),
+      loadGrammar: async () => {
+        const filename = path.resolve(__dirname, '../../../syntaxes/goml.tmLanguage.json');
+        return parseRawGrammar(fs.readFileSync(filename, 'utf8'), filename);
+      },
+    });
+    const loaded = await registry.loadGrammar('source.goml');
+    assert.ok(loaded);
+    grammar = loaded;
+  });
+
+  suiteTeardown(() => registry.dispose());
+
+  function scopesAt(source: string, text: string): string[] {
+    const offset = source.indexOf(text);
+    assert.ok(offset >= 0, text);
+    const token = grammar.tokenizeLine(source, INITIAL).tokens.find(
+      token => token.startIndex <= offset && token.endIndex > offset,
+    );
+    assert.ok(token, text);
+    return token.scopes;
+  }
+
+  test('Literal braces and adjacent expression braces close correctly', () => {
+    for (const literal of [
+      'f"{{{value}}}"',
+      'f"{value}}}"',
+      'f"{ {value}}"',
+      'f"{ { {value}}}"',
+      'f"{if true {1} else {2}}"',
+      'f"{r"}"}"',
+      'f"{f"{value}"}"',
+    ]) {
+      const source = `let text = ${literal}; let after = 1;`;
+      const result = grammar.tokenizeLine(source, INITIAL);
+      assert.ok(result.ruleStack.equals(grammar.tokenizeLine('', INITIAL).ruleStack), literal);
+      assert.deepStrictEqual(scopesAt(source, 'after'), ['source.goml'], literal);
+      const next = grammar.tokenizeLine('let next = 2;', result.ruleStack);
+      assert.deepStrictEqual(next.tokens[0].scopes, ['source.goml', 'keyword.declaration.goml']);
+    }
+    const source = 'f"{{{value}}}"';
+    assert.ok(scopesAt(source, '{{').includes('constant.character.escape.goml'));
+    assert.ok(scopesAt(source, 'value').includes('meta.interpolation.goml'));
+    assert.ok(scopesAt('f"{{text}}"', '}}').includes('constant.character.escape.goml'));
+    assert.ok(scopesAt('f"\\q"', '\\q').includes('invalid.illegal.escape.goml'));
+  });
+
+  test('Generic calls retain function scopes with nested type arguments', () => {
+    for (const source of [
+      'identity::[i32](1)',
+      'pkg::identity::[Vec[Option[i32]]](value)',
+      'value.convert::[string](fallback)',
+      'Box::[i32]::convert::[string](value)',
+      'identity :: [i32](1)',
+    ]) {
+      const name = source.includes('identity') ? 'identity' : 'convert';
+      assert.ok(scopesAt(source, name).includes('entity.name.function.goml'), source);
+    }
+    assert.ok(scopesAt('pkg::identity(1)', 'pkg').includes('entity.name.namespace.goml'));
+    assert.ok(scopesAt('Box::new()', 'Box').includes('entity.name.type.goml'));
+    assert.ok(!scopesAt('values[index](1)', 'values').includes('entity.name.function.goml'));
+  });
+
+  test('Constants and statics are values while declarations remain types', () => {
+    assert.ok(scopesAt('pub const MAX: isize = 10;', 'MAX').includes('constant.other.goml'));
+    assert.ok(scopesAt('static cache: OnceCell[string];', 'cache').includes('variable.other.goml'));
+    for (const declaration of ['struct', 'enum', 'trait', 'type']) {
+      assert.ok(scopesAt(`${declaration} Example`, 'Example').includes('entity.name.type.goml'));
+    }
+  });
+
+  test('Primitive types are distinct and library types use ordinary type scopes', () => {
+    for (const name of ['bool', 'isize', 'string', 'byte', 'never']) {
+      assert.ok(scopesAt(`fn value() -> ${name}`, name).includes('storage.type.primitive.goml'));
+    }
+    for (const name of ['Vec', 'Option', 'HashMap', 'Bytes', 'OnceCell', 'FrozenVec', 'Custom']) {
+      assert.deepStrictEqual(scopesAt(`let value: ${name};`, name), ['source.goml', 'entity.name.type.goml']);
+    }
+  });
 });
