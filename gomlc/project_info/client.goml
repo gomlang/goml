@@ -1,0 +1,260 @@
+package project_info;
+
+use std::collections;
+use std::env;
+use std::fs;
+use std::json;
+use std::path;
+use std::process;
+use std::utf8;
+use utf8::BytesUtf8;
+
+pub struct Module {
+    pub name: string,
+    pub root: string,
+    pub dependencies: Vec[string],
+    pub dev_dependencies: Vec[string],
+}
+
+pub struct Description {
+    pub root: string,
+    pub module_path: string,
+    pub target_dir: string,
+    pub development: bool,
+    pub modules: Vec[Module],
+    pub error: Option[string],
+}
+
+struct Watched {
+    path: string,
+    content: Option[string],
+    canonical: Option[string],
+}
+
+struct Cached {
+    description: Option[Description],
+    watched: Vec[Watched],
+}
+
+pub struct Client {
+    cache: collections::IndexMap[string, Cached],
+    requests: Ref[isize],
+}
+
+pub fn new_client() -> Client {
+    Client { cache: collections::IndexMap::new(), requests: Ref::new(0) }
+}
+
+pub fn clear(client: Client) -> () {
+    client.cache.clear()
+}
+
+pub fn request_count(client: Client) -> isize {
+    client.requests.get()
+}
+
+fn optional_content(filename: string) -> Option[string] {
+    match fs::read_file_structured(filename) {
+        Ok(value) => Option::Some(value),
+        Err(_) => Option::None,
+    }
+}
+
+fn canonical_path(filename: string) -> Option[string] {
+    match fs::canonicalize(filename) {
+        Ok(value) => Option::Some(value),
+        Err(_) => Option::None,
+    }
+}
+
+fn current(watched: Vec[Watched]) -> bool {
+    for value in watched {
+        if optional_content(value.path) != value.content
+            || canonical_path(value.path) != value.canonical {
+            return false
+        }
+    }
+    true
+}
+
+fn string_field(value: json::Value, name: string) -> Result[string, string] {
+    json::field(value, name).and_then(json::as_string).ok_or(
+        "invalid project description field " + name,
+    )
+}
+
+fn array_field(value: json::Value, name: string) -> Result[Vec[json::Value], string] {
+    json::field(value, name).and_then(json::as_array).ok_or(
+        "invalid project description field " + name,
+    )
+}
+
+fn strings(value: json::Value, name: string) -> Result[Vec[string], string] {
+    let result = Vec::new();
+    for item in array_field(value, name)? {
+        result.push(json::as_string(item).ok_or("invalid project description string in " + name)?);
+    }
+    Result::Ok(result)
+}
+
+fn absolute_field(value: json::Value, name: string) -> Result[string, string] {
+    let result = string_field(value, name)?;
+    if !path::is_absolute(result) {
+        return Result::Err("project description requires absolute " + name)
+    }
+    Result::Ok(result)
+}
+
+fn decode(source: string) -> Result[Cached, string] {
+    let value = json::parse(source)?;
+    if json::field(value, "protocol").and_then(json::as_int) != Option::Some(1) {
+        return Result::Err(
+            "unsupported goml project description protocol; install matching goml and gomlc tools",
+        )
+    }
+    let watched = Vec::new();
+    for filename in strings(value, "watched")? {
+        if !path::is_absolute(filename) {
+            return Result::Err("project watch path must be absolute")
+        }
+        watched.push(
+            Watched {
+                path: filename,
+                content: optional_content(filename),
+                canonical: canonical_path(filename),
+            },
+        );
+    }
+    let project = json::field(value, "project").ok_or("missing project description")?;
+    let description = match project {
+        json::Value::Null => Option::None,
+        json::Value::Object(_) => {
+            let modules: Vec[Module] = Vec::new();
+            for module in array_field(project, "modules")? {
+                let name = string_field(module, "name")?;
+                if name == "" {
+                    return Result::Err("empty project module name")
+                }
+                for previous in modules {
+                    if previous.name == name {
+                        return Result::Err("duplicate project module " + name)
+                    }
+                }
+                modules.push(
+                    Module {
+                        name,
+                        root: absolute_field(module, "root")?,
+                        dependencies: strings(module, "dependencies")?,
+                        dev_dependencies: strings(module, "dev_dependencies")?,
+                    },
+                );
+            }
+            let error = match json::field(project, "error") {
+                Some(json::Value::Null) => Option::None,
+                Some(json::Value::String(message)) => Option::Some(message),
+                _ => return Result::Err("invalid project resolution error"),
+            };
+            let root = absolute_field(project, "root")?;
+            let module_path = string_field(project, "module")?;
+            let mut found = false;
+            for module in modules {
+                found = found || (module.name == module_path && module.root == root);
+            }
+            if !found {
+                return Result::Err("project description is missing its root module")
+            }
+            Option::Some(
+                Description {
+                    root,
+                    module_path,
+                    target_dir: absolute_field(project, "target")?,
+                    development: json::field(project, "development").and_then(json::as_bool).ok_or(
+                        "missing project development mode",
+                    )?,
+                    modules,
+                    error,
+                },
+            )
+        },
+        _ => return Result::Err("invalid project description"),
+    };
+    Result::Ok(Cached { description, watched })
+}
+
+fn driver_path() -> Result[string, string] {
+    if let Ok(value) = env::var_structured("GOML_PROJECT_DRIVER") {
+        if value == "" {
+            return Result::Err("GOML_PROJECT_DRIVER is empty")
+        }
+        return Result::Ok(value)
+    }
+    if let Ok(executable) = env::current_exe_structured() {
+        if let Some(directory) = path::parent(executable) {
+            let sibling = path::join(directory, "goml");
+            if fs::is_file(sibling) {
+                return Result::Ok(sibling)
+            }
+        }
+    }
+    if let Ok(value) = env::var_structured("GOML_TEST_GOML") {
+        return path::absolute_structured(value).map_err(|error| error.to_string())
+    }
+    if let Ok(home) = env::var_structured("GOML_HOME") {
+        let binary = path::join(path::join(home, "bin"), "goml");
+        if fs::is_file(binary) {
+            return Result::Ok(binary)
+        }
+    }
+    Result::Ok("goml")
+}
+
+pub fn load(client: Client, source: string) -> Result[Option[Description], string] {
+    load_at(client, source, Option::None)
+}
+
+pub fn load_at(client: Client, source: string, registry: Option[string]) -> Result[
+    Option[Description],
+    string,
+] {
+    let source = path::absolute_structured(source).map_err(|error| error.to_string())?;
+    let driver = driver_path()?;
+    let mut key = source + "\n" + driver + "\n" + registry.unwrap_or("");
+    for name in Vec::from_array(["GOML_HOME", "GOML_WORKSPACE", "HOME", "USERPROFILE", "PATH"]) {
+        key = key + "\n" + env::var_structured(name).unwrap_or("");
+    }
+    if let Some(cached) = client.cache.get(key) {
+        if current(cached.watched) {
+            return Result::Ok(cached.description)
+        }
+    }
+    let _ = client.cache.remove(key);
+    let arguments = Vec::from_array(["__project-info", "--source", source]);
+    if let Some(root) = registry {
+        arguments.push("--registry-root");
+        arguments.push(root);
+    }
+    client.requests.set(client.requests.get() + 1);
+    let output = process::Command::new(driver).args(arguments).output_structured().map_err(
+        |error| "cannot load project using goml: " + error.to_string(),
+    )?;
+    if !output.status().success() {
+        return Result::Err(
+            "goml project loading failed: "
+                + output.stderr().to_string_utf8().unwrap_or("invalid UTF-8 diagnostic"),
+        )
+    }
+    let cached = decode(
+        output.stdout().to_string_utf8().map_err(|_| "invalid UTF-8 project description")?,
+    )?;
+    let cacheable = match cached.description {
+        Some(value) => value.error.is_none(),
+        None => true,
+    };
+    if cacheable {
+        if client.cache.len() >= 128 {
+            client.cache.clear();
+        }
+        let _ = client.cache.insert(key, cached);
+    }
+    Result::Ok(cached.description)
+}

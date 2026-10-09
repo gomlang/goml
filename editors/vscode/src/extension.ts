@@ -139,14 +139,18 @@ export function activate(context: ExtensionContext) {
         return;
     }
 
+    const driverPath = workspace.getConfiguration('goml').get<string>('driverPath', '');
+    const driverOptions = driverPath ? { env: { ...process.env, GOML_PROJECT_DRIVER: driverPath } } : undefined;
     const serverOptions: ServerOptions = {
         run: {
             command: serverPath,
             transport: TransportKind.stdio,
+            options: driverOptions,
         },
         debug: {
             command: serverPath,
             transport: TransportKind.stdio,
+            options: driverOptions,
         },
     };
 

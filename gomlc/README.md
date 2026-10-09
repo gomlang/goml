@@ -25,3 +25,5 @@ just update-golden
 ```
 
 See the [language guide](../docs/goml.md), [formatter rules](../docs/formatting.md), [API documentation](../docs/documentation.md), and [compile-time evaluation architecture](../docs/comptime.md) for the corresponding compiler contracts.
+
+Project-aware queries obtain module descriptions from the matching `goml` driver through `project_info/`; `query::analyze_with_project` also accepts an explicit description from its caller. Manifest, workspace, and registry interpretation remain in the driver. Source import resolution, package analysis, and navigation remain in `query/`. Standalone compiler commands keep their existing inputs and do not need project dependency resolution. Set `GOML_PROJECT_DRIVER` when the driver is not installed beside the compiler or language server and cannot be discovered through `GOML_HOME/bin` or `PATH`.

@@ -1,12 +1,10 @@
 package query;
 
-use gomlang::toolchain_manifest as source_files;
-use std::ascii;
+use module::source as source_files;
+use module::project_info;
 use std::fs;
 use std::path;
 use std::text;
-
-const MANIFEST_FILENAME: string = "goml.toml";
 
 pub struct SourceOverride {
     pub path: string,
@@ -20,6 +18,7 @@ pub struct SourceFile {
 }
 
 pub struct Project {
+    pub description: Option[project_info::Description],
     pub module_root: string,
     pub module_path: string,
     pub package_dir: string,
@@ -27,104 +26,11 @@ pub struct Project {
     pub files: Vec[SourceFile],
 }
 
-struct ModuleInfo {
-    root: string,
-    path: string,
-}
-
-fn trim_ascii(value: string) -> string {
-    let mut start = 0;
-    let mut end = value.byte_len();
-    while start < end && ascii::is_whitespace(value.byte_get(start)) {
-        start += 1;
-    }
-    while end > start && ascii::is_whitespace(value.byte_get(end - 1)) {
-        end -= 1;
-    }
-    value.byte_slice(start, end)
-}
-
-fn strip_comment(value: string) -> string {
-    let mut quoted = false;
-    let mut escaped = false;
-    for index in 0..value.byte_len() {
-        let byte = value.byte_get(index);
-        if escaped {
-            escaped = false;
-        } else if quoted && byte == b'\\' {
-            escaped = true;
-        } else if byte == b'"' {
-            quoted = !quoted;
-        } else if !quoted && byte == b'#' {
-            return value.byte_slice(0, index)
-        }
-    }
-    value
-}
-
-fn manifest_module_path(source: string) -> Option[string] {
-    let mut cursor = 0;
-    let mut in_module = false;
-    while cursor <= source.byte_len() {
-        let mut end = cursor;
-        while end < source.byte_len() && source.byte_get(end) != b'\n' {
-            end += 1;
-        }
-        let line = trim_ascii(strip_comment(source.byte_slice(cursor, end)));
-        if line.starts_with("[") {
-            in_module = line == "[module]";
-        } else if in_module {
-            let mut equals = 0;
-            while equals < line.byte_len() && line.byte_get(equals) != b'=' {
-                equals += 1;
-            }
-            if equals < line.byte_len() && trim_ascii(line.byte_slice(0, equals)) == "path" {
-                let value = trim_ascii(line.byte_slice(equals + 1, line.byte_len()));
-                if value.byte_len() >= 2 && value.byte_get(0) == b'"'
-                    && value.byte_get(value.byte_len() - 1) == b'"' {
-                    return Option::Some(value.byte_slice(1, value.byte_len() - 1))
-                }
-            }
-        }
-        if end == source.byte_len() {
-            cursor = source.byte_len() + 1;
-        } else {
-            cursor = end + 1;
-        }
-    }
-    Option::None
-}
-
 fn source_directory(source_path: string) -> string {
     match path::parent(source_path) {
         Some(value) => path::clean(value),
         None => ".",
     }
-}
-
-fn find_module(source_path: string) -> Result[Option[ModuleInfo], string] {
-    let mut current = source_directory(source_path);
-    let result = loop {
-        let manifest = path::join(current, MANIFEST_FILENAME);
-        if fs::is_file(manifest) {
-            let source = fs::read_file_structured(manifest).map_err(|error| error.to_string())?;
-            if let Some(module_path) = manifest_module_path(source) {
-                break Option::Some(ModuleInfo { root: current, path: module_path })
-            }
-        }
-        match path::parent(current) {
-            Some(parent) => {
-                let parent = path::clean(parent);
-                if parent == current {
-                    break Option::None
-                } else {
-                    current = parent;
-                }
-            },
-            None => break Option::None,
-        }
-    };
-    Result::Ok(result)
 }
 
 fn package_name(module_root: string, module_path: string, package_dir: string) -> Result[
@@ -164,7 +70,7 @@ fn package_name(module_root: string, module_path: string, package_dir: string) -
 }
 
 fn normalized_path(value: string) -> string {
-    path::clean(value)
+    path::absolute_structured(value).unwrap_or(path::clean(value))
 }
 
 fn same_path(left: string, right: string) -> bool {
@@ -323,7 +229,16 @@ fn dependency_project(
         Some(package_dir) => match collect_dependency_files(package_dir, overrides) {
             Ok(files) => {
                 let files = source_files_with_package(files, package_name);
-                Result::Ok(Project { module_root, module_path, package_dir, package_name, files })
+                Result::Ok(
+                    Project {
+                        description: Option::None,
+                        module_root,
+                        module_path,
+                        package_dir,
+                        package_name,
+                        files,
+                    },
+                )
             },
             Err(error) => Result::Err(error),
         },
@@ -335,36 +250,46 @@ pub fn discover_project(source_path: string, source: string, overrides: Vec[Sour
     Option[Project],
     string,
 ] {
-    match find_module(source_path) {
-        Ok(Some(module)) => {
-            let package_dir = source_directory(source_path);
-            match package_name(module.root, module.path, package_dir) {
-                Ok(name) => match collect_package_files(package_dir, source_path, source, overrides) {
-                    Ok(files) => {
-                        let files = source_files_with_package(files, name);
-                        Result::Ok(
-                            Option::Some(
-                                Project {
-                                    module_root: module.root,
-                                    module_path: module.path,
-                                    package_dir,
-                                    package_name: name,
-                                    files,
-                                },
-                            ),
-                        )
-                    },
-                    Err(error) => Result::Err(error),
-                },
-                Err(error) => Result::Err(error),
-            }
-        },
-        Ok(None) => Result::Ok(Option::None),
-        Err(error) => Result::Err(error),
-    }
+    let description = project_info::load(project_info::new_client(), source_path)?;
+    discover_described_project(description, source_path, source, overrides)
+}
+
+fn discover_described_project(
+    description: Option[project_info::Description],
+    source_path: string,
+    source: string,
+    overrides: Vec[SourceOverride],
+) -> Result[Option[Project], string] {
+    let Some(module) = description else {
+        return Result::Ok(Option::None)
+    };
+    let package_dir = source_directory(source_path);
+    let absolute_dir = path::absolute_structured(package_dir).map_err(|error| error.to_string())?;
+    let name = package_name(
+        module.root,
+        module.module_path,
+        fs::canonicalize(absolute_dir).unwrap_or(absolute_dir),
+    )?;
+    let files = source_files_with_package(
+        collect_package_files(package_dir, source_path, source, overrides)?,
+        name,
+    );
+    Result::Ok(
+        Option::Some(
+            Project {
+                description,
+                module_root: module.root,
+                module_path: module.module_path,
+                package_dir,
+                package_name: name,
+                files,
+            },
+        ),
+    )
 }
 
 pub fn module_root_for_source(source_path: string) -> Result[string, string] {
-    let module = find_module(source_path)?.ok_or("expected an existing GoML module")?;
-    Result::Ok(module.root)
+    project_info::load(project_info::new_client(), source_path)?.map(|value| value.root).ok_or(
+        "expected an existing GoML module",
+    )
 }

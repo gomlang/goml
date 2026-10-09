@@ -15,7 +15,6 @@ make-tools: make
 
 [positional-arguments]
 test: make-tools
-    cd toolchain/manifest && ../../stage2/bin/goml test --compiler ../../stage2/bin/gomlc --jobs 4
     cd tools/goml-go-meta && go test ./...
     cd lib/cabi && CGO_ENABLED=0 go test -gcflags=all=-d=checkptr=2 ./...
     bash tools/lib/install.sh _artifact/gomlc-test/test
@@ -33,7 +32,6 @@ clean:
     rm -rf _artifact _bootstrap
     rm -rf gomlc/_artifact gomlc/_bootstrap
     rm -rf goml/_artifact goml/_bootstrap
-    rm -rf toolchain/manifest/_artifact
     rm -rf stage1 stage2 stage3
     rm -rf editors/vscode/bin editors/vscode/lib
 
@@ -49,9 +47,9 @@ _bootstrap-stage3:
     bash tools/lib/finalize-toolchain.sh stage3 stage3/bin/goml stage3/bin/gomlc
     bash bootstrap/build-stage.sh stage3-fixed stage3/bin/goml stage3/bin/gomlc artifacts
     diff -ru --exclude='*.goml-*-fingerprint' --exclude='*.goml-output-epoch' gomlc/_bootstrap/stage3/build/pkg gomlc/_bootstrap/stage3-fixed/build/pkg
-    diff -ru --exclude='*.goml-*-fingerprint' --exclude='*.goml-output-epoch' gomlc/_bootstrap/stage3/build/deps gomlc/_bootstrap/stage3-fixed/build/deps
+    if test -d gomlc/_bootstrap/stage3/build/deps || test -d gomlc/_bootstrap/stage3-fixed/build/deps; then diff -ru --exclude='*.goml-*-fingerprint' --exclude='*.goml-output-epoch' gomlc/_bootstrap/stage3/build/deps gomlc/_bootstrap/stage3-fixed/build/deps; fi
     diff -ru --exclude='*.goml-*-fingerprint' --exclude='*.goml-output-epoch' goml/_bootstrap/stage3/build/pkg goml/_bootstrap/stage3-fixed/build/pkg
-    diff -ru --exclude='*.goml-*-fingerprint' --exclude='*.goml-output-epoch' goml/_bootstrap/stage3/build/deps goml/_bootstrap/stage3-fixed/build/deps
+    if test -d goml/_bootstrap/stage3/build/deps || test -d goml/_bootstrap/stage3-fixed/build/deps; then diff -ru --exclude='*.goml-*-fingerprint' --exclude='*.goml-output-epoch' goml/_bootstrap/stage3/build/deps goml/_bootstrap/stage3-fixed/build/deps; fi
 
 bootstrap:
     rm -rf gomlc/_bootstrap/stage1 gomlc/_bootstrap/stage2 gomlc/_bootstrap/stage3 gomlc/_bootstrap/stage3-fixed
@@ -61,7 +59,6 @@ bootstrap:
     just _bootstrap-stage3
 
 _ci-scripts:
-    cd toolchain/manifest && ../../stage2/bin/goml test --compiler ../../stage2/bin/gomlc --jobs 4
     go run tools/generate_unicode_tables.go --check
     python3 tools/generate_unicode_casefold.py --check
     python3 tools/syscall/generate.py --check
@@ -98,6 +95,7 @@ _ci-vscode:
     find editors/vscode/bin -mindepth 1 -type f -delete
     find editors/vscode/bin -mindepth 1 -depth -type d -empty -delete
     cp stage2/bin/gomllsp editors/vscode/bin/gomllsp
+    cp stage2/bin/goml editors/vscode/bin/goml
     cp stage2/bin/goml-go-meta editors/vscode/bin/goml-go-meta
     bash tools/lib/install.sh editors/vscode
     cd editors/vscode && npm install
@@ -128,6 +126,7 @@ vscode-ext: make-tools
     find editors/vscode/bin -mindepth 1 -type f -delete
     find editors/vscode/bin -mindepth 1 -depth -type d -empty -delete
     cp stage2/bin/gomllsp editors/vscode/bin/gomllsp
+    cp stage2/bin/goml editors/vscode/bin/goml
     cp stage2/bin/goml-go-meta editors/vscode/bin/goml-go-meta
     bash tools/lib/install.sh editors/vscode
     cd editors/vscode && npm install

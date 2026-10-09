@@ -22,10 +22,11 @@ Use **GoML: Show Expanded Derive** to inspect the current document's AST after d
 
 Use **Format Document** to format the current GoML buffer. The language server uses GoML's fixed formatting rules and leaves syntactically invalid documents unchanged.
 
-The bundled server is built for the host platform. A custom server needs its complete executable-relative toolchain resources and an adjacent `goml-go-meta` helper for external Go type checks. See the [language guide](../../docs/goml.md#lsp-and-editor) and [formatting rules](../../docs/formatting.md) for details.
+The bundled server is built for the host platform. A custom server needs its complete executable-relative toolchain resources, a matching `goml` project driver, and an adjacent `goml-go-meta` helper for external Go type checks. See the [language guide](../../docs/goml.md#lsp-and-editor) and [formatting rules](../../docs/formatting.md) for details.
 
 Configuration:
 
+- `goml.driverPath` selects the matching project driver used for module and dependency resolution.
 - `goml.serverPath` overrides the bundled or `PATH`-resolved `gomllsp`.
 - `goml.trace.server` controls language-server tracing.
 
