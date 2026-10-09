@@ -3081,6 +3081,8 @@ goml test [FILTER]
 
 Each test is executed in a separate runner process, and failure to exit and timeout do not affect other tests; `--jobs` controls the number of test processes running at the same time. Executing `goml test` requires an available Go toolchain to build the test runner.
 
+`GOML_TEST_SHARD=INDEX/COUNT` splits matching tests across independent machines. Both numbers are positive, one-based decimal integers with at most nine digits, and `INDEX` must not exceed `COUNT`. After applying the name and ignored-test filters, the driver sorts tests by display name and assigns successive tests to shards in round-robin order. For example, run `GOML_TEST_SHARD=1/4 goml test --jobs 4` through `GOML_TEST_SHARD=4/4 goml test --jobs 4` on four machines. `--list` uses the same shard selection. An unset or empty value runs the full selection; an invalid value produces a diagnostic. The driver clears this variable in test processes so nested `goml test` commands run their complete selection.
+
 `goml test --seed N` supplies one reproducible positive seed to every test process through `testing::seed()`. Failure summaries print the replay seed, and every JSON result event includes it. Captured stdout and stderr remain isolated per test process and are emitted only for failures unless `--nocapture` is selected.
 
 ### LSP and editor
