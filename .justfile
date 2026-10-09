@@ -76,12 +76,22 @@ _ci-scripts:
     bash -n bootstrap/bootstrap.sh bootstrap/test.sh
     bash bootstrap/test.sh
 
-_ci-gomlc-test:
-    bash tools/lib/install.sh _artifact/gomlc-test/test
-    cd gomlc && GOML_TEST_GOML=../stage2/bin/goml GOML_TEST_GOMLC=../stage2/bin/gomlc GOML_TEST_COMPILER_WORLD=../stage2/lib/compiler/compiler-world-v2.gaf ../stage2/bin/goml test --target-dir ../_artifact/gomlc-test --compiler ../stage2/bin/gomlc --jobs "${GOML_TEST_JOBS:-16}" --timeout 10m
+_ci-gomlc-test: _ci-gomlc-test-build _ci-gomlc-test-run
 
-_ci-goml-test:
-    cd goml && GOML_TEST_GOML=../stage2/bin/goml GOML_TEST_GOMLC=../stage2/bin/gomlc ../stage2/bin/goml test --compiler ../stage2/bin/gomlc --jobs "${GOML_TEST_JOBS:-4}" --timeout 10m
+_ci-gomlc-test-build:
+    bash tools/lib/install.sh _artifact/gomlc-test/test
+    cd gomlc && ../stage2/bin/goml test --no-run --target-dir ../_artifact/gomlc-test --compiler ../stage2/bin/gomlc --jobs "${GOML_TEST_JOBS:-16}"
+
+_ci-gomlc-test-run:
+    cd gomlc && GOML_TEST_GOML=../stage2/bin/goml GOML_TEST_GOMLC=../stage2/bin/gomlc GOML_TEST_COMPILER_WORLD=../stage2/lib/compiler/compiler-world-v2.gaf ../stage2/bin/goml test --no-build --target-dir ../_artifact/gomlc-test --compiler ../stage2/bin/gomlc --jobs "${GOML_TEST_JOBS:-16}" --timeout 10m
+
+_ci-goml-test: _ci-goml-test-build _ci-goml-test-run
+
+_ci-goml-test-build:
+    cd goml && ../stage2/bin/goml test --no-run --compiler ../stage2/bin/gomlc --jobs "${GOML_TEST_JOBS:-4}"
+
+_ci-goml-test-run:
+    cd goml && GOML_TEST_GOML=../stage2/bin/goml GOML_TEST_GOMLC=../stage2/bin/gomlc ../stage2/bin/goml test --no-build --compiler ../stage2/bin/gomlc --jobs "${GOML_TEST_JOBS:-4}" --timeout 10m
 
 _ci-vscode:
     mkdir -p editors/vscode/bin

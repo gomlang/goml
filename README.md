@@ -38,7 +38,7 @@ just clean
 
 Local CI runs its check groups concurrently. Set `GOML_CI_SEQUENTIAL=1` to run them sequentially, `GOML_BUILD_JOBS` to limit bootstrap package workers, and `GOML_TEST_JOBS` to override compiler and driver test concurrency. Compiler fixtures may use Yaegi when it is available on `PATH`; they fall back to native Go compilation when it is unavailable or cannot run a fixture.
 
-GitHub CI distributes compiler tests across four runners using `GOML_TEST_SHARD=1/4` through `4/4`, with four test workers on each runner. Each shard downloads the shared stage2 build and builds its test runner locally. The final `test` check requires every shard and the other CI jobs to pass.
+GitHub CI distributes compiler and driver tests across four runners each using `GOML_TEST_SHARD=1/4` through `4/4`, with four test workers on each runner. Two build jobs compile the compiler and driver test runners once and upload their binaries, test manifests, and executable-relative libraries. Each shard downloads its test artifact and the shared stage2 build, then uses `goml test --no-build` to execute its selection. The final `test` check requires both builds, all eight shards, and the other CI jobs to pass.
 
 The bootstrap downloads the checksum-pinned stage0 release recorded in [bootstrap/stage0.env](bootstrap/stage0.env). `just bootstrap` rebuilds stage2 from stage0, builds stage3 with stage2, then uses stage3 to rebuild the compiler and driver artifacts and compares them with the first stage3 build. Set `GOML_STAGE0_ARCHIVE` to a previously downloaded pinned archive to avoid downloading stage0.
 
