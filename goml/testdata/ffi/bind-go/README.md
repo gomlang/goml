@@ -1,12 +1,14 @@
 # Import a standard-library allowlist
 
+Release smoke tests reuse these inputs to check binding generation, repeatability, execution, and rejection of edits to generated files.
+
 From this directory, with the repository toolchain built:
 
 ```sh
-../../stage2/bin/goml bind-go bindings.json --dry-run
-../../stage2/bin/goml bind-go bindings.json
-../../stage2/bin/goml check
-../../stage2/bin/goml run
+../../../../stage2/bin/goml bind-go bindings.json --dry-run
+../../../../stage2/bin/goml bind-go bindings.json
+../../../../stage2/bin/goml check
+../../../../stage2/bin/goml run
 ```
 
 The output is:

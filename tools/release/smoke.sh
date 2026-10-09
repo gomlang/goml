@@ -101,9 +101,9 @@ rm calc.goml goml.toml
 test ! -e go.sum
 mkdir -p "$smoke_root/file-read"
 for source in goml.toml go.mod main.goml data.txt; do
-    cp "$repository_root/examples/ffi-file-read/$source" "$smoke_root/file-read/$source"
+    cp "$repository_root/goml/testdata/ffi/file-read/$source" "$smoke_root/file-read/$source"
 done
-cp -R "$repository_root/examples/ffi-file-read/shim" "$smoke_root/file-read/shim"
+cp -R "$repository_root/goml/testdata/ffi/file-read/shim" "$smoke_root/file-read/shim"
 cd "$smoke_root/file-read"
 "$smoke_root/$package/bin/goml" fmt --check
 "$smoke_root/$package/bin/goml" check --ffi-check required
@@ -127,7 +127,7 @@ done
 test ! -e go.sum
 mkdir -p "$smoke_root/callbacks/shim"
 for source in goml.toml go.mod main.goml shim/shim.go; do
-    cp "$repository_root/examples/ffi-callbacks/$source" "$smoke_root/callbacks/$source"
+    cp "$repository_root/goml/testdata/ffi/callbacks/$source" "$smoke_root/callbacks/$source"
 done
 cd "$smoke_root/callbacks"
 "$smoke_root/$package/bin/goml" fmt --check
@@ -152,7 +152,7 @@ done
 test ! -e go.sum
 mkdir -p "$smoke_root/bind-go"
 for source in goml.toml go.mod main.goml bindings.json; do
-    cp "$repository_root/examples/ffi-bind-go/$source" "$smoke_root/bind-go/$source"
+    cp "$repository_root/goml/testdata/ffi/bind-go/$source" "$smoke_root/bind-go/$source"
 done
 cd "$smoke_root/bind-go"
 "$smoke_root/$package/bin/goml" bind-go bindings.json --dry-run
@@ -181,7 +181,7 @@ test ! -e .goml-bind-go-lock
 "$smoke_root/$package/bin/goml-c-bind" --help > "$smoke_root/bind-c-helper-help.txt"
 mkdir -p "$smoke_root/bind-c"
 for source in goml.toml go.mod main.goml bindings_test.goml bindings.json sample.h; do
-    cp "$repository_root/examples/ffi-bind-c/$source" "$smoke_root/bind-c/$source"
+    cp "$repository_root/goml/testdata/ffi/bind-c/$source" "$smoke_root/bind-c/$source"
 done
 cd "$smoke_root/bind-c"
 export CGO_ENABLED=1
