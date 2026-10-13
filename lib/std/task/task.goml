@@ -31,10 +31,9 @@ pub enum WaitResult[T] {
 }
 
 fn completed_scope_value[T](result: Ref[Option[T]]) -> T {
-    loop {
-        if let Some(value) = result.get() {
-            break value
-        }
+    match result.get() {
+        Some(value) => value,
+        None => panic::raise("scope completed without a result"),
     }
 }
 
@@ -65,50 +64,42 @@ impl ConcurrencyLimit {
     }
 }
 
-pub fn scope[T](body: (Scope) -> T) -> T {
-    let handle = internal_task::root_scope();
+fn run_scope[T](handle: internal_task::ScopeHandle, body: (Scope) -> T) -> T {
     let result: Ref[Option[T]] = Ref::new(Option::None);
     internal_task::run(handle, || result.set(Option::Some(body(Scope { handle }))));
     completed_scope_value(result)
+}
+
+fn run_try_scope[T, E](handle: internal_task::ScopeHandle, body: (Scope) -> Result[T, E]) -> Result[
+    T,
+    E,
+] {
+    run_scope(
+        handle,
+        |scope| {
+            let value = body(scope);
+            if value.is_err() {
+                scope.cancel()
+            }
+            value
+        },
+    )
+}
+
+pub fn scope[T](body: (Scope) -> T) -> T {
+    run_scope(internal_task::root_scope(), body)
 }
 
 pub fn scope_with[T](parent: CancelToken, body: (Scope) -> T) -> T {
-    let handle = internal_task::child_scope(parent.value);
-    let result: Ref[Option[T]] = Ref::new(Option::None);
-    internal_task::run(handle, || result.set(Option::Some(body(Scope { handle }))));
-    completed_scope_value(result)
+    run_scope(internal_task::child_scope(parent.value), body)
 }
 
 pub fn try_scope[T, E](body: (Scope) -> Result[T, E]) -> Result[T, E] {
-    let handle = internal_task::root_scope();
-    let result: Ref[Option[Result[T, E]]] = Ref::new(Option::None);
-    internal_task::run(
-        handle,
-        || {
-            let value = body(Scope { handle });
-            if value.is_err() {
-                internal_task::cancel(handle)
-            }
-            result.set(Option::Some(value))
-        },
-    );
-    completed_scope_value(result)
+    run_try_scope(internal_task::root_scope(), body)
 }
 
 pub fn try_scope_with[T, E](parent: CancelToken, body: (Scope) -> Result[T, E]) -> Result[T, E] {
-    let handle = internal_task::child_scope(parent.value);
-    let result: Ref[Option[Result[T, E]]] = Ref::new(Option::None);
-    internal_task::run(
-        handle,
-        || {
-            let value = body(Scope { handle });
-            if value.is_err() {
-                internal_task::cancel(handle)
-            }
-            result.set(Option::Some(value))
-        },
-    );
-    completed_scope_value(result)
+    run_try_scope(internal_task::child_scope(parent.value), body)
 }
 
 pub fn active_scope_count() -> isize {
@@ -117,39 +108,17 @@ pub fn active_scope_count() -> isize {
 
 impl Scope {
     pub fn spawn[T](self: Scope, body: (CancelToken) -> T) -> Task[T] {
-        let result: Ref[Option[Result[T, panic::Panic]]] = Ref::new(Option::None);
-        let ready: Channel[()] = Channel::new(0);
-        let token = CancelToken { value: internal_task::token(self.handle) };
-        internal_task::spawn(
-            self.handle,
-            || {
-                let outcome = panic::catch(|| body(token));
-                result.set(Option::Some(outcome));
-                ready.close();
-                if let Err(info) = outcome {
-                    panic::resume(info);
-                }
-            },
-        );
-        Task { result, ready }
+        let task: Task[T] = Task::pending();
+        let token = self.token();
+        internal_task::spawn(self.handle, || task.run(token, body));
+        task
     }
 
     pub fn try_spawn[T](self: Scope, body: (CancelToken) -> T) -> Option[Task[T]] {
-        let result: Ref[Option[Result[T, panic::Panic]]] = Ref::new(Option::None);
-        let ready: Channel[()] = Channel::new(0);
-        let token = CancelToken { value: internal_task::token(self.handle) };
-        if internal_task::try_spawn(
-            self.handle,
-            || {
-                let outcome = panic::catch(|| body(token));
-                result.set(Option::Some(outcome));
-                ready.close();
-                if let Err(info) = outcome {
-                    panic::resume(info);
-                }
-            },
-        ) {
-            Option::Some(Task { result, ready })
+        let task: Task[T] = Task::pending();
+        let token = self.token();
+        if internal_task::try_spawn(self.handle, || task.run(token, body)) {
+            Option::Some(task)
         } else {
             Option::None
         }
@@ -220,6 +189,19 @@ pub fn sleep_nanoseconds_with(cancel: CancelToken, nanoseconds: i64) -> WaitResu
 }
 
 impl[T] Task[T] {
+    fn pending() -> Task[T] {
+        Task { result: Ref::new(Option::None), ready: Channel::new(0) }
+    }
+
+    fn run(self: Task[T], token: CancelToken, body: (CancelToken) -> T) -> () {
+        let outcome = panic::catch(|| body(token));
+        self.result.set(Option::Some(outcome));
+        self.ready.close();
+        if let Err(info) = outcome {
+            panic::resume(info);
+        }
+    }
+
     pub fn done(self: Task[T]) -> Receiver[()] {
         self.ready.receiver()
     }

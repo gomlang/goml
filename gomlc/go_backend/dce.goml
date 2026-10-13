@@ -207,31 +207,9 @@ fn free_vars_in_block(value: Block) -> DceNames {
     let declared = new_dce_names();
     for stmt in value.stmts {
         match stmt {
-            Expr { expr } | Go { call: expr } | Defer { call: expr } => add_expr_uses(used, expr),
-            Var { name, ty: _, value: initial } => {
+            Var { name, .. } => {
                 add_name(declared, name);
-                if let Some(expr) = initial {
-                    add_expr_uses(used, expr)
-                }
-            },
-            Assign { name: _, value: expr } => add_expr_uses(used, expr),
-            FieldAssign { target, field_name: _, value: expr } => {
-                add_expr_uses(used, target);
-                add_expr_uses(used, expr)
-            },
-            IndexAssign { base: target, index, value: expr } => {
-                add_expr_uses(used, target);
-                add_expr_uses(used, index);
-                add_expr_uses(used, expr)
-            },
-            MultiAssign { names: _, value: expr } => add_expr_uses(used, expr),
-            Return { expr } => if let Some(expr) = expr {
-                add_expr_uses(used, expr)
-            },
-            ReturnMulti { exprs } => {
-                for expr in exprs {
-                    add_expr_uses(used, expr)
-                }
+                add_stmt_uses(used, stmt)
             },
             If { cond, then_, else_ } => {
                 add_expr_uses(used, cond);
@@ -299,9 +277,7 @@ fn free_vars_in_block(value: Block) -> DceNames {
                     add_names(used, free_vars_in_block(body))
                 }
             },
-            Break | BreakLabel { label: _ } | Continue | ContinueLabel { label: _ } | Panic {
-                message: _,
-            } | Unreachable => (),
+            _ => add_stmt_uses(used, stmt),
         }
     }
     for name in declared {
@@ -364,20 +340,10 @@ fn append_target(values: Vec[Expr]) -> Option[string] {
 
 fn emit_side_effect(value: Expr) -> Stmt {
     match value {
-        Call { func, args } => if append_call(func) {
-            let call = Expr::Call { func, args };
-            match append_target(args) {
-                Some(name) => Stmt::Assign { name, value: call },
-                None => Stmt::Assign { name: "_", value: call },
-            }
-        } else {
-            Stmt::Expr { expr: Expr::Call { func, args } }
-        },
-        CallSpread { func, args, spread } => if append_call(func) {
-            Stmt::Assign {
-                name: append_target(args).unwrap_or("_"),
-                value: Expr::CallSpread { func, args, spread },
-            }
+        Call { func, args } | CallSpread { func, args, .. } => if append_call(func) {
+            Stmt::Assign { name: append_target(args).unwrap_or("_"), value }
+        } else if call_result_must_be_used(func) {
+            Stmt::Assign { name: "_", value }
         } else {
             Stmt::Expr { expr: value }
         },
@@ -392,24 +358,24 @@ fn binary_may_panic(value: BinaryOp) -> bool {
     }
 }
 
+fn exprs_have_side_effects(values: Vec[Expr]) -> bool {
+    for value in values {
+        if expr_has_side_effects(value) {
+            return true
+        }
+    }
+    false
+}
+
 fn expr_has_side_effects(value: Expr) -> bool {
     match value {
         Call { func, args } => {
-            for arg in args {
-                if expr_has_side_effects(arg) {
-                    return true
-                }
-            }
-            append_call(func) || !call_result_must_be_used(func)
+            exprs_have_side_effects(args) || append_call(func) || !call_result_must_be_used(func)
         },
         Instantiate { expr, .. } => expr_has_side_effects(expr),
         CallSpread { func, args, spread } => {
-            for arg in args {
-                if expr_has_side_effects(arg) {
-                    return true
-                }
-            }
-            expr_has_side_effects(spread) || append_call(func) || !call_result_must_be_used(func)
+            exprs_have_side_effects(args) || expr_has_side_effects(spread) || append_call(func)
+                || !call_result_must_be_used(func)
         },
         Unary { op: _, expr } => expr_has_side_effects(expr),
         Binary { op, lhs, rhs } => {
@@ -418,14 +384,7 @@ fn expr_has_side_effects(value: Expr) -> bool {
         Field { expr, field_name: _ } => expr_has_side_effects(expr),
         Index { base: _, index: _ } | Slice { base: _, start: _, end: _ } => true,
         Cast { expr, ty: _ } | Convert { ty: _, expr } => expr_has_side_effects(expr),
-        Make { ty: _, args } => {
-            for arg in args {
-                if expr_has_side_effects(arg) {
-                    return true
-                }
-            }
-            false
-        },
+        Make { args, .. } => exprs_have_side_effects(args),
         Send { channel: _, value: _ } | Receive { channel: _ } => true,
         StructLiteral { ty: _, fields } => {
             for field in fields {
@@ -435,14 +394,7 @@ fn expr_has_side_effects(value: Expr) -> bool {
             }
             false
         },
-        ArrayLiteral { ty: _, items } => {
-            for item in items {
-                if expr_has_side_effects(item) {
-                    return true
-                }
-            }
-            false
-        },
+        ArrayLiteral { items, .. } => exprs_have_side_effects(items),
         FuncLit { params: _, ret_ty: _, body: _ } => false,
         MethodExpression { .. } | Nil | Unit | Var { name: _ } | Bool { value: _ } | Int {
             value: _,
@@ -456,6 +408,13 @@ fn reversed(values: Vec[Stmt]) -> Vec[Stmt] {
         result.push(values[values.len() - index - 1])
     }
     result
+}
+
+fn retain_side_effect(output: Vec[Stmt], live: DceNames, value: Expr) -> () {
+    if expr_has_side_effects(value) {
+        add_expr_uses(live, value);
+        output.push(emit_side_effect(value))
+    }
 }
 
 fn dce_block_with_live(value: Block, live_out: DceNames) -> DceResult {
@@ -488,24 +447,13 @@ fn dce_block_with_live(value: Block, live_out: DceNames) -> DceResult {
                         add_expr_uses(live, expr)
                     }
                     output.push(Stmt::Var { name, ty, value: initial })
-                } else if needs_decl.contains(name) {
-                    remove_name(needs_decl, name);
-                    match initial {
-                        Some(expr) => {
-                            if expr_has_side_effects(expr) {
-                                add_expr_uses(live, expr);
-                                output.push(emit_side_effect(expr))
-                            }
-                            output.push(Stmt::Var { name, ty, value: Option::None })
-                        },
-                        None => output.push(Stmt::Var { name, ty, value: Option::None }),
-                    }
                 } else {
                     if let Some(expr) = initial {
-                        if expr_has_side_effects(expr) {
-                            add_expr_uses(live, expr);
-                            output.push(emit_side_effect(expr))
-                        }
+                        retain_side_effect(output, live, expr)
+                    }
+                    if needs_decl.contains(name) {
+                        remove_name(needs_decl, name);
+                        output.push(Stmt::Var { name, ty, value: Option::None })
                     }
                 }
             },
@@ -515,9 +463,8 @@ fn dce_block_with_live(value: Block, live_out: DceNames) -> DceResult {
                     add_expr_uses(live, expr);
                     add_name(needs_decl, name);
                     output.push(Stmt::Assign { name, value: expr })
-                } else if expr_has_side_effects(expr) {
-                    add_expr_uses(live, expr);
-                    output.push(emit_side_effect(expr))
+                } else {
+                    retain_side_effect(output, live, expr)
                 }
             },
             FieldAssign { target, field_name: field, value: expr } => {

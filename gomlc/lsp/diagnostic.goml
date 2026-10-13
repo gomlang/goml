@@ -1,9 +1,12 @@
 package lsp;
 
+use module::ast;
 use module::query;
 use module::tast;
 use std::json;
 use json::Serialize;
+
+const PUBLISH_DIAGNOSTICS_METHOD: string = "textDocument/publishDiagnostics";
 
 #[derive(Serialize)]
 struct DiagnosticEditOutput {
@@ -143,10 +146,16 @@ fn fix_changes(fix: json::Value) -> Option[Vec[(string, json::Value)]] {
     let changes: Vec[(string, json::Value)] = Vec::new();
     for edit in edits {
         let uri = json::as_string(json::field(edit, "uri")?)?;
-        let range = json::field(edit, "range")?;
+        if uri_to_path(uri).is_err() {
+            return Option::None
+        }
+        let range = match parse_range(json::field(edit, "range")?) {
+            Ok(range) => range,
+            Err(_) => return Option::None,
+        };
         let replacement = json::as_string(json::field(edit, "replacement")?)?;
         let fields: Vec[(string, json::Value)] = Vec::new();
-        push_json_field(fields, "range", range);
+        push_json_field(fields, "range", range_json(range));
         push_json_field(fields, "newText", json::Value::String(replacement));
         let encoded = json::Value::Object(fields);
         let mut found = false;
@@ -163,4 +172,132 @@ fn fix_changes(fix: json::Value) -> Option[Vec[(string, json::Value)]] {
         }
     }
     Option::Some(changes)
+}
+
+fn diagnostic_text(value: tast::Diagnostic) -> string {
+    let message = match value.primary_label {
+        Some(label) => value.message + "\n" + label,
+        None => value.message,
+    };
+    message + tast::diagnostic_guidance(value)
+}
+
+fn diagnostic_contains_offset(value: tast::Diagnostic, source_path: string, offset: isize) -> bool {
+    (value.source_path == "" || value.source_path == source_path)
+        && match value.span {
+            Some(span) => if span.start == span.end {
+                offset == span.start
+            } else {
+                span.start <= offset && offset < span.end
+            },
+            None => offset == 0,
+        }
+}
+
+fn diagnostic_severity(value: tast::DiagnosticSeverity) -> isize {
+    match value {
+        Error => 1,
+        Warning => 2,
+    }
+}
+
+fn diagnostic_json(
+    server: Server,
+    document: Document,
+    analysis: query::Analysis,
+    value: tast::Diagnostic,
+) -> json::Value {
+    let span = value.span.unwrap_or_else(|| ast::span(0, 0));
+    let related = Vec::new();
+    for label in value.secondary_labels {
+        if let Some(source) = source_for_path(analysis, label.source_path) {
+            let index = source_line_index(server, label.source_path, source);
+            related.push(
+                DiagnosticRelatedOutput {
+                    location: DiagnosticLocationOutput {
+                        uri: path_to_uri(label.source_path),
+                        range: offsets_to_range_with_index(index, label.span.start, label.span.end),
+                    },
+                    message: label.message,
+                },
+            )
+        }
+    }
+    protocol_value(
+        DiagnosticOutput {
+            range: offsets_to_range_with_index(document.line_index, span.start, span.end),
+            severity: diagnostic_severity(value.severity),
+            source: "goml",
+            message: diagnostic_text(value),
+            code: value.code,
+            data: diagnostic_data(server, document, analysis, value),
+            related,
+        },
+    )
+}
+
+fn publish_diagnostics(server: Server, document: Document) -> json::Value {
+    let analysis = document_analysis(server, document);
+    let _ = query::build_symbol_index(analysis);
+    let diagnostics: Vec[json::Value] = Vec::new();
+    for diagnostic in analysis.checked.diagnostics {
+        if diagnostic.source_path == "" || diagnostic.source_path == document.path {
+            diagnostics.push(diagnostic_json(server, document, analysis, diagnostic))
+        }
+    }
+    let params: Vec[(string, json::Value)] = Vec::new();
+    push_json_field(params, "uri", json::Value::String(document.uri));
+    push_json_field(params, "version", json::Value::Number(document.version.to_string()));
+    push_json_field(params, "diagnostics", json::Value::Array(diagnostics));
+    rpc_notification(PUBLISH_DIAGNOSTICS_METHOD, json::Value::Object(params))
+}
+
+fn fix_action(diagnostic: json::Value, fix: json::Value) -> Option[json::Value] {
+    let changes = fix_changes(fix)?;
+    let title = match json::field(fix, "title") {
+        Some(value) => json::as_string(value).unwrap_or("Apply suggested fix"),
+        None => "Apply suggested fix",
+    };
+    let preferred = match json::field(fix, "preferred") {
+        Some(Bool(value)) => value,
+        _ => false,
+    };
+    let workspace_edit: Vec[(string, json::Value)] = Vec::new();
+    push_json_field(workspace_edit, "changes", json::Value::Object(changes));
+    let diagnostics: Vec[json::Value] = Vec::new();
+    diagnostics.push(diagnostic);
+    let action: Vec[(string, json::Value)] = Vec::new();
+    push_json_field(action, "title", json::Value::String(title));
+    push_json_field(action, "kind", json::Value::String("quickfix"));
+    push_json_field(action, "diagnostics", json::Value::Array(diagnostics));
+    push_json_field(action, "edit", json::Value::Object(workspace_edit));
+    push_json_field(action, "isPreferred", json::Value::Bool(preferred));
+    Option::Some(json::Value::Object(action))
+}
+
+fn code_action_response(server: Server, params: json::Value) -> Result[json::Value, string] {
+    let context = required_field(params, "context")?;
+    let Array(diagnostics) = required_field(context, "diagnostics")? else {
+        return Result::Err("field diagnostics must be an array");
+    };
+    let actions: Vec[json::Value] = Vec::new();
+    for diagnostic in diagnostics {
+        if let Some(data) = json::field(diagnostic, "data") {
+            if !diagnostic_version_matches(server, data) {
+                continue
+            }
+            if let Some(Array(fixes)) = json::field(data, "fixes") {
+                for fix in fixes {
+                    if let Some(action) = fix_action(diagnostic, fix) {
+                        actions.push(action)
+                    }
+                }
+            }
+        }
+    }
+    if actions.is_empty() {
+        Result::Ok(json::Value::Null)
+    } else {
+        Result::Ok(json::Value::Array(actions))
+    }
 }

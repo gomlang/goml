@@ -16,7 +16,7 @@ just vscode-ext
 
 Open `editors/vscode` as the VS Code workspace and press F5 to launch the Extension Development Host. The launch task runs `npm run compile`.
 
-Use **GoML: Show Expanded Derive** to inspect the current document's AST after derive expansion. **GoML: Show Language Server Output** opens the server log. Test code lenses save the source and invoke `goml test` with the selected test name and kind; the project driver must be on `PATH`, and the workspace folder must be inside the GoML module containing the test.
+Use **GoML: Show Expanded Derive** to inspect the current document's AST after derive expansion. **GoML: Show Language Server Output** opens the server log. Test code lenses save the source and invoke `goml test` with the selected test name and kind from the source file's directory. Set `goml.driverPath` or put the project driver on `PATH`; module discovery starts at the test file, including when a workspace contains several modules. A failed save cancels the test run.
 
 Use **Format Document** to format the current GoML buffer. The language server uses GoML's fixed formatting rules and leaves syntactically invalid documents unchanged.
 

@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type astType struct {
@@ -57,6 +58,7 @@ func (b *limitedBuffer) Write(data []byte) (int, error) {
 
 func run(ctx context.Context, directory, input, program string, arguments ...string) ([]byte, error) {
 	command := exec.CommandContext(ctx, program, arguments...)
+	command.WaitDelay = time.Second
 	command.Dir = directory
 	command.Stdin = strings.NewReader(input)
 	command.Env = append(os.Environ(), "LC_ALL=C", "GOWORK=off", "GOTOOLCHAIN=local", "GOPROXY=off", "GOSUMDB=off")

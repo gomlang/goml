@@ -26,6 +26,13 @@ type Parameter struct {
 	MaxBytes int    `json:"max_bytes,omitempty"`
 }
 
+func (p Parameter) kind() string {
+	if p.Kind == "" {
+		return "value"
+	}
+	return p.Kind
+}
+
 type Return struct {
 	Kind     string `json:"kind,omitempty"`
 	Type     string `json:"type,omitempty"`
@@ -77,6 +84,7 @@ type Project struct {
 var identifier = regexp.MustCompile(`^[A-Za-z_][A-Za-z_0-9]*$`)
 var cTypeName = regexp.MustCompile(`^(struct )?[A-Za-z_][A-Za-z_0-9]*(\s*\*)*$`)
 var headerName = regexp.MustCompile(`^[A-Za-z_0-9./+-]+$`)
+var pkgConfigName = regexp.MustCompile(`^[A-Za-z_0-9.+-]+$`)
 var gomlKeywords = strings.Fields("fn let mut if else match for in while loop break continue return defer use pub package module struct enum trait impl extern type const comptime dyn as where true false self Self")
 
 func nameOK(name string, upper bool) bool {
@@ -173,9 +181,11 @@ func validate(c Config) error {
 			return fmt.Errorf("invalid include directory %q", dir)
 		}
 	}
-	for _, flag := range append(append([]string{}, c.CFlags...), c.LDFlags...) {
-		if flag == "" || strings.ContainsAny(flag, "\x00\r\n\t \"'") || strings.Contains(flag, "*/") {
-			return fmt.Errorf("invalid native flag %q", flag)
+	for _, flags := range [][]string{c.CFlags, c.LDFlags} {
+		for _, flag := range flags {
+			if flag == "" || strings.ContainsAny(flag, "\x00\r\n\t \"'") || strings.Contains(flag, "*/") {
+				return fmt.Errorf("invalid native flag %q", flag)
+			}
 		}
 	}
 	for _, flag := range c.CFlags {
@@ -189,7 +199,7 @@ func validate(c Config) error {
 		}
 	}
 	for _, pkg := range c.PkgConfig {
-		if !regexp.MustCompile(`^[A-Za-z_0-9.+-]+$`).MatchString(pkg) || strings.HasPrefix(pkg, "-") {
+		if !pkgConfigName.MatchString(pkg) || strings.HasPrefix(pkg, "-") {
 			return fmt.Errorf("invalid pkg-config package %q", pkg)
 		}
 	}
@@ -210,10 +220,7 @@ func validate(c Config) error {
 			if !nameOK(param.Name, false) || params[param.Name] != "" {
 				return fmt.Errorf("invalid or duplicate parameter in %s", fn.Name)
 			}
-			kind := param.Kind
-			if kind == "" {
-				kind = "value"
-			}
+			kind := param.kind()
 			switch kind {
 			case "value", "cstring", "bytes", "inout_bytes", "length", "out", "out_string":
 			default:

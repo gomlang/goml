@@ -116,17 +116,7 @@ fn ct_error(state: EvalState, module: ctir::CtModule, origin: isize, message: st
 }
 
 fn missing_constant_error(state: EvalState, module: ctir::CtModule, origin: isize, message: string) -> CtError {
-    CtError {
-        kind: CtErrorKind::MissingConstant,
-        message,
-        package_name: module.package_name,
-        origin,
-        stack: copy_stack(state.stack),
-        derive_span: match state.derive_state {
-            Some(value) => value.error_span.get(),
-            None => Option::None,
-        },
-    }
+    CtError { kind: CtErrorKind::MissingConstant, ..ct_error(state, module, origin, message) }
 }
 
 fn consume_fuel(state: EvalState, module: ctir::CtModule, origin: isize) -> Result[(), CtError] {
@@ -138,55 +128,33 @@ fn consume_fuel(state: EvalState, module: ctir::CtModule, origin: isize) -> Resu
     }
 }
 
-fn value_node_count(value: ctir::CtValue) -> isize {
-    match value {
-        ctir::CtValue::Tuple(values) | ctir::CtValue::Array(values) => {
-            let mut result = 1;
-            for value in values {
-                result = result + value_node_count(value);
-            }
-            result
-        },
-        ctir::CtValue::Struct { name: _, fields } | ctir::CtValue::Enum {
-            name: _,
-            variant: _,
-            fields,
-        } => {
-            let mut result = 1;
-            for value in fields {
-                result = result + value_node_count(value);
-            }
-            result
-        },
-        _ => 1,
+fn value_list_size(values: Vec[ctir::CtValue], own_bytes: isize) -> (isize, isize) {
+    let mut nodes = 1;
+    let mut bytes = own_bytes;
+    for value in values {
+        let size = value_size(value);
+        nodes += size.0;
+        bytes += size.1;
     }
+    let size = (nodes, bytes);
+    size
 }
 
-fn value_byte_size(value: ctir::CtValue) -> isize {
+fn value_size(value: ctir::CtValue) -> (isize, isize) {
     match value {
-        ctir::CtValue::Unit => 1,
-        ctir::CtValue::Bool(_) => 1,
-        ctir::CtValue::Integer { .. } => 8,
-        ctir::CtValue::String(value) => value.byte_len(),
-        ctir::CtValue::Char(_) => 4,
-        ctir::CtValue::Tuple(values) | ctir::CtValue::Array(values) => {
-            let mut result = 1;
-            for value in values {
-                result = result + value_byte_size(value);
-            }
-            result
-        },
-        ctir::CtValue::Struct { name, fields } | ctir::CtValue::Enum { name, variant: _, fields } => {
-            let mut result = name.byte_len() + 8;
-            for value in fields {
-                result = result + value_byte_size(value);
-            }
-            result
-        },
-        ctir::CtValue::Meta { kind, id: _ } => kind.byte_len() + 8,
+        ctir::CtValue::Unit | ctir::CtValue::Bool(_) => (1, 1),
+        ctir::CtValue::Integer { .. } => (1, 8),
+        ctir::CtValue::String(value) => (1, value.byte_len()),
+        ctir::CtValue::Char(_) => (1, 4),
+        ctir::CtValue::Tuple(values) | ctir::CtValue::Array(values) => value_list_size(values, 1),
+        ctir::CtValue::Struct { name, fields } | ctir::CtValue::Enum { name, variant: _, fields } => value_list_size(
+            fields,
+            name.byte_len() + 8,
+        ),
+        ctir::CtValue::Meta { kind, id: _ } => (1, kind.byte_len() + 8),
         ctir::CtValue::Dynamic { .. } | ctir::CtValue::Buffer { .. } | ctir::CtValue::Callable {
             ..,
-        } => 16,
+        } => (1, 16),
     }
 }
 
@@ -223,8 +191,7 @@ fn allocate_value(state: EvalState, module: ctir::CtModule, origin: isize, value
     ctir::CtValue,
     CtError,
 ] {
-    let count = value_node_count(value);
-    let bytes = value_byte_size(value);
+    let (count, bytes) = value_size(value);
     charge_allocation(state, module, origin, count, bytes)?;
     Result::Ok(value)
 }
@@ -416,6 +383,18 @@ fn set_local(frame: EvalFrame, slot: isize, value: ctir::CtValue) -> bool {
         frame.locals[slot].set(Option::Some(value));
         true
     }
+}
+
+fn new_frame(state: EvalState, module: ctir::CtModule, origin: isize, local_count: isize) -> Result[
+    EvalFrame,
+    CtError,
+] {
+    charge_allocation(state, module, origin, local_count, local_count * 16)?;
+    let locals: Vec[Ref[Option[ctir::CtValue]]] = Vec::with_capacity(local_count);
+    for _ in 0..local_count {
+        locals.push(Ref::new(Option::None))
+    }
+    Result::Ok(EvalFrame { locals })
 }
 
 fn match_pattern(
@@ -1016,17 +995,9 @@ fn call_target(state: EvalState, current: ctir::CtModule, target: ctir::CtCallTa
     }
 }
 
-fn memo_args_equal(left: Vec[ctir::CtValue], right: Vec[ctir::CtValue]) -> bool {
-    if left.len() != right.len() {
-        false
-    } else {
-        for index in 0..left.len() {
-            if !values_equal(left[index], right[index]) {
-                return false
-            }
-        }
-        true
-    }
+fn memoization_enabled(state: EvalState) -> bool {
+    state.derive_state.is_none() && state.closures.is_empty() && state.buffers.is_empty()
+        && state.dynamics.is_empty()
 }
 
 fn find_memoized(
@@ -1037,7 +1008,7 @@ fn find_memoized(
 ) -> Option[ctir::CtValue] {
     for entry in state.memo {
         if entry.package_name == package_name && entry.function_id == function_id
-            && memo_args_equal(entry.args, args) {
+            && value_lists_equal(entry.args, args) {
             return Option::Some(entry.value)
         }
     }
@@ -1067,10 +1038,17 @@ fn eval_function(
             )
         }
     }
-    if state.derive_state.is_none() && state.closures.is_empty() && state.buffers.is_empty()
-        && state.dynamics.is_empty() {
+    if memoization_enabled(state) {
         if let Some(value) = find_memoized(state, module.package_name, function.id, args) {
             return Result::Ok(value)
+        }
+    }
+    let frame = new_frame(state, module, call_origin, function.local_count)?;
+    for index in 0..args.len() {
+        if !set_local(frame, function.parameter_slots[index], args[index]) {
+            return Result::Err(
+                ct_error(state, module, call_origin, "comptime function parameter slot is invalid"),
+            )
         }
     }
     state.call_depth.set(state.call_depth.get() + 1);
@@ -1081,27 +1059,12 @@ fn eval_function(
             origin: function.origin,
         },
     );
-    let locals: Vec[Ref[Option[ctir::CtValue]]] = Vec::with_capacity(function.local_count);
-    for _ in 0..function.local_count {
-        locals.push(Ref::new(Option::None))
-    }
-    let frame = EvalFrame { locals };
-    for index in 0..args.len() {
-        if !set_local(frame, function.parameter_slots[index], args[index]) {
-            state.stack.truncate(state.stack.len() - 1);
-            state.call_depth.set(state.call_depth.get() - 1);
-            return Result::Err(
-                ct_error(state, module, call_origin, "comptime function parameter slot is invalid"),
-            )
-        }
-    }
     let result = eval_block(state, module, frame, function.body);
     state.stack.truncate(state.stack.len() - 1);
     state.call_depth.set(state.call_depth.get() - 1);
     match result {
         Ok(EvalFlow::Value(value)) | Ok(EvalFlow::Return(value)) => {
-            if state.derive_state.is_none() && state.closures.is_empty() && state.buffers.is_empty()
-                && state.dynamics.is_empty() {
+            if memoization_enabled(state) {
                 state.memo.push(
                     CtMemoEntry {
                         package_name: module.package_name,
@@ -1832,7 +1795,7 @@ fn finish_value(state: EvalState, module: ctir::CtModule, origin: isize, flow: E
             ct_error(state, module, origin, "comptime site escaped with control flow"),
         ),
     };
-    if value_byte_size(value) > state.limits.final_bytes {
+    if value_size(value).1 > state.limits.final_bytes {
         Result::Err(ct_error(state, module, origin, "comptime result size limit exceeded"))
     } else {
         Result::Ok(value)
@@ -1850,28 +1813,31 @@ fn invalid_ctir_error(module: ctir::CtModule, message: string) -> CtError {
     }
 }
 
+fn verified_modules(module: ctir::CtModule, dependencies: Vec[ctir::CtModule]) -> Result[
+    Vec[ctir::CtModule],
+    CtError,
+] {
+    verify_module(module, dependencies).map_err(|message| invalid_ctir_error(module, message))?;
+    let modules: Vec[ctir::CtModule] = Vec::with_capacity(dependencies.len() + 1);
+    modules.push(module);
+    for dependency in dependencies {
+        modules.push(dependency)
+    }
+    Result::Ok(modules)
+}
+
 pub fn evaluate_site(
     module: ctir::CtModule,
     dependencies: Vec[ctir::CtModule],
     site_id: isize,
     limits: EvalLimits,
 ) -> Result[ctir::CtValue, CtError] {
-    if let Err(message) = verify_module(module, dependencies) {
-        return Result::Err(invalid_ctir_error(module, message))
-    }
-    let modules: Vec[ctir::CtModule] = Vec::with_capacity(dependencies.len() + 1);
-    modules.push(module);
-    for dependency in dependencies {
-        modules.push(dependency)
-    }
+    let modules = verified_modules(module, dependencies)?;
     let state = new_state(modules, limits, Option::None);
     for site in module.sites {
         if site.id == site_id {
-            let locals: Vec[Ref[Option[ctir::CtValue]]] = Vec::with_capacity(site.local_count);
-            for _ in 0..site.local_count {
-                locals.push(Ref::new(Option::None))
-            }
-            let flow = eval_expr(state, module, EvalFrame { locals }, site.expression)?;
+            let frame = new_frame(state, module, site.origin, site.local_count)?;
+            let flow = eval_expr(state, module, frame, site.expression)?;
             return finish_value(state, module, site.origin, flow)
         }
     }
@@ -1885,24 +1851,13 @@ pub fn evaluate_entry(
     args: Vec[ctir::CtValue],
     limits: EvalLimits,
 ) -> Result[ctir::CtValue, CtError] {
-    if let Err(message) = verify_module(module, dependencies) {
-        return Result::Err(invalid_ctir_error(module, message))
-    }
-    let modules: Vec[ctir::CtModule] = Vec::with_capacity(dependencies.len() + 1);
-    modules.push(module);
-    for dependency in dependencies {
-        modules.push(dependency)
-    }
+    let modules = verified_modules(module, dependencies)?;
     let state = new_state(modules, limits, Option::None);
     let Some(function) = find_entry(module, entry_name) else {
         return Result::Err(ct_error(state, module, 0, "unknown comptime entry " + entry_name))
     };
     let value = eval_function(state, module, function, args, function.origin)?;
-    if value_byte_size(value) > limits.final_bytes {
-        Result::Err(ct_error(state, module, function.origin, "comptime result size limit exceeded"))
-    } else {
-        Result::Ok(value)
-    }
+    finish_value(state, module, function.origin, EvalFlow::Value(value))
 }
 
 pub fn evaluate_derive_entry(
@@ -1912,14 +1867,7 @@ pub fn evaluate_derive_entry(
     request: derive::DeriveRequest,
     limits: EvalLimits,
 ) -> Result[Vec[ast::Item], CtError] {
-    if let Err(message) = verify_module(module, dependencies) {
-        return Result::Err(invalid_ctir_error(module, message))
-    }
-    let modules: Vec[ctir::CtModule] = Vec::with_capacity(dependencies.len() + 1);
-    modules.push(module);
-    for dependency in dependencies {
-        modules.push(dependency)
-    }
+    let modules = verified_modules(module, dependencies)?;
     let derive_state = derive::new_state(request, module.target.int_width);
     let state = new_state(modules, limits, Option::Some(derive_state));
     let Some(function) = find_derive_entry(module, entry_name) else {

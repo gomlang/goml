@@ -18,19 +18,7 @@ import (
 func serve(ctx context.Context, input io.ReadCloser, output io.Writer) int {
 	stop := context.AfterFunc(ctx, func() { input.Close() })
 	defer stop()
-	request, err := protocol.DecodeRequest(ctx, input)
-	var response protocol.Response
-	if err != nil {
-		response = protocol.Response{ProtocolVersion: protocol.Version, Diagnostics: []protocol.Diagnostic{{Code: "ffi-protocol", Message: err.Error()}}}
-	} else {
-		cleanup, resolveErr := selectGoCommand(request.BuildContext.GoExecutable)
-		if resolveErr != nil {
-			response = protocol.Response{ProtocolVersion: protocol.Version, Diagnostics: []protocol.Diagnostic{{Code: "ffi-tool-unavailable", Message: resolveErr.Error()}}}
-		} else {
-			response = validate.Check(ctx, request)
-			cleanup()
-		}
-	}
+	response := checkRequest(ctx, input)
 	if err := protocol.EncodeResponse(output, response); err != nil {
 		fmt.Fprintln(os.Stderr, "ffi-protocol:", err)
 		return 1
@@ -51,6 +39,23 @@ func serve(ctx context.Context, input io.ReadCloser, output io.Writer) int {
 	return 0
 }
 
+func checkRequest(ctx context.Context, input io.Reader) protocol.Response {
+	request, err := protocol.DecodeRequest(ctx, input)
+	if err != nil {
+		return failureResponse("ffi-protocol", err)
+	}
+	cleanup, err := selectGoCommand(request.BuildContext.GoExecutable)
+	if err != nil {
+		return failureResponse("ffi-tool-unavailable", err)
+	}
+	defer cleanup()
+	return validate.Check(ctx, request)
+}
+
+func failureResponse(code string, err error) protocol.Response {
+	return protocol.Response{ProtocolVersion: protocol.Version, Diagnostics: []protocol.Diagnostic{{Code: code, Message: err.Error()}}}
+}
+
 func selectGoCommand(value string) (func(), error) {
 	selected, err := exec.LookPath(value)
 	if err != nil {
@@ -60,12 +65,19 @@ func selectGoCommand(value string) (func(), error) {
 	if err != nil {
 		return nil, err
 	}
-	previousPath := os.Getenv("PATH")
+	previousPath, hadPath := os.LookupEnv("PATH")
 	directory, err := os.MkdirTemp("", "goml-go-command-")
 	if err != nil {
 		return nil, err
 	}
-	cleanup := func() { os.Setenv("PATH", previousPath); os.RemoveAll(directory) }
+	cleanup := func() {
+		if hadPath {
+			os.Setenv("PATH", previousPath)
+		} else {
+			os.Unsetenv("PATH")
+		}
+		os.RemoveAll(directory)
+	}
 	if err := os.Symlink(selected, filepath.Join(directory, "go")); err != nil {
 		cleanup()
 		return nil, err

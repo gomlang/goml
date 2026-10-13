@@ -255,10 +255,7 @@ func (g *generator) function(fn Function) error {
 		canonical := g.w.normalize(ty)
 		name := fmt.Sprintf("a%d", i)
 		cName := fmt.Sprintf("cArg%d", i)
-		kind := mapping.Kind
-		if kind == "" {
-			kind = "value"
-		}
+		kind := mapping.kind()
 		switch kind {
 		case "value":
 			rep, err := g.representation(ty, mapping.Type)

@@ -17,6 +17,11 @@ type witnessOrigins struct {
 	lines map[int][]string
 }
 
+type witnessDeclaration struct {
+	node   ast.Decl
+	owners []string
+}
+
 func (o witnessOrigins) files(path string, line int) []string {
 	if path == o.path {
 		return o.lines[line]
@@ -49,8 +54,7 @@ func bundleWitnesses(packageName, path string, sources map[string][]byte) ([]byt
 	aliases := map[string]string{}
 	nextAlias := 0
 	importOwners := map[string][]string{}
-	declarations := []ast.Decl{}
-	owners := [][]string{}
+	declarations := []witnessDeclaration{}
 	for _, name := range paths {
 		file, err := parser.ParseFile(token.NewFileSet(), name, sources[name], 0)
 		if err != nil {
@@ -90,25 +94,26 @@ func bundleWitnesses(packageName, path string, sources map[string][]byte) ([]byt
 				}
 				return true
 			})
-			declarations = append(declarations, declaration)
-			owners = append(owners, []string{name})
+			declarations = append(declarations, witnessDeclaration{node: declaration, owners: []string{name}})
 		}
 	}
 	file := &ast.File{Name: ast.NewIdent(packageName)}
-	allOwners := [][]string{}
+	allDeclarations := make([]witnessDeclaration, 0, len(aliases)+len(declarations))
 	imports := make([]string, 0, len(aliases))
 	for name := range aliases {
 		imports = append(imports, name)
 	}
 	sort.Strings(imports)
 	for _, name := range imports {
-		file.Decls = append(file.Decls, &ast.GenDecl{Tok: token.IMPORT, Specs: []ast.Spec{
+		declaration := &ast.GenDecl{Tok: token.IMPORT, Specs: []ast.Spec{
 			&ast.ImportSpec{Name: ast.NewIdent(aliases[name]), Path: &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote(name)}},
-		}})
-		allOwners = append(allOwners, importOwners[name])
+		}}
+		allDeclarations = append(allDeclarations, witnessDeclaration{node: declaration, owners: importOwners[name]})
 	}
-	file.Decls = append(file.Decls, declarations...)
-	allOwners = append(allOwners, owners...)
+	allDeclarations = append(allDeclarations, declarations...)
+	for _, declaration := range allDeclarations {
+		file.Decls = append(file.Decls, declaration.node)
+	}
 	var output bytes.Buffer
 	if err := format.Node(&output, token.NewFileSet(), file); err != nil {
 		return nil, witnessOrigins{}, err
@@ -121,7 +126,7 @@ func bundleWitnesses(packageName, path string, sources map[string][]byte) ([]byt
 	origins := witnessOrigins{path: path, lines: map[int][]string{}}
 	for index, declaration := range parsed.Decls {
 		for line := positions.Position(declaration.Pos()).Line; line <= positions.Position(declaration.End()).Line; line++ {
-			origins.lines[line] = allOwners[index]
+			origins.lines[line] = allDeclarations[index].owners
 		}
 	}
 	return output.Bytes(), origins, nil

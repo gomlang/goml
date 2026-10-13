@@ -42,25 +42,25 @@ func (g *typeGraph) field(object types.Object) protocol.TypeField {
 }
 
 func (g *typeGraph) tuple(tuple *types.Tuple) []string {
-	result := []string{}
+	result := make([]string, tuple.Len())
 	for i := 0; i < tuple.Len(); i++ {
-		result = append(result, g.add(tuple.At(i).Type()))
+		result[i] = g.add(tuple.At(i).Type())
 	}
 	return result
 }
 
 func (g *typeGraph) typeParams(params *types.TypeParamList) []string {
-	result := []string{}
+	result := make([]string, params.Len())
 	for i := 0; i < params.Len(); i++ {
-		result = append(result, g.add(params.At(i)))
+		result[i] = g.add(params.At(i))
 	}
 	return result
 }
 
 func (g *typeGraph) typeArgs(args *types.TypeList) []string {
-	result := []string{}
+	result := make([]string, args.Len())
 	for i := 0; i < args.Len(); i++ {
-		result = append(result, g.add(args.At(i)))
+		result[i] = g.add(args.At(i))
 	}
 	return result
 }
@@ -133,9 +133,9 @@ func (g *typeGraph) add(ty types.Type) string {
 		t.Complete()
 		runtimeInterface := t.IsMethodSet()
 		node.RuntimeInterface = &runtimeInterface
-		methods := []protocol.TypeField{}
+		methods := make([]protocol.TypeField, t.NumMethods())
 		for i := 0; i < t.NumMethods(); i++ {
-			methods = append(methods, g.field(t.Method(i)))
+			methods[i] = g.field(t.Method(i))
 		}
 		node.InterfaceMethods = &methods
 		for i := 0; i < t.NumExplicitMethods(); i++ {
