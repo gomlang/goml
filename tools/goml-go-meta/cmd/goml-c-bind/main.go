@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"goml.dev/tools/goml-go-meta/internal/cbind"
+	"goml.run/tools/goml-go-meta/internal/cbind"
 )
 
 func main() {

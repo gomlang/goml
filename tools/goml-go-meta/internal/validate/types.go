@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"go/types"
 
-	"goml.dev/tools/goml-go-meta/internal/protocol"
+	"goml.run/tools/goml-go-meta/internal/protocol"
 )
 
 type typeGraph struct {

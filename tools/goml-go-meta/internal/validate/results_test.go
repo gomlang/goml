@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"golang.org/x/tools/go/packages"
-	"goml.dev/tools/goml-go-meta/internal/protocol"
+	"goml.run/tools/goml-go-meta/internal/protocol"
 )
 
 func TestPackageDiagnosticAttribution(t *testing.T) {

@@ -2,7 +2,7 @@ package validate
 
 import (
 	"golang.org/x/tools/go/packages"
-	"goml.dev/tools/goml-go-meta/internal/protocol"
+	"goml.run/tools/goml-go-meta/internal/protocol"
 )
 
 type checkResults struct {

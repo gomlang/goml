@@ -1,4 +1,4 @@
-module goml.dev/tools/goml-go-meta
+module goml.run/tools/goml-go-meta
 
 go 1.26.0
 

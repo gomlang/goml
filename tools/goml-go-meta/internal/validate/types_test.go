@@ -7,7 +7,7 @@ import (
 	"go/types"
 	"testing"
 
-	"goml.dev/tools/goml-go-meta/internal/protocol"
+	"goml.run/tools/goml-go-meta/internal/protocol"
 )
 
 func TestTypeGraphRecursiveGenericDeclarations(t *testing.T) {

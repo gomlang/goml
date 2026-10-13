@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"testing"
 
-	"goml.dev/tools/goml-go-meta/internal/protocol"
+	"goml.run/tools/goml-go-meta/internal/protocol"
 )
 
 func TestModuleFileFlagWithSpaces(t *testing.T) {

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"goml.dev/tools/goml-go-meta/internal/protocol"
+	"goml.run/tools/goml-go-meta/internal/protocol"
 )
 
 func environment(c protocol.BuildContext) []string {

@@ -127,7 +127,7 @@ func validateNative(ctx context.Context, p Project, generated generated, tempora
 				return err
 			}
 		}
-		if _, err := run(ctx, p.Root, "", "go", "mod", "edit", "-modfile="+modfile, "-require=goml.dev/cabi@v0.0.0", "-replace=goml.dev/cabi="+runtimeDirectory); err != nil {
+		if _, err := run(ctx, p.Root, "", "go", "mod", "edit", "-modfile="+modfile, "-require=goml.run/cabi@v0.0.0", "-replace=goml.run/cabi="+runtimeDirectory); err != nil {
 			return err
 		}
 		arguments = append(arguments, "-modfile="+modfile)

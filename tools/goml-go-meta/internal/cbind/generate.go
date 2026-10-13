@@ -529,7 +529,7 @@ func Generate(w *World) (generated, error) {
 			return generated{}, err
 		}
 		body := support + g.native.String()
-		fmt.Fprintf(&source, "package %s\nimport (\"goml.dev/cabi\"\n", w.Project.Config.GoPackage)
+		fmt.Fprintf(&source, "package %s\nimport (\"goml.run/cabi\"\n", w.Project.Config.GoPackage)
 		for _, name := range []string{"fmt", "strings", "unsafe", "math", "sync"} {
 			if strings.Contains(body, name+".") {
 				fmt.Fprintf(&source, "%q\n", name)

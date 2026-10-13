@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"goml.dev/tools/goml-go-meta/internal/protocol"
+	"goml.run/tools/goml-go-meta/internal/protocol"
 )
 
 func methodBinding(id, name string, parameters, results []protocol.Type) protocol.Binding {

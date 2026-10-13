@@ -7,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"goml.dev/tools/goml-go-meta/internal/protocol"
+	"goml.run/tools/goml-go-meta/internal/protocol"
 )
 
 type witnessTargets struct {

@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strconv"
 
-	"goml.dev/tools/goml-go-meta/internal/protocol"
+	"goml.run/tools/goml-go-meta/internal/protocol"
 )
 
 type witnessTypes struct{ aliases map[string]string }

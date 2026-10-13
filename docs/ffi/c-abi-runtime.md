@@ -1,6 +1,6 @@
 # GoML C ABI runtime
 
-`lib/cabi` is a first-party Go and assembly module shipped with the toolchain. It has no third-party dependencies and no `import "C"`. The dynamic binding generator uses its `goml.dev/cabi` import through driver-managed Go module requirements and replacements. The package is an implementation boundary, not a public GoML raw-pointer API.
+`lib/cabi` is a first-party Go and assembly module shipped with the toolchain. It has no third-party dependencies and no `import "C"`. The dynamic binding generator uses its `goml.run/cabi` import through driver-managed Go module requirements and replacements. The package is an implementation boundary, not a public GoML raw-pointer API.
 
 ## Supported execution environment
 

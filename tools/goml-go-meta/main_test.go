@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"goml.dev/tools/goml-go-meta/internal/protocol"
+	"goml.run/tools/goml-go-meta/internal/protocol"
 )
 
 func TestSelectGoCommandRestoresPath(t *testing.T) {

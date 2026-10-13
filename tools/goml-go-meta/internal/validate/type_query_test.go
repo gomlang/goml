@@ -2,7 +2,7 @@ package validate
 
 import (
 	"context"
-	"goml.dev/tools/goml-go-meta/internal/protocol"
+	"goml.run/tools/goml-go-meta/internal/protocol"
 	"os"
 	"path/filepath"
 	"testing"

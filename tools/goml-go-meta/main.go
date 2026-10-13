@@ -11,8 +11,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"goml.dev/tools/goml-go-meta/internal/protocol"
-	"goml.dev/tools/goml-go-meta/internal/validate"
+	"goml.run/tools/goml-go-meta/internal/protocol"
+	"goml.run/tools/goml-go-meta/internal/validate"
 )
 
 func serve(ctx context.Context, input io.ReadCloser, output io.Writer) int {

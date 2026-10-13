@@ -22,7 +22,7 @@ Select the backend and library sonames in the binding configuration:
 }
 ```
 
-The module manifest needs `native.go-module` and `native.c-bindings`; omit `native.cgo = "required"`. Run generation and project commands with `CGO_ENABLED=0`, for example `CGO_ENABLED=0 goml bind-c bindings.json` and `CGO_ENABLED=0 goml run`. The driver supplies the bundled `goml.dev/cabi` runtime through a temporary Go module file without modifying the project's `go.mod`. No third-party FFI library is used. The same runtime is shared by all binding modules in a dependency graph.
+The module manifest needs `native.go-module` and `native.c-bindings`; omit `native.cgo = "required"`. Run generation and project commands with `CGO_ENABLED=0`, for example `CGO_ENABLED=0 goml bind-c bindings.json` and `CGO_ENABLED=0 goml run`. The driver supplies the bundled `goml.run/cabi` runtime through a temporary Go module file without modifying the project's `go.mod`. No third-party FFI library is used. The same runtime is shared by all binding modules in a dependency graph.
 
 `libraries` accepts one to 64 sonames or absolute paths. Sonames follow the system dynamic loader's search rules, including `LD_LIBRARY_PATH`; relative paths containing `/` are rejected. All listed libraries must load successfully, and symbols are searched in list order. Loading uses `RTLD_NOW | RTLD_LOCAL`. A binding initializes its function addresses once on first use, including configured release functions. Initialization errors are returned as `c::Error::Native` and cached for the process. Loaded libraries remain open for the process lifetime. C library constructors run when the application first loads the library; generation and `--check` do not load it or validate its exported symbols.
 

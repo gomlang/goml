@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"goml.dev/tools/goml-go-meta/internal/protocol"
+	"goml.run/tools/goml-go-meta/internal/protocol"
 )
 
 func TestPointerBindingsPreservePointeeIdentity(t *testing.T) {
