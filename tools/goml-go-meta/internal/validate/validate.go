@@ -10,7 +10,6 @@ import (
 	"go/types"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 
@@ -19,14 +18,10 @@ import (
 )
 
 func failure(request protocol.Request, code, message string) protocol.Response {
-	response := protocol.Response{ProtocolVersion: protocol.Version, Diagnostics: []protocol.Diagnostic{{Code: code, Message: message}}}
-	for _, binding := range request.Bindings {
-		response.Bindings = append(response.Bindings, protocol.BindingResult{ID: binding.ID, Status: "failed", Diagnostics: []protocol.Diagnostic{{Code: code, Message: message}}})
-	}
-	for _, query := range request.TypeQueries {
-		response.TypeResults = append(response.TypeResults, protocol.TypeResult{ID: query.ID, Status: "failed", Diagnostics: []protocol.Diagnostic{{Code: code, Message: message}}})
-	}
-	return response
+	results := newCheckResults(request)
+	results.Diagnostics = []protocol.Diagnostic{{Code: code, Message: message}}
+	results.failAll(code, message)
+	return results.Response
 }
 
 func Check(ctx context.Context, request protocol.Request) protocol.Response {
@@ -53,86 +48,9 @@ func Check(ctx context.Context, request protocol.Request) protocol.Response {
 	if !filepath.IsAbs(caller.Directory) || !filepath.IsAbs(request.BuildContext.ModuleDir) {
 		return failure(request, "ffi-protocol", "build and caller directories must be absolute")
 	}
-	overlay := map[string][]byte{}
-	if value := request.SourceOverlay; value != nil {
-		overlay[value.Path] = []byte(value.Source)
-	}
-	if caller.GeneratedSource != "" {
-		if _, exists := overlay[filepath.Join(caller.Directory, "goml_generated.go")]; exists {
-			return failure(request, "ffi-protocol", "conflicting generated source overlays")
-		}
-		overlay[filepath.Join(caller.Directory, "goml_generated.go")] = []byte(caller.GeneratedSource)
-	}
-	fileBindings := map[string][]int{}
-	keys := map[string]string{}
-	var firstFile string
-	for i, binding := range request.Bindings {
-		if !token.IsIdentifier(binding.Symbol) || binding.Symbol == "_" {
-			return failure(request, "ffi-protocol", "invalid Go symbol")
-		}
-		identity := binding
-		identity.ID = ""
-		encoded, _ := json.Marshal(identity)
-		if file, found := keys[string(encoded)]; found {
-			fileBindings[file] = append(fileBindings[file], i)
-			continue
-		}
-		file := filepath.Join(caller.Directory, fmt.Sprintf("goml_ffi_witness_%d.go", i))
-		if _, err := os.Lstat(file); !os.IsNotExist(err) {
-			return failure(request, "ffi-package-load", "witness file conflicts with an existing file: "+file)
-		}
-		data, err := witness(caller.Package, binding, i)
-		if err != nil {
-			return failure(request, "ffi-protocol", err.Error())
-		}
-		overlay[file] = data
-		keys[string(encoded)] = file
-		fileBindings[file] = []int{i}
-		if firstFile == "" {
-			firstFile = file
-		}
-	}
-	fileQueries := map[string]int{}
-	for i, query := range request.TypeQueries {
-		if !token.IsIdentifier(query.Name) || query.Name == "_" {
-			return failure(request, "ffi-protocol", "invalid Go type name")
-		}
-		file := filepath.Join(caller.Directory, fmt.Sprintf("goml_type_query_%d.go", i))
-		if _, err := os.Lstat(file); !os.IsNotExist(err) {
-			return failure(request, "ffi-package-load", "type witness conflicts with an existing file: "+file)
-		}
-		data, err := typeWitness(caller.Package, query, i)
-		if err != nil {
-			return failure(request, "ffi-protocol", err.Error())
-		}
-		overlay[file] = data
-		fileQueries[file] = i
-		if firstFile == "" {
-			firstFile = file
-		}
-	}
-	origins := witnessOrigins{}
-	if caller.LoadMode == "files" {
-		bundlePath := filepath.Join(caller.Directory, "goml_ffi_witness_bundle.go")
-		if _, err := os.Lstat(bundlePath); !os.IsNotExist(err) {
-			return failure(request, "ffi-package-load", "witness file conflicts with an existing file: "+bundlePath)
-		}
-		sources := map[string][]byte{}
-		for path := range fileBindings {
-			sources[path] = overlay[path]
-			delete(overlay, path)
-		}
-		for path := range fileQueries {
-			sources[path] = overlay[path]
-			delete(overlay, path)
-		}
-		data, mapping, err := bundleWitnesses(caller.Package, bundlePath, sources)
-		if err != nil {
-			return failure(request, "ffi-protocol", err.Error())
-		}
-		overlay[bundlePath] = data
-		origins = mapping
-		firstFile = bundlePath
+	witnesses, diagnostic := prepareWitnesses(request)
+	if diagnostic != nil {
+		return failure(request, diagnostic.Code, diagnostic.Message)
 	}
 	flags, err := splitGoFlags(request.BuildContext.GOFLAGS)
 	if err != nil {
@@ -144,9 +62,9 @@ func Check(ctx context.Context, request protocol.Request) protocol.Response {
 	if len(request.BuildContext.BuildTags) > 0 {
 		flags = append(flags, "-tags="+strings.Join(request.BuildContext.BuildTags, ","))
 	}
-	patterns := []string{"file=" + firstFile}
+	patterns := []string{"file=" + witnesses.firstFile}
 	if caller.LoadMode == "files" {
-		patterns = []string{firstFile}
+		patterns = []string{witnesses.firstFile}
 	}
 	loadMode := packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles | packages.NeedImports | packages.NeedDeps | packages.NeedTypes | packages.NeedTypesSizes | packages.NeedModule
 	for _, binding := range request.Bindings {
@@ -155,7 +73,7 @@ func Check(ctx context.Context, request protocol.Request) protocol.Response {
 		}
 	}
 	loaded, err := packages.Load(&packages.Config{
-		Context: ctx, Dir: request.BuildContext.ModuleDir, Env: append(env[:len(env):len(env)], "GOFLAGS="), BuildFlags: flags, Overlay: overlay,
+		Context: ctx, Dir: request.BuildContext.ModuleDir, Env: append(env[:len(env):len(env)], "GOFLAGS="), BuildFlags: flags, Overlay: witnesses.overlay,
 		Mode: loadMode,
 	}, patterns...)
 	if err := ctx.Err(); err != nil {
@@ -171,176 +89,22 @@ func Check(ctx context.Context, request protocol.Request) protocol.Response {
 	if request.BuildContext.GO111MODULE == "on" && root.PkgPath != caller.ImportPath {
 		return failure(request, "ffi-package-load", fmt.Sprintf("caller import path mismatch: expected %s, found %s", caller.ImportPath, root.PkgPath))
 	}
-	response := protocol.Response{ProtocolVersion: protocol.Version}
-	for _, binding := range request.Bindings {
-		response.Bindings = append(response.Bindings, protocol.BindingResult{ID: binding.ID, Status: "verified"})
-	}
-	for _, query := range request.TypeQueries {
-		response.TypeResults = append(response.TypeResults, protocol.TypeResult{ID: query.ID, Status: "verified"})
-	}
-	addType := func(index int, code, message string) {
-		result := &response.TypeResults[index]
-		result.Status = "failed"
-		for _, d := range result.Diagnostics {
-			if d.Code == code && d.Message == message {
-				return
-			}
-		}
-		result.Diagnostics = append(result.Diagnostics, protocol.Diagnostic{Code: code, Message: message})
-	}
-	add := func(index int, code, message string) {
-		r := &response.Bindings[index]
-		r.Status = "failed"
-		for _, d := range r.Diagnostics {
-			if d.Code == code && d.Message == message {
-				return
-			}
-		}
-		r.Diagnostics = append(r.Diagnostics, protocol.Diagnostic{Code: code, Message: message})
-	}
+	results := newCheckResults(request)
 	allPackages := map[string]*packages.Package{}
 	packages.Visit(loaded, func(p *packages.Package) bool { allPackages[p.PkgPath] = p; return true }, nil)
-	paths := make([]string, 0, len(allPackages))
-	for path := range allPackages {
-		paths = append(paths, path)
+	packageList := make([]*packages.Package, 0, len(allPackages))
+	for _, p := range allPackages {
+		packageList = append(packageList, p)
 	}
-	sort.Strings(paths)
-	for _, path := range paths {
-		p := allPackages[path]
-		for _, problem := range p.Errors {
-			indices := []int{}
-			problemFiles := origins.diagnostic(problem.Pos)
-			for file, bindings := range fileBindings {
-				if slices.Contains(problemFiles, file) {
-					indices = append(indices, bindings...)
-				}
-			}
-			queryIndices := []int{}
-			for file, index := range fileQueries {
-				if slices.Contains(problemFiles, file) {
-					queryIndices = append(queryIndices, index)
-				}
-			}
-			if len(indices) == 0 && len(queryIndices) == 0 {
-				for i := range response.TypeResults {
-					queryIndices = append(queryIndices, i)
-				}
-				for i := range response.Bindings {
-					indices = append(indices, i)
-				}
-			}
-			code := "ffi-package-load"
-			if p == root && problem.Kind == packages.TypeError {
-				code = "ffi-signature-mismatch"
-			}
-			for _, index := range indices {
-				add(index, code, problem.Msg)
-			}
-			for _, index := range queryIndices {
-				addType(index, code, problem.Msg)
-			}
-		}
-	}
+	sort.Slice(packageList, func(i, j int) bool { return packageList[i].PkgPath < packageList[j].PkgPath })
+	results.packageErrors(root, packageList, witnesses)
 	graph := typeGraph{ids: map[types.Type]string{}}
-	methods := selectedWitnessMethods(root, fileBindings, origins)
-	for i, binding := range request.Bindings {
-		if binding.CallMode == "method" {
-			method := methods[i]
-			if method == nil || !method.Exported() {
-				add(i, "ffi-symbol-not-found", "Go receiver has no exported method: "+binding.Symbol)
-				continue
-			}
-			response.Bindings[i].SignatureType = graph.add(method.Type())
-			response.Bindings[i].ActualSignature = types.TypeString(method.Type(), func(p *types.Package) string { return p.Path() })
-			continue
-		}
-		p := allPackages[binding.ImportPath]
-		if p == nil || p.Types == nil {
-			add(i, "ffi-package-load", "could not load "+binding.ImportPath)
-			continue
-		}
-		if p.Name == "main" {
-			add(i, "ffi-package-load", "cannot import package main")
-			continue
-		}
-		object := p.Types.Scope().Lookup(binding.Symbol)
-		if object == nil {
-			add(i, "ffi-symbol-not-found", "Go symbol not found: "+binding.ImportPath+"."+binding.Symbol)
-			continue
-		}
-		response.Bindings[i].SignatureType = graph.add(object.Type())
-		response.Bindings[i].ActualSignature = types.TypeString(object.Type(), func(p *types.Package) string { return p.Path() })
-		if !object.Exported() {
-			add(i, "ffi-symbol-not-found", "Go symbol is not exported: "+binding.Symbol)
-		}
-		if _, ok := object.(*types.Func); !ok {
-			add(i, "ffi-signature-mismatch", "Go symbol is not a package-level function: "+binding.Symbol)
-		}
-	}
-	for i, query := range request.TypeQueries {
-		p := allPackages[query.ImportPath]
-		if p == nil || p.Types == nil || p.Name == "main" {
-			addType(i, "ffi-package-load", "could not import "+query.ImportPath)
-			continue
-		}
-		object := p.Types.Scope().Lookup(query.Name)
-		if object == nil || !object.Exported() {
-			addType(i, "ffi-symbol-not-found", "Go type is missing or not exported: "+query.Name)
-			continue
-		}
-		if query.Mode == "function" {
-			function, ok := object.(*types.Func)
-			if !ok {
-				addType(i, "ffi-signature-mismatch", "Go object is not a package-level function: "+query.Name)
-				continue
-			}
-			result := &response.TypeResults[i]
-			result.Kind = "function"
-			result.DeclaredType = graph.add(function.Type())
-			if result.Status != "verified" {
-				continue
-			}
-			resolved := root.Types.Scope().Lookup(fmt.Sprintf("goml_type_query_%d", i))
-			if resolved == nil {
-				addType(i, "ffi-package-load", "missing resolved function witness")
-				continue
-			}
-			signature, ok := resolved.Type().(*types.Signature)
-			if !ok || signature.TypeParams().Len() != 0 {
-				addType(i, "ffi-signature-mismatch", "function query requires a concrete signature")
-				continue
-			}
-			result.Type = graph.add(signature)
-			continue
-		}
-		declared, ok := object.(*types.TypeName)
-		if !ok {
-			addType(i, "ffi-signature-mismatch", "Go object is not a type: "+query.Name)
-			continue
-		}
-		result := &response.TypeResults[i]
-		result.Kind = "defined"
-		if declared.IsAlias() {
-			result.Kind = "alias"
-		}
-		result.DeclaredType = graph.add(declared.Type())
-		if query.Mode == "declaration" {
-			continue
-		}
-		resolved := root.Types.Scope().Lookup(fmt.Sprintf("goml_type_query_%d", i))
-		if result.Status != "verified" {
-			continue
-		}
-		if resolved == nil {
-			addType(i, "ffi-package-load", "missing resolved type witness")
-			continue
-		}
-		result.Type = graph.add(types.Unalias(resolved.Type()))
-	}
+	results.resolveBindings(request.Bindings, allPackages, selectedWitnessMethods(root, witnesses), &graph)
+	results.resolveQueries(request.TypeQueries, allPackages, root, &graph)
 	if graph.err != nil {
 		return failure(request, "ffi-protocol", graph.err.Error())
 	}
-	response.ReferencedTypes = graph.nodes
+	results.ReferencedTypes = graph.nodes
 	world := sha256.New()
 	worldContext := request.BuildContext
 	worldContext.GoExecutable = ""
@@ -348,13 +112,12 @@ func Check(ctx context.Context, request protocol.Request) protocol.Response {
 	data, _ := json.Marshal(worldContext)
 	world.Write(data)
 	world.Write([]byte(caller.ImportPath + "\x00" + caller.LoadMode))
-	for _, path := range paths {
-		p := allPackages[path]
-		world.Write([]byte("\x00" + path))
+	for _, p := range packageList {
+		world.Write([]byte("\x00" + p.PkgPath))
 		files := append([]string{}, p.CompiledGoFiles...)
 		sort.Strings(files)
 		for _, file := range files {
-			contents, exists := overlay[file]
+			contents, exists := witnesses.overlay[file]
 			if !exists {
 				var readErr error
 				contents, readErr = os.ReadFile(file)
@@ -370,29 +133,6 @@ func Check(ctx context.Context, request protocol.Request) protocol.Response {
 			world.Write([]byte("\x00" + p.Module.Path + "\x00" + p.Module.Version))
 		}
 	}
-	response.GoWorldIdentity = hex.EncodeToString(world.Sum(nil))
-	return response
-}
-
-func selectedWitnessMethods(root *packages.Package, files map[string][]int, origins witnessOrigins) map[int]*types.Func {
-	result := map[int]*types.Func{}
-	if root == nil || root.TypesInfo == nil || root.Fset == nil {
-		return result
-	}
-	for expression, selection := range root.TypesInfo.Selections {
-		if selection.Kind() != types.MethodExpr {
-			continue
-		}
-		method, ok := selection.Obj().(*types.Func)
-		if !ok {
-			continue
-		}
-		position := root.Fset.Position(expression.Pos())
-		for _, file := range origins.files(position.Filename, position.Line) {
-			for _, index := range files[file] {
-				result[index] = method
-			}
-		}
-	}
-	return result
+	results.GoWorldIdentity = hex.EncodeToString(world.Sum(nil))
+	return results.Response
 }

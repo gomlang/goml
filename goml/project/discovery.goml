@@ -9,6 +9,7 @@ use module::registry;
 use module::util;
 use module::manifest::config as config;
 use std::bytes;
+use std::cmp;
 use std::collections;
 use std::env;
 use std::fs;
@@ -826,19 +827,25 @@ pub fn discover_toolchain_graph(compiler: string, lib_dir: string, artifact_root
     )
 }
 
-fn discover_graph(
+fn load_package_closure(
     compiler: string,
     module_dir: string,
-    module_path: string,
-    entry_dir: string,
-    include_tests: bool,
     sources: Vec[ModuleSource],
-) -> Result[Graph, failure::Failure] {
-    let entry_package = package_name_for_directory(module_dir, module_path, entry_dir)?;
-    let packages: Vec[Package] = Vec::new();
+    packages: Vec[Package],
+    roots: Vec[string],
+    include_tests: bool,
+    entry_package: string,
+) -> Result[(), failure::Failure] {
     let pending: collections::Deque[string] = collections::Deque::new();
     let seen: collections::HashSet[string] = collections::HashSet::new();
-    pending.push_back(entry_package);
+    for package_value in packages {
+        let _ = seen.insert(package_value.name);
+    }
+    for package_name in roots {
+        if !seen.contains(package_name) {
+            pending.push_back(package_name)
+        }
+    }
     while !pending.is_empty() {
         let Some(package_name) = pending.pop_front() else {
             break;
@@ -860,6 +867,28 @@ fn discover_graph(
             packages.push(package_value)
         }
     }
+    Result::Ok(())
+}
+
+fn discover_graph(
+    compiler: string,
+    module_dir: string,
+    module_path: string,
+    entry_dir: string,
+    include_tests: bool,
+    sources: Vec[ModuleSource],
+) -> Result[Graph, failure::Failure] {
+    let entry_package = package_name_for_directory(module_dir, module_path, entry_dir)?;
+    let packages: Vec[Package] = Vec::new();
+    load_package_closure(
+        compiler,
+        module_dir,
+        sources,
+        packages,
+        Vec::from_array([entry_package]),
+        include_tests,
+        entry_package,
+    )?;
     let order = topological_order(packages, entry_package)?;
     Result::Ok(Graph { module_dir, module_path, entry_package, packages, sources, order })
 }
@@ -893,55 +922,35 @@ fn installed_compiler_world(compiler: string) -> Result[string, failure::Failure
     }
 }
 
+fn compiler_candidate(explicit: Option[string]) -> string {
+    if let Some(value) = explicit {
+        return value
+    }
+    if let Ok(value) = env::var_structured("GOMLC") {
+        if value != "" {
+            return value
+        }
+    }
+    let Ok(executable) = env::current_exe_structured() else {
+        return "gomlc"
+    };
+    if let Some(parent) = path::parent(executable) {
+        let sibling = path::join(parent, "gomlc");
+        if fs::is_file(sibling) {
+            return sibling
+        }
+    }
+    if let Ok(home) = env::var_structured("GOML_HOME") {
+        let installed = path::join(path::join(home, "bin"), "gomlc");
+        if fs::is_file(installed) {
+            return installed
+        }
+    }
+    "gomlc"
+}
+
 fn resolve_compiler(explicit: Option[string]) -> Result[ResolvedCompiler, failure::Failure] {
-    let candidate = match explicit {
-        Some(value) => Option::Some(value),
-        None => match env::var_structured("GOMLC") {
-            Ok(value) => if value == "" {
-                Option::None
-            } else {
-                Option::Some(value)
-            },
-            Err(_) => Option::None,
-        },
-    };
-    let compiler = match candidate {
-        Some(value) => value,
-        None => match env::current_exe_structured() {
-            Ok(value) => match path::parent(value) {
-                Some(parent) => {
-                    let sibling = path::join(parent, "gomlc");
-                    if fs::is_file(sibling) {
-                        sibling
-                    } else {
-                        match env::var_structured("GOML_HOME") {
-                            Ok(home) => {
-                                let installed = path::join(path::join(home, "bin"), "gomlc");
-                                if fs::is_file(installed) {
-                                    installed
-                                } else {
-                                    "gomlc"
-                                }
-                            },
-                            Err(_) => "gomlc",
-                        }
-                    }
-                },
-                None => match env::var_structured("GOML_HOME") {
-                    Ok(home) => {
-                        let installed = path::join(path::join(home, "bin"), "gomlc");
-                        if fs::is_file(installed) {
-                            installed
-                        } else {
-                            "gomlc"
-                        }
-                    },
-                    Err(_) => "gomlc",
-                },
-            },
-            Err(_) => "gomlc",
-        },
-    };
+    let compiler = compiler_candidate(explicit);
     let compiler = if fs::is_file(compiler) {
         canonical(compiler)?
     } else {
@@ -1086,42 +1095,22 @@ fn internal_test_graph(context: Context, package_value: Package, test_package: P
     failure::Failure,
 ] {
     let packages: Vec[Package] = Vec::new();
-    let seen: collections::HashSet[string] = collections::HashSet::new();
     for current in context.graph.packages {
         if current.name == package_value.name {
             packages.push(test_package)
         } else {
             packages.push(current)
         }
-        let _ = seen.insert(current.name);
     }
-    let pending: collections::Deque[string] = collections::Deque::new();
-    for dependency in test_package.imports {
-        if !seen.contains(dependency) {
-            pending.push_back(dependency)
-        }
-    }
-    while !pending.is_empty() {
-        let Some(package_name) = pending.pop_front() else {
-            break;
-        };
-        if seen.insert(package_name) {
-            let current = load_package(
-                context.compiler,
-                context.graph.module_dir,
-                context.graph.sources,
-                package_name,
-                false,
-                package_value.name,
-            )?;
-            for dependency in current.imports {
-                if !seen.contains(dependency) {
-                    pending.push_back(dependency)
-                }
-            }
-            packages.push(current)
-        }
-    }
+    load_package_closure(
+        context.compiler,
+        context.graph.module_dir,
+        context.graph.sources,
+        packages,
+        test_package.imports,
+        false,
+        package_value.name,
+    )?;
     let order = topological_order(packages, package_value.name)?;
     Result::Ok(
         Graph {
@@ -1137,33 +1126,33 @@ fn internal_test_graph(context: Context, package_value: Package, test_package: P
 
 pub fn internal_test_graphs(context: Context) -> Result[Vec[Graph], failure::Failure] {
     let result: Vec[Graph] = Vec::new();
-    let names: Vec[string] = Vec::new();
+    let package_files: Vec[(Package, Vec[string], Vec[string])] = Vec::new();
     for package_value in context.graph.packages {
         if owns_test_package(context.graph, package_value) {
             let files = source_files(package_value.directory, true)?;
             if files.len() > package_value.files.len() {
-                names.push(package_value.name)
+                let test_files: Vec[string] = Vec::new();
+                for file in files {
+                    if !package_value.files.contains(file) {
+                        test_files.push(file)
+                    }
+                }
+                package_files.push((package_value, files, test_files))
             }
         }
-    }
-    let package_files: Vec[(Package, Vec[string], Vec[string])] = Vec::new();
-    let all_files: Vec[string] = Vec::new();
-    for package_name in util::sorted(names) {
-        let Some(package_value) = find_package(context.graph.packages, package_name) else {
-            return Result::Err(failure::convert("missing package " + package_name))
-        };
-        let files = source_files(package_value.directory, true)?;
-        let test_files: Vec[string] = Vec::new();
-        for file in files {
-            if !package_value.files.contains(file) {
-                test_files.push(file);
-                all_files.push(file)
-            }
-        }
-        package_files.push((package_value, files, test_files))
     }
     if package_files.is_empty() {
         return Result::Ok(result)
+    }
+    collections::sort_by_ordering(
+        package_files,
+        |left, right| cmp::compare(left.0.name, right.0.name),
+    );
+    let all_files: Vec[string] = Vec::new();
+    for item in package_files {
+        for file in item.2 {
+            all_files.push(file)
+        }
     }
     let all_info = compiler_package_info(context.compiler, context.graph.module_dir, all_files)?;
     for item in package_files {
@@ -1186,40 +1175,40 @@ pub fn internal_test_graphs(context: Context) -> Result[Vec[Graph], failure::Fai
 
 pub fn external_test_graphs(context: Context) -> Result[Vec[ExternalTest], failure::Failure] {
     let result: Vec[ExternalTest] = Vec::new();
-    let names: Vec[string] = Vec::new();
+    let packages: Vec[Package] = Vec::new();
     for package_value in context.graph.packages {
         if owns_test_package(context.graph, package_value) {
-            names.push(package_value.name)
+            packages.push(package_value)
         }
     }
-    for target_package in util::sorted(names) {
-        let Some(package_value) = find_package(context.graph.packages, target_package) else {
-            return Result::Err(failure::convert("missing package " + target_package))
-        };
+    collections::sort_by_ordering(packages, |left, right| cmp::compare(left.name, right.name));
+    for package_value in packages {
         let tests_dir = path::join(package_value.directory, "tests");
-        if !fs::exists(tests_dir) {} else if !fs::is_dir(tests_dir) {
-            return Result::Err(failure::convert(tests_dir + " must be a directory"))
-        } else {
-            let files = black_box_test_files(tests_dir)?;
-            if files.is_empty() {} else {
-                let graph = discover_graph(
-                    context.compiler,
-                    context.graph.module_dir,
-                    context.graph.module_path,
-                    tests_dir,
-                    true,
-                    context.graph.sources,
-                )?;
-                let Some(test_package) = find_package(graph.packages, graph.entry_package) else {
-                    return Result::Err(failure::convert("missing black-box test package"))
-                };
-                if test_package.declared_name != "tests" {
-                    return Result::Err(failure::convert(tests_dir + " must declare package tests;"))
-                }
-                let combined = graph_with_entry(context.graph, graph, test_package.name)?;
-                result.push(ExternalTest { graph: combined, target_package })
-            }
+        if !fs::exists(tests_dir) {
+            continue;
         }
+        if !fs::is_dir(tests_dir) {
+            return Result::Err(failure::convert(tests_dir + " must be a directory"))
+        }
+        if black_box_test_files(tests_dir)?.is_empty() {
+            continue;
+        }
+        let graph = discover_graph(
+            context.compiler,
+            context.graph.module_dir,
+            context.graph.module_path,
+            tests_dir,
+            true,
+            context.graph.sources,
+        )?;
+        let Some(test_package) = find_package(graph.packages, graph.entry_package) else {
+            return Result::Err(failure::convert("missing black-box test package"))
+        };
+        if test_package.declared_name != "tests" {
+            return Result::Err(failure::convert(tests_dir + " must declare package tests;"))
+        }
+        let combined = graph_with_entry(context.graph, graph, test_package.name)?;
+        result.push(ExternalTest { graph: combined, target_package: package_value.name })
     }
     Result::Ok(result)
 }

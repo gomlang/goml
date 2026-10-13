@@ -13,6 +13,26 @@ type typeGraph struct {
 	err   error
 }
 
+type declaredType interface {
+	types.Type
+	Obj() *types.TypeName
+	TypeParams() *types.TypeParamList
+	TypeArgs() *types.TypeList
+}
+
+func (g *typeGraph) declaration(node *protocol.ReferencedType, ty declaredType, origin types.Type) {
+	object := ty.Obj()
+	node.Name = object.Name()
+	if object.Pkg() != nil {
+		node.ImportPath = object.Pkg().Path()
+	}
+	node.TypeParameters = g.typeParams(ty.TypeParams())
+	node.TypeArguments = g.typeArgs(ty.TypeArgs())
+	if origin != ty {
+		node.Origin = g.add(origin)
+	}
+}
+
 func (g *typeGraph) field(object types.Object) protocol.TypeField {
 	field := protocol.TypeField{Name: object.Name(), Type: g.add(object.Type())}
 	if object.Pkg() != nil {
@@ -91,31 +111,15 @@ func (g *typeGraph) add(ty types.Type) string {
 		node.Element = g.add(t.Elem())
 	case *types.Named:
 		node.Tag = "named"
-		node.Name = t.Obj().Name()
-		if t.Obj().Pkg() != nil {
-			node.ImportPath = t.Obj().Pkg().Path()
-		}
 		node.Underlying = g.add(t.Underlying())
-		node.TypeParameters = g.typeParams(t.TypeParams())
-		node.TypeArguments = g.typeArgs(t.TypeArgs())
-		if t.Origin() != t {
-			node.Origin = g.add(t.Origin())
-		}
+		g.declaration(&node, t, t.Origin())
 		for i := 0; i < t.NumMethods(); i++ {
 			node.Methods = append(node.Methods, g.field(t.Method(i)))
 		}
 	case *types.Alias:
 		node.Tag = "alias"
-		node.Name = t.Obj().Name()
-		if t.Obj().Pkg() != nil {
-			node.ImportPath = t.Obj().Pkg().Path()
-		}
 		node.Underlying = g.add(t.Rhs())
-		node.TypeParameters = g.typeParams(t.TypeParams())
-		node.TypeArguments = g.typeArgs(t.TypeArgs())
-		if t.Origin() != t {
-			node.Origin = g.add(t.Origin())
-		}
+		g.declaration(&node, t, t.Origin())
 	case *types.Struct:
 		node.Tag = "struct"
 		for i := 0; i < t.NumFields(); i++ {
