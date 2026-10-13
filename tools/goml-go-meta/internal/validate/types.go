@@ -23,30 +23,24 @@ func (g *typeGraph) field(object types.Object) protocol.TypeField {
 
 func (g *typeGraph) tuple(tuple *types.Tuple) []string {
 	result := []string{}
-	if tuple != nil {
-		for i := 0; i < tuple.Len(); i++ {
-			result = append(result, g.add(tuple.At(i).Type()))
-		}
+	for i := 0; i < tuple.Len(); i++ {
+		result = append(result, g.add(tuple.At(i).Type()))
 	}
 	return result
 }
 
 func (g *typeGraph) typeParams(params *types.TypeParamList) []string {
 	result := []string{}
-	if params != nil {
-		for i := 0; i < params.Len(); i++ {
-			result = append(result, g.add(params.At(i)))
-		}
+	for i := 0; i < params.Len(); i++ {
+		result = append(result, g.add(params.At(i)))
 	}
 	return result
 }
 
 func (g *typeGraph) typeArgs(args *types.TypeList) []string {
 	result := []string{}
-	if args != nil {
-		for i := 0; i < args.Len(); i++ {
-			result = append(result, g.add(args.At(i)))
-		}
+	for i := 0; i < args.Len(); i++ {
+		result = append(result, g.add(args.At(i)))
 	}
 	return result
 }

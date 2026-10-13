@@ -10,6 +10,7 @@ import (
 	"go/types"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -210,13 +211,13 @@ func Check(ctx context.Context, request protocol.Request) protocol.Response {
 			indices := []int{}
 			problemFiles := origins.diagnostic(problem.Pos)
 			for file, bindings := range fileBindings {
-				if containsFile(problemFiles, file) {
+				if slices.Contains(problemFiles, file) {
 					indices = append(indices, bindings...)
 				}
 			}
 			queryIndices := []int{}
 			for file, index := range fileQueries {
-				if containsFile(problemFiles, file) {
+				if slices.Contains(problemFiles, file) {
 					queryIndices = append(queryIndices, index)
 				}
 			}

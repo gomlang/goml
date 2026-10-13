@@ -51,13 +51,7 @@ function requestDiagnostics(uri: string): void {
 function scheduleDiagnostics(uri: string): void {
     clearDiagnosticsTimer();
     diagnosticsUri = uri;
-    diagnosticsTimer = setTimeout(() => {
-        const pendingUri = diagnosticsUri;
-        clearDiagnosticsTimer();
-        if (pendingUri) {
-            requestDiagnostics(pendingUri);
-        }
-    }, checkDiagnosticsDelay);
+    diagnosticsTimer = setTimeout(() => requestDiagnostics(uri), checkDiagnosticsDelay);
 }
 
 export function activate(context: ExtensionContext) {
@@ -141,17 +135,14 @@ export function activate(context: ExtensionContext) {
 
     const driverPath = workspace.getConfiguration('goml').get<string>('driverPath', '');
     const driverOptions = driverPath ? { env: { ...process.env, GOML_PROJECT_DRIVER: driverPath } } : undefined;
+    const serverExecutable = {
+        command: serverPath,
+        transport: TransportKind.stdio,
+        options: driverOptions,
+    };
     const serverOptions: ServerOptions = {
-        run: {
-            command: serverPath,
-            transport: TransportKind.stdio,
-            options: driverOptions,
-        },
-        debug: {
-            command: serverPath,
-            transport: TransportKind.stdio,
-            options: driverOptions,
-        },
+        run: serverExecutable,
+        debug: serverExecutable,
     };
 
     const clientOptions: LanguageClientOptions = {
@@ -211,17 +202,14 @@ export function activate(context: ExtensionContext) {
 
 export function deactivate(): Thenable<void> | undefined {
     clearDiagnosticsTimer();
-    if (!client) {
-        return undefined;
-    }
-    return client.stop();
+    return client?.stop();
 }
 
 function findServerPath(context: ExtensionContext): string | undefined {
     const config = workspace.getConfiguration('goml');
     const configPath = config.get<string>('serverPath');
 
-    if (configPath && configPath.length > 0 && fs.existsSync(configPath)) {
+    if (configPath && fs.existsSync(configPath)) {
         return configPath;
     }
 

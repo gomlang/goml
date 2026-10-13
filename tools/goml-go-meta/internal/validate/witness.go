@@ -130,25 +130,27 @@ func witness(packageName string, binding protocol.Binding, index int) ([]byte, e
 
 func typeWitness(packageName string, query protocol.TypeQuery, index int) ([]byte, error) {
 	w := witnessTypes{aliases: map[string]string{query.ImportPath: "goml_target"}}
-	target := w.named(query.ImportPath, query.Name, query.Arguments)
-	file := &ast.File{Name: ast.NewIdent(packageName), Decls: []ast.Decl{
-		w.imports(),
-		&ast.GenDecl{Tok: token.TYPE, Specs: []ast.Spec{&ast.TypeSpec{Name: ast.NewIdent(fmt.Sprintf("goml_type_query_%d", index)), Assign: token.Pos(1), Type: target}}},
-		&ast.GenDecl{Tok: token.VAR, Specs: []ast.Spec{&ast.ValueSpec{Names: []*ast.Ident{ast.NewIdent("_")}, Type: ast.NewIdent(fmt.Sprintf("goml_type_query_%d", index))}}},
-	}}
-	if query.Mode == "function" {
+	name := fmt.Sprintf("goml_type_query_%d", index)
+	file := &ast.File{Name: ast.NewIdent(packageName)}
+	switch query.Mode {
+	case "declaration":
+		w.aliases[query.ImportPath] = "_"
+	case "function":
+		target := w.named(query.ImportPath, query.Name, query.Arguments)
 		file.Decls = []ast.Decl{
-			w.imports(),
 			&ast.GenDecl{Tok: token.VAR, Specs: []ast.Spec{&ast.ValueSpec{
-				Names:  []*ast.Ident{ast.NewIdent(fmt.Sprintf("goml_type_query_%d", index))},
+				Names:  []*ast.Ident{ast.NewIdent(name)},
 				Values: []ast.Expr{target},
 			}}},
 		}
+	default:
+		target := w.named(query.ImportPath, query.Name, query.Arguments)
+		file.Decls = []ast.Decl{
+			&ast.GenDecl{Tok: token.TYPE, Specs: []ast.Spec{&ast.TypeSpec{Name: ast.NewIdent(name), Assign: token.Pos(1), Type: target}}},
+			&ast.GenDecl{Tok: token.VAR, Specs: []ast.Spec{&ast.ValueSpec{Names: []*ast.Ident{ast.NewIdent("_")}, Type: ast.NewIdent(name)}}},
+		}
 	}
-	if query.Mode == "declaration" {
-		w.aliases = map[string]string{query.ImportPath: "_"}
-		file.Decls = []ast.Decl{w.imports()}
-	}
+	file.Decls = append([]ast.Decl{w.imports()}, file.Decls...)
 	var output bytes.Buffer
 	if err := format.Node(&output, token.NewFileSet(), file); err != nil {
 		return nil, err

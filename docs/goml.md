@@ -4,11 +4,7 @@ This guide describes the GoML syntax, type rules, tools, and public library APIs
 
 GoML is a statically typed language with garbage collection. Its syntax is close to Rust, while its semantics are closer to ML. The compiler monomorphizes generics and lambda-lifts GoML closures before emitting Go. Explicit Go FFI can preserve native generic types and function values. GoML has no ownership, borrowing, lifetimes, or manual memory management.
 
-Generated Go code and Go FFI use Go 1.26 as their compatibility baseline. Building the toolchain, compiling generated programs, and validating Go bindings require Go 1.26 or newer. The independent [gomlgo frontend and interpreter](../gomlgo/README.md) targets Go 1.26 language and standard-library behavior; its execution and differential tests require Go 1.26.x.
-
-The separate [`ecosystem::go_doc`](../../gomlang/go_doc/README.md) module parses
-and renders Go documentation comments with explicit input and output limits.
-It is for Go source documentation, not GoML syntax or compiler comments.
+Generated Go code and Go FFI use Go 1.26 as their compatibility baseline. Building the toolchain, compiling generated programs, and validating Go bindings require Go 1.26 or newer. The independent [gomlgo frontend and interpreter](https://github.com/gomlang/gomlgo) targets Go 1.26 language and standard-library behavior; its execution and differential tests require Go 1.26.x.
 
 Quick navigation: [packages](#modules-packages-and-imports), [types](#type), [control flow](#control-flow), [patterns](#patterns), [traits](#trait-and-impl), [compile-time evaluation](#compile-time-evaluation), [Go FFI](#go-ffi), [tests](#tests), [API documentation](#comments-and-api-documentation), [prelude](#built-in-prelude), [standard library](#standard-library-package), and [verification](#verify-generated-code).
 
@@ -2385,7 +2381,7 @@ User code can allocate or loop independently of these quotas; blocking providers
 cannot be interrupted by a byte limit. Concurrent access is unsupported.
 Callers must keep input Value containers stable during encoding; detected length
 changes fail recoverably, but same-length mutations are not a snapshot protocol.
-Cycles terminate through structural or event limits. These APIs add no grammar.
+Cycles terminate through structural or event limits.
 The library's token/Value traversal and unknown-field skipping are iterative;
 user-written or derived recursive typed serde code still uses its own call stack.
 Limits are logical work/storage bounds, not an allocation-failure guarantee.
@@ -2818,7 +2814,7 @@ fn checked_text() -> bool {
 }
 ```
 
-Legacy foreign bindings declared with GoML `string` retain their existing trusted text contract. Use `ffi::String` when a Go producer can return arbitrary bytes. GoLibrary exports may use `ffi::String` to select the raw-byte policy. Ordinary GoML `string` and `char` exports remain unsupported; use explicit checked adapters at the boundary. Raw Go strings use ordinary qualified type and function syntax; no new grammar is introduced.
+Legacy foreign bindings declared with GoML `string` retain their existing trusted text contract. Use `ffi::String` when a Go producer can return arbitrary bytes. GoLibrary exports may use `ffi::String` to select the raw-byte policy. Ordinary GoML `string` and `char` exports remain unsupported; use explicit checked adapters at the boundary.
 
 ### Raw Go runes
 
@@ -2852,7 +2848,7 @@ fn append_header() -> bool {
 }
 ```
 
-These APIs reuse ordinary aliases, generic functions and existing slice operations; no new grammar is introduced. GoLibrary slice exports remain unavailable.
+GoLibrary slice exports remain unavailable.
 
 ### Raw Go maps
 
@@ -2890,7 +2886,7 @@ Use `goml bind-go <CONFIG> [--compiler <COMPILER>] [--dry-run]` to generate expl
 
 Native APIs may reside in the output Go package; same-package references do not introduce self imports. Metadata queries omit the previously owned output in memory, then Go checks the complete candidate package, including handwritten files, before publication. No source overlay is written to disk.
 
-The ownership manifest `<CONFIG>.goml-bind.json` records both generated files. Identical regeneration preserves timestamps; modifications to either source or the manifest prevent overwriting. Put handwritten conversions and wrappers in separate files. Raw strings and errors retain their explicit `std::ffi` boundaries; the generator does not infer error, nullable or record adapters. Dry runs validate configuration, module and output paths and print destinations without writing files; they do not query the selected symbols. See [the configuration contract](ffi/bind-go.md) and [the standard-library binding fixture](../goml/testdata/ffi/bind-go/README.md). This command uses existing extern/type-alias syntax and introduces no grammar changes.
+The ownership manifest `<CONFIG>.goml-bind.json` records both generated files. Identical regeneration preserves timestamps; modifications to either source or the manifest prevent overwriting. Put handwritten conversions and wrappers in separate files. Raw strings and errors retain their explicit `std::ffi` boundaries; the generator does not infer error, nullable or record adapters. Dry runs validate configuration, module and output paths and print destinations without writing files; they do not query the selected symbols. See [the configuration contract](ffi/bind-go.md) and [the standard-library binding fixture](../goml/testdata/ffi/bind-go/README.md).
 
 ### Calling C libraries
 
@@ -3654,7 +3650,7 @@ return the remaining view only when the corresponding edge matches. Returned
 slices share the input's backing storage; mutation through an existing mutable
 alias is visible. Copy a returned view with `to_vec()` when isolation is needed.
 An empty separator cuts into an empty prefix and the whole input; cutting an
-empty prefix/suffix returns the whole input. These APIs add no syntax forms.
+empty prefix/suffix returns the whole input.
 
 `bytes::count(input, pattern) -> Result[isize, TransformError]` counts
 nonoverlapping matches. Empty patterns match before the first UTF-8 scalar and
@@ -3713,7 +3709,7 @@ limits succeed. Failure never mutates inputs or exposes a partial result.
 Limits cover output bytes or part count, not caller-owned inputs, compiled search
 tables or allocator overhead. They do not make global allocation failure
 recoverable. As with other shared slices, callers must not concurrently mutate
-inputs while an operation is reading them. These functions use existing syntax.
+inputs while an operation is reading them.
 
 The Unicode-aware byte helpers decode valid UTF-8 scalars and treat each malformed
 or truncated byte as U+FFFD, without coalescing adjacent invalid bytes. `find_char`
@@ -3759,7 +3755,7 @@ fold cycles, not full multi-scalar folding or normalization. Different malformed
 bytes can compare equal because each decodes as U+FFFD. Raw `find`/`rfind`, byte
 search, prefix/suffix checks and split/replace remain byte-pattern operations.
 Inputs must not be concurrently mutated while a call is reading them; shared
-views reflect subsequent mutations. These APIs introduce no new syntax forms.
+views reflect subsequent mutations.
 
 ```goml
 use std::bytes;
@@ -3817,7 +3813,7 @@ fn write_header(writer: endian::Writer, version: u16, enabled: bool) -> Result[(
 
 `write_uvarint(output, offset, value)` and `write_varint` validate the complete output range before writing and return the byte count or `BoundsError`; failure does not partially mutate the destination. `append_uvarint(builder, value)` and `append_varint` append to `bytes::Builder`. These free functions do not advance an endian `Reader` or `Writer`.
 
-`endian::Reader::read_uvarint()` and `read_varint()` decode from the current position and advance it only after success, returning the value. Truncated and overflowing input leave the position unchanged; error offsets are absolute within the reader's original view. `endian::Writer::write_uvarint(value)` and `write_varint(value)` return `Result[(), BoundsError]`, advancing by the encoded length only on success. Insufficient space changes neither position nor output bytes. Copies of a reader/writer share its position, consistent with existing fixed-width methods. For example, `writer.write_uvarint(300)` writes two bytes and advances two positions. These ordinary inherent methods introduce no grammar. The endian value package retains its pure memory-only dependency graph; streaming I/O belongs to its separately imported child package.
+`endian::Reader::read_uvarint()` and `read_varint()` decode from the current position and advance it only after success, returning the value. Truncated and overflowing input leave the position unchanged; error offsets are absolute within the reader's original view. `endian::Writer::write_uvarint(value)` and `write_varint(value)` return `Result[(), BoundsError]`, advancing by the encoded length only on success. Insufficient space changes neither position nor output bytes. Copies of a reader/writer share its position, consistent with existing fixed-width methods. For example, `writer.write_uvarint(300)` writes two bytes and advances two positions. The endian value package retains its pure memory-only dependency graph; streaming I/O belongs to its separately imported child package.
 
 Import `std::bytes::endian::stream` for `read_uvarint(reader: R) -> Result[Option[u64], stream::ReadError]` and `read_varint(reader: R) -> Result[Option[i64], stream::ReadError]`, with `R: io::Read`. A clean EOF before the first byte returns `None`; after any prefix it returns `ReadError::Decode(VarintError::Truncated(count))`. Overflow and noncanonical-but-valid encodings follow the existing byte decoder. Reads request one byte at a time, return every error including `Interrupted`, validate returned counts and consume at most ten bytes, never the next encoded value. Decode error offsets start at zero for each operation. `ReadError::Io(error, count)` preserves the original I/O error and the number of bytes returned by preceding successful reads; it cannot account for unreported side effects inside a failed read. Unlike memory cursors, streams cannot roll back consumed prefixes after errors.
 
@@ -4178,7 +4174,7 @@ fn message(value: i64) -> Result[string, format::Error] {
 }
 ```
 
-This library adds no grammar production. Protocol templating, contextual HTML
+Protocol templating, contextual HTML
 escaping and terminal layout remain ecosystem concerns. Compiler and driver
 formatting consumers retain released fallbacks until stage0 advancement.
 
@@ -4210,8 +4206,6 @@ fn unicode_example() -> bool {
         }
 }
 ```
-
-These APIs use existing function, enum and struct syntax; they add no grammar forms.
 
 ### Mathematics
 
@@ -4434,7 +4428,6 @@ The adapters neither close streams nor reset/copy digests automatically, allocat
 no transfer buffers and add no synchronization. Keep stream and hash access
 serialized and do not mutate write input during a call. The base hash package
 still depends only on bytes; only the stream child adds an io dependency.
-These adapters use existing traits and generics and add no syntax.
 
 ```goml
 use std::bytes;
@@ -5408,7 +5401,7 @@ These opt-in APIs leave the existing copy signatures unchanged and add no syntax
 
 `read_exact_at` and `write_all_at` validate the range before calling the implementation once. They validate returned counts and error progress, preserve valid underlying errors (including `Interrupted`), and do not retry. A short successful read is normalized to `UnexpectedEof`; a short successful write or impossible count is `InvalidData`. Impossible progress is reported as zero because the provider's count cannot be trusted; this does not imply no mutation occurred. Errors never roll back already transferred bytes or other provider side effects. Implementations must not retain the supplied buffer after returning. Unlike Go's ReaderAt/WriterAt concurrency contracts, these traits alone do not promise concurrency safety: callers must follow the concrete provider's synchronization requirements. The offset type is GoML's signed machine word, not an independent 64-bit file-offset type.
 
-`Cursor` also implements `ReadAt` and `WriteAt`. A nonempty read extending past the end copies the available prefix and returns `UnexpectedEof` with its count, leaving the remaining destination untouched. An empty read at any nonnegative offset succeeds. Positional writes may overwrite or append at the current length, but cannot create gaps; validation failures leave storage unchanged. Both sequential and positional writes snapshot their input before mutation, including overlapping views obtained from `fill_buf`. Positional operations preserve `position()`, including on errors. For example, with `use std::io::ReadAt`, `cursor.read_exact_at(output.as_mut_slice(), 4)` fills a buffer starting at byte four without seeking the cursor. These APIs use ordinary traits and methods and add no grammar.
+`Cursor` also implements `ReadAt` and `WriteAt`. A nonempty read extending past the end copies the available prefix and returns `UnexpectedEof` with its count, leaving the remaining destination untouched. An empty read at any nonnegative offset succeeds. Positional writes may overwrite or append at the current length, but cannot create gaps; validation failures leave storage unchanged. Both sequential and positional writes snapshot their input before mutation, including overlapping views obtained from `fill_buf`. Positional operations preserve `position()`, including on errors. For example, with `use std::io::ReadAt`, `cursor.read_exact_at(output.as_mut_slice(), 4)` fills a buffer starting at byte four without seeking the cursor.
 
 `BufRead::fill_buf` exposes the currently buffered bytes and `consume(amount)` checks the available range. `read_until(delimiter, limit)` includes a found delimiter; `read_line(limit)` includes the newline, validates UTF-8, and returns `None` only at EOF with no bytes. A final unterminated line may exactly fill the limit. Treat a buffer view as valid only until the next operation on that reader.
 
@@ -5481,7 +5474,7 @@ Default helpers follow the operations they actually perform: `discard(0)` and
 unchanged. Handle aliases share permissions and offset. A copied byte snapshot
 survives later operations, but a borrowed buffer view does not. For example,
 after `reader.read_char()` returns `Some(('界', 3))`, `reader.unread_char()` makes
-the same three original bytes available again. These APIs use existing syntax.
+the same three original bytes available again.
 
 `BufReader::read_fragment(delimiter: byte)` returns
 `Result[ReadFragment, FragmentError]`, consuming a bounded piece of the logical
@@ -6076,7 +6069,6 @@ does not echo that input. Error equality compares the original input. Bound inpu
 size before parsing untrusted data if retaining error strings would be costly.
 The existing boolean `ToString` implementation remains the canonical formatter,
 producing lowercase `true`/`false`; no separate formatting API is needed.
-This uses ordinary functions, structs and Result and adds no grammar forms.
 
 ```goml
 use std::num;
@@ -6209,7 +6201,7 @@ assembly. Each temporary component string is separately bounded by max_bytes;
 this is a final-output limit, not a bound on total allocations or conversion work.
 For example, `format_complex_f64(1.0, -2.0, ComplexFormat::Fixed(1), 16)` returns
 `Ok("(1.0-2.0i)")`. Binary significand notation is a display format and is not
-accepted by the complex decimal/hex parser. These APIs introduce no grammar forms.
+accepted by the complex decimal/hex parser.
 
 `std::num::ToFloat` supplies `.to_f32()` and `.to_f64()` for every scalar integer width. Conversions round directly to the destination IEEE 754 width using nearest, ties to even; `u64` to `f32` does not round through `f64`. Large integers can lose precision.
 
@@ -6322,7 +6314,7 @@ The package exports all 385 native amd64 `SYS_*` numbers in the pinned [Linux 7.
 
 `Iovecs::new(buffers: Slice[MutSlice[byte]]) -> Result[Iovecs, string]` accepts up to 1024 views and creates the encoded vector array and pointer descriptors. `buffer()`, `pointers()`, and `len()` supply the arguments for `readv`, `writev`, and related calls. `Message::new(name: MutSlice[byte], vectors: Iovecs, control: MutSlice[byte]) -> Result[Message, string]` constructs an `msghdr` graph for synchronous `sendmsg`/`recvmsg`; empty name/control views represent null pointers. Its `buffer()` and `pointers()` are used together with `syscall6_with_pointers`, and `header()` decodes lengths and flags after the call. Pointer slots are restored by that call. Builders retain the views and do not copy their contents. A builder, its views, and its graph must not be accessed concurrently while a call is using it; editing embedded lengths requires following the raw syscall ABI.
 
-The layout manifest is `tools/syscall/linux-amd64-layouts.json`. Run `python3 tools/syscall/layouts.py`, then `goml fmt` in `lib/std`, to regenerate the codecs. `python3 tools/syscall/layouts.py --check --verify-headers` checks canonical output and compiles C assertions for every size, offset, and field width against Linux amd64 system headers. This API uses ordinary structs and methods and adds no grammar.
+The layout manifest is `tools/syscall/linux-amd64-layouts.json`. Run `python3 tools/syscall/layouts.py`, then `goml fmt` in `lib/std`, to regenerate the codecs. `python3 tools/syscall/layouts.py --check --verify-headers` checks canonical output and compiles C assertions for every size, offset, and field width against Linux amd64 system headers.
 
 ### Linux amd64 file descriptors
 

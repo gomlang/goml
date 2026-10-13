@@ -112,14 +112,7 @@ goml-X.Y.Z-<os>-<arch>/
 └── lib/
     ├── builtin/
     │   ├── goml.toml
-    │   ├── contract.goml
-    │   ├── runtime.goml
-    │   ├── impls.goml
-    │   ├── intrinsics.goml
-    │   ├── language.goml
-    │   ├── derive.goml
-    │   ├── ordering.goml
-    │   └── numeric.goml
+    │   └── ...
     ├── cabi/
     │   ├── go.mod
     │   └── ...
@@ -135,12 +128,7 @@ The compiler resolves `lib` relative to its executable. The archive must preserv
 
 The packaged `lib/cabi` module contains the first-party dynamic C ABI runtime. Keep its Go and assembly sources together; `goml-c-bind --runtime-dir` resolves this directory relative to the installed helper. Release smoke tests check this path after archive relocation.
 
-Release archives contain the toolchain project sources and manifests, but do not contain `lib/compiler/compiler-world-v2.gaf`. After extracting an archive, installation must finalize it once with the binaries from that same archive:
-
-```sh
-prefix=/path/to/goml-X.Y.Z-darwin-arm64
-"$prefix/bin/goml" __toolchain-finalize --prefix "$prefix"
-```
+Release archives contain the toolchain project sources and manifests, but do not contain `lib/compiler/compiler-world-v2.gaf`. The installation command above finalizes it once with the binaries from that same archive.
 
 Finalization builds and validates the compiler world in a temporary path, then atomically installs it at `lib/compiler/compiler-world-v2.gaf`. Normal `goml check`, `goml build`, and `goml test` commands only read that executable-relative world. A missing world is an incomplete installation and must not trigger an implicit source build.
 

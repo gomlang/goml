@@ -25,7 +25,7 @@ The configuration uses versioned JSON and explicitly selects each native functio
 
 Each entry may have `type_arguments`, a finite array using the [bridge-type JSON schema](protocol-v1.md). For example, `[{"tag":"int64"}]` requests one concrete Go `int64` argument. The Go checker validates instantiation and constraints. Function queries preserve both the original declaration signature and the concrete signature; GoML substitutes the requested arguments and verifies that the signatures agree.
 
-The Go output is intended for native forwarding functions that retain explicit generic arguments and variadic slice expansion. It is constructed through Go AST nodes. The GoML output exposes the selected bindings with explicit raw boundaries and no implicit error, nullable or record conversion. Such higher-level adapters require explicit mapping configuration before they can be generated.
+The Go output is intended for native forwarding functions that retain explicit generic arguments and variadic slice expansion. It is constructed through Go AST nodes. The GoML output exposes the selected bindings with explicit raw boundaries and no implicit error, nullable or record conversion. Write higher-level adapters in separate files.
 
 Publication validates module-relative output paths and Go import identity. `--dry-run` validates configuration, module boundaries, and output paths and prints destinations without writing files or querying native symbols. See the [standard-library binding fixture](../../goml/testdata/ffi/bind-go/README.md) for generation, checking and execution commands.
 

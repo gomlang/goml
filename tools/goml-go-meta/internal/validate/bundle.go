@@ -17,15 +17,6 @@ type witnessOrigins struct {
 	lines map[int][]string
 }
 
-func containsFile(files []string, path string) bool {
-	for _, file := range files {
-		if file == path {
-			return true
-		}
-	}
-	return false
-}
-
 func (o witnessOrigins) files(path string, line int) []string {
 	if path == o.path {
 		return o.lines[line]

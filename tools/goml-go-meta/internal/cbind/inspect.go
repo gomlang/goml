@@ -34,7 +34,6 @@ type astNode struct {
 type World struct {
 	EnumTypes   map[string]string
 	Project     Project
-	Clang       string
 	Aliases     map[string]string
 	Functions   map[string]astNode
 	Constants   map[string]string
@@ -123,7 +122,7 @@ func Inspect(ctx context.Context, p Project) (*World, error) {
 	if err != nil {
 		return nil, err
 	}
-	w := &World{Project: p, Clang: clang, Aliases: map[string]string{}, Functions: map[string]astNode{}, Constants: map[string]string{}, Values: map[string]string{}, Handles: map[string]string{}, Sizes: map[string]int{}}
+	w := &World{Project: p, Aliases: map[string]string{}, Functions: map[string]astNode{}, Constants: map[string]string{}, Values: map[string]string{}, Handles: map[string]string{}, Sizes: map[string]int{}}
 	var probe strings.Builder
 	probe.WriteString("#include <stddef.h>\n#include <stdint.h>\n#include <stdbool.h>\n")
 	for _, header := range p.Config.Headers {

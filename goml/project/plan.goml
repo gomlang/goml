@@ -979,21 +979,15 @@ fn prepare_cached_command(
         GoBuild { .. } => return Result::Ok(CachePreparation::Execute(Option::None)),
         _ => (),
     }
-    match cache_spec(command) {
-        Some(spec) => {
-            let fingerprint = command_fingerprint(digests, context, identity, spec)?;
-            let fresh = cache_is_fresh(digests, context, spec, fingerprint)?;
-            if fresh {
-                Result::Ok(CachePreparation::Fresh)
-            } else {
-                invalidate_output_digests(digests, context.graph.module_dir, spec.outputs);
-                prepare_cache_execution(context, spec)?;
-                Result::Ok(
-                    CachePreparation::Execute(Option::Some(PreparedCache { spec, fingerprint })),
-                )
-            }
-        },
-        None => Result::Ok(CachePreparation::Execute(Option::None)),
+    let spec = cache_spec(command);
+    let fingerprint = command_fingerprint(digests, context, identity, spec)?;
+    let fresh = cache_is_fresh(digests, context, spec, fingerprint)?;
+    if fresh {
+        Result::Ok(CachePreparation::Fresh)
+    } else {
+        invalidate_output_digests(digests, context.graph.module_dir, spec.outputs);
+        prepare_cache_execution(context, spec)?;
+        Result::Ok(CachePreparation::Execute(Option::Some(PreparedCache { spec, fingerprint })))
     }
 }
 
@@ -1032,58 +1026,55 @@ fn abandon_prepared_command(context: Context, cache: Option[PreparedCache]) -> (
     }
 }
 
-fn build_graph(commands: Vec[Command]) -> Result[BuildGraph, failure::Failure] {
+fn build_graph(commands: Vec[Command]) -> BuildGraph {
     let producers: HashMap[string, Vec[isize]] = HashMap::new();
     for index in 0..commands.len() {
-        if let Some(spec) = cache_spec(commands[index]) {
-            for output in spec.outputs {
-                producers.entry(output).or_insert_with(|| Vec::new()).push(index)
-            }
+        for output in cache_spec(commands[index]).outputs {
+            producers.entry(output).or_insert_with(|| Vec::new()).push(index)
         }
     }
     let result: Vec[BuildNode] = Vec::new();
     for index in 0..commands.len() {
         let command = commands[index];
         let dependencies: collections::IndexSet[isize] = collections::IndexSet::new();
-        if let Some(spec) = cache_spec(command) {
-            for input in spec.inputs {
-                let mut previous = -1;
-                let mut following = -1;
-                if let Some(values) = producers[input] {
-                    for candidate in values {
-                        if candidate < index && candidate > previous {
-                            previous = candidate;
-                        } else if candidate > index && following < 0 {
-                            following = candidate;
-                        }
+        let spec = cache_spec(command);
+        for input in spec.inputs {
+            let mut previous = -1;
+            let mut following = -1;
+            if let Some(values) = producers[input] {
+                for candidate in values {
+                    if candidate < index && candidate > previous {
+                        previous = candidate;
+                    } else if candidate > index && following < 0 {
+                        following = candidate;
                     }
-                }
-                let producer = if previous >= 0 {
-                    previous
-                } else {
-                    following
-                };
-                if producer >= 0 {
-                    let _ = dependencies.insert(producer);
                 }
             }
-            for output in spec.outputs {
-                let mut previous = -1;
-                if let Some(values) = producers[output] {
-                    for candidate in values {
-                        if candidate < index && candidate > previous {
-                            previous = candidate;
-                        }
+            let producer = if previous >= 0 {
+                previous
+            } else {
+                following
+            };
+            if producer >= 0 {
+                let _ = dependencies.insert(producer);
+            }
+        }
+        for output in spec.outputs {
+            let mut previous = -1;
+            if let Some(values) = producers[output] {
+                for candidate in values {
+                    if candidate < index && candidate > previous {
+                        previous = candidate;
                     }
                 }
-                if previous >= 0 {
-                    let _ = dependencies.insert(previous);
-                }
+            }
+            if previous >= 0 {
+                let _ = dependencies.insert(previous);
             }
         }
         result.push(BuildNode { index, command, dependencies })
     }
-    Result::Ok(BuildGraph { nodes: result })
+    BuildGraph { nodes: result }
 }
 
 fn build_node(nodes: Vec[BuildNode], index: isize) -> Option[BuildNode] {
@@ -1218,15 +1209,14 @@ fn execute_plan_concurrently(
     context: Context,
     graph: BuildGraph,
     identity: string,
-    total: isize,
     jobs: isize,
     completed: Ref[isize],
 ) -> Result[(), failure::Failure] {
-    let initial: Vec[isize] = Vec::new();
+    let total = graph.nodes.len();
+    let pending: Vec[isize] = Vec::new();
     for node in graph.nodes {
-        initial.push(node.index)
+        pending.push(node.index)
     }
-    let mut pending = initial;
     let completed_nodes = collections::BitSet::new();
     let mut running = 0;
     let worker_count = if jobs < total {
@@ -1363,40 +1353,30 @@ pub fn execute_plan(context: Context, plan: Plan, dry_run: bool, jobs: isize) ->
     if !dry_run && jobs < 1 {
         return Result::Err(failure::convert("build jobs must be greater than zero"))
     }
-    let total = plan.commands.len();
-    let completed = Ref::new(0);
-    let identity = if dry_run {
-        ""
-    } else {
-        compiler_digest(context)?
-    };
     if dry_run {
         for command in plan.commands {
             let invocation = foreign_command_args(context, command);
             io::println(display_args(invocation.0, invocation.1))
         }
-    } else {
-        let graph = build_graph(plan.commands)?;
-        let digests = digest_cache();
-        let execution = task::try_scope(
-            |scope: task::Scope| execute_plan_concurrently(
-                scope,
-                digests,
-                context,
-                graph,
-                identity,
-                total,
-                jobs,
-                completed,
-            ),
-        );
-        if let Err(message) = execution {
-            return Result::Err(failure::convert(message))
-        }
+        return Result::Ok(())
     }
-    if dry_run {} else {
-        util::display_progress(completed.get(), total, "finished", true)
-    }
+    let total = plan.commands.len();
+    let completed = Ref::new(0);
+    let identity = compiler_digest(context)?;
+    let graph = build_graph(plan.commands);
+    let digests = digest_cache();
+    task::try_scope(
+        |scope: task::Scope| execute_plan_concurrently(
+            scope,
+            digests,
+            context,
+            graph,
+            identity,
+            jobs,
+            completed,
+        ),
+    )?;
+    util::display_progress(completed.get(), total, "finished", true);
     Result::Ok(())
 }
 

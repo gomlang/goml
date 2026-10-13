@@ -27,7 +27,6 @@ struct LowerEnv {
     active_loop_labels: Vec[(string, string)],
     variants: VariantInfos,
     structs: Vec[repr::StructDef],
-    instances: Vec[repr::TypeInstance],
     functions: Vec[anf::Function],
     function_names: FunctionNames,
     dyn_helper_names: DynHelperNames,
@@ -146,21 +145,13 @@ fn resolve_function_name(value: string, type_names: collections::HashSet[string]
     }
 }
 
-fn add_entry_variant_names(
-    used: NameSet,
-    enums: Vec[repr::EnumDef],
-    structs: Vec[repr::StructDef],
-    instances: Vec[repr::TypeInstance],
-    function_names: FunctionNames,
-) -> () {
+fn add_entry_variant_names(used: NameSet, enums: Vec[repr::EnumDef], function_names: FunctionNames) -> () {
     for definition in enums {
         for variant in definition.variants {
-            let name = variant_go_name(
+            let name = concrete_variant_go_name(
                 definition.name,
                 variant.name,
                 enums,
-                structs,
-                instances,
                 function_names,
             );
             add_reachable(used, name)
@@ -190,7 +181,7 @@ fn entry_wrapper_name(
     for instance in instances {
         add_reachable(used, go_user_type_name(instance.name))
     }
-    add_entry_variant_names(used, enums, structs, instances, function_names);
+    add_entry_variant_names(used, enums, function_names);
     if !name_present(used, "main0") {
         "main0"
     } else {
@@ -273,14 +264,7 @@ fn build_top_level_names(
         let _ = result.insert(go_user_type_name(definition.name));
         for variant in definition.variants {
             let _ = result.insert(
-                variant_go_name(
-                    definition.name,
-                    variant.name,
-                    enums,
-                    structs,
-                    instances,
-                    function_names,
-                ),
+                concrete_variant_go_name(definition.name, variant.name, enums, function_names),
             );
         }
     }
@@ -1000,7 +984,7 @@ fn compile_closure_function(
     }
 }
 
-fn compile_imm_expected(env: LowerEnv, value: anf::Imm, expected_ty: repr::Type) -> Expr {
+fn compile_value_imm(env: LowerEnv, value: anf::Imm) -> Expr {
     match value {
         Tag { index: tag, ty: owner_ty } => {
             match find_enum_info(env.variants, owner_ty) {
@@ -1050,13 +1034,11 @@ fn compile_imm_expected(env: LowerEnv, value: anf::Imm, expected_ty: repr::Type)
     }
 }
 
-fn compile_imms_expected(env: LowerEnv, values: Vec[anf::Imm], expected: Vec[repr::Type]) -> Vec[
-    Expr,
-] {
+fn compile_imms_with_arity(env: LowerEnv, values: Vec[anf::Imm], arity: isize) -> Vec[Expr] {
     let result: Vec[Expr] = Vec::new();
     for index in 0..values.len() {
-        if index < expected.len() {
-            result.push(compile_imm_expected(env, values[index], expected[index]))
+        if index < arity {
+            result.push(compile_value_imm(env, values[index]))
         } else {
             result.push(compile_imm(env, values[index]))
         }
@@ -2412,11 +2394,11 @@ fn compile_callable(env: LowerEnv, func: anf::Imm, args: Vec[anf::Imm]) -> Expr 
 }
 
 fn compile_call(env: LowerEnv, func: anf::Imm, args: Vec[anf::Imm]) -> Expr {
-    let expected = match repr::resolve_type(anf::imm_type(func)) {
-        Func { params, ret_ty: _ } => params,
-        _ => Vec::new(),
+    let arity = match repr::resolve_type(anf::imm_type(func)) {
+        Func { params, ret_ty: _ } => params.len(),
+        _ => 0,
     };
-    let compiled = compile_imms_expected(env, args, expected);
+    let compiled = compile_imms_with_arity(env, args, arity);
     if let Callable { callable: Runtime(key), ty: _ } = func {
         if key == "core.defer.push" || key == "core.defer.pop" {
             env.cleanup_used.set(true);
@@ -2551,25 +2533,19 @@ fn compile_constructor(
     args: Vec[anf::Imm],
     ty: repr::Type,
 ) -> Expr {
-    let expected: Vec[repr::Type] = Vec::new();
     let info = if constructor.is_struct {
         Option::None
     } else {
         constructor.tag.and_then(|tag| find_variant_info(env.variants, ty, tag))
     };
-    if constructor.is_struct {
-        for field_ty in struct_field_types(env, ty) {
-            expected.push(field_ty)
-        }
+    let arity = if constructor.is_struct {
+        struct_field_types(env, ty).len()
     } else {
-        if let Some(tag) = constructor.tag {
-            if let Some(info) = find_variant_info(env.variants, ty, tag) {
-                for field_ty in info.field_types {
-                    expected.push(field_ty)
-                }
-            }
+        match info {
+            Some(value) => value.field_types.len(),
+            None => 0,
         }
-    }
+    };
     if constructor.is_struct {
         let fields: Vec[(string, Expr)] = Vec::new();
         for index in 0..args.len() {
@@ -2578,8 +2554,8 @@ fn compile_constructor(
             } else {
                 f"_{index}"
             };
-            let compiled = if index < expected.len() {
-                compile_imm_expected(env, args[index], expected[index])
+            let compiled = if index < arity {
+                compile_value_imm(env, args[index])
             } else {
                 compile_imm(env, args[index])
             };
@@ -2615,8 +2591,8 @@ fn compile_constructor(
     }
     let payload_fields: Vec[(string, Expr)] = Vec::new();
     for index in 0..args.len() {
-        let compiled = if index < expected.len() {
-            compile_imm_expected(env, args[index], expected[index])
+        let compiled = if index < arity {
+            compile_value_imm(env, args[index])
         } else {
             compile_imm(env, args[index])
         };
@@ -2631,11 +2607,7 @@ fn compile_constructor(
         }
     }
     match owner.storage {
-        Singleton | TagOnly => compile_imm_expected(
-            env,
-            anf::Imm::Tag { index: variant.tag, ty },
-            ty,
-        ),
+        Singleton | TagOnly => compile_value_imm(env, anf::Imm::Tag { index: variant.tag, ty }),
         Flat => {
             payload_fields.push(("_tag", Expr::Int { value: variant.tag.to_string() }));
             Expr::StructLiteral { ty: lower_type(ty), fields: payload_fields }
@@ -2671,22 +2643,17 @@ fn compile_constructor(
     }
 }
 
-fn compile_value(env: LowerEnv, bind_name: string, value: anf::Value, expected_ty: repr::Type) -> CompiledValue {
+fn compile_value(env: LowerEnv, bind_name: string, value: anf::Value) -> CompiledValue {
     let stmts: Vec[Stmt] = Vec::new();
     let expr = match value {
-        Imm(value) => compile_imm_expected(env, value, expected_ty),
+        Imm(value) => compile_value_imm(env, value),
         Constr { constructor, args, ty } => compile_constructor(env, constructor, args, ty),
         Tuple { items, ty } => {
             let fields: Vec[(string, Expr)] = Vec::new();
             match repr::resolve_type(ty) {
-                Tuple { items: item_types } => {
+                Tuple { items: _ } => {
                     for index in 0..items.len() {
-                        fields.push(
-                            (
-                                f"_{index}",
-                                compile_imm_expected(env, items[index], item_types[index]),
-                            ),
-                        )
+                        fields.push((f"_{index}", compile_value_imm(env, items[index])))
                     }
                 },
                 _ => {
@@ -2698,19 +2665,13 @@ fn compile_value(env: LowerEnv, bind_name: string, value: anf::Value, expected_t
             Expr::StructLiteral { ty: lower_type(ty), fields }
         },
         Array { items, ty } => {
-            let expected = match repr::resolve_type(ty) {
-                Array { len: _, elem } => {
-                    let values: Vec[repr::Type] = Vec::new();
-                    for _ in items {
-                        values.push(elem)
-                    }
-                    values
-                },
-                _ => Vec::new(),
+            let arity = match repr::resolve_type(ty) {
+                Array { .. } => items.len(),
+                _ => 0,
             };
             Expr::ArrayLiteral {
                 ty: lower_type(ty),
-                items: compile_imms_expected(env, items, expected),
+                items: compile_imms_with_arity(env, items, arity),
             }
         },
         ConstrGet { expr, constructor, field_index: index, ty: field_ty } => {
@@ -2810,11 +2771,11 @@ fn compile_value(env: LowerEnv, bind_name: string, value: anf::Value, expected_t
             append_stmts(stmts, compiled_rhs.stmts);
             Expr::Binary { op: compile_binary(op), lhs: compiled_lhs.expr, rhs: compiled_rhs.expr }
         },
-        Assign { name, value, target_ty, ty: _ } => {
+        Assign { name, value, target_ty: _, ty: _ } => {
             stmts.push(
                 Stmt::Assign {
                     name: env_local_ident(env, name),
-                    value: compile_imm_expected(env, value, target_ty),
+                    value: compile_value_imm(env, value),
                 },
             );
             Expr::Unit
@@ -2823,7 +2784,7 @@ fn compile_value(env: LowerEnv, bind_name: string, value: anf::Value, expected_t
         ToDyn { trait_name, for_ty, expr, ty } => {
             let trait_name = dyn_runtime_key(ty);
             let fields: Vec[(string, Expr)] = Vec::new();
-            let compiled = compile_imm_expected(env, expr, for_ty);
+            let compiled = compile_value_imm(env, expr);
             let data = match repr::resolve_type(for_ty) {
                 Bool | Int | Int8 | Int16 | Int32 | Int64 | Uint | Uint8 | Uint16 | Uint32 | Uint64 | Float32 | Float64 | Char => Expr::Convert {
                     ty: lower_type(for_ty),
@@ -2852,16 +2813,11 @@ fn compile_value(env: LowerEnv, bind_name: string, value: anf::Value, expected_t
             let receiver = compile_imm(env, receiver);
             let values: Vec[Expr] = Vec::new();
             values.push(Expr::Field { expr: receiver, field_name: "data" });
-            let expected = match find_dyn_method(
-                env.builtin,
-                env.functions,
-                trait_name,
-                method_name,
-            ) {
-                Some(info) => info.params,
-                None => Vec::new(),
+            let arity = match find_dyn_method(env.builtin, env.functions, trait_name, method_name) {
+                Some(info) => info.params.len(),
+                None => 0,
             };
-            for arg in compile_imms_expected(env, args, expected) {
+            for arg in compile_imms_with_arity(env, args, arity) {
                 values.push(arg)
             }
             Expr::Call {
@@ -2892,7 +2848,7 @@ fn compile_let(env: LowerEnv, value: anf::LetBind) -> Vec[Stmt] {
         return result
     }
     let result: Vec[Stmt] = Vec::new();
-    let compiled = compile_value(env, value.name, value.value, value.ty);
+    let compiled = compile_value(env, value.name, value.value);
     append_stmts(result, compiled.stmts);
     result.push(
         Stmt::Var {
@@ -3283,7 +3239,7 @@ fn compile_jump_args(env: LowerEnv, value: anf::JoinBind, args: Vec[anf::Imm]) -
             result.push(
                 Stmt::Assign {
                     name: env_local_ident(env, value.params[index].0),
-                    value: compile_imm_expected(env, args[index], value.params[index].1),
+                    value: compile_value_imm(env, args[index]),
                 },
             )
         }
@@ -3640,7 +3596,7 @@ fn compile_select(
                     SelectCase {
                         operation: SelectOperation::Send {
                             channel: selected_channel,
-                            value: compile_imm_expected(env, value, select_channel_elem(channel)),
+                            value: compile_value_imm(env, value),
                         },
                         body: compile_body(body),
                     },
@@ -3682,9 +3638,7 @@ fn compile_term_leaf(env: LowerEnv, value: anf::Term) -> Vec[Stmt] {
     let result: Vec[Stmt] = Vec::new();
     match value {
         Return(value) => result.push(
-            Stmt::Return {
-                expr: Option::Some(compile_imm_expected(env, value, anf::imm_type(value))),
-            },
+            Stmt::Return { expr: Option::Some(compile_value_imm(env, value)) },
         ),
         Jump { target, args, ret_ty: _ } => match find_join(env.joins, target) {
             Some(join) => {
@@ -5553,9 +5507,7 @@ fn collect_type_definition_fields(
     result: CollectedTypes,
     enums: Vec[repr::EnumDef],
     structs: Vec[repr::StructDef],
-    instances: Vec[repr::TypeInstance],
 ) -> () {
-    let _ = instances;
     for definition in structs {
         for field in definition.fields {
             collect_type(result, field.1)
@@ -5806,7 +5758,6 @@ fn compile_function(
     top_level_names: collections::HashSet[string],
     variants: VariantInfos,
     structs: Vec[repr::StructDef],
-    instances: Vec[repr::TypeInstance],
     functions: Vec[anf::Function],
     function_names: FunctionNames,
     dyn_helper_names: DynHelperNames,
@@ -5856,7 +5807,6 @@ fn compile_function(
         active_loop_labels: Vec::new(),
         variants,
         structs,
-        instances,
         functions,
         function_names,
         dyn_helper_names,
@@ -5917,7 +5867,6 @@ fn compile_functions(
     top_level_names: collections::HashSet[string],
     variants: VariantInfos,
     structs: Vec[repr::StructDef],
-    instances: Vec[repr::TypeInstance],
     function_names: FunctionNames,
     dyn_helper_names: DynHelperNames,
     pointer_params: Vec[PointerParamInfo],
@@ -5941,7 +5890,6 @@ fn compile_functions(
                     top_level_names,
                     variants,
                     structs,
-                    instances,
                     values,
                     function_names,
                     dyn_helper_names,
@@ -5968,7 +5916,6 @@ fn compile_functions(
                     top_level_names,
                     variants,
                     structs,
-                    instances,
                     values,
                     function_names,
                     dyn_helper_names,
@@ -6120,7 +6067,7 @@ fn lower_with_target_and_names(
         )
     }
     let dyn_helper_names = build_dyn_helper_names(builtin, coercions, value.functions);
-    collect_type_definition_fields(types, enums, structs, type_instances);
+    collect_type_definition_fields(types, enums, structs);
     emit_go_foreign_import_items(items, go_foreign, types.values);
     emit_runtime_hook_items(items, runtime_hooks, intrinsics);
     emit_go_foreign_wrapper_items(items, go_foreign);
@@ -6163,7 +6110,6 @@ fn lower_with_target_and_names(
         top_level_names,
         variants,
         structs,
-        type_instances,
         function_names,
         dyn_helper_names,
         pointer_params,
