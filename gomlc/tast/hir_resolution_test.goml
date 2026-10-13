@@ -1,0 +1,127 @@
+package tast;
+
+use module::ast;
+use module::hir;
+use module::parser;
+use std::testing;
+
+fn assert_hir_resolution_diagnostics(values: Vec[Diagnostic], expected: Option[string]) -> () {
+    match expected {
+        Some(message) => if has_diagnostic_containing(values, message) {
+            return
+        },
+        None => if values.is_empty() {
+            return
+        },
+    }
+    let mut details = "unexpected HIR resolution diagnostics";
+    for value in values {
+        details = details + "\n" + value.message;
+    }
+    testing::fail(details);
+}
+
+#[test]
+fn hir_resolution_rejects_bindings_outside_their_block() -> () {
+    for source in Vec::from_array(
+        [
+            "fn invalid() -> isize { let _ = { let hidden = 1; hidden }; hidden }",
+            "fn invalid() -> isize { let _ = comptime { let hidden = 1; hidden }; hidden }",
+            "fn invalid() -> isize { let _ = { let _ = { let hidden = 1; hidden }; hidden }; 0 }",
+        ],
+    ) {
+        testing::assert(has_diagnostic(checked_diagnostics(source), "Unresolved name hidden"));
+    }
+}
+
+#[test]
+fn hir_resolution_keeps_constant_initializers_outside_generic_scope() -> () {
+    let declarations = "const SIZE: usize = 2; const WIDTH: usize = SIZE; fn first[const SIZE: usize](values: [isize; WIDTH]) -> isize { values[0] } ";
+    assert_hir_resolution_diagnostics(
+        checked_diagnostics(declarations + "fn valid() -> isize { first::[3]([1, 2]) }"),
+        Option::None,
+    );
+    assert_hir_resolution_diagnostics(
+        checked_diagnostics(declarations + "fn invalid() -> isize { first::[3]([1, 2, 3]) }"),
+        Option::Some("Array length mismatch: expected [isize; 2]"),
+    );
+}
+
+#[test]
+fn hir_resolution_restores_outer_binding_types_after_blocks() -> () {
+    for source in Vec::from_array(
+        [
+            "fn valid() -> bool { let value = true; let _ = { let value = 1; value }; value }",
+            "fn valid() -> bool { let value = true; let _ = comptime { let value = 1; value }; value }",
+            "fn valid() -> bool { let value = true; let read = { let value = 1; || value }; let _number: isize = read(); value }",
+            "fn valid() -> bool { let value = true; let _ = { let value = value; value }; value }",
+        ],
+    ) {
+        testing::assert_eq(checked_diagnostics(source).len(), 0);
+    }
+}
+
+fn hir_resolution_cross_file_constant_diagnostics(array: string) -> Vec[Diagnostic] {
+    let parsed = Vec::from_array(
+        [
+            parser::parse(
+                "package sample; use example::short as sizes; use example::short::{SIZE as BOUND}; const WIDTH: usize = sizes::SIZE; const SELECTED: usize = BOUND;",
+            ),
+            parser::parse(
+                "package sample; use example::long as sizes; use example::long::{SIZE as BOUND}; const INDIRECT: usize = WIDTH; fn first(values: [isize; WIDTH]) -> isize { values[0] } fn selected(values: [isize; SELECTED]) -> isize { values[0] } fn nested(values: [isize; INDIRECT]) -> isize { values[0] } pub fn checked() -> isize { first("
+                    + array
+                    + ") + selected("
+                    + array
+                    + ") + nested("
+                    + array
+                    + ") }",
+            ),
+        ],
+    );
+    let ast_files = ast::lower_package(parsed);
+    let inputs: Vec[(ast::LowerResult, string)] = Vec::from_array(
+        [(ast_files[0], "constants.goml"), (ast_files[1], "functions.goml")],
+    );
+    let files: Vec[hir::File] = Vec::new();
+    for result in hir::lower_package_files(inputs, "example::sample") {
+        testing::assert_eq(result.diagnostics.len(), 0);
+        files.push(testing::expect_some(result.hir, "expected package HIR"));
+    }
+    check_package_files_for_link_with_environments(
+        files,
+        Vec::from_array(
+            [
+                checked_dependency_environment(
+                    "package short; pub const SIZE: usize = 2;",
+                    "example::short",
+                ),
+                checked_dependency_environment(
+                    "package long; pub const SIZE: usize = 3;",
+                    "example::long",
+                ),
+            ],
+        ),
+    ).diagnostics
+}
+
+#[test]
+fn hir_resolution_checks_constant_lengths_in_their_defining_import_scope() -> () {
+    assert_hir_resolution_diagnostics(
+        hir_resolution_cross_file_constant_diagnostics("[1, 2]"),
+        Option::None,
+    );
+    assert_hir_resolution_diagnostics(
+        hir_resolution_cross_file_constant_diagnostics("[1, 2, 3]"),
+        Option::Some("Array length mismatch: expected [isize; 2]"),
+    );
+}
+
+#[test]
+fn hir_resolution_does_not_identify_generic_parameters_with_package_types() -> () {
+    let source = "package sample; struct T { value: isize } fn concrete(value: T) -> T { value } fn invalid[T](value: T) -> T { concrete(value) }";
+    let result = check_for_link_with_dependencies(
+        hir::lower_package(ast::lower(parser::parse(source)), "sample.goml", "example::sample"),
+        Vec::new(),
+    );
+    testing::assert(has_diagnostic_containing(result.diagnostics, "Type mismatch"));
+}

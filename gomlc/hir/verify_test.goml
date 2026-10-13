@@ -1,0 +1,273 @@
+package hir;
+
+use module::ast;
+use module::parser;
+use std::testing;
+
+fn verify_test_reference(value: Expr) -> Option[Expr] {
+    match value.kind {
+        NameRef { name_ref: Local(_) } => Option::Some(value),
+        Block { block } => block.tail.and_then(verify_test_reference),
+        If { then_branch, .. } => verify_test_reference(then_branch),
+        Closure { body, .. } => verify_test_reference(body),
+        Call { func, .. } => verify_test_reference(func),
+        Match { arms, .. } => if arms.is_empty() {
+            Option::None
+        } else {
+            verify_test_reference(arms[0].body)
+        },
+        _ => Option::None,
+    }
+}
+
+fn verify_test_tail(file: File, function: Function, tail: Expr) -> File {
+    File {
+        items: Vec::from_array(
+            [
+                Item::Function(
+                    Function {
+                        body: Block { tail: Option::Some(tail), ..function.body },
+                        ..function,
+                    },
+                ),
+            ],
+        ),
+        ..file,
+    }
+}
+
+#[test]
+fn verifier_accepts_nested_scopes_and_shared_or_bindings() -> () {
+    let file = lowered_file(
+        "enum Value { First(isize), Second(isize) } const INITIAL: isize = 1; static COUNT: isize = INITIAL; fn choose(input: Value) -> isize { let outer = 1; let compute = |arg: isize| { let outer = arg; outer }; let _ = if true { let inner = 2; inner } else { let inner = 3; inner }; for (index, item) in [(0, 1)] { let _ = index + item; } match input { whole @ Value::First(value) | whole @ Value::Second(value) if value > 0 => { let _ = whole; compute(value) + outer }, _ => 0 } }",
+    );
+    testing::assert_eq(verify_file(file, Vec::new()).len(), 0)
+}
+
+#[test]
+fn verifier_accepts_array_rest_select_and_let_else_scopes() -> () {
+    let file = lowered_file(
+        "fn choose(input: Option[isize], channel: Channel[isize]) -> isize { let Some(value) = input else { return 0 }; let [first, rest @ ..] = [value, 2, 3]; let _ = rest; select { recv(channel) when (first > 0) as received => received.unwrap_or(first), send(channel, first) => first, default => first } }",
+    );
+    testing::assert_eq(verify_file(file, Vec::new()).len(), 0)
+}
+
+#[test]
+fn verifier_rejects_locals_that_escape_blocks_branches_and_closures() -> () {
+    let sources = Vec::from_array(
+        [
+            "fn sample() -> isize { { let hidden = 1; hidden } }",
+            "fn sample() -> isize { if true { let hidden = 1; hidden } else { 0 } }",
+            "fn sample() -> isize { (|hidden: isize| hidden)(1) }",
+            "fn sample() -> isize { match 1 { hidden => hidden } }",
+        ],
+    );
+    for source in sources {
+        let file = lowered_file(source);
+        if let Item::Function(function) = file.items[0] {
+            if let Some(tail) = function.body.tail.and_then(verify_test_reference) {
+                let diagnostics = verify_file(verify_test_tail(file, function, tail), Vec::new());
+                testing::assert_eq(diagnostics.len(), 1);
+                testing::assert(diagnostics[0].message.contains("is not in scope"));
+                if let Some(span) = diagnostics[0].span {
+                    testing::assert_eq(span.start, tail.span.start);
+                    testing::assert_eq(span.end, tail.span.end)
+                } else {
+                    testing::fail("expected source span")
+                }
+            } else {
+                testing::fail("expected nested local reference")
+            }
+        } else {
+            testing::fail("expected function")
+        }
+    }
+}
+
+#[test]
+fn verifier_rejects_missing_definition_and_invalid_variant_ids() -> () {
+    let file = lowered_file("enum Value { Item(isize) } fn sample() -> Value { Value::Item(1) }");
+    if let Item::Function(function) = file.items[1] {
+        if let Some(tail) = function.body.tail {
+            let missing = Expr {
+                kind: ExprKind::NameRef {
+                    name_ref: NameRef::Def(source_definition("main", 999999)),
+                },
+                ..tail,
+            };
+            let diagnostics = verify_file(verify_test_tail(file, function, missing), Vec::new());
+            testing::assert_eq(diagnostics.len(), 1);
+            testing::assert(diagnostics[0].message.contains("unknown definition"));
+            if let ExprKind::Constr { constructor: Resolved { enum_def, .. }, args, .. } = tail.kind {
+                for variant_index in Vec::from_array([-1, 1]) {
+                    let invalid = Expr {
+                        kind: ExprKind::Constr {
+                            constructor: ConstructorRef::Resolved { enum_def, variant_index },
+                            args,
+                        },
+                        ..tail,
+                    };
+                    let diagnostics = verify_file(
+                        verify_test_tail(file, function, invalid),
+                        Vec::from_array([file]),
+                    );
+                    testing::assert_eq(diagnostics.len(), 1);
+                    testing::assert(diagnostics[0].message.contains("invalid enum variant index"))
+                }
+            } else {
+                testing::fail("expected resolved constructor")
+            }
+        } else {
+            testing::fail("expected function tail")
+        }
+    } else {
+        testing::fail("expected function")
+    }
+}
+
+#[test]
+fn verifier_accepts_cross_file_definitions_and_impl_methods() -> () {
+    let results = lower_package_files(
+        Vec::from_array(
+            [
+                (
+                    ast::lower(
+                        parser::parse(
+                            "package sample; pub fn helper(value: isize) -> isize { value } struct Value {} impl Value { fn method(self) -> isize { helper(1) } }",
+                        ),
+                    ),
+                    "helper.goml",
+                ),
+                (
+                    ast::lower(parser::parse("package sample; fn call() -> isize { helper(1) }")),
+                    "call.goml",
+                ),
+            ],
+        ),
+        "review::sample",
+    );
+    let files: Vec[File] = Vec::new();
+    for result in results {
+        testing::assert_eq(result.diagnostics.len(), 0);
+        if let Some(file) = result.hir {
+            files.push(file)
+        } else {
+            testing::fail("expected package file")
+        }
+    }
+    for file in files {
+        testing::assert_eq(verify_file(file, files).len(), 0)
+    }
+    if let Item::ImplBlock(implementation) = files[0].items[2] {
+        if let Item::Function(function) = files[1].items[0] {
+            if let Some(tail) = function.body.tail {
+                let method = Expr {
+                    kind: ExprKind::NameRef {
+                        name_ref: NameRef::Def(implementation.methods[0].def_id),
+                    },
+                    ..tail,
+                };
+                testing::assert_eq(
+                    verify_file(verify_test_tail(files[1], function, method), files).len(),
+                    0,
+                )
+            } else {
+                testing::fail("expected function tail")
+            }
+        } else {
+            testing::fail("expected function")
+        }
+    } else {
+        testing::fail("expected implementation")
+    }
+}
+
+#[test]
+fn verifier_rejects_or_pattern_bindings_with_different_identities() -> () {
+    let file = lowered_file(
+        "fn sample(input: isize) -> isize { match input { value | value => value } }",
+    );
+    if let Item::Function(function) = file.items[0] {
+        if let Some(tail) = function.body.tail {
+            if let ExprKind::Match { expr, arms } = tail.kind {
+                let arm = arms[0];
+                if let PatKind::Or { pats } = arm.pat.kind {
+                    if let PatKind::Var { name, is_mut } = pats[1].kind {
+                        let alternative = Pat {
+                            kind: PatKind::Var {
+                                name: LocalId { index: name.index + 1000, ..name },
+                                is_mut,
+                            },
+                            ..pats[1],
+                        };
+                        let pattern = Pat {
+                            kind: PatKind::Or { pats: Vec::from_array([pats[0], alternative]) },
+                            ..arm.pat,
+                        };
+                        let invalid = Expr {
+                            kind: ExprKind::Match {
+                                expr,
+                                arms: Vec::from_array([Arm { pat: pattern, ..arm }]),
+                            },
+                            ..tail,
+                        };
+                        let diagnostics = verify_file(
+                            verify_test_tail(file, function, invalid),
+                            Vec::new(),
+                        );
+                        testing::assert_eq(diagnostics.len(), 1);
+                        testing::assert(diagnostics[0].message.contains("different local bindings"))
+                    } else {
+                        testing::fail("expected binding pattern")
+                    }
+                } else {
+                    testing::fail("expected or-pattern")
+                }
+            } else {
+                testing::fail("expected match")
+            }
+        } else {
+            testing::fail("expected function tail")
+        }
+    } else {
+        testing::fail("expected function")
+    }
+}
+
+#[test]
+fn verifier_checks_constant_and_static_initializers() -> () {
+    let file = lowered_file("const FIRST: isize = 1; static SECOND: isize = 2;");
+    let items: Vec[Item] = Vec::new();
+    for item in file.items {
+        match item {
+            Constant(value) => items.push(
+                Item::Constant(
+                    Constant {
+                        value: Expr {
+                            kind: ExprKind::NameRef {
+                                name_ref: NameRef::Def(source_definition("main", 999999)),
+                            },
+                            ..value.value,
+                        },
+                        ..value,
+                    },
+                ),
+            ),
+            Static(value) => items.push(
+                Item::Static(
+                    Static {
+                        value: Expr {
+                            kind: ExprKind::NameRef {
+                                name_ref: NameRef::Def(source_definition("main", 999999)),
+                            },
+                            ..value.value,
+                        },
+                        ..value,
+                    },
+                ),
+            ),
+            _ => testing::fail("expected initializer"),
+        }
+    }
+    testing::assert_eq(verify_file(File { items, ..file }, Vec::new()).len(), 2)
+}
