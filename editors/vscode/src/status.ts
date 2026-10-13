@@ -160,10 +160,6 @@ export class LanguageServerStatus implements Disposable {
         }
     }
 
-    private currentRequest(): Activity | undefined {
-        return this.requests.values().next().value;
-    }
-
     private render(): void {
         this.item.backgroundColor = undefined;
         if (this.unavailableMessage) {
@@ -192,7 +188,7 @@ export class LanguageServerStatus implements Disposable {
             this.item.accessibilityInformation = { label: 'GoML language server stopped' };
             return;
         }
-        const activity = this.serverOperation ?? this.currentRequest();
+        const activity = this.serverOperation ?? this.requests.values().next().value;
         if (activity) {
             const duration = Date.now() - activity.startedAt;
             const extraRequests = this.serverOperation ? 0 : this.requests.size - 1;

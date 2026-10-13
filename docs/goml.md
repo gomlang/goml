@@ -2933,7 +2933,7 @@ pub fn checked_text(value: ffi::String) -> (ffi::String, bool) {
 }
 ```
 
-A raw echo returning `ffi::String` can preserve bytes without decoding. A rune adapter can return `(ffi::Rune, bool)` in the same way. Fixed arrays and flat tuple returns preserve these element policies. `Result` itself is not a Go export ABI type; selecting and documenting the failure shape belongs to the adapter author. These exports reuse existing type aliases, function syntax and `go_export` grammar.
+A raw echo returning `ffi::String` can preserve bytes without decoding. A rune adapter can return `(ffi::Rune, bool)` in the same way. Fixed arrays and flat tuple returns preserve these element policies. `Result` itself is not a Go export ABI type; selecting and documenting the failure shape belongs to the adapter author.
 
 Interface and Core artifacts preserve the selected Go export name, stable package/function identity, resolved signature, and relative source origin. Export names and signatures participate in the interface semantic hash; source positions do not. The internal library linker selects only the chosen package’s declared exports as function roots before dead-code elimination and monomorphization; reachable private and cross-package helpers are retained without requiring a `main`. The internal Go library backend emits callable wrappers for scalar and fixed-array parameters and results, maps unit to no Go result, and maps a flat tuple to multiple Go results. Library wrappers use package-level OnceCell initialization and preserve panics. Generated internal package declarations are private Go identifiers; only explicitly selected export names become public API. `pub` alone does not request a Go export.
 
@@ -3119,7 +3119,7 @@ The custom `goml/expandedDerive` request returns the formatted AST after built-i
 
 `gomllsp` supports full-document formatting through `textDocument/formatting`. Formatting uses the latest unsaved document text and the fixed rules described in [formatting.md](formatting.md). Invalid documents are left unchanged.
 
-CLI and LSP diagnostics share a model with optional stable codes, notes, help, and suggested edits. The CLI displays codes as `error[typer/try_error_mismatch]` or `warning[typer/unused_result]`; the LSP exposes the same identifier in `Diagnostic.code` and secondary locations in `relatedInformation`. Notes and help appear in the displayed message and separately in diagnostic `data`, alongside fixes and the document version. Fixes carry a title, one or more ranged edits, and `machine-applicable` or `requires-review` applicability. Code actions reject fixes from an older document version. Codes are currently assigned to the unused-Result warning and the three `?` diagnostics above; other diagnostics may omit them. This changes diagnostic output, not language syntax or propagation rules.
+CLI and LSP diagnostics share a model with optional stable codes, notes, help, and suggested edits. The CLI displays codes as `error[typer/try_error_mismatch]` or `warning[typer/unused_result]`; the LSP exposes the same identifier in `Diagnostic.code` and secondary locations in `relatedInformation`. Notes and help appear in the displayed message and separately in diagnostic `data`, alongside fixes and the document version. Fixes carry a title, one or more ranged edits, and `machine-applicable` or `requires-review` applicability. Code actions reject fixes from an older document version. Codes are currently assigned to the unused-Result warning and the three `?` diagnostics above; other diagnostics may omit them.
 
 ## Built-in prelude
 
@@ -4000,7 +4000,6 @@ casing. `case_with_checked(value, special, kind, max_bytes)` uses a
 `unicode::SpecialCase` override with normal fallback. These are one-scalar maps,
 not normalization, full folding or word-title algorithms. Limits count encoded
 bytes, not characters, and do not guarantee recovery from allocator exhaustion.
-All these APIs use existing function, enum and closure syntax.
 
 ```goml
 use std::text;
@@ -4581,7 +4580,7 @@ Decoding is strict and all-or-error: the standard variants reject lowercase, whi
 
 `Encoding::encoded_len(input_length)` computes the exact padded or raw output byte length without allocating output and returns `Result[isize, OutputError]`; negative lengths and arithmetic overflow are recoverable errors. `.encode_checked(input, max_bytes)` rejects negative limits and excessive/overflowing output before encoding. `.decode_checked(input, max_bytes)` checks padding/length shape and the resulting decoded length before allocating the output buffer, then performs the usual digit and canonical-bit validation. Exact limits succeed; failures return no partial result. Free `encode_checked` and `decode_checked` functions use the standard padded configuration. Custom alphabets use the methods on their Encoding value.
 
-`OutputError` distinguishes `InvalidLength(length)`, `InvalidLimit(limit)`, `LengthOverflow`, `LimitExceeded(limit)` and `Decode(original_error)`. Decode error precedence is negative limit, invalid shape, exceeded output limit, then invalid digits/trailing bits; an oversized malformed body can therefore report a limit error before a digit error. Limits bound output storage, not input length or total process memory. Existing unbounded entry points remain compatible, and no new syntax is introduced.
+`OutputError` distinguishes `InvalidLength(length)`, `InvalidLimit(limit)`, `LengthOverflow`, `LimitExceeded(limit)` and `Decode(original_error)`. Decode error precedence is negative limit, invalid shape, exceeded output limit, then invalid digits/trailing bits; an oversized malformed body can therefore report a limit error before a digit error. Limits bound output storage, not input length or total process memory.
 
 `Encoder::new(encoding, max_bytes) -> Result[Encoder, OutputError]` creates incremental encoding state with a cumulative output limit. `update(input: Slice[byte]) -> Result[string, StreamError]` emits all complete five-bit symbols available from that input and prior pending bits; concatenate returned chunks in call order. It retains only a scalar bit accumulator and counters, not input slices or emitted chunks. Calls can split input anywhere. `finish() -> Result[string, StreamError]` emits the final zero-filled symbol and configured padding, then closes the encoder; repeated finish succeeds with an empty string. Update after finish, even with empty input, returns `StreamError::Closed`.
 
@@ -5393,9 +5392,8 @@ live source/destination storage or be accessed concurrently. `copy_progress`
 allocates an 8 KiB scratch buffer. Reads are clipped to the remaining `u64`
 counter range; once the maximum count is reached the next iteration reports
 `InvalidData` before I/O, even if a further read would have discovered EOF.
-These opt-in APIs leave the existing copy signatures unchanged and add no syntax.
 
-`io::Discard::new()` creates a stateless `Write` implementation that accepts the entire supplied buffer, including empty buffers, without retaining data; `flush` succeeds without work. For example, `io::copy_n(reader, io::Discard::new(), 32)` skips exactly 32 bytes or reports premature EOF. These APIs use existing function, trait and generic syntax.
+`io::Discard::new()` creates a stateless `Write` implementation that accepts the entire supplied buffer, including empty buffers, without retaining data; `flush` succeeds without work. For example, `io::copy_n(reader, io::Discard::new(), 32)` skips exactly 32 bytes or reports premature EOF.
 
 `io::ReadAt::read_at(output: MutSlice[byte], offset: isize)` and `io::WriteAt::write_at(input: Slice[byte], offset: isize)` perform positional transfers without changing the sequential position. Their result is `Result[isize, io::TransferError]`: success reports the complete buffer length; failure can report a transferred prefix together with its cause. `TransferError::new(transferred: usize, error: io::Error)`, `.transferred()` and `.error()` preserve both values without changing existing `Read`/`Write` error signatures. Implementations must reject negative offsets and offset-plus-length overflow, and must report short transfers as errors. They must not report progress beyond the supplied buffer.
 
@@ -6524,7 +6522,7 @@ For example, `/café?q=a b+#é` serializes as `/caf%C3%A9?q=a%20b+#%C3%A9`; lite
 
 Authority and UserInfo implement raw equality and lossless ToString, but deliberately omit Debug. `Authority::redacted(limit)` and `Reference::redacted(limit)` replace a present password, including an empty one, with `xxxxx`, retaining all other spelling. For example, `https://u:p@host/a?q=secret` becomes `https://u:xxxxx@host/a?q=secret`. Query, path, fragment and username secrets are not removed; this is not a general safe-logging sanitizer. Reference redaction first validates the authority. Negative limits fail, and output byte limits are checked before joining the result. Decode limits bound decoded bytes; bound the original parse input separately.
 
-Additional ParseErrorKind variants are `InvalidHost`, `InvalidPort`, `PortOutOfRange`, `InvalidUserInfo`, `InvalidZone` and `InvalidIpLiteral`; malformed percent sequences use `InvalidEscape`. Diagnostics report kinds and byte offsets without echoing credentials. These APIs use existing struct, enum and method syntax without new grammar or runtime hooks.
+Additional ParseErrorKind variants are `InvalidHost`, `InvalidPort`, `PortOutOfRange`, `InvalidUserInfo`, `InvalidZone` and `InvalidIpLiteral`; malformed percent sequences use `InvalidEscape`. Diagnostics report kinds and byte offsets without echoing credentials.
 
 ### Networking
 

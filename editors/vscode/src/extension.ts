@@ -213,28 +213,15 @@ function findServerPath(context: ExtensionContext): string | undefined {
         return configPath;
     }
 
-    const binary = 'gomllsp';
-    const bundledPath = path.join(context.extensionPath, 'bin', binary);
-    if (fs.existsSync(bundledPath)) {
-        return bundledPath;
-    }
-
-    const bundledPathExe = path.join(context.extensionPath, 'bin', `${binary}.exe`);
-    if (fs.existsSync(bundledPathExe)) {
-        return bundledPathExe;
-    }
-
-    const envPath = process.env.PATH;
-    if (envPath) {
-        const pathDirs = envPath.split(path.delimiter);
-        for (const dir of pathDirs) {
-            const candidate = path.join(dir, binary);
+    const directories = [
+        path.join(context.extensionPath, 'bin'),
+        ...(process.env.PATH ? process.env.PATH.split(path.delimiter) : []),
+    ];
+    for (const directory of directories) {
+        for (const binary of ['gomllsp', 'gomllsp.exe']) {
+            const candidate = path.join(directory, binary);
             if (fs.existsSync(candidate)) {
                 return candidate;
-            }
-            const candidateExe = path.join(dir, `${binary}.exe`);
-            if (fs.existsSync(candidateExe)) {
-                return candidateExe;
             }
         }
     }

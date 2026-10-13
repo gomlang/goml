@@ -99,7 +99,7 @@ func decode(data []byte, value any) error {
 		return fmt.Errorf("configuration exceeds 1 MiB")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
-	if err := uniqueJSON(decoder); err != nil {
+	if err := uniqueJSON(decoder, 0); err != nil {
 		return err
 	}
 	if _, err := decoder.Token(); err != io.EOF {
@@ -110,11 +110,7 @@ func decode(data []byte, value any) error {
 	return decoder.Decode(value)
 }
 
-func uniqueJSON(decoder *json.Decoder) error {
-	return uniqueJSONDepth(decoder, 0)
-}
-
-func uniqueJSONDepth(decoder *json.Decoder, depth int) error {
+func uniqueJSON(decoder *json.Decoder, depth int) error {
 	if depth > 64 {
 		return fmt.Errorf("configuration nesting exceeds 64")
 	}
@@ -136,7 +132,7 @@ func uniqueJSONDepth(decoder *json.Decoder, depth int) error {
 				}
 				seen[name] = true
 			}
-			if err := uniqueJSONDepth(decoder, depth+1); err != nil {
+			if err := uniqueJSON(decoder, depth+1); err != nil {
 				return err
 			}
 		}

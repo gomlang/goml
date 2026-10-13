@@ -102,7 +102,7 @@ _ci-stdlib-test-build:
 _ci-stdlib-test-run:
     cd lib/std && ../../stage2/bin/goml test --no-build --target-dir ../../_artifact/stdlib-test --compiler ../../stage2/bin/gomlc --jobs "${GOML_TEST_JOBS:-16}" --timeout 10m
 
-_ci-vscode:
+_vscode-bundle:
     mkdir -p editors/vscode/bin
     find editors/vscode/bin -mindepth 1 -type f -delete
     find editors/vscode/bin -mindepth 1 -depth -type d -empty -delete
@@ -111,6 +111,8 @@ _ci-vscode:
     cp stage2/bin/goml-go-meta editors/vscode/bin/goml-go-meta
     bash tools/lib/install.sh editors/vscode
     cd editors/vscode && npm install
+
+_ci-vscode: _vscode-bundle
     cd editors/vscode && npm run package
 
 _ci-release-smoke:
@@ -133,15 +135,7 @@ set-bootstrap-stage0 version sha256:
     bash tools/release/release.sh set-stage0 "{{version}}" "{{sha256}}"
     bash bootstrap/bootstrap.sh bootstrap/stage0.env stage0
 
-vscode-ext: make-tools
-    mkdir -p editors/vscode/bin
-    find editors/vscode/bin -mindepth 1 -type f -delete
-    find editors/vscode/bin -mindepth 1 -depth -type d -empty -delete
-    cp stage2/bin/gomllsp editors/vscode/bin/gomllsp
-    cp stage2/bin/goml editors/vscode/bin/goml
-    cp stage2/bin/goml-go-meta editors/vscode/bin/goml-go-meta
-    bash tools/lib/install.sh editors/vscode
-    cd editors/vscode && npm install
+vscode-ext: make-tools _vscode-bundle
     cd editors/vscode && npm run compile
 
 package-vscode-ext: vscode-ext
