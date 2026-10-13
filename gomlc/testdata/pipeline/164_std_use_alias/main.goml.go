@@ -51,10 +51,6 @@ type _goml_vec__goml_m_std_p_text_p_ReplacementNode struct {
     items []_goml_m_std_p_text_p_ReplacementNode
 }
 
-type _goml_vec_Tuple2_6string_6string struct {
-    items []Tuple2_6string_6string
-}
-
 type ref_int_x struct {
     value int
 }
@@ -85,11 +81,6 @@ type hashmap_uint8_int_x struct {
     indices map[uint8]int
     entries []hashmap_uint8_int_x_entry
     len int
-}
-
-type Tuple2_6string_6string struct {
-    _0 string
-    _1 string
 }
 
 type Tuple2_3int_3int struct {
@@ -284,7 +275,7 @@ type _goml_m_std_p_text_p_ReplacementNode struct {
 
 type _goml_m_std_p_text_p_Replacer struct {
     nodes *_goml_vec__goml_m_std_p_text_p_ReplacementNode
-    rules *_goml_vec_Tuple2_6string_6string
+    replacements *_goml_vec_string
 }
 
 type _goml_m_std_p_text_p_ReplacementCursor struct {

@@ -179,8 +179,8 @@ type _goml_vec__goml_m_std_p_text_p_ReplacementNode struct {
     items []_goml_m_std_p_text_p_ReplacementNode
 }
 
-type _goml_vec_Tuple2_6string_6string struct {
-    items []Tuple2_6string_6string
+type _goml_vec_string struct {
+    items []string
 }
 
 type _goml_vec__goml_m_std_p_json_p_JsonDeserializeFrame struct {
@@ -311,11 +311,6 @@ type Tuple2_6string_28_goml_m_std_p_serde_p_Schema struct {
 type Tuple2_6string_27_goml_m_std_p_serde_p_Value struct {
     _0 string
     _1 _goml_m_std_p_serde_p_Value
-}
-
-type Tuple2_6string_6string struct {
-    _0 string
-    _1 string
 }
 
 type Tuple2_27_goml_m_std_p_serde_p_Value_27_goml_m_std_p_serde_p_Value struct {
@@ -550,7 +545,7 @@ type _goml_m_std_p_text_p_ReplacementNode struct {
 
 type _goml_m_std_p_text_p_Replacer struct {
     nodes *_goml_vec__goml_m_std_p_text_p_ReplacementNode
-    rules *_goml_vec_Tuple2_6string_6string
+    replacements *_goml_vec_string
 }
 
 type _goml_m_std_p_text_p_ReplacementCursor struct {
