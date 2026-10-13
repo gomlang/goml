@@ -2,6 +2,8 @@
 
 The extension provides syntax highlighting, diagnostics, hover, completion, go-to-definition, signature help, inlay hints, formatting, test code lenses, and quick fixes for `.goml` files.
 
+Type inlay hints use short type names and a 25-character budget. Long types use `…` while preserving their outer structure; hover over a hint to see its full type, including package paths.
+
 Unused `Result` and invalid `?` diagnostics expose stable codes and handling suggestions. Propagation errors link to the enclosing return type. The unused-Result quick fix makes ignoring the error explicit with `let _ = ...`; review that choice before applying it. Fixes from an older document version are discarded.
 
 The status bar shows whether the language server is starting, ready, stopped, or busy. While it is busy, it shows the current server operation and elapsed time. Hover over the status item to see queued client requests, or click it to open the language server output. Operations taking at least two seconds are recorded there as warnings.
