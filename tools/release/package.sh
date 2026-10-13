@@ -21,7 +21,7 @@ mkdir -p "dist/$package/bin"
 
 export CGO_ENABLED=0 GOOS="$target_goos" GOARCH="$target_goarch"
 export GOWORK=off GO111MODULE=off GOFLAGS=
-go build -trimpath -o "dist/$package/bin/goml" goml/_bootstrap/stage2/build/pkg/gomlang/bootstrap_goml/cmd/goml/goml_generated.go
+go build -trimpath -o "dist/$package/bin/goml" goml/_bootstrap/stage2/build/pkg/goml/cmd/goml/goml_generated.go
 for tool in gomlc gomlfmt gomldoc gomllsp; do
     go build -trimpath -o "dist/$package/bin/$tool" "gomlc/_bootstrap/stage2/build/pkg/gomlc/cmd/$tool/goml_generated.go"
 done
