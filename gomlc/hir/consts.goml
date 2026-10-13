@@ -3,13 +3,6 @@ package hir;
 use module::ast;
 use module::consts;
 
-fn hir_const_value(value: TypeExpr) -> Option[isize] {
-    match value {
-        Con { name } => consts::value_number(name),
-        _ => Option::None,
-    }
-}
-
 fn const_name_path(name: string) -> ast::Path {
     let segments: Vec[ast::PathSegment] = Vec::new();
     for part in name.split("::") {
@@ -18,95 +11,114 @@ fn const_name_path(name: string) -> ast::Path {
     ast::Path { segments }
 }
 
-fn lower_const_source(ctx: LowerCtx, source: string, params: Vec[string], active: Vec[string]) -> TypeExpr {
+fn lower_const_source(
+    ctx: LowerCtx,
+    source: string,
+    params: Vec[string],
+    active: Vec[string],
+    span: Option[ast::Span],
+) -> ConstExpr {
     match consts::parse(source) {
-        Ok(value) => lower_const_expr(ctx, value, params, active),
+        Ok(value) => lower_const_expr(ctx, value, params, active, span),
         Err(message) => {
-            ctx.diagnostics.push(Diagnostic { message, span: Option::None });
-            TypeExpr::Con { name: consts::value_name(0) }
+            ctx.diagnostics.push(Diagnostic { message, span });
+            ConstExpr { kind: ConstKind::Error, span }
         },
     }
 }
 
-fn lower_const_expr(ctx: LowerCtx, value: consts::Expr, params: Vec[string], active: Vec[string]) -> TypeExpr {
-    match value {
-        Value(value) => TypeExpr::Con { name: consts::value_name(value) },
+fn lower_const_expr(
+    ctx: LowerCtx,
+    value: consts::Expr,
+    params: Vec[string],
+    active: Vec[string],
+    span: Option[ast::Span],
+) -> ConstExpr {
+    let kind = match value {
+        Value(value) => ConstKind::Value(value),
         Name(name) => {
             if params.contains(consts::parameter(name)) {
-                return TypeExpr::Con { name: consts::parameter(name) }
+                return ConstExpr { kind: ConstKind::Param(name), span }
             }
             let qualified = path_text(ctx, const_name_path(name));
-            let local = full_name(ctx.package_name, name);
-            for entry in ctx.constant_expressions {
-                if entry.0 == qualified || entry.0 == local {
-                    if active.contains(entry.0) {
+            let local = full_name(ctx.package_env.name, name);
+            for entry in ctx.package_env.constant_expressions {
+                if entry.name == qualified || entry.name == local {
+                    if active.contains(entry.name) {
                         ctx.diagnostics.push(
-                            Diagnostic {
-                                message: "cyclic array length constant " + name,
-                                span: Option::None,
-                            },
+                            Diagnostic { message: "cyclic array length constant " + name, span },
                         );
-                        return TypeExpr::Con { name: consts::value_name(0) }
+                        return ConstExpr { kind: ConstKind::Error, span }
                     }
-                    active.push(entry.0);
+                    active.push(entry.name);
                     let result = lower_const_source(
-                        ctx,
-                        ast::expression_text(entry.1),
-                        params,
+                        constant_context(ctx, entry),
+                        ast::expression_text(entry.value),
+                        Vec::new(),
                         active,
+                        span,
                     );
                     let _ = active.pop();
                     return result
                 }
             }
-            TypeExpr::Con { name: "$const_name:" + qualified }
+            ConstKind::Reference(qualified)
         },
         Unary { op, value } => {
-            let left = TypeExpr::Con {
-                name: consts::value_name(
-                    if op == "~" {
-                        -1
-                    } else {
-                        0
-                    },
-                ),
-            };
-            let right = lower_const_expr(ctx, value, params, active);
-            if op == "+" {
-                right
-            } else {
-                lower_const_operation(
-                    ctx,
-                    if op == "~" {
+            let inner = lower_const_expr(ctx, value, params, active, span);
+            match inner.kind {
+                Value(number) => if op == "+" {
+                    ConstKind::Value(number)
+                } else {
+                    let operation = if op == "~" {
                         "^"
                     } else {
                         "-"
-                    },
-                    left,
-                    right,
-                )
+                    };
+                    let left = if op == "~" {
+                        -1
+                    } else {
+                        0
+                    };
+                    const_operation_kind(
+                        ctx,
+                        operation,
+                        ConstExpr { kind: ConstKind::Value(left), span },
+                        inner,
+                        span,
+                    )
+                },
+                Error => ConstKind::Error,
+                _ => ConstKind::Unary { op, value: inner },
             }
         },
-        Binary { op, left, right } => {
-            let left = lower_const_expr(ctx, left, params, active);
-            let right = lower_const_expr(ctx, right, params, active);
-            lower_const_operation(ctx, op, left, right)
-        },
-    }
+        Binary { op, left, right } => const_operation_kind(
+            ctx,
+            op,
+            lower_const_expr(ctx, left, params, active, span),
+            lower_const_expr(ctx, right, params, active, span),
+            span,
+        ),
+    };
+    ConstExpr { kind, span }
 }
 
-fn lower_const_operation(ctx: LowerCtx, op: string, left: TypeExpr, right: TypeExpr) -> TypeExpr {
-    if let (Some(left_value), Some(right_value)) = (hir_const_value(left), hir_const_value(right)) {
-        match consts::binary(op, left_value, right_value) {
-            Ok(value) => return TypeExpr::Con { name: consts::value_name(value) },
+fn const_operation_kind(
+    ctx: LowerCtx,
+    op: string,
+    left: ConstExpr,
+    right: ConstExpr,
+    span: Option[ast::Span],
+) -> ConstKind {
+    match (left.kind, right.kind) {
+        (Value(left), Value(right)) => match consts::binary(op, left, right) {
+            Ok(value) => ConstKind::Value(value),
             Err(message) => {
-                ctx.diagnostics.push(Diagnostic { message, span: Option::None });
-                return TypeExpr::Con { name: consts::value_name(0) }
+                ctx.diagnostics.push(Diagnostic { message, span });
+                ConstKind::Error
             },
-        }
-    }
-    TypeExpr::App {
-        ty: TypeExpr::Con { name: "$const_op:" + op },
-        args: Vec::from_array([left, right]),
+        },
+        (Error, _) | (_, Error) => ConstKind::Error,
+        _ => ConstKind::Binary { op, left, right },
     }
 }

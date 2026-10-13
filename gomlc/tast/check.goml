@@ -1,6 +1,7 @@
 package tast;
 
 use module::ast;
+use module::consts;
 use module::derive;
 use module::hir;
 use module::numeric;
@@ -727,9 +728,9 @@ fn primitive_expr(ctx: Checker, value: hir::Expr) -> Option[Expr] {
 
 fn function_scheme_for_name_ref(ctx: Checker, value: hir::NameRef) -> Option[FunctionScheme] {
     match value {
-        Local(_) => Option::None,
+        Local(_) | ConstParam(_) | Error => Option::None,
         Def(definition) => find_function_by_def(ctx, definition),
-        Other(name) => match find_function_by_name(ctx, name) {
+        Unresolved(name) => match find_function_by_name(ctx, name) {
             Some(value) => Option::Some(value),
             None => scoped_builtin_function_scheme(ctx, name),
         },
@@ -738,6 +739,8 @@ fn function_scheme_for_name_ref(ctx: Checker, value: hir::NameRef) -> Option[Fun
 
 fn check_name_ref_inner(ctx: Checker, value: hir::NameRef) -> Expr {
     match value {
+        ConstParam(name) => Expr::Var { name: consts::parameter(name), ty: Type::Uint },
+        Error => Expr::Prim { value: Primitive::Unit, ty: Type::Error },
         Local(local) => match find_local(ctx, local) {
             Some(ty) => Expr::Var { name: local_name(local), ty },
             None => {
@@ -792,10 +795,7 @@ fn check_name_ref_inner(ctx: Checker, value: hir::NameRef) -> Expr {
                 },
             },
         },
-        Other(name) => {
-            if name.starts_with("$const_param:") && ctx.type_params.contains(name) {
-                return Expr::Var { name, ty: Type::Uint }
-            }
+        Unresolved(name) => {
             match find_constant_by_name(ctx, name) {
                 Some(value) => Expr::Var { name: value.name, ty: value.ty },
                 None => {
@@ -896,30 +896,10 @@ fn check_static_member(
     ctx: Checker,
     owner: string,
     member: string,
-    owner_type_args: Vec[hir::TypeExpr],
-    member_type_args: Vec[hir::TypeExpr],
+    owner_type_args: Vec[hir::GenericArg],
+    member_type_args: Vec[hir::GenericArg],
     report_inference: bool,
 ) -> Expr {
-    if owner == "$array" && member == "repeat" && owner_type_args.len() == 1 {
-        let length = normalize_type(
-            ctx,
-            expand_type_aliases(
-                ctx,
-                type_from_hir(ctx.builtin, owner_type_args[0], ctx.type_params, ctx.self_ty),
-                true,
-            ),
-        );
-        validate_const_argument(ctx, length);
-        let elem = fresh_type(ctx.counter, VarKind::Any);
-        let ret_ty = const_application(
-            Type::Con { name: "$array" },
-            Vec::from_array([length, elem]),
-        );
-        return Expr::Callable {
-            callable: Callable::Intrinsic("array.repeat"),
-            ty: Type::Func { params: Vec::from_array([elem]), ret_ty },
-        }
-    }
     if let Some(value) = associated_constant_value(ctx, owner, member, owner_type_args) {
         if !member_type_args.is_empty() {
             push_diagnostic(ctx, "associated constants do not accept member type arguments")
@@ -934,7 +914,13 @@ fn check_static_member(
             }
             Expr::Var { name: value.name, ty: value.ty }
         },
-        None => match resolve_named_constructor(ctx, owner, member) {
+        None => match resolve_named_constructor_with_arguments(
+            ctx,
+            owner,
+            member,
+            owner_type_args,
+            member_type_args,
+        ) {
             Some(info) => resolved_constructor_value_expr(ctx, info),
             None => match resolve_static_member(
                 ctx,
@@ -1459,7 +1445,13 @@ fn check_byte_string_expr(
 ) -> Expr {
     let items: Vec[hir::Expr] = Vec::new();
     for value in values {
-        items.push(hir::Expr { kind: hir::ExprKind::Byte { value }, span: value_span })
+        items.push(
+            hir::Expr {
+                kind: hir::ExprKind::Byte { value },
+                span: value_span,
+                origin: hir::Origin::Desugared,
+            },
+        )
     }
     if let Some(ty) = expected {
         if symbolic_array(ty).is_some() {
@@ -2060,7 +2052,7 @@ fn check_method_call(
     ctx: Checker,
     receiver_source: hir::Expr,
     name: string,
-    method_type_args: Vec[hir::TypeExpr],
+    method_type_args: Vec[hir::GenericArg],
     args: Vec[hir::Expr],
     expected: Option[Type],
 ) -> Expr {
@@ -2207,11 +2199,13 @@ fn is_inherent_callable(value: Expr) -> bool {
 
 fn call_reference_target(reference: hir::NameRef, result: Expr) -> ReferenceTarget {
     match reference {
+        ConstParam(name) => ReferenceTarget::Unresolved(name),
+        Error => ReferenceTarget::Unresolved("<error>"),
         Local(local) => ReferenceTarget::Local(local),
         Def(definition) => {
             ReferenceTarget::Definition(definition)
         },
-        Other(name) => match result {
+        Unresolved(name) => match result {
             Call { func: Callable { callable, ty }, args: _, ty: _ } => match resolve_type(ty) {
                 Error => ReferenceTarget::Unresolved(name),
                 _ => ReferenceTarget::Callable(callable),
@@ -2278,6 +2272,29 @@ fn check_while_condition_term(ctx: Checker, source: hir::Expr, expected: Option[
     result
 }
 
+fn check_array_repeat_expr(
+    ctx: Checker,
+    value: hir::Expr,
+    len: hir::ConstExpr,
+    expected: Option[Type],
+) -> Expr {
+    let previous_span = ctx.current_span.get();
+    ctx.current_span.set(len.span);
+    let length = normalize_type(ctx, expand_type_aliases(ctx, const_expr_from_hir(len), true));
+    validate_const_argument(ctx, length);
+    ctx.current_span.set(previous_span);
+    let elem = fresh_type(ctx.counter, VarKind::Any);
+    let ret_ty = const_application(Type::Con { name: "$array" }, Vec::from_array([length, elem]));
+    let ty = Type::Func { params: Vec::from_array([elem]), ret_ty };
+    constrain_callable_return(ctx, ty, expected);
+    apply_call(
+        ctx,
+        Expr::Callable { callable: Callable::Intrinsic("array.repeat"), ty },
+        Vec::new(),
+        Vec::from_array([value]),
+    )
+}
+
 fn check_call_expr(
     ctx: Checker,
     call_span: ast::Span,
@@ -2285,13 +2302,6 @@ fn check_call_expr(
     args: Vec[hir::Expr],
     expected: Option[Type],
 ) -> Expr {
-    if args.len() == 1 {
-        if let NameRef { name_ref: hir::NameRef::Other(name) } = function.kind {
-            if name == "$while_condition" {
-                return check_while_condition_term(ctx, args[0], expected)
-            }
-        }
-    }
     let function_span = function.span;
     let function_source = function;
     let argument_spans: Vec[ast::Span] = Vec::new();
@@ -2316,7 +2326,7 @@ fn check_call_expr(
                 result
             },
             None => match reference {
-                Other(name) => {
+                Unresolved(name) => {
                     push_diagnostic(ctx, "Unresolved callee " + name);
                     if let None = expected {
                         push_global_diagnostic(ctx, INFERENCE_FAILURE_MESSAGE)
@@ -2334,16 +2344,15 @@ fn check_call_expr(
                 _ => apply_call(ctx, check_name_ref(ctx, reference), Vec::new(), args),
             },
         },
-        StaticMember {
-            owner,
-            member,
-            owner_type_args,
-            owner_type_arg_spans: _,
-            member_type_args,
-            member_type_arg_spans: _,
-        } => {
+        StaticMember { owner, member, owner_type_args, member_type_args } => {
             let previous_span = ctx.current_span.get();
-            let value = match resolve_named_constructor(ctx, owner, member) {
+            let value = match resolve_named_constructor_with_arguments(
+                ctx,
+                owner,
+                member,
+                owner_type_args,
+                member_type_args,
+            ) {
                 Some(info) => {
                     check_resolved_constructor_expr(ctx, info, args, expected)
                 },
@@ -3863,8 +3872,8 @@ fn check_assign_target(ctx: Checker, target: hir::Expr, compound: bool) -> (Expr
         NameRef { name_ref: reference } => {
             let static_value = match reference {
                 hir::NameRef::Def(definition) => find_constant_by_def(ctx, definition),
-                hir::NameRef::Other(name) => find_constant_by_name(ctx, name),
-                hir::NameRef::Local(_) => Option::None,
+                hir::NameRef::Unresolved(name) => find_constant_by_name(ctx, name),
+                hir::NameRef::Local(_) | hir::NameRef::ConstParam(_) | hir::NameRef::Error => Option::None,
             };
             if let Some(value) = static_value {
                 push_diagnostic_at(
@@ -4315,6 +4324,9 @@ fn infer_expr(ctx: Checker, value: hir::Expr) -> Expr {
     match primitive_expr(ctx, value) {
         Some(result) => result,
         None => match value.kind {
+            Error => Expr::Prim { value: Primitive::Unit, ty: Type::Error },
+            WhileCondition { expr } => check_while_condition_term(ctx, expr, Option::None),
+            ArrayRepeat { value, len } => check_array_repeat_expr(ctx, value, len, Option::None),
             NameRef { name_ref: reference } => {
                 let result = check_name_ref_inner(ctx, reference);
                 if let Local(local) = reference {
@@ -4326,14 +4338,7 @@ fn infer_expr(ctx: Checker, value: hir::Expr) -> Expr {
                 }
                 result
             },
-            StaticMember {
-                owner,
-                member,
-                owner_type_args,
-                owner_type_arg_spans: _,
-                member_type_args,
-                member_type_arg_spans: _,
-            } => {
+            StaticMember { owner, member, owner_type_args, member_type_args } => {
                 check_static_member(ctx, owner, member, owner_type_args, member_type_args, true)
             },
             ConstructorValue { constructor } => {
@@ -4504,9 +4509,19 @@ fn check_expr_inner(ctx: Checker, value: hir::Expr, expected: Option[Type]) -> E
     let always_exits = hir_expr_always_exits_loop_control(value);
     let value_span = value.span;
     match value.kind {
+        Error => Expr::Prim { value: Primitive::Unit, ty: Type::Error },
+        WhileCondition { expr } => check_while_condition_term(ctx, expr, expected),
+        ArrayRepeat { value, len } => {
+            let result = check_array_repeat_expr(ctx, value, len, expected);
+            if always_exits {
+                result
+            } else {
+                coerce_expr(ctx, result, expected)
+            }
+        },
         NameRef { name_ref: reference } => {
             let unresolved_other = match reference {
-                Other(_) => true,
+                Unresolved(_) => true,
                 _ => false,
             };
             let unresolved_local = match reference {
@@ -4761,11 +4776,13 @@ fn check_expr(ctx: Checker, value: hir::Expr, expected: Option[Type]) -> Expr {
     ctx.typeck_results.exprs.push(ExprFact { source_path: ctx.source_path, span: value.span, ty });
     if let NameRef { name_ref: reference } = value.kind {
         let target = match reference {
+            ConstParam(name) => ReferenceTarget::Unresolved(name),
+            Error => ReferenceTarget::Unresolved("<error>"),
             Local(local) => ReferenceTarget::Local(local),
             Def(definition) => {
                 ReferenceTarget::Definition(definition)
             },
-            Other(name) => match result {
+            Unresolved(name) => match result {
                 Callable { callable, ty: _ } => {
                     ReferenceTarget::Callable(callable)
                 },
@@ -4918,16 +4935,18 @@ fn check_constructor_pattern(
 fn constant_scheme_for_pattern(ctx: Checker, reference: hir::NameRef) -> Option[ConstantScheme] {
     match reference {
         hir::NameRef::Def(definition) => find_constant_by_def(ctx, definition),
-        hir::NameRef::Other(name) => find_constant_by_name(ctx, name),
-        hir::NameRef::Local(_) => Option::None,
+        hir::NameRef::Unresolved(name) => find_constant_by_name(ctx, name),
+        hir::NameRef::Local(_) | hir::NameRef::ConstParam(_) | hir::NameRef::Error => Option::None,
     }
 }
 
 fn constant_pattern_name(reference: hir::NameRef) -> string {
     match reference {
         hir::NameRef::Def(_) => "<constant>",
-        hir::NameRef::Other(name) => name,
+        hir::NameRef::Unresolved(name) => name,
         hir::NameRef::Local(local) => local_name(local),
+        hir::NameRef::ConstParam(name) => name,
+        hir::NameRef::Error => "<error>",
     }
 }
 
@@ -4977,7 +4996,7 @@ fn check_qualified_constant_pattern(ctx: Checker, head: hir::PatternHead, expect
 ] {
     match head {
         hir::PatternHead::Qualified { name, span } => find_constant_by_name(ctx, name).map(
-            |_| check_constant_pattern(ctx, hir::NameRef::Other(name), expected, span),
+            |_| check_constant_pattern(ctx, hir::NameRef::Unresolved(name), expected, span),
         ),
         _ => Option::None,
     }
@@ -5428,8 +5447,11 @@ fn check_stmt(ctx: Checker, value: hir::Stmt) -> Stmt {
             let previous_span = ctx.current_span.get();
             ctx.current_span.set(
                 match annotation {
-                    Some(Dyn { bounds: _ }) => Option::Some(source.span),
-                    _ => previous_span,
+                    Some(value) => match value.kind {
+                        Dyn { bounds: _ } => Option::Some(source.span),
+                        _ => value.span,
+                    },
+                    None => previous_span,
                 },
             );
             let annotation_result = match annotation {
@@ -5637,7 +5659,9 @@ fn hir_expr_contains_defer_control(value: hir::Expr) -> bool {
         Call { func, args } => {
             hir_expr_contains_defer_control(func) || hir_expr_list_contains_defer_control(args)
         },
-        Unary { op: _, expr } | Cast { expr, ty: _ } | Go { expr } | Field { expr, .. } => {
+        Unary { op: _, expr } | Cast { expr, ty: _ } | Go { expr } | Field { expr, .. } | WhileCondition {
+            expr,
+        } | ArrayRepeat { value: expr, len: _ } => {
             hir_expr_contains_defer_control(expr)
         },
         Binary { op: _, lhs, rhs } => {
@@ -5785,7 +5809,10 @@ fn hir_expr_always_exits_loop_control(value: hir::Expr) -> bool {
         Unary { op: _, expr: source } | Cast { expr: source, ty: _ } | Try {
             depth: _,
             expr: source,
-        } | Go { expr: source } | Field { expr: source, .. } => {
+        } | Go { expr: source } | Field { expr: source, .. } | WhileCondition { expr: source } | ArrayRepeat {
+            value: source,
+            len: _,
+        } => {
             hir_expr_always_exits_loop_control(source)
         },
         Binary { op, lhs: left, rhs: right } => {

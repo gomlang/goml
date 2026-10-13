@@ -281,8 +281,8 @@ fn report_unresolved_expr(ctx: Checker, value: hir::Expr, report_all: bool) -> (
                 }
             }
         },
-        ConstructorValue { constructor: _ } => (),
-        Constr { constructor: _, args } | Tuple { items: args } | Array { items: args } => {
+        ConstructorValue { .. } => (),
+        Constr { args, .. } | Tuple { items: args } | Array { items: args } => {
             report_unresolved_exprs(ctx, args, report_all)
         },
         InterpolatedString { parts } => for part in parts {
@@ -344,10 +344,12 @@ fn report_unresolved_expr(ctx: Checker, value: hir::Expr, report_all: bool) -> (
             report_unresolved_expr(ctx, func, report_all);
             report_unresolved_exprs(ctx, args, report_all)
         },
-        Unary { op: _, expr } | Cast { expr, ty: _ } | Try { depth: _, expr } | Proj {
-            tuple: expr,
-            index: _,
-        } | Field { expr, .. } | Go { expr } => report_unresolved_expr(ctx, expr, report_all),
+        ArrayRepeat { value: expr, .. } | WhileCondition { expr } | Unary { op: _, expr } | Cast {
+            expr,
+            ty: _,
+        } | Try { depth: _, expr } | Proj { tuple: expr, index: _ } | Field { expr, .. } | Go {
+            expr,
+        } => report_unresolved_expr(ctx, expr, report_all),
         Range { start, end, inclusive: _ } | Binary { op: _, lhs: start, rhs: end } | Index {
             base: start,
             index: end,
@@ -355,7 +357,7 @@ fn report_unresolved_expr(ctx: Checker, value: hir::Expr, report_all: bool) -> (
             report_unresolved_expr(ctx, start, report_all);
             report_unresolved_expr(ctx, end, report_all)
         },
-        Block { block } => report_unresolved_block(ctx, block, report_all),
+        Block { block } | Comptime { block } => report_unresolved_block(ctx, block, report_all),
         _ => (),
     }
 }
@@ -429,7 +431,11 @@ fn check_function_inner(
             }
         }
     }
-    let type_params = append_names(inherited_generics, value.generics);
+    let type_params = append_names(inherited_generics, hir::generic_names(value.generics));
+    let return_span = match value.ret_ty {
+        Some(ty) => ty.span,
+        None => Option::None,
+    };
     let opaque_return = opaque_function_return(base, value.def_id);
     let raw_ret_ty = match opaque_return {
         Some(value) => opaque_hidden(value).unwrap_or(Type::Error),
@@ -464,7 +470,7 @@ fn check_function_inner(
         comptime,
     );
     let previous_span = base.current_span.get();
-    base.current_span.set(value.ret_ty_span);
+    base.current_span.set(return_span);
     let ret_ty = if opaque_return.is_some() {
         raw_ret_ty
     } else {
@@ -482,19 +488,12 @@ fn check_function_inner(
         base.allow_unused_result || attribute_allows(value.attrs, "unused_result"),
         comptime,
     );
-    ctx.return_span = Option::Some(value.ret_ty_span.unwrap_or(value.name_span));
+    ctx.return_span = Option::Some(return_span.unwrap_or(value.name_span));
     let comptime_origin_start = base.typeck_results.exprs.len();
     let params: Vec[(string, Type)] = Vec::new();
     for param in value.params {
-        let index = params.len();
         let previous_span = ctx.current_span.get();
-        ctx.current_span.set(
-            if index < value.param_type_spans.len() {
-                Option::Some(value.param_type_spans[index])
-            } else {
-                Option::None
-            },
-        );
+        ctx.current_span.set(param.1.span);
         let ty = resolve_signature_type(
             ctx,
             type_from_hir(ctx.builtin, param.1, type_params, self_ty),
@@ -689,7 +688,7 @@ fn check_constant(base: Checker, value: hir::Constant) -> (
     Option[PendingConstant],
 ) {
     let previous_span = base.current_span.get();
-    base.current_span.set(Option::Some(value.ty_span));
+    base.current_span.set(value.ty.span);
     let ty = resolve_signature_type(
         base,
         type_from_hir(base.builtin, value.ty, Vec::new(), Option::None),
@@ -771,20 +770,10 @@ fn once_cell_type(builtin: BuiltinContract, value: Type) -> bool {
 
 fn hir_once_cell_initializer(builtin: BuiltinContract, value: hir::Expr) -> bool {
     match value.kind {
-        Call {
-            func: hir::Expr {
-                kind: StaticMember {
-                    owner,
-                    member,
-                    owner_type_args: _,
-                    owner_type_arg_spans: _,
-                    member_type_args: _,
-                    member_type_arg_spans: _,
-                },
-                span: _,
-            },
-            args,
-        } => names_match(owner, builtin.static_cell.name)
+        Call { func: hir::Expr { kind: StaticMember { owner, member, .. }, .. }, args } => names_match(
+            owner,
+            builtin.static_cell.name,
+        )
             && member == builtin.static_cell.constructor
             && args.is_empty(),
         _ => false,
@@ -794,7 +783,7 @@ fn hir_once_cell_initializer(builtin: BuiltinContract, value: hir::Expr) -> bool
 fn check_static(base: Checker, value: hir::Static) -> Static {
     let valid_initializer = hir_once_cell_initializer(base.builtin, value.value);
     let previous_span = base.current_span.get();
-    base.current_span.set(Option::Some(value.ty_span));
+    base.current_span.set(value.ty.span);
     let ty = resolve_signature_type(
         base,
         type_from_hir(base.builtin, value.ty, Vec::new(), Option::None),
@@ -1036,13 +1025,12 @@ fn trait_reference_has_wrong_arity(ctx: Checker, reference: TraitRef) -> bool {
 }
 
 fn hir_type_uses_self_projection(value: hir::TypeExpr) -> bool {
-    match value {
-        Projection { base: Con { name }, associated: _ } => {
-            name == "Self"
+    match value.kind {
+        Projection { base, .. } => match base.kind {
+            hir::TypeKind::SelfType => true,
+            _ => hir_type_uses_self_projection(base),
         },
-        Projection { base, associated: _ } | Array { len: _, elem: base } => hir_type_uses_self_projection(
-            base,
-        ),
+        Array { elem, .. } => hir_type_uses_self_projection(elem),
         Tuple { items } => {
             for item in items {
                 if hir_type_uses_self_projection(item) {
@@ -1056,8 +1044,10 @@ fn hir_type_uses_self_projection(value: hir::TypeExpr) -> bool {
                 true
             } else {
                 for arg in args {
-                    if hir_type_uses_self_projection(arg) {
-                        return true
+                    if let hir::GenericArg::Type(arg) = arg {
+                        if hir_type_uses_self_projection(arg) {
+                            return true
+                        }
                     }
                 }
                 false
@@ -1078,8 +1068,13 @@ fn hir_type_uses_self_projection(value: hir::TypeExpr) -> bool {
 fn check_impl(base: Checker, value: hir::ImplBlock) -> ImplBlock {
     let mut invalid = false;
     let previous_span = base.current_span.get();
-    base.current_span.set(Option::Some(value.for_type_span));
-    let raw_for_type = type_from_hir(base.builtin, value.for_type, value.generics, Option::None);
+    base.current_span.set(value.for_type.span);
+    let raw_for_type = type_from_hir(
+        base.builtin,
+        value.for_type,
+        hir::generic_names(value.generics),
+        Option::None,
+    );
     let wrong_arity = nominal_application_has_wrong_arity(base, raw_for_type);
     let for_type = resolve_signature_type(
         base,
@@ -1090,7 +1085,7 @@ fn check_impl(base: Checker, value: hir::ImplBlock) -> ImplBlock {
     base.current_span.set(previous_span);
     if wrong_arity {
         return ImplBlock {
-            generics: value.generics,
+            generics: hir::generic_names(value.generics),
             predicates: Vec::new(),
             trait_ref: Option::None,
             for_type,
@@ -1104,7 +1099,7 @@ fn check_impl(base: Checker, value: hir::ImplBlock) -> ImplBlock {
             base.builtin,
             value.generic_bounds,
             value.predicates,
-            value.generics,
+            hir::generic_names(value.generics),
             Option::Some(for_type),
         ),
         true,
@@ -1114,7 +1109,7 @@ fn check_impl(base: Checker, value: hir::ImplBlock) -> ImplBlock {
             let reference = trait_ref_from_hir(
                 base.builtin,
                 reference,
-                value.generics,
+                hir::generic_names(value.generics),
                 Option::Some(for_type),
             );
             match find_trait(base, reference.name) {
@@ -1130,15 +1125,21 @@ fn check_impl(base: Checker, value: hir::ImplBlock) -> ImplBlock {
         None => Option::None,
     };
     let validation_start = base.diagnostics.len();
-    validate_impl_type_params(base, value.generics, trait_ref, for_type, value.for_type_span);
+    validate_impl_type_params(
+        base,
+        hir::generic_names(value.generics),
+        trait_ref,
+        for_type,
+        value.for_type.span.unwrap_or(ast::span(0, 0)),
+    );
     if base.diagnostics.len() > validation_start {
         invalid = true;
     }
     if let Some(reference) = trait_ref {
         if trait_reference_has_wrong_arity(base, reference) {
-            mark_impl_invalid_at(base, value.for_type_span);
+            mark_impl_invalid_at(base, value.for_type.span.unwrap_or(ast::span(0, 0)));
             return ImplBlock {
-                generics: value.generics,
+                generics: hir::generic_names(value.generics),
                 predicates,
                 trait_ref,
                 for_type,
@@ -1170,7 +1171,7 @@ fn check_impl(base: Checker, value: hir::ImplBlock) -> ImplBlock {
                     type_from_hir(
                         base.builtin,
                         associated.1,
-                        value.generics,
+                        hir::generic_names(value.generics),
                         Option::Some(for_type),
                     ),
                     associated_predicates,
@@ -1181,7 +1182,7 @@ fn check_impl(base: Checker, value: hir::ImplBlock) -> ImplBlock {
     }
     if let Some(reference) = trait_ref {
         let validation_span = base.current_span.get();
-        base.current_span.set(Option::Some(value.for_type_span));
+        base.current_span.set(value.for_type.span);
         let validation_start = base.diagnostics.len();
         validate_trait_impl_definition_requirements(
             base,
@@ -1189,7 +1190,7 @@ fn check_impl(base: Checker, value: hir::ImplBlock) -> ImplBlock {
             for_type,
             associated_types,
             predicates,
-            value.generics,
+            hir::generic_names(value.generics),
         );
         if base.diagnostics.len() > validation_start {
             invalid = true;
@@ -1201,7 +1202,13 @@ fn check_impl(base: Checker, value: hir::ImplBlock) -> ImplBlock {
     method_base.allow_unused_result = attribute_allows(value.attrs, "unused_result");
     for method in value.methods {
         methods.push(
-            check_function(method_base, method, value.generics, predicates, Option::Some(for_type)),
+            check_function(
+                method_base,
+                method,
+                hir::generic_names(value.generics),
+                predicates,
+                Option::Some(for_type),
+            ),
         )
     }
     match trait_ref {
@@ -1213,7 +1220,7 @@ fn check_impl(base: Checker, value: hir::ImplBlock) -> ImplBlock {
                 for_type,
                 associated_types,
                 methods,
-                value.generics,
+                hir::generic_names(value.generics),
                 predicates,
             );
             if base.diagnostics.len() > validation_start {
@@ -1223,10 +1230,10 @@ fn check_impl(base: Checker, value: hir::ImplBlock) -> ImplBlock {
         None => validate_inherent_impl(base, for_type, methods),
     }
     if invalid {
-        mark_impl_invalid_at(base, value.for_type_span)
+        mark_impl_invalid_at(base, value.for_type.span.unwrap_or(ast::span(0, 0)))
     }
     ImplBlock {
-        generics: value.generics,
+        generics: hir::generic_names(value.generics),
         predicates,
         trait_ref,
         for_type,
@@ -2420,42 +2427,48 @@ fn validate_file_declaration_names(ctx: Checker, value: hir::File) -> () {
     for item in value.items {
         match item {
             EnumDef(definition) => {
-                validate_type_parameter_names(ctx, definition.generics);
+                validate_type_parameter_names(ctx, hir::generic_names(definition.generics));
                 validate_enum_variant_names(ctx, definition)
             },
             StructDef(definition) => {
-                validate_type_parameter_names(ctx, definition.generics);
+                validate_type_parameter_names(ctx, hir::generic_names(definition.generics));
                 validate_struct_field_names(ctx, definition)
             },
             TraitDef(definition) => {
-                validate_type_parameter_names(ctx, definition.generics);
+                validate_type_parameter_names(ctx, hir::generic_names(definition.generics));
                 validate_trait_member_names(ctx, definition);
                 for method in definition.method_sigs {
                     validate_type_parameter_names(
                         ctx,
-                        append_names(definition.generics, method.generics),
+                        append_names(
+                            hir::generic_names(definition.generics),
+                            hir::generic_names(method.generics),
+                        ),
                     )
                 }
             },
             ImplBlock(block) => {
-                validate_type_parameter_names(ctx, block.generics);
+                validate_type_parameter_names(ctx, hir::generic_names(block.generics));
                 for method in block.methods {
                     validate_type_parameter_names(
                         ctx,
-                        append_names(block.generics, method.generics),
+                        append_names(
+                            hir::generic_names(block.generics),
+                            hir::generic_names(method.generics),
+                        ),
                     );
                     validate_function_parameter_names(ctx, method)
                 }
             },
             Function(function) => {
-                validate_type_parameter_names(ctx, function.generics);
+                validate_type_parameter_names(ctx, hir::generic_names(function.generics));
                 validate_function_parameter_names(ctx, function)
             },
             ExternFunction(function) => {
-                validate_type_parameter_names(ctx, function.generics)
+                validate_type_parameter_names(ctx, hir::generic_names(function.generics))
             },
             ExternType(definition) => {
-                validate_type_parameter_names(ctx, definition.generics);
+                validate_type_parameter_names(ctx, hir::generic_names(definition.generics));
                 if find_type_alias(ctx, definition.name).is_none() {
                     push_diagnostic_at(
                         ctx,
@@ -2465,7 +2478,7 @@ fn validate_file_declaration_names(ctx: Checker, value: hir::File) -> () {
                 }
             },
             TypeAlias(alias) => {
-                validate_type_parameter_names(ctx, alias.generics)
+                validate_type_parameter_names(ctx, hir::generic_names(alias.generics))
             },
             Constant(_) => (),
             Static(_) => (),
@@ -2818,12 +2831,18 @@ fn order_extern_diagnostics(ctx: Checker) -> Vec[Diagnostic] {
     result
 }
 
-fn attach_diagnostic_span(ctx: Checker, message: string, span: Option[ast::Span]) -> () {
+struct TypeDiagnosticSpans {
+    checker: Checker,
+    attached: collections::BitSet,
+}
+
+fn attach_diagnostic_span(ctx: TypeDiagnosticSpans, message: string, span: Option[ast::Span]) -> () {
     if let Some(span) = span {
-        for index in 0..ctx.diagnostics.len() {
-            let value = ctx.diagnostics[index];
-            if value.message == message && value.source_path == ctx.source_path {
-                ctx.diagnostics.set(
+        for index in 0..ctx.checker.diagnostics.len() {
+            let value = ctx.checker.diagnostics[index];
+            if value.message == message && value.source_path == ctx.checker.source_path
+                && !ctx.attached.contains(index) {
+                ctx.checker.diagnostics.set(
                     index,
                     Diagnostic {
                         code: value.code,
@@ -2840,80 +2859,111 @@ fn attach_diagnostic_span(ctx: Checker, message: string, span: Option[ast::Span]
                         sort_order: value.sort_order,
                     },
                 );
+                let _ = ctx.attached.insert(index);
                 return
             }
         }
     }
 }
 
-fn attach_type_diagnostic_span(ctx: Checker, value: hir::TypeExpr, span: Option[ast::Span]) -> () {
-    match value {
-        Con { name } => match nominal_arity(ctx, name) {
-            Some(expected) => if expected != 0 {
-                attach_diagnostic_span(
-                    ctx,
-                    "Type " + short_name(name) + f" expects {expected} type arguments, but got 0",
-                    span,
-                )
-            },
-            None => attach_diagnostic_span(ctx, "Unknown type constructor " + name, span),
+fn attach_type_diagnostic_span(ctx: TypeDiagnosticSpans, value: hir::TypeExpr) -> () {
+    match value.kind {
+        Named { reference } => {
+            let name = hir::type_reference_name(reference);
+            match nominal_arity(ctx.checker, name) {
+                Some(expected) => if expected != 0 {
+                    attach_diagnostic_span(
+                        ctx,
+                        "Type " + short_name(name)
+                            + f" expects {expected} type arguments, but got 0",
+                        value.span,
+                    )
+                },
+                None => attach_diagnostic_span(ctx, "Unknown type constructor " + name, value.span),
+            }
         },
         App { ty, args } => {
-            match ty {
-                Con { name } => match nominal_arity(ctx, name) {
-                    Some(expected) => if expected != args.len() {
-                        let category = if expected == 0 && !args.is_empty() {
-                            match find_struct_by_name(ctx, name) {
-                                Some(_) => "Struct",
-                                None => "Type",
-                            }
-                        } else {
-                            "Type"
-                        };
-                        attach_diagnostic_span(
-                            ctx,
-                            category + " " + short_name(name)
-                                + f" expects {expected} type arguments, but got {args.len()}",
-                            span,
-                        )
-                    },
-                    None => attach_type_diagnostic_span(ctx, ty, span),
+            match ty.kind {
+                Named { reference } => {
+                    let name = hir::type_reference_name(reference);
+                    match nominal_arity(ctx.checker, name) {
+                        Some(expected) => if expected != args.len() {
+                            let category = if expected == 0 && !args.is_empty() {
+                                match find_struct_by_name(ctx.checker, name) {
+                                    Some(_) => "Struct",
+                                    None => "Type",
+                                }
+                            } else {
+                                "Type"
+                            };
+                            attach_diagnostic_span(
+                                ctx,
+                                category + " " + short_name(name)
+                                    + f" expects {expected} type arguments, but got {args.len()}",
+                                value.span,
+                            )
+                        },
+                        None => attach_type_diagnostic_span(ctx, ty),
+                    }
                 },
-                _ => attach_type_diagnostic_span(ctx, ty, span),
+                _ => attach_type_diagnostic_span(ctx, ty),
             }
-            for arg in args {
-                attach_type_diagnostic_span(ctx, arg, span)
+            attach_generic_arg_diagnostic_spans(ctx, args)
+        },
+        Tuple { items } => for item in items {
+            attach_type_diagnostic_span(ctx, item)
+        },
+        Array { elem, .. } | Projection { base: elem, .. } => attach_type_diagnostic_span(ctx, elem),
+        Func { params, ret_ty } => {
+            for param in params {
+                attach_type_diagnostic_span(ctx, param)
+            }
+            attach_type_diagnostic_span(ctx, ret_ty)
+        },
+        Dyn { bounds } => for bound in bounds {
+            attach_generic_arg_diagnostic_spans(ctx, bound.args);
+            for associated in bound.associated_types {
+                attach_type_diagnostic_span(ctx, associated.1)
             }
         },
         _ => (),
     }
 }
 
-fn attach_trait_ref_diagnostic_spans(ctx: Checker, value: hir::TraitRef) -> () {
-    for index in 0..value.args.len() {
-        attach_type_diagnostic_span(
-            ctx,
-            value.args[index],
-            if index < value.arg_spans.len() {
-                value.arg_spans[index]
-            } else {
-                Option::None
-            },
-        )
+fn attach_generic_arg_diagnostic_spans(ctx: TypeDiagnosticSpans, values: Vec[hir::GenericArg]) -> () {
+    for value in values {
+        match value {
+            hir::GenericArg::Type(ty) => attach_type_diagnostic_span(ctx, ty),
+            hir::GenericArg::Unresolved { name, span } => attach_type_diagnostic_span(
+                ctx,
+                hir::TypeExpr {
+                    kind: hir::TypeKind::Named { reference: hir::TypeReference::Unresolved(name) },
+                    span,
+                },
+            ),
+            hir::GenericArg::Const(_) => (),
+        }
     }
 }
 
-fn attach_expr_list_diagnostic_spans(ctx: Checker, values: Vec[hir::Expr]) -> () {
+fn attach_trait_ref_diagnostic_spans(ctx: TypeDiagnosticSpans, value: hir::TraitRef) -> () {
+    attach_generic_arg_diagnostic_spans(ctx, value.args)
+}
+
+fn attach_expr_list_diagnostic_spans(ctx: TypeDiagnosticSpans, values: Vec[hir::Expr]) -> () {
     for value in values {
         attach_expr_diagnostic_spans(ctx, value)
     }
 }
 
-fn attach_block_diagnostic_spans(ctx: Checker, value: hir::Block) -> () {
+fn attach_block_diagnostic_spans(ctx: TypeDiagnosticSpans, value: hir::Block) -> () {
     for stmt in value.stmts {
         match stmt {
             Defer { expr } => attach_expr_diagnostic_spans(ctx, expr),
-            Let { is_mut: _, pat: _, annotation: _, value, else_branch } => {
+            Let { annotation, value, else_branch, .. } => {
+                if let Some(ty) = annotation {
+                    attach_type_diagnostic_span(ctx, ty)
+                }
                 attach_expr_diagnostic_spans(ctx, value);
                 if let Some(value) = else_branch {
                     attach_expr_diagnostic_spans(ctx, value)
@@ -2931,41 +2981,14 @@ fn attach_block_diagnostic_spans(ctx: Checker, value: hir::Block) -> () {
     }
 }
 
-fn attach_expr_diagnostic_spans(ctx: Checker, value: hir::Expr) -> () {
+fn attach_expr_diagnostic_spans(ctx: TypeDiagnosticSpans, value: hir::Expr) -> () {
     match value.kind {
-        StaticMember {
-            owner: _,
-            member: _,
-            owner_type_args,
-            owner_type_arg_spans,
-            member_type_args,
-            member_type_arg_spans,
-        } => {
-            for index in 0..owner_type_args.len() {
-                attach_type_diagnostic_span(
-                    ctx,
-                    owner_type_args[index],
-                    if index < owner_type_arg_spans.len() {
-                        owner_type_arg_spans[index]
-                    } else {
-                        Option::None
-                    },
-                )
-            }
-            for index in 0..member_type_args.len() {
-                attach_type_diagnostic_span(
-                    ctx,
-                    member_type_args[index],
-                    if index < member_type_arg_spans.len() {
-                        member_type_arg_spans[index]
-                    } else {
-                        Option::None
-                    },
-                )
-            }
+        StaticMember { owner_type_args, member_type_args, .. } => {
+            attach_generic_arg_diagnostic_spans(ctx, owner_type_args);
+            attach_generic_arg_diagnostic_spans(ctx, member_type_args)
         },
-        ConstructorValue { constructor: _ } => (),
-        Constr { constructor: _, args } | Tuple { items: args } | Array { items: args } => {
+        ConstructorValue { .. } => (),
+        Constr { args, .. } | Tuple { items: args } | Array { items: args } => {
             attach_expr_list_diagnostic_spans(ctx, args)
         },
         InterpolatedString { parts } => for part in parts {
@@ -2984,10 +3007,25 @@ fn attach_expr_diagnostic_spans(ctx: Checker, value: hir::Expr) -> () {
                 attach_expr_diagnostic_spans(ctx, value)
             }
         },
-        Closure { params: _, body } | Unary { op: _, expr: body } | Cast { expr: body, ty: _ } | Try {
-            depth: _,
+        Closure { params, body } => {
+            for param in params {
+                if let Some(ty) = param.ty {
+                    attach_type_diagnostic_span(ctx, ty)
+                }
+            }
+            attach_expr_diagnostic_spans(ctx, body)
+        },
+        Cast { expr, ty } => {
+            attach_expr_diagnostic_spans(ctx, expr);
+            attach_type_diagnostic_span(ctx, ty)
+        },
+        Field { expr, method_type_args, .. } => {
+            attach_expr_diagnostic_spans(ctx, expr);
+            attach_generic_arg_diagnostic_spans(ctx, method_type_args)
+        },
+        Unary { op: _, expr: body } | Try { depth: _, expr: body } | Proj { tuple: body, index: _ } | Go {
             expr: body,
-        } | Proj { tuple: body, index: _ } | Field { expr: body, .. } | Go { expr: body } => {
+        } | WhileCondition { expr: body } | ArrayRepeat { value: body, .. } => {
             attach_expr_diagnostic_spans(ctx, body)
         },
         Match { expr, arms } => {
@@ -2997,6 +3035,26 @@ fn attach_expr_diagnostic_spans(ctx: Checker, value: hir::Expr) -> () {
                     attach_expr_diagnostic_spans(ctx, guard)
                 }
                 attach_expr_diagnostic_spans(ctx, arm.body)
+            }
+        },
+        Select { arms, .. } => for arm in arms {
+            match arm {
+                Receive { channel, guard, body, .. } => {
+                    attach_expr_diagnostic_spans(ctx, channel);
+                    if let Some(guard) = guard {
+                        attach_expr_diagnostic_spans(ctx, guard)
+                    }
+                    attach_expr_diagnostic_spans(ctx, body)
+                },
+                Send { channel, value, guard, body } => {
+                    attach_expr_diagnostic_spans(ctx, channel);
+                    attach_expr_diagnostic_spans(ctx, value);
+                    if let Some(guard) = guard {
+                        attach_expr_diagnostic_spans(ctx, guard)
+                    }
+                    attach_expr_diagnostic_spans(ctx, body)
+                },
+                Default { body } => attach_expr_diagnostic_spans(ctx, body),
             }
         },
         If { cond, then_branch, else_branch } => {
@@ -3030,56 +3088,33 @@ fn attach_expr_diagnostic_spans(ctx: Checker, value: hir::Expr) -> () {
             attach_expr_diagnostic_spans(ctx, start);
             attach_expr_diagnostic_spans(ctx, end)
         },
-        Block { block } => attach_block_diagnostic_spans(ctx, block),
+        Block { block } | Comptime { block } => attach_block_diagnostic_spans(ctx, block),
         _ => (),
     }
 }
 
 fn attach_file_diagnostic_spans(ctx: Checker, value: hir::File) -> () {
+    let ctx = TypeDiagnosticSpans { checker: ctx, attached: collections::BitSet::new() };
     for item in value.items {
         match item {
             EnumDef(value) => for variant in value.variants {
                 match variant.fields {
                     Unit => (),
                     Tuple(types) => {
-                        for index in 0..types.len() {
-                            attach_type_diagnostic_span(
-                                ctx,
-                                types[index],
-                                if index < variant.field_type_spans.len() {
-                                    Option::Some(variant.field_type_spans[index])
-                                } else {
-                                    Option::None
-                                },
-                            )
+                        for ty in types {
+                            attach_type_diagnostic_span(ctx, ty)
                         }
                     },
                     Struct(values) => {
-                        for index in 0..values.len() {
-                            attach_type_diagnostic_span(
-                                ctx,
-                                values[index].1,
-                                if index < variant.field_type_spans.len() {
-                                    Option::Some(variant.field_type_spans[index])
-                                } else {
-                                    Option::None
-                                },
-                            )
+                        for field in values {
+                            attach_type_diagnostic_span(ctx, field.1)
                         }
                     },
                 }
             },
             StructDef(value) => if value.generics.is_empty() {
-                for index in 0..value.fields.len() {
-                    attach_type_diagnostic_span(
-                        ctx,
-                        value.fields[index].1,
-                        if index < value.field_type_spans.len() {
-                            Option::Some(value.field_type_spans[index])
-                        } else {
-                            Option::None
-                        },
-                    )
+                for field in value.fields {
+                    attach_type_diagnostic_span(ctx, field.1)
                 }
             },
             TraitDef(value) => {
@@ -3089,10 +3124,16 @@ fn attach_file_diagnostic_spans(ctx: Checker, value: hir::File) -> () {
                     }
                 }
                 for method in value.method_sigs {
-                    attach_type_diagnostic_span(ctx, method.ret_ty, method.ret_ty_span)
+                    attach_type_diagnostic_span(ctx, method.ret_ty)
                 }
             },
             Function(value) => {
+                for param in value.params {
+                    attach_type_diagnostic_span(ctx, param.1)
+                }
+                if let Some(ret_ty) = value.ret_ty {
+                    attach_type_diagnostic_span(ctx, ret_ty)
+                }
                 for bound in value.generic_bounds {
                     for reference in bound.1 {
                         attach_trait_ref_diagnostic_spans(ctx, reference)
@@ -3224,10 +3265,15 @@ fn check_file_with_package_inferred(
     for item in value.items {
         if let TypeAlias(alias) = item {
             let previous = ctx.current_span.get();
-            ctx.current_span.set(Option::Some(alias.ty_span));
+            ctx.current_span.set(alias.ty.span);
             let _ = resolve_signature_type(
                 ctx,
-                type_from_hir(ctx.builtin, alias.ty, alias.generics, Option::None),
+                type_from_hir(
+                    ctx.builtin,
+                    alias.ty,
+                    hir::generic_names(alias.generics),
+                    Option::None,
+                ),
                 Vec::new(),
                 true,
             );

@@ -1,0 +1,395 @@
+package hir;
+
+use module::ast;
+
+struct VerifyContext {
+    definitions: HashMap[string, DefId],
+    enums: HashMap[string, EnumDef],
+    diagnostics: Vec[Diagnostic],
+}
+
+struct VerifyScope {
+    bindings: HashMap[string, LocalId],
+    parent: Option[VerifyScope],
+}
+
+fn verify_root_scope() -> VerifyScope {
+    VerifyScope { bindings: HashMap::new(), parent: Option::None }
+}
+
+fn verify_child_scope(parent: VerifyScope) -> VerifyScope {
+    VerifyScope { bindings: HashMap::new(), parent: Option::Some(parent) }
+}
+
+fn verify_local_key(value: LocalId) -> string {
+    value.pkg.len().to_string() + ":" + value.pkg + ":" + value.index.to_string()
+}
+
+fn verify_bind_local(scope: VerifyScope, local: LocalId) -> () {
+    scope.bindings[verify_local_key(local)] = local;
+}
+
+fn verify_has_local(scope: VerifyScope, local: LocalId) -> bool {
+    let mut current = scope;
+    loop {
+        if let Some(bound) = current.bindings[verify_local_key(local)] {
+            return same_local(bound, local)
+        }
+        match current.parent {
+            Some(parent) => {
+                current = parent;
+            },
+            None => return false,
+        }
+    }
+}
+
+fn verify_error(ctx: VerifyContext, message: string, span: ast::Span) -> () {
+    ctx.diagnostics.push(
+        Diagnostic { message: "Invalid HIR: " + message, span: Option::Some(span) },
+    );
+}
+
+fn verify_definition(ctx: VerifyContext, definition: DefId, span: ast::Span) -> () {
+    let valid = match ctx.definitions[definition_key(definition)] {
+        Some(bound) => same_definition(bound, definition),
+        None => false,
+    };
+    if !valid {
+        verify_error(ctx, "unknown definition " + definition_key(definition), span)
+    }
+}
+
+fn verify_name(ctx: VerifyContext, scope: VerifyScope, reference: NameRef, span: ast::Span) -> () {
+    match reference {
+        Local(local) => if !verify_has_local(scope, local) {
+            verify_error(
+                ctx,
+                "local " + local.hint + "/" + local.index.to_string() + " is not in scope",
+                span,
+            )
+        },
+        Def(definition) => verify_definition(ctx, definition, span),
+        Unresolved(_) | ConstParam(_) | Error => (),
+    }
+}
+
+fn verify_variant(ctx: VerifyContext, definition: DefId, index: isize, span: ast::Span) -> () {
+    match ctx.enums[definition_key(definition)] {
+        Some(value) => if !same_definition(value.def_id, definition) || index < 0
+            || index >= value.variants.len() {
+            verify_error(ctx, "invalid enum variant index " + index.to_string(), span)
+        },
+        None => verify_error(ctx, "unknown enum definition " + definition_key(definition), span),
+    }
+}
+
+fn verify_constructor(ctx: VerifyContext, constructor: ConstructorRef, span: ast::Span) -> () {
+    match constructor {
+        Resolved { enum_def, variant_index } => verify_variant(ctx, enum_def, variant_index, span),
+        Unresolved(_) => (),
+    }
+}
+
+fn verify_pattern_head(ctx: VerifyContext, head: PatternHead) -> () {
+    match head {
+        Resolved { enum_def, variant_index, span } => verify_variant(
+            ctx,
+            enum_def,
+            variant_index,
+            span,
+        ),
+        Qualified { .. } | Contextual { .. } => (),
+    }
+}
+
+fn verify_pattern_binding(bindings: Vec[LocalId], value: LocalId) -> () {
+    for binding in bindings {
+        if same_local(binding, value) {
+            return
+        }
+    }
+    bindings.push(value);
+}
+
+fn verify_same_pattern_bindings(left: Vec[LocalId], right: Vec[LocalId]) -> bool {
+    if left.len() != right.len() {
+        return false
+    }
+    for binding in left {
+        let mut found = false;
+        for other in right {
+            if same_local(binding, other) {
+                found = true;
+                break
+            }
+        }
+        if !found {
+            return false
+        }
+    }
+    true
+}
+
+fn verify_pattern(ctx: VerifyContext, scope: VerifyScope, value: Pat, bindings: Vec[LocalId]) -> () {
+    match value.kind {
+        Var { name, .. } => verify_pattern_binding(bindings, name),
+        Constant { reference } => verify_name(ctx, scope, reference, value.span),
+        Constr { head, args } => {
+            verify_pattern_head(ctx, head);
+            for arg in args {
+                verify_pattern(ctx, scope, arg, bindings)
+            }
+        },
+        Struct { head, fields, .. } => {
+            verify_pattern_head(ctx, head);
+            for field in fields {
+                verify_pattern(ctx, scope, field.1, bindings)
+            }
+        },
+        Tuple { items } => for item in items {
+            verify_pattern(ctx, scope, item, bindings)
+        },
+        Array { prefix, rest, suffix } => {
+            for item in prefix {
+                verify_pattern(ctx, scope, item, bindings)
+            }
+            if let Some(rest) = rest {
+                if let Some(binding) = rest.binding {
+                    verify_pattern_binding(bindings, binding)
+                }
+            }
+            for item in suffix {
+                verify_pattern(ctx, scope, item, bindings)
+            }
+        },
+        Alias { name, pat } => {
+            verify_pattern_binding(bindings, name);
+            verify_pattern(ctx, scope, pat, bindings)
+        },
+        Or { pats } => {
+            let mut expected: Option[Vec[LocalId]] = Option::None;
+            for pat in pats {
+                let alternative: Vec[LocalId] = Vec::new();
+                verify_pattern(ctx, scope, pat, alternative);
+                match expected {
+                    Some(first) => if !verify_same_pattern_bindings(first, alternative) {
+                        verify_error(
+                            ctx,
+                            "or-pattern alternatives have different local bindings",
+                            pat.span,
+                        )
+                    },
+                    None => {
+                        for binding in alternative {
+                            verify_pattern_binding(bindings, binding)
+                        }
+                        expected = Option::Some(alternative);
+                    },
+                }
+            }
+        },
+        Range { start, end, .. } => {
+            verify_pattern(ctx, scope, start, bindings);
+            verify_pattern(ctx, scope, end, bindings)
+        },
+        Unit | Bool { .. } | Int { .. } | Float { .. } | String { .. } | Char { .. } | Byte { .. } | Wild => (),
+    }
+}
+
+fn verify_bind_pattern(ctx: VerifyContext, scope: VerifyScope, pattern: Pat) -> () {
+    let bindings: Vec[LocalId] = Vec::new();
+    verify_pattern(ctx, scope, pattern, bindings);
+    for binding in bindings {
+        verify_bind_local(scope, binding)
+    }
+}
+
+fn verify_optional_expr(ctx: VerifyContext, scope: VerifyScope, value: Option[Expr]) -> () {
+    if let Some(value) = value {
+        verify_expr(ctx, scope, value)
+    }
+}
+
+fn verify_block(ctx: VerifyContext, parent: VerifyScope, block: Block) -> () {
+    let scope = verify_child_scope(parent);
+    for stmt in block.stmts {
+        match stmt {
+            Let { pat, value, else_branch, .. } => {
+                verify_expr(ctx, scope, value);
+                verify_optional_expr(ctx, scope, else_branch);
+                verify_bind_pattern(ctx, scope, pat)
+            },
+            Assign { target, value, .. } => {
+                verify_expr(ctx, scope, target);
+                verify_expr(ctx, scope, value)
+            },
+            Defer { expr } | Expr { expr, .. } => verify_expr(ctx, scope, expr),
+        }
+    }
+    verify_optional_expr(ctx, scope, block.tail)
+}
+
+fn verify_expr(ctx: VerifyContext, scope: VerifyScope, value: Expr) -> () {
+    match value.kind {
+        NameRef { name_ref } => verify_name(ctx, scope, name_ref, value.span),
+        ConstructorValue { constructor, .. } => verify_constructor(ctx, constructor, value.span),
+        Constr { constructor, args, .. } => {
+            verify_constructor(ctx, constructor, value.span);
+            for arg in args {
+                verify_expr(ctx, scope, arg)
+            }
+        },
+        InterpolatedString { parts } => for part in parts {
+            if let InterpolatedStringPart::Expr(expr) = part {
+                verify_expr(ctx, scope, expr)
+            }
+        },
+        StructLiteral { fields, base, .. } => {
+            for field in fields {
+                verify_expr(ctx, scope, field.1)
+            }
+            verify_optional_expr(ctx, scope, base)
+        },
+        Tuple { items } | Array { items } => for item in items {
+            verify_expr(ctx, scope, item)
+        },
+        ArrayRepeat { value, .. } => verify_expr(ctx, scope, value),
+        Closure { params, body } => {
+            let closure_scope = verify_child_scope(scope);
+            for param in params {
+                verify_bind_local(closure_scope, param.name)
+            }
+            verify_expr(ctx, closure_scope, body)
+        },
+        Match { expr, arms } => {
+            verify_expr(ctx, scope, expr);
+            for arm in arms {
+                let arm_scope = verify_child_scope(scope);
+                verify_bind_pattern(ctx, arm_scope, arm.pat);
+                verify_optional_expr(ctx, arm_scope, arm.guard);
+                verify_expr(ctx, arm_scope, arm.body)
+            }
+        },
+        Select { arms, .. } => for arm in arms {
+            match arm {
+                Receive { channel, guard, binding, body } => {
+                    verify_expr(ctx, scope, channel);
+                    verify_optional_expr(ctx, scope, guard);
+                    let arm_scope = verify_child_scope(scope);
+                    verify_bind_local(arm_scope, binding);
+                    verify_expr(ctx, arm_scope, body)
+                },
+                Send { channel, value, guard, body } => {
+                    verify_expr(ctx, scope, channel);
+                    verify_expr(ctx, scope, value);
+                    verify_optional_expr(ctx, scope, guard);
+                    verify_expr(ctx, scope, body)
+                },
+                Default { body } => verify_expr(ctx, scope, body),
+            }
+        },
+        If { cond, then_branch, else_branch } => {
+            verify_expr(ctx, scope, cond);
+            verify_expr(ctx, scope, then_branch);
+            verify_expr(ctx, scope, else_branch)
+        },
+        While { cond, body, .. } => {
+            verify_expr(ctx, scope, cond);
+            verify_expr(ctx, scope, body)
+        },
+        Loop { body, .. } => verify_expr(ctx, scope, body),
+        For { pat, iterator, body, .. } => {
+            verify_expr(ctx, scope, iterator);
+            let body_scope = verify_child_scope(scope);
+            verify_bind_pattern(ctx, body_scope, pat);
+            verify_expr(ctx, body_scope, body)
+        },
+        Break { value, .. } => verify_optional_expr(ctx, scope, value),
+        Return { expr } => verify_optional_expr(ctx, scope, expr),
+        Call { func, args } => {
+            verify_expr(ctx, scope, func);
+            for arg in args {
+                verify_expr(ctx, scope, arg)
+            }
+        },
+        Go { expr } | Unary { expr, .. } | Cast { expr, .. } | Try { expr, .. } | Field { expr, .. } | WhileCondition {
+            expr,
+        } => verify_expr(ctx, scope, expr),
+        Range { start, end, .. } => {
+            verify_expr(ctx, scope, start);
+            verify_expr(ctx, scope, end)
+        },
+        Binary { lhs, rhs, .. } => {
+            verify_expr(ctx, scope, lhs);
+            verify_expr(ctx, scope, rhs)
+        },
+        Proj { tuple, .. } => verify_expr(ctx, scope, tuple),
+        Index { base, index } => {
+            verify_expr(ctx, scope, base);
+            verify_expr(ctx, scope, index)
+        },
+        Comptime { block } | Block { block } => verify_block(ctx, scope, block),
+        StaticMember { .. } | Unit | Bool { .. } | Int { .. } | Float { .. } | String { .. } | Char {
+            ..,
+        } | Byte { .. } | ByteString { .. } | Continue { .. } | Error => (),
+    }
+}
+
+fn verify_function(ctx: VerifyContext, value: Function) -> () {
+    let scope = verify_root_scope();
+    for param in value.params {
+        verify_bind_local(scope, param.0)
+    }
+    verify_block(ctx, scope, value.body)
+}
+
+fn verify_collect_definitions(ctx: VerifyContext, file: File) -> () {
+    for item in file.items {
+        let definition = match item {
+            EnumDef(value) => {
+                ctx.enums[definition_key(value.def_id)] = value;
+                value.def_id
+            },
+            StructDef(value) => value.def_id,
+            TraitDef(value) => value.def_id,
+            ImplBlock(value) => {
+                for method in value.methods {
+                    ctx.definitions[definition_key(method.def_id)] = method.def_id;
+                }
+                value.def_id
+            },
+            Function(value) => value.def_id,
+            ExternFunction(value) => value.def_id,
+            ExternType(value) => value.def_id,
+            TypeAlias(value) => value.def_id,
+            Constant(value) => value.def_id,
+            Static(value) => value.def_id,
+        };
+        ctx.definitions[definition_key(definition)] = definition;
+    }
+}
+
+pub fn verify_file(file: File, package_files: Vec[File]) -> Vec[Diagnostic] {
+    let ctx = VerifyContext {
+        definitions: HashMap::new(),
+        enums: HashMap::new(),
+        diagnostics: Vec::new(),
+    };
+    for package_file in package_files {
+        verify_collect_definitions(ctx, package_file)
+    }
+    verify_collect_definitions(ctx, file);
+    for item in file.items {
+        match item {
+            Function(value) => verify_function(ctx, value),
+            ImplBlock(value) => for method in value.methods {
+                verify_function(ctx, method)
+            },
+            Constant(value) => verify_expr(ctx, verify_root_scope(), value.value),
+            Static(value) => verify_expr(ctx, verify_root_scope(), value.value),
+            EnumDef(_) | StructDef(_) | TraitDef(_) | ExternFunction(_) | ExternType(_) | TypeAlias(_) => (),
+        }
+    }
+    ctx.diagnostics
+}

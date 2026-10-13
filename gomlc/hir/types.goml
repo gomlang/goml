@@ -1,0 +1,276 @@
+package hir;
+
+use module::ast;
+use module::consts;
+use module::imports;
+
+pub fn type_reference_name(value: TypeReference) -> string {
+    match value {
+        Definition { name, .. } => name,
+        Unresolved(name) => name,
+    }
+}
+
+pub fn generic_names(values: Vec[GenericParam]) -> Vec[string] {
+    let result: Vec[string] = Vec::new();
+    for value in values {
+        result.push(
+            match value {
+                Type { name } => name,
+                Const { name } => consts::parameter(name),
+            },
+        )
+    }
+    result
+}
+
+pub fn generic_arg_span(value: GenericArg) -> Option[ast::Span] {
+    match value {
+        Type(value) => value.span,
+        Const(value) => value.span,
+        Unresolved { span, .. } => span,
+    }
+}
+
+fn lower_generics(values: Vec[string]) -> Vec[GenericParam] {
+    let result: Vec[GenericParam] = Vec::new();
+    for name in values {
+        result.push(
+            match consts::parameter_name(name) {
+                Some(name) => GenericParam::Const { name },
+                None => GenericParam::Type { name },
+            },
+        )
+    }
+    result
+}
+
+fn lower_named_reference(ctx: LowerCtx, path: ast::Path) -> TypeReference {
+    let parts = qualified_segments(ctx, path);
+    let name = if parts.len() == 1 && ctx.package_env.traits.contains(parts[0]) {
+        full_name(ctx.package_env.name, parts[0])
+    } else {
+        imports::join_segments(parts)
+    };
+    let local_name = if !name.contains("::") {
+        full_name(ctx.package_env.name, name)
+    } else {
+        name
+    };
+    match find_definition(ctx, local_name) {
+        Some(definition) => TypeReference::Definition { definition, name: local_name },
+        None => TypeReference::Unresolved(name),
+    }
+}
+
+fn lower_type(ctx: LowerCtx, value: ast::TypeExpr, params: Vec[string]) -> TypeExpr {
+    lower_type_at(ctx, value, params, Option::None)
+}
+
+fn lower_type_at(
+    ctx: LowerCtx,
+    value: ast::TypeExpr,
+    params: Vec[string],
+    fallback: Option[ast::Span],
+) -> TypeExpr {
+    let span = match ast_type_head_span(value) {
+        Some(span) if span.end > span.start => Option::Some(span),
+        _ => fallback,
+    };
+    TypeExpr { kind: lower_type_kind(ctx, value, params, span), span }
+}
+
+fn lower_generic_arg(
+    ctx: LowerCtx,
+    value: ast::TypeExpr,
+    params: Vec[string],
+    fallback: Option[ast::Span],
+) -> GenericArg {
+    let span = match ast_type_head_span(value) {
+        Some(span) if span.end > span.start => Option::Some(span),
+        _ => fallback,
+    };
+    if let ast::TypeExpr::Con { path } = value {
+        if !path.segments.is_empty() {
+            let name = path.segments[0].ident;
+            if params.contains(name) || name == "Self" {
+                return GenericArg::Type(lower_type_at(ctx, value, params, span))
+            }
+        }
+        if path.segments.len() == 1 {
+            let name = path.segments[0].ident;
+            if name.starts_with("$const_expr:") {
+                return GenericArg::Const(
+                    lower_const_source(
+                        ctx,
+                        name.byte_slice(12, name.byte_len()),
+                        params,
+                        Vec::new(),
+                        span,
+                    ),
+                )
+            }
+            if params.contains(consts::parameter(name)) {
+                return GenericArg::Const(ConstExpr { kind: ConstKind::Param(name), span })
+            }
+        }
+        let reference = lower_named_reference(ctx, path);
+        let name = type_reference_name(reference);
+        for entry in ctx.package_env.constant_expressions {
+            if entry.name == name || entry.name == full_name(ctx.package_env.name, name) {
+                return GenericArg::Const(lower_const_source(ctx, name, params, Vec::new(), span))
+            }
+        }
+        if let TypeReference::Unresolved(name) = reference {
+            if name != "byte" && name != "never" {
+                return GenericArg::Unresolved { name, span }
+            }
+        }
+    }
+    GenericArg::Type(lower_type_at(ctx, value, params, span))
+}
+
+fn lower_generic_args(
+    ctx: LowerCtx,
+    values: Vec[ast::TypeExpr],
+    params: Vec[string],
+    span: Option[ast::Span],
+) -> Vec[GenericArg] {
+    let result: Vec[GenericArg] = Vec::new();
+    for value in values {
+        result.push(lower_generic_arg(ctx, value, params, span))
+    }
+    result
+}
+
+fn lower_type_kind(
+    ctx: LowerCtx,
+    value: ast::TypeExpr,
+    params: Vec[string],
+    span: Option[ast::Span],
+) -> TypeKind {
+    match value {
+        Unit => TypeKind::Unit,
+        Bool => TypeKind::Bool,
+        Int => TypeKind::Int,
+        Int8 => TypeKind::Int8,
+        Int16 => TypeKind::Int16,
+        Int32 => TypeKind::Int32,
+        Int64 => TypeKind::Int64,
+        Uint => TypeKind::Uint,
+        Uint8 => TypeKind::Uint8,
+        Uint16 => TypeKind::Uint16,
+        Uint32 => TypeKind::Uint32,
+        Uint64 => TypeKind::Uint64,
+        Float32 => TypeKind::Float32,
+        Float64 => TypeKind::Float64,
+        String => TypeKind::String,
+        Char => TypeKind::Char,
+        Tuple { items } => {
+            let result: Vec[TypeExpr] = Vec::new();
+            for item in items {
+                result.push(lower_type_at(ctx, item, params, span))
+            }
+            TypeKind::Tuple { items: result }
+        },
+        Con { path } => {
+            let parts = type_path_segments(ctx, path, params);
+            if !parts.is_empty() && (parts[0] == "Self" || params.contains(parts[0])) {
+                let base = TypeExpr {
+                    kind: if parts[0] == "Self" {
+                        TypeKind::SelfType
+                    } else {
+                        TypeKind::Param { name: parts[0] }
+                    },
+                    span,
+                };
+                let result = Ref::new(base);
+                for index in 1..parts.len() {
+                    result.set(
+                        TypeExpr {
+                            kind: TypeKind::Projection {
+                                base: result.get(),
+                                associated: parts[index],
+                            },
+                            span,
+                        },
+                    )
+                }
+                return result.get().kind
+            }
+            if parts.len() == 1
+                && (parts[0].starts_with("$const_expr:")
+                    || params.contains(consts::parameter(parts[0]))) {
+                let message = if params.contains(consts::parameter(parts[0])) {
+                    "const parameter cannot be used as a value type"
+                } else {
+                    "integer constant cannot be used as a value type"
+                };
+                ctx.diagnostics.push(Diagnostic { message, span });
+                return TypeKind::Error
+            }
+            TypeKind::Named { reference: lower_named_reference(ctx, path) }
+        },
+        Dyn { bounds } => {
+            let result: Vec[DynTraitBound] = Vec::new();
+            for bound in bounds {
+                let associated_types: Vec[(string, TypeExpr)] = Vec::new();
+                for binding in bound.associated_types {
+                    associated_types.push((binding.0, lower_type_at(ctx, binding.1, params, span)))
+                }
+                result.push(
+                    DynTraitBound {
+                        reference: lower_named_reference(ctx, bound.trait_path),
+                        args: lower_generic_args(ctx, bound.args, params, span),
+                        associated_types,
+                    },
+                )
+            }
+            TypeKind::Dyn { bounds: result }
+        },
+        App { ty, args } => TypeKind::App {
+            ty: lower_type_at(ctx, ty, params, span),
+            args: lower_generic_args(ctx, args, params, span),
+        },
+        Array { len, elem } => {
+            let length = lower_const_source(ctx, len, params, Vec::new(), span);
+            if let ConstKind::Value(value) = length.kind {
+                if value < 0 {
+                    ctx.diagnostics.push(
+                        Diagnostic { message: "array length must be nonnegative", span },
+                    );
+                    return TypeKind::Error
+                }
+            }
+            TypeKind::Array { len: length, elem: lower_type_at(ctx, elem, params, span) }
+        },
+        Func { params: arguments, ret_ty } => {
+            let result: Vec[TypeExpr] = Vec::new();
+            for argument in arguments {
+                result.push(lower_type_at(ctx, argument, params, span))
+            }
+            TypeKind::Func { params: result, ret_ty: lower_type_at(ctx, ret_ty, params, span) }
+        },
+    }
+}
+
+fn lower_trait_ref(ctx: LowerCtx, value: ast::TraitRef, params: Vec[string]) -> TraitRef {
+    let span = if value.path.segments.is_empty() {
+        Option::None
+    } else {
+        Option::Some(pattern_head_span(value.path))
+    };
+    TraitRef {
+        reference: lower_named_reference(ctx, value.path),
+        args: lower_generic_args(ctx, value.args, params, span),
+        span,
+    }
+}
+
+fn span_at(values: Vec[ast::Span], index: isize) -> Option[ast::Span] {
+    if index < values.len() {
+        Option::Some(values[index])
+    } else {
+        Option::None
+    }
+}

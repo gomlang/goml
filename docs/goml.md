@@ -621,6 +621,19 @@ const NEWLINE: byte = b'\n';
 
 Constant names may start with an uppercase letter, a lowercase letter, or `_`; `UPPER_SNAKE_CASE` is the preferred convention. Constant expressions support literals, constructors, references to other constants, unary and binary operators, integer conversion methods, and comptime-capable calls. They may use forward references, but cycles are rejected. Allowed constant types are recursively immutable values: `bool`, numeric types, `string`, `char`, `byte`, tuples, fixed arrays, and structs or enums whose fields satisfy the same rule. `Vec`, `HashMap`, `Ref`, `Channel`, closures, and dynamic values are rejected. Composite constants cannot be used as patterns. Public constants are available through package-qualified paths.
 
+Names in a constant initializer resolve where the constant is declared, using that file's imports and the enclosing declaration's generic parameters. Referencing the constant from another file or generic function does not reinterpret its initializer in the caller's scope. In particular, a top-level constant cannot capture a generic parameter of a function that uses it:
+
+```goml
+const SIZE: usize = 2;
+const WIDTH: usize = SIZE;
+
+fn first[const SIZE: usize](values: [isize; WIDTH]) -> isize {
+    values[0]
+}
+```
+
+`first::[3]([10, 20])` accepts a two-element array because `WIDTH` remains `2`.
+
 Visible top-level constants can be used as value patterns in `match`, `if let`, `while let`, and `let else`. Both local names and package-qualified names are supported, and constant patterns can be nested or combined with or-patterns:
 
 ```goml
@@ -737,6 +750,8 @@ fn make_point(x: i32, y: i32) -> Point {
 }
 ```
 
+Named-field literals do not accept turbofish arguments. Supply a type annotation when field values do not provide the intended generic type, for example `let value: Box[bool] = Box { value: true };`. This also applies to structure updates.
+
 Field access uses dot notation:
 
 ```goml
@@ -791,6 +806,19 @@ Tuple variant constructors are also available as first-class function values:
 ```goml
 let some: (i32) -> Option[i32] = Option::Some;
 ```
+
+Explicit generic arguments belong to the enum owner and appear before the variant name. They constrain the payload and result type for both direct construction and constructor function values:
+
+```goml
+let value = Message::[i32]::Value(42);
+let quit = Message::[string]::Quit;
+let make = Message::[bool]::Value;
+let ready = make(true);
+```
+
+For an enum with const parameters, the same list includes its const arguments, such as `Storage::[i32, 2]::Values([1, 2])`. Supplied arguments must match the enum's parameter count and kinds. A variant has no independent generic parameter list, and explicit arguments must agree with any expected type and payload types.
+
+Struct-like variants use an expected type instead of turbofish arguments: write `let value: Message[bool] = Message::Named { value: true };`. `Message::[bool]::Named { value: true }` is rejected.
 
 An expected enum type also permits an unqualified constructor in an expression:
 
@@ -913,6 +941,8 @@ let number = identity::[i32](1);
 let text = identity::[string]("text");
 ```
 
+An explicit generic argument list must contain at least one argument. Omit the whole list to use inference; `identity::[](1)` is rejected.
+
 Don't write `identity[i32](1)` or Rust's `identity::<i32>(1)`. Generic arguments for an owner type or trait appear before the member name, while arguments owned by a method appear after it:
 
 ```goml
@@ -923,6 +953,8 @@ let trait_call = Convert::[i32]::convert::[string](value, fallback);
 ```
 
 Top-level functions and methods may introduce their own type parameters. A method's parameters are distinct from the parameters of its enclosing trait or impl and may have their own bounds and `where` predicates. Local named functions do not exist; use closures. Closures do not have generics. Structures, enumerations, traits, and impl blocks can also have type parameters.
+
+An in-scope generic type parameter takes precedence over an unqualified package type or imported name. For example, in a package that also defines `struct T`, the parameter and return types of `fn identity[T](value: T) -> T { value }` refer to the generic parameter. A qualified path continues to refer to the package item.
 
 A free function may use a type parameter only in its body, with no occurrence in its parameter or result types. Supply such arguments explicitly, for example `schema::[User]()`, including when taking a function value. Those arguments are retained across package interfaces and specialization; an unused generic definition does not generate an unspecialized executable body.
 
@@ -1004,6 +1036,20 @@ let name = "second";
 ```
 
 Local variables allow shadowing with the same name. `let _ = expr;` executes explicitly and discards the result.
+
+Each block has a lexical binding scope, including ordinary expression blocks, `comptime` blocks, and task `scope` blocks. A binding is visible after its initializer through the end of its block, including nested blocks and closures. Leaving a block restores any outer binding with the same name; newly introduced names are unavailable outside that block. Assignment to an existing outer mutable binding still changes that binding:
+
+```goml
+let value = 1;
+let inner = {
+    let value = 2;
+    value
+};
+println(inner);
+println(value);
+```
+
+This prints `2` and then `1`.
 
 The left side of `let` can be an irrefutable pattern:
 
@@ -6959,6 +7005,11 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | Put test-only helpers in production dependencies | Use root `[dev-dependencies]`; tests and `examples/<name>/` can import them |
 | Create a separate consumer manifest for every example | Use `goml run --example <name>` and `goml test`; examples share the module-root manifest |
 | `fn helper` inside function | Top-level function or local closure |
+| Use a local binding after leaving its block | Return the value from the block and bind its result outside |
+| `Message::Value::[i32](42)` | Enum arguments belong to the owner: `Message::[i32]::Value(42)` |
+| `identity::[](1)` | Omit the empty turbofish and write `identity(1)` |
+| `Message::[bool]::Named { value: true }` | Use `let value: Message[bool] = Message::Named { value: true };` |
+| Expect a function's const parameter to change a top-level constant initializer | Constants retain the bindings from their declaration site |
 | Go external type | `#[go_type("pkg", "Name")] extern type Name[T];` retains Go identity and validates concrete instances across packages and artifacts; `std::ffi::Ptr[T]` and Go pointer aliases preserve nullable pointer values, with explicit `ffi::null()` and `ffi::is_nil`; method bindings use `#[go_method("Method")]`; public fields and keyed struct construction use ordinary syntax, and symbolic function/alias instances are checked after specialization |
 | Go interface adapter | `#[go_interface(RawType, Wrapper, method = "GoMethod")]` generates a checked native-interface wrapper and trait implementation; `from_trait` explicitly creates a typed Go bridge retaining the supplied dyn object; nil/typed-nil and multiple results are preserved |
 | Go binding generator | `goml bind-go <CONFIG>` selects explicit package/symbol allowlists and finite Go-checked generic arguments; emits raw bindings with protected deterministic output |
@@ -7186,7 +7237,7 @@ assignment_operator = "=" | "+=" | "-=" | "*=" | "/=" | "%="
                     | "&=" | "|=" | "^=" | "<<=" | ">>="
 
 expression    = literal | raw_string | byte_string | raw_byte_string
-              | interpolated_string | path | tuple | array | block
+              | interpolated_string | expression_path | tuple | array | block
               | struct_literal | closure
               | call | field | index | unary | binary | cast | range_expression
               | try_expression
@@ -7197,6 +7248,8 @@ expression    = literal | raw_string | byte_string | raw_byte_string
               | "break" loop_label? expression?
               | "continue" loop_label?
               | "go" expression
+
+expression_path = path ("::" type_args)? ("::" ident ("::" type_args)?)?
 
 interpolated_string = "f\"" (string_text | "{{" | "}}" | "{" expression "}")* "\""
 byte_string   = "b\"" byte_string_content* "\""
@@ -7265,6 +7318,8 @@ The expression-statement grammar also permits a built-in `Result` value, but dis
 The parser will do some error recovery for commas and semicolons, but the code agent should always generate the above canonical form: list items separated by commas, `let`, assignments and ordinary non-tail expressions with semicolons, unlabeled control-flow statements without unnecessary semicolons, labeled loop statements with semicolons before following statements, and trait method signatures with semicolons. The sequence pattern contains at most one rest; the `..` in the structure pattern appears at most once and must be at the end.
 
 In a condition chain containing `let`, `boolean_term` and `initializer_term` are expressions without top-level `&&` or `||`; grouping parentheses permit a boolean disjunction inside one term. `opaque_return` is restricted to complete top-level function and inherent method returns, even though trait signatures share the abbreviated `return_type` rule above. An unqualified enum variant uses the ordinary `path`, call, or struct-literal grammar and is resolved using its expected type.
+
+In an enum `expression_path`, generic arguments apply to the owner before the variant name, as in `Message::[i32]::Value`; variants cannot take a second list. The `block` rule introduces a lexical binding scope, while names in constant initializers and generic type parameters follow their declaration scopes rather than their eventual use sites.
 
 ## Verify generated code
 
