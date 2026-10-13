@@ -127,14 +127,14 @@ func main0() struct{} {
     var t7 bool = t6 == ANSWER
     var inline20 string = _goml_m_trait__impl_i_ToString_i_bool_i_to__string(t7)
     _goml_runtime_core_string_println(inline20)
-    var shadowed__0 int = 12
+    var shadowed__0 int = 11
     var inline18 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(shadowed__0)
     _goml_runtime_core_string_println(inline18)
     var t8 int
     var inline14 int = 3
     var inline15 int = inline14 + 1
     var inline16 int = inline15 * 2
-    var inline17 int = inline15 + inline16
+    var inline17 int = inline14 + inline16
     t8 = inline17
     var t9 bool = t8 == shadowed__0
     var inline12 string = _goml_m_trait__impl_i_ToString_i_bool_i_to__string(t9)
