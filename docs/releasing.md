@@ -20,7 +20,7 @@ During the early bootstrap period, releases are limited to continuous `0.1.x` pa
 
 ## Publish
 
-Run from the repository root with the development prerequisites in the [README](../README.md#development), plus an authenticated GitHub CLI (`gh`) for release operations. Replace `X.Y.Z` with the next continuous version after the latest published release:
+Run from the repository root with the prerequisites in the [development guide](development.md), plus an authenticated GitHub CLI (`gh`) for release operations. Replace `X.Y.Z` with the next continuous version after the latest published release:
 
 ```sh
 release_version=X.Y.Z

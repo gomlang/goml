@@ -26,7 +26,7 @@ public-suffix datasets remain ecosystem concerns. General URL and IP values
 carry no HTTP client policy. Lexical slash paths remain separate from host
 filepath operations.
 
-Public APIs and limitations are documented in the [language guide](goml.md) and
+Public APIs and limitations are documented in the [standard library reference](stdlib.md) and
 individual ecosystem READMEs. The ownership table is not a claim of Go API
 compatibility. Go source comment tooling belongs to `go_doc`, independently of
 GoML documentation and the independent [gomlgo frontend](https://github.com/gomlang/gomlgo).
@@ -62,6 +62,6 @@ need source catalog, dependency, navigation and packaging coverage. Compiler and
 driver sources may adopt new APIs only after release and stage0 advancement;
 see [repository guidelines](../AGENTS.md#bootstrap-and-language-evolution).
 
-Use [repository checks](../README.md#development) for standard-library changes
+Use [repository checks](development.md) for standard-library changes
 and the sibling ecosystem verification repository for its modules. Follow the
 [release guide](releasing.md) for publication.

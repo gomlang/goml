@@ -2,7 +2,7 @@
 
 `goml` is the self-hosted project driver. It provides project creation, package discovery, check/build/run/test plans, named examples, dependency resolution, registry cache management, incremental artifact fingerprints, native linking, and parallel test execution.
 
-See [repository development](../README.md#development) for requirements,
+See [repository development](../docs/development.md) for requirements,
 toolchain builds and repository checks.
 
 Starting at the repository root, enter the driver module to use stage2 directly:

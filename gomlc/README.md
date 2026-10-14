@@ -6,7 +6,7 @@
 lexer → parser → CST → AST → HIR → TAST → Core → Mono → Lift → ANF → Go
 ```
 
-See [repository development](../README.md#development) for requirements,
+See [repository development](../docs/development.md) for requirements,
 toolchain layout, builds and bootstrap verification.
 
 Run a single source or inspect an IR stage:
