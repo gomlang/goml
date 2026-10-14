@@ -800,8 +800,7 @@ Finite division scales extreme magnitudes to reduce avoidable overflow.
 Logarithm, square root and inverse functions use principal branches with
 signed-zero branch cuts. `try_div` reports a zero denominator instead of
 returning an IEEE infinity; extreme transcendental inputs may overflow through
-scalar `exp`. These operations reuse the existing scalar math boundary and add
-no native complex backend.
+scalar `exp`. These operations reuse the scalar GoML math functions.
 
 ```goml
 use std::math::complex;
