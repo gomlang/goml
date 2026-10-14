@@ -1,47 +1,29 @@
 package tast;
 
 use module::ffi;
-use std::json;
 use std::testing;
-
-fn ffi_test_scheme(ret_ty: Type) -> FunctionScheme {
-    FunctionScheme {
-        def_id: Option::None,
-        name: "demo::calc::value",
-        comptime: ComptimeCapability::RuntimeOnly,
-        generics: Vec::new(),
-        predicates: Vec::new(),
-        params: Vec::from_array([Type::Char]),
-        ret_ty,
-        callable: Callable::GoForeign {
-            binding: "",
-            import_path: "example.com/host/shim",
-            symbol: "Value",
-        },
-    }
-}
 
 #[test]
 fn foreign_bridge_preserves_tuple_and_char_representation() -> () {
-    let scheme = ffi_test_scheme(Type::Tuple { items: Vec::from_array([Type::Int64, Type::Bool]) });
-    match foreign_binding("demo::calc::value", scheme, Vec::new()) {
-        Ok(Some(binding)) => {
-            testing::assert_eq(binding.binding_id, "demo::calc::value");
-            testing::assert_eq(binding.parameters.len(), 1);
-            testing::assert_eq(binding.results.len(), 2);
-            let shape = ffi::bridge_type_json(binding.parameters[0]);
-            testing::assert_eq(
-                json::as_string(json::field(shape, "tag").unwrap_or(json::Value::Null)).unwrap_or(
-                    "",
-                ),
-                "int32",
-            )
-        },
-        _ => testing::fail("failed to collect foreign binding"),
+    let signature = Type::Func {
+        params: Vec::from_array([Type::Char]),
+        ret_ty: Type::Tuple { items: Vec::from_array([Type::Int64, Type::Bool]) },
+    };
+    let expected = ffi::BridgeType::Function {
+        parameters: Vec::from_array([ffi::BridgeType::Scalar("int32")]),
+        results: Vec::from_array(
+            [ffi::BridgeType::Scalar("int64"), ffi::BridgeType::Scalar("bool")],
+        ),
+    };
+    match foreign_function_bridge(signature, Vec::new()) {
+        Ok(actual) => testing::assert(ffi::bridge_types_equal(actual, expected)),
+        Err(error) => testing::fail(error),
     }
-    match foreign_binding("unit", ffi_test_scheme(Type::Unit), Vec::new()) {
-        Ok(Some(binding)) => testing::assert_eq(binding.results.len(), 0),
-        _ => testing::fail("failed to collect zero-result binding"),
+    let unit_signature = Type::Func { params: Vec::new(), ret_ty: Type::Unit };
+    let expected_unit = ffi::BridgeType::Function { parameters: Vec::new(), results: Vec::new() };
+    match foreign_function_bridge(unit_signature, Vec::new()) {
+        Ok(actual) => testing::assert(ffi::bridge_types_equal(actual, expected_unit)),
+        Err(error) => testing::fail(error),
     }
 }
 
@@ -64,7 +46,9 @@ fn foreign_bridge_rejects_unsupported_nested_values() -> () {
             [Type::Int, Type::Tuple { items: Vec::from_array([Type::Bool, Type::Int]) }],
         ),
     };
-    testing::assert(foreign_binding("nested", ffi_test_scheme(nested), Vec::new()).is_err())
+    testing::assert(
+        foreign_function_bridge(Type::Func { params: Vec::new(), ret_ty: nested }, Vec::new()).is_err(),
+    )
 }
 
 #[test]
@@ -88,7 +72,6 @@ fn foreign_marker_requires_complete_empty_trait_contract() -> () {
     testing::assert(foreign_bridge_type(ty, traits, true).is_ok());
     testing::assert(foreign_bridge_type(ty, traits, false).is_err());
     testing::assert(foreign_bridge_type(Type::Slice { elem: ty }, traits, true).is_err());
-    testing::assert(foreign_binding("marker", ffi_test_scheme(ty), traits).is_ok());
     let qualified = TraitInfo {
         name: "demo::calc::Marker",
         generics: Vec::new(),
@@ -98,7 +81,16 @@ fn foreign_marker_requires_complete_empty_trait_contract() -> () {
         methods: Vec::new(),
     };
     testing::assert(
-        foreign_binding("local", ffi_test_scheme(ty), Vec::from_array([qualified])).is_ok(),
+        foreign_bridge_type(
+            Type::Dyn {
+                trait_name: "demo::calc::Marker",
+                args: Vec::new(),
+                associated_types: Vec::new(),
+                additional_bounds: Vec::new(),
+            },
+            Vec::from_array([qualified]),
+            true,
+        ).is_ok(),
     );
     testing::assert(foreign_bridge_type(ty, Vec::from_array([qualified]), true).is_err());
     marker.methods.push(
@@ -117,19 +109,85 @@ fn foreign_marker_requires_complete_empty_trait_contract() -> () {
 }
 
 #[test]
-fn foreign_metadata_cannot_enable_comptime_execution() -> () {
-    let value = ffi_test_scheme(Type::Bool);
-    let invalid = FunctionScheme {
-        def_id: value.def_id,
-        name: value.name,
-        comptime: ComptimeCapability::Capable,
-        generics: value.generics,
-        predicates: value.predicates,
-        params: value.params,
-        ret_ty: value.ret_ty,
-        callable: value.callable,
-    };
-    testing::assert(foreign_binding("invalid", invalid, Vec::new()).is_err())
+fn foreign_declarations_remain_runtime_only_and_monomorphic() -> () {
+    for attribute in Vec::from_array(
+        ["#[go_ffi(\"example.com/host\", \"Value\")]", "#[go_method(\"Value\")]"],
+    ) {
+        let declaration = attribute + " extern fn value(receiver: i64) -> bool; ";
+        testing::assert(checked_diagnostics(declaration).is_empty());
+        let runtime_call = checked_diagnostics(
+            declaration + "#[comptime] fn execute() -> bool { value(1) }",
+        );
+        testing::assert(
+            has_diagnostic_containing(
+                runtime_call,
+                "comptime only supports direct #[comptime] function calls",
+            ),
+        );
+        let invalid_attribute = checked_diagnostics("#[comptime] " + declaration);
+        testing::assert(
+            has_diagnostic_containing(
+                invalid_attribute,
+                "#[comptime] is only valid on free function declarations",
+            ),
+        );
+        let generic = checked_diagnostics(attribute + " extern fn value[T](receiver: i64) -> bool;");
+        testing::assert(has_diagnostic_containing(generic, "generic"));
+        let constrained = checked_diagnostics(
+            "trait Bound {} " + attribute
+                + " extern fn value(receiver: i64) -> bool where i64: Bound;",
+        );
+        testing::assert(has_diagnostic_containing(constrained, "generic"));
+    }
+    let missing_receiver = checked_diagnostics("#[go_method(\"Value\")] extern fn value() -> bool;");
+    testing::assert(has_diagnostic_containing(missing_receiver, "requires a receiver"));
+}
+
+#[test]
+fn foreign_source_signatures_check_marker_and_tuple_boundaries_for_functions_and_methods() -> () {
+    for attribute in Vec::from_array(
+        ["#[go_ffi(\"example.com/host\", \"Value\")]", "#[go_method(\"Value\")]"],
+    ) {
+        let declarations = "trait Marker {} " + attribute;
+        for signature in Vec::from_array(
+            [
+                " extern fn value(receiver: dyn Marker) -> dyn Marker;",
+                " extern fn value(receiver: char) -> (i64, bool);",
+                " extern fn value(receiver: char) -> ();",
+            ],
+        ) {
+            let diagnostics = checked_diagnostics(declarations + signature);
+            for diagnostic in diagnostics {
+                testing::fail(diagnostic.message)
+            }
+        }
+        for signature in Vec::from_array(
+            [
+                " extern fn value(receiver: i64) -> (i64, (bool, i64));",
+                " extern fn value(receiver: (i64, bool)) -> ();",
+                " extern fn value(receiver: i64) -> (dyn Marker, bool);",
+                " extern fn value(receiver: Slice[dyn Marker]) -> ();",
+            ],
+        ) {
+            testing::assert(
+                has_diagnostic_containing(
+                    checked_diagnostics(declarations + signature),
+                    "unsupported",
+                ),
+            );
+        }
+    }
+    let checked = check_external_source(
+        Vec::from_array(
+            [
+                "package api; trait Marker {} #[go_ffi(\"example.com/host\", \"Value\")] extern fn value(receiver: dyn Marker) -> dyn Marker;",
+            ],
+        ),
+    );
+    match checked {
+        Ok(result) => testing::assert(result.diagnostics.is_empty()),
+        Err(error) => testing::fail(error),
+    }
 }
 
 #[test]
