@@ -10,7 +10,7 @@ Read the documentation relevant to the change:
 - [Standard library](docs/stdlib.md): public standard-library APIs, examples, and limitations.
 - [Formatting](docs/formatting.md): formatter behavior and CLI.
 - [Releases](docs/releasing.md): publishing, toolchain installation, and stage0 advancement.
-- [Compile-time evaluation](docs/comptime.md), [Go FFI](docs/ffi/bind-go.md), and [FFI protocol](docs/ffi/protocol-v1.md): specialized workflows and the Go metadata boundary.
+- [Compile-time evaluation](docs/comptime.md) and [Go FFI](docs/ffi/bind-go.md): specialized workflows and explicit foreign declarations.
 - [gomlgo](https://github.com/gomlang/gomlgo): independent Go frontend, interpreter, compatibility target, and differential tests.
 - [VS Code extension](editors/vscode/README.md): editor setup, behavior, and configuration.
 
@@ -22,7 +22,7 @@ Read the documentation relevant to the change:
 | `lib/prelude/` | Independent package defining the automatically scoped public API |
 | `lib/std/` | Standard-library packages loaded through explicit imports |
 | `bootstrap/` | Bootstrap scripts and checksum-pinned released stage0 metadata |
-| `tools/` | Build, library packaging, release, and Go metadata tooling |
+| `tools/` | Build, library packaging, release, and source-data generation |
 | `editors/vscode/` | VS Code extension |
 | `gomlc/testdata/` | Compiler regression fixtures and generated golden files |
 
@@ -37,7 +37,7 @@ Run recipes from the repository root; [.justfile](.justfile) is the command refe
 | Command | Purpose |
 | --- | --- |
 | `just make` | Incrementally build stage2 from pinned stage0 |
-| `just test` / `just all` | Build and run compiler, driver, standard-library, and Go metadata tests |
+| `just test` / `just all` | Build and run compiler, driver, and standard-library tests |
 | `just test-stdlib` | Build stage2 and run native standard-library package tests |
 | `just ci` | Full CI, including bootstrap fixed point and packaging |
 | `just bootstrap` | Clean bootstrap and fixed-point verification |
@@ -62,7 +62,7 @@ Run recipes from the repository root; [.justfile](.justfile) is the command refe
 - The frontend pipeline is `lexer → parser → CST → AST → HIR → TAST → Core → Mono → Lift → ANF → Go`.
 - `gomlc/hir/` owns AST-to-HIR lowering and name resolution. `gomlc/tast/` owns inference, checking, constraints, and type-directed decisions, including contextual enum-pattern resolution.
 - Ambiguity, missing lookups, invalid caches, and dependency failures must produce recoverable diagnostics. Environment and lookup code must return failure values instead of terminating the compiler.
-- `lib/builtin/` alone owns compiler runtime externs and language items. Keep this contract distinct from ordinary user Go FFI; see the language guide and FFI docs for supported bindings.
+- `lib/builtin/` alone owns compiler runtime externs and language items. Keep this contract distinct from ordinary user Go FFI; standard-library algorithms use GoML and compiler-owned runtime hooks. User FFI trusts explicit signatures and leaves native validation to the final Go build; external Go types are opaque. See the language guide and FFI docs for supported bindings.
 - Reuse `gomlc/query/` for LSP features. Preserve file-scoped imports, canonical package identities, dependency navigation, and existing document-analysis caching.
 - ANF join points are local continuations reached in tail position through `Jump`; recursive joins represent loops. Preserve lexical scope and jump arguments. Consult [ANF definitions](gomlc/anf/model.goml), [verification](gomlc/anf/verify.goml), and [Go lowering](gomlc/go_backend/lower.goml) when changing control flow.
 - Go lowering emits structured control flow without `goto`; labeled loop breaks/continues are supported. Preserve continuation merging, recursive-loop handling, and the post-emission [Go DCE pass](gomlc/go_backend/dce.goml).

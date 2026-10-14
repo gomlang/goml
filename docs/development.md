@@ -1,6 +1,6 @@
 # Developing GoML
 
-Run recipes from the repository root. The toolchain build requires Linux amd64, Go 1.26+, `just`, Bash, curl, tar, and sha256sum. Tests require a C compiler for Go's race detector; full CI also uses Node 20+, npm, jq, Python 3, Clang 15+ for C binding smoke tests, Perl's `shasum` for checksum portability tests, and Linux development headers for checking the generated syscall ABI and record layouts. See [.justfile](../.justfile) for all commands. The independent [gomlgo frontend and interpreter](https://github.com/gomlang/gomlgo) targets Go 1.26 and requires Go 1.26.x for execution and differential tests.
+Run recipes from the repository root. The toolchain build requires Linux amd64, Go 1.26+, `just`, Bash, curl, tar, and sha256sum. Tests require a C compiler for Go's race detector; full CI also uses Node 20+, npm, jq, Python 3, Perl's `shasum` for checksum portability tests, and Linux development headers for checking the generated syscall ABI and record layouts. See [.justfile](../.justfile) for all commands. The independent [gomlgo frontend and interpreter](https://github.com/gomlang/gomlgo) targets Go 1.26 and requires Go 1.26.x for execution and differential tests.
 
 ```sh
 just make
@@ -9,7 +9,7 @@ just ci
 just clean
 ```
 
-`just make` incrementally builds stage2 directly from the pinned stage0. `just test` builds the tools and runs compiler, driver, standard-library, and Go metadata tests; `just all` is an alias for it. `just ci` performs a clean stage2 build, fixed-point verification, tests, extension compilation, and release archive smoke checks. Standard-library behavior tests live beside their implementations in `lib/std/<package>/tests`; run them with `just test-stdlib`.
+`just make` incrementally builds stage2 directly from the pinned stage0. `just test` builds the tools and runs compiler, driver, and standard-library tests; `just all` is an alias for it. `just ci` performs a clean stage2 build, fixed-point verification, tests, extension compilation, and release archive smoke checks. Standard-library behavior tests live beside their implementations in `lib/std/<package>/tests`; run them with `just test-stdlib`.
 
 Local CI runs its check groups concurrently. Set `GOML_CI_SEQUENTIAL=1` to run them sequentially, `GOML_BUILD_JOBS` to limit bootstrap package workers, and `GOML_TEST_JOBS` to override compiler and driver test concurrency. Compiler fixtures may use Yaegi when it is available on `PATH`; they fall back to native Go compilation when it is unavailable or cannot run a fixture.
 
@@ -25,6 +25,6 @@ The root `goml.work` groups `gomlc` and `goml`. The driver owns manifest parsing
 
 Explore [gomlc/testdata/pipeline](../gomlc/testdata/pipeline) for source programs and every compiler-stage golden file. Use `just verify-golden` to check the corpus or `just update-golden` to regenerate it through the self-hosted compiler.
 
-Basic FFI integration fixtures live under [goml/testdata/ffi](../goml/testdata/ffi) and are shared by driver regression tests and release smoke checks. Full SQLite and LLVM integrations are maintained in [gomlang/sqlite](https://github.com/gomlang/sqlite) and [gomlang/llvm](https://github.com/gomlang/llvm).
+Direct Go FFI integration fixtures live under [goml/testdata/ffi](../goml/testdata/ffi) and are shared by driver regression tests and release smoke checks. Full SQLite and LLVM integrations are maintained in [gomlang/sqlite](https://github.com/gomlang/sqlite) and [gomlang/llvm](https://github.com/gomlang/llvm).
 
 See the [compiler](../gomlc/README.md) and [project driver](../goml/README.md) documentation for component-specific commands and architecture.

@@ -4,7 +4,7 @@ Releases use strict `vX.Y.Z` tags and publish Linux amd64 and macOS arm64 binari
 
 The Go compatibility baseline is Go 1.26. Build and validate releases with Go 1.26.x; users need Go 1.26 or newer to compile generated programs and validate Go FFI. The archives do not bundle a Go toolchain.
 
-The root [VERSION](../VERSION) file is authoritative. `goml`, `gomlc`, `gomlfmt`, `gomldoc`, `gomllsp`, and the VS Code extension must use the same version. The metadata helper `goml-go-meta` and C binding helper `goml-c-bind` are packaged alongside them. C binding generation and verification additionally require Clang. The cgo backend also needs a C compiler. The dynamic backend uses the bundled runtime with `CGO_ENABLED=0` and currently requires Linux amd64, glibc 2.34+ and Go 1.26.x.
+The root [VERSION](../VERSION) file is authoritative. `goml`, `gomlc`, `gomlfmt`, `gomldoc`, `gomllsp`, and the VS Code extension must use the same version. Official archives contain these five executables and the builtin, prelude and standard-library resources.
 
 ## Version policy
 
@@ -45,9 +45,9 @@ just ci
 
 The block stops before tagging if the push fails, the CI run is not registered yet, or CI fails. If the run is not yet visible, wait for it to appear and rerun the block.
 
-Main CI builds stage2 directly from the pinned Linux amd64 stage0. Its Linux checks cover compiler and driver tests, Go metadata and scripts, extension compilation and VSIX packaging, archive smoke tests, and the stage3 fixed point. Fixed-point verification compares the compiler and driver artifacts built by stage2 with a rebuild using stage3. A macOS 15 arm64 job builds and tests its release archive using the generated Go sources exported by the Linux build. It receives no Linux executables or compiler world. Both platforms must pass the final `test` job. The independent [gomlgo project](https://github.com/gomlang/gomlgo) owns its separate test suite.
+Main CI builds stage2 directly from the pinned Linux amd64 stage0. Its Linux checks cover compiler, driver, standard-library and script tests, extension compilation and VSIX packaging, archive smoke tests, and the stage3 fixed point. Fixed-point verification compares the compiler and driver artifacts built by stage2 with a rebuild using stage3. A macOS 15 arm64 job builds and tests its release archive using the generated Go sources exported by the Linux build. It receives no Linux executables or compiler world. Both platforms must pass the final `test` job. The independent [gomlgo project](https://github.com/gomlang/gomlgo) owns its separate test suite.
 
-The Release workflow requires successful main CI for the exact tagged commit and verifies the version, previous release, and stage0. It rebuilds stage2 on Linux, exports the five generated Go entry points, then builds all seven tools natively in parallel on Ubuntu amd64 and macOS arm64. Each job verifies binary target metadata, packages resources, and runs archive relocation, finalization, project commands, formatting, documentation, LSP, Go FFI, Go export, and cgo C binding smoke tests. macOS also checks rejection of Linux syscalls and dynamic C bindings. Release CI does not repeat the complete Linux suite or fixed-point verification.
+The Release workflow requires successful main CI for the exact tagged commit and verifies the version, previous release, and stage0. It rebuilds stage2 on Linux, exports the five generated Go entry points, then builds all five tools natively in parallel on Ubuntu amd64 and macOS arm64. Each job verifies binary target metadata, packages resources, and runs archive relocation, finalization, project commands, formatting, documentation, LSP, direct Go FFI and Go export smoke tests. macOS also checks rejection of Linux syscalls. Release CI does not repeat the complete Linux suite or fixed-point verification.
 
 Each platform uploads its archive and an archive-specific `.sha256` file. The publish job waits for both platforms, checks both digests, generates one `SHA256SUMS` containing exactly the two archives, and uploads them to a draft release before publishing. Only this job has release write permission. Published releases are not overwritten.
 
@@ -59,7 +59,7 @@ bash tools/release/smoke.sh "$(cat VERSION)" linux amd64
 bash tools/release/sources.sh _artifact/release-sources.tar.gz
 ```
 
-Transfer the source archive to a checkout of the same commit on macOS arm64, with Go 1.26.x, Bash, tar, jq, Clang and a C compiler available, then run:
+Transfer the source archive to a checkout of the same commit on macOS arm64, with Go 1.26.x, Bash, tar, jq and a C compiler available, then run:
 
 ```sh
 tar -xzf release-sources.tar.gz
@@ -93,9 +93,9 @@ export PATH="$prefix/bin:$PATH"
 goml version
 ```
 
-Linux users select `linux-amd64` and may use `sha256sum -c archive.sha256`. Keep `bin` and `lib` together when relocating an installation. Go 1.26 or newer must be on `PATH` to build programs; Clang and a C compiler are additionally required for cgo C bindings.
+Linux users select `linux-amd64` and may use `sha256sum -c archive.sha256`. Keep `bin` and `lib` together when relocating an installation. Go 1.26 or newer must be on `PATH` to build programs. User-supplied cgo adapters additionally require a C compiler.
 
-macOS supports the compiler, driver, formatter, documentation generator, LSP, Go FFI and cgo C bindings. `std::os::linux`, the current Linux syscall-backed socket operations in `std::net` and dependent networking APIs, and the dynamic C ABI backend remain Linux amd64-specific. SIMD uses its scalar implementation on arm64. The macOS release does not change the Linux stage0 trust root or enable native macOS source bootstrap.
+macOS supports the compiler, driver, formatter, documentation generator, LSP, Go FFI and user-supplied cgo adapters. `std::os::linux`, the current Linux syscall-backed socket operations in `std::net` and dependent networking APIs remain Linux amd64-specific. SIMD uses its scalar implementation on arm64. The macOS release does not change the Linux stage0 trust root or enable native macOS source bootstrap.
 
 Release archives use a complete toolchain prefix:
 
@@ -106,15 +106,10 @@ goml-X.Y.Z-<os>-<arch>/
 │   ├── gomlc
 │   ├── gomlfmt
 │   ├── gomldoc
-│   ├── goml-go-meta
-│   ├── goml-c-bind
 │   └── gomllsp
 └── lib/
     ├── builtin/
     │   ├── goml.toml
-    │   └── ...
-    ├── cabi/
-    │   ├── go.mod
     │   └── ...
     ├── prelude/
     │   ├── goml.toml
@@ -125,8 +120,6 @@ goml-X.Y.Z-<os>-<arch>/
 ```
 
 The compiler resolves `lib` relative to its executable. The archive must preserve this layout exactly. `builtin`, `prelude`, and `std` are separate GoML projects; flat `builtin_*.goml` files must not be packaged.
-
-The packaged `lib/cabi` module contains the first-party dynamic C ABI runtime. Keep its Go and assembly sources together; `goml-c-bind --runtime-dir` resolves this directory relative to the installed helper. Release smoke tests check this path after archive relocation.
 
 Release archives contain the toolchain project sources and manifests, but do not contain `lib/compiler/compiler-world-v2.gaf`. The installation command above finalizes it once with the binaries from that same archive.
 

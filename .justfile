@@ -1,7 +1,6 @@
 make:
     bash bootstrap/bootstrap.sh bootstrap/stage0.env stage0
     mkdir -p stage2/bin
-    bash tools/goml-go-meta/build.sh stage2
     bash bootstrap/build-stage.sh stage2 stage0/bin/goml stage0/bin/gomlc
     cp gomlc/_bootstrap/stage2/bin/cmd/gomlc/gomlc stage2/bin/gomlc
     cp gomlc/_bootstrap/stage2/bin/cmd/gomlfmt/gomlfmt stage2/bin/gomlfmt
@@ -15,8 +14,6 @@ make-tools: make
 
 [positional-arguments]
 test: make-tools
-    cd tools/goml-go-meta && go test ./...
-    cd lib/cabi && CGO_ENABLED=0 go test -gcflags=all=-d=checkptr=2 ./...
     bash tools/lib/install.sh _artifact/gomlc-test/test
     cd gomlc && GOML_TEST_GOML=../stage2/bin/goml GOML_TEST_GOMLC=../stage2/bin/gomlc GOML_TEST_COMPILER_WORLD=../stage2/lib/compiler/compiler-world-v2.gaf ../stage2/bin/goml test --target-dir ../_artifact/gomlc-test --compiler ../stage2/bin/gomlc --jobs 16 --timeout 10m
     cd goml && GOML_TEST_GOML=../stage2/bin/goml GOML_TEST_GOMLC=../stage2/bin/gomlc ../stage2/bin/goml test --compiler ../stage2/bin/gomlc --jobs 16 --timeout 10m
@@ -43,7 +40,6 @@ _bootstrap-stage3:
     rm -rf gomlc/_bootstrap/stage3 gomlc/_bootstrap/stage3-fixed
     rm -rf goml/_bootstrap/stage3 goml/_bootstrap/stage3-fixed stage3
     mkdir -p stage3/bin
-    bash tools/goml-go-meta/build.sh stage3
     bash bootstrap/build-stage.sh stage3 stage2/bin/goml stage2/bin/gomlc compiler
     cp gomlc/_bootstrap/stage3/bin/cmd/gomlc/gomlc stage3/bin/gomlc
     bash tools/lib/install.sh stage3
@@ -68,9 +64,7 @@ _ci-scripts:
     python3 tools/syscall/generate.py --check
     python3 tools/syscall/layouts.py --check --verify-headers
     bash -n tools/release/release.sh tools/release/test.sh tools/release/common.sh tools/release/sources.sh tools/release/checksums.sh tools/release/package.sh tools/release/smoke.sh tools/release/lsp_smoke.sh
-    bash -n tools/lib/install.sh tools/lib/test.sh tools/lib/finalize-toolchain.sh tools/goml-go-meta/build.sh
-    cd tools/goml-go-meta && go test -race ./...
-    cd lib/cabi && CGO_ENABLED=0 go test -gcflags=all=-d=checkptr=2 ./...
+    bash -n tools/lib/install.sh tools/lib/test.sh tools/lib/finalize-toolchain.sh
     bash tools/release/test.sh
     bash tools/lib/test.sh stage2
     bash tools/release/release.sh check-version "$(cat VERSION)"
@@ -108,7 +102,6 @@ _vscode-bundle:
     find editors/vscode/bin -mindepth 1 -depth -type d -empty -delete
     cp stage2/bin/gomllsp editors/vscode/bin/gomllsp
     cp stage2/bin/goml editors/vscode/bin/goml
-    cp stage2/bin/goml-go-meta editors/vscode/bin/goml-go-meta
     bash tools/lib/install.sh editors/vscode
     cd editors/vscode && npm install
 
@@ -148,8 +141,6 @@ install: make-tools
     cp stage2/bin/gomlfmt "${GOML_HOME:-$HOME/.goml}/bin/gomlfmt"
     cp stage2/bin/gomldoc "${GOML_HOME:-$HOME/.goml}/bin/gomldoc"
     cp stage2/bin/gomllsp "${GOML_HOME:-$HOME/.goml}/bin/gomllsp"
-    cp stage2/bin/goml-go-meta "${GOML_HOME:-$HOME/.goml}/bin/goml-go-meta"
-    cp stage2/bin/goml-c-bind "${GOML_HOME:-$HOME/.goml}/bin/goml-c-bind"
     bash tools/lib/install.sh "${GOML_HOME:-$HOME/.goml}"
     bash tools/lib/finalize-toolchain.sh "${GOML_HOME:-$HOME/.goml}" "${GOML_HOME:-$HOME/.goml}/bin/goml" "${GOML_HOME:-$HOME/.goml}/bin/gomlc"
 

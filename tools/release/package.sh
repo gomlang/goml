@@ -26,7 +26,6 @@ for tool in gomlc gomlfmt gomldoc gomllsp; do
     go build -trimpath -o "dist/$package/bin/$tool" "gomlc/_bootstrap/stage2/build/pkg/gomlc/cmd/$tool/goml_generated.go"
 done
 
-bash tools/goml-go-meta/build.sh "dist/$package" "$target_goos" "$target_goarch"
 bash tools/lib/install.sh "dist/$package"
 test -f "dist/$package/lib/builtin/contract.goml"
 test -f "dist/$package/lib/builtin/goml.toml"
@@ -38,10 +37,10 @@ test -f "dist/$package/lib/builtin/derive.goml"
 test -f "dist/$package/lib/prelude/prelude.goml"
 test -f "dist/$package/lib/prelude/goml.toml"
 test -f "dist/$package/lib/std/goml.toml"
-test -f "dist/$package/lib/cabi/go.mod"
-test -f "dist/$package/lib/cabi/runtime_linux_amd64.s"
+test -f "dist/$package/lib/std/math/LICENSE"
+test -f "dist/$package/lib/std/path/LICENSE"
 test ! -e "dist/$package/lib/compiler/compiler-world-v2.gaf"
-for tool in goml gomlc gomlfmt gomldoc gomllsp goml-go-meta goml-c-bind; do
+for tool in goml gomlc gomlfmt gomldoc gomllsp; do
     metadata="$(go version -m "dist/$package/bin/$tool")"
     printf '%s\n' "$metadata" | grep -q "build[[:space:]]GOOS=$target_goos$"
     printf '%s\n' "$metadata" | grep -q "build[[:space:]]GOARCH=$target_goarch$"

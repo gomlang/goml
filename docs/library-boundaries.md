@@ -1,7 +1,7 @@
 # Library boundaries
 
 `lib/std` contains broadly reusable value types, algorithms and composition
-contracts. It depends only on builtin, prelude and other standard packages.
+contracts. Its algorithms are implemented in GoML and depend only on builtin, prelude and other standard packages. Host operations use compiler-owned builtin runtime hooks; standard packages do not depend on user Go FFI or metadata discovery.
 Protocol engines, application policy, large datasets and domain-specific types
 live in independently versioned sibling repositories under `../gomlang/`.
 

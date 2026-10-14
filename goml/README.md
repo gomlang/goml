@@ -23,7 +23,7 @@ cd goml
 
 `goml doc` generates offline HTML API documentation for the module in `<target-dir>/doc/`. Use `--format json` for a versioned API model or `--document-private-items` for internal documentation. See [documentation](../docs/documentation.md) for comment syntax, links, and the standalone `gomldoc` command.
 
-Go FFI is validated by default with `--ffi-check required`. See the [language guide](../docs/goml.md#go-ffi) for the boundary rules, [bind-go](../docs/ffi/bind-go.md) for allowlisted binding generation, and [export-go](../docs/goml.md#exporting-a-go-library) for publishing a generated Go package.
+Go FFI trusts explicit binding signatures; the final Go build checks native symbols and signatures. External Go types are opaque. See the [language guide](../docs/goml.md#go-ffi) for boundary rules, [Go interoperability](../docs/ffi/bind-go.md) for explicit bindings, and [export-go](../docs/goml.md#exporting-a-go-library) for publishing a generated Go package.
 
 `goml clean` removes the current module's configured build target directory. Use `goml clean --target-dir <path>` to clean another target directory inside the module.
 

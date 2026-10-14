@@ -18,7 +18,9 @@ rm -f \
     "$prefix/lib/builtin_prelude.gom" \
     "$prefix/lib/builtin_numeric.gom" \
     "$prefix/lib/builtin_derive.gom"
-rm -rf -- "$prefix/lib/builtin" "$prefix/lib/prelude" "$prefix/lib/std" "$prefix/lib/cabi"
-cp -R "$repo_root/lib/." "$prefix/lib/"
+rm -rf -- "$prefix/lib/builtin" "$prefix/lib/prelude" "$prefix/lib/std"
+for module in builtin prelude std; do
+    cp -R "$repo_root/lib/$module" "$prefix/lib/$module"
+done
 
 find "$prefix/lib/std" -type d -name tests -prune -exec rm -rf -- {} +
