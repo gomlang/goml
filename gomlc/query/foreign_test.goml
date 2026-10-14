@@ -1,18 +1,8 @@
 package query;
 
 use module::tast;
-use std::env;
 use std::fs;
-use std::path;
 use std::testing;
-
-fn foreign_test_context() -> AnalysisContext {
-    let compiler = env::var_structured("GOML_TEST_GOMLC").unwrap_or("../stage2/bin/gomlc");
-    let helper = path::absolute_structured(compiler).map_err(|error| error.to_string()).and_then(
-        |compiler| path::parent(compiler).ok_or("compiler has no directory"),
-    ).map(|directory| path::join(directory, "goml-go-meta"));
-    analysis_context_with_foreign_helper(helper)
-}
 
 fn foreign_query_fixture(root: string) -> () {
     for directory in Vec::from_array([root, root + "/native", root + "/bindings", root + "/client"]) {
@@ -46,12 +36,15 @@ fn assert_foreign_query_error(analysis: Analysis, expected: string) -> () {
 fn query_checks_external_types_across_packages_and_unsaved_sources() -> () {
     let root = "/tmp/goml-query-external-types";
     foreign_query_fixture(root);
-    let context = foreign_test_context();
+    let context = analysis_context();
     let file = root + "/client/main.goml";
-    let source = "package client; use module::bindings; pub fn echo(value: bindings::Named) -> bindings::Named { bindings::echo(value) } pub fn alias(value: bindings::Alias) -> i64 { value } pub fn box(value: bindings::Box[i64]) -> bindings::Box[i64] { value }";
+    let source = "package client; use module::bindings; pub fn echo(value: bindings::Named) -> bindings::Named { bindings::echo(value) } pub fn alias(value: bindings::Alias) -> bindings::Alias { value } pub fn box(value: bindings::Box[i64]) -> bindings::Box[i64] { value }";
     write_query_fixture(file, source);
     let analysis = analyze_with_context(context, file, source, Vec::new());
     assert_no_diagnostics(analysis);
+    assert_query_counts(context, 2, 0);
+    assert_no_diagnostics(analyze_with_context(context, file, source, Vec::new()));
+    assert_query_counts(context, 0, 2);
     if let Some(offset) = last_substring(source, "Named") {
         let definitions = goto_definitions(analysis, offset);
         testing::assert_eq(definitions.len(), 1);
@@ -61,13 +54,13 @@ fn query_checks_external_types_across_packages_and_unsaved_sources() -> () {
     } else {
         testing::fail("missing external type reference")
     }
-    let bad = "package client; use module::bindings; pub fn bad(value: bindings::Named) -> i64 { value }";
+    let bad = "package client; use module::bindings; pub fn bad(value: bindings::Named) -> bindings::Alias { value }";
     testing::assert(
         tast::diagnostics_have_errors(
             diagnostics(analyze_with_context(context, file, bad, Vec::new())),
         ),
     );
-    let changed = "package bindings; #[go_type(\"example.com/query/native\", \"Alias\")] pub extern type Named;";
+    let changed = "package bindings; #[go_type(\"example.com/query/native\", \"Alias\")] pub extern type Named; #[go_type(\"example.com/query/native\", \"Alias\")] pub extern type Alias;";
     assert_no_diagnostics(
         analyze_with_context(
             context,
@@ -83,21 +76,27 @@ fn query_checks_external_types_across_packages_and_unsaved_sources() -> () {
 }
 
 #[test]
-fn query_validates_external_generic_constraints_including_erased_aliases() -> () {
+fn query_checks_declared_generic_arity_without_inspecting_go_constraints() -> () {
     let root = "/tmp/goml-query-external-constraints";
     foreign_query_fixture(root);
-    let context = foreign_test_context();
+    let context = analysis_context();
     let file = root + "/client/main.goml";
     for name in Vec::from_array(["Box", "Erased"]) {
         let valid = "package client; use module::bindings; pub fn accept(value: Option[bindings::"
             + name
             + "[i64]]) -> () {}";
         assert_no_diagnostics(analyze_with_context(context, file, valid, Vec::new()));
-        let invalid = "package client; use module::bindings; pub fn accept(value: Option[bindings::"
+        let deferred = "package client; use module::bindings; pub fn accept(value: Option[bindings::"
             + name
             + "[bool]]) -> () {}";
-        let analysis = analyze_with_context(context, file, invalid, Vec::new());
-        testing::assert(tast::diagnostics_have_errors(diagnostics(analysis)));
+        assert_no_diagnostics(analyze_with_context(context, file, deferred, Vec::new()));
+        let invalid = "package client; use module::bindings; pub fn accept(value: bindings::" + name
+            + "[i64, bool]) -> () {}";
+        testing::assert(
+            tast::diagnostics_have_errors(
+                diagnostics(analyze_with_context(context, file, invalid, Vec::new())),
+            ),
+        );
         let symbolic = "package client; use module::bindings; pub fn accept[T](value: bindings::"
             + name
             + "[T]) -> () {}";
@@ -112,47 +111,169 @@ fn query_validates_external_generic_constraints_including_erased_aliases() -> ()
                 Vec::new(),
             ),
         );
-        let invalid_alias = analyze_with_context(
+        let alias_analysis = analyze_with_context(
             context,
             file,
             alias + "pub fn accept(value: Wrapped[bool]) -> Wrapped[bool] { value }",
             Vec::new(),
         );
-        testing::assert(tast::diagnostics_have_errors(diagnostics(invalid_alias)));
+        assert_no_diagnostics(alias_analysis);
     }
     let _ = fs::remove_dir_all(root);
 }
 
 #[test]
-fn query_recovers_external_metadata_errors_and_rechecks_native_changes() -> () {
-    let root = "/tmp/goml-query-external-recovery";
+fn query_uses_explicit_foreign_declarations_without_go_sources() -> () {
+    let root = "/tmp/goml-query-external-declarations";
+    foreign_query_fixture(root);
+    let _ = fs::remove_file(root + "/go.mod");
+    let _ = fs::remove_dir_all(root + "/native");
+    let file = root + "/client/main.goml";
+    let context = analysis_context();
+    let source = "package client; #[go_type(\"missing.example/native\", \"Missing\")] pub extern type Missing; #[go_ffi(\"missing.example/native\", \"Identity\")] extern fn identity(value: Missing) -> Missing; pub fn accept(value: Missing) -> Missing { identity(value) }";
+    assert_no_diagnostics(analyze_with_context(context, file, source, Vec::new()));
+    assert_no_diagnostics(analyze_with_context(context, file, source, Vec::new()));
+    assert_query_counts(context, 0, 1);
+    let invalid = "package client; pub extern type Missing;";
+    assert_foreign_query_error(
+        analyze_with_context(context, file, invalid, Vec::new()),
+        "external types require exactly one go_type attribute",
+    );
+    assert_no_diagnostics(analyze_with_context(context, file, source, Vec::new()));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn query_keeps_go_aliases_opaque_and_reports_metadata_dependent_operations() -> () {
+    let root = "/tmp/goml-query-external-opaque";
     foreign_query_fixture(root);
     let file = root + "/client/main.goml";
-    let context = foreign_test_context();
-    let missing = "package client; #[go_type(\"example.com/query/native\", \"Missing\")] extern type Missing;";
-    assert_foreign_query_error(analyze_with_context(context, file, missing, Vec::new()), "Missing");
-    let source = "package client; #[go_type(\"example.com/query/native\", \"Alias\")] extern type Alias; pub fn accept(value: Alias) -> i64 { value }";
+    let context = analysis_context();
+    let declaration = "package client; #[go_type(\"example.com/query/native\", \"Alias\")] pub extern type Alias; ";
+    let source = declaration + "pub fn accept(value: Alias) -> Alias { value }";
     assert_no_diagnostics(analyze_with_context(context, file, source, Vec::new()));
     write_query_fixture(root + "/native/types.go", "package native\ntype Alias = bool\n");
-    testing::assert(
-        tast::diagnostics_have_errors(
-            diagnostics(analyze_with_context(context, file, source, Vec::new())),
-        ),
+    assert_no_diagnostics(analyze_with_context(context, file, source, Vec::new()));
+    assert_query_counts(context, 0, 1);
+    for body in Vec::from_array(
+        [
+            "pub fn accept(value: Alias) -> i64 { value }",
+            "pub fn accept(value: Alias) -> bool { value }",
+        ],
+    ) {
+        testing::assert(
+            tast::diagnostics_have_errors(
+                diagnostics(analyze_with_context(context, file, declaration + body, Vec::new())),
+            ),
+        );
+    }
+    for body in Vec::from_array(
+        [
+            "pub fn field(value: Alias) -> i64 { value.Value }",
+            "pub fn construct() -> Alias { Alias { Value: 1 } }",
+        ],
+    ) {
+        assert_foreign_query_error(
+            analyze_with_context(context, file, declaration + body, Vec::new()),
+            "opaque external Go type",
+        );
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+fn assert_foreign_diagnostic_location(
+    analysis: Analysis,
+    message: string,
+    source_path: string,
+    source: string,
+    expected: string,
+) -> () {
+    for diagnostic in diagnostics(analysis) {
+        if diagnostic.message.contains(message) {
+            testing::assert_eq(diagnostic.source_path, source_path);
+            let Some(span) = diagnostic.span else {
+                testing::fail("foreign diagnostic has no source location");
+                return
+            };
+            testing::assert_eq(source.byte_slice(span.start, span.end), expected);
+            return
+        }
+    }
+    testing::fail("expected foreign diagnostic: " + message)
+}
+
+#[test]
+fn foreign_type_diagnostics_identify_the_failing_declaration_and_file() -> () {
+    let root = "/tmp/goml-query-foreign-locations";
+    foreign_query_fixture(root);
+    let context = analysis_context();
+    let file = root + "/client/main.goml";
+    let good = "package client; #[go_type(\"time\", \"Duration\")] pub extern type Good; ";
+    let source = good + "#[go_type(\"invalid import path\", \"Bad\")] pub extern type Bad;";
+    write_query_fixture(file, source);
+    assert_foreign_diagnostic_location(
+        analyze_with_context(context, file, source, Vec::new()),
+        "external Go type is not publicly nameable",
+        file,
+        source,
+        "Bad",
     );
-    let unavailable = analysis_context_with_foreign_helper(
-        Result::Err("ffi-tool-unavailable: test helper unavailable"),
+    write_query_fixture(file, good);
+    let second = root + "/client/types.goml";
+    let invalid = "package client; pub extern type Missing;";
+    write_query_fixture(second, invalid);
+    assert_foreign_diagnostic_location(
+        analyze_with_context(context, file, good, Vec::new()),
+        "external types require exactly one go_type attribute",
+        second,
+        invalid,
+        "pub extern type Missing;",
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn query_validates_explicit_interface_boundaries_and_cross_file_members() -> () {
+    let root = "/tmp/goml-query-interface-boundaries";
+    foreign_query_fixture(root);
+    let context = analysis_context();
+    let file = root + "/client/main.goml";
+    let raw = "package client; #[go_type(\"io\", \"Reader\")] pub extern type Raw; ";
+    let valid = raw
+        + "#[go_interface(Raw, Wrapped, read = \"Read\")] pub trait Reader { fn read(self: Self) -> i64; }";
+    write_query_fixture(file, valid);
+    assert_no_diagnostics(analyze_with_context(context, file, valid, Vec::new()));
+    for source in Vec::from_array(
+        [
+            raw
+                + "#[go_interface(Raw, Wrapped, read = \"Read\")] pub trait Reader { fn read(self: Self, value: string) -> (); }",
+            raw
+                + "#[go_interface(Raw, Wrapped, read = \"Read\")] pub trait Reader { fn read(self: Self, value: Slice[u8]) -> (); }",
+        ],
+    ) {
+        assert_foreign_query_error(
+            analyze_with_context(context, file, source, Vec::new()),
+            "go_interface",
+        );
+    }
     assert_foreign_query_error(
-        analyze_with_context(unavailable, file, source, Vec::new()),
-        "ffi-tool-unavailable",
-    );
-    assert_no_diagnostics(
         analyze_with_context(
-            unavailable,
+            context,
             file,
-            "package client; pub fn value() -> i64 { 1 }",
+            "package client; type Raw = i64; #[go_interface(Raw, Wrapped, read = \"Read\")] trait Reader { fn read(self: Self) -> i64; }",
             Vec::new(),
         ),
+        "Go interface bridge requires a native interface target",
+    );
+    let second = root + "/client/extension.goml";
+    let extension = "package client; type Alias = Wrapped; impl Alias { pub fn into_go(self: Alias) -> Raw { self.raw } }";
+    write_query_fixture(second, extension);
+    assert_foreign_diagnostic_location(
+        analyze_with_context(context, file, valid, Vec::new()),
+        "go_interface generated member collides",
+        second,
+        extension,
+        "into_go",
     );
     let _ = fs::remove_dir_all(root);
 }
