@@ -6,13 +6,14 @@ Quick navigation: [packages](#packages), [text](#text-and-source-positions), [co
 
 ## Packages
 
-The standard library is distinct from both the hidden builtin contract and the automatically scoped prelude. Its packages must be imported explicitly:
+The standard library is distinct from both the hidden builtin contract and the automatically scoped prelude. Algorithms are implemented in GoML; host operations use compiler-owned builtin runtime hooks, without user Go FFI declarations or metadata discovery. Its packages must be imported explicitly:
 
 ```goml
 use std::ascii;
 use std::bincode;
 use std::bytes;
 use std::bytes::endian;
+use std::c;
 use std::channel;
 use std::cmp;
 use std::collections;
@@ -62,6 +63,7 @@ Public APIs include:
 - `ascii::is_ascii`, character-class predicates, ASCII case conversion and comparison, and `escape_default`
 - `bincode::standard`, `legacy`, configuration builders, serde `Serialize` and `Deserialize` re-exports, `encode_to_vec`, and `decode_from_slice`
 - `bytes::Bytes`, `bytes::FrozenBytes`, `bytes::Builder`, explicit byte copies, immutable snapshots, checked and zero-copy byte views, plus `bytes::endian::{Builder, Reader, Writer, Endian}` and checked integer and floating-point reads and writes
+- `c::CString`, `literal`, and `check_error` for explicit C-compatible string and error boundaries
 - `channel::Operation`, `Selection`, `select`, `try_select`, and `try_select_priority` for runtime-sized channel selection
 - `cmp::Ordering`, `Ord`, `Reverse`, comparison helpers, and two-value minimum, maximum, and clamping operations. `Ordering` is a builtin type re-exported by `cmp`.
 - `collections::Arena`, `BinaryHeap`, `BitSet`, `BTreeMap`, `BTreeSet`, `Deque`, `HashSet`, `IndexMap`, `IndexSet`, `IndexVec`, `Interner`, and `Stack`; hash-backed collections require `Hash + Eq`, while tree collections and heaps use `cmp::Ord`
@@ -784,7 +786,7 @@ fn unicode_example() -> bool {
 
 ## Mathematics
 
-`std::math` delegates elementary operations to Go's `math` package and follows its IEEE 754 special-value behavior. The f32 forms calculate through f64 and round the result back to f32. Results therefore use the target Go toolchain's correctly rounded conversions but do not promise bit-for-bit equality across different operating systems or processor implementations for every transcendental function.
+`std::math` implements its elementary operations in GoML while preserving its public API and IEEE 754 special-value behavior. It does not bind Go's `math` package. The f32 forms calculate through f64 and round the result back to f32. Transcendental results do not promise bit-for-bit equality with Go or across targets.
 
 `std::math::complex::Complex` is a pure GoML pair of `f64` values with public
 `real` and `imaginary` fields. `new`, `from_real` and `from_polar` construct
@@ -2845,6 +2847,26 @@ let approximate: f64 = count.to_f64();
 let truncated = (12.75).try_to_i32();
 ```
 
+## C-compatible strings
+
+`std::c::CString` stores bytes without interior NUL. `CString::new(string)`, `from_bytes(bytes::Bytes)` and `from_raw(ffi::String)` return `Result[CString, c::Error]`, rejecting interior NUL with `Error::InteriorNul`. `bytes()` returns a byte copy, `text()` validates UTF-8 and returns `Result[string, utf8::Utf8Error]`, and `as_raw()` exposes the underlying `ffi::String` for an explicit foreign declaration. Native allocation, termination and lifetime belong to the adapter that consumes this value.
+
+`c::Error` has `InteriorNul` and `Native(string)` variants and implements `Debug`, `PartialEq`, `Eq` and `ToString`. `c::check_error(ffi::Error)` returns `Ok(())` for a nil Go error and `Err(Error::Native(message))` otherwise. An invalid UTF-8 error message uses the text `C boundary error contains invalid UTF-8`.
+
+`c::literal(string) -> string` is a `#[comptime]` function that rejects interior NUL through `compile_error`. A constant initializer or `comptime` block requests compile-time validation:
+
+```goml
+use std::c;
+
+const DATABASE: string = c::literal(":memory:");
+
+fn database_name() -> Result[c::CString, c::Error] {
+    c::CString::new(DATABASE)
+}
+```
+
+The `CString` constructors also enforce their invariant at runtime. An ordinary runtime call to `c::literal` is not forced into compile-time evaluation and traps on invalid input. These operations do not inspect C headers or determine native layouts.
+
 ## Environment, paths, and processes
 
 `env::current_dir_structured`, `current_exe_structured`, and `var_structured`, `path::absolute_structured`, and the `process` structured execution methods expose whole-operation errors. Process timeout methods take `time::Duration`, terminate and wait through the command runtime, and return `TimedOut` through `process::Error`.
@@ -3780,6 +3802,7 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | `Simd[T, N]` or vector `a + b` | Import `std::simd`, select a fixed 128/256-bit vector type, and use `a.add(b)` |
 | `float_value.to_i32()` | Import `std::num::TryToInt` and use `float_value.try_to_i32()`; handle nonfinite and range errors |
 | Traverse a directory tree | `ecosystem::walkdir` dependency for Linux amd64 syscall-backed depth-first iteration with depth bounds, pruning, optional link following, and per-path errors |
+| Validate a C-compatible string | `std::c::CString` rejects interior NUL; `c::literal` supports compile-time validation |
 | Manipulate logical slash paths or shell patterns | `std::path::slash` for pure lexical operations and bounded Unicode matching; keep host paths in `std::path` |
 | Watch a directory tree for changes | Use the `ecosystem::notify` dependency and its `watch_recursive` or `WatchSet` on Linux amd64, prune ignored paths through `Options`, consume timed reads or scoped subscriptions, handle `Event.rescan`, and close the handle |
 | TCP and UDP networking | `std::net` sockets, DNS resolution, shared epoll readiness, explicit close, and context-aware waits; `std::net::tls` for verified TLS clients and listeners |
