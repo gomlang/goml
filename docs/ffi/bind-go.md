@@ -19,6 +19,6 @@ An external type is opaque. Its import path, Go name and declared type arguments
 
 Use a module-root `go.mod` for local Go shims and Go dependencies. Ordinary project builds disable Go workspace mode, select module mode from the presence of `go.mod`, and otherwise use the user's Go environment for dependency and toolchain behavior. Go library export and native SIMD builds retain readonly, offline module handling and require dependencies to be prepared beforehand. Unicode validity, ownership, mutability and concurrency guarantees remain explicit adapter contracts; successful Go compilation cannot prove them.
 
-`--ffi-check required` and `--ffi-check off` remain accepted for command compatibility. Both use trusted declarations and neither invokes metadata inspection or emits an unverified-binding warning. Unused foreign declarations may not appear in generated Go and therefore need not be checked by the final build.
+Unused foreign declarations may not appear in generated Go and therefore need not be checked by the final build. Changes to native Go sources are checked when the generated program or library is built; `goml check` continues to use the declared GoML signatures.
 
 See the [language guide](../goml.md#go-ffi) for the complete boundary rules, the [file reading example](../../goml/testdata/ffi/file-read/README.md) for explicit pointer and method bindings, and [Go library export](../goml.md#exporting-a-go-library) for the reverse direction.
