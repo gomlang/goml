@@ -2,8 +2,168 @@ package main;
 
 use module::artifact::interface_codec as interface_codec;
 use module::artifact;
+use module::ast;
+use module::hir;
+use module::parser;
 use module::tast;
 use std::testing;
+
+fn decode_foreign_function_fixture(function: artifact::ArtifactFnScheme) -> Result[
+    artifact::ArtifactInterfaceUnit,
+    string,
+] {
+    let base = binary_interface_fixture();
+    base.exports.functions.push(function);
+    interface_codec::decode_binary(
+        interface_codec::encode_binary(
+            interface_codec::new_unit(
+                base.package_name,
+                base.exports,
+                base.package_interface,
+                base.deps,
+            ),
+        )?,
+    )
+}
+
+fn foreign_function_fixture(body: tast::Callable) -> artifact::ArtifactFnScheme {
+    artifact::ArtifactFnScheme {
+        name: "audit::value::probe",
+        comptime: tast::ComptimeCapability::RuntimeOnly,
+        type_params: Vec::new(),
+        constraints: Vec::new(),
+        ty: tast::Type::Func {
+            params: Vec::from_array([tast::Type::Float64]),
+            ret_ty: tast::Type::Float64,
+        },
+        body,
+    }
+}
+
+fn foreign_source_has_diagnostic(source: string, message: string) -> bool {
+    let checked = tast::check(hir::lower(ast::lower(parser::parse(source)), "foreign.goml"));
+    for diagnostic in checked.diagnostics {
+        if diagnostic.message.contains(message) {
+            return true
+        }
+    }
+    false
+}
+
+#[test]
+fn foreign_function_source_and_artifacts_reject_malformed_targets() -> () {
+    for target in Vec::from_array(
+        [
+            ("", "Value", "import path"),
+            ("invalid path", "Value", "import path"),
+            ("example.com/host", "value", "symbol"),
+            ("example.com/host", "Value;panic", "symbol"),
+        ],
+    ) {
+        let source = "#[go_ffi(\"" + target.0 + "\", \"" + target.1
+            + "\")] extern fn probe(value: f64) -> f64;";
+        testing::assert(foreign_source_has_diagnostic(source, target.2));
+        let decoded = decode_foreign_function_fixture(
+            foreign_function_fixture(
+                tast::Callable::GoForeign { binding: "", import_path: target.0, symbol: target.1 },
+            ),
+        );
+        match decoded {
+            Err(message) => testing::assert(message.contains(target.2)),
+            Ok(_) => testing::fail("artifact accepted malformed Go " + target.2),
+        }
+    }
+    let source = "#[go_ffi(\"example.invalid/host\", \"Unknown\")] extern fn probe(value: f64) -> f64;";
+    let checked = tast::check(hir::lower(ast::lower(parser::parse(source)), "foreign.goml"));
+    testing::assert(!tast::diagnostics_have_errors(checked.diagnostics));
+    testing::assert(
+        decode_foreign_function_fixture(
+            foreign_function_fixture(
+                tast::Callable::GoForeign {
+                    binding: "",
+                    import_path: "example.invalid/host",
+                    symbol: "Unknown",
+                },
+            ),
+        ).is_ok(),
+    );
+}
+
+#[test]
+fn foreign_function_source_and_artifacts_reject_generic_declarations() -> () {
+    for target in Vec::from_array(
+        [
+            (
+                "#[go_ffi(\"example.com/host\", \"Value\")]",
+                tast::Callable::GoForeign {
+                    binding: "",
+                    import_path: "example.com/host",
+                    symbol: "Value",
+                },
+            ),
+            ("#[go_method(\"Value\")]", tast::Callable::GoMethod { binding: "", symbol: "Value" }),
+        ],
+    ) {
+        for generic in Vec::from_array([true, false]) {
+            let function = foreign_function_fixture(target.1);
+            let source = if generic {
+                function.type_params.push("T");
+                target.0 + " extern fn probe[T](receiver: f64) -> f64;"
+            } else {
+                function.constraints.push(tast::TypePredicate::GoComparable(tast::Type::Float64));
+                "trait Bound {} " + target.0
+                    + " extern fn probe(receiver: f64) -> f64 where f64: Bound;"
+            };
+            testing::assert(foreign_source_has_diagnostic(source, "generic"));
+            match decode_foreign_function_fixture(function) {
+                Err(message) => testing::assert(
+                    message.contains("generic parameters or predicates"),
+                ),
+                Ok(_) => testing::fail("artifact accepted a generic foreign declaration"),
+            }
+        }
+        let mut function = foreign_function_fixture(target.1);
+        function.ty = tast::Type::Float64;
+        testing::assert(decode_foreign_function_fixture(function).is_err());
+    }
+}
+
+#[test]
+fn foreign_artifacts_accept_concrete_generic_external_types_and_interface_bridges() -> () {
+    let target = tast::Type::External {
+        import_path: "example.com/host",
+        name: "Reader",
+        args: Vec::from_array([tast::Type::Float64]),
+    };
+    for body in Vec::from_array(
+        [
+            tast::Callable::GoForeign {
+                binding: "",
+                import_path: "example.com/host",
+                symbol: "Read",
+            },
+            tast::Callable::GoMethod { binding: "", symbol: "Read" },
+            tast::Callable::GoInterfaceBridge {
+                binding: "audit::value::probe",
+                methods: Vec::from_array(["Read"]),
+            },
+        ],
+    ) {
+        let mut function = foreign_function_fixture(body);
+        let parameter = if let tast::Callable::GoInterfaceBridge { .. } = body {
+            tast::Type::Func { params: Vec::new(), ret_ty: tast::Type::Float64 }
+        } else {
+            target
+        };
+        function.ty = tast::Type::Func { params: Vec::from_array([parameter]), ret_ty: target };
+        match decode_foreign_function_fixture(function) {
+            Ok(decoded) => testing::assert(
+                tast::types_equal(decoded.exports.functions[0].ty, function.ty),
+            ),
+            Err(message) => testing::fail(message),
+        }
+    }
+}
 
 #[test]
 fn foreign_callable_artifacts_cannot_be_comptime() -> () {
