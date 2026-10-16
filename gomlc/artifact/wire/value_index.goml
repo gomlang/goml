@@ -1,0 +1,187 @@
+package wire;
+
+use std::bytes;
+use std::collections;
+
+pub fn encode_artifact_binary_value_index(table: ArtifactBinaryStringTable, data: Slice[byte]) -> Result[
+    bytes::Bytes,
+    string,
+] {
+    let value = index_artifact_binary_value(table, data)?;
+    let number_set: collections::IndexSet[string] = collections::IndexSet::new();
+    for number in value.numbers {
+        let _ = number_set.insert(number);
+    }
+    let numbers = artifact_binary_string_table_from_values(number_set.to_vec());
+    let encoded_numbers = encode_artifact_binary_string_table(numbers);
+    let writer = new_artifact_binary_writer();
+    artifact_binary_write_u32(writer, encoded_numbers.len().to_u32());
+    artifact_binary_write_raw_bytes(writer, encoded_numbers);
+    for node in value.nodes {
+        artifact_binary_write_u32(writer, node.tag.to_u32());
+        artifact_binary_write_u32(writer, node.next.to_u32());
+        artifact_binary_write_u32(
+            writer,
+            if node.tag == 3 {
+                artifact_binary_string_id(numbers, value.numbers[node.value]).to_u32()
+            } else {
+                node.value.to_u32()
+            },
+        );
+        artifact_binary_write_u32(
+            writer,
+            if node.name < 0 {
+                4294967295
+            } else {
+                node.name.to_u32()
+            },
+        );
+    }
+    Result::Ok(artifact_binary_writer_finish(writer))
+}
+
+fn artifact_binary_index_u32(data: Slice[byte], offset: isize) -> isize {
+    data.get(offset).to_isize() | (data.get(offset + 1).to_isize() << 8)
+        | (data.get(offset + 2).to_isize() << 16)
+        | (data.get(offset + 3).to_isize() << 24)
+}
+
+fn artifact_binary_invalid_node(value: ArtifactBinaryValue, index: isize) -> ArtifactBinaryNode {
+    value.error.set(Option::Some("invalid binary artifact value index"));
+    ArtifactBinaryNode { tag: 255, next: index + 1, value: 0, name: -1 }
+}
+
+fn artifact_binary_node(value: ArtifactBinaryValue, index: isize) -> ArtifactBinaryNode {
+    if value.encoded_nodes.len() == 0 {
+        return value.nodes[index]
+    }
+    let count = value.encoded_nodes.len() / 16;
+    if index < 0 || index >= count {
+        return artifact_binary_invalid_node(value, index)
+    }
+    let offset = index * 16;
+    let tag = artifact_binary_index_u32(value.encoded_nodes, offset);
+    let next = artifact_binary_index_u32(value.encoded_nodes, offset + 4);
+    let payload = artifact_binary_index_u32(value.encoded_nodes, offset + 8);
+    let name = artifact_binary_index_u32(value.encoded_nodes, offset + 12);
+    if tag > 6 || next <= index || next > count
+        || (name != 4294967295 && name >= value.strings.len()) {
+        return artifact_binary_invalid_node(value, index)
+    }
+    if tag < 5 {
+        if next != index + 1 || (tag < 3 && payload != 0)
+            || (tag == 3 && payload >= value.numbers.len())
+            || (tag == 4 && payload >= value.strings.len()) {
+            return artifact_binary_invalid_node(value, index)
+        }
+    } else if payload > next - index - 1 || (payload == 0 && next != index + 1) {
+        return artifact_binary_invalid_node(value, index)
+    }
+    ArtifactBinaryNode {
+        tag: tag.to_u8(),
+        next,
+        value: payload,
+        name: if name == 4294967295 {
+            -1
+        } else {
+            name
+        },
+    }
+}
+
+fn artifact_binary_field_name(value: ArtifactBinaryValue, index: isize) -> string {
+    let name = artifact_binary_node(value, index).name;
+    if name < 0 || name >= value.strings.len() {
+        value.error.set(Option::Some("invalid binary artifact object field"));
+        ""
+    } else {
+        value.strings[name]
+    }
+}
+
+fn artifact_binary_validate_children(value: ArtifactBinaryValue, object: bool) -> Result[(), string] {
+    if value.encoded_nodes.len() == 0 {
+        return Result::Ok(())
+    }
+    let parent = artifact_binary_node(value, value.index);
+    let mut index = value.index + 1;
+    let names: Option[collections::HashSet[isize]] = if object && parent.value > 32 {
+        Option::Some(collections::HashSet::new())
+    } else {
+        Option::None
+    };
+    for _ in 0..parent.value {
+        if index >= parent.next {
+            return Result::Err("invalid binary artifact child count")
+        }
+        let child = artifact_binary_node(value, index);
+        if child.tag > 6 || child.next > parent.next {
+            return Result::Err("invalid binary artifact child range")
+        }
+        if let Some(names) = names {
+            if child.name < 0 || !names.insert(child.name) {
+                return Result::Err("invalid or duplicate binary artifact object field")
+            }
+        } else if object {
+            if child.name < 0 {
+                return Result::Err("invalid binary artifact object field")
+            }
+            let mut previous = value.index + 1;
+            while previous < index {
+                let sibling = artifact_binary_node(value, previous);
+                if sibling.name == child.name {
+                    return Result::Err("duplicate binary artifact object field")
+                }
+                previous = sibling.next;
+            }
+        } else if child.name != -1 {
+            return Result::Err("invalid binary artifact array element")
+        }
+        index = child.next;
+    }
+    if index != parent.next {
+        Result::Err("invalid binary artifact child coverage")
+    } else {
+        artifact_binary_value_valid(ArtifactValue::Indexed(value))
+    }
+}
+
+pub fn artifact_binary_value_valid(value: ArtifactValue) -> Result[(), string] {
+    if let ArtifactValue::Indexed(view) = value {
+        if let Some(error) = view.error.get() {
+            return Result::Err(error)
+        }
+    }
+    Result::Ok(())
+}
+
+pub fn decode_artifact_binary_value_index(table: ArtifactBinaryStringTable, data: Slice[byte]) -> Result[
+    ArtifactValue,
+    string,
+] {
+    let reader = new_artifact_binary_slice_reader(data);
+    let number_length = artifact_binary_read_u32(reader)?.to_isize();
+    if number_length > artifact_binary_reader_remaining(reader) {
+        return Result::Err("invalid binary artifact number table length")
+    }
+    let numbers = decode_artifact_binary_string_table_view(data.sub(4, 4 + number_length))?;
+    let encoded_nodes = data.sub(4 + number_length, data.len());
+    if encoded_nodes.len() == 0 || encoded_nodes.len() % 16 != 0
+        || encoded_nodes.len() / 16 > 10000000 {
+        return Result::Err("invalid binary artifact index length")
+    }
+    let value = ArtifactBinaryValue {
+        nodes: Vec::new(),
+        encoded_nodes,
+        error: Ref::new(Option::None),
+        depth: 0,
+        strings: table.interner.values,
+        numbers: numbers.interner.values,
+        index: 0,
+    };
+    let root = artifact_binary_node(value, 0);
+    if root.tag > 6 || root.name != -1 || root.next != encoded_nodes.len() / 16 {
+        return Result::Err("invalid binary artifact root index")
+    }
+    Result::Ok(artifact_binary_value_at(value, 0))
+}

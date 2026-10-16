@@ -69,6 +69,12 @@ bash tools/release/smoke.sh "$(cat VERSION)" darwin arm64
 
 The package script also supports cross compilation with an explicit target; smoke tests require the target host. The scripts use `shasum -a 256` when `sha256sum` is unavailable. Once both archives and their `.sha256` files are in `dist`, run `bash tools/release/checksums.sh "$(cat VERSION)"` to generate `dist/SHA256SUMS`.
 
+## Compiler world loading
+
+Toolchain finalization writes and fully validates `lib/compiler/compiler-world-v2.gaf`. The world contains builtin initialization metadata and indexed package interfaces and Core. The compiler treats the world at its own executable-relative installation path as an immutable toolchain resource: normal loading checks its structure, format, compiler identity and dependency fingerprints without recomputing file checksums. The driver uses the installed world's size and modification time for cache freshness, alongside the compiler fingerprint; it does not rehash the world on every command. Worlds supplied from other paths and finalization validation retain complete checksum verification. Release archives and stage0 downloads retain SHA-256 verification.
+
+Replace toolchain resources through installation or finalization rather than editing an installed world in place. Normal compilation does not guarantee detection of corruption in the installed world. Changes that preserve its size and modification time can retain a stale driver cache. Package checking loads interfaces, types and compile-time metadata; runtime Core is loaded for linking.
+
 ## Installation
 
 Download the archive for your host and `SHA256SUMS` from the same release:

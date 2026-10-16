@@ -1,6 +1,8 @@
 package wire;
 
-use module::hash;
+use std::crypto::hash as crypto_hash;
+use std::hash as standard_hash;
+use standard_hash::Hasher;
 use std::bytes;
 use std::cmp;
 use std::collections;
@@ -63,26 +65,14 @@ pub fn artifact_binary_bytes_equal(left: bytes::Bytes, right: bytes::Bytes) -> b
     }
 }
 
-fn artifact_binary_hex_value(value: u8) -> u8 {
-    if value >= 48 && value <= 57 {
-        value - 48
-    } else if value >= 97 && value <= 102 {
-        value - 87
-    } else {
-        0
-    }
+fn artifact_binary_sha256_slice(value: Slice[byte]) -> bytes::Bytes {
+    let digest = crypto_hash::Sha256Digest::new256();
+    digest.update(value);
+    digest.sum()
 }
 
 fn artifact_binary_sha256(value: bytes::Bytes) -> bytes::Bytes {
-    let text = hash::sha256_bytes_hex(value);
-    let result = bytes::Bytes::with_capacity(32);
-    for index in 0..32 {
-        result.push(
-            (artifact_binary_hex_value(text.byte_get(index * 2)) << 4)
-                | artifact_binary_hex_value(text.byte_get(index * 2 + 1)),
-        )
-    }
-    result
+    artifact_binary_sha256_slice(value.as_slice())
 }
 
 fn artifact_binary_section_compare(left: ArtifactBinarySection, right: ArtifactBinarySection) -> cmp::Ordering {
@@ -165,11 +155,79 @@ fn artifact_binary_checked_int(reader: ArtifactBinaryReader, value: u64, name: s
     }
 }
 
+pub struct ArtifactBinarySectionView {
+    pub id: u16,
+    pub version: u16,
+    pub flags: u16,
+    pub data: Slice[byte],
+}
+
+pub struct ArtifactBinaryContainerView {
+    pub kind: u8,
+    pub sections: Vec[ArtifactBinarySectionView],
+}
+
+fn copy_artifact_binary_container(value: ArtifactBinaryContainerView) -> ArtifactBinaryContainer {
+    let sections: Vec[ArtifactBinarySection] = Vec::with_capacity(value.sections.len());
+    for section in value.sections {
+        sections.push(
+            ArtifactBinarySection {
+                id: section.id,
+                version: section.version,
+                flags: section.flags,
+                data: bytes::Bytes::from_slice_copy(section.data),
+            },
+        )
+    }
+    ArtifactBinaryContainer { kind: value.kind, sections }
+}
+
 pub fn decode_artifact_binary_container(data: bytes::Bytes) -> Result[
     ArtifactBinaryContainer,
     string,
 ] {
-    let reader = new_artifact_binary_reader(data);
+    decode_artifact_binary_container_view(data.as_slice()).map(copy_artifact_binary_container)
+}
+
+pub fn decode_verified_artifact_binary_container(data: bytes::Bytes) -> Result[
+    ArtifactBinaryContainer,
+    string,
+] {
+    decode_verified_artifact_binary_container_view(data.as_slice()).map(
+        copy_artifact_binary_container,
+    )
+}
+
+pub fn decode_artifact_binary_container_view(data: Slice[byte]) -> Result[
+    ArtifactBinaryContainerView,
+    string,
+] {
+    decode_artifact_binary_container_checked(data, true)
+}
+
+pub fn decode_verified_artifact_binary_container_view(data: Slice[byte]) -> Result[
+    ArtifactBinaryContainerView,
+    string,
+] {
+    decode_artifact_binary_container_checked(data, false)
+}
+
+pub fn artifact_binary_find_section_view(value: ArtifactBinaryContainerView, id: u16) -> Option[
+    ArtifactBinarySectionView,
+] {
+    for section in value.sections {
+        if section.id == id {
+            return Option::Some(section)
+        }
+    }
+    Option::None
+}
+
+fn decode_artifact_binary_container_checked(data: Slice[byte], verify_checksums: bool) -> Result[
+    ArtifactBinaryContainerView,
+    string,
+] {
+    let reader = new_artifact_binary_slice_reader(data);
     let magic = artifact_binary_read_raw_bytes(reader, 8)?;
     if !artifact_binary_bytes_equal(magic, artifact_binary_magic()) {
         return Err("invalid binary artifact magic")
@@ -244,14 +302,14 @@ pub fn decode_artifact_binary_container(data: bytes::Bytes) -> Result[
         let hash = artifact_binary_read_raw_bytes(reader, 32)?;
         directory.push(ArtifactBinaryDirectoryEntry { id, version, flags, offset, length, hash })
     }
-    let payload = bytes::Bytes::with_capacity(payload_length);
-    for index in 0..payload_length {
-        payload.push(data.get(payload_offset + index))
-    }
-    if !artifact_binary_bytes_equal(payload_hash, artifact_binary_sha256(payload)) {
+    if verify_checksums
+        && !artifact_binary_bytes_equal(
+            payload_hash,
+            artifact_binary_sha256_slice(data.sub(payload_offset, data.len())),
+        ) {
         return Err("binary artifact payload checksum mismatch")
     }
-    let result: Vec[ArtifactBinarySection] = Vec::new();
+    let result: Vec[ArtifactBinarySectionView] = Vec::new();
     let mut previous_end = payload_offset;
     for entry in directory {
         let offset = entry.offset;
@@ -259,15 +317,13 @@ pub fn decode_artifact_binary_container(data: bytes::Bytes) -> Result[
         if offset != previous_end || length > data.len() - offset {
             return Err("invalid binary artifact section range")
         }
-        let section_data = bytes::Bytes::with_capacity(length);
-        for item in 0..length {
-            section_data.push(data.get(offset + item))
-        }
-        if !artifact_binary_bytes_equal(entry.hash, artifact_binary_sha256(section_data)) {
+        let section_data = data.sub(offset, offset + length);
+        if verify_checksums
+            && !artifact_binary_bytes_equal(entry.hash, artifact_binary_sha256_slice(section_data)) {
             return Err("binary artifact section checksum mismatch")
         }
         result.push(
-            ArtifactBinarySection {
+            ArtifactBinarySectionView {
                 id: entry.id,
                 version: entry.version,
                 flags: entry.flags,
@@ -279,7 +335,7 @@ pub fn decode_artifact_binary_container(data: bytes::Bytes) -> Result[
     if previous_end != data.len() {
         Err("invalid binary artifact section coverage")
     } else {
-        Ok(ArtifactBinaryContainer { kind, sections: result })
+        Ok(ArtifactBinaryContainerView { kind, sections: result })
     }
 }
 

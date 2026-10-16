@@ -1,0 +1,318 @@
+package wire;
+
+use std::collections;
+
+struct ArtifactBinaryNode {
+    tag: u8,
+    next: isize,
+    value: isize,
+    name: isize,
+}
+
+pub struct ArtifactBinaryValue {
+    nodes: Vec[ArtifactBinaryNode],
+    encoded_nodes: Slice[byte],
+    error: Ref[Option[string]],
+    depth: isize,
+    strings: Vec[string],
+    numbers: Vec[string],
+    index: isize,
+}
+
+pub struct ArtifactObject {
+    value: ArtifactValue,
+}
+
+pub struct ArtifactArray {
+    value: ArtifactValue,
+}
+
+fn artifact_binary_view_string_id(reader: ArtifactBinaryReader, strings: Vec[string]) -> Result[
+    isize,
+    string,
+] {
+    let index = artifact_binary_read_length(reader)?;
+    if index >= strings.len() {
+        Result::Err(artifact_binary_reader_error(reader, "string table index out of bounds"))
+    } else {
+        Result::Ok(index)
+    }
+}
+
+fn artifact_binary_index_value(
+    reader: ArtifactBinaryReader,
+    value: ArtifactBinaryValue,
+    name: isize,
+    depth: isize,
+) -> Result[(), string] {
+    if depth > 4096 {
+        return Result::Err("binary artifact value nesting exceeds limit")
+    }
+    let tag = artifact_binary_read_u8(reader)?;
+    let index = value.nodes.len();
+    value.nodes.push(ArtifactBinaryNode { tag, next: index + 1, value: 0, name });
+    let mut payload = 0;
+    if tag == 3 {
+        payload = value.numbers.len();
+        value.numbers.push(artifact_binary_read_string(reader)?);
+    } else if tag == 4 {
+        payload = artifact_binary_view_string_id(reader, value.strings)?;
+    } else if tag == 5 || tag == 6 {
+        payload = artifact_binary_read_u32(reader)?.to_isize();
+        if payload > 10000000 {
+            return Result::Err("binary artifact container exceeds limit")
+        }
+        let width = if tag == 6 {
+            2
+        } else {
+            1
+        };
+        if payload > artifact_binary_reader_remaining(reader) / width {
+            return Result::Err("binary artifact container exceeds remaining input")
+        }
+        let names: Option[collections::HashSet[isize]] = if tag == 6 && payload > 32 {
+            Option::Some(collections::HashSet::new())
+        } else {
+            Option::None
+        };
+        for _ in 0..payload {
+            let child_name = if tag == 6 {
+                let child_name = artifact_binary_view_string_id(reader, value.strings)?;
+                if let Some(names) = names {
+                    if !names.insert(child_name) {
+                        return Result::Err("duplicate binary artifact object field")
+                    }
+                } else {
+                    let mut sibling = index + 1;
+                    while sibling < value.nodes.len() {
+                        if value.nodes[sibling].name == child_name {
+                            return Result::Err("duplicate binary artifact object field")
+                        }
+                        sibling = value.nodes[sibling].next;
+                    }
+                }
+                child_name
+            } else {
+                -1
+            };
+            artifact_binary_index_value(reader, value, child_name, depth + 1)?;
+        }
+    } else if tag > 6 {
+        return Result::Err(artifact_binary_reader_error(reader, "invalid value tag"))
+    }
+    value.nodes[index] = ArtifactBinaryNode { tag, next: value.nodes.len(), value: payload, name };
+    Result::Ok(())
+}
+
+fn artifact_binary_value_at(value: ArtifactBinaryValue, index: isize) -> ArtifactValue {
+    if value.depth > 4096 {
+        value.error.set(Option::Some("binary artifact value nesting exceeds limit"));
+        return ArtifactValue::Null;
+    }
+    let node = artifact_binary_node(value, index);
+    match node.tag {
+        0 => ArtifactValue::Null,
+        1 => ArtifactValue::Bool(false),
+        2 => ArtifactValue::Bool(true),
+        3 => ArtifactValue::Number(value.numbers[node.value]),
+        4 => ArtifactValue::String(value.strings[node.value]),
+        5 | 6 => ArtifactValue::Indexed(
+            ArtifactBinaryValue {
+                nodes: value.nodes,
+                encoded_nodes: value.encoded_nodes,
+                error: value.error,
+                depth: value.depth + 1,
+                strings: value.strings,
+                numbers: value.numbers,
+                index,
+            },
+        ),
+        _ => ArtifactValue::Null,
+    }
+}
+
+fn index_artifact_binary_value(table: ArtifactBinaryStringTable, data: Slice[byte]) -> Result[
+    ArtifactBinaryValue,
+    string,
+] {
+    let reader = new_artifact_binary_slice_reader(data);
+    let value = ArtifactBinaryValue {
+        nodes: Vec::with_capacity(data.len() / 12),
+        encoded_nodes: Vec::new().as_slice(),
+        error: Ref::new(Option::None),
+        depth: 0,
+        strings: table.interner.values,
+        numbers: Vec::new(),
+        index: 0,
+    };
+    artifact_binary_index_value(reader, value, -1, 0)?;
+    if artifact_binary_reader_remaining(reader) != 0 {
+        return Result::Err("trailing bytes in binary artifact value")
+    }
+    Result::Ok(value)
+}
+
+pub fn artifact_value_materialize_head(value: ArtifactValue) -> ArtifactValue {
+    match value {
+        Indexed(view) => if artifact_binary_node(view, view.index).tag == 6 {
+            let fields: Vec[(string, ArtifactValue)] = Vec::with_capacity(
+                artifact_binary_node(view, view.index).value,
+            );
+            let object = ArtifactObject { value };
+            for field in object {
+                fields.push(field)
+            }
+            ArtifactValue::Object(fields)
+        } else {
+            let items: Vec[ArtifactValue] = Vec::with_capacity(
+                artifact_binary_node(view, view.index).value,
+            );
+            let array = ArtifactArray { value };
+            for item in array {
+                items.push(item)
+            }
+            ArtifactValue::Array(items)
+        },
+        _ => value,
+    }
+}
+
+pub fn artifact_object_from_fields(fields: Vec[(string, ArtifactValue)]) -> ArtifactObject {
+    ArtifactObject { value: ArtifactValue::Object(fields) }
+}
+
+impl ArtifactObject {
+    pub fn len(self: ArtifactObject) -> isize {
+        match self.value {
+            Object(fields) => fields.len(),
+            Indexed(view) => artifact_binary_node(view, view.index).value,
+            _ => 0,
+        }
+    }
+
+    pub fn is_empty(self: ArtifactObject) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(self: ArtifactObject, index: isize) -> (string, ArtifactValue) {
+        match self.value {
+            Object(fields) => fields[index],
+            Indexed(view) => {
+                let mut child = view.index + 1;
+                for _ in 0..index {
+                    child = artifact_binary_node(view, child).next;
+                };
+                (artifact_binary_field_name(view, child), artifact_binary_value_at(view, child))
+            },
+            _ => ("", ArtifactValue::Null),
+        }
+    }
+
+    pub fn iter(self: ArtifactObject) -> FnIterator[(string, ArtifactValue)] {
+        let mut index = 0;
+        let mut child = match self.value {
+            Indexed(view) => view.index + 1,
+            _ => 0,
+        };
+        FnIterator::from_fn(
+            || {
+                if index >= self.len() {
+                    return Option::None
+                }
+                let item = match self.value {
+                    Indexed(view) => {
+                        let item = (
+                            artifact_binary_field_name(view, child),
+                            artifact_binary_value_at(view, child),
+                        );
+                        child = artifact_binary_node(view, child).next;
+                        item
+                    },
+                    _ => self.get(index),
+                };
+                index = index + 1;
+                Option::Some(item)
+            },
+        )
+    }
+}
+
+impl IntoIterator for ArtifactObject {
+    type Item = (string, ArtifactValue);
+
+    type IntoIter = FnIterator[(string, ArtifactValue)];
+
+    fn into_iter(self: ArtifactObject) -> FnIterator[(string, ArtifactValue)] {
+        self.iter()
+    }
+}
+
+impl ArtifactArray {
+    pub fn len(self: ArtifactArray) -> isize {
+        match self.value {
+            Array(items) => items.len(),
+            Indexed(view) => artifact_binary_node(view, view.index).value,
+            _ => 0,
+        }
+    }
+
+    pub fn is_empty(self: ArtifactArray) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(self: ArtifactArray, index: isize) -> ArtifactValue {
+        match self.value {
+            Array(items) => items[index],
+            Indexed(view) => {
+                let mut child = view.index + 1;
+                for _ in 0..index {
+                    child = artifact_binary_node(view, child).next;
+                }
+                artifact_binary_value_at(view, child)
+            },
+            _ => ArtifactValue::Null,
+        }
+    }
+
+    pub fn iter(self: ArtifactArray) -> FnIterator[ArtifactValue] {
+        let mut index = 0;
+        let mut child = match self.value {
+            Indexed(view) => view.index + 1,
+            _ => 0,
+        };
+        FnIterator::from_fn(
+            || {
+                if index >= self.len() {
+                    return Option::None
+                }
+                let item = match self.value {
+                    Indexed(view) => {
+                        let item = artifact_binary_value_at(view, child);
+                        child = artifact_binary_node(view, child).next;
+                        item
+                    },
+                    _ => self.get(index),
+                };
+                index = index + 1;
+                Option::Some(item)
+            },
+        )
+    }
+}
+
+impl IntoIterator for ArtifactArray {
+    type Item = ArtifactValue;
+
+    type IntoIter = FnIterator[ArtifactValue];
+
+    fn into_iter(self: ArtifactArray) -> FnIterator[ArtifactValue] {
+        self.iter()
+    }
+}
+
+pub fn decode_artifact_binary_value_view(table: ArtifactBinaryStringTable, data: Slice[byte]) -> Result[
+    ArtifactValue,
+    string,
+] {
+    Result::Ok(artifact_binary_value_at(index_artifact_binary_value(table, data)?, 0))
+}

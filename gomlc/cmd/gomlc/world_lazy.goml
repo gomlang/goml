@@ -1,0 +1,218 @@
+package main;
+
+use module::artifact::core_codec as core_codec;
+use module::artifact::builtin_codec as builtin_codec;
+use module::artifact::interface_codec as interface_codec;
+use module::artifact::wire as wire;
+use module::resources;
+use module::version;
+use std::bytes;
+use std::fs;
+use std::path;
+use module::checker;
+
+fn world_view_section(value: wire::ArtifactBinaryContainerView, id: u16, version: u16) -> Result[
+    wire::ArtifactBinarySectionView,
+    string,
+] {
+    let section = wire::artifact_binary_find_section_view(value, id).ok_or(
+        "world artifact is missing a required section",
+    )?;
+    if section.version != version || section.flags != wire::required_section_flag() {
+        Result::Err("invalid world artifact section")
+    } else {
+        Result::Ok(section)
+    }
+}
+
+fn world_lazy_package(value: DeferredWorldPackage, load_core: bool) -> Result[
+    ToolchainPackage,
+    string,
+] {
+    let interface = interface_codec::decode_verified_binary_view(value.interface_data)?;
+    if interface.package_name != value.name {
+        return Result::Err("world artifact package identity does not match")
+    }
+    if load_core {
+        let core = core_codec::decode_verified_binary_view(value.core_data)?;
+        if core.package_name != interface.package_name
+            || core.interface_hash != interface.interface_hash
+            || !world_dependencies_equal(core.deps, interface.deps) {
+            return Result::Err("world artifact package identity does not match")
+        }
+        value.core_loaded.set(true);
+        Result::Ok(
+            ToolchainPackage {
+                core_value: core.core_ir,
+                interface_unit: interface,
+                environment_exports: core.exports,
+            },
+        )
+    } else {
+        let types = artifact_dependency_core_types(Vec::from_array([interface]));
+        Result::Ok(
+            ToolchainPackage {
+                core_value: types[0],
+                interface_unit: interface,
+                environment_exports: interface.exports,
+            },
+        )
+    }
+}
+
+fn decode_package_world_lazy(data: bytes::Bytes) -> Result[PackageWorld, string] {
+    decode_package_world_for_command(data, true, false)
+}
+
+fn decode_package_world_for_command(data: bytes::Bytes, verify_checksums: bool, load_core: bool) -> Result[
+    PackageWorld,
+    string,
+] {
+    let container = if verify_checksums {
+        wire::decode_artifact_binary_container_view(data.as_slice())?
+    } else {
+        wire::decode_verified_artifact_binary_container_view(data.as_slice())?
+    };
+    if container.kind != 3 {
+        return Result::Err("binary artifact is not a compiler world")
+    }
+    let metadata_section = world_view_section(container, 1, 2)?;
+    let metadata = world_decode_metadata_v2(bytes::Bytes::from_slice_copy(metadata_section.data))?;
+    if metadata.artifact_format != WORLD_ARTIFACT_FORMAT {
+        return Result::Err("world artifact format does not match compiler")
+    }
+    if metadata.compiler_abi != WORLD_COMPILER_ABI {
+        return Result::Err("world compiler ABI does not match compiler")
+    }
+    if metadata.compiler_identity != version::current() {
+        return Result::Err("world compiler identity does not match compiler")
+    }
+    if metadata.builtin_package != "builtin" || metadata.prelude_package != "prelude" {
+        return Result::Err("world builtin or prelude package identity does not match")
+    }
+    let names = Vec::from_array(["builtin", "prelude"]);
+    for spec in resources::standard_package_specs() {
+        names.push(spec.name)
+    }
+    let names = wire::sort_artifact_names(names);
+    if metadata.package_count != names.len() || container.sections.len() != 2 + names.len() * 2 {
+        return Result::Err("world artifact package section count does not match")
+    }
+    let builtin_metadata = builtin_codec::decode(world_view_section(container, 65535, 1)?.data)?;
+    let deferred: Vec[DeferredWorldPackage] = Vec::new();
+    let initial: Vec[ToolchainPackage] = Vec::new();
+    for index in 0..names.len() {
+        let entry = DeferredWorldPackage {
+            name: names[index],
+            interface_data: world_view_section(container, (2 + index * 2).to_u16(), 1)?.data,
+            core_data: world_view_section(container, (3 + index * 2).to_u16(), 1)?.data,
+            core_loaded: Ref::new(false),
+        };
+        if entry.name == "builtin" || entry.name == "prelude" {
+            initial.push(world_lazy_package(entry, load_core)?);
+        } else {
+            deferred.push(entry);
+        }
+    }
+    let builtin = world_required_package(initial, "builtin")?;
+    let prelude = world_required_package(initial, "prelude")?;
+    if !artifact_interface_has_dependency(
+        prelude.interface_unit,
+        "builtin",
+        builtin.interface_unit.interface_hash,
+    ) {
+        return Result::Err("world artifact prelude builtin dependency does not match")
+    }
+    Result::Ok(
+        PackageWorld {
+            builtin_metadata,
+            deferred,
+            counter: Ref::new(metadata.counter),
+            source_digest: metadata.source_digest,
+            builtins: builtin.core_value,
+            builtin_interface: builtin.interface_unit,
+            prelude,
+            standard: Vec::new(),
+        },
+    )
+}
+
+fn world_load_standard_package(world: PackageWorld, name: string, load_core: bool) -> Result[
+    (),
+    string,
+] {
+    for entry in world.deferred {
+        if entry.name != name {
+            continue;
+        }
+        if let Some(_) = artifact_standard_package(world.standard, name) {
+            if !load_core || entry.core_loaded.get() {
+                return Result::Ok(())
+            }
+        }
+        let package_value = world_lazy_package(entry, load_core)?;
+        world_validate_standard_dependencies(
+            Vec::from_array([package_value]),
+            world.builtin_interface.interface_hash,
+            world.prelude.interface_unit.interface_hash,
+        )?;
+        let mut replaced = false;
+        for index in 0..world.standard.len() {
+            if world.standard[index].interface_unit.package_name == name {
+                world.standard[index] = package_value;
+                replaced = true;
+                break;
+            }
+        }
+        if !replaced {
+            world.standard.push(package_value)
+        }
+        for dependency in package_value.interface_unit.deps {
+            world_load_standard_package(world, dependency.0, load_core)?;
+            let actual = if dependency.0 == "builtin" {
+                world.builtin_interface.interface_hash
+            } else if dependency.0 == "prelude" {
+                world.prelude.interface_unit.interface_hash
+            } else {
+                world_required_package(world.standard, dependency.0)?.interface_unit.interface_hash
+            };
+            if actual != dependency.1 {
+                return Result::Err("world artifact dependency interface_hash does not match")
+            }
+        }
+        return Result::Ok(())
+    }
+    Result::Ok(())
+}
+
+fn world_load_standard_needs(world: PackageWorld, needs: StandardNeeds, load_core: bool) -> Result[
+    (),
+    string,
+] {
+    for name in selected_standard_package_names(needs) {
+        world_load_standard_package(world, name, load_core)?;
+    }
+    Result::Ok(())
+}
+
+fn read_package_world_lazy(path: string, load_core: bool) -> Result[PackageWorld, string] {
+    let data = fs::read_bytes_structured(path).map_err(
+        |error| f"failed to read compiler world {path}: {error}",
+    )?;
+    let world = decode_package_world_for_command(data, !world_is_installed_path(path), load_core).map_err(
+        |error| "failed to parse compiler world " + path + ": " + error,
+    )?;
+    checker::install_builtin_metadata(world.builtin_metadata)?;
+    Result::Ok(world)
+}
+
+fn world_is_installed_path(value: string) -> bool {
+    let Ok(lib_dir) = resources::toolchain_lib_dir() else {
+        return false;
+    };
+    let expected = path::join(path::join(lib_dir, "compiler"), "compiler-world-v2.gaf");
+    match (fs::canonicalize(value), fs::canonicalize(expected)) {
+        (Ok(actual), Ok(installed)) => actual == installed,
+        _ => false,
+    }
+}
