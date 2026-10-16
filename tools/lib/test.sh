@@ -103,6 +103,17 @@ grep -F -- "--world $temporary/toolchain/lib/compiler/compiler-world-v2.gaf" "$t
 test -f "$temporary/toolchain/smoke/main.interface"
 test -f "$temporary/toolchain/smoke/main.core"
 
+mv "$temporary/toolchain/lib/builtin" "$temporary/toolchain/lib/builtin.saved"
+mv "$temporary/toolchain/lib/prelude" "$temporary/toolchain/lib/prelude.saved"
+(
+    cd "$temporary/project"
+    "$temporary/toolchain/bin/goml" check
+    "$temporary/toolchain/bin/goml" build
+)
+mv "$temporary/toolchain/lib/builtin.saved" "$temporary/toolchain/lib/builtin"
+mv "$temporary/toolchain/lib/prelude.saved" "$temporary/toolchain/lib/prelude"
+
+
 mkdir -p "$temporary/bin"
 cp "$prefix/bin/gomlc" "$temporary/bin/gomlc"
 
