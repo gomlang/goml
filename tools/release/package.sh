@@ -40,7 +40,7 @@ test -f "dist/$package/lib/prelude/goml.toml"
 test -f "dist/$package/lib/std/goml.toml"
 test -f "dist/$package/lib/std/math/LICENSE"
 test -f "dist/$package/lib/std/path/LICENSE"
-test ! -e "dist/$package/lib/compiler/compiler-world-v2.gaf"
+test ! -e "dist/$package/lib/compiler/compiler-world.gaf"
 for tool in goml gomlc gomlfmt gomldoc gomllsp; do
     metadata="$(go version -m "dist/$package/bin/$tool")"
     printf '%s\n' "$metadata" | grep -q "build[[:space:]]GOOS=$target_goos$"

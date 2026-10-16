@@ -90,7 +90,8 @@ done
 bash tools/lib/finalize-toolchain.sh \
     "$stage0_output" \
     "$stage0_output/bin/goml" \
-    "$stage0_output/bin/gomlc"
+    "$stage0_output/bin/gomlc" \
+    compiler-world-v2.gaf
 test -f "$stage0_output/lib/compiler/compiler-world-v2.gaf"
 test ! -e "$stage0_output/lib/compiler/compiler-world-v2.gaf.tmp"
 stage0_fingerprint="$(stage0_tree_fingerprint)"

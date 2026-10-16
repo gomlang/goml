@@ -71,7 +71,9 @@ The package script also supports cross compilation with an explicit target; smok
 
 ## Compiler world loading
 
-Toolchain finalization writes and fully validates `lib/compiler/compiler-world-v2.gaf`. The world contains builtin initialization metadata and indexed package interfaces and Core. The compiler treats the world at its own executable-relative installation path as an immutable toolchain resource: normal loading checks its structure, format, compiler identity and dependency fingerprints without recomputing file checksums. The driver uses the installed world's size and modification time for cache freshness, alongside the compiler fingerprint; it does not rehash the world on every command. Worlds supplied from other paths and finalization validation retain complete checksum verification. Release archives and stage0 downloads retain SHA-256 verification.
+Toolchain finalization writes and fully validates `lib/compiler/compiler-world.gaf`. The world contains builtin initialization metadata and indexed package interfaces and Core. The compiler treats the world at its own executable-relative installation path as an immutable toolchain resource: normal loading checks its structure, format, compiler identity and dependency fingerprints without recomputing file checksums. The driver uses the installed world's size and modification time for cache freshness, alongside the compiler fingerprint; it does not rehash the world on every command. Worlds supplied from other paths and finalization validation retain complete checksum verification. Release archives and stage0 downloads retain SHA-256 verification.
+
+Package artifacts store 12-byte indexed nodes and share identical subtrees, including repeated types, within each package artifact. References point only to completed earlier subtrees; loading validates their bounds and limits value expansion. Only the current artifact schema is supported. Rebuild project artifacts and rerun toolchain finalization after a format change. The pinned stage0 release retains its own world filename and format until stage0 is advanced.
 
 Replace toolchain resources through installation or finalization rather than editing an installed world in place. Normal compilation does not guarantee detection of corruption in the installed world. Changes that preserve its size and modification time can retain a stale driver cache. Package checking loads interfaces, types and compile-time metadata; runtime Core is loaded for linking.
 
@@ -147,9 +149,9 @@ goml-X.Y.Z-<os>-<arch>/
 
 The compiler resolves `lib` relative to its executable. The archive must preserve this layout exactly. `builtin`, `prelude`, and `std` are separate GoML projects; flat `builtin_*.goml` files must not be packaged.
 
-Release archives contain the toolchain project sources and manifests, but do not contain `lib/compiler/compiler-world-v2.gaf`. The installation command above finalizes it once with the binaries from that same archive.
+Release archives contain the toolchain project sources and manifests, but do not contain `lib/compiler/compiler-world.gaf`. The installation command above finalizes it once with the binaries from that same archive.
 
-Finalization builds and validates the compiler world in a temporary path, then atomically installs it at `lib/compiler/compiler-world-v2.gaf`. Normal `goml check`, `goml build`, and `goml test` commands only read that executable-relative world. A missing world is an incomplete installation and must not trigger an implicit source build.
+Finalization builds and validates the compiler world in a temporary path, then atomically installs it at `lib/compiler/compiler-world.gaf`. Normal `goml check`, `goml build`, and `goml test` commands only read that executable-relative world. A missing world is an incomplete installation and must not trigger an implicit source build.
 
 ## Advance stage0
 
