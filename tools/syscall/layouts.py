@@ -32,15 +32,15 @@ def generate(records):
             if ty in WIDTHS:
                 codec = "u64" if ty == "usize" else ty
                 value = f"self.{key}.to_u64()" if ty == "usize" else f"self.{key}"
-                lines.append(f"        let _ = endian::write_{codec}(data.as_mut_slice(), {offset}, {value}, endian::Endian::Little);")
+                lines.append(f"        let _ = endian::write_{codec}(data.as_mut_slice(), {offset}, {value}, Little);")
             else:
                 lines.append(f"        let _ = data.as_mut_slice().copy_from({offset}, self.{key}.encode().as_slice());")
-        lines.extend(["        data", "    }", "", f"    pub fn decode(data: Slice[byte]) -> Result[{name}, endian::BoundsError] {{", f"        require_size(data, {size})?;", f"        Result::Ok({name} {{"])
+        lines.extend(["        data", "    }", "", f"    pub fn decode(data: Slice[byte]) -> Result[{name}, endian::BoundsError] {{", f"        require_size(data, {size})?;", f"        Ok({name} {{"])
         for field in record["fields"]:
             key, ty, offset = field["name"], field["type"], field["offset"]
             if ty in WIDTHS:
                 codec = "u64" if ty == "usize" else ty
-                value = f"endian::read_{codec}(data, {offset}, endian::Endian::Little)?"
+                value = f"endian::read_{codec}(data, {offset}, Little)?"
                 if ty == "usize":
                     value += ".to_usize()"
             else:
