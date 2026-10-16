@@ -67,45 +67,45 @@ mkdir -p "$temporary/toolchain/lib"
 cp -R "$prefix/lib/builtin" "$temporary/toolchain/lib/builtin"
 cp -R "$prefix/lib/prelude" "$temporary/toolchain/lib/prelude"
 cp -R "$prefix/lib/std" "$temporary/toolchain/lib/std"
-test ! -e "$temporary/toolchain/lib/compiler/compiler-world-v2.gaf"
+test ! -e "$temporary/toolchain/lib/compiler/compiler-world.gaf"
 "$temporary/toolchain/bin/goml" __toolchain-finalize --prefix "$temporary/toolchain"
-test -f "$temporary/toolchain/lib/compiler/compiler-world-v2.gaf"
-test ! -e "$temporary/toolchain/lib/compiler/compiler-world-v2.gaf.tmp"
-first_world_hash="$(toolchain_sha256 "$temporary/toolchain/lib/compiler/compiler-world-v2.gaf")"
+test -f "$temporary/toolchain/lib/compiler/compiler-world.gaf"
+test ! -e "$temporary/toolchain/lib/compiler/compiler-world.gaf.tmp"
+first_world_hash="$(toolchain_sha256 "$temporary/toolchain/lib/compiler/compiler-world.gaf")"
 "$temporary/toolchain/bin/goml" __toolchain-finalize --prefix "$temporary/toolchain"
-second_world_hash="$(toolchain_sha256 "$temporary/toolchain/lib/compiler/compiler-world-v2.gaf")"
+second_world_hash="$(toolchain_sha256 "$temporary/toolchain/lib/compiler/compiler-world.gaf")"
 test "$first_world_hash" = "$second_world_hash"
 rm -f "$temporary/toolchain/lib/compiler/finalize-input.sha256"
 bash "$repo_root/tools/lib/finalize-toolchain.sh" \
     "$temporary/toolchain" \
     "$temporary/toolchain/bin/goml" \
     "$temporary/toolchain/bin/gomlc"
-first_world_mtime="$(toolchain_file_stamp "$temporary/toolchain/lib/compiler/compiler-world-v2.gaf")"
+first_world_mtime="$(toolchain_file_stamp "$temporary/toolchain/lib/compiler/compiler-world.gaf")"
 bash "$repo_root/tools/lib/finalize-toolchain.sh" \
     "$temporary/toolchain" \
     "$temporary/toolchain/bin/goml" \
     "$temporary/toolchain/bin/gomlc"
-second_world_mtime="$(toolchain_file_stamp "$temporary/toolchain/lib/compiler/compiler-world-v2.gaf")"
+second_world_mtime="$(toolchain_file_stamp "$temporary/toolchain/lib/compiler/compiler-world.gaf")"
 test "$first_world_mtime" = "$second_world_mtime"
-expected_world_hash="$(toolchain_sha256 "$temporary/toolchain/lib/compiler/compiler-world-v2.gaf")"
-printf '%s\n' invalid > "$temporary/toolchain/lib/compiler/compiler-world-v2.gaf"
+expected_world_hash="$(toolchain_sha256 "$temporary/toolchain/lib/compiler/compiler-world.gaf")"
+printf '%s\n' invalid > "$temporary/toolchain/lib/compiler/compiler-world.gaf"
 bash "$repo_root/tools/lib/finalize-toolchain.sh" \
     "$temporary/toolchain" \
     "$temporary/toolchain/bin/goml" \
     "$temporary/toolchain/bin/gomlc"
-repaired_world_hash="$(toolchain_sha256 "$temporary/toolchain/lib/compiler/compiler-world-v2.gaf")"
+repaired_world_hash="$(toolchain_sha256 "$temporary/toolchain/lib/compiler/compiler-world.gaf")"
 test "$expected_world_hash" = "$repaired_world_hash"
 cp -R "$repo_root/tools/release/testdata/smoke" "$temporary/project"
 (
     cd "$temporary/project"
     "$temporary/toolchain/bin/goml" check --dry-run > "$temporary/project-plan"
 )
-grep -F -- "--world $temporary/toolchain/lib/compiler/compiler-world-v2.gaf" "$temporary/project-plan" >/dev/null
+grep -F -- "--world $temporary/toolchain/lib/compiler/compiler-world.gaf" "$temporary/project-plan" >/dev/null
 "$temporary/toolchain/bin/gomlc" build \
     --package tests::toml \
     --input "$repo_root/gomlc/testdata/module/project055_toml/main.goml" \
     --output "$temporary/toolchain/smoke/main" \
-    --world "$temporary/toolchain/lib/compiler/compiler-world-v2.gaf"
+    --world "$temporary/toolchain/lib/compiler/compiler-world.gaf"
 test -f "$temporary/toolchain/smoke/main.interface"
 test -f "$temporary/toolchain/smoke/main.core"
 
