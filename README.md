@@ -10,7 +10,14 @@ GoML is statically typed and garbage-collected, with Rust-like syntax, monomorph
 
 ## Get started
 
-[Install the toolchain](docs/releasing.md#installation) for Linux amd64 or macOS arm64. Building programs requires a Go toolchain.
+[Install the toolchain](docs/releasing.md#installation) for Linux amd64 or macOS arm64. Install Go 1.26 or newer first, then run:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gomlang/install/main/install.sh -o install-goml.sh && sh install-goml.sh
+export PATH="${GOML_HOME:-$HOME/.goml}/bin:$PATH"
+```
+
+The [installer](https://github.com/gomlang/install) downloads the latest release, verifies its checksum, and initializes the toolchain. Add the printed PATH command to your shell configuration.
 
 ```sh
 goml new hello
