@@ -115,7 +115,7 @@ Public APIs include:
 
 `std::error` provides the common protocol used by structured standard-library errors. `Error` is a marker trait requiring `Debug` and `ToString`. `ErrorKind` defines stable, message-independent categories including missing files, permission failures, invalid input or data, timeouts, interruption, short I/O, broken pipes, unsupported operations, and `Other`.
 
-`Error` has a blanket implementation for every value implementing `Debug` and `ToString`, so domain errors participate in the common protocol directly.
+`Error` has a blanket implementation for every value implementing `Debug` and `ToString`, so domain errors participate in the common protocol directly. Domain enums can derive both traits and customize user-facing messages with per-variant `#[to_string("...")]` templates; see [attributes and derive](goml.md#attributes-and-derive). These templates affect `ToString` only: `Debug` and serialization retain their own representations.
 
 `Report[E]` preserves typed leaf errors while adding an immutable tree of context and aggregation. `Report::new(value)` creates a leaf; `.context(message)` returns a new parent without changing the original. `Report::join(Slice[Report[E]])` snapshots the supplied sequence, preserves order and duplicates, and returns None for an empty sequence. A singleton remains an aggregate with one cause. Use a domain enum for heterogeneous leaf variants; this API does not erase types or perform reflective downcasts.
 
@@ -166,8 +166,8 @@ fn example() -> string {
     let value = error::Details::new(
         error::kind_code(error::ErrorKind::NotFound),
         "read",
-        Option::Some("missing.txt"),
-        Option::None,
+        Some("missing.txt"),
+        None,
         "file does not exist",
     );
     describe(value)
@@ -195,12 +195,12 @@ fn decode_stream(input: Slice[byte]) -> Result[Vec[char], utf8::DecoderError] {
     let decoder = utf8::Decoder::new();
     let output = Vec::new();
     for value in input {
-        if let Option::Some(character) = decoder.feed(value)? {
+        if let Some(character) = decoder.feed(value)? {
             output.push(character);
         }
     }
     decoder.finish()?;
-    Result::Ok(output)
+    Ok(output)
 }
 ```
 
@@ -360,7 +360,7 @@ fn repair_byte_runs_example() -> Result[bytes::Bytes, bytes::TransformError] {
 
 The stateful `Reader`, `Writer`, and `Builder` provide typed methods for `bool`, `u8/u16/u32/u64`, `i8/i16/i32/i64`, and `f32/f64`. Multibyte methods take explicit endianness. Reader and Writer methods advance only after success, with copies sharing the cursor; failed bounds checks leave both position and destination unchanged. Floating-point methods preserve IEEE bit patterns, including signed zero and NaN payloads. Top-level functions take an explicit offset and do not advance any cursor.
 
-Boolean `read_bool` and `write_bool` operations occupy one byte without an endianness argument: zero decodes to false and every nonzero byte to true; writing produces only zero or one. These operations are available as memory functions, cursor/builder methods, and `std::bytes::endian::stream::{read_bool, write_bool}` with the same EOF, error-propagation and partial-progress contracts as other fixed-width stream functions. For example, `builder.write_bool(true)` appends one byte and `reader.read_i16(endian::Endian::Big)` reads a signed two-byte value. These ordinary methods introduce no syntax or implicit struct layout.
+Boolean `read_bool` and `write_bool` operations occupy one byte without an endianness argument: zero decodes to false and every nonzero byte to true; writing produces only zero or one. These operations are available as memory functions, cursor/builder methods, and `std::bytes::endian::stream::{read_bool, write_bool}` with the same EOF, error-propagation and partial-progress contracts as other fixed-width stream functions. For example, `builder.write_bool(true)` appends one byte and `reader.read_i16(Big)` reads a signed two-byte value. These ordinary methods introduce no syntax or implicit struct layout.
 
 `Reader::read_with[T](width, decode)` composes an explicit fixed-width record or array layout. The callback `(Reader) -> Result[T, BoundsError]` receives an independent cursor over exactly that block. The complete outer range is checked before invoking it. Success advances the outer cursor by the declared width, skipping any unread padding; failure leaves the outer cursor unchanged. Nested errors retain offsets and lengths relative to the nested view where they arose, while the initial range error describes the outer view.
 
@@ -373,15 +373,15 @@ use std::bytes::endian;
 
 fn read_header(reader: endian::Reader) -> Result[(u16, bool), endian::BoundsError] {
     reader.read_with(4, |block: endian::Reader| {
-        let version = block.read_u16(endian::Endian::Big)?;
+        let version = block.read_u16(Big)?;
         let enabled = block.read_bool()?;
-        Result::Ok((version, enabled))
+        Ok((version, enabled))
     })
 }
 
 fn write_header(writer: endian::Writer, version: u16, enabled: bool) -> Result[(), endian::BoundsError] {
     writer.write_with(4, |block: endian::Writer| {
-        block.write_u16(version, endian::Endian::Big)?;
+        block.write_u16(version, Big)?;
         block.write_bool(enabled)
     })
 }
@@ -399,7 +399,7 @@ Import `std::bytes::endian::stream` for `read_uvarint(reader: R) -> Result[Optio
 
 The same package exposes `read_u8/i8(reader)`, `read_u16/i16/u32/i32/u64/i64/f32/f64(reader, order)` and corresponding `write_*` functions taking `(writer, value)` or `(writer, value, order)`. Here `order` is `endian::Endian::{Little, Big}`. Each read returns `Result[Option[T], stream::ReadError]` for its scalar type; each write returns `Result[(), io::Error]`. Integer and IEEE floating-point bit encodings reuse the memory codecs, including signed zero and NaN payloads, without native algorithm calls or reflection.
 
-Fixed-width reads fill at most the remaining field width using one buffer of one, two, four or eight bytes, return every error including `Interrupted` and validate each reported count. EOF before any byte returns `None`; EOF after a prefix returns `ReadError::Io(error, count)` with `UnexpectedEof` and the successfully read prefix length. Other I/O errors keep their original details with that same progress convention. A successful read consumes exactly the field width, leaving subsequent fields untouched. Fixed-width writes fully encode before calling `write_all`, retain the destination's retry policy and never flush or close it. For example, `stream::read_u32(reader, endian::Endian::Big)` reads an optional four-byte big-endian field. These are ordinary generic functions, not a new binary-layout language.
+Fixed-width reads fill at most the remaining field width using one buffer of one, two, four or eight bytes, return every error including `Interrupted` and validate each reported count. EOF before any byte returns `None`; EOF after a prefix returns `ReadError::Io(error, count)` with `UnexpectedEof` and the successfully read prefix length. Other I/O errors keep their original details with that same progress convention. A successful read consumes exactly the field width, leaving subsequent fields untouched. Fixed-width writes fully encode before calling `write_all`, retain the destination's retry policy and never flush or close it. For example, `stream::read_u32(reader, Big)` reads an optional four-byte big-endian field. These are ordinary generic functions, not a new binary-layout language.
 
 For explicit aggregate layouts, `stream::read_with(reader, width, limit, decode)` and `stream::write_with(writer, width, limit, encode)` accept the same bounded endian Reader/Writer callbacks as memory blocks. The nonnegative per-record byte limit is checked before allocation, callback invocation or I/O; invalid parameters return `InvalidInput` (with zero read progress). Each operation stages exactly `width` bytes, with the same zero padding and trailing-field rules as memory blocks. Reads fill the block before decoding, stop on every read error and never consume the following record; clean EOF returns `None`, a partial block returns `UnexpectedEof` with confirmed progress, and a callback bounds error becomes `InvalidData` with progress equal to the whole consumed block. This error includes the callback bounds diagnostic, not a rollback of the stream. A zero-width read invokes the decoder and returns `Some(value)` without probing EOF; do not use it as an EOF-driven loop condition.
 
@@ -422,7 +422,7 @@ fn encoded_integer() -> bytes::Bytes {
 
 ## Text and source positions
 
-Text search indices are UTF-8 byte offsets, matching the indices accepted by the built-in string APIs. `starts_with_at` returns false for out-of-range and non-character-boundary offsets. `rfind` returns the last matching byte offset. Trimming recognizes ASCII whitespace. Splitting on an empty separator returns the original string as one item, while `split_once` with an empty separator returns `Option::None`.
+Text search indices are UTF-8 byte offsets, matching the indices accepted by the built-in string APIs. `starts_with_at` returns false for out-of-range and non-character-boundary offsets. `rfind` returns the last matching byte offset. Trimming recognizes ASCII whitespace. Splitting on an empty separator returns the original string as one item, while `split_once` with an empty separator returns `None`.
 
 `text::LineIndex` precomputes line starts and non-ASCII scalar positions for repeated source-position conversion. `offset_to_line_column` and `line_column_to_offset` support UTF-8, UTF-16, and UTF-32 columns, treat CRLF as one line ending, and clamp unchecked out-of-range positions. `line_column_to_offset_checked` rejects positions inside an encoded scalar or outside the source.
 
@@ -638,7 +638,7 @@ fn legacy_word_title_checked(
         |character: char| {
             let boundary = legacy_title_separator(previous.get());
             previous.set(character);
-            Option::Some(
+            Some(
                 if boundary {
                     unicode::to_titlecase(character)
                 } else {
@@ -747,7 +747,7 @@ fn message(value: i64) -> Result[string, format::Error] {
         radix: 16, alternate: true, min_digits: 4,
         ..format::IntSpec::plain()
     })?;
-    Result::Ok(output.finish())
+    Ok(output.finish())
 }
 ```
 
@@ -1019,7 +1019,7 @@ fn hash_output[W: Write](writer: W, data: Slice[byte]) -> Result[bytes::Bytes, i
     let output = stream::Writer::new(writer, digest);
     output.write_all(data)?;
     output.flush()?;
-    Result::Ok(digest.sum())
+    Ok(digest.sum())
 }
 ```
 
@@ -1077,7 +1077,7 @@ fn edit(values: Vec[isize]) -> Result[(), collections::SequenceError] {
     for chunk in chunks {
         println(chunk.len());
     }
-    Result::Ok(())
+    Ok(())
 }
 ```
 
@@ -1176,8 +1176,8 @@ fn main() -> () {
     println(slash::clean("docs/../images//icon.png"));
     println(slash::join(Vec::from_array(["docs", "guide", "../index.md"])));
     match matches_docs("docs/index.md") {
-        Result::Ok(matched) => println(matched),
-        Result::Err(error) => println(error.to_string()),
+        Ok(matched) => println(matched),
+        Err(error) => println(error.to_string()),
     }
 }
 ```
@@ -1196,7 +1196,7 @@ Decoding is strict and all-or-error: the standard variants reject lowercase, whi
 
 `Encoding::new(alphabet: string, padding: Option[byte]) -> Result[Encoding, ConfigError]` constructs a reusable immutable configuration and decoding table. The alphabet must have exactly 32 distinct ASCII bytes, excluding CR/LF; an optional padding byte must also be ASCII, exclude CR/LF and not appear in the alphabet. This explicit ASCII restriction keeps every encoded result a valid GoML string; it is narrower than Go's arbitrary-byte alphabet. NUL, spaces and tabs may be deliberately configured and are then literal symbols, never ignored whitespace. `ConfigError` distinguishes invalid length, invalid/duplicate symbol byte offsets and invalid padding.
 
-`Encoding::from_variant(variant)` provides the established alphabets and padding settings. `alphabet()` and `padding()` inspect a configuration; `with_padding(option)` returns a newly validated configuration without changing the original. `.encode(bytes)` and `.decode(text)` share the standard algorithm and canonical trailing-bit checks. With no padding, `=` may be an alphabet digit; otherwise a stray `=` remains rejected. For example, `Encoding::new("abcdefghijklmnopqrstuvwxyz234567", Option::Some(b'!'))` creates a lowercase alphabet with exclamation padding. Free functions and Variant retain their previous results and errors. These APIs use ordinary structs, enums, methods and generic containers without syntax changes.
+`Encoding::from_variant(variant)` provides the established alphabets and padding settings. `alphabet()` and `padding()` inspect a configuration; `with_padding(option)` returns a newly validated configuration without changing the original. `.encode(bytes)` and `.decode(text)` share the standard algorithm and canonical trailing-bit checks. With no padding, `=` may be an alphabet digit; otherwise a stray `=` remains rejected. For example, `Encoding::new("abcdefghijklmnopqrstuvwxyz234567", Some(b'!'))` creates a lowercase alphabet with exclamation padding. Free functions and Variant retain their previous results and errors. These APIs use ordinary structs, enums, methods and generic containers without syntax changes.
 
 `Encoding::encoded_len(input_length)` computes the exact padded or raw output byte length without allocating output and returns `Result[isize, OutputError]`; negative lengths and arithmetic overflow are recoverable errors. `.encode_checked(input, max_bytes)` rejects negative limits and excessive/overflowing output before encoding. `.decode_checked(input, max_bytes)` checks padding/length shape and the resulting decoded length before allocating the output buffer, then performs the usual digit and canonical-bit validation. Exact limits succeed; failures return no partial result. Free `encode_checked` and `decode_checked` functions use the standard padded configuration. Custom alphabets use the methods on their Encoding value.
 
@@ -1349,7 +1349,7 @@ memory, and does not make allocation failure recoverable.
 use std::fs;
 
 fn describe_pipe() -> Result[string, fs::Error] {
-    let mode = fs::FileMode::from_parts(fs::NodeKind::NamedPipe, 0o600, Option::None);
+    let mode = fs::FileMode::from_parts(NamedPipe, 0o600, None);
     let metadata = fs::Metadata::from_mode(mode, 0, 0);
     fs::format_metadata("events", metadata, 256)
 }
@@ -1552,10 +1552,10 @@ where F::Handle: ReadDirFile {
     };
     fs::walk_from(filesystem, ".", limits, |path, _, error| {
         if let Some(error) = error {
-            Result::Err(error)
+            Err(error)
         } else {
             println(path);
-            Result::Ok(fs::WalkControl::Continue)
+            Ok(Continue)
         }
     })
 }
@@ -1935,7 +1935,7 @@ Import `std::resource` for explicit cleanup of resources managed by libraries. `
 use std::resource;
 
 fn run_job() -> Result[isize, resource::ScopeError[string, string]] {
-    resource::with_cleanup(|| Result::Ok(42), || Result::Ok(()))
+    resource::with_cleanup(|| Ok(42), || Ok(()))
 }
 ```
 
@@ -2726,7 +2726,7 @@ output bytes) and do not promise allocation-free conversion. Existing parsing,
 scalar decimal to_string and floating-point behavior are unchanged. No grammar or
 compiler/runtime intrinsic is added.
 
-Numeric parsing returns `Result[_, num::ParseIntError]` or `Result[_, num::ParseFloatError]`. Integer radix parsing accepts radix `0` or `2..36`; radix `0` recognizes `0b`, `0o`, and `0x` prefixes and permits Go-style digit separators. Invalid radices, malformed input, and overflow return `Result::Err`. Floating-point parsing supports decimal and hexadecimal IEEE 754 input, signed exponents, digit separators, `inf`, `infinity`, and `NaN`, and rounds directly to the requested `f32` or `f64` width.
+Numeric parsing returns `Result[_, num::ParseIntError]` or `Result[_, num::ParseFloatError]`. Integer radix parsing accepts radix `0` or `2..36`; radix `0` recognizes `0b`, `0o`, and `0x` prefixes and permits Go-style digit separators. Invalid radices, malformed input, and overflow return `Err`. Floating-point parsing supports decimal and hexadecimal IEEE 754 input, signed exponents, digit separators, `inf`, `infinity`, and `NaN`, and rounds directly to the requested `f32` or `f64` width.
 
 `ParseFloatError::is_range()` distinguishes numeric overflow from malformed
 syntax for `parse_float32_structured` and `parse_float64_structured`. Overflow
@@ -2888,9 +2888,9 @@ fn process_id() -> Result[usize, string] {
         |error| error.to_string(),
     )?;
     if result.is_ok() {
-        Result::Ok(result.r1)
+        Ok(result.r1)
     } else {
-        Result::Err("getpid errno " + result.errno.to_string())
+        Err("getpid errno " + result.errno.to_string())
     }
 }
 ```
@@ -3042,7 +3042,7 @@ use std::os::linux::process;
 fn child_status() -> Result[isize, process::Error] {
     let child = process::Command::new("/bin/sh").arg("-c").arg("exit 7").spawn()?;
     let result = child.wait()?;
-    Result::Ok(result.status.exit_code().unwrap_or(-1))
+    Ok(result.status.exit_code().unwrap_or(-1))
 }
 ```
 
@@ -3078,7 +3078,7 @@ fn mapped_bytes() -> Result[Vec[byte], memory::Error] {
     region.write_all_at(b"hello".as_slice(), 0)?;
     let output = b"?????";
     region.read_exact_at(output.as_mut_slice(), 0)?;
-    Result::Ok(output)
+    Ok(output)
 }
 ```
 
@@ -3149,7 +3149,7 @@ use std::net::url;
 fn resolve_link(base: string, link: string) -> Result[string, url::ParseError] {
     let base = url::Reference::parse(base, 4096)?;
     let reference = url::Reference::parse(link, 4096)?;
-    Result::Ok(base.resolve(reference, 8192)?.to_string())
+    Ok(base.resolve(reference, 8192)?.to_string())
 }
 ```
 
@@ -3645,7 +3645,7 @@ fn round_trip(value: Message) -> Result[Message, string] {
         encoded.slice(0, encoded.len()),
         bincode::standard(),
     )?;
-    Result::Ok(decoded.0)
+    Ok(decoded.0)
 }
 ```
 
@@ -3676,7 +3676,7 @@ fn load(input: string) -> Result[Server, string] {
 
 Sorting mutates a `Vec[T]` in place. `sort` and `stable_sort` use `cmp::Ord`; `sort_by_ordering` and `stable_sort_by_ordering` use `cmp::Ordering`; `sort_by` and `stable_sort_by` accept negative/zero/positive integer comparators. All sorting variants are stable. `binary_search` and its comparator-based variants expect the vector to already be ordered and return the first matching index.
 
-`std::cmp` provides `PartialOrd` and `Ord`. `()`, `bool`, `string`, `char`, and all signed and unsigned integer types implement both. Floating-point values implement only `PartialOrd`, because NaN does not form a total order; comparison with NaN yields `Option::None`. Tuples, fixed arrays, `Vec`, `Slice`, `Option`, and `Result` implement the comparison traits conditionally and use lexicographic order. `cmp::compare` returns `Ordering::Less`, `Equal`, or `Greater`; `Ordering` supports predicates, reversal, lexicographic chaining, and conversion to the negative/zero/positive integer convention. `cmp::Reverse[T]` reverses an existing ordering. `cmp::clamp` returns an error when the minimum exceeds the maximum.
+`std::cmp` provides `PartialOrd` and `Ord`. `()`, `bool`, `string`, `char`, and all signed and unsigned integer types implement both. Floating-point values implement only `PartialOrd`, because NaN does not form a total order; comparison with NaN yields `None`. Tuples, fixed arrays, `Vec`, `Slice`, `Option`, and `Result` implement the comparison traits conditionally and use lexicographic order. `cmp::compare` returns `Ordering::Less`, `Equal`, or `Greater`; `Ordering` supports predicates, reversal, lexicographic chaining, and conversion to the negative/zero/positive integer convention. `cmp::Reverse[T]` reverses an existing ordering. `cmp::clamp` returns an error when the minimum exceeds the maximum.
 
 ## Dynamic channel selection
 
@@ -3694,7 +3694,7 @@ fn load_pair() -> Result[(isize, isize), string] {
         |scope: task::Scope| {
             let left = scope.spawn_try(|cancel| load_left(cancel));
             let right = scope.spawn_try(|cancel| load_right(cancel));
-            Result::Ok((left.join()?, right.join()?))
+            Ok((left.join()?, right.join()?))
         },
     )
 }
@@ -3709,7 +3709,7 @@ fn load_pair() -> Result[(isize, isize), string] {
     scope {
         let left = spawn |cancel| load_left(cancel);
         let right = spawn |cancel| load_right(cancel);
-        Result::Ok((left.join()?, right.join()?))
+        Ok((left.join()?, right.join()?))
     }
 }
 ```
@@ -3718,7 +3718,7 @@ fn load_pair() -> Result[(isize, isize), string] {
 
 `scope` stops accepting new work after its body returns, waits for every direct child task, and then returns the body's value. It still waits when a `Task[T]` handle is discarded. `Task::join` may be called repeatedly or concurrently; every call observes the same stored result. `Scope::try_spawn` returns `Some(task)` when it registers the task before closing begins and `None` after the scope starts closing. Ordinary `Scope::spawn` retains the stricter runtime-error behavior for closed scopes.
 
-`try_scope` cancels its scope when the body returns `Result::Err`, waits for all direct children to exit, and then returns the original error. `Scope::spawn_try` also cancels sibling tasks as soon as its child returns `Result::Err`. A nested scope inherits cancellation when it is created with `scope_with(parent_token, body)` or `try_scope_with(parent_token, body)`.
+`try_scope` cancels its scope when the body returns `Err`, waits for all direct children to exit, and then returns the original error. `Scope::spawn_try` also cancels sibling tasks as soon as its child returns `Err`. A nested scope inherits cancellation when it is created with `scope_with(parent_token, body)` or `try_scope_with(parent_token, body)`.
 
 Cancellation is cooperative. `Scope::cancel` changes the state observed by `CancelToken::is_cancelled`; it does not forcibly terminate a goroutine. Blocking work can use:
 
@@ -3760,7 +3760,7 @@ fn guarded() -> Result[(), panic::Panic] {
 }
 ```
 
-`raise(message: string) -> never` starts unwinding. `catch[T](body: () -> T) -> Result[T, Panic]` returns `Ok` for a normal callback return, including a callback returning an ordinary `Result::Err`. It returns `Err` only for a panic after all exited blocks have run their registered defers. Bounds errors and other recoverable Go runtime panics, including panics crossing an FFI callback, are caught on the same goroutine. Execution resumes after `catch`, not at the failing expression. This is not a transaction: shared-state mutations and I/O are not rolled back.
+`raise(message: string) -> never` starts unwinding. `catch[T](body: () -> T) -> Result[T, Panic]` returns `Ok` for a normal callback return, including a callback returning an ordinary `Err`. It returns `Err` only for a panic after all exited blocks have run their registered defers. Bounds errors and other recoverable Go runtime panics, including panics crossing an FFI callback, are caught on the same goroutine. Execution resumes after `catch`, not at the failing expression. This is not a transaction: shared-state mutations and I/O are not rolled back.
 
 `Panic.message()` and `to_string()` return diagnostic text; invalid UTF-8 in host panic diagnostics is replaced with U+FFFD. `stack_trace()` returns the Go stack captured at the first `std::panic::catch` boundary; generated function names may appear. Child task panics are captured before transfer to the scope owner, while a scope-body panic may first be captured after the scope re-raises it. `resume(info: Panic) -> never` rethrows while preserving that diagnostic text and stack in subsequent GoML catches, including across generated Go packages. The original payload remains private and garbage-collected; there is no global panic registry. If a defer panics during cleanup, remaining defers run and the newest panic is delivered to the catch boundary.
 
@@ -3800,6 +3800,7 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 
 | Task or pitfall | GoML form |
 | --- | --- |
+| Give domain enum errors readable messages | `#[derive(ToString, Debug)]` with per-variant `#[to_string("message {field}")]`; implement no extra `Error` methods |
 | `Simd[T, N]` or vector `a + b` | Import `std::simd`, select a fixed 128/256-bit vector type, and use `a.add(b)` |
 | `float_value.to_i32()` | Import `std::num::TryToInt` and use `float_value.try_to_i32()`; handle nonfinite and range errors |
 | Traverse a directory tree | `ecosystem::walkdir` dependency for Linux amd64 syscall-backed depth-first iteration with depth bounds, pruning, optional link following, and per-path errors |

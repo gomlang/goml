@@ -87,7 +87,7 @@ The single `_` is a wildcard character, not an ordinary variable name. The curre
 - The fixed-width vector and mask type spellings listed under [Portable SIMD](stdlib.md#portable-simd), including `u8x16`, `i32x8`, `f32x4`, `f64x4`, and `mask32x4`, are also accepted as structure and type-alias names and in type positions. They are ordinary scoped names, supplied by `std::simd`, rather than globally reserved keywords;
 - Paths retain the appropriate case for the referenced name.
 
-Enumeration construction and patterns may omit `Enum::` when their expected type determines the variant owner. Use `Enum::Variant` when there is insufficient type context.
+Prefer unqualified enumeration variants in construction and patterns when their expected type determines the variant owner. Use `Enum::Variant` when there is insufficient type context or ordinary name resolution selects another declaration. Prefer receiver methods such as `value.to_string()` for operations on an existing value, and indexing such as `values[i]` for ordinary vector element access.
 
 Common keywords include:
 
@@ -1281,7 +1281,7 @@ let label = if score > 90 {
 `if let` executes the then branch when the pattern match is successful and restricts the pattern binding to that branch. The matched expression is evaluated only once:
 
 ```goml
-let number = if let Option::Some(value) = candidate {
+let number = if let Some(value) = candidate {
     value
 } else {
     0
@@ -1291,7 +1291,7 @@ let number = if let Option::Some(value) = candidate {
 The `else` of `if let` can also be omitted; in this case the compiler treats the else branch as `()`, so the then branch must produce `()`:
 
 ```goml
-if let Option::Some(value) = candidate {
+if let Some(value) = candidate {
     println(value);
 }
 ```
@@ -1329,8 +1329,8 @@ An unqualified variant in a pattern is resolved only against the matched value's
 
 ```goml
 match value {
-    Option::Some(inner) => inner,
-    Option::None => fallback,
+    Some(inner) => inner,
+    None => fallback,
 }
 ```
 
@@ -1340,9 +1340,9 @@ A match arm may have a guard of type `bool`. The guard can use bindings introduc
 
 ```goml
 match value {
-    Option::Some(inner) if inner > 0 => inner,
-    Option::Some(_) => 0,
-    Option::None => -1,
+    Some(inner) if inner > 0 => inner,
+    Some(_) => 0,
+    None => -1,
 }
 ```
 
@@ -1352,11 +1352,11 @@ A branch body can be a single expression or a block. Different branches must be 
 
 ```goml
 match value {
-    Option::Some(inner) => {
+    Some(inner) => {
         let doubled = inner * 2;
         doubled
     },
-    Option::None => 0,
+    None => 0,
 }
 ```
 
@@ -1382,8 +1382,8 @@ Communication arms may have a `when` guard after their operands. Operands and gu
 ```goml
 select {
     recv(messages) when accepting match {
-        Some(Event::Data { id, value }) => handle(id, value),
-        Some(Event::Stop) | None => stop(),
+        Some(Data { id, value }) => handle(id, value),
+        Some(Stop) | None => stop(),
     },
     send(events, "ready") when publishing => published(),
     default => idle(),
@@ -1414,7 +1414,7 @@ The condition must be `bool` and the loop result is `()`. A `while` loop accepts
 `while let` evaluates the right-hand expression once in each round; when the match is successful, it enters the loop body and provides pattern binding, and when the match fails, it exits the loop:
 
 ```goml
-while let Option::Some(value) = iterator.next() {
+while let Some(value) = iterator.next() {
     println(value);
 }
 ```
@@ -1534,7 +1534,7 @@ The `unused_result` lint warns when an expression statement directly discards a 
 
 ```goml
 fn save() -> Result[(), string] {
-    Result::Err("save failed")
+    Err("save failed")
 }
 
 fn main() -> () {
@@ -1555,12 +1555,12 @@ The suffix `?` only supports the built-in semantics `Option[T]` and `Result[T, E
 
 ```goml
 fn plus_one(value: Option[i32]) -> Option[i32] {
-    Option::Some(value? + 1)
+    Some(value? + 1)
 }
 
 fn read_number(flag: bool) -> Result[i32, string] {
     let value = parse_number(flag)?;
-    Result::Ok(value)
+    Ok(value)
 }
 ```
 
@@ -1602,14 +1602,14 @@ Patterns can be used with `let`, `for`, `match`, `if let` and `while let`.
 | partial structure | `Point { x, .. }` |
 | newtype | `UserId(inner)` |
 | Enum unit variant | `Color::Red` or contextual `Red` |
-| Enum tuple variant | `Option::Some(value)` or contextual `Some(value)` |
+| Enum tuple variant | `Some(value)` or qualified `Option::Some(value)` |
 | Enum struct-like variant | `Message::Named { value }` or contextual `Named { value }` |
 | Array, Vec, Slice or MutSlice | `[first, second]`, `[first, .., last]` |
 | rest binding | `[first, middle @ .., last]` |
-| Alias | `whole @ Option::Some(value)` |
+| Alias | `whole @ Some(value)` |
 | or-pattern | `Color::Red \| Color::Blue` |
 | Range | `0..10`, `'a'..='z'` |
-| Nested pattern | `Result::Ok((key, value))` |
+| Nested pattern | `Ok((key, value))` |
 
 ### Refutability and binding
 
@@ -1617,7 +1617,7 @@ Patterns can be used with `let`, `for`, `match`, `if let` and `while let`.
 
 ```goml
 let (left, right) = pair;
-if let Option::Some(value) = candidate {
+if let Some(value) = candidate {
     println(value);
 }
 ```
@@ -1628,7 +1628,7 @@ Variables with the same name cannot be bound repeatedly in the same pattern bran
 
 ```goml
 match value {
-    Either::Left(shared) | Either::Right(shared) => shared,
+    Left(shared) | Right(shared) => shared,
 }
 ```
 
@@ -1687,15 +1687,15 @@ For `Vec[T]`, `Slice[T]` and `MutSlice[T]`, the binding type of `name @ ..` is r
 
 ```goml
 match value {
-    whole @ Option::Some(inner) => use_both(whole, inner),
-    Option::None => fallback(),
+    whole @ Some(inner) => use_both(whole, inner),
+    None => fallback(),
 }
 ```
 
 `@` is more tightly bound than `|`. Therefore `whole @ A | B` resolves to `(whole @ A) | B`, and usually an error will be reported because the variables bound to the two alternatives are different. To make the alias cover the entire or-pattern, you must write parentheses:
 
 ```goml
-whole @ (Either::Left(value) | Either::Right(value))
+whole @ (Left(value) | Right(value))
 ```
 
 Or-pattern alternatives are tried from left to right and can be nested in tuple, struct, enum, and sequence patterns.
@@ -2964,7 +2964,7 @@ enum Result[T, E] {
 }
 ```
 
-Construction uses `Option::Some`, `Option::None`, `Result::Ok` and `Result::Err`. Patterns may use either those full names or contextual `Some`, `None`, `Ok` and `Err`.
+Prefer `Some`, `None`, `Ok`, and `Err` in construction and patterns when the expected type identifies the enum. Qualified names such as `Option::Some` and `Result::Ok` remain available when type context is insufficient or another declaration shadows the variant.
 
 `Option[T]` provides `is_some`, `is_none`, `unwrap_or`, and `unwrap_or_else`, plus type-changing generic methods:
 
@@ -3047,7 +3047,7 @@ The index type is `isize`. The underlying `array_get` and `array_set` can also b
 
 ```goml
 let values = Vec::from_array([1, 2, 3]);
-let first = values.get(0);
+let first = values[0];
 ```
 
 `Vec::from_array([values...])` creates a vector from a fixed array. Array items are evaluated once from left to right. The vector receives new outer backing storage, so replacing an array element later does not change the vector, while referenced elements remain shared because the copy is shallow. Use `Vec::new()` for an empty vector. Direct nonempty array calls coallocate the vector header and backing array. Passing an array variable retains the same shallow-copy semantics. The associated function is an ordinary first-class value, for example `let make: ([i32; 3]) -> Vec[i32] = Vec::from_array;`.
