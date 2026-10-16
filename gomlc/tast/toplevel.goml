@@ -21,22 +21,13 @@ fn function_context(
     let param_aliases = predicate_type_aliases(predicates);
     let projection_aliases = predicate_projection_aliases(predicates);
     Checker {
+        inference: inference_context(base.inference.counter),
         discarded_exprs: Vec::new(),
-        coercion_constraints: Vec::new(),
-        numeric_literal_constraints: Vec::new(),
-        defer_coercion_depth: Ref::new(0),
         predicates,
         param_aliases,
         projection_aliases,
-        active_projections: Vec::new(),
-        field_constraints: Vec::new(),
-        silent_field_receivers: Vec::new(),
-        required_predicates: Vec::new(),
-        generic_arguments: Vec::new(),
         locals: Vec::new(),
         unresolved_locals: Vec::new(),
-        unresolved_inference_vars: Vec::new(),
-        reported_inference_spans: Vec::new(),
         suppress_unresolved_ref_diagnostic: Ref::new(0),
         mutable_locals: Vec::new(),
         return_ty: ret_ty,
@@ -89,103 +80,6 @@ fn attribute_allows(attrs: Vec[ast::Attribute], lint: string) -> bool {
         }
     }
     false
-}
-
-fn deferred_method_name(value: Callable) -> Option[string] {
-    match value {
-        Function(name) => {
-            let prefix = "__goml_deferred_method:";
-            if name.byte_len() > prefix.byte_len() && name.starts_with(prefix) {
-                Some(name.byte_slice(prefix.byte_len(), name.byte_len()))
-            } else {
-                None
-            }
-        },
-        _ => None,
-    }
-}
-
-fn resolve_deferred_exprs(ctx: Checker, values: Vec[Expr]) -> Vec[Expr] {
-    let result: Vec[Expr] = Vec::new();
-    for value in values {
-        result.push(resolve_deferred_expr(ctx, value))
-    }
-    result
-}
-
-fn resolve_deferred_block(ctx: Checker, value: Block) -> Block {
-    let stmts: Vec[Stmt] = Vec::new();
-    for stmt in value.stmts {
-        stmts.push(
-            match stmt {
-                Defer { expr } => Defer { expr: resolve_deferred_expr(ctx, expr) },
-                Let { is_mut, pat, value } => Let {
-                    is_mut,
-                    pat,
-                    value: resolve_deferred_expr(ctx, value),
-                },
-                LetElse { is_mut, pat, value, else_branch } => LetElse {
-                    is_mut,
-                    pat,
-                    value: resolve_deferred_expr(ctx, value),
-                    else_branch: resolve_deferred_expr(ctx, else_branch),
-                },
-                Assign { target, op, value } => Assign {
-                    target: resolve_deferred_expr(ctx, target),
-                    op,
-                    value: resolve_deferred_expr(ctx, value),
-                },
-                Expr { expr } => Stmt::Expr { expr: resolve_deferred_expr(ctx, expr) },
-            },
-        )
-    }
-    Block { stmts, tail: value.tail.map(|expr| resolve_deferred_expr(ctx, expr)) }
-}
-
-fn resolve_deferred_expr(ctx: Checker, value: Expr) -> Expr {
-    match value {
-        Closure { params, body, ty } => Closure {
-            params,
-            body: resolve_deferred_expr(ctx, body),
-            ty,
-        },
-        Block { block, ty } => Expr::Block { block: resolve_deferred_block(ctx, block), ty },
-        Call { func, args, ty } => {
-            let args = resolve_deferred_exprs(ctx, args);
-            let func = match func {
-                Callable { callable, ty: callable_ty } => {
-                    match deferred_method_name(callable) {
-                        Some(name) => if !args.is_empty() {
-                            let arg_types: Vec[Type] = Vec::new();
-                            for index in 1..args.len() {
-                                arg_types.push(expr_type(args[index]))
-                            }
-                            match resolve_method(
-                                ctx,
-                                expr_type(args[0]),
-                                name,
-                                arg_types,
-                                Some(ty),
-                                Vec::new(),
-                            ) {
-                                Some(value) => Expr::Callable {
-                                    callable: value.callable,
-                                    ty: value.ty,
-                                },
-                                None => Expr::Callable { callable, ty: callable_ty },
-                            }
-                        } else {
-                            Expr::Callable { callable, ty: callable_ty }
-                        },
-                        None => Expr::Callable { callable, ty: callable_ty },
-                    }
-                },
-                other => resolve_deferred_expr(ctx, other),
-            };
-            Call { func, args, ty }
-        },
-        other => other,
-    }
 }
 
 fn pattern_has_unresolved_inference(ctx: Checker, value: hir::Pat) -> bool {
@@ -507,14 +401,15 @@ fn check_function_inner(
     resolve_coercion_constraints(ctx);
     resolve_numeric_literal_constraints(ctx);
     infer_function_map_predicates(ctx, params, ret_ty, comptime_origin_start, predicates);
+    solve_required_predicates(ctx);
+    let body = resolve_deferred_block(ctx, checked_body.0);
     let report_all_unresolved = resolve_required_predicates(ctx);
     report_unresolved_block(ctx, value.body, report_all_unresolved);
-    for argument in ctx.generic_arguments {
+    for argument in ctx.inference.generic_arguments {
         if contains_unbound_any_variable(argument.0) {
             push_diagnostic_at(ctx, INFERENCE_FAILURE_MESSAGE, argument.1)
         }
     }
-    let body = resolve_deferred_block(ctx, checked_body.0);
     warn_unused_results(ctx);
     for index in comptime_origin_start..base.typeck_results.exprs.len() {
         let fact = base.typeck_results.exprs[index];
@@ -704,6 +599,7 @@ fn check_constant(base: Checker, value: hir::Constant) -> (
     resolve_coercion_constraints(ctx);
     resolve_numeric_literal_constraints(ctx);
     let checked = resolve_deferred_expr(ctx, checked);
+    let _ = resolve_required_predicates(ctx);
     warn_unused_results(ctx);
     let comptime_origins: Vec[ast::Span] = Vec::new();
     for index in comptime_origin_start..base.typeck_results.exprs.len() {
@@ -791,6 +687,7 @@ fn check_static(base: Checker, value: hir::Static) -> Static {
     resolve_coercion_constraints(ctx);
     resolve_numeric_literal_constraints(ctx);
     let _ = resolve_deferred_expr(ctx, checked);
+    let _ = resolve_required_predicates(ctx);
     warn_unused_results(ctx);
     if !once_cell_type(base.builtin, ty) || !valid_initializer {
         push_diagnostic(base, "static initializer must be `OnceCell::new()`")
@@ -3367,8 +3264,15 @@ fn check_file_with_package_inferred(
             },
         )
     }
+    let file = File { items, enums, structs, constants, statics };
+    if !diagnostics_have_errors(ctx.diagnostics) {
+        if let Err(message) = verify(file) {
+            push_diagnostic_at(ctx, message, None)
+        }
+        verify_typeck_results(ctx);
+    }
     CheckResult {
-        tast: Option::Some(File { items, enums, structs, constants, statics }),
+        tast: Option::Some(file),
         comptime: ctir::empty_module(ctx.package_name),
         pending_constants,
         diagnostics: order_extern_diagnostics(ctx),

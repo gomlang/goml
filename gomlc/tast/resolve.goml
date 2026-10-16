@@ -33,6 +33,11 @@ struct ResolvedCallable {
     predicates: Vec[TypePredicate],
 }
 
+struct MethodMatch {
+    value: ResolvedCallable,
+    inference: InferenceSnapshot,
+}
+
 struct MethodCandidate {
     owner: Type,
     callable: ResolvedCallable,
@@ -241,7 +246,7 @@ fn instantiate_enum_with_arguments(ctx: Checker, value: EnumInfo, explicit: Vec[
     Type,
     Vec[TypeSubst],
 ) {
-    let substitutions = instantiate_substitutions(ctx.counter, value.generics, explicit);
+    let substitutions = instantiate_substitutions(ctx.inference.counter, value.generics, explicit);
     let args: Vec[Type] = Vec::new();
     for generic in value.generics {
         if let Some(ty) = find_substitution(substitutions, generic) {
@@ -487,7 +492,7 @@ fn resolve_pattern_constructor(ctx: Checker, head: hir::PatternHead, expected: T
 }
 
 fn instantiate_struct(ctx: Checker, value: StructInfo) -> ResolvedStruct {
-    let substitutions = instantiate_substitutions(ctx.counter, value.generics, Vec::new());
+    let substitutions = instantiate_substitutions(ctx.inference.counter, value.generics, Vec::new());
     let args: Vec[Type] = Vec::new();
     for generic in value.generics {
         if let Some(ty) = find_substitution(substitutions, generic) {
@@ -901,8 +906,8 @@ fn method_substitutions(
         method_explicit,
     );
     append_type_substitutions(
-        instantiate_substitutions(ctx.counter, value.owner_generics, owner_explicit),
-        instantiate_substitutions(ctx.counter, value.method_generics, method_explicit),
+        instantiate_substitutions(ctx.inference.counter, value.owner_generics, owner_explicit),
+        instantiate_substitutions(ctx.inference.counter, value.method_generics, method_explicit),
     )
 }
 
@@ -950,10 +955,16 @@ fn resolve_user_method(
     method_explicit: Vec[Type],
     expected: Option[Type],
 ) -> Option[ResolvedCallable] {
-    let inherent: Vec[MethodCandidate] = Vec::new();
-    let traits: Vec[MethodCandidate] = Vec::new();
+    let inherent: Vec[(MethodCandidate, InferenceSnapshot)] = Vec::new();
+    let traits: Vec[(MethodCandidate, InferenceSnapshot)] = Vec::new();
     for value in ctx.methods {
         if value.function.name == name && receiver_matches(ctx.builtin, value.for_type, receiver) {
+            let snapshot = method_inference_snapshot(
+                receiver,
+                Vec::new(),
+                expected,
+                method_explicit,
+            );
             let candidate = instantiate_method_candidate(ctx, value, Vec::new(), method_explicit);
             let return_matches = match (expected, prune(candidate.callable.ty)) {
                 (Some(expected), Func { ret_ty, .. }) => call_types_compatible(ret_ty, expected),
@@ -961,10 +972,11 @@ fn resolve_user_method(
             };
             if call_types_compatible(candidate.owner, receiver) && return_matches {
                 match value.trait_ref {
-                    Some(_) => traits.push(candidate),
-                    None => inherent.push(candidate),
+                    Some(_) => traits.push((candidate, snapshot.capture())),
+                    None => inherent.push((candidate, snapshot.capture())),
                 }
             }
+            snapshot.restore();
         }
     }
     let candidates = if inherent.is_empty() {
@@ -973,7 +985,8 @@ fn resolve_user_method(
         inherent
     };
     if candidates.len() == 1 {
-        let candidate = candidates[0];
+        candidates[0].1.restore();
+        let candidate = candidates[0].0;
         let _ = unify(candidate.owner, receiver);
         Some(
             ResolvedCallable {
@@ -1052,6 +1065,16 @@ fn context_trait_bound_satisfied(ctx: Checker, bound_ty: Type, reference: TraitR
 }
 
 fn predicates_satisfied_at(ctx: Checker, predicates: Vec[TypePredicate], goals: Vec[string]) -> bool {
+    let snapshot = inference_snapshot(Vec::new());
+    snapshot.include_predicates(predicates);
+    let satisfied = predicates_satisfied_inner(ctx, predicates, goals);
+    if !satisfied {
+        snapshot.restore()
+    }
+    satisfied
+}
+
+fn predicates_satisfied_inner(ctx: Checker, predicates: Vec[TypePredicate], goals: Vec[string]) -> bool {
     for predicate in predicates {
         match predicate {
             GoComparable(ty) => if !go_comparable_satisfied(ctx, ty) {
@@ -1074,7 +1097,7 @@ fn predicates_satisfied_at(ctx: Checker, predicates: Vec[TypePredicate], goals: 
 
 fn require_predicates(ctx: Checker, predicates: Vec[TypePredicate]) -> () {
     for predicate in predicates {
-        ctx.required_predicates.push(
+        ctx.inference.required_predicates.push(
             PredicateRequirement {
                 predicate,
                 message: "type predicate not satisfied",
@@ -1085,7 +1108,7 @@ fn require_predicates(ctx: Checker, predicates: Vec[TypePredicate]) -> () {
 }
 
 fn require_predicate(ctx: Checker, predicate: TypePredicate, message: string) -> () {
-    ctx.required_predicates.push(
+    ctx.inference.required_predicates.push(
         PredicateRequirement { predicate, message, span: ctx.current_span.get() },
     )
 }
@@ -1228,7 +1251,7 @@ fn mark_unresolved_inference_type(ctx: Checker, value: Type) -> () {
         Var(variable) => match variable.get() {
             Unbound { id: _, kind: Any } => {
                 if unresolved_inference_var(ctx, variable) {} else {
-                    ctx.unresolved_inference_vars.push(variable)
+                    ctx.inference.unresolved_inference_vars.push(variable)
                 }
             },
             Link(inner) => mark_unresolved_inference_type(ctx, inner),
@@ -1268,8 +1291,8 @@ fn predicate_message_present(
     false
 }
 
-fn resolve_required_predicates(ctx: Checker) -> bool {
-    for requirement in ctx.required_predicates {
+fn solve_required_predicates(ctx: Checker) -> () {
+    for requirement in ctx.inference.required_predicates {
         match requirement.predicate {
             GoComparable(ty) => {
                 let _ = default_numeric_type(ty);
@@ -1286,18 +1309,29 @@ fn resolve_required_predicates(ctx: Checker) -> bool {
             },
         }
     }
-    for _ in 0..ctx.required_predicates.len() + 1 {
-        for requirement in ctx.required_predicates {
+    for _ in 0..ctx.inference.required_predicates.len() + 1 {
+        let snapshot = inference_snapshot(Vec::new());
+        for requirement in ctx.inference.required_predicates {
+            snapshot.include_predicates(Vec::from_array([requirement.predicate]))
+        }
+        for requirement in ctx.inference.required_predicates {
             let _ = predicates_satisfied_at(
                 ctx,
                 Vec::from_array([requirement.predicate]),
                 Vec::new(),
             );
         }
+        if !snapshot.changed() {
+            break
+        }
     }
+}
+
+fn resolve_required_predicates(ctx: Checker) -> bool {
+    solve_required_predicates(ctx);
     let messages: Vec[string] = Vec::new();
     let spans: Vec[Option[ast::Span]] = Vec::new();
-    for requirement in ctx.required_predicates {
+    for requirement in ctx.inference.required_predicates {
         if predicate_contains_error(requirement.predicate)
             || predicates_satisfied_at(ctx, Vec::from_array([requirement.predicate]), Vec::new()) {} else {
             let message = predicate_requirement_message(
@@ -1494,7 +1528,8 @@ fn trait_bound_satisfied_at(ctx: Checker, bound_ty: Type, reference: TraitRef, g
                 canonical_reference,
             );
             let reference_short_name = short_name(reference.name);
-            let ambiguous = if contains_unbound_any_variable(bound_ty) {
+            let ambiguous = if contains_unbound_any_variable(bound_ty)
+                || any_type(reference.args, contains_unbound_any_variable) {
                 compatible_impl_count(
                     ctx,
                     bound_ty,
@@ -1521,8 +1556,10 @@ fn trait_bound_satisfied_at(ctx: Checker, bound_ty: Type, reference: TraitRef, g
                             canonical_reference,
                             reference_short_name,
                         ) {
+                        let snapshot = inference_snapshot(Vec::from_array([bound_ty]));
+                        snapshot.include_types(reference.args);
                         let substitutions = instantiate_substitutions(
-                            ctx.counter,
+                            ctx.inference.counter,
                             impl_info.generics,
                             Vec::new(),
                         );
@@ -1541,6 +1578,7 @@ fn trait_bound_satisfied_at(ctx: Checker, bound_ty: Type, reference: TraitRef, g
                                 }
                             }
                         }
+                        snapshot.restore();
                     }
                 }
             }
@@ -1570,7 +1608,7 @@ fn compatible_impl_count(
                     reference_short_name,
                 ) {
                 let substitutions = instantiate_substitutions(
-                    ctx.counter,
+                    ctx.inference.counter,
                     impl_info.generics,
                     Vec::new(),
                 );
@@ -1590,7 +1628,7 @@ fn compatible_impl_count(
 }
 
 fn instantiated_impl_parts(ctx: Checker, value: ImplInfo) -> (Type, TraitRef, Vec[TypePredicate]) {
-    let substitutions = instantiate_substitutions(ctx.counter, value.generics, Vec::new());
+    let substitutions = instantiate_substitutions(ctx.inference.counter, value.generics, Vec::new());
     (
         substitute_type(value.for_type, substitutions),
         substitute_trait_ref(value.trait_ref, substitutions),
@@ -1708,34 +1746,48 @@ fn deferred_method_candidate(
     expected: Option[Type],
     method_explicit: Vec[Type],
 ) -> Option[ResolvedCallable] {
-    let mut matches = 0;
-    let mut candidate_ty = Type::Error;
+    let candidates: Vec[Type] = Vec::new();
     for value in ctx.methods {
         if value.function.name == name && method_trait_in_scope(ctx, value)
             && value.trait_ref.is_some() {
+            let snapshot = method_inference_snapshot(receiver, args, expected, method_explicit);
             let candidate = instantiate_method_candidate(ctx, value, Vec::new(), method_explicit);
             if method_matches_call(ctx, candidate.callable, receiver, args, expected) {
-                matches += 1;
-                if matches == 1 {
-                    candidate_ty = candidate.callable.ty;
-                }
+                candidates.push(resolved_inference_type(candidate.callable.ty));
             }
+            snapshot.restore();
         }
     }
-    if matches > 1 {
-        match prune(candidate_ty) {
-            Func { params, ret_ty } => {
-                params[0] = receiver;
-                Some(
-                    ResolvedCallable {
-                        callable: Callable::Function(f"__goml_deferred_method:{name}"),
-                        ty: Type::Func { params, ret_ty },
-                        predicates: Vec::new(),
-                    },
-                )
-            },
-            _ => None,
+    if candidates.len() > 1 {
+        let params = Vec::from_array([receiver]);
+        for arg in args {
+            params.push(arg)
         }
+        for index in 1..params.len() {
+            if let Some(common) = common_deferred_method_type(candidates, Some(index)) {
+                expect_type(ctx, params[index], common)
+            }
+        }
+        let ret_ty = expected.unwrap_or_else(|| fresh_type(ctx.inference.counter, VarKind::Any));
+        if let Some(common) = common_deferred_method_type(candidates, None) {
+            expect_type(ctx, ret_ty, common)
+        }
+        let ty = Type::Func { params, ret_ty };
+        let id = ctx.inference.counter.get();
+        ctx.inference.counter.set(id + 1);
+        ctx.inference.deferred_methods.push(
+            DeferredMethod {
+                id,
+                name,
+                explicit: method_explicit,
+                span: ctx.current_span.get(),
+                ty,
+                resolved: Ref::new(None),
+            },
+        );
+        Some(
+            ResolvedCallable { callable: Callable::DeferredMethod(id), ty, predicates: Vec::new() },
+        )
     } else {
         None
     }
@@ -1760,8 +1812,8 @@ fn resolve_user_method_for_call(
     expected: Option[Type],
     method_explicit: Vec[Type],
 ) -> Option[ResolvedCallable] {
-    let inherent: Vec[ResolvedCallable] = Vec::new();
-    let trait_methods: Vec[ResolvedCallable] = Vec::new();
+    let inherent: Vec[MethodMatch] = Vec::new();
+    let trait_methods: Vec[MethodMatch] = Vec::new();
     let inherent_expected = if method_shape_is_ambiguous(ctx, receiver, name) {
         expected
     } else {
@@ -1770,6 +1822,7 @@ fn resolve_user_method_for_call(
     for value in ctx.methods {
         if value.function.name == name && receiver_matches(ctx.builtin, value.for_type, receiver)
             && method_trait_in_scope(ctx, value) {
+            let snapshot = method_inference_snapshot(receiver, args, expected, method_explicit);
             let candidate = instantiate_method_candidate(ctx, value, Vec::new(), method_explicit);
             let matches = match value.trait_ref {
                 Some(_) => {
@@ -1790,19 +1843,25 @@ fn resolve_user_method_for_call(
             };
             if matches {
                 match value.trait_ref {
-                    Some(_) => trait_methods.push(candidate.callable),
+                    Some(_) => trait_methods.push(
+                        MethodMatch { value: candidate.callable, inference: snapshot.capture() },
+                    ),
                     None => inherent.push(
-                        ResolvedCallable {
-                            callable: candidate.callable.callable,
-                            ty: candidate.callable.ty,
-                            predicates: append_predicates(
-                                candidate.owner_predicates,
-                                candidate.callable.predicates,
-                            ),
+                        MethodMatch {
+                            value: ResolvedCallable {
+                                callable: candidate.callable.callable,
+                                ty: candidate.callable.ty,
+                                predicates: append_predicates(
+                                    candidate.owner_predicates,
+                                    candidate.callable.predicates,
+                                ),
+                            },
+                            inference: snapshot.capture(),
                         },
                     ),
                 }
             }
+            snapshot.restore();
         }
     }
     let matches = if !inherent.is_empty() {
@@ -1811,7 +1870,8 @@ fn resolve_user_method_for_call(
         trait_methods
     };
     if matches.len() == 1 {
-        Some(matches[0])
+        matches[0].inference.restore();
+        Some(matches[0].value)
     } else {
         if matches.len() > 1 {
             push_diagnostic(ctx, f"ambiguous method: {name}")
@@ -2043,7 +2103,7 @@ fn trait_ref_closure(ctx: Checker, reference: TraitRef) -> Vec[TraitRef] {
         if let Some(info) = find_trait(ctx, current.name) {
             if info.generics.len() == current.args.len() {
                 let substitutions = instantiate_substitutions(
-                    ctx.counter,
+                    ctx.inference.counter,
                     info.generics,
                     current.args,
                 );
@@ -2074,7 +2134,7 @@ fn trait_substitutions(ctx: Checker, info: TraitInfo, reference: TraitRef, self_
     if let Some(ty) = self_ty {
         explicit.push(ty)
     }
-    instantiate_substitutions(ctx.counter, params, explicit)
+    instantiate_substitutions(ctx.inference.counter, params, explicit)
 }
 
 struct ProjectionCandidate {
@@ -2983,7 +3043,11 @@ fn resolve_trait_reference_method(
                     );
                     let substitutions = append_type_substitutions(
                         trait_substitutions(ctx, info, reference, self_ty),
-                        instantiate_substitutions(ctx.counter, method.generics, method_explicit),
+                        instantiate_substitutions(
+                            ctx.inference.counter,
+                            method.generics,
+                            method_explicit,
+                        ),
                     );
                     let params: Vec[Type] = Vec::new();
                     for param in method.params {
@@ -2996,7 +3060,7 @@ fn resolve_trait_reference_method(
                         params,
                         substitute_type(method.ret_ty, substitutions),
                         find_substitution(substitutions, "Self").unwrap_or_else(
-                            || fresh_type(ctx.counter, VarKind::Any),
+                            || fresh_type(ctx.inference.counter, VarKind::Any),
                         ),
                         method.has_receiver,
                     );
@@ -3161,7 +3225,11 @@ fn resolve_trait_static(
                     },
                 )
             }
-            let substitutions = instantiate_substitutions(ctx.counter, info.generics, explicit);
+            let substitutions = instantiate_substitutions(
+                ctx.inference.counter,
+                info.generics,
+                explicit,
+            );
             let args: Vec[Type] = Vec::new();
             for generic in info.generics {
                 if let Some(ty) = find_substitution(substitutions, generic) {
@@ -3251,7 +3319,7 @@ fn static_owner_type(ctx: Checker, owner: string, explicit: Vec[Type]) -> Type {
     }
     let args: Vec[Type] = Vec::new();
     for _ in 0..arity {
-        args.push(fresh_type(ctx.counter, VarKind::Any))
+        args.push(fresh_type(ctx.inference.counter, VarKind::Any))
     }
     nominal_type(ctx.builtin, owner, args)
 }

@@ -1,0 +1,132 @@
+package tast;
+
+use module::ast;
+
+struct DeferredMethod {
+    id: isize,
+    name: string,
+    explicit: Vec[Type],
+    span: Option[ast::Span],
+    ty: Type,
+    resolved: Ref[Option[ResolvedCallable]],
+}
+
+fn common_deferred_method_type(candidates: Vec[Type], parameter: Option[isize]) -> Option[Type] {
+    let mut common: Option[Type] = None;
+    for candidate in candidates {
+        let Func { params, ret_ty } = candidate else {
+            return None
+        };
+        let ty = match parameter {
+            Some(index) => params[index],
+            None => ret_ty,
+        };
+        if !type_is_concrete(ty) {
+            return None
+        }
+        if let Some(previous) = common {
+            if !types_equal(previous, ty) {
+                return None
+            }
+        }
+        common = Some(ty);
+    }
+    common
+}
+
+fn deferred_error() -> ResolvedCallable {
+    ResolvedCallable {
+        callable: Callable::Function("<error>"),
+        ty: Type::Error,
+        predicates: Vec::new(),
+    }
+}
+
+fn resolve_deferred_method(ctx: Checker, id: isize) -> ResolvedCallable {
+    for pending in ctx.inference.deferred_methods {
+        if pending.id != id {
+            continue
+        }
+        if let Some(result) = pending.resolved.get() {
+            return result
+        }
+        let previous = ctx.current_span.get();
+        ctx.current_span.set(pending.span);
+        let diagnostic_start = ctx.diagnostics.len();
+        let mut result = deferred_error();
+        if let Func { params, ret_ty } = prune(pending.ty) {
+            if !params.is_empty() {
+                let args = Vec::new();
+                for index in 1..params.len() {
+                    args.push(params[index])
+                }
+                if let Some(resolved) = resolve_method(
+                    ctx,
+                    params[0],
+                    pending.name,
+                    args,
+                    Some(ret_ty),
+                    pending.explicit,
+                ) {
+                    expect_type(ctx, resolved.ty, pending.ty);
+                    require_predicates(ctx, resolved.predicates);
+                    result = resolved;
+                }
+            }
+        }
+        if types_equal(result.ty, Type::Error) && ctx.diagnostics.len() == diagnostic_start {
+            push_diagnostic(ctx, "Could not resolve deferred method " + pending.name)
+        }
+        pending.resolved.set(Some(result));
+        ctx.current_span.set(previous);
+        update_deferred_facts(ctx.typeck_results, id, result);
+        return result
+    }
+    push_diagnostic(ctx, "invalid deferred method reference");
+    deferred_error()
+}
+
+fn is_deferred_target(value: ReferenceTarget, id: isize) -> bool {
+    match value {
+        Callable(DeferredMethod(actual)) => actual == id,
+        _ => false,
+    }
+}
+
+fn update_deferred_facts(results: TypeckResults, id: isize, value: ResolvedCallable) -> () {
+    for index in 0..results.references.len() {
+        let fact = results.references[index];
+        if is_deferred_target(fact.target, id) {
+            results.references[index] = ReferenceFact {
+                target: ReferenceTarget::Callable(value.callable),
+                ty: value.ty,
+                ..fact,
+            };
+        }
+    }
+    for index in 0..results.calls.len() {
+        let fact = results.calls[index];
+        if is_deferred_target(fact.target, id) {
+            results.calls[index] = CallFact {
+                target: ReferenceTarget::Callable(value.callable),
+                callee_ty: value.ty,
+                ..fact,
+            };
+        }
+    }
+}
+
+fn resolve_deferred_expr(ctx: Checker, value: Expr) -> Expr {
+    let value = map_child_exprs(value, |child| resolve_deferred_expr(ctx, child));
+    match value {
+        Callable { callable: DeferredMethod(id), .. } => {
+            let resolved = resolve_deferred_method(ctx, id);
+            Expr::Callable { callable: resolved.callable, ty: resolved.ty }
+        },
+        other => other,
+    }
+}
+
+fn resolve_deferred_block(ctx: Checker, value: Block) -> Block {
+    map_block_exprs(value, |expr| resolve_deferred_expr(ctx, expr))
+}

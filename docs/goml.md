@@ -1746,7 +1746,7 @@ let increment = |value: i32| {
 let greet = || println("hello");
 ```
 
-Closure parameter types can be inferred from the expected function type or the calling location; when inference is unstable, it should be explicitly marked:
+Closure parameter types can be inferred from the expected function type or the calling location. Deferred method calls also resolve inside nested expressions, including tuples, arrays, and control-flow branches. When inference is ambiguous, annotate the closure parameter or expected function type:
 
 ```goml
 let transform: (i32) -> string = |value| value.to_string();
@@ -2013,6 +2013,8 @@ Generic trait UFCS uses `::[...]` after the trait name to give the type paramete
 let number = Convert::[i32]::convert(token, 0);
 let text = Convert::[string]::convert(token, "");
 ```
+
+Trait implementation and method candidate searches do not retain type bindings from rejected candidates. Reordering otherwise equivalent implementation declarations does not select a different inferred type.
 
 Trait bounds make the corresponding methods available on generic values. Imported short trait names, renamed imports, and public re-exports retain the defining trait identity in generic bounds and `where` predicates through specialization. Supertraits and associated type bounds also participate in method resolution as implied constraints.
 
