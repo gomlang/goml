@@ -2156,9 +2156,28 @@ enum Entry[T, Marker] {
 }
 ```
 
-All fields or variant payloads used by a derive must support that trait. For a generic definition, the generated impl constrains each distinct participating field or payload type that mentions a type parameter. An unused phantom parameter receives no constraint. Compiler-owned runtime, intrinsic, and lang-item attributes remain unavailable to ordinary projects. User projects may use the `go_ffi`, `go_type`, `go_method` and `go_interface` attributes described in the next section.
+All fields or variant payloads used by a derive must support that trait. A `ToString` variant template only uses the fields referenced by its placeholders. For a generic definition, the generated impl constrains each distinct participating field or payload type that mentions a type parameter. An unused phantom parameter receives no constraint. Compiler-owned runtime, intrinsic, and lang-item attributes remain unavailable to ordinary projects. User projects may use the `go_ffi`, `go_type`, `go_method` and `go_interface` attributes described in the next section.
 
 The eight prelude derives are supplied by verified handlers in the toolchain's builtin sources. They are not hard-coded code generators in the compiler. The `PartialOrd` and `Ord` traits themselves live in `std::cmp`; import that package when using their derives, and import the traits for unqualified bounds and method calls. Standard-library and third-party derives use the same handler and artifact mechanism, but they are not added to the prelude: import the trait or its package before using the derive name.
+
+Derived `ToString` formats an enum with its type name, variant name, and payload by default. A variant can replace its entire output with a string template:
+
+```goml
+#[derive(ToString, Debug)]
+enum Status {
+    #[to_string("ready")]
+    Ready,
+    #[to_string("retry after {0}s")]
+    Retry(isize),
+    #[to_string("failed: {message}")]
+    Failed { code: isize, message: string },
+    Unknown,
+}
+```
+
+`Status::Ready.to_string()` returns `"ready"`, `Status::Retry(3).to_string()` returns `"retry after 3s"`, and `Status::Unknown.to_string()` retains `"Status::Unknown"`. Named payloads use `{field}`; tuple payloads use zero-based canonical decimal indexes such as `{0}`. `{{` and `}}` produce literal braces. Ordinary and raw string literals are accepted, including empty strings and Unicode text. A template may omit any or all payload fields. Referenced fields are converted once each, in declaration order, and repeated placeholders reuse the converted string. Only referenced fields require `ToString`; generic predicates also retain the requirements of every uncustomized variant. String payloads are inserted directly.
+
+A `to_string` attribute requires exactly one positional string literal and may occur once per variant. Duplicate attributes, invalid arguments, unmatched braces, unknown fields, and out-of-range tuple indexes are compile-time errors located at the attribute or its template argument. When deriving `ToString`, placing this attribute on an enum, struct, or payload field is an error. Templates do not support implicit `{}` placeholders, expressions, format specifiers, callbacks, or automatic case conversion. They are interpreted by the `ToString` derive, independently of `Debug` and `serde(rename)`, and do not generate string parsing or require unique outputs. More complex formatting uses a handwritten `impl ToString`.
 
 Derived `Debug` provides `Debug::debug(value)` and the `.debug()` method. It formats structs with their type and field names and enums with their type and variant names. Primitive field values use their ordinary textual representation, while nested values recursively use `Debug`.
 
@@ -3204,6 +3223,7 @@ For library APIs and common tasks, see the [standard library reference](stdlib.m
 | `fn id<T>(x: T) -> T` | `fn id[T](x: T) -> T` |
 | `fn count[N](values: [i32; N])` | Declare the value parameter as `fn count[const N: usize](values: [i32; N]) -> usize` |
 | `Buffer[i32, N + 1]` | `Buffer[i32, {N + 1}]` |
+| Using `serde(rename)` to change `.to_string()` | Use `#[to_string("text")]` on the variant with `#[derive(ToString)]` |
 | `Type::LIMIT()` for an associated constant | `Type::LIMIT` |
 | `id::<i32>(1)` | `id::[i32](1)` |
 | Ordinary function `id[i32](1)` | `id::[i32](1)`, or rely on parameter/result type inference |
@@ -3247,6 +3267,7 @@ For library APIs and common tasks, see the [standard library reference](stdlib.m
 | Go external type | `#[go_type("pkg", "Name")] extern type Name[T];` retains an opaque Go identity and declared arguments; use explicit functions and methods, with `std::ffi::Ptr[T]` for raw pointers. No automatic fields, struct construction, alias expansion or constraint discovery; final Go compilation validates native uses |
 | Go interface adapter | `#[go_interface(RawType, Wrapper, method = "GoMethod")]` generates adapters from explicit trait signatures and mappings; final Go compilation checks the real interface. `from_trait` retains the supplied dyn object; nil/typed-nil and multiple results are preserved |
 | Go-callable export | Annotate a supported public function with `#[go_export("Name")]` and generate a Go package with `goml export-go` |
+| Customize enum display text | `#[derive(ToString)]` with `#[to_string("text {field}")]` on variants |
 | Generate public inherent methods | `derive_output_inherent` and `derive_output_add_public_method` |
 | Generate multiple implementations and helpers | `derive_output_merge`, associated item builders, and private function/type builders |
 | Build runtime callbacks in derive | `meta_expr_closure` and `meta_type_function` |
@@ -3310,6 +3331,7 @@ go_export_attribute = "#[" "go_export" "(" string_literal ")" "]"
 comptime_attribute = "#[" "comptime" "]"
 comptime_derive_attribute = "#[" "comptime_derive" ("(" ident ")")? "]"
 derive_attribute = "#[" "derive" "(" path ("," path)* ")" "]"
+to_string_attribute = "#[" "to_string" "(" string_literal ")" "]"
 extern_type = "extern" "type" upper_ident generic_params? ";"
 go_ffi_attribute = "#[" "go_ffi" "(" string_literal "," string_literal ")" "]"
 go_method_attribute = "#[" "go_method" "(" string_literal ")" "]"
@@ -3340,9 +3362,9 @@ struct_field  = visibility? lower_ident ":" type
 newtype_field = visibility? type
 enum_def      = "enum" upper_ident type_names? "{" variants? "}"
 variants      = variant ("," variant)* ","?
-variant       = upper_ident
+variant       = attribute* (upper_ident
               | upper_ident "(" type_list? ")"
-              | upper_ident "{" variant_fields? "}"
+              | upper_ident "{" variant_fields? "}")
 variant_fields = lower_ident ":" type ("," lower_ident ":" type)* ","?
 type_names    = "[" type_parameter ("," type_parameter)* "]"
 type_parameter = upper_ident | "const" upper_ident ":" "usize"
