@@ -1,0 +1,215 @@
+package tast;
+
+use module::ast;
+use module::hir;
+use module::parser;
+use std::testing;
+
+#[test]
+fn failed_trait_candidates_do_not_bind_later_candidates() -> () {
+    let first = "impl PairMark for (isize, bool) {} ";
+    let second = "impl PairMark for (bool, isize) {} ";
+    for implementations in Vec::from_array([first + second, second + first]) {
+        let file = checked_file(
+            "trait PairMark {} " + implementations
+                + "fn need[T]() -> Vec[T] where (T, isize): PairMark { Vec::new() } fn main() -> () { let values = need(); let _ = values.len(); }",
+        );
+        testing::assert(encode_file(file).contains("Vec[bool]"));
+    }
+}
+
+#[test]
+fn ambiguous_trait_arguments_do_not_select_the_first_impl() -> () {
+    for implementations in Vec::from_array(
+        [
+            "impl Mark[bool] for Token {} impl Mark[string] for Token {} ",
+            "impl Mark[string] for Token {} impl Mark[bool] for Token {} ",
+        ],
+    ) {
+        let source = "struct Token {} trait Mark[T] {} " + implementations
+            + "fn need[T]() -> Vec[T] where Token: Mark[T] { Vec::new() } fn main() -> () { let values = need(); let _ = values.len(); }";
+        testing::assert(diagnostics_have_errors(checked_diagnostics(source)));
+    }
+}
+
+#[test]
+fn projection_candidates_restore_failed_receiver_matches() -> () {
+    let first = "impl Item for (isize, bool) { type Value = string; } ";
+    let second = "impl Item for (bool, isize) { type Value = bool; } ";
+    for implementations in Vec::from_array([first + second, second + first]) {
+        let lowered = hir::lower(
+            ast::lower(parser::parse("trait Item { type Value; } " + implementations)),
+            "main.goml",
+        );
+        let file = testing::expect_some(lowered.hir, "expected HIR");
+        let ctx = collect_environment(
+            file,
+            false,
+            testing::expect_ok(builtin_contract(), "expected builtins"),
+        );
+        let variable = fresh_type(ctx.inference.counter, VarKind::Any);
+        let base = Type::Tuple { items: Vec::from_array([variable, Type::Int]) };
+        let projection = testing::expect_some(
+            impl_projection(ctx, base, "Value", Some(TraitRef { name: "Item", args: Vec::new() })),
+            "expected associated type",
+        );
+        testing::assert(types_equal(projection, Type::Bool));
+        testing::assert(types_equal(variable, Type::Bool));
+    }
+}
+
+#[test]
+fn inference_snapshots_restore_links_and_numeric_kinds() -> () {
+    let counter = Ref::new(0);
+    let first = fresh_type(counter, VarKind::Any);
+    let second = fresh_type(counter, VarKind::Any);
+    testing::assert(unify(first, second));
+    let snapshot = inference_snapshot(Vec::from_array([first]));
+    let numeric = fresh_type(counter, VarKind::Integer);
+    testing::assert(unify(numeric, second));
+    testing::assert(unify(first, Type::Int));
+    let committed = snapshot.capture();
+    snapshot.restore();
+    testing::assert(unify(first, Type::Bool));
+    testing::assert(types_equal(second, Type::Bool));
+    committed.restore();
+    testing::assert(types_equal(first, Type::Int));
+    testing::assert(types_equal(second, Type::Int));
+}
+
+fn deferred_test_declarations() -> string {
+    "struct A {} struct B {} struct Pair { value: isize } trait Label { fn label(self) -> isize; } impl Label for A { fn label(self) -> isize { 1 } } impl Label for B { fn label(self) -> isize { 2 } } "
+}
+
+#[test]
+fn deferred_methods_resolve_in_nested_expression_forms() -> () {
+    for body in Vec::from_array(
+        [
+            "(x.label(), true)",
+            "[x.label()]",
+            "Option::Some(x.label())",
+            "Pair { value: x.label() }",
+            "if true { x.label() } else { 0 }",
+            "match true { true => x.label(), false => 0 }",
+            "match true { _ if x.label() == 1 => 1, _ => 0 }",
+            "-x.label()",
+            "x.label() + 1",
+            "{ return x.label(); }",
+            "loop { break x.label(); }",
+            "{ while x.label() == 0 { break; } 1 }",
+        ],
+    ) {
+        let source = deferred_test_declarations() + "fn main() -> () { let f = |x| " + body
+            + "; let _ = f(A {}); }";
+        let checked = check(hir::lower(ast::lower(parser::parse(source)), "main.goml"));
+        for diagnostic in checked.diagnostics {
+            testing::fail(body + ": " + diagnostic.message)
+        }
+        let file = testing::expect_some(checked.tast, "expected TAST");
+        testing::assert(!encode_file(file).contains("<deferred"));
+    }
+}
+
+#[test]
+fn deferred_methods_update_query_call_and_reference_targets() -> () {
+    let source = deferred_test_declarations()
+        + "fn main() -> () { let f = |x| x.label(); let _ = f(A {}); }";
+    let checked = check(hir::lower(ast::lower(parser::parse(source)), "main.goml"));
+    testing::assert_eq(checked.diagnostics.len(), 0);
+    let mut found_call = false;
+    let mut found_reference = false;
+    for call in checked.typeck_results.calls {
+        match call.target {
+            Callable(DeferredMethod(_)) => testing::fail(
+                "deferred call target escaped finalization",
+            ),
+            Callable(TraitMethod { method_name, .. }) => if method_name == "label" {
+                found_call = true;
+            },
+            _ => (),
+        }
+    }
+    for reference in checked.typeck_results.references {
+        match reference.target {
+            Callable(DeferredMethod(_)) => testing::fail("deferred reference escaped finalization"),
+            Callable(TraitMethod { method_name, .. }) => if method_name == "label" {
+                found_reference = true;
+            },
+            _ => (),
+        }
+    }
+    testing::assert(found_call);
+    testing::assert(found_reference);
+}
+
+#[test]
+fn deferred_methods_preserve_explicit_method_arguments() -> () {
+    let file = checked_file(
+        "struct A {} struct B {} trait Pick { fn pick[T](self, value: T) -> T; } impl Pick for A { fn pick[T](self, value: T) -> T { value } } impl Pick for B { fn pick[T](self, value: T) -> T { value } } fn main() -> () { let f = |x| x.pick::[bool](true); let value: bool = f(A {}); let _ = value; }",
+    );
+    testing::assert(!encode_file(file).contains("<deferred"));
+}
+
+#[test]
+fn deferred_method_arguments_are_checked_once() -> () {
+    let source = deferred_test_declarations()
+        + "trait Run { fn run(self, callback: (A) -> isize) -> isize; } impl Run for A { fn run(self, callback: (A) -> isize) -> isize { callback(A {}) } } impl Run for B { fn run(self, callback: (A) -> isize) -> isize { callback(A {}) } } fn main() -> () { let f = |r| r.run(|x| x.label()); let _ = f(A {}); }";
+    let checked = check(hir::lower(ast::lower(parser::parse(source)), "main.goml"));
+    for diagnostic in checked.diagnostics {
+        testing::fail(diagnostic.message)
+    }
+    let mut label_calls = 0;
+    for call in checked.typeck_results.calls {
+        if let Callable(TraitMethod { method_name, .. }) = call.target {
+            if method_name == "label" {
+                label_calls += 1;
+            }
+        }
+    }
+    testing::assert_eq(label_calls, 1);
+}
+
+#[test]
+fn deferred_methods_resolve_receiver_dependencies_before_consumers() -> () {
+    let declarations = "struct A {} struct B {} struct C {} struct D {} trait Factory { type Item; fn make(self) -> Self::Item; } impl Factory for A { type Item = C; fn make(self) -> C { C {} } } impl Factory for B { type Item = D; fn make(self) -> D { D {} } } trait Label { fn label(self) -> isize; } impl Label for C { fn label(self) -> isize { 1 } } impl Label for D { fn label(self) -> isize { 2 } } ";
+    for body in Vec::from_array(["x.make().label()", "match x.make() { value => value.label() }"]) {
+        let source = declarations + "fn main() -> () { let f = |x| " + body + "; let _ = f(A {}); }";
+        let checked = check(hir::lower(ast::lower(parser::parse(source)), "main.goml"));
+        for diagnostic in checked.diagnostics {
+            testing::fail(body + ": " + diagnostic.message)
+        }
+        testing::assert(verify(testing::expect_some(checked.tast, "expected TAST")).is_ok());
+    }
+}
+
+#[test]
+fn unresolved_deferred_methods_report_type_diagnostics() -> () {
+    let source = deferred_test_declarations()
+        + "struct Missing {} fn main() -> () { let f = |x| x.label(); let _ = f(Missing {}); }";
+    let checked = check(hir::lower(ast::lower(parser::parse(source)), "main.goml"));
+    testing::assert(diagnostics_have_errors(checked.diagnostics));
+    testing::assert(has_diagnostic_containing(checked.diagnostics, "deferred method label"));
+    if let Some(file) = checked.tast {
+        testing::assert(!encode_file(file).contains("<deferred"));
+    }
+}
+
+#[test]
+fn tast_verifier_rejects_nested_deferred_calls() -> () {
+    let file = checked_file("fn main() -> () {} ");
+    let Item::Function(function) = file.items[0] else {
+        testing::fail("expected main");
+        return
+    };
+    let pending = Expr::Callable { callable: Callable::DeferredMethod(0), ty: Type::Unit };
+    let body = Block {
+        stmts: Vec::new(),
+        tail: Some(Expr::Tuple { items: Vec::from_array([pending]), ty: Type::Unit }),
+    };
+    let invalid = File {
+        items: Vec::from_array([Item::Function(Function { body, ..function })]),
+        ..file,
+    };
+    testing::assert(verify(file).is_ok());
+    testing::assert(verify(invalid).is_err());
+}
