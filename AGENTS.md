@@ -58,7 +58,10 @@ Run recipes from the repository root; [.justfile](.justfile) is the command refe
 - Do not add code comments; write clear, self-explanatory code.
 - GoML uses four-space indentation, snake_case functions/packages, CamelCase types, and explicit top-level function signatures. Generics use square brackets; local closures have one concrete type and cannot declare generics or use let-generalization.
 - TypeScript uses two-space indentation and PascalCase components; prefer named exports.
-- Keep packages small and focused. Prefer method syntax when available, such as `s.len()`, `s.get(i)`, and `x.to_string()`.
+- Keep packages small and focused. Prefer method syntax when available, such as `s.len()` and `x.to_string()`.
+- Prefer contextual enum variants such as `Ok(value)`, `Some(value)`, and `None` when the expected type identifies the enum. Retain qualified variants when needed for inference or disambiguation.
+- Prefer `values[index]` for `Vec` element access. Keep `get` for types that require it, including `FrozenVec`, and for lookup APIs with different semantics.
+- Define operations on a concrete object as methods when the receiver is clear, and call them through the receiver. Keep standalone constructors and operations without a natural receiver as free functions.
 - The frontend pipeline is `lexer → parser → CST → AST → HIR → TAST → Core → Mono → Lift → ANF → Go`.
 - `gomlc/hir/` owns AST-to-HIR lowering and name resolution. `gomlc/tast/` owns inference, checking, constraints, and type-directed decisions, including contextual enum-pattern resolution.
 - Ambiguity, missing lookups, invalid caches, and dependency failures must produce recoverable diagnostics. Environment and lookup code must return failure values instead of terminating the compiler.
