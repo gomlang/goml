@@ -3,6 +3,7 @@
 set -euo pipefail
 
 test "$#" = 3
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 prefix="$(realpath "$1")"
 driver="$(realpath "$2")"
@@ -14,16 +15,14 @@ temporary="$fingerprint.tmp"
 
 mkdir -p "$compiler_dir"
 input_fingerprint="$({
-    sha256sum "$driver" "$compiler"
-    find "$prefix/lib/builtin" "$prefix/lib/prelude" "$prefix/lib/std" -type f -print0 \
-        | sort -z \
-        | xargs -0 -r sha256sum
-} | sha256sum | cut -d ' ' -f 1)"
+    toolchain_sha256 "$driver" "$compiler"
+    toolchain_hash_files "$prefix/lib/builtin" "$prefix/lib/prelude" "$prefix/lib/std"
+} | toolchain_sha256 | cut -d ' ' -f 1)"
 
 if test -f "$world" && test -f "$fingerprint"; then
     stored_input_fingerprint="$(sed -n '1p' "$fingerprint")"
     stored_world_fingerprint="$(sed -n '2p' "$fingerprint")"
-    world_fingerprint="$(sha256sum "$world" | cut -d ' ' -f 1)"
+    world_fingerprint="$(toolchain_sha256 "$world" | cut -d ' ' -f 1)"
     if test "$stored_input_fingerprint" = "$input_fingerprint" \
         && test "$stored_world_fingerprint" = "$world_fingerprint"; then
         exit 0
@@ -31,6 +30,6 @@ if test -f "$world" && test -f "$fingerprint"; then
 fi
 
 "$driver" __toolchain-finalize --prefix "$prefix" --compiler "$compiler"
-world_fingerprint="$(sha256sum "$world" | cut -d ' ' -f 1)"
+world_fingerprint="$(toolchain_sha256 "$world" | cut -d ' ' -f 1)"
 printf '%s\n%s\n' "$input_fingerprint" "$world_fingerprint" > "$temporary"
 mv "$temporary" "$fingerprint"

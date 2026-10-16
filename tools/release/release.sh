@@ -36,6 +36,8 @@ check_stage0() {
     expected="v$release_major.$release_minor.$release_patch"
     source bootstrap/stage0.env
     test "$GOML_STAGE0_RELEASE_TAG" = "$expected"
+    [[ "$GOML_STAGE0_LINUX_AMD64_SHA256" =~ ^[0-9a-f]{64}$ ]] || return 1
+    [[ "$GOML_STAGE0_DARWIN_ARM64_SHA256" =~ ^[0-9a-f]{64}$ ]] || return 1
 }
 
 check_next() {
@@ -86,14 +88,14 @@ set_version() {
 set_stage0() {
     parse_version "$1"
     value="$release_major.$release_minor.$release_patch"
-    checksum="$2"
-    [[ "$checksum" =~ ^[0-9a-f]{64}$ ]]
-    asset="goml-$value-linux-amd64.tar.gz"
+    linux_checksum="$2"
+    darwin_checksum="$3"
+    [[ "$linux_checksum" =~ ^[0-9a-f]{64}$ ]] || return 1
+    [[ "$darwin_checksum" =~ ^[0-9a-f]{64}$ ]] || return 1
     printf '%s\n' \
         "GOML_STAGE0_RELEASE_TAG=v$value" \
-        "GOML_STAGE0_ASSET_NAME=$asset" \
-        "GOML_STAGE0_URL=https://github.com/gomlang/goml/releases/download/v$value/$asset" \
-        "GOML_STAGE0_SHA256=$checksum" \
+        "GOML_STAGE0_LINUX_AMD64_SHA256=$linux_checksum" \
+        "GOML_STAGE0_DARWIN_ARM64_SHA256=$darwin_checksum" \
         > bootstrap/stage0.env
 }
 
@@ -105,6 +107,6 @@ case "$command" in
     check-next) test "$#" = 2; check_next "$1" "$2" ;;
     latest) test "$#" -gt 0; latest "$@" ;;
     set-version) test "$#" = 1; set_version "$1" ;;
-    set-stage0) test "$#" = 2; set_stage0 "$1" "$2" ;;
+    set-stage0) test "$#" = 3; set_stage0 "$1" "$2" "$3" ;;
     *) exit 2 ;;
 esac

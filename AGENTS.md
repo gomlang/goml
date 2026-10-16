@@ -30,7 +30,7 @@ The current bootstrap uses toolchain prefixes under `stage0`, `stage2`, and `sta
 
 ## Development Workflow
 
-Requirements: Linux amd64, Go 1.26+, a C compiler for race-detector tests, Node 20+, npm, `just`, Bash, curl, tar, sha256sum, and jq. Generated Go code and Go FFI target Go 1.26. The gomlgo interpreter and differential tests require Go 1.26.x; see its README for details.
+Requirements: Linux amd64 or macOS arm64, Go 1.26+, a C compiler for race-detector tests, Node 20+, npm, `just`, Bash, curl, tar, sha256sum or shasum, and jq. Full `just ci` and Linux syscall tests require Linux amd64; macOS supports native bootstrap, fixed-point verification, toolchain script tests, and release smoke tests. Generated Go code and Go FFI target Go 1.26. The gomlgo interpreter and differential tests require Go 1.26.x; see its README for details.
 
 Run recipes from the repository root; [.justfile](.justfile) is the command reference.
 
@@ -92,7 +92,7 @@ Run recipes from the repository root; [.justfile](.justfile) is the command refe
 
 ## Bootstrap and Language Evolution
 
-- `bootstrap/stage0.env` is the trust root: only published Linux amd64 Release archives with pinned SHA-256 checksums may become stage0. Never use unreleased workflow artifacts.
+- `bootstrap/stage0.env` is the trust root: only published Linux amd64 and macOS arm64 Release archives with separately pinned SHA-256 checksums may become stage0. Both platforms use the same release version. Never use unreleased workflow artifacts.
 - Current stage0 must compile the current compiler and driver sources. Every change must preserve this invariant; use the Development Workflow above to select local checks.
 - Implement new syntax, builtins, standard-library APIs, traits, or type-system capabilities before using them in compiler or driver sources. Tests and fixtures may use them immediately; self-hosted consumers must wait until release and stage0 advancement.
 - Introduce standard-library capabilities in two phases: first ship public source, resource packaging, dependency selection, navigation, docs, and external tests while retaining compiler-owned fallbacks; after release and stage0 advancement, migrate consumers and remove fallbacks.
@@ -110,4 +110,4 @@ Run recipes from the repository root; [.justfile](.justfile) is the command refe
 - Follow [docs/releasing.md](docs/releasing.md): run `just set-version X.Y.Z` and `just ci`, push the release commit, wait for successful main CI on that exact commit, then tag and push it.
 - `just set-version` must synchronize `VERSION`, both GoML version modules, and the VS Code package and lockfile versions.
 - Main CI must pass before merge or release and owns fixed-point verification and the complete test suite. Release CI requires successful main CI for the exact tagged commit, rebuilds stage2, and runs archive/LSP smoke tests without repeating the full suite.
-- After publication, take the archive checksum from `SHA256SUMS`, run `just set-bootstrap-stage0 X.Y.Z <sha256>` and `just bootstrap`, then commit `bootstrap/stage0.env` before relying on newly released capabilities.
+- After publication, take both archive checksums from `SHA256SUMS`, run `just set-bootstrap-stage0 X.Y.Z <linux-sha256> <darwin-sha256>` and `just bootstrap`, then commit `bootstrap/stage0.env` before relying on newly released capabilities.

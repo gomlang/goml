@@ -37,6 +37,7 @@ clean:
     rm -rf editors/vscode/bin editors/vscode/lib
 
 _bootstrap-stage3:
+    bash bootstrap/check-host.sh
     rm -rf gomlc/_bootstrap/stage3 gomlc/_bootstrap/stage3-fixed
     rm -rf goml/_bootstrap/stage3 goml/_bootstrap/stage3-fixed stage3
     mkdir -p stage3/bin
@@ -52,6 +53,7 @@ _bootstrap-stage3:
     if test -d goml/_bootstrap/stage3/build/deps || test -d goml/_bootstrap/stage3-fixed/build/deps; then diff -ru --exclude='*.goml-*-fingerprint' --exclude='*.goml-output-epoch' goml/_bootstrap/stage3/build/deps goml/_bootstrap/stage3-fixed/build/deps; fi
 
 bootstrap:
+    bash bootstrap/check-host.sh
     rm -rf gomlc/_bootstrap/stage1 gomlc/_bootstrap/stage2 gomlc/_bootstrap/stage3 gomlc/_bootstrap/stage3-fixed
     rm -rf goml/_bootstrap/stage1 goml/_bootstrap/stage2 goml/_bootstrap/stage3 goml/_bootstrap/stage3-fixed
     rm -rf stage0 stage1 stage2 stage3
@@ -113,6 +115,7 @@ _ci-release-smoke:
     bash tools/release/smoke.sh "$(cat VERSION)"
 
 ci:
+    bash bootstrap/check-host.sh linux-amd64
     rm -rf gomlc/_bootstrap/stage1 gomlc/_bootstrap/stage2 gomlc/_bootstrap/stage3 gomlc/_bootstrap/stage3-fixed
     rm -rf goml/_bootstrap/stage1 goml/_bootstrap/stage2 goml/_bootstrap/stage3 goml/_bootstrap/stage3-fixed
     rm -rf stage1 stage2 stage3
@@ -124,8 +127,8 @@ set-version version:
     cd editors/vscode && npm version --no-git-tag-version "{{version}}"
     bash tools/release/release.sh check-version "$(cat VERSION)"
 
-set-bootstrap-stage0 version sha256:
-    bash tools/release/release.sh set-stage0 "{{version}}" "{{sha256}}"
+set-bootstrap-stage0 version linux_sha256 darwin_sha256:
+    bash tools/release/release.sh set-stage0 "{{version}}" "{{linux_sha256}}" "{{darwin_sha256}}"
     bash bootstrap/bootstrap.sh bootstrap/stage0.env stage0
 
 vscode-ext: make-tools _vscode-bundle

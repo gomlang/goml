@@ -45,7 +45,7 @@ just ci
 
 The block stops before tagging if the push fails, the CI run is not registered yet, or CI fails. If the run is not yet visible, wait for it to appear and rerun the block.
 
-Main CI builds stage2 directly from the pinned Linux amd64 stage0. Its Linux checks cover compiler, driver, standard-library and script tests, extension compilation and VSIX packaging, archive smoke tests, and the stage3 fixed point. Fixed-point verification compares the compiler and driver artifacts built by stage2 with a rebuild using stage3. A macOS 15 arm64 job builds and tests its release archive using the generated Go sources exported by the Linux build. It receives no Linux executables or compiler world. Both platforms must pass the final `test` job. The independent [gomlgo project](https://github.com/gomlang/gomlgo) owns its separate test suite.
+Main CI builds stage2 directly from the pinned Linux amd64 stage0. Its Linux checks cover compiler, driver, standard-library and script tests, extension compilation and VSIX packaging, archive smoke tests, and the stage3 fixed point. Fixed-point verification compares the compiler and driver artifacts built by stage2 with a rebuild using stage3. A macOS 15 arm64 job builds and tests its release archive using the generated Go sources exported by the Linux build, then independently bootstraps from the pinned macOS arm64 stage0, verifies its native fixed point, and runs toolchain script tests. It receives no Linux executables or compiler world. Both platforms must pass the final `test` job. The independent [gomlgo project](https://github.com/gomlang/gomlgo) owns its separate test suite.
 
 The Release workflow requires successful main CI for the exact tagged commit and verifies the version, previous release, and stage0. It rebuilds stage2 on Linux, exports the five generated Go entry points, then builds all five tools natively in parallel on Ubuntu amd64 and macOS arm64. Each job verifies binary target metadata, packages resources, and runs archive relocation, finalization, project commands, formatting, documentation, LSP, direct Go FFI and Go export smoke tests. macOS also checks rejection of Linux syscalls. Release CI does not repeat the complete Linux suite or fixed-point verification.
 
@@ -95,7 +95,7 @@ goml version
 
 Linux users select `linux-amd64` and may use `sha256sum -c archive.sha256`. Keep `bin` and `lib` together when relocating an installation. Go 1.26 or newer must be on `PATH` to build programs. User-supplied cgo adapters additionally require a C compiler.
 
-macOS supports the compiler, driver, formatter, documentation generator, LSP, Go FFI and user-supplied cgo adapters. `std::os::linux`, the current Linux syscall-backed socket operations in `std::net` and dependent networking APIs remain Linux amd64-specific. SIMD uses its scalar implementation on arm64. The macOS release does not change the Linux stage0 trust root or enable native macOS source bootstrap.
+macOS supports the compiler, driver, formatter, documentation generator, LSP, Go FFI, user-supplied cgo adapters, and native source bootstrap through `just bootstrap`. The bootstrap uses the published macOS arm64 archive and its pinned checksum in `bootstrap/stage0.env`. `std::os::linux`, the current Linux syscall-backed socket operations in `std::net` and dependent networking APIs remain Linux amd64-specific. SIMD uses its scalar implementation on arm64.
 
 Release archives use a complete toolchain prefix:
 
@@ -127,18 +127,19 @@ Finalization builds and validates the compiler world in a temporary path, then a
 
 ## Advance stage0
 
-The release is built by the previous Linux amd64 release as stage0. After publishing, keep `release_version` set to the published version and replace `SHA256_FROM_SHA256SUMS` with the **Linux amd64 archive's** checksum, then advance stage0:
+The release is built by the previous Linux amd64 release as stage0; native macOS bootstrap uses the macOS arm64 archive of that same release. After publishing, keep `release_version` set to the published version and take both platform checksums from `SHA256SUMS`, then advance stage0:
 
 ```sh
-archive_sha256=SHA256_FROM_SHA256SUMS
-just set-bootstrap-stage0 "$release_version" "$archive_sha256"
+linux_sha256=LINUX_AMD64_SHA256_FROM_SHA256SUMS
+darwin_sha256=DARWIN_ARM64_SHA256_FROM_SHA256SUMS
+just set-bootstrap-stage0 "$release_version" "$linux_sha256" "$darwin_sha256"
 just bootstrap
 ```
 
 Commit the updated `bootstrap/stage0.env` before using language features that the previous stage0 cannot compile. The next release workflow requires stage0 to match the latest published release.
 
-For an offline bootstrap, download the pinned archive and run:
+For an offline bootstrap, download the pinned archive for the host and run, for example on macOS arm64:
 
 ```sh
-GOML_STAGE0_ARCHIVE=/path/to/goml-X.Y.Z-linux-amd64.tar.gz just bootstrap
+GOML_STAGE0_ARCHIVE=/path/to/goml-X.Y.Z-darwin-arm64.tar.gz just bootstrap
 ```

@@ -1,6 +1,6 @@
 # Developing GoML
 
-Run recipes from the repository root. The toolchain build requires Linux amd64, Go 1.26+, `just`, Bash, curl, tar, and sha256sum. Tests require a C compiler for Go's race detector; full CI also uses Node 20+, npm, jq, Python 3, Perl's `shasum` for checksum portability tests, and Linux development headers for checking the generated syscall ABI and record layouts. See [.justfile](../.justfile) for all commands. The independent [gomlgo frontend and interpreter](https://github.com/gomlang/gomlgo) targets Go 1.26 and requires Go 1.26.x for execution and differential tests.
+Run recipes from the repository root. The toolchain build requires Linux amd64 or macOS arm64, Go 1.26+, `just`, Bash, curl, tar, and sha256sum or shasum. Tests require a C compiler for Go's race detector; full CI also uses Node 20+, npm, jq, Python 3, Perl's `shasum` for checksum portability tests, and Linux development headers for checking the generated syscall ABI and record layouts. See [.justfile](../.justfile) for all commands. The independent [gomlgo frontend and interpreter](https://github.com/gomlang/gomlgo) targets Go 1.26 and requires Go 1.26.x for execution and differential tests.
 
 ```sh
 just make
@@ -16,6 +16,10 @@ Local CI runs its check groups concurrently. Set `GOML_CI_SEQUENTIAL=1` to run t
 GitHub CI builds test artifacts once and runs them in shards with `goml test --no-build`. See [the workflow](../.github/workflows/ci.yml) for job dependencies and [test commands](goml.md#check-and-run-tests) for sharding and artifact reuse.
 
 The bootstrap downloads the checksum-pinned stage0 release recorded in [bootstrap/stage0.env](../bootstrap/stage0.env). `just bootstrap` rebuilds stage2 from stage0, builds stage3 with stage2, then uses stage3 to rebuild the compiler and driver artifacts and compares them with the first stage3 build. Set `GOML_STAGE0_ARCHIVE` to a previously downloaded pinned archive to avoid downloading stage0.
+
+Source bootstrap selects the published `linux-amd64` or `darwin-arm64` archive for the host and verifies its separately pinned SHA-256 checksum. Both platforms use the same stage0 release version. An offline `GOML_STAGE0_ARCHIVE` must match the host's pinned archive. Unsupported hosts are rejected before downloading stage0 or cleaning existing bootstrap outputs.
+
+On macOS arm64, run `just bootstrap` for a clean native build and fixed-point verification, or `just make` for an incremental build. Run `just _ci-toolchain-scripts` and `just _ci-release-smoke` after building to check installation, caching, packaging, and the published-toolchain workflows. Full `just ci` and the complete compiler and standard-library test suites require Linux amd64 because they exercise Linux syscalls and ABI headers. GitHub CI also runs the native macOS bootstrap and toolchain script checks alongside the macOS release archive smoke tests.
 
 Use `stage2/bin` for local development. Toolchain prefixes under `stage0`, `stage2`, and `stage3` contain `bin`, library projects under `lib`, and the finalized compiler world under `lib/compiler`. Downloaded archives are cached in `_bootstrap/cache`; compiler and driver bootstrap products live in their module-local `_bootstrap` directories. Generated outputs are ignored by Git.
 

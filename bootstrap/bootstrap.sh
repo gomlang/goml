@@ -1,21 +1,21 @@
 set -euo pipefail
 
 test "$#" = 2
-test "$(uname -s)" = Linux
-test "$(uname -m)" = x86_64
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/../tools/lib/common.sh"
+stage0_platform="$(bootstrap_platform)"
 
 stage0_file="$1"
 stage0_output="$2"
 source "$stage0_file"
+bootstrap_stage0 "$stage0_platform"
 
 stage0_cache="_bootstrap/cache"
 stage0_archive="${GOML_STAGE0_ARCHIVE:-$stage0_cache/$GOML_STAGE0_ASSET_NAME}"
 stage0_stamp="$stage0_output/.stage0.sha256"
 stage0_tree_fingerprint() {
-    find "$stage0_output/bin" "$stage0_output/lib" -type f -print0 \
-        | sort -z \
-        | xargs -0 -r sha256sum \
-        | sha256sum \
+    toolchain_hash_files "$stage0_output/bin" "$stage0_output/lib" \
+        | toolchain_sha256 \
         | cut -d ' ' -f 1
 }
 if test -f "$stage0_stamp" \
@@ -31,17 +31,17 @@ fi
 mkdir -p "$stage0_cache" "$stage0_output/bin" "$stage0_output/lib"
 
 if test -z "${GOML_STAGE0_ARCHIVE:-}"; then
-    if ! test -f "$stage0_archive" || ! printf '%s  %s\n' "$GOML_STAGE0_SHA256" "$stage0_archive" | sha256sum --check --status; then
+    if ! test -f "$stage0_archive" || ! printf '%s  %s\n' "$GOML_STAGE0_SHA256" "$stage0_archive" | toolchain_sha256 -c - >/dev/null; then
         stage0_temporary="$(mktemp "$stage0_cache/$GOML_STAGE0_ASSET_NAME.XXXXXX")"
         trap 'rm -f "$stage0_temporary"' EXIT
         curl --fail --location --retry 3 --output "$stage0_temporary" "$GOML_STAGE0_URL"
-        printf '%s  %s\n' "$GOML_STAGE0_SHA256" "$stage0_temporary" | sha256sum --check --status
+        printf '%s  %s\n' "$GOML_STAGE0_SHA256" "$stage0_temporary" | toolchain_sha256 -c - >/dev/null
         mv "$stage0_temporary" "$stage0_archive"
         trap - EXIT
     fi
 fi
 
-printf '%s  %s\n' "$GOML_STAGE0_SHA256" "$stage0_archive" | sha256sum --check --status
+printf '%s  %s\n' "$GOML_STAGE0_SHA256" "$stage0_archive" | toolchain_sha256 -c - >/dev/null
 
 stage0_extracted="$(mktemp -d "$stage0_output/.stage0-install.XXXXXX")"
 cleanup_stage0_install() {

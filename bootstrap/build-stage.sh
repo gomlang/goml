@@ -11,7 +11,7 @@ case "$build_mode" in
     full|compiler|artifacts) ;;
     *) exit 1 ;;
 esac
-build_jobs="${GOML_BUILD_JOBS:-$(nproc)}"
+build_jobs="${GOML_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN)}"
 case "$build_jobs" in
     ''|*[!0-9]*) exit 1 ;;
 esac
