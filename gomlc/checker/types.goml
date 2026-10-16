@@ -1,0 +1,1052 @@
+package checker;
+
+use module::ast;
+use module::tast::{Callable, DynTraitBound, ImplInfo, TraitRef, Type, TypePredicate, TypeSubst, TypeVar, VarKind, any_child_type, any_type, const_type, diagnostic_type_text, dyn_bounds, map_child_types, names_match, opaque_bounds, opaque_parts, prune, substitute_type, symbolic_array, trait_ref_text, type_text, types_equal};
+
+struct ProjectionAlias {
+    projection: Type,
+    ty: Type,
+}
+
+fn merge_var_kind(left: VarKind, right: VarKind) -> Option[VarKind] {
+    match (left, right) {
+        (Any, value) => Some(value),
+        (value, Any) => Some(value),
+        (Integer, Integer) => Some(VarKind::Integer),
+        (Float, Float) => Some(VarKind::Float),
+        _ => None,
+    }
+}
+
+fn is_integer_type(value: Type) -> bool {
+    match prune(value) {
+        Int | Int8 | Int16 | Int32 | Int64 | Uint | Uint8 | Uint16 | Uint32 | Uint64 => true,
+        Var(variable) => match variable.get() {
+            Unbound { id: _, kind: Integer } => true,
+            Link(inner) => is_integer_type(inner),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn is_float_type(value: Type) -> bool {
+    match prune(value) {
+        Float32 | Float64 => true,
+        Var(variable) => match variable.get() {
+            Unbound { id: _, kind: Float } => true,
+            Link(inner) => is_float_type(inner),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn is_numeric_type(value: Type) -> bool {
+    is_integer_type(value) || is_float_type(value)
+}
+
+fn is_unsigned_type(value: Type) -> bool {
+    match prune(value) {
+        Uint | Uint8 | Uint16 | Uint32 | Uint64 => true,
+        _ => false,
+    }
+}
+
+fn kind_accepts(kind: VarKind, value: Type) -> bool {
+    match kind {
+        Any => true,
+        Integer | Float => is_numeric_type(value),
+    }
+}
+
+fn fresh_type(counter: Ref[isize], kind: VarKind) -> Type {
+    let index = counter.get();
+    counter.set(index + 1);
+    Type::Var(Ref::new(TypeVar::Unbound { id: index, kind }))
+}
+
+fn occurs(variable: Ref[TypeVar], value: Type) -> bool {
+    match prune(value) {
+        Var(other) => ptr_eq(variable, other),
+        value => match opaque_parts(value) {
+            Some((_, args)) => any_type(args, |child| occurs(variable, child)),
+            None => any_child_type(value, |child| occurs(variable, child)),
+        },
+    }
+}
+
+fn bind_variable(variable: Ref[TypeVar], value: Type) -> bool {
+    if occurs(variable, value) {
+        false
+    } else {
+        match variable.get() {
+            Link(inner) => unify(inner, value),
+            Unbound { id: _, kind } => if kind_accepts(kind, value) {
+                variable.set(TypeVar::Link(value));
+                true
+            } else {
+                false
+            },
+        }
+    }
+}
+
+fn unify_types(left: Vec[Type], right: Vec[Type]) -> bool {
+    if left.len() != right.len() {
+        false
+    } else {
+        for index in 0..left.len() {
+            if !unify(left[index], right[index]) {
+                return false
+            }
+        }
+        true
+    }
+}
+
+fn unify_trait_refs(left: Option[TraitRef], right: Option[TraitRef]) -> bool {
+    match (left, right) {
+        (Some(first), Some(second)) => {
+            names_match(first.name, second.name) && unify_types(first.args, second.args)
+        },
+        _ => true,
+    }
+}
+
+fn associated_type_bindings_unify(first: Vec[(string, Type)], second: Vec[(string, Type)]) -> bool {
+    if first.len() != second.len() {
+        false
+    } else {
+        for index in 0..first.len() {
+            if first[index].0 != second[index].0 || !unify(first[index].1, second[index].1) {
+                return false
+            }
+        }
+        true
+    }
+}
+
+fn dyn_bound_lists_unify(first: Vec[DynTraitBound], second: Vec[DynTraitBound]) -> bool {
+    if first.len() != second.len() {
+        false
+    } else {
+        for index in 0..first.len() {
+            if first[index].trait_name != second[index].trait_name
+                || !unify_types(first[index].args, second[index].args)
+                || !associated_type_bindings_unify(
+                    first[index].associated_types,
+                    second[index].associated_types,
+                ) {
+                return false
+            }
+        }
+        true
+    }
+}
+
+fn unify(left: Type, right: Type) -> bool {
+    let left = prune(left);
+    let right = prune(right);
+    if let (Some(parts), Array { len, elem }) = (symbolic_array(left), right) {
+        return (len < 0 || unify(parts.0, const_type(len))) && unify(parts.1, elem)
+    }
+    if let (Array { len, elem }, Some(parts)) = (left, symbolic_array(right)) {
+        return (len < 0 || unify(parts.0, const_type(len))) && unify(elem, parts.1)
+    }
+    match (left, right) {
+        (
+            External { import_path: first_path, name: first_name, args: first_args },
+            External { import_path: second_path, name: second_name, args: second_args },
+        ) => first_path == second_path && first_name == second_name
+            && unify_types(first_args, second_args),
+        (Error, _) | (_, Error) => true,
+        (Var(first), Var(second)) => if ptr_eq(first, second) {
+            true
+        } else {
+            match (first.get(), second.get()) {
+                (Link(inner), _) => unify(inner, Type::Var(second)),
+                (_, Link(inner)) => unify(Type::Var(first), inner),
+                (Unbound { id: _, kind: first_kind }, Unbound { id: second_id, kind: second_kind }) => {
+                    match merge_var_kind(first_kind, second_kind) {
+                        Some(kind) => {
+                            second.set(TypeVar::Unbound { id: second_id, kind });
+                            first.set(TypeVar::Link(Type::Var(second)));
+                            true
+                        },
+                        None => false,
+                    }
+                },
+            }
+        },
+        (Var(variable), value) => bind_variable(variable, value),
+        (value, Var(variable)) => bind_variable(variable, value),
+        (Unit, Unit) | (Never, Never) | (Bool, Bool) | (Int, Int) | (Int8, Int8) | (Int16, Int16) | (
+            Int32,
+            Int32,
+        ) | (Int64, Int64) | (Uint, Uint) | (Uint8, Uint8) | (Uint16, Uint16) | (Uint32, Uint32) | (
+            Uint64,
+            Uint64,
+        ) | (Float32, Float32) | (Float64, Float64) | (String, String) | (Char, Char) => true,
+        (Tuple { items: first }, Tuple { items: second }) => unify_types(first, second),
+        (Con { name: first }, Con { name: second }) => first == second,
+        (
+            Dyn {
+                trait_name: first_name,
+                args: first_args,
+                associated_types: first_associated,
+                additional_bounds: first_additional,
+            },
+            Dyn {
+                trait_name: second_name,
+                args: second_args,
+                associated_types: second_associated,
+                additional_bounds: second_additional,
+            },
+        ) => {
+            first_name == second_name && unify_types(first_args, second_args)
+                && associated_type_bindings_unify(first_associated, second_associated)
+                && dyn_bound_lists_unify(first_additional, second_additional)
+        },
+        (
+            Projection { for_ty: first_base, name: first_name, trait_ref: first_trait },
+            Projection { for_ty: second_base, name: second_name, trait_ref: second_trait },
+        ) => {
+            first_name == second_name && unify_trait_refs(first_trait, second_trait)
+                && unify(first_base, second_base)
+        },
+        (App { ty: first_base, args: first_args }, App { ty: second_base, args: second_args }) => {
+            unify(first_base, second_base) && unify_types(first_args, second_args)
+        },
+        (Array { len: first_len, elem: first_elem }, Array { len: second_len, elem: second_elem }) => {
+            (first_len < 0 || second_len < 0 || first_len == second_len)
+                && unify(first_elem, second_elem)
+        },
+        (Slice { elem: first }, Slice { elem: second }) | (
+            MutSlice { elem: first },
+            MutSlice { elem: second },
+        ) | (VecType { elem: first }, VecType { elem: second }) | (
+            RefType { elem: first },
+            RefType { elem: second },
+        ) | (GoPointer { elem: first }, GoPointer { elem: second }) | (
+            GoFunction { signature: first },
+            GoFunction { signature: second },
+        ) => unify(first, second),
+        (
+            Channel { elem: first, direction: first_direction },
+            Channel { elem: second, direction: second_direction },
+        ) => ast::channel_directions_equal(first_direction, second_direction)
+            && unify(first, second),
+        (
+            HashMap { key: first_key, value: first_value },
+            HashMap { key: second_key, value: second_value },
+        ) => {
+            unify(first_key, second_key) && unify(first_value, second_value)
+        },
+        (
+            GoMap { key: first_key, value: first_value },
+            GoMap { key: second_key, value: second_value },
+        ) => {
+            unify(first_key, second_key) && unify(first_value, second_value)
+        },
+        (Param { name: first }, Param { name: second }) => first == second,
+        (
+            Func { params: first_params, ret_ty: first_ret },
+            Func { params: second_params, ret_ty: second_ret },
+        ) => {
+            unify_types(first_params, second_params) && unify(first_ret, second_ret)
+        },
+        _ => false,
+    }
+}
+
+fn type_mismatch_text(left: Type, right: Type) -> string {
+    "Type mismatch: expected " + diagnostic_type_text(left) + ", found "
+        + diagnostic_type_text(right)
+}
+
+fn first_type_list_error(left: Vec[Type], right: Vec[Type]) -> Option[string] {
+    for index in 0..left.len() {
+        if let Some(message) = first_unification_error(left[index], right[index]) {
+            return Some(message)
+        }
+    }
+    None
+}
+
+fn first_trait_ref_error(left: Option[TraitRef], right: Option[TraitRef]) -> Option[string] {
+    match (left, right) {
+        (Some(first), Some(second)) => if names_match(first.name, second.name)
+            && first.args.len() == second.args.len() {
+            first_type_list_error(first.args, second.args)
+        } else {
+            Some("trait reference mismatch")
+        },
+        (None, None) => None,
+        _ => Some("trait reference mismatch"),
+    }
+}
+
+fn first_unification_error(left: Type, right: Type) -> Option[string] {
+    let left = prune(left);
+    let right = prune(right);
+    match (left, right) {
+        (Error, _) | (_, Error) => None,
+        (Var(first), Var(second)) => if ptr_eq(first, second) {
+            None
+        } else {
+            match (first.get(), second.get()) {
+                (Link(inner), _) => {
+                    first_unification_error(inner, Type::Var(second))
+                },
+                (_, Link(inner)) => {
+                    first_unification_error(Type::Var(first), inner)
+                },
+                (Unbound { id: _, kind: first_kind }, Unbound { id: _, kind: second_kind }) => {
+                    match merge_var_kind(first_kind, second_kind) {
+                        Some(_) => None,
+                        None => Some("Type inference failed while unifying unknown types"),
+                    }
+                },
+            }
+        },
+        (Var(variable), value) | (value, Var(variable)) => {
+            match variable.get() {
+                Link(inner) => first_unification_error(inner, value),
+                Unbound { id: _, kind } => if occurs(variable, value) {
+                    Some("Type inference failed: recursive type")
+                } else if kind_accepts(kind, value) {
+                    None
+                } else if match kind {
+                    Integer | Float => true,
+                    Any => false,
+                } {
+                    Some("Numeric literal cannot be used as " + diagnostic_type_text(value))
+                } else {
+                    Some(
+                        "Type inference failed while unifying unknown type with " + type_text(value),
+                    )
+                },
+            }
+        },
+        (Unit, Unit) | (Never, Never) | (Bool, Bool) | (Int, Int) | (Int8, Int8) | (Int16, Int16) | (
+            Int32,
+            Int32,
+        ) | (Int64, Int64) | (Uint, Uint) | (Uint8, Uint8) | (Uint16, Uint16) | (Uint32, Uint32) | (
+            Uint64,
+            Uint64,
+        ) | (Float32, Float32) | (Float64, Float64) | (String, String) | (Char, Char) => None,
+        (Tuple { items: first }, Tuple { items: second }) => if first.len() == second.len() {
+            first_type_list_error(first, second)
+        } else {
+            Some(
+                "Tuple length mismatch: expected " + type_text(Type::Tuple { items: first })
+                    + ", found "
+                    + type_text(Type::Tuple { items: second }),
+            )
+        },
+        (
+            External { import_path: first_path, name: first_name, args: first_args },
+            External { import_path: second_path, name: second_name, args: second_args },
+        ) => {
+            if first_path != second_path || first_name != second_name
+                || first_args.len() != second_args.len() {
+                Some(type_mismatch_text(left, right))
+            } else {
+                first_type_list_error(first_args, second_args)
+            }
+        },
+        (Con { name: first }, Con { name: second }) => if first == second {
+            None
+        } else {
+            Some(type_mismatch_text(Type::Con { name: first }, Type::Con { name: second }))
+        },
+        (Dyn { .. }, Dyn { .. }) => if types_equal(left, right) {
+            None
+        } else {
+            Some(type_mismatch_text(left, right))
+        },
+        (
+            Projection { for_ty: first_base, name: first_name, trait_ref: first_trait },
+            Projection { for_ty: second_base, name: second_name, trait_ref: second_trait },
+        ) => if first_name != second_name {
+            Some(
+                type_mismatch_text(
+                    Projection { for_ty: first_base, name: first_name, trait_ref: first_trait },
+                    Projection { for_ty: second_base, name: second_name, trait_ref: second_trait },
+                ),
+            )
+        } else {
+            match first_trait_ref_error(first_trait, second_trait) {
+                Some(message) => Some(message),
+                None => first_unification_error(first_base, second_base),
+            }
+        },
+        (App { ty: first_base, args: first_args }, App { ty: second_base, args: second_args }) => {
+            if first_args.len() != second_args.len() {
+                Some(
+                    "Type argument arity mismatch: expected "
+                        + type_text(Type::App { ty: first_base, args: first_args })
+                        + ", found "
+                        + type_text(Type::App { ty: second_base, args: second_args }),
+                )
+            } else {
+                match first_unification_error(first_base, second_base) {
+                    Some(message) => Some(message),
+                    None => first_type_list_error(first_args, second_args),
+                }
+            }
+        },
+        (Array { len: first_len, elem: first_elem }, Array { len: second_len, elem: second_elem }) => {
+            if first_len >= 0 && second_len >= 0 && first_len != second_len {
+                Some(
+                    "Array length mismatch: expected "
+                        + type_text(Type::Array { len: first_len, elem: first_elem })
+                        + ", found "
+                        + type_text(Type::Array { len: second_len, elem: second_elem }),
+                )
+            } else {
+                first_unification_error(first_elem, second_elem)
+            }
+        },
+        (Slice { elem: first }, Slice { elem: second }) | (
+            MutSlice { elem: first },
+            MutSlice { elem: second },
+        ) | (VecType { elem: first }, VecType { elem: second }) | (
+            RefType { elem: first },
+            RefType { elem: second },
+        ) | (GoPointer { elem: first }, GoPointer { elem: second }) | (
+            GoFunction { signature: first },
+            GoFunction { signature: second },
+        ) | (Channel { elem: first, direction: _ }, Channel { elem: second, direction: _ }) => {
+            first_unification_error(first, second)
+        },
+        (
+            HashMap { key: first_key, value: first_value },
+            HashMap { key: second_key, value: second_value },
+        ) => {
+            match first_unification_error(first_key, second_key) {
+                Some(message) => Some(message),
+                None => first_unification_error(first_value, second_value),
+            }
+        },
+        (
+            GoMap { key: first_key, value: first_value },
+            GoMap { key: second_key, value: second_value },
+        ) => {
+            match first_unification_error(first_key, second_key) {
+                Some(message) => Some(message),
+                None => first_unification_error(first_value, second_value),
+            }
+        },
+        (Param { name: first }, Param { name: second }) => if first == second {
+            None
+        } else {
+            Some(type_mismatch_text(Type::Param { name: first }, Type::Param { name: second }))
+        },
+        (Param { name }, value) | (value, Param { name }) => Some(
+            "Type mismatch: expected " + name + ", found " + type_text(value),
+        ),
+        (
+            Func { params: first_params, ret_ty: first_ret },
+            Func { params: second_params, ret_ty: second_ret },
+        ) => {
+            if first_params.len() != second_params.len() {
+                Some(
+                    "Function arity mismatch: expected "
+                        + type_text(Type::Func { params: first_params, ret_ty: first_ret })
+                        + ", found "
+                        + type_text(Type::Func { params: second_params, ret_ty: second_ret }),
+                )
+            } else {
+                match first_type_list_error(first_params, second_params) {
+                    Some(message) => Some(message),
+                    None => first_unification_error(first_ret, second_ret),
+                }
+            }
+        },
+        _ => Some(type_mismatch_text(left, right)),
+    }
+}
+
+fn resolve_parameter_alias_at(value: Type, substitutions: Vec[TypeSubst], depth: isize) -> Type {
+    if depth > substitutions.len() {
+        value
+    } else {
+        let next = substitute_type(value, substitutions);
+        if types_equal(next, value) {
+            value
+        } else {
+            resolve_parameter_alias_at(next, substitutions, depth + 1)
+        }
+    }
+}
+
+fn resolve_parameter_alias(value: Type, substitutions: Vec[TypeSubst]) -> Type {
+    resolve_parameter_alias_at(value, substitutions, 0)
+}
+
+fn contains_parameter(value: Type, name: string, substitutions: Vec[TypeSubst]) -> bool {
+    match prune(resolve_parameter_alias(value, substitutions)) {
+        Param { name: candidate } => candidate == name,
+        value => any_child_type(value, |child| contains_parameter(child, name, substitutions)),
+    }
+}
+
+fn bind_parameter_alias(name: string, value: Type, substitutions: Vec[TypeSubst]) -> bool {
+    let value = resolve_parameter_alias(value, substitutions);
+    match value {
+        Param { name: candidate } => if candidate == name {
+            true
+        } else {
+            substitutions.push(TypeSubst { name, ty: value });
+            true
+        },
+        _ => if contains_parameter(value, name, substitutions) {
+            false
+        } else {
+            substitutions.push(TypeSubst { name, ty: value });
+            true
+        },
+    }
+}
+
+fn unify_parameter_alias_lists(left: Vec[Type], right: Vec[Type], substitutions: Vec[TypeSubst]) -> bool {
+    if left.len() != right.len() {
+        false
+    } else {
+        for index in 0..left.len() {
+            if !unify_parameter_aliases(left[index], right[index], substitutions) {
+                return false
+            }
+        }
+        true
+    }
+}
+
+fn unify_parameter_alias_trait_refs(
+    left: Option[TraitRef],
+    right: Option[TraitRef],
+    substitutions: Vec[TypeSubst],
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            names_match(left.name, right.name)
+                && unify_parameter_alias_lists(left.args, right.args, substitutions)
+        },
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn unify_parameter_aliases(left: Type, right: Type, substitutions: Vec[TypeSubst]) -> bool {
+    let left = prune(resolve_parameter_alias(left, substitutions));
+    let right = prune(resolve_parameter_alias(right, substitutions));
+    match (left, right) {
+        (
+            External { import_path: first_path, name: first_name, args: first_args },
+            External { import_path: second_path, name: second_name, args: second_args },
+        ) => first_path == second_path && first_name == second_name
+            && unify_parameter_alias_lists(first_args, second_args, substitutions),
+        (Param { name }, value) => bind_parameter_alias(name, value, substitutions),
+        (value, Param { name }) => bind_parameter_alias(name, value, substitutions),
+        (Tuple { items: left }, Tuple { items: right }) => {
+            unify_parameter_alias_lists(left, right, substitutions)
+        },
+        (
+            Projection { for_ty: left_base, name: left_name, trait_ref: left_trait },
+            Projection { for_ty: right_base, name: right_name, trait_ref: right_trait },
+        ) => {
+            left_name == right_name
+                && unify_parameter_alias_trait_refs(left_trait, right_trait, substitutions)
+                && unify_parameter_aliases(left_base, right_base, substitutions)
+        },
+        (App { ty: left_base, args: left_args }, App { ty: right_base, args: right_args }) => {
+            unify_parameter_aliases(left_base, right_base, substitutions)
+                && unify_parameter_alias_lists(left_args, right_args, substitutions)
+        },
+        (Array { len: left_len, elem: left }, Array { len: right_len, elem: right }) => {
+            left_len == right_len && unify_parameter_aliases(left, right, substitutions)
+        },
+        (Slice { elem: left }, Slice { elem: right }) | (
+            MutSlice { elem: left },
+            MutSlice { elem: right },
+        ) | (VecType { elem: left }, VecType { elem: right }) | (
+            RefType { elem: left },
+            RefType { elem: right },
+        ) | (GoPointer { elem: left }, GoPointer { elem: right }) | (
+            GoFunction { signature: left },
+            GoFunction { signature: right },
+        ) => {
+            unify_parameter_aliases(left, right, substitutions)
+        },
+        (
+            Channel { elem: left, direction: left_direction },
+            Channel { elem: right, direction: right_direction },
+        ) => {
+            ast::channel_directions_equal(left_direction, right_direction)
+                && unify_parameter_aliases(left, right, substitutions)
+        },
+        (HashMap { key: left_key, value: left_item }, HashMap { key: right_key, value: right_item }) => {
+            unify_parameter_aliases(left_key, right_key, substitutions)
+                && unify_parameter_aliases(left_item, right_item, substitutions)
+        },
+        (GoMap { key: left_key, value: left_item }, GoMap { key: right_key, value: right_item }) => {
+            unify_parameter_aliases(left_key, right_key, substitutions)
+                && unify_parameter_aliases(left_item, right_item, substitutions)
+        },
+        (
+            Func { params: left_params, ret_ty: left_ret },
+            Func { params: right_params, ret_ty: right_ret },
+        ) => {
+            unify_parameter_alias_lists(left_params, right_params, substitutions)
+                && unify_parameter_aliases(left_ret, right_ret, substitutions)
+        },
+        (left, right) => types_equal(left, right),
+    }
+}
+
+fn predicate_type_aliases(predicates: Vec[TypePredicate]) -> Vec[TypeSubst] {
+    let substitutions: Vec[TypeSubst] = Vec::new();
+    for predicate in predicates {
+        match predicate {
+            GoComparable(_) => (),
+            Equality { lhs: left, rhs: right } => match (prune(left), prune(right)) {
+                (Projection { for_ty: _, name: _, trait_ref: _ }, _) | (
+                    _,
+                    Projection { for_ty: _, name: _, trait_ref: _ },
+                ) => (),
+                (left, right) => {
+                    let _ = unify_parameter_aliases(left, right, substitutions);
+                },
+            },
+            Trait { for_ty: _, trait_ref: _ } => (),
+        }
+    }
+    substitutions
+}
+
+fn projection_alias_index(values: Vec[ProjectionAlias], projection: Type) -> isize {
+    let mut result = -1;
+    for index in 0..values.len() {
+        if result < 0 && types_equal(values[index].projection, projection) {
+            result = index;
+        }
+    }
+    result
+}
+
+fn projection_alias(values: Vec[ProjectionAlias], projection: Type) -> Option[Type] {
+    let index = projection_alias_index(values, projection);
+    if index < 0 {
+        None
+    } else {
+        Some(values[index].ty)
+    }
+}
+
+fn set_projection_alias(values: Vec[ProjectionAlias], projection: Type, ty: Type) -> bool {
+    let index = projection_alias_index(values, projection);
+    if index < 0 {
+        values.push(ProjectionAlias { projection, ty });
+        true
+    } else if types_equal(values[index].ty, ty) {
+        false
+    } else {
+        values[index] = ProjectionAlias { projection, ty };
+        true
+    }
+}
+
+fn type_list_contains(values: Vec[Type], expected: Type) -> bool {
+    for value in values {
+        if types_equal(value, expected) {
+            return true
+        }
+    }
+    false
+}
+
+fn resolve_projection_alias(value: Type, aliases: Vec[ProjectionAlias]) -> Type {
+    let mut current = value;
+    let seen: Vec[Type] = Vec::new();
+    loop {
+        if type_list_contains(seen, current) {
+            break current
+        } else {
+            seen.push(current);
+            match projection_alias(aliases, current) {
+                Some(next) => {
+                    current = next;
+                },
+                None => break current,
+            }
+        }
+    }
+}
+
+fn predicate_projection_aliases(predicates: Vec[TypePredicate]) -> Vec[ProjectionAlias] {
+    let aliases: Vec[ProjectionAlias] = Vec::new();
+    let equalities: Vec[(Type, Type)] = Vec::new();
+    for predicate in predicates {
+        match predicate {
+            GoComparable(_) => (),
+            Equality { lhs: left, rhs: right } => match (left, right) {
+                (
+                    left @ Projection { for_ty: _, name: _, trait_ref: _ },
+                    right @ Projection { for_ty: _, name: _, trait_ref: _ },
+                ) => equalities.push((left, right)),
+                (projection @ Projection { for_ty: _, name: _, trait_ref: _ }, other) => {
+                    if projection_alias_index(aliases, projection) < 0 {
+                        aliases.push(ProjectionAlias { projection, ty: other })
+                    }
+                },
+                (other, projection @ Projection { for_ty: _, name: _, trait_ref: _ }) => {
+                    if projection_alias_index(aliases, projection) < 0 {
+                        aliases.push(ProjectionAlias { projection, ty: other })
+                    }
+                },
+                _ => (),
+            },
+            Trait { for_ty: _, trait_ref: _ } => (),
+        }
+    }
+    while advance_projection_aliases(aliases, equalities) {}
+    for equality in equalities {
+        if projection_alias_index(aliases, equality.0) < 0
+            && projection_alias_index(aliases, equality.1) < 0 {
+            aliases.push(ProjectionAlias { projection: equality.0, ty: equality.1 })
+        }
+    }
+    aliases
+}
+
+fn advance_projection_aliases(aliases: Vec[ProjectionAlias], equalities: Vec[(Type, Type)]) -> bool {
+    for equality in equalities {
+        let left = equality.0;
+        let right = equality.1;
+        let left_alias = resolve_projection_alias(left, aliases);
+        let right_alias = resolve_projection_alias(right, aliases);
+        if !types_equal(left_alias, left) && types_equal(right_alias, right)
+            && set_projection_alias(aliases, right, left_alias) {
+            return true
+        } else if !types_equal(right_alias, right) && types_equal(left_alias, left)
+            && set_projection_alias(aliases, left, right_alias) {
+            return true
+        }
+    }
+    false
+}
+
+fn projection_equality(ctx: Checker, base: Type, name: string, qualifier: Option[TraitRef]) -> Option[
+    Type,
+] {
+    let projection = Type::Projection { for_ty: base, name, trait_ref: qualifier };
+    let resolved = resolve_projection_alias(projection, ctx.projection_aliases);
+    if types_equal(projection, resolved) {
+        None
+    } else {
+        Some(resolved)
+    }
+}
+
+fn associated_binding(value: ImplInfo, name: string) -> Option[Type] {
+    for offset in 0..value.associated_types.len() {
+        let associated = value.associated_types[value.associated_types.len() - 1 - offset];
+        if associated.0 == name {
+            return Some(associated.1)
+        }
+    }
+    None
+}
+
+struct ProjectionMatch {
+    ty: Type,
+    inference: InferenceSnapshot,
+}
+
+fn collect_impl_projection_candidate(
+    ctx: Checker,
+    impl_info: ImplInfo,
+    base: Type,
+    name: string,
+    qualifier: Option[TraitRef],
+    candidates: Vec[ProjectionMatch],
+) -> () {
+    if let Some(associated) = associated_binding(impl_info, name) {
+        let snapshot = inference_snapshot(Vec::from_array([base]));
+        if let Some(reference) = qualifier {
+            snapshot.include_types(reference.args)
+        }
+        let substitutions = instantiate_substitutions(
+            ctx.inference.counter,
+            impl_info.generics,
+            Vec::new(),
+        );
+        let owner = substitute_type(impl_info.for_type, substitutions);
+        let application = substitute_trait_ref(impl_info.trait_ref, substitutions);
+        if unify(owner, base) {
+            let trait_matches = match qualifier {
+                Some(reference) => impl_matches_trait(ctx, impl_info, reference)
+                    && unify_types(application.args, reference.args),
+                None => true,
+            };
+            let predicates = substitute_predicates(impl_info.predicates, substitutions);
+            apply_predicate_equalities(predicates);
+            if trait_matches && predicates_satisfied_at(ctx, predicates, Vec::new()) {
+                let candidate = resolved_inference_type(substitute_type(associated, substitutions));
+                candidates.push(ProjectionMatch { ty: candidate, inference: snapshot.capture() })
+            }
+        }
+        snapshot.restore();
+    }
+}
+
+fn impl_projection(ctx: Checker, base: Type, name: string, qualifier: Option[TraitRef]) -> Option[
+    Type,
+] {
+    let goal = type_text(Type::Projection { for_ty: base, name, trait_ref: qualifier });
+    if ctx.inference.active_projections.contains(goal) {
+        return None
+    }
+    ctx.inference.active_projections.push(goal);
+    let candidates: Vec[ProjectionMatch] = Vec::new();
+    match qualifier {
+        Some(reference) => match impl_candidate_indices(ctx, reference.name) {
+            Some(indices) => for index in indices {
+                collect_impl_projection_candidate(
+                    ctx,
+                    ctx.impls[index],
+                    base,
+                    name,
+                    qualifier,
+                    candidates,
+                )
+            },
+            None => (),
+        },
+        None => for impl_info in ctx.impls {
+            collect_impl_projection_candidate(ctx, impl_info, base, name, qualifier, candidates)
+        },
+    }
+    ctx.inference.active_projections.truncate(ctx.inference.active_projections.len() - 1);
+    if candidates.len() == 1 {
+        candidates[0].inference.restore();
+        Some(candidates[0].ty)
+    } else if !candidates.is_empty() {
+        let ty = candidates[0].ty;
+        for candidate in candidates {
+            if !types_equal(ty, candidate.ty) {
+                return None
+            }
+        }
+        Some(ty)
+    } else {
+        None
+    }
+}
+
+fn normalize_types(ctx: Checker, values: Vec[Type]) -> Vec[Type] {
+    let result: Vec[Type] = Vec::new();
+    for value in values {
+        result.push(normalize_type(ctx, value))
+    }
+    result
+}
+
+fn dyn_associated_type(value: Type, name: string, qualifier: Option[TraitRef]) -> Option[Type] {
+    match prune(opaque_bounds(value)) {
+        Dyn { .. } => {
+            let mut result = Option::None;
+            for bound in dyn_bounds(opaque_bounds(value)) {
+                if let Some(reference) = qualifier {
+                    if !trait_ref_equal(
+                        TraitRef { name: bound.trait_name, args: bound.args },
+                        reference,
+                    ) {
+                        continue
+                    }
+                }
+                for binding in bound.associated_types {
+                    if binding.0 == name {
+                        if let Some(existing) = result {
+                            if !types_equal(existing, binding.1) {
+                                return None
+                            }
+                        }
+                        result = Option::Some(binding.1);
+                    }
+                }
+            }
+            result
+        },
+        _ => None,
+    }
+}
+
+fn normalize_type(ctx: Checker, value: Type) -> Type {
+    if opaque_parts(value).is_some() {
+        return map_child_types(value, |child| normalize_type(ctx, child))
+    }
+    match prune(value) {
+        Con { name } => Con { name: canonical_imported_name(ctx, name) },
+        Dyn { trait_name: name, args, associated_types, additional_bounds } => {
+            let normalized_associated: Vec[(string, Type)] = Vec::new();
+            for binding in associated_types {
+                normalized_associated.push((binding.0, normalize_type(ctx, binding.1)))
+            }
+            let normalized_additional: Vec[DynTraitBound] = Vec::new();
+            for bound in additional_bounds {
+                let bound_associated: Vec[(string, Type)] = Vec::new();
+                for binding in bound.associated_types {
+                    bound_associated.push((binding.0, normalize_type(ctx, binding.1)))
+                }
+                normalized_additional.push(
+                    DynTraitBound {
+                        trait_name: canonical_imported_name(ctx, bound.trait_name),
+                        args: normalize_types(ctx, bound.args),
+                        associated_types: bound_associated,
+                    },
+                )
+            }
+            canonical_dyn_type(
+                ctx,
+                Dyn {
+                    trait_name: canonical_imported_name(ctx, name),
+                    args: normalize_types(ctx, args),
+                    associated_types: normalized_associated,
+                    additional_bounds: normalized_additional,
+                },
+            )
+        },
+        Tuple { items: values } => Type::Tuple { items: normalize_types(ctx, values) },
+        Projection { for_ty: base, name, trait_ref: qualifier } => {
+            let base = normalize_type(ctx, base);
+            let qualifier = qualifier.map(|reference| normalize_trait_ref(ctx, reference));
+            let projection = Type::Projection { for_ty: base, name, trait_ref: qualifier };
+            let candidate = match dyn_associated_type(base, name, qualifier) {
+                Some(value) => Option::Some(value),
+                None => match projection_equality(ctx, base, name, qualifier) {
+                    Some(value) => Option::Some(value),
+                    None => match base {
+                        Param { name: _ } | Var(_) => Option::None,
+                        _ => impl_projection(ctx, base, name, qualifier),
+                    },
+                },
+            };
+            match candidate {
+                Some(value) => if types_equal(value, projection) {
+                    projection
+                } else {
+                    normalize_type(ctx, value)
+                },
+                None => projection,
+            }
+        },
+        External { import_path, name, args } => {
+            let result: Vec[Type] = Vec::new();
+            for arg in args {
+                result.push(normalize_type(ctx, arg))
+            }
+            External { import_path, name, args: result }
+        },
+        App { ty: base, args } => {
+            App { ty: normalize_type(ctx, base), args: normalize_types(ctx, args) }
+        },
+        Array { len: length, elem } => Type::Array { len: length, elem: normalize_type(ctx, elem) },
+        Slice { elem } => Slice { elem: normalize_type(ctx, elem) },
+        MutSlice { elem } => MutSlice { elem: normalize_type(ctx, elem) },
+        VecType { elem } => VecType { elem: normalize_type(ctx, elem) },
+        GoPointer { elem } => GoPointer { elem: normalize_type(ctx, elem) },
+        GoFunction { signature } => GoFunction { signature: normalize_type(ctx, signature) },
+        RefType { elem } => RefType { elem: normalize_type(ctx, elem) },
+        Channel { elem, direction } => Channel { elem: normalize_type(ctx, elem), direction },
+        HashMap { key, value: item } => {
+            HashMap { key: normalize_type(ctx, key), value: normalize_type(ctx, item) }
+        },
+        GoMap { key, value: item } => {
+            GoMap { key: normalize_type(ctx, key), value: normalize_type(ctx, item) }
+        },
+        Func { params, ret_ty } => {
+            Func { params: normalize_types(ctx, params), ret_ty: normalize_type(ctx, ret_ty) }
+        },
+        Param { name } => {
+            let original = Type::Param { name };
+            let resolved = resolve_parameter_alias(original, ctx.param_aliases);
+            if types_equal(resolved, original) {
+                original
+            } else {
+                normalize_type(ctx, resolved)
+            }
+        },
+        other => other,
+    }
+}
+
+fn normalize_trait_ref(ctx: Checker, value: TraitRef) -> TraitRef {
+    TraitRef {
+        name: canonical_imported_name(ctx, value.name),
+        args: normalize_types(ctx, value.args),
+    }
+}
+
+fn normalize_callable(ctx: Checker, value: Callable) -> Callable {
+    match value {
+        FunctionInstance { name, bindings } => {
+            let result: Vec[(string, Type)] = Vec::new();
+            for binding in bindings {
+                result.push((binding.0, normalize_type(ctx, binding.1)))
+            }
+            FunctionInstance { name, bindings: result }
+        },
+        TraitMethod { trait_ref: reference, method_name: name, for_ty, has_receiver } => {
+            TraitMethod {
+                trait_ref: reference,
+                method_name: name,
+                for_ty: normalize_type(ctx, for_ty),
+                has_receiver,
+            }
+        },
+        InherentMethod { receiver_ty: owner, method_name: name } => {
+            InherentMethod { receiver_ty: normalize_type(ctx, owner), method_name: name }
+        },
+        other => other,
+    }
+}
+
+fn instantiate_substitutions(counter: Ref[isize], params: Vec[string], explicit: Vec[Type]) -> Vec[
+    TypeSubst,
+] {
+    let result: Vec[TypeSubst] = Vec::new();
+    for index in 0..params.len() {
+        result.push(
+            TypeSubst {
+                name: params[index],
+                ty: if index < explicit.len() {
+                    explicit[index]
+                } else {
+                    fresh_type(counter, VarKind::Any)
+                },
+            },
+        )
+    }
+    result
+}
+
+fn default_numeric_type(value: Type) -> Type {
+    match prune(value) {
+        Var(variable) => match variable.get() {
+            Unbound { id: _, kind: Integer } => {
+                variable.set(TypeVar::Link(Type::Int));
+                Type::Int
+            },
+            Unbound { id: _, kind: Float } => {
+                variable.set(TypeVar::Link(Type::Float64));
+                Type::Float64
+            },
+            Link(inner) => default_numeric_type(inner),
+            _ => Type::Var(variable),
+        },
+        other => map_child_types(other, default_numeric_type),
+    }
+}

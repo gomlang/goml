@@ -1,0 +1,220 @@
+package tast;
+
+use module::ast;
+use module::hir;
+
+static builtin_type_implementations: OnceCell[FrozenVec[ImplInfo]] = OnceCell::new();
+
+fn load_builtin_type_implementations() -> FrozenVec[ImplInfo] {
+    let result = Vec::new();
+    let Ok(builtin) = builtin_contract() else {
+        return result.freeze()
+    };
+    let Ok(files) = implicit_builtin_hir_files() else {
+        return result.freeze()
+    };
+    for file in files {
+        for item in file.items {
+            if let hir::Item::ImplBlock(value) = item {
+                if let Some(reference) = value.trait_ref {
+                    let generics = hir::generic_names(value.generics);
+                    let for_type = type_from_hir(builtin, value.for_type, generics, None);
+                    let associated_types = Vec::new();
+                    for associated in value.associated_types {
+                        associated_types.push(
+                            (
+                                associated.0,
+                                type_from_hir(builtin, associated.1, generics, Some(for_type)),
+                            ),
+                        )
+                    }
+                    result.push(
+                        ImplInfo {
+                            generics,
+                            predicates: predicates_from_hir(
+                                builtin,
+                                value.generic_bounds,
+                                value.predicates,
+                                generics,
+                                Some(for_type),
+                            ),
+                            trait_ref: trait_ref_from_hir(
+                                builtin,
+                                reference,
+                                generics,
+                                Some(for_type),
+                            ),
+                            for_type,
+                            associated_types,
+                            origin: f"builtin#source#{result.len()}",
+                            span: value.for_type.span.unwrap_or(ast::span(0, 0)),
+                        },
+                    )
+                }
+            }
+        }
+    }
+    result.freeze()
+}
+
+fn builtin_match_types(
+    patterns: Vec[Type],
+    values: Vec[Type],
+    generics: Vec[string],
+    bindings: Vec[TypeSubst],
+) -> bool {
+    if patterns.len() != values.len() {
+        return false
+    }
+    for index in 0..patterns.len() {
+        if !builtin_match_type(patterns[index], values[index], generics, bindings) {
+            return false
+        }
+    }
+    true
+}
+
+fn builtin_match_type(pattern: Type, value: Type, generics: Vec[string], bindings: Vec[TypeSubst]) -> bool {
+    let pattern = prune(pattern);
+    let value = prune(value);
+    if let Param { name } = pattern {
+        if generics.contains(name) {
+            if let Some(previous) = find_substitution(bindings, name) {
+                return types_equal(previous, value)
+            }
+            bindings.push(TypeSubst { name, ty: value });
+            return true
+        }
+    }
+    if let (Some(parts), Array { len, elem }) = (symbolic_array(pattern), value) {
+        return (len < 0 || builtin_match_type(parts.0, const_type(len), generics, bindings))
+            && builtin_match_type(parts.1, elem, generics, bindings)
+    }
+    if let (Array { len: first, elem: left }, Array { len: second, elem: right }) = (pattern, value) {
+        return (first < 0 || second < 0 || first == second)
+            && builtin_match_type(left, right, generics, bindings)
+    }
+    let left = Vec::new();
+    let right = Vec::new();
+    let left_shape = map_child_types(
+        pattern,
+        |child| {
+            left.push(child);
+            Type::Unit
+        },
+    );
+    let right_shape = map_child_types(
+        value,
+        |child| {
+            right.push(child);
+            Type::Unit
+        },
+    );
+    types_equal(left_shape, right_shape) && builtin_match_types(left, right, generics, bindings)
+}
+
+fn builtin_type_predicates_satisfied(
+    values: Vec[TypePredicate],
+    bindings: Vec[TypeSubst],
+    goals: Vec[string],
+) -> bool {
+    for value in values {
+        match value {
+            GoComparable(_) => return false,
+            Equality { lhs, rhs } => if !types_equal(
+                substitute_type(lhs, bindings),
+                substitute_type(rhs, bindings),
+            ) {
+                return false
+            },
+            Trait { for_ty, trait_ref } => {
+                let args = map_types(trait_ref.args, |ty| substitute_type(ty, bindings));
+                if !builtin_type_trait_satisfied(
+                    substitute_type(for_ty, bindings),
+                    TraitRef { name: trait_ref.name, args },
+                    goals,
+                ) {
+                    return false
+                }
+            },
+        }
+    }
+    true
+}
+
+fn builtin_type_trait_satisfied(base: Type, reference: TraitRef, goals: Vec[string]) -> bool {
+    let goal = type_text(base) + ": " + trait_ref_text(reference);
+    if goals.contains(goal) {
+        return false
+    }
+    let next = Vec::new();
+    for value in goals {
+        next.push(value)
+    }
+    next.push(goal);
+    let implementations = builtin_type_implementations.get_or_init(
+        load_builtin_type_implementations,
+    );
+    for index in 0..implementations.len() {
+        let value = implementations.get(index);
+        let bindings = Vec::new();
+        if names_match(value.trait_ref.name, reference.name)
+            && builtin_match_type(value.for_type, base, value.generics, bindings)
+            && builtin_match_types(value.trait_ref.args, reference.args, value.generics, bindings)
+            && builtin_type_predicates_satisfied(value.predicates, bindings, next) {
+            return true
+        }
+    }
+    false
+}
+
+pub fn builtin_trait_satisfied(base: Type, reference: TraitRef) -> bool {
+    builtin_type_trait_satisfied(base, reference, Vec::new())
+}
+
+pub fn builtin_projection(base: Type, name: string, qualifier: Option[TraitRef]) -> Option[Type] {
+    let candidates: Vec[Type] = Vec::new();
+    let implementations = builtin_type_implementations.get_or_init(
+        load_builtin_type_implementations,
+    );
+    for index in 0..implementations.len() {
+        let value = implementations.get(index);
+        let bindings = Vec::new();
+        if !builtin_match_type(value.for_type, base, value.generics, bindings) {
+            continue
+        }
+        if let Some(reference) = qualifier {
+            if !names_match(value.trait_ref.name, reference.name)
+                || !builtin_match_types(
+                    value.trait_ref.args,
+                    reference.args,
+                    value.generics,
+                    bindings,
+                ) {
+                continue
+            }
+        }
+        if !builtin_type_predicates_satisfied(value.predicates, bindings, Vec::new()) {
+            continue
+        }
+        for associated in value.associated_types {
+            if associated.0 == name {
+                let ty = substitute_type(associated.1, bindings);
+                let mut found = false;
+                for candidate in candidates {
+                    if types_equal(candidate, ty) {
+                        found = true;
+                    }
+                }
+                if !found {
+                    candidates.push(ty)
+                }
+            }
+        }
+    }
+    if candidates.len() == 1 {
+        Some(candidates[0])
+    } else {
+        None
+    }
+}
