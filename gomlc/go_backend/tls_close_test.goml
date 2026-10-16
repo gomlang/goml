@@ -24,6 +24,9 @@ fn tls_abort_interrupts_graceful_close_without_losing_close_notifications() -> (
                     resources::StandardRuntimeHook::Network(resources::NetworkRuntimeHook::TlsAbort),
                 ),
                 resources::RuntimeHook::Standard(
+                    resources::StandardRuntimeHook::Network(resources::NetworkRuntimeHook::TlsRead),
+                ),
+                resources::RuntimeHook::Standard(
                     resources::StandardRuntimeHook::Network(
                         resources::NetworkRuntimeHook::TlsAddress,
                     ),
@@ -68,6 +71,22 @@ fn tls_abort_interrupts_graceful_close_without_losing_close_notifications() -> (
             },
         ),
     );
+    items.push(
+        Item::Struct(
+            StructDef {
+                name: type_name(
+                    repr::Type::Tuple {
+                        items: Vec::from_array(
+                            [repr::Type::Int, repr::Type::Int, repr::Type::String],
+                        ),
+                    },
+                ),
+                fields: Vec::from_array(
+                    [("_0", Type::Int), ("_1", Type::Int), ("_2", Type::String)],
+                ),
+            },
+        ),
+    );
     let source = encode_package(File { items: prune_imports(items) }, "tlsclosetest");
     let root = "_artifact/tls-close-runtime";
     testing::assert(fs::create_dir_all(root).is_ok());
@@ -101,12 +120,24 @@ fn tls_abort_interrupts_graceful_close_without_losing_close_notifications() -> (
         \\    closed atomic.Bool
         \\    once sync.Once
         \\    writes chan []byte
+        \\    readOnce, writeOnce sync.Once
+        \\    reading, written, resume chan struct{}
+        \\}
+        \\func (c *observedConn) Read(data []byte) (int, error) {
+        \\    if c.armed.Load() && c.reading != nil {
+        \\        c.readOnce.Do(func() { close(c.reading) })
+        \\    }
+        \\    return c.Conn.Read(data)
         \\}
         \\func (c *observedConn) Write(data []byte) (int, error) {
         \\    if c.armed.Load() {
         \\        c.once.Do(func() { c.writes <- append([]byte(nil), data...) })
         \\    }
-        \\    return c.Conn.Write(data)
+        \\    n, err := c.Conn.Write(data)
+        \\    if c.armed.Load() && c.written != nil && err == nil {
+        \\        c.writeOnce.Do(func() { close(c.written); <-c.resume })
+        \\    }
+        \\    return n, err
         \\}
         \\func (c *observedConn) Close() error {
         \\    if c.closed.Swap(true) { return net.ErrClosed }
@@ -169,7 +200,11 @@ fn tls_abort_interrupts_graceful_close_without_losing_close_notifications() -> (
         \\    case <-time.After(time.Second):
         \\        t.Fatal("close notification did not start")
         \\    }
-        \\    if _goml_tls_lookup(id) == nil { t.Fatal("graceful close hid the socket before TLS cleanup completed") }
+        \\    if _goml_tls_lookup(id) != nil { t.Fatal("graceful close left the socket available for I/O") }
+        \\    _goml_tls_mu.Lock()
+        \\    retained := _goml_tls_closing[id] != nil
+        \\    _goml_tls_mu.Unlock()
+        \\    if !retained { t.Fatal("graceful close lost the socket before TLS cleanup completed") }
         \\    aborted := make(chan string, 1)
         \\    go func() { aborted <- _goml_runtime_std_net_tls_abort(id) }()
         \\    result(t, aborted)
@@ -181,6 +216,56 @@ fn tls_abort_interrupts_graceful_close_without_losing_close_notifications() -> (
         \\        result(t, aborted)
         \\        result(t, closed)
         \\    }
+        \\}
+        \\type readResult struct { count, kind int; message string }
+        \\func TestLocalCloseRejectsRemoteEOFBeforeNotificationCompletes(t *testing.T) {
+        \\    id, client, raw := pair(t)
+        \\    raw.reading, raw.written, raw.resume = make(chan struct{}), make(chan struct{}), make(chan struct{})
+        \\    var resumed sync.Once
+        \\    release := func() { resumed.Do(func() { close(raw.resume) }) }
+        \\    defer release()
+        \\    read := make(chan readResult, 1)
+        \\    go func() {
+        \\        got := _goml_runtime_std_net_tls_read(id, make([]byte, 1), 0, -1)
+        \\        read <- readResult{got._0, got._1, got._2}
+        \\    }()
+        \\    select {
+        \\    case <-raw.reading:
+        \\    case <-time.After(time.Second):
+        \\        t.Fatal("TLS read did not start")
+        \\    }
+        \\    closed := make(chan string, 1)
+        \\    go func() { closed <- _goml_runtime_std_net_tls_close(id) }()
+        \\    client.SetReadDeadline(time.Now().Add(time.Second))
+        \\    if n, err := client.Read(make([]byte, 1)); n != 0 || err != io.EOF { t.Fatal(n, err) }
+        \\    select {
+        \\    case <-raw.written:
+        \\    case <-time.After(time.Second):
+        \\        t.Fatal("local close notification did not reach the peer")
+        \\    }
+        \\    if err := client.Close(); err != nil { t.Fatal(err) }
+        \\    select {
+        \\    case got := <-read:
+        \\        if got.count != 0 || got.kind != 5 || got.message == "" { t.Fatalf("local close returned %+v, want BrokenPipe", got) }
+        \\    case <-time.After(time.Second):
+        \\        t.Fatal("TLS read did not report local close")
+        \\    }
+        \\    select {
+        \\    case <-closed:
+        \\        t.Fatal("graceful close completed before its notification was released")
+        \\    default:
+        \\    }
+        \\    release()
+        \\    result(t, closed)
+        \\}
+        \\func TestRemoteCloseRemainsEOF(t *testing.T) {
+        \\    id, client, _ := pair(t)
+        \\    closed := make(chan error, 1)
+        \\    go func() { closed <- client.Close() }()
+        \\    got := _goml_runtime_std_net_tls_read(id, make([]byte, 1), 0, int64(time.Second))
+        \\    if got._0 != 0 || got._1 != 0 || got._2 != "" { t.Fatal(got) }
+        \\    if _goml_tls_lookup(id) == nil { t.Fatal("remote close changed local ownership") }
+        \\    if err := <-closed; err != nil { t.Fatal(err) }
         \\}
         \\type addressConn struct {
         \\    net.Conn
