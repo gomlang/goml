@@ -111,6 +111,21 @@ fn network_error_kind(fallback: isize) -> Expr {
     )
 }
 
+fn network_locally_closed() -> Expr {
+    network_binary(
+        BinaryOp::Or,
+        network_binary(
+            BinaryOp::Eq,
+            task_call(network_global("lookup"), Vec::from_array([task_var("id")])),
+            Expr::Nil,
+        ),
+        task_call(
+            "_goml_errors.Is",
+            Vec::from_array([task_var("err"), task_var("_goml_net.ErrClosed")]),
+        ),
+    )
+}
+
 fn network_result_type(value: repr::Type) -> Type {
     std_tuple_type(Vec::from_array([repr::Type::Bool, value, repr::Type::Int, repr::Type::String]))
 }
@@ -505,6 +520,12 @@ fn network_io_item(key: string, writing: bool) -> Item {
         body: Block {
             stmts: Vec::from_array(
                 [
+                    network_var(
+                        "raw",
+                        network_named("_goml_net.Conn"),
+                        task_method("conn", "NetConn", Vec::new()),
+                    ),
+                    task_expr(task_method("raw", "Close", Vec::new())),
                     task_expr(task_method("conn", "Close", Vec::new())),
                     task_expr(task_call("close", Vec::from_array([task_var("aborted")]))),
                 ],
@@ -548,15 +569,7 @@ fn network_io_item(key: string, writing: bool) -> Item {
     );
     stmts.push(
         network_if(
-            network_binary(
-                BinaryOp::And,
-                std_error_condition(),
-                network_binary(
-                    BinaryOp::Eq,
-                    task_call(network_global("lookup"), Vec::from_array([task_var("id")])),
-                    Expr::Nil,
-                ),
-            ),
+            network_binary(BinaryOp::And, std_error_condition(), network_locally_closed()),
             Vec::from_array(
                 [
                     task_return(
@@ -619,7 +632,7 @@ fn network_io_item(key: string, writing: bool) -> Item {
     )
 }
 
-fn network_close_item(key: string) -> Item {
+fn network_close_item(key: string, abort: bool) -> Item {
     let stmts = Vec::from_array(
         [
             task_expr(task_method(network_global("mu"), "Lock", Vec::new())),
@@ -628,10 +641,19 @@ fn network_close_item(key: string) -> Item {
                 network_pointer("_goml_tls.Conn"),
                 Expr::Index { base: task_var(network_global("connections")), index: task_var("id") },
             ),
-            task_expr(
-                task_call(
-                    "delete",
-                    Vec::from_array([task_var(network_global("connections")), task_var("id")]),
+            network_if(
+                Expr::Bool { value: abort },
+                Vec::from_array(
+                    [
+                        task_expr(
+                            task_call(
+                                "delete",
+                                Vec::from_array(
+                                    [task_var(network_global("connections")), task_var("id")],
+                                ),
+                            ),
+                        ),
+                    ],
                 ),
             ),
             task_expr(task_method(network_global("mu"), "Unlock", Vec::new())),
@@ -639,8 +661,69 @@ fn network_close_item(key: string) -> Item {
                 network_binary(BinaryOp::Eq, task_var("conn"), Expr::Nil),
                 Vec::from_array([task_return(network_text(""))]),
             ),
-            network_var("err", network_named("error"), task_method("conn", "Close", Vec::new())),
-            network_if(std_error_condition(), Vec::from_array([task_return(std_error_string())])),
+            network_var("err", network_named("error"), Expr::Nil),
+            Stmt::If {
+                cond: Expr::Bool { value: abort },
+                then_: Block {
+                    stmts: Vec::from_array(
+                        [
+                            network_var(
+                                "raw",
+                                network_named("_goml_net.Conn"),
+                                task_method("conn", "NetConn", Vec::new()),
+                            ),
+                            Stmt::Assign {
+                                name: "err",
+                                value: task_method("raw", "Close", Vec::new()),
+                            },
+                            task_expr(task_method("conn", "Close", Vec::new())),
+                        ],
+                    ),
+                },
+                else_: Option::Some(
+                    Block {
+                        stmts: Vec::from_array(
+                            [
+                                Stmt::Assign {
+                                    name: "err",
+                                    value: task_method("conn", "Close", Vec::new()),
+                                },
+                            ],
+                        ),
+                    },
+                ),
+            },
+            network_if(
+                Expr::Bool { value: !abort },
+                Vec::from_array(
+                    [
+                        task_expr(task_method(network_global("mu"), "Lock", Vec::new())),
+                        task_expr(
+                            task_call(
+                                "delete",
+                                Vec::from_array(
+                                    [task_var(network_global("connections")), task_var("id")],
+                                ),
+                            ),
+                        ),
+                        task_expr(task_method(network_global("mu"), "Unlock", Vec::new())),
+                    ],
+                ),
+            ),
+            network_if(
+                network_binary(
+                    BinaryOp::And,
+                    std_error_condition(),
+                    Expr::Unary {
+                        op: UnaryOp::Not,
+                        expr: task_call(
+                            "_goml_errors.Is",
+                            Vec::from_array([task_var("err"), task_var("_goml_net.ErrClosed")]),
+                        ),
+                    },
+                ),
+                Vec::from_array([task_return(std_error_string())]),
+            ),
             task_return(network_text("")),
         ],
     );
@@ -701,10 +784,14 @@ fn network_runtime_hook_item(hook: resources::NetworkRuntimeHook, key: string) -
         TlsConnect => network_connect_item(key),
         TlsRead => network_io_item(key, false),
         TlsWrite => network_io_item(key, true),
-        TlsClose => network_close_item(key),
+        TlsClose => network_close_item(key, false),
+        TlsAbort => network_close_item(key, true),
         TlsState => network_state_item(key),
         TlsListen => tls_server_listen_item(key),
-        TlsAccept => tls_server_accept_item(key),
+        TlsAccept => tls_server_accept_item(key, false),
+        TlsAcceptPending => tls_server_accept_item(key, true),
+        TlsHandshake => tls_stream_handshake_item(key),
+        TlsAddress => tls_stream_address_item(key),
         TlsListenerClose => tls_server_close_item(key),
         TlsListenerAddress => tls_server_address_item(key),
     }

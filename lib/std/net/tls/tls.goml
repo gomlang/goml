@@ -2,6 +2,7 @@ package tls;
 
 use module::context;
 use module::io;
+use module::net;
 use module::time;
 
 pub enum Version {
@@ -68,6 +69,9 @@ pub struct TlsStream {
     write_gate: Channel[()],
     closed: Channel[()],
     close_gate: Channel[()],
+    handshake_gate: Channel[()],
+    handshake_done: Channel[()],
+    handshake_timeout: time::Duration,
 }
 
 fn copied(data: Slice[byte]) -> Vec[byte] {
@@ -188,7 +192,7 @@ pub fn connect_with(host: string, port: u16, config: ClientConfig, context: cont
         check_context(context, "TLS connect")?;
         return Result::Err(runtime_error(kind, "TLS connect", message))
     }
-    let stream = stream_from_runtime(id);
+    let stream = stream_from_runtime(id, config.timeout, true);
     if let Err(error) = check_context(context, "TLS connect") {
         let _ = stream.close();
         return Result::Err(error)
@@ -219,14 +223,105 @@ impl TlsStream {
         }
     }
 
-    pub fn close(self: TlsStream) -> Result[(), io::Error] {
-        let _ = self.close_gate.recv();
-        defer self.close_gate.send(());
+    fn handshake_complete(self: TlsStream) -> bool {
+        select {
+            recv(self.handshake_done) as _ => true,
+            default => false,
+        }
+    }
+
+    pub fn handshake(self: TlsStream) -> Result[(), io::Error] {
+        self.handshake_with(context::Context::background())
+    }
+
+    pub fn handshake_with(self: TlsStream, context: context::Context) -> Result[(), io::Error] {
+        check_context(context, "TLS handshake")?;
         if self.is_closed() {
+            return Result::Err(
+                error(io::ErrorKind::BrokenPipe, "TLS handshake", "TLS stream is closed"),
+            )
+        }
+        if self.handshake_complete() {
             return Result::Ok(())
         }
-        self.closed.close();
-        let message = __goml_std_net_tls_close(self.id);
+        self.acquire(self.handshake_gate, context, "TLS handshake")?;
+        defer self.handshake_gate.send(());
+        if self.handshake_complete() {
+            return Result::Ok(())
+        }
+        let timeout = match context.remaining() {
+            Some(remaining) if remaining.compare(self.handshake_timeout) < 0 => remaining,
+            _ => self.handshake_timeout,
+        };
+        let (ok, _, kind, message) = __goml_std_net_tls_handshake(
+            self.id,
+            cancellation_id(context),
+            timeout.as_nanoseconds(),
+        );
+        if !ok {
+            let closed = self.is_closed();
+            let _ = self.abort();
+            check_context(context, "TLS handshake")?;
+            if closed {
+                return Result::Err(
+                    error(io::ErrorKind::BrokenPipe, "TLS handshake", "TLS stream is closed"),
+                )
+            }
+            return Result::Err(runtime_error(kind, "TLS handshake", message))
+        }
+        if let Err(failure) = check_context(context, "TLS handshake") {
+            let _ = self.abort();
+            return Result::Err(failure)
+        }
+        self.handshake_done.close();
+        Result::Ok(())
+    }
+
+    fn address(self: TlsStream, peer: bool) -> Result[net::SocketAddr, io::Error] {
+        if self.is_closed() {
+            return Result::Err(
+                error(io::ErrorKind::BrokenPipe, "TLS address", "TLS stream is closed"),
+            )
+        }
+        let address = __goml_std_net_tls_address(self.id, peer);
+        if address.byte_len() == 0 {
+            return Result::Err(
+                error(io::ErrorKind::BrokenPipe, "TLS address", "TLS stream is closed"),
+            )
+        }
+        net::SocketAddr::parse(address)
+    }
+
+    pub fn local_addr(self: TlsStream) -> Result[net::SocketAddr, io::Error] {
+        self.address(false)
+    }
+
+    pub fn peer_addr(self: TlsStream) -> Result[net::SocketAddr, io::Error] {
+        self.address(true)
+    }
+
+    pub fn close(self: TlsStream) -> Result[(), io::Error] {
+        self.finish_close(false)
+    }
+
+    pub fn abort(self: TlsStream) -> Result[(), io::Error] {
+        self.finish_close(true)
+    }
+
+    fn finish_close(self: TlsStream, abort: bool) -> Result[(), io::Error] {
+        let mut message = if abort {
+            __goml_std_net_tls_abort(self.id)
+        } else {
+            ""
+        };
+        let _ = self.close_gate.recv();
+        defer self.close_gate.send(());
+        if !self.is_closed() {
+            self.closed.close();
+            if !abort {
+                message = __goml_std_net_tls_close(self.id);
+            }
+        }
         if message == "" {
             Result::Ok(())
         } else {
@@ -242,6 +337,16 @@ impl TlsStream {
     }
 
     pub fn connection_info(self: TlsStream) -> Result[ConnectionInfo, io::Error] {
+        if self.is_closed() {
+            return Result::Err(
+                error(io::ErrorKind::BrokenPipe, "TLS state", "TLS stream is closed"),
+            )
+        }
+        if !self.handshake_complete() {
+            return Result::Err(
+                error(io::ErrorKind::InvalidInput, "TLS state", "TLS handshake has not completed"),
+            )
+        }
         let (ok, version, negotiated_protocol) = __goml_std_net_tls_state(self.id);
         if !ok {
             return Result::Err(
@@ -312,6 +417,7 @@ impl TlsStream {
         isize,
         io::Error,
     ] {
+        self.handshake_with(context)?;
         self.acquire(self.read_gate, context, "TLS read")?;
         defer self.read_gate.send(());
         self.read_locked(buffer, context)
@@ -321,6 +427,7 @@ impl TlsStream {
         isize,
         io::Error,
     ] {
+        self.handshake_with(context)?;
         self.acquire(self.write_gate, context, "TLS write")?;
         defer self.write_gate.send(());
         self.write_locked(buffer, context)
@@ -330,6 +437,7 @@ impl TlsStream {
         (),
         io::Error,
     ] {
+        self.handshake_with(context)?;
         self.acquire(self.read_gate, context, "TLS read exact")?;
         defer self.read_gate.send(());
         let mut offset = 0;
@@ -353,6 +461,7 @@ impl TlsStream {
         (),
         io::Error,
     ] {
+        self.handshake_with(context)?;
         self.acquire(self.write_gate, context, "TLS write all")?;
         defer self.write_gate.send(());
         let mut offset = 0;

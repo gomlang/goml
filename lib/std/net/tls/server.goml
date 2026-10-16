@@ -52,6 +52,7 @@ pub struct TlsListener {
     accept_gate: Channel[()],
     close_gate: Channel[()],
     closed: Channel[()],
+    handshake_timeout: time::Duration,
 }
 
 fn version_number(version: Version) -> u16 {
@@ -61,14 +62,29 @@ fn version_number(version: Version) -> u16 {
     }
 }
 
-fn stream_from_runtime(id: i64) -> TlsStream {
+fn stream_from_runtime(id: i64, handshake_timeout: time::Duration, complete: bool) -> TlsStream {
     let read_gate = Channel::new(1);
     let write_gate = Channel::new(1);
     let close_gate = Channel::new(1);
+    let handshake_gate = Channel::new(1);
+    let handshake_done = Channel::new(0);
+    handshake_gate.send(());
+    if complete {
+        handshake_done.close();
+    }
     read_gate.send(());
     write_gate.send(());
     close_gate.send(());
-    TlsStream { id, read_gate, write_gate, close_gate, closed: Channel::new(0) }
+    TlsStream {
+        id,
+        read_gate,
+        write_gate,
+        close_gate,
+        closed: Channel::new(0),
+        handshake_gate,
+        handshake_done,
+        handshake_timeout,
+    }
 }
 
 impl TlsListener {
@@ -124,7 +140,15 @@ impl TlsListener {
         let close_gate = Channel::new(1);
         accept_gate.send(());
         close_gate.send(());
-        Result::Ok(TlsListener { id, accept_gate, close_gate, closed: Channel::new(0) })
+        Result::Ok(
+            TlsListener {
+                id,
+                accept_gate,
+                close_gate,
+                closed: Channel::new(0),
+                handshake_timeout: config.handshake_timeout,
+            },
+        )
     }
 
     pub fn is_closed(self: TlsListener) -> bool {
@@ -169,6 +193,24 @@ impl TlsListener {
     }
 
     pub fn accept_with(self: TlsListener, context: context::Context) -> Result[TlsStream, io::Error] {
+        self.accept_inner(context, false)
+    }
+
+    pub fn accept_pending(self: TlsListener) -> Result[TlsStream, io::Error] {
+        self.accept_pending_with(context::Context::background())
+    }
+
+    pub fn accept_pending_with(self: TlsListener, context: context::Context) -> Result[
+        TlsStream,
+        io::Error,
+    ] {
+        self.accept_inner(context, true)
+    }
+
+    fn accept_inner(self: TlsListener, context: context::Context, pending: bool) -> Result[
+        TlsStream,
+        io::Error,
+    ] {
         check_context(context, "TLS accept")?;
         select {
             recv(self.closed) as _ => return Result::Err(
@@ -189,11 +231,15 @@ impl TlsListener {
                 error(io::ErrorKind::BrokenPipe, "TLS accept", "TLS listener is closed"),
             )
         }
-        let (ok, id, kind, message) = __goml_std_net_tls_accept(
-            self.id,
-            cancellation_id(context),
-            operation_timeout(context),
-        );
+        let (ok, id, kind, message) = if pending {
+            __goml_std_net_tls_accept_pending(
+                self.id,
+                cancellation_id(context),
+                operation_timeout(context),
+            )
+        } else {
+            __goml_std_net_tls_accept(self.id, cancellation_id(context), operation_timeout(context))
+        };
         if !ok {
             check_context(context, "TLS accept")?;
             if self.is_closed() {
@@ -203,7 +249,7 @@ impl TlsListener {
             }
             return Result::Err(runtime_error(kind, "TLS accept", message))
         }
-        let stream = stream_from_runtime(id);
+        let stream = stream_from_runtime(id, self.handshake_timeout, !pending);
         if let Err(failure) = check_context(context, "TLS accept") {
             let _ = stream.close();
             return Result::Err(failure)
