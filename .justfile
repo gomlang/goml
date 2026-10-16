@@ -65,12 +65,16 @@ _ci-scripts:
     python3 tools/generate_unicode_casefold.py --check
     python3 tools/syscall/generate.py --check
     python3 tools/syscall/layouts.py --check --verify-headers
+    just _ci-toolchain-scripts
+
+_ci-toolchain-scripts:
     bash -n tools/release/release.sh tools/release/test.sh tools/release/common.sh tools/release/sources.sh tools/release/checksums.sh tools/release/package.sh tools/release/smoke.sh tools/release/lsp_smoke.sh
-    bash -n tools/lib/install.sh tools/lib/test.sh tools/lib/finalize-toolchain.sh
+    bash -n tools/lib/common.sh tools/lib/install.sh tools/lib/test.sh tools/lib/finalize-toolchain.sh
     bash tools/release/test.sh
     bash tools/lib/test.sh stage2
     bash tools/release/release.sh check-version "$(cat VERSION)"
-    bash -n bootstrap/bootstrap.sh bootstrap/test.sh
+    bash -n bootstrap/bootstrap.sh bootstrap/build-stage.sh bootstrap/common.sh bootstrap/check-host.sh bootstrap/test-host.sh bootstrap/test.sh
+    bash bootstrap/test-host.sh
     bash bootstrap/test.sh
 
 _ci-gomlc-test: _ci-gomlc-test-build _ci-gomlc-test-run

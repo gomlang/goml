@@ -37,9 +37,22 @@ test "$(wc -l < "$archive_dir/SHA256SUMS" | tr -d ' ')" = 2
     cd "$archive_dir"
     release_sha256 -c SHA256SUMS
     ln -s "$(command -v shasum)" "$temporary/hash-bin/shasum"
-    PATH="$temporary/hash-bin" release_sha256 -c SHA256SUMS
-    PATH="$temporary/hash-bin" release_sha256 "goml-$release_version-linux-amd64.tar.gz" > fallback.sha256
+    for tool in find sort xargs; do
+        ln -s "$(command -v "$tool")" "$temporary/hash-bin/$tool"
+    done
+    (
+        export PATH="$temporary/hash-bin"
+        release_sha256 -c SHA256SUMS
+        release_sha256 "goml-$release_version-linux-amd64.tar.gz" > fallback.sha256
+        release_sha256 -c - < fallback.sha256
+    )
     cmp fallback.sha256 "goml-$release_version-linux-amd64.tar.gz.sha256"
+    toolchain_hash_files "$archive_dir" > "$temporary/tree.sha256"
+    (
+        export PATH="$temporary/hash-bin"
+        toolchain_hash_files "$archive_dir" > "$temporary/fallback-tree.sha256"
+    )
+    cmp "$temporary/tree.sha256" "$temporary/fallback-tree.sha256"
 )
 rm "$archive_dir/SHA256SUMS"
 printf 'corrupt\n' >> "$archive_dir/goml-$release_version-darwin-arm64.tar.gz"
@@ -47,8 +60,30 @@ if bash tools/release/checksums.sh "$release_version" "$archive_dir"; then
     exit 1
 fi
 test ! -e "$archive_dir/SHA256SUMS"
+
 rm "$archive_dir/goml-$release_version-darwin-arm64.tar.gz"
 if bash tools/release/checksums.sh "$release_version" "$archive_dir"; then
     exit 1
 fi
 test ! -e "$archive_dir/SHA256SUMS"
+
+source bootstrap/stage0.env
+mkdir -p "$temporary/stage0-project/bootstrap"
+(
+    cd "$temporary/stage0-project"
+    bash "$release_script" set-stage0 "${GOML_STAGE0_RELEASE_TAG#v}" \
+        "$GOML_STAGE0_LINUX_AMD64_SHA256" "$GOML_STAGE0_DARWIN_ARM64_SHA256"
+    cmp bootstrap/stage0.env "$repository_root/bootstrap/stage0.env"
+    bash "$release_script" check-stage0 "${GOML_STAGE0_RELEASE_TAG#v}"
+    for invalid in '' invalid; do
+        if bash "$release_script" set-stage0 "${GOML_STAGE0_RELEASE_TAG#v}" \
+            "$GOML_STAGE0_LINUX_AMD64_SHA256" "$invalid"; then
+            exit 1
+        fi
+        if bash "$release_script" set-stage0 "${GOML_STAGE0_RELEASE_TAG#v}" \
+            "$invalid" "$GOML_STAGE0_DARWIN_ARM64_SHA256"; then
+            exit 1
+        fi
+        cmp bootstrap/stage0.env "$repository_root/bootstrap/stage0.env"
+    done
+)
