@@ -1,0 +1,375 @@
+package tests;
+
+use std::context;
+use std::io;
+use std::net;
+use std::net::tls;
+use std::task;
+use std::testing;
+use std::time;
+
+#[test]
+fn pending_accept_exposes_addresses_and_allows_concurrent_handshakes() -> () {
+    task::scope(
+        |scope| {
+            let listener = testing::expect_ok(
+                tls::TlsListener::bind(local_address(), server_config()),
+                "pending listener",
+            );
+            defer {
+                let _ = listener.close();
+            };
+            let address = testing::expect_ok(listener.local_addr(), "listener address");
+            let stalled = testing::expect_ok(net::TcpStream::connect(address), "stalled client");
+            defer {
+                let _ = stalled.close();
+            };
+            let pending = testing::expect_ok(listener.accept_pending(), "pending stream");
+            defer {
+                let _ = pending.close();
+            };
+            testing::assert_eq(
+                testing::expect_ok(pending.local_addr(), "pending local address").to_string(),
+                address.to_string(),
+            );
+            testing::assert_eq(
+                testing::expect_ok(pending.peer_addr(), "pending peer address").to_string(),
+                testing::expect_ok(stalled.local_addr(), "client address").to_string(),
+            );
+            testing::assert_eq(
+                testing::expect_err(pending.connection_info(), "pending connection state").kind(),
+                io::ErrorKind::InvalidInput,
+            );
+            let worker = scope.spawn(
+                |_| {
+                    let stream = testing::expect_ok(
+                        listener.accept_pending(),
+                        "second pending stream",
+                    );
+                    defer {
+                        let _ = stream.close();
+                    };
+                    testing::expect_ok(
+                        listener.close(),
+                        "close listener while streams remain owned",
+                    );
+                    context::with_timeout(
+                        context::Context::background(),
+                        time::Duration::from_seconds(2),
+                        |ctx, _| {
+                            testing::expect_ok(
+                                stream.handshake_with(ctx),
+                                "explicit server handshake",
+                            );
+                            testing::expect_ok(stream.handshake_with(ctx), "idempotent handshake");
+                            let input = Vec::from_array([0.to_u8(); 4]);
+                            testing::expect_ok(
+                                stream.read_exact_with(input.as_mut_slice(), ctx),
+                                "read pending stream",
+                            );
+                            testing::expect_ok(
+                                stream.write_all_with(input.as_slice(), ctx),
+                                "echo pending stream",
+                            );
+                        },
+                    );
+                },
+            );
+            let client = testing::expect_ok(
+                tls::connect(
+                    "127.0.0.1",
+                    address.port,
+                    config().with_connect_timeout(time::Duration::from_seconds(2)),
+                ),
+                "healthy client while first handshake is stalled",
+            );
+            defer {
+                let _ = client.close();
+            };
+            testing::assert_eq(
+                testing::expect_ok(client.peer_addr(), "TLS peer address").to_string(),
+                address.to_string(),
+            );
+            context::with_timeout(
+                context::Context::background(),
+                time::Duration::from_seconds(2),
+                |ctx, _| {
+                    testing::expect_ok(client.write_all_with(b"ping".as_slice(), ctx), "write ping");
+                    let output = Vec::from_array([0.to_u8(); 4]);
+                    testing::expect_ok(
+                        client.read_exact_with(output.as_mut_slice(), ctx),
+                        "read ping",
+                    );
+                    testing::assert_eq(string_from_utf8(output).1, "ping");
+                },
+            );
+            worker.join();
+            testing::expect_ok(pending.close(), "close pending stream");
+            testing::expect_ok(pending.close(), "idempotent pending close");
+            testing::assert_eq(
+                testing::expect_err(pending.peer_addr(), "closed peer address").kind(),
+                io::ErrorKind::BrokenPipe,
+            );
+            testing::assert_eq(
+                testing::expect_err(pending.handshake(), "closed handshake").kind(),
+                io::ErrorKind::BrokenPipe,
+            );
+        },
+    );
+}
+
+#[test]
+fn pending_handshake_timeout_cancellation_and_implicit_io() -> () {
+    task::scope(
+        |scope| {
+            let listener = testing::expect_ok(
+                tls::TlsListener::bind(
+                    local_address(),
+                    server_config().with_handshake_timeout(time::Duration::from_milliseconds(200)),
+                ),
+                "short handshake listener",
+            );
+            defer {
+                let _ = listener.close();
+            };
+            let address = testing::expect_ok(listener.local_addr(), "listener address");
+            context::with_cancel(
+                context::Context::background(),
+                |ctx, cancel| {
+                    cancel.cancel();
+                    testing::assert_eq(
+                        testing::expect_err(
+                            listener.accept_pending_with(ctx),
+                            "pre-cancelled pending accept",
+                        ).kind(),
+                        io::ErrorKind::Interrupted,
+                    );
+                },
+            );
+            context::with_timeout(
+                context::Context::background(),
+                time::Duration::from_milliseconds(20),
+                |ctx, _| {
+                    testing::assert_eq(
+                        testing::expect_err(
+                            listener.accept_pending_with(ctx),
+                            "pending accept deadline",
+                        ).kind(),
+                        io::ErrorKind::TimedOut,
+                    );
+                },
+            );
+            let raw = testing::expect_ok(net::TcpStream::connect(address), "silent peer");
+            defer {
+                let _ = raw.close();
+            };
+            let stream = testing::expect_ok(listener.accept_pending(), "silent pending stream");
+            defer {
+                let _ = stream.close();
+            };
+            context::with_cancel(
+                context::Context::background(),
+                |ctx, cancel| {
+                    cancel.cancel();
+                    testing::assert_eq(
+                        testing::expect_err(stream.handshake_with(ctx), "pre-cancelled handshake").kind(),
+                        io::ErrorKind::Interrupted,
+                    );
+                    testing::assert(!stream.is_closed());
+                },
+            );
+            testing::assert_eq(
+                testing::expect_err(stream.handshake(), "configured explicit handshake deadline").kind(),
+                io::ErrorKind::TimedOut,
+            );
+            testing::assert(stream.is_closed());
+            testing::assert(!listener.is_closed());
+            let worker = scope.spawn(
+                |_| {
+                    let stream = testing::expect_ok(
+                        listener.accept_pending(),
+                        "implicit handshake stream",
+                    );
+                    defer {
+                        let _ = stream.close();
+                    };
+                    context::with_timeout(
+                        context::Context::background(),
+                        time::Duration::from_seconds(2),
+                        |ctx, _| {
+                            let input = Vec::from_array([0.to_u8(); 4]);
+                            testing::expect_ok(
+                                stream.read_exact_with(input.as_mut_slice(), ctx),
+                                "read automatically handshakes",
+                            );
+                            testing::expect_ok(
+                                stream.write_all_with(input.as_slice(), ctx),
+                                "write after implicit handshake",
+                            );
+                            testing::assert_eq(
+                                testing::expect_ok(stream.connection_info(), "handshake state").negotiated_protocol,
+                                "goml-test",
+                            );
+                        },
+                    );
+                },
+            );
+            let client = testing::expect_ok(
+                tls::connect("127.0.0.1", address.port, config()),
+                "listener remains usable",
+            );
+            defer {
+                let _ = client.close();
+            };
+            context::with_timeout(
+                context::Context::background(),
+                time::Duration::from_seconds(2),
+                |ctx, _| {
+                    testing::expect_ok(
+                        client.write_all_with(b"pong".as_slice(), ctx),
+                        "write implicit handshake",
+                    );
+                    let output = Vec::from_array([0.to_u8(); 4]);
+                    testing::expect_ok(
+                        client.read_exact_with(output.as_mut_slice(), ctx),
+                        "read implicit handshake",
+                    );
+                    testing::assert_eq(string_from_utf8(output).1, "pong");
+                },
+            );
+            worker.join();
+        },
+    );
+}
+
+#[test]
+fn pending_stream_close_interrupts_active_and_queued_handshakes() -> () {
+    task::scope(
+        |scope| {
+            let listener = testing::expect_ok(
+                tls::TlsListener::bind(local_address(), server_config()),
+                "pending close listener",
+            );
+            defer {
+                let _ = listener.close();
+            };
+            let raw = testing::expect_ok(
+                net::TcpStream::connect(
+                    testing::expect_ok(listener.local_addr(), "listener address"),
+                ),
+                "silent peer",
+            );
+            defer {
+                let _ = raw.close();
+            };
+            let stream = testing::expect_ok(listener.accept_pending(), "pending stream");
+            defer {
+                let _ = stream.close();
+            };
+            let started = Channel::new(2);
+            let completed = Channel::new(2);
+            for _ in 0..2 {
+                let _ = scope.spawn(
+                    |_| {
+                        started.send(());
+                        completed.send(
+                            testing::expect_err(stream.handshake(), "closed handshake").kind(),
+                        );
+                    },
+                );
+            }
+            let _ = started.recv();
+            let _ = started.recv();
+            let closing = scope.spawn(|_| stream.close());
+            testing::expect_ok(stream.abort(), "interrupt pending handshakes");
+            testing::expect_ok(closing.join(), "concurrent graceful close");
+            testing::expect_ok(stream.abort(), "idempotent abort");
+            testing::expect_ok(stream.close(), "close after abort");
+            testing::assert_eq(
+                testing::expect_err(stream.connection_info(), "closed stream state").kind(),
+                io::ErrorKind::BrokenPipe,
+            );
+            testing::assert_eq(
+                testing::expect_err(stream.local_addr(), "closed local address").kind(),
+                io::ErrorKind::BrokenPipe,
+            );
+            testing::assert_eq(
+                testing::expect_err(stream.peer_addr(), "closed peer address").kind(),
+                io::ErrorKind::BrokenPipe,
+            );
+            let timer = time::Timer::new(time::Duration::from_seconds(2));
+            defer {
+                let _ = timer.stop();
+            };
+            for _ in 0..2 {
+                select {
+                    recv(completed) as kind => testing::assert_eq(
+                        testing::expect_some(kind, "handshake completion"),
+                        io::ErrorKind::BrokenPipe,
+                    ),
+                    recv(timer.done()) as _ => testing::fail(
+                        "pending handshake did not wake after close",
+                    ),
+                }
+            }
+        },
+    );
+}
+
+#[test]
+fn pending_handshake_context_cancellation_interrupts_active_negotiation() -> () {
+    task::scope(
+        |scope| {
+            let listener = testing::expect_ok(
+                tls::TlsListener::bind(local_address(), server_config()),
+                "cancel handshake listener",
+            );
+            defer {
+                let _ = listener.close();
+            };
+            let client = testing::expect_ok(
+                net::TcpStream::connect(
+                    testing::expect_ok(listener.local_addr(), "listener address"),
+                ),
+                "pending client",
+            );
+            defer {
+                let _ = client.close();
+            };
+            let stream = testing::expect_ok(listener.accept_pending(), "pending server stream");
+            defer {
+                let _ = stream.abort();
+            };
+            context::with_cancel(
+                context::Context::background(),
+                |ctx, cancel| {
+                    let handshake = scope.spawn(|_| stream.handshake_with(ctx));
+                    let hello = b"\x16\x03\x01\x00\x4f\x01\x00\x00\x4b\x03\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x04\xc0\x2b\xc0\x2f\x01\x00\x00\x1e\x00\x0a\x00\x04\x00\x02\x00\x17\x00\x0b\x00\x02\x01\x00\x00\x0d\x00\x08\x00\x06\x08\x07\x04\x03\x08\x04\x00\x17\x00\x00";
+                    let options = net::WaitOptions::new().with_timeout(
+                        time::Duration::from_seconds(2),
+                    );
+                    testing::expect_ok(
+                        client.write_all_with(hello.as_slice(), options),
+                        "write ClientHello",
+                    );
+                    let header = Vec::from_array([0.to_u8(); 9]);
+                    testing::expect_ok(
+                        client.read_exact_with(header.as_mut_slice(), options),
+                        "read ServerHello before cancellation",
+                    );
+                    testing::assert_eq(header[0], 22.to_u8());
+                    testing::assert_eq(header[5], 2.to_u8());
+                    cancel.cancel();
+                    testing::assert_eq(
+                        testing::expect_err(handshake.join(), "cancel active negotiation").kind(),
+                        io::ErrorKind::Interrupted,
+                    );
+                    testing::assert(stream.is_closed());
+                    testing::expect_ok(stream.abort(), "abort after cancellation");
+                    testing::expect_ok(stream.close(), "close after cancellation");
+                    testing::assert(!listener.is_closed());
+                },
+            );
+        },
+    );
+}

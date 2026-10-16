@@ -1,0 +1,282 @@
+package go_backend;
+
+use module::resources;
+use module::repr;
+use std::fs;
+use std::path;
+use std::process;
+use std::testing;
+use std::time;
+use std::utf8;
+use utf8::BytesUtf8;
+
+#[test]
+fn tls_abort_interrupts_graceful_close_without_losing_close_notifications() -> () {
+    let items: Vec[Item] = Vec::new();
+    emit_runtime_hook_items(
+        items,
+        Vec::from_array(
+            [
+                resources::RuntimeHook::Standard(
+                    resources::StandardRuntimeHook::Network(resources::NetworkRuntimeHook::TlsClose),
+                ),
+                resources::RuntimeHook::Standard(
+                    resources::StandardRuntimeHook::Network(resources::NetworkRuntimeHook::TlsAbort),
+                ),
+                resources::RuntimeHook::Standard(
+                    resources::StandardRuntimeHook::Network(
+                        resources::NetworkRuntimeHook::TlsAddress,
+                    ),
+                ),
+                resources::RuntimeHook::Standard(
+                    resources::StandardRuntimeHook::Network(
+                        resources::NetworkRuntimeHook::TlsListenerAddress,
+                    ),
+                ),
+                resources::RuntimeHook::Standard(
+                    resources::StandardRuntimeHook::Network(
+                        resources::NetworkRuntimeHook::TlsHandshake,
+                    ),
+                ),
+            ],
+        ),
+        Vec::new(),
+    );
+    items.push(
+        Item::Struct(
+            StructDef {
+                name: type_name(
+                    repr::Type::Tuple {
+                        items: Vec::from_array(
+                            [
+                                repr::Type::Bool,
+                                repr::Type::Int64,
+                                repr::Type::Int,
+                                repr::Type::String,
+                            ],
+                        ),
+                    },
+                ),
+                fields: Vec::from_array(
+                    [
+                        ("_0", Type::Bool),
+                        ("_1", Type::Int64),
+                        ("_2", Type::Int),
+                        ("_3", Type::String),
+                    ],
+                ),
+            },
+        ),
+    );
+    let source = encode_package(File { items: prune_imports(items) }, "tlsclosetest");
+    let root = "_artifact/tls-close-runtime";
+    testing::assert(fs::create_dir_all(root).is_ok());
+    testing::assert(
+        fs::write_file_structured(path::join(root, "go.mod"), "module tlsclosetest\n\ngo 1.26\n").is_ok(),
+    );
+    testing::assert(fs::write_file_structured(path::join(root, "runtime.go"), source).is_ok());
+    for name in["certificate.pem", "private_key.pem"] {
+        let contents = testing::expect_ok(
+            fs::read_file_structured(path::join("../lib/std/net/tls/tests", name)),
+            "TLS test fixture",
+        );
+        testing::assert(fs::write_file_structured(path::join(root, name), contents).is_ok());
+    }
+    let host =
+        \\package tlsclosetest
+        \\import (
+        \\    "context"
+        \\    "crypto/tls"
+        \\    "io"
+        \\    "net"
+        \\    "strconv"
+        \\    "sync"
+        \\    "sync/atomic"
+        \\    "testing"
+        \\    "time"
+        \\)
+        \\type observedConn struct {
+        \\    net.Conn
+        \\    armed atomic.Bool
+        \\    closed atomic.Bool
+        \\    once sync.Once
+        \\    writes chan []byte
+        \\}
+        \\func (c *observedConn) Write(data []byte) (int, error) {
+        \\    if c.armed.Load() {
+        \\        c.once.Do(func() { c.writes <- append([]byte(nil), data...) })
+        \\    }
+        \\    return c.Conn.Write(data)
+        \\}
+        \\func (c *observedConn) Close() error {
+        \\    if c.closed.Swap(true) { return net.ErrClosed }
+        \\    return c.Conn.Close()
+        \\}
+        \\func pair(t *testing.T) (int64, *tls.Conn, *observedConn) {
+        \\    t.Helper()
+        \\    certificate, err := tls.LoadX509KeyPair("certificate.pem", "private_key.pem")
+        \\    if err != nil { t.Fatal(err) }
+        \\    serverSocket, clientSocket := net.Pipe()
+        \\    raw := &observedConn{Conn: serverSocket, writes: make(chan []byte, 1)}
+        \\    t.Cleanup(func() { raw.Close(); clientSocket.Close() })
+        \\    server := tls.Server(raw, &tls.Config{Certificates: []tls.Certificate{certificate}, MaxVersion: tls.VersionTLS12})
+        \\    client := tls.Client(clientSocket, &tls.Config{InsecureSkipVerify: true, MaxVersion: tls.VersionTLS12})
+        \\    ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+        \\    defer cancel()
+        \\    finished := make(chan error, 1)
+        \\    go func() { finished <- server.HandshakeContext(ctx) }()
+        \\    if err := client.HandshakeContext(ctx); err != nil { t.Fatal(err) }
+        \\    if err := <-finished; err != nil { t.Fatal(err) }
+        \\    _goml_tls_mu.Lock()
+        \\    id := _goml_tls_next
+        \\    _goml_tls_next++
+        \\    _goml_tls_connections[id] = server
+        \\    _goml_tls_mu.Unlock()
+        \\    t.Cleanup(func() { _goml_runtime_std_net_tls_abort(id) })
+        \\    raw.armed.Store(true)
+        \\    return id, client, raw
+        \\}
+        \\func result(t *testing.T, done <-chan string) {
+        \\    t.Helper()
+        \\    select {
+        \\    case message := <-done:
+        \\        if message != "" { t.Fatal(message) }
+        \\    case <-time.After(time.Second):
+        \\        t.Fatal("TLS close did not finish promptly")
+        \\    }
+        \\}
+        \\func TestGracefulCloseSendsNotification(t *testing.T) {
+        \\    id, client, raw := pair(t)
+        \\    closed := make(chan string, 1)
+        \\    go func() { closed <- _goml_runtime_std_net_tls_close(id) }()
+        \\    client.SetReadDeadline(time.Now().Add(time.Second))
+        \\    if n, err := client.Read(make([]byte, 1)); n != 0 || err != io.EOF { t.Fatal(n, err) }
+        \\    select {
+        \\    case record := <-raw.writes:
+        \\        if len(record) < 5 || record[0] != 21 { t.Fatalf("missing TLS alert: %x", record) }
+        \\    default:
+        \\        t.Fatal("graceful close skipped the TLS close notification")
+        \\    }
+        \\    result(t, closed)
+        \\    if _goml_tls_lookup(id) != nil { t.Fatal("closed connection remains registered") }
+        \\}
+        \\func TestAbortInterruptsBlockedGracefulClose(t *testing.T) {
+        \\    id, _, raw := pair(t)
+        \\    closed := make(chan string, 1)
+        \\    go func() { closed <- _goml_runtime_std_net_tls_close(id) }()
+        \\    select {
+        \\    case <-raw.writes:
+        \\    case <-time.After(time.Second):
+        \\        t.Fatal("close notification did not start")
+        \\    }
+        \\    if _goml_tls_lookup(id) == nil { t.Fatal("graceful close hid the socket before TLS cleanup completed") }
+        \\    aborted := make(chan string, 1)
+        \\    go func() { aborted <- _goml_runtime_std_net_tls_abort(id) }()
+        \\    result(t, aborted)
+        \\    result(t, closed)
+        \\    if !raw.closed.Load() || _goml_tls_lookup(id) != nil { t.Fatal("aborted socket remains live or registered") }
+        \\    for range 8 {
+        \\        go func() { aborted <- _goml_runtime_std_net_tls_abort(id) }()
+        \\        go func() { closed <- _goml_runtime_std_net_tls_close(id) }()
+        \\        result(t, aborted)
+        \\        result(t, closed)
+        \\    }
+        \\}
+        \\type addressConn struct {
+        \\    net.Conn
+        \\    local, peer *net.TCPAddr
+        \\}
+        \\func (c *addressConn) LocalAddr() net.Addr { return c.local }
+        \\func (c *addressConn) RemoteAddr() net.Addr { return c.peer }
+        \\func TestSocketAddressesUseNumericScopes(t *testing.T) {
+        \\    interfaces, err := net.Interfaces()
+        \\    if err != nil { t.Fatal(err) }
+        \\    if len(interfaces) == 0 { t.Fatal("no local network interface") }
+        \\    iface := interfaces[0]
+        \\    zone := strconv.Itoa(iface.Index)
+        \\    socket, peer := net.Pipe()
+        \\    defer socket.Close()
+        \\    defer peer.Close()
+        \\    localAddr := &net.TCPAddr{IP: net.ParseIP("fe80::1"), Port: 443, Zone: iface.Name}
+        \\    peerAddr := &net.TCPAddr{IP: net.ParseIP("fe80::2"), Port: 12345, Zone: iface.Name}
+        \\    conn := tls.Server(&addressConn{Conn: socket, local: localAddr, peer: peerAddr}, &tls.Config{})
+        \\    _goml_tls_mu.Lock()
+        \\    id := _goml_tls_next
+        \\    _goml_tls_next++
+        \\    _goml_tls_connections[id] = conn
+        \\    _goml_tls_mu.Unlock()
+        \\    defer _goml_runtime_std_net_tls_abort(id)
+        \\    if got := _goml_runtime_std_net_tls_address(id, false); got != "[fe80::1%"+zone+"]:443" { t.Fatal(got) }
+        \\    if got := _goml_runtime_std_net_tls_address(id, true); got != "[fe80::2%"+zone+"]:12345" { t.Fatal(got) }
+        \\    if localAddr.Zone != iface.Name || peerAddr.Zone != iface.Name { t.Fatal("socket address was mutated") }
+        \\    for _, address := range []*net.TCPAddr{
+        \\        {IP: net.ParseIP("fe80::3"), Port: 80, Zone: zone},
+        \\        {IP: net.ParseIP("::1"), Port: 443},
+        \\        {IP: net.ParseIP("127.0.0.1"), Port: 443},
+        \\    } {
+        \\        if got := _goml_tls_socket_address(address); got != address.String() { t.Fatal(got) }
+        \\    }
+        \\    listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+        \\    if err != nil { t.Fatal(err) }
+        \\    defer listener.Close()
+        \\    _goml_tls_mu.Lock()
+        \\    _goml_tls_listeners[id] = &_goml_tls_listener_state{socket: listener}
+        \\    _goml_tls_mu.Unlock()
+        \\    defer func() { _goml_tls_mu.Lock(); delete(_goml_tls_listeners, id); _goml_tls_mu.Unlock() }()
+        \\    if got := _goml_runtime_std_net_tls_listener_address(id); got != listener.Addr().String() { t.Fatal(got) }
+        \\}
+        \\type handshakeConn struct {
+        \\    net.Conn
+        \\    once sync.Once
+        \\    started chan struct{}
+        \\}
+        \\func (c *handshakeConn) Read(data []byte) (int, error) {
+        \\    c.once.Do(func() { close(c.started) })
+        \\    return c.Conn.Read(data)
+        \\}
+        \\func TestAbortedHandshakeReportsClosed(t *testing.T) {
+        \\    socket, peer := net.Pipe()
+        \\    defer socket.Close()
+        \\    defer peer.Close()
+        \\    raw := &handshakeConn{Conn: socket, started: make(chan struct{})}
+        \\    conn := tls.Server(raw, &tls.Config{})
+        \\    _goml_tls_mu.Lock()
+        \\    id := _goml_tls_next
+        \\    _goml_tls_next++
+        \\    _goml_tls_connections[id] = conn
+        \\    _goml_tls_mu.Unlock()
+        \\    defer _goml_runtime_std_net_tls_abort(id)
+        \\    done := make(chan int, 1)
+        \\    go func() { done <- _goml_runtime_std_net_tls_handshake(id, 0, int64(5*time.Second))._2 }()
+        \\    select {
+        \\    case <-raw.started:
+        \\    case <-time.After(time.Second):
+        \\        t.Fatal("handshake did not start reading")
+        \\    }
+        \\    if message := _goml_runtime_std_net_tls_abort(id); message != "" { t.Fatal(message) }
+        \\    select {
+        \\    case kind := <-done:
+        \\        if kind != 5 { t.Fatalf("aborted handshake error kind = %d, want BrokenPipe (5)", kind) }
+        \\    case <-time.After(time.Second):
+        \\        t.Fatal("aborted handshake did not return")
+        \\    }
+        \\    if got := _goml_runtime_std_net_tls_handshake(id, 0, -1); got._0 || got._2 != 5 { t.Fatal(got) }
+        \\    if got := _goml_runtime_std_net_tls_handshake(id, 0, 0); got._0 || got._2 != 3 { t.Fatal(got) }
+        \\}
+    ;
+    testing::assert(fs::write_file_structured(path::join(root, "runtime_test.go"), host).is_ok());
+    let output = process::Command::new("go").args(
+        Vec::from_array(["test", "-race", "-count=1", "-timeout=15s", "./..."]),
+    ).current_dir(root).env("GOWORK", "off").env("GOTOOLCHAIN", "local").env("GOPROXY", "off").output_timeout_structured(
+        time::Duration::from_seconds(120),
+    );
+    match output {
+        Ok(output) => if !output.status().success() {
+            testing::fail(
+                output.stdout().to_string_utf8().unwrap_or("")
+                    + output.stderr().to_string_utf8().unwrap_or("TLS close runtime test failed"),
+            );
+        },
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
