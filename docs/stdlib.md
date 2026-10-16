@@ -17,6 +17,7 @@ use std::c;
 use std::channel;
 use std::cmp;
 use std::collections;
+use std::collections::imm;
 use std::context;
 use std::crypto;
 use std::encoding::base32;
@@ -67,6 +68,7 @@ Public APIs include:
 - `channel::Operation`, `Selection`, `select`, `try_select`, and `try_select_priority` for runtime-sized channel selection
 - `cmp::Ordering`, `Ord`, `Reverse`, comparison helpers, and two-value minimum, maximum, and clamping operations. `Ordering` is a builtin type re-exported by `cmp`.
 - `collections::Arena`, `BinaryHeap`, `BitSet`, `BTreeMap`, `BTreeSet`, `Deque`, `HashSet`, `IndexMap`, `IndexSet`, `IndexVec`, `Interner`, and `Stack`; hash-backed collections require `Hash + Eq`, while tree collections and heaps use `cmp::Ord`
+- `collections::imm::{HashMap, HashSet, Vector, List, BTreeMap, BTreeSet}` for immutable, structurally shared collections whose updates return new versions
 - `collections::sort`, `stable_sort`, `binary_search`, `min`, `max`, and their comparator variants. The sorting, search, selection, and deduplication methods on `Vec[T]` are the canonical forms.
 - `collections::search`, `is_sorted`, `lower_bound`, `upper_bound`, `equal_range` and comparator variants for monotone indexed search, sortedness checks and duplicate ranges
 - `collections::slice_*` view algorithms and `vec_replace`, `vec_insert_slice`, `vec_delete_range`, `vec_delete_if`, `vec_grow`, `vec_append_iter` for checked range edits and iterator composition
@@ -1108,6 +1110,108 @@ fn main() -> () {
     println(collections::map_equal(counts, copy));
 }
 ```
+
+## Immutable collections
+
+Import `std::collections::imm` for persistent `HashMap[K, V]`, `HashSet[T]`,
+`Vector[T]`, `List[T]`, `BTreeMap[K, V]`, and `BTreeSet[T]`. Persistence means that
+old versions remain usable after updates; it does not imply storage on disk.
+Insertion, removal, and replacement return new collections and share unchanged
+nodes with the original. Assigning a collection retains its version in O(1)
+space and time. Keep the return value of an update to use the new version.
+
+```goml
+use std::collections::imm;
+
+fn main() -> () {
+    let original: imm::HashMap[string, isize] = imm::HashMap::new();
+    let first = original.insert("count", 1);
+    let second = first.insert("count", 2);
+    println(original.is_empty());
+    println(first.get("count").unwrap_or(0));
+    println(second.get("count").unwrap_or(0));
+
+    let values = imm::Vector::from_vec(Vec::from_array([10, 20]));
+    let appended = values.push(30);
+    println(values.len());
+    println(appended.get(2).unwrap_or(0));
+
+    let ordered = imm::BTreeSet::from_vec(Vec::from_array([3, 1, 2]));
+    for value in ordered.range(1, 3) {
+        println(value);
+    }
+}
+```
+
+All six types provide `new`, `from_vec`, `len`, `is_empty`, `iter`, `Default`, and
+`IntoIterator`. Maps accept `Vec[(K, V)]`; sequences and sets accept `Vec[T]`.
+Map construction processes entries in input order, with later values replacing
+earlier values for equivalent keys. Sets discard duplicates. List and Vector
+construction preserves input order. `from_vec` isolates the outer collection
+from later input mutations. Sequence/set `to_vec` and map `entries`, `keys`, and
+`values` return independent mutable vectors.
+
+| Type | Operations | Representation and costs |
+| --- | --- | --- |
+| `HashMap[K, V]` | `get`, `contains_key`, `insert`, `remove`, `entries`, `keys`, `values` | Bitmap-indexed 32-way hash trie over 64-bit hashes; updates copy a path and any affected collision bucket |
+| `HashSet[T]` | `contains`, `insert`, `remove`, `to_vec`, set algebra | Shares the HashMap implementation with unit values |
+| `Vector[T]` | `get`, `set`, `push`, `pop`, `first`, `last`, `to_vec` | 32-way indexed tree with a tail buffer; indexed access and path-copying updates take O(log₃₂ n) tree work, with bounded node copies |
+| `List[T]` | `first`, `push_front`, `pop_front`, `tail`, `reverse`, `to_vec` | Shared-tail singly linked list; head access, prepend, and tail removal are O(1); reversal and traversal are O(n) |
+| `BTreeMap[K, V]` | Map operations plus `first`, `last`, `lower_bound`, `upper_bound`, `range` | B-tree with copied update paths and affected split/borrow/merge nodes; lookup and single-key updates take O(log n) |
+| `BTreeSet[T]` | Set operations plus `first`, `last`, `lower_bound`, `upper_bound`, `range` | Shares the BTreeMap implementation with unit values |
+
+Hash collections require `Hash + Eq`. Hash/equality work is additional to trie
+traversal; identical full hashes use an equality-checked bucket, so collision
+lookups and updates can take linear time in the bucket size. Hash collection
+iteration order is unspecified. Tree keys/elements require `cmp::Ord`, and tree
+iteration is ascending. Keys comparing equal identify one tree entry. Both map
+families retain the stored key when replacing its value with an equivalent key.
+Removing an absent key/element returns an unchanged version.
+
+Map `get` returns `Option[V]`. Vector `get(index)` returns `Option[T]` and
+`set(index, value)` returns `Option[Vector[T]]`; negative indexes and indexes at
+or beyond `len()` return `None`. `push` appends one element. Vector `pop` and
+List `pop_front` return `Option[(T, Self)]`, pairing the removed value with the
+remaining collection. List `tail` returns `Option[List[T]]`. Empty collections
+return `None` from these removal/access operations, including `first` and
+`last` where provided.
+
+Tree `lower_bound(key)` returns the first entry/element greater than or equal
+to the key; `upper_bound(key)` returns the first strictly greater one. Maps
+return `Option[(K, V)]`, and sets return `Option[T]`. `range(start, end)` returns
+a lazy iterator over the half-open interval `[start, end)`. Equal or reversed
+bounds produce an empty iterator. Bounds seek in O(log n); a range visiting m
+items takes O(log n + m) traversal work and O(log n) cursor space.
+
+Both sets provide `union`, `intersection`, `difference`,
+`symmetric_difference`, `is_subset`, and `is_disjoint`. These operations compare
+membership and build persistent results without changing either input; they
+do not promise specialized subtree-merging complexity.
+
+`iter()` returns a single-pass `FnIterator`, retaining the collection version
+without first copying all elements. Iterating an older version is unaffected
+by deriving newer versions. Separate `iter()` calls have independent cursors;
+copies of one iterator share its mutable cursor and require synchronization
+if used concurrently. Content equality is available through conditional
+`PartialEq` and `Eq` implementations: sequence order matters, while map/set
+insertion history does not. Equality uses the element/value traits, not private
+node identity. Collection `Hash` and serde implementations are not provided.
+
+Immutability is shallow. Elements and values retain their ordinary copy or
+shared-handle semantics, so an `imm::Vector[Ref[T]]` still permits changing its
+referenced values. Hash keys must keep stable hashing/equality, and tree keys
+must keep stable ordering while stored. No API exposes mutable node storage.
+Independent immutable versions can be read without modifying their structure;
+concurrent access to mutable payloads still needs the payload's synchronization.
+
+`FrozenVec` remains a compact, contiguous immutable snapshot with constant-time
+indexing; `imm::Vector` supports deriving updated versions through structural
+sharing. The persistent collections do not currently offer mutable transient
+builders, deep freezing, arbitrary Vector insertion/concatenation, or lazy List
+evaluation. Retaining old versions also retains their reachable shared nodes
+and payloads. All algorithms use existing GoML facilities and add no syntax or
+runtime intrinsics. Compiler and driver consumers retain their existing
+collections until a release and stage0 advancement make these APIs available.
 
 ## Iterator adapters
 
@@ -3814,6 +3918,9 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | Resolve a raw URL reference | `url::Reference::parse` and `base.resolve` preserve component markers and remove literal dot segments; authority validation and ASCII serialization are explicit separate operations |
 | Inspect a URL host or hide its password | `url::Authority::parse` validates user information, host literals and decimal port syntax; `redacted` hides only passwords, not query or other secrets |
 | Keep byte snapshots independent | `Bytes::copy` for mutable copies; `Bytes::freeze` and `FrozenBytes` for immutable snapshots |
+| Derive collection versions while retaining the originals | `std::collections::imm` maps, sets, Vector, and List; retain the new collection returned by each update |
+| Query ordered immutable keys or ranges | `imm::BTreeMap` / `BTreeSet` with `lower_bound`, `upper_bound`, and half-open `range(start, end)` |
+| Choose an immutable indexed sequence | `FrozenVec` for a contiguous snapshot; `imm::Vector` for repeated path-copying updates; neither deep-freezes mutable elements |
 | Search binary data repeatedly | `bytes::Finder` snapshots a pattern and reuses linear-time search state; `cut` returns shared views, not copied buffers |
 | Apply Unicode rules to binary input | `bytes::fields`, `trim_space` and scalar searches preserve view bytes; `map_chars` emits valid UTF-8; `replace_invalid_utf8` replaces malformed runs once with caller-selected bytes and an explicit output limit |
 | Search or traverse text without collecting parts | `text::Finder` uses byte offsets and linear search; `split_iter` preserves GoML empty-separator semantics, and `lines_inclusive_iter` preserves newline bytes |

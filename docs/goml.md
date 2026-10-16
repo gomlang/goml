@@ -2950,6 +2950,8 @@ User and third-party packages cannot explicitly import `builtin` or `prelude`; a
 
 Compiler-recognized protocols are declared in `builtin` with reserved `#[lang(...)]` metadata. The metadata identifies the owning type or trait together with protocol members such as enum variants, associated types, and methods, so compiler behavior does not depend on their public spelling. `#[lang(...)]` is rejected in user, third-party, prelude, and standard-library sources.
 
+Runtime-backed collection types retain their builtin identity when re-exported. A qualified type from another package remains distinct even when it has the same short name: after `use std::collections::imm;`, `imm::HashMap[K, V]` is the persistent standard-library map, while the prelude `HashMap[K, V]` is the mutable runtime map. This uses ordinary package-qualified type paths and adds no syntax.
+
 The following names can be used without `use`.
 
 ### `Option` and `Result`
