@@ -11,7 +11,7 @@ prefix="$temporary/stage0"
 mkdir -p "$prefix/bin" "$prefix/lib/builtin" "$prefix/lib/prelude" "$prefix/lib/std/ascii" \
     "$prefix/lib/compiler" "$prefix/lib/obsolete" "$prefix/custom"
 for file in builtin/obsolete.gom builtin/obsolete.goml prelude/obsolete.goml \
-    std/ascii/obsolete.goml compiler/compiler-world-v2.gaf; do
+    std/ascii/obsolete.goml compiler/compiler-world.gaf; do
     printf '%s\n' invalid > "$prefix/lib/$file"
 done
 printf '%s\n' obsolete > "$prefix/bin/obsolete"
@@ -26,7 +26,7 @@ done
 test ! -e "$prefix/bin/obsolete"
 test ! -e "$prefix/lib/obsolete"
 test -f "$prefix/custom/retained"
-test -f "$prefix/lib/compiler/compiler-world-v2.gaf"
+test -f "$prefix/lib/compiler/compiler-world.gaf"
 source bootstrap/stage0.env
 bootstrap_stage0 "$(bootstrap_platform)"
 printf '%s\n' obsolete > "$prefix/bin/obsolete"
@@ -38,9 +38,9 @@ bash bootstrap/bootstrap.sh bootstrap/stage0.env "$prefix"
 test ! -e "$prefix/bin/obsolete"
 test ! -e "$prefix/lib/obsolete"
 test -f "$prefix/custom/retained"
-first_world_mtime="$(toolchain_file_stamp "$prefix/lib/compiler/compiler-world-v2.gaf")"
+first_world_mtime="$(toolchain_file_stamp "$prefix/lib/compiler/compiler-world.gaf")"
 bash bootstrap/bootstrap.sh bootstrap/stage0.env "$prefix"
-second_world_mtime="$(toolchain_file_stamp "$prefix/lib/compiler/compiler-world-v2.gaf")"
+second_world_mtime="$(toolchain_file_stamp "$prefix/lib/compiler/compiler-world.gaf")"
 test "$first_world_mtime" = "$second_world_mtime"
 
 package="$temporary/package"

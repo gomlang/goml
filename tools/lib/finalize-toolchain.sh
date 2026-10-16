@@ -2,14 +2,14 @@
 
 set -euo pipefail
 
-test "$#" = 3 || test "$#" = 4
+test "$#" = 3
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 prefix="$(realpath "$1")"
 driver="$(realpath "$2")"
 compiler="$(realpath "$3")"
 compiler_dir="$prefix/lib/compiler"
-world="$compiler_dir/${4:-compiler-world.gaf}"
+world="$compiler_dir/compiler-world.gaf"
 fingerprint="$compiler_dir/finalize-input.sha256"
 temporary="$fingerprint.tmp"
 

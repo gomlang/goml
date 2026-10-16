@@ -24,7 +24,7 @@ if test -f "$stage0_stamp" \
     && test -x "$stage0_output/bin/goml" \
     && test -x "$stage0_output/bin/gomlc" \
     && test -x "$stage0_output/bin/gomllsp" \
-    && test -f "$stage0_output/lib/compiler/compiler-world-v2.gaf" \
+    && test -f "$stage0_output/lib/compiler/compiler-world.gaf" \
     && test "$(sed -n '2p' "$stage0_stamp")" = "$(stage0_tree_fingerprint)"; then
     exit 0
 fi
@@ -90,10 +90,9 @@ done
 bash tools/lib/finalize-toolchain.sh \
     "$stage0_output" \
     "$stage0_output/bin/goml" \
-    "$stage0_output/bin/gomlc" \
-    compiler-world-v2.gaf
-test -f "$stage0_output/lib/compiler/compiler-world-v2.gaf"
-test ! -e "$stage0_output/lib/compiler/compiler-world-v2.gaf.tmp"
+    "$stage0_output/bin/gomlc"
+test -f "$stage0_output/lib/compiler/compiler-world.gaf"
+test ! -e "$stage0_output/lib/compiler/compiler-world.gaf.tmp"
 stage0_fingerprint="$(stage0_tree_fingerprint)"
 printf '%s\n%s\n%s\n' "$GOML_STAGE0_SHA256" "$stage0_fingerprint" managed-bin-lib-v1 > "$stage0_extracted/stamp"
 mv "$stage0_extracted/stamp" "$stage0_stamp"
