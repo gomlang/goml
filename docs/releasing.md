@@ -80,7 +80,7 @@ Replace toolchain resources through installation or finalization rather than edi
 Install Go 1.26 or newer and make it available on `PATH`. The standalone POSIX shell installer is maintained in [gomlang/install](https://github.com/gomlang/install) and requires curl, tar, and sha256sum or shasum:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/gomlang/install/main/install.sh -o install-goml.sh && sh install-goml.sh
+curl -fsSL https://gomlang.github.io/install/install.sh | sh
 export PATH="${GOML_HOME:-$HOME/.goml}/bin:$PATH"
 goml version
 ```
@@ -90,7 +90,7 @@ The installer detects Linux amd64 or macOS arm64, downloads the latest published
 To select a release or installation directory:
 
 ```sh
-sh install-goml.sh --version X.Y.Z --prefix "$HOME/tools/goml"
+curl -fsSL https://gomlang.github.io/install/install.sh | sh -s -- --version X.Y.Z --prefix "$HOME/tools/goml"
 ```
 
 Run the installer again to upgrade. It replaces the five GoML executables and the `builtin`, `prelude`, `std`, and `compiler` resource directories, preserving dependency caches and other files. If replacement or initialization fails, it restores the previous toolchain. Concurrent installations to the same prefix are rejected; after a forced termination, inspect the reported `.goml-install` directory and any backups before retrying. The installer rejects unsupported hosts, Go versions older than 1.26, and installation over a GoML source checkout.
