@@ -1,0 +1,133 @@
+package lsp;
+
+use module::checker;
+use module::project_info;
+use module::query;
+use module::source as source_files;
+use std::collections;
+use std::fs;
+use std::path;
+
+fn canonical_watched_path(filename: string) -> string {
+    fs::canonicalize(filename).unwrap_or_else(|_| watched_source_identity(filename))
+}
+
+fn watched_source_identity(filename: string) -> string {
+    match (path::parent(filename), path::file_name(filename)) {
+        (Some(directory), Some(name)) => path::join(
+            fs::canonicalize(directory).unwrap_or(directory),
+            name,
+        ),
+        _ => path::clean(filename),
+    }
+}
+
+fn cache_document_analysis(
+    generation: isize,
+    analysis: query::Analysis,
+    project: Option[project_info::Description],
+) -> CachedAnalysis {
+    let source_paths = collections::IndexSet::new();
+    let source_directories = collections::IndexSet::new();
+    for source in analysis.sources {
+        let _ = source_paths.insert(canonical_watched_path(source.path));
+        if project.is_some() || source.package_name != analysis.package_name {
+            if let Some(directory) = path::parent(source.path) {
+                let _ = source_directories.insert(canonical_watched_path(directory));
+            }
+        }
+    }
+    CachedAnalysis {
+        generation,
+        analysis,
+        project,
+        source_paths,
+        source_directories,
+        entry_directory: path::parent(analysis.source_path).map(
+            |directory| canonical_watched_path(directory),
+        ),
+    }
+}
+
+fn path_in_directory(filename: string, directory: string) -> bool {
+    let directory = path::clean(directory);
+    filename == directory
+        || filename.starts_with(
+            if directory.ends_with("/") {
+                directory
+            } else {
+                directory + "/"
+            },
+        )
+}
+
+fn watched_source_affects(
+    cached: CachedAnalysis,
+    filename: string,
+    directory: Option[string],
+    is_test: bool,
+) -> bool {
+    if cached.source_paths.contains(filename) {
+        return true
+    }
+    let include_tests = source_files::is_test_source(cached.analysis.source_path);
+    if let Some(directory) = directory {
+        if cached.source_directories.contains(directory)
+            && (!is_test || (include_tests && Option::Some(directory) == cached.entry_directory)) {
+            return true
+        }
+    }
+    if let Some(project) = cached.project {
+        if path_in_directory(filename, canonical_watched_path(project.target_dir)) {
+            return false
+        }
+        if checker::diagnostics_have_errors(cached.analysis.checked.diagnostics) {
+            for module in project.modules {
+                if path_in_directory(filename, module.root) {
+                    return true
+                }
+            }
+        }
+    }
+    false
+}
+
+fn invalidate_watched_paths(server: Server, paths: Vec[string]) -> () {
+    for filename in paths {
+        if project_info::watches_path(server.project_client, filename)
+            || project_info::watches_path(server.project_client, canonical_watched_path(filename)) {
+            invalidate_analyses(server);
+            return
+        }
+    }
+    for filename in paths {
+        if !source_files::is_source_file(filename) {
+            continue
+        }
+        let identity = watched_source_identity(filename);
+        let mut open = false;
+        for (_, document) in server.documents {
+            if watched_source_identity(document.path) == identity {
+                open = true;
+            }
+        }
+        if open {
+            continue
+        }
+        let affected = Vec::new();
+        let canonical = canonical_watched_path(filename);
+        let directory = path::parent(identity);
+        let is_test = source_files::is_test_source(filename);
+        for (source_path, cached) in server.analyses {
+            if watched_source_affects(cached, canonical, directory, is_test) {
+                affected.push(source_path)
+            }
+        }
+        if !affected.is_empty() {
+            for source_path in affected {
+                let _ = server.analyses.remove(source_path);
+            }
+            server.line_indexes.clear();
+        }
+    }
+}

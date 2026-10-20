@@ -12,6 +12,8 @@ The status bar shows whether the language server is starting, ready, stopped, or
 
 Diagnostics run after editing pauses, while completion reuses the latest checked types immediately. Saving requests diagnostics without waiting for the edit delay. Package checks reuse unchanged dependencies across edits. Go FFI analysis uses the signatures declared in GoML and treats external Go types as opaque. Native symbol, method and generic-constraint errors are reported by the final Go build.
 
+Source file notifications invalidate documents that use the affected package while retaining unchanged package checks. Unrelated source files, build outputs, and native Go file changes preserve cached hover results. Changes to tracked module and workspace configuration refresh project resolution.
+
 Enum completions include payload types and editable placeholders for tuple and named fields. In `match` patterns, suggestions follow the matched enum and insert an arm body when needed. Existing payloads and arm bodies are preserved, and unit variants already covered by an unguarded arm are omitted. Contextual constructors such as `Some` also use the expected type.
 
 For syntax highlighting without a language server, set `"goml.lsp.enabled": false`. This works without an installed toolchain. Changing the setting stops or starts the server immediately; disabling it clears server diagnostics and hides the server status item. Syntax highlighting and bracket matching remain available.

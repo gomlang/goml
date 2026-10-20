@@ -173,7 +173,7 @@ async function startLanguageServer(context: ExtensionContext, status: LanguageSe
     debug: serverExecutable,
   };
 
-  const watcher = workspace.createFileSystemWatcher('**/*.{goml,toml,work,go,mod,sum}');
+  const watcher = workspace.createFileSystemWatcher('**/*.{goml,toml,work}');
   serverSubscriptions.push(watcher);
   const clientOptions: LanguageClientOptions = {
     documentSelector: [{ scheme: 'file', language: 'goml' }],
