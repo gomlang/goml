@@ -2,6 +2,7 @@ package lsp;
 
 use module::query;
 use module::project_info;
+use module::checker;
 use std::fs;
 use std::json;
 use std::testing;
@@ -131,4 +132,185 @@ fn project_description_refreshes_cached_documents_without_editor_notifications()
     testing::assert(cached_document_analysis(server, document).is_none());
     testing::assert_eq(document_analysis(server, document).package_name, "watched::changed");
     testing::assert_eq(project_info::request_count(server.project_client), requests + 1);
+}
+
+#[test]
+fn ignores_generated_files_and_native_go_changes_without_losing_analysis() -> () {
+    let server = new_server();
+    let root = "/tmp/gomllsp-watched-output";
+    let _ = fs::remove_dir_all(root);
+    let document = watched_document(server, root, "package main; fn main() -> () { () }");
+    write_watched_fixture(
+        root + "/goml.toml",
+        "[module]\npath = \"watched::app\"\n[build]\ntarget-dir = \"generated\"\n",
+    );
+    let _ = document_analysis(server, document);
+    let generation = server.generation.get();
+    let requests = project_info::request_count(server.project_client);
+    for filename in Vec::from_array(
+        [
+            "generated/pkg/copy.goml",
+            "generated/pkg/goml.toml",
+            "generated/pkg/native.go",
+            "generated/go.mod",
+            "generated/go.sum",
+            "native.go",
+            "settings.toml",
+            "unrelated/file.goml",
+            "new_test.goml",
+        ],
+    ) {
+        notify_watched_file(server, root + "/" + filename, 1);
+        testing::assert_eq(server.analyses.len(), 1);
+        testing::assert_eq(server.generation.get(), generation);
+    }
+    notify_watched_file(server, document.path, 2);
+    testing::assert_eq(server.analyses.len(), 1);
+    let _ = document_analysis(server, document);
+    testing::assert_eq(project_info::request_count(server.project_client), requests);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn source_notifications_keep_unrelated_document_and_dependency_caches() -> () {
+    let server = new_server();
+    let root = "/tmp/gomllsp-watched-selective";
+    let _ = fs::remove_dir_all(root);
+    let document = watched_document(
+        server,
+        root,
+        "package main; use module::lib; fn main() -> isize { lib::value() }",
+    );
+    let dependency = root + "/lib/lib.goml";
+    write_watched_fixture(dependency, "package lib; pub fn value() -> isize { 1 }");
+    let other_root = "/tmp/gomllsp-watched-selective-other";
+    let _ = fs::remove_dir_all(other_root);
+    let other = watched_document(server, other_root, "package main; fn main() -> () { () }");
+    let _ = document_analysis(server, document);
+    let _ = document_analysis(server, other);
+    let _ = document_analysis(server, document);
+    testing::assert_eq(server.analyses.len(), 2);
+    let generation = server.generation.get();
+    let requests = project_info::request_count(server.project_client);
+    write_watched_fixture(dependency, "package lib; pub fn value() -> bool { true }");
+    notify_watched_file(server, dependency, 2);
+    testing::assert_eq(server.analyses.len(), 1);
+    testing::assert(server.analyses.get(other.path).is_some());
+    testing::assert_eq(server.generation.get(), generation);
+    testing::assert(
+        checker::diagnostics_have_errors(document_analysis(server, document).checked.diagnostics),
+    );
+    testing::assert_eq(project_info::request_count(server.project_client), requests);
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(other_root);
+}
+
+#[test]
+fn newly_created_dependency_packages_recover_failed_analysis() -> () {
+    let server = new_server();
+    let root = "/tmp/gomllsp-watched-missing-package";
+    let _ = fs::remove_dir_all(root);
+    let document = watched_document(
+        server,
+        root,
+        "package main; use module::missing; fn main() -> isize { missing::value() }",
+    );
+    testing::assert(
+        checker::diagnostics_have_errors(document_analysis(server, document).checked.diagnostics),
+    );
+    let generation = server.generation.get();
+    notify_watched_file(server, root + "/_artifact/copied.goml", 1);
+    testing::assert_eq(server.analyses.len(), 1);
+    testing::assert_eq(server.generation.get(), generation);
+    testing::expect_ok(fs::create_dir_all(root + "/missing"), "create missing package");
+    let dependency = root + "/missing/lib.goml";
+    write_watched_fixture(dependency, "package missing; pub fn value() -> isize { 1 }");
+    notify_watched_file(server, dependency, 1);
+    testing::assert(server.analyses.is_empty());
+    testing::assert(
+        !checker::diagnostics_have_errors(document_analysis(server, document).checked.diagnostics),
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn new_test_sources_invalidate_test_analysis() -> () {
+    let server = new_server();
+    let root = "/tmp/gomllsp-watched-test-source";
+    let _ = fs::remove_dir_all(root);
+    let entry = watched_document(server, root, "package main; fn main() -> () { () }");
+    let path = root + "/main_test.goml";
+    let source = "package main; #[test] fn checks() -> () { () }";
+    write_watched_fixture(path, source);
+    let document = Document {
+        uri: path_to_uri(path),
+        path,
+        text: source,
+        version: 1,
+        line_index: line_index(source),
+    };
+    open_document(server, document);
+    let _ = document_analysis(server, entry);
+    let _ = document_analysis(server, document);
+    let _ = document_analysis(server, entry);
+    testing::assert_eq(server.analyses.len(), 2);
+    let added = root + "/extra_test.goml";
+    write_watched_fixture(added, "package main; fn helper() -> () { () }");
+    notify_watched_file(server, added, 1);
+    testing::assert(server.analyses.get(entry.path).is_some());
+    testing::assert(server.analyses.get(document.path).is_none());
+    let analysis = document_analysis(server, document);
+    let mut found = false;
+    for source in analysis.sources {
+        if source.path == added {
+            found = true;
+        }
+    }
+    testing::assert(found);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn watched_sources_match_symbolic_link_directories() -> () {
+    let server = new_server();
+    let root = "/tmp/gomllsp-watched-symlink";
+    let alias = "/tmp/gomllsp-watched-symlink-alias";
+    let _ = fs::remove_file(alias);
+    let _ = fs::remove_dir_all(root);
+    let entry = watched_document(server, root, "package main; fn main() -> () { () }");
+    testing::expect_ok(fs::symbolic_link(root, alias), "link project directory");
+    let path = alias + "/main.goml";
+    let document = Document {
+        uri: path_to_uri(path),
+        path,
+        text: entry.text,
+        version: 1,
+        line_index: entry.line_index,
+    };
+    close_document(server, entry.uri);
+    open_document(server, document);
+    let _ = document_analysis(server, document);
+    notify_watched_file(server, entry.path, 2);
+    testing::assert_eq(server.analyses.len(), 1);
+    let extra = root + "/extra.goml";
+    write_watched_fixture(extra, "package main; pub fn added() -> () { () }");
+    notify_watched_file(server, extra, 1);
+    testing::assert(server.analyses.is_empty());
+    let _ = document_analysis(server, document);
+    let target = root + "/lib/template.txt";
+    write_watched_fixture(target, "package main; pub fn linked() -> () { () }");
+    let linked = root + "/linked.goml";
+    testing::expect_ok(fs::symbolic_link(target, linked), "link a GoML source");
+    notify_watched_file(server, linked, 1);
+    testing::assert(server.analyses.is_empty());
+    let _ = document_analysis(server, document);
+    testing::expect_ok(fs::remove_file(extra), "remove source through canonical directory");
+    notify_watched_file(server, extra, 3);
+    testing::assert(server.analyses.is_empty());
+    let _ = document_analysis(server, document);
+    write_watched_fixture(root + "/goml.toml", "[module]\npath = \"watched::renamed\"\n");
+    notify_watched_file(server, root + "/goml.toml", 2);
+    testing::assert_eq(document_analysis(server, document).package_name, "watched::renamed");
+    let _ = fs::remove_file(alias);
+    let _ = fs::remove_dir_all(root);
 }
