@@ -12,6 +12,10 @@ The status bar shows whether the language server is starting, ready, stopped, or
 
 Diagnostics run after editing pauses, while completion reuses the latest checked types immediately. Saving requests diagnostics without waiting for the edit delay. Package checks reuse unchanged dependencies across edits. Go FFI analysis uses the signatures declared in GoML and treats external Go types as opaque. Native symbol, method and generic-constraint errors are reported by the final Go build.
 
+Enum completions include payload types and editable placeholders for tuple and named fields. In `match` patterns, suggestions follow the matched enum and insert an arm body when needed. Existing payloads and arm bodies are preserved, and unit variants already covered by an unguarded arm are omitted. Contextual constructors such as `Some` also use the expected type.
+
+For syntax highlighting without a language server, set `"goml.lsp.enabled": false`. This works without an installed toolchain. Changing the setting stops or starts the server immediately; disabling it clears server diagnostics and hides the server status item. Syntax highlighting and bracket matching remain available.
+
 From the repository root, build the self-hosted language server and extension:
 
 ```sh
@@ -28,6 +32,7 @@ The bundled server is built for the host platform. A custom server needs its com
 
 Configuration:
 
+- `goml.lsp.enabled` enables the language server (default: `true`); disable it for syntax highlighting only.
 - `goml.driverPath` selects the matching project driver used for module and dependency resolution.
 - `goml.serverPath` overrides the bundled or `PATH`-resolved `gomllsp`.
 - `goml.trace.server` controls language-server tracing.

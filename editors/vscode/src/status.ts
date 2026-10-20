@@ -42,6 +42,7 @@ export class LanguageServerStatus implements Disposable {
   private unavailableMessage: string | undefined;
   private timer: NodeJS.Timeout | undefined;
   private disposed = false;
+  private enabled = true;
 
   constructor() {
     this.item = window.createStatusBarItem(
@@ -66,6 +67,13 @@ export class LanguageServerStatus implements Disposable {
       this.updateVisibility();
     });
     this.render();
+    this.updateVisibility();
+  }
+
+  setEnabled(enabled: boolean): void {
+    this.enabled = enabled;
+    this.outputChannel = undefined;
+    this.setClientState(State.Stopped);
     this.updateVisibility();
   }
 
@@ -270,7 +278,7 @@ export class LanguageServerStatus implements Disposable {
   }
 
   private updateVisibility(): void {
-    if (window.activeTextEditor?.document.languageId === 'goml') {
+    if (this.enabled && window.activeTextEditor?.document.languageId === 'goml') {
       this.item.show();
     } else {
       this.item.hide();

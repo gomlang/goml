@@ -1,6 +1,7 @@
 import * as path from 'path';
 import {
   commands,
+  Disposable,
   ExtensionContext,
   ProcessExecution,
   Task,
@@ -26,6 +27,9 @@ import { DiagnosticsScheduler } from './diagnosticsScheduler';
 import { findExecutable } from './executables';
 
 let client: LanguageClient | undefined;
+let serverUpdate = Promise.resolve();
+let deactivating = false;
+const serverSubscriptions: Disposable[] = [];
 
 const serverStatusNotification = new NotificationType<ServerStatusNotification>('goml/status');
 const checkDiagnosticsDelay = 750;
@@ -40,7 +44,8 @@ const diagnostics = new DiagnosticsScheduler(checkDiagnosticsDelay, uri => {
   }
 });
 
-export function activate(context: ExtensionContext) {
+export async function activate(context: ExtensionContext) {
+  deactivating = false;
   const status = new LanguageServerStatus();
   context.subscriptions.push(status, diagnostics);
 
@@ -109,6 +114,41 @@ export function activate(context: ExtensionContext) {
     })
   );
 
+  context.subscriptions.push(workspace.onDidChangeConfiguration(event => {
+    if (event.affectsConfiguration('goml.lsp.enabled')
+      || event.affectsConfiguration('goml.serverPath')
+      || event.affectsConfiguration('goml.driverPath')) {
+      void updateLanguageServer(context, status);
+    }
+  }));
+  await updateLanguageServer(context, status);
+}
+
+function updateLanguageServer(context: ExtensionContext, status: LanguageServerStatus): Promise<void> {
+  serverUpdate = serverUpdate.then(async () => {
+    await stopLanguageServer();
+    const enabled = !deactivating && workspace.getConfiguration('goml').get<boolean>('lsp.enabled', true);
+    status.setEnabled(enabled);
+    if (enabled) {
+      await startLanguageServer(context, status);
+    }
+  }).catch(error => {
+    status.setUnavailable(`GoML language server failed: ${String(error)}`);
+  });
+  return serverUpdate;
+}
+
+async function stopLanguageServer(): Promise<void> {
+  diagnostics.dispose();
+  for (const subscription of serverSubscriptions.splice(0)) {
+    subscription.dispose();
+  }
+  const previous = client;
+  client = undefined;
+  await previous?.dispose();
+}
+
+async function startLanguageServer(context: ExtensionContext, status: LanguageServerStatus): Promise<void> {
   const serverPath = findServerPath(context);
 
   if (!serverPath) {
@@ -133,10 +173,12 @@ export function activate(context: ExtensionContext) {
     debug: serverExecutable,
   };
 
+  const watcher = workspace.createFileSystemWatcher('**/*.{goml,toml,work,go,mod,sum}');
+  serverSubscriptions.push(watcher);
   const clientOptions: LanguageClientOptions = {
     documentSelector: [{ scheme: 'file', language: 'goml' }],
     synchronize: {
-      fileEvents: workspace.createFileSystemWatcher('**/*.{goml,toml,work,go,mod,sum}'),
+      fileEvents: watcher,
     },
     outputChannelName: 'GoML Language Server',
     middleware: status.middleware,
@@ -151,44 +193,45 @@ export function activate(context: ExtensionContext) {
 
   status.attachOutputChannel(client.outputChannel);
   status.setClientState(State.Starting);
-  context.subscriptions.push(
+  serverSubscriptions.push(
     client.onDidChangeState(event => {
       status.setClientState(event.newState);
     })
   );
-  context.subscriptions.push(
+  serverSubscriptions.push(
     client.onNotification(serverStatusNotification, serverStatus => {
       status.handleServerStatus(serverStatus);
     })
   );
-  context.subscriptions.push(
+  serverSubscriptions.push(
     workspace.onDidChangeTextDocument(event => {
       if (event.document.languageId === 'goml') {
         diagnostics.schedule(event.document.uri.toString());
       }
     })
   );
-  context.subscriptions.push(
+  serverSubscriptions.push(
     workspace.onDidSaveTextDocument(document => {
       if (document.languageId === 'goml') {
         diagnostics.request(document.uri.toString());
       }
     })
   );
-  context.subscriptions.push(
+  serverSubscriptions.push(
     workspace.onDidCloseTextDocument(document => {
       diagnostics.clear(document.uri.toString());
     })
   );
-  void client.start().catch(error => {
+  await client.start().catch(error => {
     const message = error instanceof Error ? error.message : String(error);
     status.setUnavailable(`GoML language server failed to start: ${message}`);
   });
 }
 
-export function deactivate(): Thenable<void> | undefined {
-  diagnostics.dispose();
-  return client?.stop();
+export async function deactivate(): Promise<void> {
+  deactivating = true;
+  await serverUpdate;
+  await stopLanguageServer();
 }
 
 function findServerPath(context: ExtensionContext): string | undefined {

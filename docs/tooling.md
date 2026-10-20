@@ -360,6 +360,10 @@ The project-description client validates protocol version 1 and caches successfu
 
 The LSP analyzes production files, internal tests, and black-box tests in their corresponding package contexts, so diagnostics, completion, hover, and go-to-definition follow the same visibility rules as compilation. Test code lenses appear on ordinary tests and parameterized test cases. The VS Code extension saves the file and invokes module-level `goml test` with the selected test display name and kind.
 
+Enum completion uses expected types for contextual constructors and the scrutinee type for `match` patterns. Variant suggestions show payload types and provide tuple or named-field placeholders; new match patterns also provide an arm body placeholder. Existing payloads and arm bodies are preserved. Unguarded unit arms suppress the corresponding variant suggestion. Completion continues to reuse checked types while the document is being edited.
+
+Set `"goml.lsp.enabled": false` in VS Code to use syntax highlighting and bracket matching without starting the language server or requiring a toolchain. The setting takes effect immediately; enabling it starts the server again.
+
 Type inlay hints use short names without package qualifiers and a 25-character type budget, excluding the leading `: `. Nested types and long names are abbreviated with `…`; the hint tooltip retains the complete inferred type and its package paths.
 
 Package analysis caches parsed/lowered sources and successful checked packages within a query context. Source contents, package membership, canonical module identity, and transitive dependency fingerprints determine reuse. Editing a package rechecks it and its dependents while independent packages remain reusable; a function-body edit in a dependency conservatively invalidates its dependents too. Open document overrides participate in the same fingerprints. External Go types remain opaque during cached and fresh analysis; native validation belongs to the final Go build. Watched source and manifest changes invalidate cached document analyses; the VS Code extension also watches `goml.work`, Go sources, `go.mod`, and `go.sum`.

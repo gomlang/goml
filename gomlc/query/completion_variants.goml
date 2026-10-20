@@ -1,0 +1,474 @@
+package query;
+
+use module::cst;
+use module::checker;
+use module::lexer;
+use module::parser;
+use module::tast;
+use std::text;
+
+struct MatchCompletionContext {
+    list: SyntaxNode,
+    arm: Option[SyntaxNode],
+    whole_arm: bool,
+}
+
+fn matches_variant_completion(value: CompletionItem) -> bool {
+    match value.kind {
+        Variant => true,
+        _ => false,
+    }
+}
+
+fn completion_syntax(value: Analysis, source: string) -> SyntaxIndex {
+    if source == value.source {
+        value.syntax
+    } else {
+        syntax_index(parser::parse(source).root)
+    }
+}
+
+fn completion_analysis_offset(value: Analysis, source: string, offset: isize) -> Option[isize] {
+    let previous = value.source;
+    let mut prefix = 0;
+    while prefix < previous.byte_len() && prefix < source.byte_len()
+        && previous.byte_get(prefix) == source.byte_get(prefix) {
+        prefix += 1;
+    }
+    if offset <= prefix {
+        return Some(offset)
+    }
+    let mut suffix = 0;
+    while suffix < previous.byte_len() - prefix && suffix < source.byte_len() - prefix
+        && previous.byte_get(previous.byte_len() - suffix - 1)
+            == source.byte_get(source.byte_len() - suffix - 1) {
+        suffix += 1;
+    }
+    if offset >= source.byte_len() - suffix {
+        Some(previous.byte_len() - (source.byte_len() - offset))
+    } else {
+        None
+    }
+}
+
+fn match_completion_context(syntax: SyntaxIndex, source: string, offset: isize) -> Option[
+    MatchCompletionContext,
+] {
+    let start = prefix_start(source, offset);
+    let mut list: Option[SyntaxNode] = None;
+    for node in syntax.nodes {
+        if cst::node_kind_equal(node.kind, MATCH_ARM_LIST) && node.start < start
+            && offset <= node.end {
+            list = Some(node);
+        }
+    }
+    let list = list?;
+    for token in syntax.tokens {
+        if token.parent == list.id && lexer::token_kind_equal(token.kind, RBrace)
+            && token.start < offset {
+            return None
+        }
+    }
+    let mut arm: Option[SyntaxNode] = None;
+    for node in syntax.nodes {
+        if node.parent == Option::Some(list.id) && cst::node_kind_equal(node.kind, MATCH_ARM)
+            && node.start <= offset
+            && start <= node.end {
+            arm = Some(node);
+        }
+    }
+    let mut whole_arm = true;
+    if let Some(node) = arm {
+        for token in syntax.tokens {
+            if token.start >= node.start && token.end <= start
+                && !lexer::token_is_trivia(token.kind) {
+                if lexer::token_kind_equal(token.kind, FatArrow)
+                    || lexer::token_kind_equal(token.kind, IfKeyword) {
+                    return None
+                }
+                if !lexer::token_kind_equal(token.kind, Ident)
+                    && !lexer::token_kind_equal(token.kind, ColonColon) {
+                    whole_arm = false;
+                }
+            }
+        }
+    }
+    Some(MatchCompletionContext { list, arm, whole_arm })
+}
+
+fn completion_enum(value: Analysis, ty: tast::Type) -> Option[tast::EnumInfo] {
+    completion_enum_named(value, type_owner_name(ty))
+}
+
+fn completion_enum_named(value: Analysis, owner: string) -> Option[tast::EnumInfo] {
+    for environment in value.environments {
+        for definition in environment.enums {
+            if completion_owner_matches(value, definition.name, owner) {
+                return Some(definition)
+            }
+        }
+    }
+    if let Ok(metadata) = checker::builtin_metadata() {
+        for definition in metadata.enums {
+            if completion_owner_matches(value, "builtin::" + definition.name, owner) {
+                return Some(definition)
+            }
+        }
+    }
+    None
+}
+
+fn expected_completion_type(value: Analysis, offset: isize, pattern: bool) -> Option[tast::Type] {
+    let mut result: Option[tast::Type] = None;
+    let mut width = 2147483647;
+    if pattern {
+        for fact in value.checked.typeck_results.pats {
+            if fact.source_path == value.source_path && fact.span.start <= offset
+                && offset <= fact.span.end
+                && fact.span.end - fact.span.start < width {
+                result = Some(fact.ty);
+                width = fact.span.end - fact.span.start;
+            }
+        }
+    } else {
+        for fact in value.checked.typeck_results.exprs {
+            if fact.source_path == value.source_path && fact.span.start <= offset
+                && offset <= fact.span.end
+                && fact.span.end - fact.span.start < width {
+                result = fact.expected;
+                width = fact.span.end - fact.span.start;
+            }
+        }
+    }
+    result
+}
+
+fn variant_detail(owner: string, variant: tast::EnumVariantInfo) -> string {
+    let builder = text::StringBuilder::new();
+    builder.write_string(owner + "::" + variant.name);
+    match variant.fields {
+        Unit => (),
+        Tuple(types) => {
+            builder.write_string("(");
+            for index in 0..types.len() {
+                if index > 0 {
+                    builder.write_string(", ")
+                }
+                builder.write_string(tast::diagnostic_type_text(types[index]))
+            }
+            builder.write_string(")")
+        },
+        Struct(fields) => {
+            builder.write_string(" { ");
+            for index in 0..fields.len() {
+                if index > 0 {
+                    builder.write_string(", ")
+                }
+                builder.write_string(
+                    fields[index].0 + ": " + tast::diagnostic_type_text(fields[index].1),
+                )
+            }
+            builder.write_string(" }")
+        },
+    }
+    builder.finish()
+}
+
+fn variant_snippet(
+    variant: tast::EnumVariantInfo,
+    source: string,
+    offset: isize,
+    whole_arm: bool,
+    arm: Option[SyntaxNode],
+    syntax: SyntaxIndex,
+) -> Option[string] {
+    let mut next = offset;
+    while next < source.byte_len() && identifier_byte(source.byte_get(next)) {
+        next += 1;
+    }
+    while next < source.byte_len() && completion_whitespace(source.byte_get(next)) {
+        next += 1;
+    }
+    if next < source.byte_len() && (source.byte_get(next) == b'(' || source.byte_get(next) == b'{') {
+        return None
+    }
+    let builder = text::StringBuilder::new();
+    builder.write_string(variant.name);
+    let mut tab = 1;
+    match variant.fields {
+        Unit => (),
+        Tuple(types) => {
+            builder.write_string("(");
+            for index in 0..types.len() {
+                if index > 0 {
+                    builder.write_string(", ")
+                }
+                let name = if types.len() == 1 {
+                    "value"
+                } else {
+                    "value" + (index + 1).to_string()
+                };
+                builder.write_string("${" + tab.to_string() + ":" + name + "}");
+                tab += 1;
+            }
+            builder.write_string(")")
+        },
+        Struct(fields) => {
+            builder.write_string(" { ");
+            for index in 0..fields.len() {
+                if index > 0 {
+                    builder.write_string(", ")
+                }
+                let name = fields[index].0;
+                builder.write_string(name + ": ${" + tab.to_string() + ":" + name + "}");
+                tab += 1;
+            }
+            builder.write_string(" }")
+        },
+    }
+    let mut has_arrow = false;
+    if let Some(arm) = arm {
+        for token in syntax.tokens {
+            if token.start >= offset && token.end <= arm.end
+                && (lexer::token_kind_equal(token.kind, FatArrow)
+                    || lexer::token_kind_equal(token.kind, IfKeyword)) {
+                has_arrow = true;
+            }
+        }
+    }
+    if whole_arm && !has_arrow {
+        builder.write_string(" => ${" + tab.to_string() + ":()}");
+        if next >= source.byte_len() || source.byte_get(next) != b',' {
+            builder.write_string(",")
+        }
+    }
+    Some(builder.finish())
+}
+
+fn completed_unit_arm(syntax: SyntaxIndex, context: MatchCompletionContext, name: string) -> bool {
+    for node in syntax.nodes {
+        if node.parent == Option::Some(context.list.id)
+            && cst::node_kind_equal(node.kind, MATCH_ARM)
+            && context.arm.map(|arm| arm.id) != Option::Some(node.id) {
+            let mut last_name = "";
+            let mut simple = true;
+            for token in syntax.tokens {
+                if token.start >= node.start && token.end <= node.end
+                    && !lexer::token_is_trivia(token.kind) {
+                    if lexer::token_kind_equal(token.kind, FatArrow) {
+                        if simple && last_name == name {
+                            return true
+                        }
+                        break
+                    } else if lexer::token_kind_equal(token.kind, Ident) {
+                        last_name = token.text;
+                    } else if !lexer::token_kind_equal(token.kind, ColonColon) {
+                        simple = false;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn enum_completions(
+    value: Analysis,
+    definition: tast::EnumInfo,
+    source: string,
+    offset: isize,
+    syntax: SyntaxIndex,
+    context: Option[MatchCompletionContext],
+) -> Vec[CompletionItem] {
+    let result = Vec::new();
+    for variant in definition.variants {
+        let covered = match (context, variant.fields) {
+            (Some(context), Unit) => completed_unit_arm(syntax, context, variant.name),
+            _ => false,
+        };
+        let shadowed = context.is_none() && namespace_path(source, offset).is_none()
+            && completion_variant_shadowed(value, variant.name, offset);
+        if !covered && !shadowed {
+            push_completion(
+                result,
+                CompletionItem {
+                    label: variant.name,
+                    detail: variant_detail(definition.name, variant),
+                    kind: Variant,
+                    insert_text: variant_snippet(
+                        variant,
+                        source,
+                        offset,
+                        context.map(|value| value.whole_arm).unwrap_or(false),
+                        context.and_then(|value| value.arm),
+                        syntax,
+                    ),
+                },
+                completion_prefix(source, offset),
+            )
+        }
+    }
+    result
+}
+
+fn completion_variant_shadowed(value: Analysis, name: string, offset: isize) -> bool {
+    for fact in value.checked.typeck_results.locals {
+        if fact.source_path == value.source_path && fact.local.hint == name {
+            if let Some(span) = fact.span {
+                if local_visible_at(value.syntax, span, offset) {
+                    return true
+                }
+            }
+        }
+    }
+    for symbol in build_symbol_index(value).symbols {
+        if symbol.name == name
+            && immediate_package_member(symbol.qualified_name, value.package_name) {
+            return true
+        }
+    }
+    false
+}
+
+fn contextual_enum_completions(value: Analysis, source: string, offset: isize, syntax: SyntaxIndex) -> Option[
+    Vec[CompletionItem],
+] {
+    let context = match_completion_context(syntax, source, offset);
+    let start = prefix_start(source, offset);
+    let ty = completion_analysis_offset(value, source, start).and_then(
+        |position| expected_completion_type(value, position, context.is_some()),
+    );
+    let definition = ty.and_then(|ty| completion_enum(value, ty));
+    let definition: Option[tast::EnumInfo] = match definition {
+        Some(definition) => Some(definition),
+        None => match context {
+            Some(context) if context.whole_arm => {
+                completion_analysis_offset(value, source, context.list.start).and_then(
+                    |position| receiver_type(value, position),
+                ).and_then(|ty| completion_enum(value, ty))
+            },
+            _ => None,
+        },
+    };
+    let definition = definition?;
+    Some(enum_completions(value, definition, source, offset, syntax, context))
+}
+
+fn complete_variant_namespace(
+    value: Analysis,
+    source: string,
+    offset: isize,
+    namespace: string,
+    syntax: SyntaxIndex,
+) -> Option[Vec[CompletionItem]] {
+    let context = match_completion_context(syntax, source, offset);
+    if let Some(definition) = completion_enum_named(value, namespace) {
+        return Some(enum_completions(value, definition, source, offset, syntax, context))
+    }
+    for environment in value.environments {
+        for alias in environment.type_aliases {
+            if completion_owner_matches(value, alias.name, namespace) {
+                if let Some(definition) = completion_enum(value, alias.ty) {
+                    return Some(
+                        enum_completions(value, definition, source, offset, syntax, context),
+                    )
+                }
+            }
+        }
+    }
+    None
+}
+
+fn append_unique_variant_completions(
+    result: Vec[CompletionItem],
+    value: Analysis,
+    source: string,
+    offset: isize,
+    syntax: SyntaxIndex,
+) -> () {
+    let definitions = Vec::new();
+    for environment in value.environments {
+        for definition in environment.enums {
+            if completion_enum_is_local(value, definition.name) {
+                definitions.push(definition)
+            }
+        }
+    }
+    for definition in definitions {
+        for variant in definition.variants {
+            let mut count = 0;
+            for other in definitions {
+                for candidate in other.variants {
+                    if candidate.name == variant.name {
+                        count += 1;
+                    }
+                }
+            }
+            if count == 1 {
+                push_completion(
+                    result,
+                    CompletionItem {
+                        label: variant.name,
+                        detail: variant_detail(definition.name, variant),
+                        kind: Variant,
+                        insert_text: variant_snippet(variant, source, offset, false, None, syntax),
+                    },
+                    completion_prefix(source, offset),
+                )
+            }
+        }
+    }
+}
+
+fn completion_enum_is_local(value: Analysis, name: string) -> bool {
+    for symbol in build_symbol_index(value).symbols {
+        if symbol.package_name == value.package_name
+            && completion_owner_matches(value, symbol.qualified_name, name) {
+            if let SymbolKind::Enum = symbol.kind {
+                return true
+            }
+        }
+    }
+    false
+}
+
+fn recovered_match_completions(value: Analysis, source: string, offset: isize) -> Option[
+    Vec[CompletionItem],
+] {
+    let syntax = completion_syntax(value, source);
+    let context = match_completion_context(syntax, source, offset)?;
+    if contextual_enum_completions(value, source, offset, syntax).is_some() {
+        return None
+    }
+    if !context.whole_arm {
+        return None
+    }
+    let arm = context.arm?;
+    for token in syntax.tokens {
+        if token.start >= offset && token.end <= arm.end
+            && lexer::token_kind_equal(token.kind, FatArrow) {
+            return None
+        }
+    }
+    let mut end = offset;
+    while end < source.byte_len() && identifier_byte(source.byte_get(end)) {
+        end += 1;
+    }
+    let placeholder = if completion_prefix(source, offset) == "" {
+        "CompletionPlaceholder"
+    } else {
+        ""
+    };
+    let repaired_source = source.byte_slice(0, end) + placeholder + " => ()"
+        + source.byte_slice(end, source.byte_len());
+    let repaired = analyze_with_context(
+        value.context,
+        value.source_path,
+        repaired_source,
+        value.overrides,
+    );
+    match namespace_path(source, offset) {
+        Some(namespace) => complete_variant_namespace(repaired, source, offset, namespace, syntax),
+        None => contextual_enum_completions(repaired, source, offset, syntax),
+    }
+}
