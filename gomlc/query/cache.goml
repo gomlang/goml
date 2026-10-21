@@ -12,9 +12,48 @@ use module::checker;
 use std::collections;
 use std::text;
 
+struct CachedPreparedSource {
+    source: string,
+    module_path: string,
+    lowered: ast::LowerResult,
+}
+
+fn copied_lower_result(value: ast::LowerResult) -> ast::LowerResult {
+    let diagnostics = Vec::new();
+    for diagnostic in value.diagnostics {
+        diagnostics.push(diagnostic)
+    }
+    ast::LowerResult { diagnostics, ..value }
+}
+
+fn prepared_source(context: AnalysisContext, file: SourceFile, module_path: string) -> ast::LowerResult {
+    if let Some(cached) = context.prepared_sources.get(file.path) {
+        if cached.source == file.source && cached.module_path == module_path {
+            return copied_lower_result(cached.lowered)
+        }
+    }
+    let lowered = ast::resolve_module_paths(
+        expand::expand_go_interfaces(ast::lower(parser::parse(file.source))),
+        module_path,
+    );
+    if context.prepared_sources.len() >= 2048 {
+        context.prepared_sources.clear()
+    }
+    let _ = context.prepared_sources.insert(
+        file.path,
+        CachedPreparedSource { source: file.source, module_path, lowered },
+    );
+    copied_lower_result(lowered)
+}
+
+struct SourceImports {
+    source_path: string,
+    import_aliases: Vec[hir::ImportAlias],
+}
+
 struct CachedDiscovery {
     fingerprint: string,
-    lowered: LoweredPackage,
+    files: Vec[SourceImports],
 }
 
 struct CachedPackage {
@@ -42,7 +81,8 @@ pub fn clear_analysis_cache(context: AnalysisContext) -> () {
     project_info::clear(context.project_client);
     context.discoveries.clear();
     context.packages.clear();
-    context.source_symbols.clear()
+    context.source_symbols.clear();
+    context.prepared_sources.clear()
 }
 
 fn package_cache_key(project: Project) -> string {
@@ -59,36 +99,42 @@ fn package_source_fingerprint(project: Project) -> string {
     hash::sha256_hex(value.finish())
 }
 
-fn discover_cached_package(
-    context: AnalysisContext,
-    project: Project,
-    builtin: Option[ctir::CtModule],
-) -> LoweredPackage {
+fn discover_cached_package(context: AnalysisContext, project: Project) -> Vec[SourceImports] {
     let key = package_cache_key(project);
     let fingerprint = package_source_fingerprint(project);
     if let Some(cached) = context.discoveries.get(key) {
         if cached.fingerprint == fingerprint {
-            return cached.lowered
+            return cached.files
         }
     }
-    let lowered = lower_package(project, builtin, Vec::new(), Vec::new(), Option::None);
+    let files = Vec::new();
+    for source in project.files {
+        if let Some(file) = prepared_source(context, source, project.module_path).ast {
+            files.push(
+                SourceImports {
+                    source_path: source.path,
+                    import_aliases: hir::source_import_aliases(file),
+                },
+            )
+        }
+    }
     if context.discoveries.len() >= 256 {
         context.discoveries.clear()
     }
-    let _ = context.discoveries.insert(key, CachedDiscovery { fingerprint, lowered });
-    lowered
+    let _ = context.discoveries.insert(key, CachedDiscovery { fingerprint, files });
+    files
 }
 
 fn package_revision(
     project: Project,
-    discovery: LoweredPackage,
+    discovery: Vec[SourceImports],
     revisions: collections::IndexMap[string, PackageRevision],
 ) -> PackageRevision {
     let value = text::StringBuilder::new();
     value.write_string(package_source_fingerprint(project));
     let dependencies: collections::IndexSet[string] = collections::IndexSet::new();
     let mut cacheable = true;
-    for file in discovery.files {
+    for file in discovery {
         for import in file.import_aliases {
             if dependencies.insert(import.package_name) {
                 if let Some(revision) = revisions.get(import.package_name) {
@@ -150,15 +196,7 @@ fn check_cached_package(
     context.stats.get().checked_packages.push(project.package_name);
     let local_inputs = Vec::new();
     for file in project.files {
-        local_inputs.push(
-            (
-                ast::resolve_module_paths(
-                    expand::expand_go_interfaces(ast::lower(parser::parse(file.source))),
-                    project.module_path,
-                ),
-                file.path,
-            ),
-        );
+        local_inputs.push((prepared_source(context, file, project.module_path), file.path));
     }
     let local = checker::local_derive_module(
         local_inputs,
@@ -167,6 +205,7 @@ fn check_cached_package(
         external,
     );
     let lowered = lower_package(
+        context,
         project,
         builtin,
         modules,

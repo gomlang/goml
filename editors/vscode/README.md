@@ -10,7 +10,7 @@ Unused `Result` and invalid `?` diagnostics expose stable codes and handling sug
 
 The status bar shows whether the language server is starting, ready, stopped, or busy. While it is busy, it shows the current server operation and elapsed time. Hover over the status item to see queued client requests, or click it to open the language server output. Operations taking at least two seconds are recorded there as warnings.
 
-Diagnostics run after editing pauses, while completion reuses the latest checked types immediately. Saving requests diagnostics without waiting for the edit delay. Package checks reuse unchanged dependencies across edits. Go FFI analysis uses the signatures declared in GoML and treats external Go types as opaque. Native symbol, method and generic-constraint errors are reported by the final Go build.
+Diagnostics run after editing pauses, while completion reuses the latest checked types immediately. Saving requests diagnostics without waiting for the edit delay. Package checks reuse unchanged dependencies and prepared source ASTs across edits. Expanded derive text is formatted only when requested. Go FFI analysis uses the signatures declared in GoML and treats external Go types as opaque. Native symbol, method and generic-constraint errors are reported by the final Go build.
 
 Source file notifications invalidate documents that use the affected package while retaining unchanged package checks. Unrelated source files, build outputs, and native Go file changes preserve cached hover results. Changes to tracked module and workspace configuration refresh project resolution.
 
