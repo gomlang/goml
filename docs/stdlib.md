@@ -2,7 +2,7 @@
 
 [English](stdlib.md) | [简体中文](stdlib.zh-CN.md)
 
-This reference describes the standard-library APIs implemented in this repository. See the [language guide](goml.md) for syntax and type rules, its [prelude reference](goml.md#built-in-prelude) for automatically scoped APIs, and [library boundaries](library-boundaries.md) for the division between standard and ecosystem packages.
+This reference describes the standard-library APIs implemented in this repository. See the [language guide](goml.md) for syntax and type rules, its [prelude reference](language/prelude.md#built-in-prelude) for automatically scoped APIs, and [library boundaries](library-boundaries.md) for the division between standard and ecosystem packages.
 
 Quick navigation: [packages](#packages), [text](#text-and-source-positions), [collections](#slice-algorithms-and-checked-vector-edits), [I/O](#composable-io), [filesystems](#portable-read-only-filesystems), [networking](#networking), [Serde and JSON](#serde-and-json), [concurrency](#structured-concurrency), and [common tasks](#common-tasks).
 
@@ -119,7 +119,7 @@ Public APIs include:
 
 `std::error` provides the common protocol used by structured standard-library errors. `Error` is a marker trait requiring `Debug` and `ToString`. `ErrorKind` defines stable, message-independent categories including missing files, permission failures, invalid input or data, timeouts, interruption, short I/O, broken pipes, unsupported operations, and `Other`.
 
-`Error` has a blanket implementation for every value implementing `Debug` and `ToString`, so domain errors participate in the common protocol directly. Domain enums can derive both traits and customize user-facing messages with per-variant `#[to_string("...")]` templates; see [attributes and derive](goml.md#attributes-and-derive). These templates affect `ToString` only: `Debug` and serialization retain their own representations.
+`Error` has a blanket implementation for every value implementing `Debug` and `ToString`, so domain errors participate in the common protocol directly. Domain enums can derive both traits and customize user-facing messages with per-variant `#[to_string("...")]` templates; see [attributes and derive](language/metaprogramming.md#attributes-and-derive). These templates affect `ToString` only: `Debug` and serialization retain their own representations.
 
 `Report[E]` preserves typed leaf errors while adding an immutable tree of context and aggregation. `Report::new(value)` creates a leaf; `.context(message)` returns a new parent without changing the original. `Report::join(Slice[Report[E]])` snapshots the supplied sequence, preserves order and duplicates, and returns None for an empty sequence. A singleton remains an aggregate with one cause. Use a domain enum for heterogeneous leaf variants; this API does not erase types or perform reflective downcasts.
 
@@ -1774,7 +1774,7 @@ types, bounds and helpers use existing syntax; no grammar changes are needed.
 
 ## Testing assertions
 
-See [tests](goml.md#tests) for test attributes, file layout, and commands.
+See [tests](tooling.md#tests) for test attributes, file layout, and commands.
 
 `std::testing` provides the following assertions:
 
@@ -3505,7 +3505,7 @@ no language grammar. Run `goml update` to fetch these modules from the [central 
 
 ## Serde and JSON
 
-For derive imports and handler rules, see [programmable derive](goml.md#programmable-derive).
+For derive imports and handler rules, see [programmable derive](language/metaprogramming.md#programmable-derive).
 
 `std::serde` owns the format-independent `Serialize`, `Deserialize`, `Serializer`, and `Deserializer` traits and the two derives. Typed formats use `Serialize::serialize` and `Deserialize::deserialize`: the format handle is a method-level generic parameter, so monomorphization produces ordinary static calls without a runtime serializer trait object, Go interface dispatch, or runtime reflection. A derived struct emits fields directly and a derived enum emits its declaration index, wire name, shape, and payload directly. Derived named-field decoding accepts arbitrary field order, skips unknown fields, and rejects duplicate fields and required fields that are missing. Struct fields, enum variants, and named variant fields support `#[serde(rename = "wire_name")]`. Field defaults, omission, flattening, and enum representation are selected with the Serde attributes below.
 

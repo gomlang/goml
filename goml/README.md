@@ -25,7 +25,7 @@ cd goml
 
 `goml doc` generates offline HTML API documentation for the module in `<target-dir>/doc/`. Use `--format json` for a versioned API model or `--document-private-items` for internal documentation. See [documentation](../docs/documentation.md) for comment syntax, links, and the standalone `gomldoc` command.
 
-Go FFI trusts explicit binding signatures; the final Go build checks native symbols and signatures. External Go types are opaque. See the [language guide](../docs/goml.md#go-ffi) for boundary rules, [Go interoperability](../docs/ffi/bind-go.md) for explicit bindings, and [export-go](../docs/goml.md#exporting-a-go-library) for publishing a generated Go package.
+Go FFI trusts explicit binding signatures; the final Go build checks native symbols and signatures. External Go types are opaque. See the [language guide](../docs/ffi/bind-go.md#go-ffi) for boundary rules, [Go interoperability](../docs/ffi/bind-go.md) for explicit bindings, and [export-go](../docs/ffi/bind-go.md#exporting-a-go-library) for publishing a generated Go package.
 
 `goml clean` removes the current module's configured build target directory. Use `goml clean --target-dir <path>` to clean another target directory inside the module.
 
@@ -41,7 +41,7 @@ goml add owner::test_support --dev
 goml remove owner::module
 ```
 
-The default index is [gomlang/registry](https://github.com/gomlang/registry). Dependencies use `"owner::module" = true`; Git sources follow their default branch without version selection. `add` fetches required sources, and `update` refreshes the current module's normal and development dependencies. Builds and LSP queries read the local cache. Registry state is stored under `$GOML_HOME/cache/registry`, defaulting to `~/.goml/cache/registry`, with source checkouts under `sources/<owner>/<module>/`. Override the index through `[registry].default` in the home configuration or `--local-registry <path>` on `update`/`add`. See the [registry documentation](../docs/goml.md#package-registry) for migration and local fixtures.
+The default index is [gomlang/registry](https://github.com/gomlang/registry). Dependencies use `"owner::module" = true`; Git sources follow their default branch without version selection. `add` fetches required sources, and `update` refreshes the current module's normal and development dependencies. Builds and LSP queries read the local cache. Registry state is stored under `$GOML_HOME/cache/registry`, defaulting to `~/.goml/cache/registry`, with source checkouts under `sources/<owner>/<module>/`. Override the index through `[registry].default` in the home configuration or `--local-registry <path>` on `update`/`add`. See the [registry documentation](../docs/tooling.md#package-registry) for migration and local fixtures.
 
 Local path dependencies and root `[replace]` entries support simultaneous library and application development. A `goml.work` file with `[workspace].members` makes declared member dependencies resolve from their working trees. Use `--workspace` for all-member check/build/test/fmt/doc/clean, or `-p owner::module` to select one member. See the language guide's module section for precedence, source validation and `GOML_WORKSPACE`.
 

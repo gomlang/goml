@@ -17,7 +17,7 @@ just clean
 
 本地 CI 并发运行各检查组。设置 `GOML_CI_SEQUENTIAL=1` 可改为顺序运行，`GOML_BUILD_JOBS` 限制自举包构建的工作线程数，`GOML_TEST_JOBS` 覆盖编译器和驱动器测试的并发度。编译器测试用例可以使用 `PATH` 中的 Yaegi；若不可用或无法运行某个用例，则回退到原生 Go 编译。
 
-GitHub CI 只构建一次测试产物，然后使用 `goml test --no-build` 分片运行。任务依赖见[工作流](../.github/workflows/ci.yml)，分片和产物复用见[测试命令](goml.zh-CN.md#check-and-run-tests)。
+GitHub CI 只构建一次测试产物，然后使用 `goml test --no-build` 分片运行。任务依赖见[工作流](../.github/workflows/ci.yml)，分片和产物复用见[测试命令](tooling.zh-CN.md#check-and-run-tests)。
 
 自举会下载 [bootstrap/stage0.env](../bootstrap/stage0.env) 中记录的、固定校验和的 stage0 发布版本。`just bootstrap` 用 stage0 重建 stage2，用 stage2 构建 stage3，再用 stage3 重建编译器和驱动器产物，并与第一次 stage3 构建比较。将 `GOML_STAGE0_ARCHIVE` 设为预先下载的固定版本归档，可避免下载 stage0。
 
@@ -44,6 +44,8 @@ GitHub CI 只构建一次测试产物，然后使用 `goml test --no-build` 分�
 英文文档保留现有路径，作为规范主版本。仓库中每篇 Markdown 文档都在同目录提供完整的简体中文译本，文件名使用 `.zh-CN.md` 后缀。新增或修改文档、语言语义、公共 API 或开发流程时，在同一次变更中同步更新两个版本。`AGENTS.md` 仍是权威指令文件；中文版供阅读参考。
 
 两种语言均保留代码示例、命令、API 标识符和诊断/输出文本。术语保持一致：package（包）、module（模块）、monomorphization（单态化）、closure lifting（闭包提升）和 compile-time evaluation（编译期求值）；`trait` 和 IR 名称在标识语言或编译器概念时保留原文。完整翻译解释性文字，不用摘要替代原章节。
+
+[语言指南](goml.zh-CN.md)作为概览和阅读导航。语言规则维护在其链接的 `language/` 专题中，项目工作流维护在[项目工具](tooling.zh-CN.md)，Go 边界规则维护在 [Go 互操作](ffi/bind-go.zh-CN.md)。重组内容时，保留概览中的原章节锚点并链接到规范专题位置；其他文档直接链接到这些位置。
 
 每篇文档包含 `English | 简体中文` 切换链接。存在中文对应文档时，中文链接指向中文版本。在中文文档中使用显式锚点保留英文标题片段，使已有交叉引用继续有效。修改标题时同步更新链接和锚点。
 

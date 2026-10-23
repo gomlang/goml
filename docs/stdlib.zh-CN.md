@@ -4,7 +4,7 @@
 
 [English](stdlib.md) | [简体中文](stdlib.zh-CN.md)
 
-本参考文档介绍本仓库已实现的标准库 API。语法和类型规则见[语言指南](goml.zh-CN.md)，自动进入作用域的 API 见其中的 [prelude 参考](goml.zh-CN.md#built-in-prelude)，标准库与生态包的划分见[库的边界](library-boundaries.zh-CN.md)。
+本参考文档介绍本仓库已实现的标准库 API。语法和类型规则见[语言指南](goml.zh-CN.md)，自动进入作用域的 API 见其中的 [prelude 参考](language/prelude.zh-CN.md#built-in-prelude)，标准库与生态包的划分见[库的边界](library-boundaries.zh-CN.md)。
 
 快速导航：[包](#packages)、[文本](#text-and-source-positions)、[集合](#slice-algorithms-and-checked-vector-edits)、[I/O](#composable-io)、[文件系统](#portable-read-only-filesystems)、[网络](#networking)、[Serde 和 JSON](#serde-and-json)、[并发](#structured-concurrency)以及[常见任务](#common-tasks)。
 
@@ -125,7 +125,7 @@ use std::unicode;
 
 `std::error` 提供标准库结构化错误使用的通用协议。`Error` 是要求 `Debug` 和 `ToString` 的标记 trait。`ErrorKind` 定义稳定且不依赖消息的类别，包括文件缺失、权限失败、非法输入或数据、超时、中断、短 I/O、管道断开、不支持的操作和 `Other`。
 
-`Error` 为每个实现 `Debug` 和 `ToString` 的值提供通用实现，因此领域错误可直接参与通用协议。领域枚举可以派生这两个 trait，并通过各变体的 `#[to_string("...")]` 模板自定义面向用户的消息；见[属性与派生](goml.zh-CN.md#attributes-and-derive)。这些模板只影响 `ToString`：`Debug` 和序列化保留各自的表示。
+`Error` 为每个实现 `Debug` 和 `ToString` 的值提供通用实现，因此领域错误可直接参与通用协议。领域枚举可以派生这两个 trait，并通过各变体的 `#[to_string("...")]` 模板自定义面向用户的消息；见[属性与派生](language/metaprogramming.zh-CN.md#attributes-and-derive)。这些模板只影响 `ToString`：`Debug` 和序列化保留各自的表示。
 
 `Report[E]` 保留叶子错误的类型，同时增加由上下文和聚合组成的不可变树。`Report::new(value)` 创建叶子；`.context(message)` 返回新的父节点，不改变原值。`Report::join(Slice[Report[E]])` 对给定序列建立快照，保留顺序和重复项，空序列返回 None。单元素序列仍是只有一个原因的聚合。对于不同类型的叶子变体，请使用领域枚举；此 API 不擦除类型，也不执行反射式向下转型。
 
@@ -1174,7 +1174,7 @@ where F::Handle: ReadDirFile {
 
 ## 测试断言
 
-测试属性、文件布局和命令见[测试](goml.zh-CN.md#tests)。
+测试属性、文件布局和命令见[测试](tooling.zh-CN.md#tests)。
 
 `std::testing` 提供以下断言：
 
@@ -2160,7 +2160,7 @@ use std::time;
 
 ## Serde 与 JSON
 
-派生导入和处理器规则见[可编程派生](goml.zh-CN.md#programmable-derive)。
+派生导入和处理器规则见[可编程派生](language/metaprogramming.zh-CN.md#programmable-derive)。
 
 `std::serde` 定义与格式无关的 `Serialize`、`Deserialize`、`Serializer`、`Deserializer` trait 及两种派生。类型化格式使用 `Serialize::serialize` 和 `Deserialize::deserialize`：格式句柄是方法级泛型参数，因此单态化产生普通静态调用，无需运行时序列化器 trait 对象、Go 接口分派或运行时反射。派生结构体直接输出字段，派生枚举直接输出声明索引、传输名称、形状和载荷。派生的具名字段解码允许任意字段顺序，跳过未知字段，拒绝重复字段和缺失的必需字段。结构体字段、枚举变体和具名变体字段支持 `#[serde(rename = "wire_name")]`。字段默认值、省略、展开和枚举表示通过下述 Serde 属性选择。
 

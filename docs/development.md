@@ -15,7 +15,7 @@ just clean
 
 Local CI runs its check groups concurrently. Set `GOML_CI_SEQUENTIAL=1` to run them sequentially, `GOML_BUILD_JOBS` to limit bootstrap package workers, and `GOML_TEST_JOBS` to override compiler and driver test concurrency. Compiler fixtures may use Yaegi when it is available on `PATH`; they fall back to native Go compilation when it is unavailable or cannot run a fixture.
 
-GitHub CI builds test artifacts once and runs them in shards with `goml test --no-build`. See [the workflow](../.github/workflows/ci.yml) for job dependencies and [test commands](goml.md#check-and-run-tests) for sharding and artifact reuse.
+GitHub CI builds test artifacts once and runs them in shards with `goml test --no-build`. See [the workflow](../.github/workflows/ci.yml) for job dependencies and [test commands](tooling.md#check-and-run-tests) for sharding and artifact reuse.
 
 The bootstrap downloads the checksum-pinned stage0 release recorded in [bootstrap/stage0.env](../bootstrap/stage0.env). `just bootstrap` rebuilds stage2 from stage0, builds stage3 with stage2, then uses stage3 to rebuild the compiler and driver artifacts and compares them with the first stage3 build. Set `GOML_STAGE0_ARCHIVE` to a previously downloaded pinned archive to avoid downloading stage0.
 
@@ -40,6 +40,8 @@ See the [compiler](../gomlc/README.md) and [project driver](../goml/README.md) d
 English documentation remains canonical at its existing paths. Every repository Markdown document has a complete Simplified Chinese translation beside it, named with the `.zh-CN.md` suffix. Keep both versions up to date in the same change when adding or changing documentation, language semantics, public APIs, or development workflows. `AGENTS.md` remains the authoritative instruction file; its Chinese counterpart is a reading reference.
 
 Preserve code examples, commands, API identifiers, and diagnostic/output text in both languages. Use consistent terminology: package (包), module (模块), monomorphization (单态化), closure lifting (闭包提升), and compile-time evaluation (编译期求值); retain `trait` and IR names where they identify language or compiler concepts. Translate explanatory prose fully rather than replacing sections with summaries.
+
+The [language guide](goml.md) is an overview and reading map. Maintain language rules in the linked `language/` topics, project workflows in [project tools](tooling.md), and Go boundary rules in [Go interoperability](ffi/bind-go.md). Keep the overview's original section anchors as links to the canonical topic locations when reorganizing content; link directly to those locations from other documents.
 
 Each document includes an `English | 简体中文` switch. Chinese links point to Chinese counterparts where available. Preserve English heading fragments in Chinese documents with explicit anchors so existing cross-references remain valid. When changing headings, update links and anchors together.
 

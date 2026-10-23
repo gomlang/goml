@@ -26,7 +26,7 @@ cd goml
 
 `goml doc` 在 `<target-dir>/doc/` 为模块生成离线 HTML API 文档。使用 `--format json` 获取带版本的 API 模型，使用 `--document-private-items` 生成内部文档。注释语法、链接和独立的 `gomldoc` 命令见[文档说明](../docs/documentation.zh-CN.md)。
 
-Go FFI 信任显式绑定签名；最终 Go 构建检查原生符号和签名。外部 Go 类型是不透明的。边界规则见[语言指南](../docs/goml.zh-CN.md#go-ffi)，显式绑定见 [Go 互操作](../docs/ffi/bind-go.zh-CN.md)，发布生成的 Go 包见 [export-go](../docs/goml.zh-CN.md#exporting-a-go-library)。
+Go FFI 信任显式绑定签名；最终 Go 构建检查原生符号和签名。外部 Go 类型是不透明的。边界规则见[语言指南](../docs/ffi/bind-go.zh-CN.md#go-ffi)，显式绑定见 [Go 互操作](../docs/ffi/bind-go.zh-CN.md)，发布生成的 Go 包见 [export-go](../docs/ffi/bind-go.zh-CN.md#exporting-a-go-library)。
 
 `goml clean` 删除当前模块配置的构建目标目录。使用 `goml clean --target-dir <path>` 清理模块内的另一个目标目录。
 
@@ -42,7 +42,7 @@ goml add owner::test_support --dev
 goml remove owner::module
 ```
 
-默认索引为 [gomlang/registry](https://github.com/gomlang/registry)。依赖使用 `"owner::module" = true`；Git 源码跟随默认分支，不进行版本选择。`add` 获取所需源码，`update` 刷新当前模块的普通依赖和开发依赖。构建和 LSP 查询读取本地缓存。注册表状态存储在 `$GOML_HOME/cache/registry`，默认是 `~/.goml/cache/registry`，源码检出目录为 `sources/<owner>/<module>/`。可通过主目录配置中的 `[registry].default`，或 `update`/`add` 的 `--local-registry <path>` 覆盖索引。迁移和本地测试用例见[注册表文档](../docs/goml.zh-CN.md#package-registry)。
+默认索引为 [gomlang/registry](https://github.com/gomlang/registry)。依赖使用 `"owner::module" = true`；Git 源码跟随默认分支，不进行版本选择。`add` 获取所需源码，`update` 刷新当前模块的普通依赖和开发依赖。构建和 LSP 查询读取本地缓存。注册表状态存储在 `$GOML_HOME/cache/registry`，默认是 `~/.goml/cache/registry`，源码检出目录为 `sources/<owner>/<module>/`。可通过主目录配置中的 `[registry].default`，或 `update`/`add` 的 `--local-registry <path>` 覆盖索引。迁移和本地测试用例见[注册表文档](../docs/tooling.zh-CN.md#package-registry)。
 
 本地路径依赖和根清单的 `[replace]` 条目支持同时开发库和应用。包含 `[workspace].members` 的 `goml.work` 文件让声明的成员依赖从各自的工作树解析。使用 `--workspace` 对所有成员执行 check/build/test/fmt/doc/clean，或用 `-p owner::module` 选择单个成员。优先级、源码验证和 `GOML_WORKSPACE` 见语言指南的模块章节。
 

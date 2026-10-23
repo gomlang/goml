@@ -26,7 +26,7 @@ just vscode-ext
 
 使用 **Format Document** 格式化当前 GoML 缓冲区。语言服务器使用 GoML 的固定格式化规则，语法无效的文档保持不变。
 
-捆绑的服务器针对宿主平台构建。自定义服务器需要完整的可执行文件相对工具链资源，以及匹配的 `goml` 项目驱动器。详情见[语言指南](../../docs/goml.zh-CN.md#lsp-and-editor)和[格式化规则](../../docs/formatting.zh-CN.md)。
+捆绑的服务器针对宿主平台构建。自定义服务器需要完整的可执行文件相对工具链资源，以及匹配的 `goml` 项目驱动器。详情见[语言指南](../../docs/tooling.zh-CN.md#lsp-and-editor)和[格式化规则](../../docs/formatting.zh-CN.md)。
 
 配置项：
 

@@ -72,4 +72,4 @@ derive 输出起始于一个 trait 实现或一个固有实现。`derive_output_
 
 结构化属性访问对括号平衡的参数列表进行 token 化，保留字面量种类、名称、嵌套类型和表达式语法。原始字符串使用普通解析器解码。类型和表达式访问器在派生文件作用域中恰好解析一个值。原始属性文本仍可访问。生成的闭包使用带类型的参数列表；`meta_expr_type_member` 携带所属类型和成员的类型实参，不解析调用方的同名类型。
 
-内建 `ToString` derive 在 GoML derive 处理函数中实现[枚举变体模板](goml.zh-CN.md#attributes-and-derive)。它通过结构化属性访问读取 `#[to_string("...")]`，在占位符的源码范围验证它们，并为引用的字段使用新局部变量构造普通 match 分支。只有模板使用的字段会贡献 `ToString` 约束；无模板变体保留默认格式及其字段约束。编译器提供元数据和语法构建器，而不自行解释模板语法。
+内建 `ToString` derive 在 GoML derive 处理函数中实现[枚举变体模板](language/metaprogramming.zh-CN.md#attributes-and-derive)。它通过结构化属性访问读取 `#[to_string("...")]`，在占位符的源码范围验证它们，并为引用的字段使用新局部变量构造普通 match 分支。只有模板使用的字段会贡献 `ToString` 约束；无模板变体保留默认格式及其字段约束。编译器提供元数据和语法构建器，而不自行解释模板语法。

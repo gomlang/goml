@@ -10,7 +10,8 @@ This file is the authoritative agent instruction entry point. [AGENTS.zh-CN.md](
 
 Read the documentation relevant to the change:
 
-- [Language guide](docs/goml.md): canonical syntax, semantics, packages, builtins, examples, and grammar.
+- [Language guide](docs/goml.md): overview and links to the canonical language topics in `docs/language/` and Go FFI rules in `docs/ffi/bind-go.md`.
+- [Project tools](docs/tooling.md): manifests, dependencies, examples, testing, editor support, and generated-code inspection.
 - [Standard library](docs/stdlib.md): public standard-library APIs, examples, and limitations.
 - [Formatting](docs/formatting.md): formatter behavior and CLI.
 - [Releases](docs/releasing.md): publishing, toolchain installation, and stage0 advancement.
@@ -107,7 +108,7 @@ Run recipes from the repository root; [.justfile](.justfile) is the command refe
 - Incompatible syntax changes need a transition release accepting both forms. Advance stage0, migrate self-hosted sources, then remove the old form in a later release.
 - Driver protocols, compiler CLI contracts, and other bootstrap interfaces need at least one release of compatibility overlap so the old stage0 driver can use the new compiler.
 - Artifact formats may break compatibility only when each clean bootstrap stage consumes artifacts produced within that stage. Cache and external-dependency errors must remain recoverable.
-- Syntax, semantics, or builtin changes must update the relevant prose, examples, limitations, comparison table, and informal grammar in [docs/goml.md](docs/goml.md) in the same change. Public standard-library API changes must update the relevant prose, examples, limitations, and common-task table in [docs/stdlib.md](docs/stdlib.md) in the same change.
+- Syntax, semantics, or builtin changes must update the relevant prose, examples, limitations, comparison table, and informal grammar in the topic documents linked from [docs/goml.md](docs/goml.md) in the same change. Public standard-library API changes must update the relevant prose, examples, limitations, and common-task table in [docs/stdlib.md](docs/stdlib.md) in the same change.
 
 ## Commits and Releases
 
