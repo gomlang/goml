@@ -18,9 +18,9 @@ On this page: [Lexical rules](#lexical-rules), [Top-level definitions](#top-leve
 
 ### Comments and API documentation
 
-Line comments start with `//` and end at the next newline. `///` (excluding `////`) at the start of a source line documents the following declaration. Consecutive documentation lines form one block; a blank line or an ordinary comment breaks attachment. Attributes belong to the following declaration and may appear between its documentation and declaration keywords.
+Line comments start with `//` and end at the next newline; block comments are unsupported. Standalone `///` lines (excluding `////`) document the following declaration; same-line trailing comments do not. Consecutive documentation lines form one block; a blank line or an ordinary comment breaks attachment. Attributes belong to the following declaration and may appear between its documentation and declaration keywords.
 
-`//!` comments before the `package` declaration describe the package. For a package with several source files, `gomldoc` combines these descriptions in relative file-path order. Documentation comments remain ordinary lexer trivia and do not affect program typing or execution.
+`//!` comments before the first source token describe the package. For a package with several source files, `gomldoc` combines these descriptions in relative file-path order. Documentation comments remain ordinary lexer trivia and do not affect program typing or execution.
 
 ```goml
 //! Small arithmetic helpers.
@@ -66,7 +66,7 @@ f32 f64 string char extern
 
 `self` is a special abbreviation for the receiver parameter, and can also be used as a common receiver variable name; `Self` has special meaning in the type position of trait and impl.
 
-Whitespace separates tokens but does not determine block structure. Only line comments from `//` to the end of the line are supported; block comments are not supported.
+Whitespace separates tokens but does not determine block structure.
 
 <a id="literals"></a>
 

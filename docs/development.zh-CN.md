@@ -15,15 +15,15 @@ just clean
 
 `just make` 直接使用固定版本的 stage0 增量构建 stage2。`just test` 构建工具并运行编译器、项目驱动器和标准库测试；`just all` 是它的别名。`just ci` 执行干净的 stage2 构建、不动点验证、测试、扩展编译和发布归档冒烟检查。标准库行为测试位于实现旁的 `lib/std/<package>/tests`，使用 `just test-stdlib` 运行。已知答案的来源、数据格式和更新规则见[标准库已知答案](../lib/std/KNOWN_ANSWERS.zh-CN.md)。
 
-本地 CI 并发运行各检查组。设置 `GOML_CI_SEQUENTIAL=1` 可改为顺序运行，`GOML_BUILD_JOBS` 限制自举包构建的工作线程数，`GOML_TEST_JOBS` 覆盖编译器和驱动器测试的并发度。编译器测试用例可以使用 `PATH` 中的 Yaegi；若不可用或无法运行某个用例，则回退到原生 Go 编译。
+本地 CI 并发运行各检查组。设置 `GOML_CI_SEQUENTIAL=1` 可改为顺序运行，`GOML_BUILD_JOBS` 限制自举包构建的工作线程数，`GOML_TEST_JOBS` 覆盖编译器、驱动器和标准库测试的并发度。编译器测试用例可以使用 `PATH` 中的 Yaegi；若不可用或无法运行某个用例，则回退到原生 Go 编译。
 
 GitHub CI 只构建一次测试产物，然后使用 `goml test --no-build` 分片运行。任务依赖见[工作流](../.github/workflows/ci.yml)，分片和产物复用见[测试命令](tooling.zh-CN.md#check-and-run-tests)。
 
-自举会下载 [bootstrap/stage0.env](../bootstrap/stage0.env) 中记录的、固定校验和的 stage0 发布版本。`just bootstrap` 用 stage0 重建 stage2，用 stage2 构建 stage3，再用 stage3 重建编译器和驱动器产物，并与第一次 stage3 构建比较。将 `GOML_STAGE0_ARCHIVE` 设为预先下载的固定版本归档，可避免下载 stage0。
+自举从 [bootstrap/stage0.env](../bootstrap/stage0.env) 选择宿主对应的已发布 `linux-amd64` 或 `darwin-arm64` stage0 归档，并验证固定的 SHA-256 校验和。两个平台使用相同的发布版本。将 `GOML_STAGE0_ARCHIVE` 设为宿主平台固定归档的本地副本，可避免下载。不支持的宿主会在下载或清理自举输出前被拒绝。
 
-源码自举为宿主选择已发布的 `linux-amd64` 或 `darwin-arm64` 归档，并验证各自固定的 SHA-256 校验和。两个平台使用相同的 stage0 发布版本。离线 `GOML_STAGE0_ARCHIVE` 必须匹配宿主平台固定的归档。不支持的宿主会在下载 stage0 或清理已有自举输出前被拒绝。
+`just bootstrap` 用 stage0 重建 stage2，用 stage2 构建 stage3，再用 stage3 重建编译器和驱动器产物，并与第一次 stage3 构建比较。
 
-在 macOS arm64 上，运行 `just bootstrap` 进行干净的原生构建和不动点验证，或运行 `just make` 进行增量构建。构建后运行 `just _ci-toolchain-scripts` 和 `just _ci-release-smoke`，检查安装、缓存、打包和已发布工具链工作流。完整的 `just ci`、编译器和标准库测试套件需要 Linux amd64，因为它们会使用 Linux 系统调用和 ABI 头文件。GitHub CI 除 macOS 发布归档冒烟测试外，还运行原生 macOS 自举和工具链脚本检查。
+在 macOS arm64 上，执行 `just make` 或 `just bootstrap` 后运行 `just _ci-toolchain-scripts` 和 `just _ci-release-smoke`，检查安装、缓存、打包和已发布工具链工作流。完整的 `just ci`、编译器和标准库测试套件需要 Linux amd64，因为它们会使用 Linux 系统调用和 ABI 头文件。GitHub CI 除 macOS 发布归档冒烟测试外，还运行原生 macOS 自举和工具链脚本检查。
 
 本地开发使用 `stage2/bin`。`stage0`、`stage2` 和 `stage3` 下的工具链前缀包含 `bin`、`lib` 下的库项目，以及 `lib/compiler` 下已完成初始化的编译器 world。下载归档缓存在 `_bootstrap/cache`；编译器和驱动器的自举产物位于各模块自己的 `_bootstrap` 目录。Git 会忽略生成的输出。
 

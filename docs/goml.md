@@ -10,8 +10,6 @@ GoML is a statically typed language with garbage collection. Its syntax is close
 
 Generated Go code and Go FFI use Go 1.26 as their compatibility baseline. Building the toolchain and compiling generated programs require Go 1.26 or newer. Native FFI signatures are checked by that final Go compilation. The independent [gomlgo frontend and interpreter](https://github.com/gomlang/gomlgo) targets Go 1.26 language and standard-library behavior; its execution and differential tests require Go 1.26.x.
 
-Quick navigation: [packages](language/packages.md#modules-packages-and-imports), [types](language/types.md#type), [control flow](language/basics.md#control-flow), [patterns](language/types.md#patterns), [traits](language/types.md#trait-and-impl), [compile-time evaluation](language/metaprogramming.md#compile-time-evaluation), [Go FFI](ffi/bind-go.md#go-ffi), [tests](tooling.md#tests), [API documentation](language/basics.md#comments-and-api-documentation), [prelude](language/prelude.md#built-in-prelude), [standard library](stdlib.md), and [verification](tooling.md#verify-generated-code).
-
 Build and installation instructions are in the [development guide](development.md) and [release guide](releasing.md#installation). See [formatting](formatting.md) for canonical source layout and [compile-time evaluation architecture](comptime.md) for CTIR internals.
 
 <a id="reading-guide"></a>
@@ -51,15 +49,7 @@ Build and installation instructions are in the [development guide](development.m
 
 ## Minimal program
 
-Single-file compilation allows omission of `package main;`:
-
-```goml
-fn main() -> () {
-    println("hello, goml")
-}
-```
-
-The entry file in the project should explicitly declare the package:
+A project entry file declares `package main;`:
 
 ```goml
 package main;
@@ -69,7 +59,7 @@ fn main() -> () {
 }
 ```
 
-`main` cannot have parameters or type parameters. When generating an executable file, the package selected as the entry must be declared as `package main;` and define `fn main()`. It is recommended to let `main` return `()`.
+`main` cannot have parameters or type parameters. Use `()` as its return type. Standalone single-file compilation also accepts this program without the package declaration.
 
 <a id="original-section-links"></a>
 

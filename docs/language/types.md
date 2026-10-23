@@ -340,9 +340,9 @@ let number = identity::[i32](1);
 let text = identity::[string]("text");
 ```
 
-An explicit generic argument list must contain at least one argument. Omit the whole list to use inference; `identity::[](../1)` is rejected.
+An explicit generic argument list must contain at least one argument. Omit the whole list to use inference; `identity::[](1)` is rejected.
 
-Don't write `identity[i32](../1)` or Rust's `identity::<i32>(1)`. Generic arguments for an owner type or trait appear before the member name, while arguments owned by a method appear after it:
+Don't write `identity[i32](1)` or Rust's `identity::<i32>(1)`. Generic arguments for an owner type or trait appear before the member name, while arguments owned by a method appear after it:
 
 ```goml
 let inferred = value.convert(fallback);

@@ -51,9 +51,7 @@ pub struct Value {
 }
 ```
 
-Consecutive standalone `///` lines attach to the next declaration, including its attributes. A blank source line or ordinary comment interrupts attachment. `////` and same-line trailing comments are ordinary comments. Documentation may appear on functions, types, constants, statics, fields, variants, trait members, implementations, methods, and public re-exports.
-
-`//!` is package documentation when it appears before the first source token. Descriptions from several package files are combined in relative path order. The formatter preserves documentation attachment. The lexer continues to treat these spellings as ordinary comments, so previous toolchains can compile sources containing them.
+See [comment syntax and attachment](language/basics.md#comments-and-api-documentation) for `///` and `//!` rules. Documentation may appear on functions, types, constants, statics, fields, variants, trait members, implementations, methods, and public re-exports. The [formatter preserves attachment](formatting.md#comments-and-literals).
 
 ## Rendering and links
 

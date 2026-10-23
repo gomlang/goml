@@ -16,6 +16,8 @@
 
 库 API 和常见任务见[标准库参考](../stdlib.zh-CN.md#common-tasks)。
 
+类型推断失败时，可以标注局部结果、空容器或闭包参数的类型，或使用 UFCS。方法解析规则见[方法调用与 UFCS](types.zh-CN.md#method-parsing-and-ufcs)。
+
 | 避免的写法 | GoML 写法 |
 | --- | --- |
 | API 文档块内使用 `////` 或空源码行 | 使用 `///`；段落之间使用仅含 `///` 的行 |
@@ -25,8 +27,8 @@
 | `Buffer[i32, N + 1]` | `Buffer[i32, {N + 1}]` |
 | 用 `serde(rename)` 修改 `.to_string()` | 在变体上使用 `#[to_string("text")]`，并配合 `#[derive(ToString)]` |
 | 用 `Type::LIMIT()` 访问关联常量 | `Type::LIMIT` |
-| `id::<i32>(1)` | `id::[i32](../1)` |
-| 普通函数调用 `id[i32](../1)` | `id::[i32](../1)`，或依赖参数/结果类型推断 |
+| `id::<i32>(1)` | `id::[i32](1)` |
+| 普通函数调用 `id[i32](1)` | `id::[i32](1)`，或依赖参数/结果类型推断 |
 | `1i32`, `1u64`, `1.0f32` | 使用预期类型，如 `let value: u64 = 1;` |
 | `b"é"` 中的非 ASCII 源文本 | 使用 `string`，或显式写编码字节，如 `b"\xC3\xA9"` |
 | 控制流头部值使用裸块 | 加括号，如 `if ({ prepare(); ready() }) { ... }` |
@@ -60,8 +62,8 @@
 | 每个示例创建独立消费方清单 | 使用 `goml run --example <name>` 和 `goml test`；示例共享模块根清单 |
 | 函数内部的 `fn helper` | 顶层函数或局部闭包 |
 | 离开块后使用其局部绑定 | 从块返回值并在外部绑定结果 |
-| `Message::Value::[i32](../42)` | 枚举实参属于枚举本身：`Message::[i32]::Value(42)` |
-| `identity::[](../1)` | 省略空 turbofish，写 `identity(1)` |
+| `Message::Value::[i32](42)` | 枚举实参属于枚举本身：`Message::[i32]::Value(42)` |
+| `identity::[](1)` | 省略空 turbofish，写 `identity(1)` |
 | `Message::[bool]::Named { value: true }` | 使用 `let value: Message[bool] = Message::Named { value: true };` |
 | 期望函数常量参数改变顶层常量初始化器 | 常量保留声明位置的绑定 |
 | Go 外部类型 | `#[go_type("pkg", "Name")] extern type Name[T];` 保留不透明 Go 身份和声明实参；使用显式函数和方法，原始指针用 `std::ffi::Ptr[T]`。不自动提供字段、结构体构造、别名展开或约束发现；最终 Go 编译验证原生使用 |

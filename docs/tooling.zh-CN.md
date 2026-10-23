@@ -395,4 +395,4 @@ goml run
 
 需要检查编译阶段时，在 `gomlc run-single` 后加 `--dump-ast`、`--dump-expanded-ast`、`--dump-hir`、`--dump-tast`、`--dump-ctir`、`--dump-core`、`--dump-mono`、`--dump-lift`、`--dump-anf` 或 `--dump-go`。`--dump-ast` 展示 derive 展开前的源码降级，`--dump-expanded-ast` 则包含所有生成实现。
 
-代码代理提交源码前至少应运行对应 `goml check` 或 `gomlc run-single`；修改测试时，还应运行 `goml check --tests` 和相关 `goml test`。类型推断失败时，优先添加局部结果类型、空容器类型、闭包参数类型或使用 UFCS，不要改写为不支持的 Rust/Go 语法。
+修改仓库时，按[开发指南](development.zh-CN.md)运行相关检查。

@@ -10,8 +10,6 @@ GoML 是一种具有垃圾回收的静态类型语言。语法接近 Rust，语�
 
 生成的 Go 代码和 Go FFI 以 Go 1.26 为兼容性基线。构建工具链和编译生成的程序需要 Go 1.26 或更高版本。原生 FFI 签名由最后的 Go 编译步骤检查。独立的 [gomlgo 前端和解释器](https://github.com/gomlang/gomlgo) 以 Go 1.26 的语言和标准库行为为目标；其执行和差分测试需要 Go 1.26.x。
 
-快速导航：[包](language/packages.zh-CN.md#modules-packages-and-imports)、[类型](language/types.zh-CN.md#type)、[控制流](language/basics.zh-CN.md#control-flow)、[模式](language/types.zh-CN.md#patterns)、[trait](language/types.zh-CN.md#trait-and-impl)、[编译期求值](language/metaprogramming.zh-CN.md#compile-time-evaluation)、[Go FFI](ffi/bind-go.zh-CN.md#go-ffi)、[测试](tooling.zh-CN.md#tests)、[API 文档](language/basics.zh-CN.md#comments-and-api-documentation)、[prelude](language/prelude.zh-CN.md#built-in-prelude)、[标准库](stdlib.zh-CN.md)和[验证](tooling.zh-CN.md#verify-generated-code)。
-
 构建和安装说明见[开发指南](development.zh-CN.md)和[发布指南](releasing.zh-CN.md#installation)。源码的规范布局见[格式化](formatting.zh-CN.md)，CTIR 内部机制见[编译期求值架构](comptime.zh-CN.md)。
 
 <a id="reading-guide"></a>
@@ -51,15 +49,7 @@ GoML 是一种具有垃圾回收的静态类型语言。语法接近 Rust，语�
 
 ## 最小程序
 
-单文件编译允许省略 `package main;`：
-
-```goml
-fn main() -> () {
-    println("hello, goml")
-}
-```
-
-项目中的入口文件应显式声明包：
+项目入口文件声明 `package main;`：
 
 ```goml
 package main;
@@ -69,7 +59,7 @@ fn main() -> () {
 }
 ```
 
-`main` 不能有参数或类型参数。生成可执行文件时，选作入口的包必须声明 `package main;` 并定义 `fn main()`。建议让 `main` 返回 `()`。
+`main` 不能有参数或类型参数，返回类型使用 `()`。单文件编译也接受省略包声明的这个程序。
 
 <a id="original-section-links"></a>
 

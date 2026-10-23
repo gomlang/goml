@@ -16,6 +16,8 @@ On this page: [Comparison of common writing errors](#comparison-of-common-writin
 
 For library APIs and common tasks, see the [standard library reference](../stdlib.md#common-tasks).
 
+When type inference fails, annotate local results, empty containers, or closure parameters, or use UFCS. See [method calls and UFCS](types.md#method-parsing-and-ufcs) for method resolution.
+
 | Avoid | GoML form |
 | --- | --- |
 | `////` or a blank source line inside an API documentation block | Use `///`; use a bare `///` line to separate paragraphs |
@@ -25,8 +27,8 @@ For library APIs and common tasks, see the [standard library reference](../stdli
 | `Buffer[i32, N + 1]` | `Buffer[i32, {N + 1}]` |
 | Using `serde(rename)` to change `.to_string()` | Use `#[to_string("text")]` on the variant with `#[derive(ToString)]` |
 | `Type::LIMIT()` for an associated constant | `Type::LIMIT` |
-| `id::<i32>(1)` | `id::[i32](../1)` |
-| Ordinary function `id[i32](../1)` | `id::[i32](../1)`, or rely on parameter/result type inference |
+| `id::<i32>(1)` | `id::[i32](1)` |
+| Ordinary function `id[i32](1)` | `id::[i32](1)`, or rely on parameter/result type inference |
 | `1i32`, `1u64`, `1.0f32` | Use the expected type, such as `let value: u64 = 1;` |
 | Non-ASCII source text in `b"é"` | Use a `string`, or write its encoded bytes explicitly such as `b"\xC3\xA9"` |
 | A bare block as a control-flow header value | Parenthesize it, for example `if ({ prepare(); ready() }) { ... }` |
@@ -60,8 +62,8 @@ For library APIs and common tasks, see the [standard library reference](../stdli
 | Create a separate consumer manifest for every example | Use `goml run --example <name>` and `goml test`; examples share the module-root manifest |
 | `fn helper` inside function | Top-level function or local closure |
 | Use a local binding after leaving its block | Return the value from the block and bind its result outside |
-| `Message::Value::[i32](../42)` | Enum arguments belong to the owner: `Message::[i32]::Value(42)` |
-| `identity::[](../1)` | Omit the empty turbofish and write `identity(1)` |
+| `Message::Value::[i32](42)` | Enum arguments belong to the owner: `Message::[i32]::Value(42)` |
+| `identity::[](1)` | Omit the empty turbofish and write `identity(1)` |
 | `Message::[bool]::Named { value: true }` | Use `let value: Message[bool] = Message::Named { value: true };` |
 | Expect a function's const parameter to change a top-level constant initializer | Constants retain the bindings from their declaration site |
 | Go external type | `#[go_type("pkg", "Name")] extern type Name[T];` retains an opaque Go identity and declared arguments; use explicit functions and methods, with `std::ffi::Ptr[T]` for raw pointers. No automatic fields, struct construction, alias expansion or constraint discovery; final Go compilation validates native uses |
