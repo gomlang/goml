@@ -102,3 +102,26 @@ python3 tools/performance/projection.py --samples 6
 原生吞吐量下降 38.63%；六组配对速度比均在 0.6126 到 0.6180 之间。两个版本在工作区间内均测得零分配。训练使用 40,000,000 个解释器步骤。四份构建记录包含相同的生成源码哈希，两项提供剖析文件的构建均报告成功接受该文件。剖析覆盖率仍未测量；这次下游 PGO 退化的原因尚未确定。
 
 原生、普通 WASM 和 PGO WASM 在 2,000,000 个解释器步骤下均产生校验和 `5556bcccd558a435`。WASM 在 Node 中执行仅用于正确性验证，其原始耗时不纳入性能比较。证据保留在 `_artifact/performance-pgo/results.json`、`samples.json`、`wasm-validation.json` 和四份 `.build.json` 文件中。此示例展示采集、应用、目标验证及退化报告流程，不承诺加速。
+
+<a id="ref-snapshot-narrowing-2026-10-24"></a>
+
+## 缩小 Ref 快照（2026-10-24）
+
+下一项优化在最终 Go 函数裁剪前，缩小相邻且仅使用一次的聚合值快照。它识别只读取字段的 getter 和经过验证的转发包装函数，然后合并紧接着执行的字段和数组投影。例如，`reference.get().nested.flag` 可以直接读取 `reference.value.nested.flag`。中间借用字段指针如果仅用于下一次值读取，也可以被消除。保留的快照、返回的聚合值、闭包捕获、逃逸地址及中间副作用仍遵循值语义。如果索引表达式修改引用，读取仍必须使用修改前捕获的聚合值。这是局部转换，不引入通用别名分析或纯度标注契约。
+
+公开基准位于 [`tools/performance/ref-projection`](../tools/performance/ref-projection)。重建前保留一个完整的旧工具链前缀目录，然后将其中的编译器与候选版本比较：
+
+```sh
+python3 tools/performance/projection.py --case ref \
+  --baseline /path/to/previous-prefix/bin/gomlc \
+  --candidate stage2/bin/gomlc \
+  --output _artifact/performance-ref-projection --samples 6
+```
+
+`value` 用例仍为默认选择。两个用例遵循相同测量流程：采样前完成所有构建，每个可执行文件执行一次不计入结果的预热，在同一 CPU 上固定运行六轮交替顺序测量，每次测量调用的校验和均为 528，并记录生成 Go、汇编、逃逸诊断、编译器哈希及原始分配/计时样本。`ref` 用例通过 `Ref[Large]` 而非值参数读取并求和 32 个整数。
+
+在 Linux amd64、Go 1.26.0、禁用 PGO 的条件下，`b36644100` 的编译器测得 113.7 ns/次调用，候选版本测得 8.985 ns/次调用，吞吐量约为原来的 12.65 倍。两者均测得 0 B/次调用、0 次分配/次调用。基线汇编在索引循环内复制聚合值；候选版本直接执行索引加载，该循环内没有聚合值复制。结果保留在 `_artifact/performance-ref-projection`。这些是单机微基准结果，不是完整模拟器或浏览器吞吐量。
+
+[`project113_ref_projection`](../gomlc/testdata/module/project113_ref_projection/main.goml) 覆盖嵌套字段、数组读写、保留及返回的快照、捕获的共享句柄、索引中的副作用、循环/match/select 路径，以及结果被丢弃或被使用的越界读取。其断言在 stage0 和候选版本上均通过。候选版本生成的 Go 也能构建为 `js/wasm`，并在 Node 中通过相同断言；这是功能检查，不是 WASM 性能测量。
+
+`just update-golden` 和 `just ci` 在包含相同实现、测试源码及生成快照的隔离工作树中通过。验证包含 1,314 项编译器测试、407 项驱动器/标准库测试、stage3 固定点验证、扩展打包及发布冒烟测试。使用隔离工作树是为了避免替换另一个模拟器测试任务正在使用的 stage2 可执行文件。

@@ -1,0 +1,506 @@
+package go_backend;
+
+use std::collections;
+
+struct SnapshotContext {
+    aggregates: collections::HashSet[string],
+    getters: HashMap[string, Vec[string]],
+    changed: Ref[bool],
+}
+
+fn snapshot_aggregate(ty: Type, context: SnapshotContext) -> bool {
+    match ty {
+        Array { .. } | Struct { .. } => true,
+        Named { name } => context.aggregates.contains(name),
+        _ => false,
+    }
+}
+
+fn snapshot_getter_path(value: Expr, root: string, getters: HashMap[string, Vec[string]]) -> Option[
+    Vec[string],
+] {
+    match value {
+        Var { name } if name == root => Some(Vec::new()),
+        Field { expr, field_name } => {
+            let path = snapshot_getter_path(expr, root, getters)?;
+            path.push(field_name);
+            Some(path)
+        },
+        Call { func: Var { name }, args } if args.len() == 1 => {
+            let fields = getters[name]?;
+            let path = snapshot_getter_path(args[0], root, getters)?;
+            for field in fields {
+                path.push(field);
+            }
+            Some(path)
+        },
+        _ => None,
+    }
+}
+
+fn snapshot_getter(function: Function, context: SnapshotContext) -> Option[Vec[string]] {
+    if function.params.len() != 1 || function.body.stmts.len() > 8 {
+        return None
+    }
+    if !snapshot_aggregate(function.ret_ty?, context) {
+        return None
+    }
+    match function.params[0].1 {
+        Pointer { .. } => (),
+        _ => return None,
+    }
+    let mut root = function.params[0].0;
+    let path: Vec[string] = Vec::new();
+    let names = collections::HashSet::new();
+    let _ = names.insert(root);
+    for index in 0..function.body.stmts.len() {
+        let (next, value) = match function.body.stmts[index] {
+            Var { name, value: Some(value), .. } if name != "_" && names.insert(name) => (
+                name,
+                value,
+            ),
+            Return { expr: Some(value) } if index + 1 == function.body.stmts.len() => ("", value),
+            _ => return None,
+        };
+        let fields = snapshot_getter_path(value, root, context.getters)?;
+        for field in fields {
+            path.push(field);
+        }
+        if path.len() > 16 {
+            return None
+        }
+        root = next;
+    }
+    if root == "" && !path.is_empty() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn snapshot_expr_names(names: DceNames, value: Expr) -> () {
+    match value {
+        Var { name } => add_name(names, name),
+        Call { func, args } | CallSpread { func, args, .. } => {
+            snapshot_expr_names(names, func);
+            for arg in args {
+                snapshot_expr_names(names, arg);
+            }
+            if let CallSpread { spread, .. } = value {
+                snapshot_expr_names(names, spread);
+            }
+        },
+        Instantiate { expr, .. } | Unary { expr, .. } | Field { expr, .. } | Cast { expr, .. } | Convert {
+            expr,
+            ..,
+        } => snapshot_expr_names(names, expr),
+        Binary { lhs, rhs, .. } => {
+            snapshot_expr_names(names, lhs);
+            snapshot_expr_names(names, rhs);
+        },
+        Index { base, index } => {
+            snapshot_expr_names(names, base);
+            snapshot_expr_names(names, index);
+        },
+        Slice { base, start, end } => {
+            snapshot_expr_names(names, base);
+            snapshot_expr_names(names, start);
+            snapshot_expr_names(names, end);
+        },
+        Make { args, .. } | ArrayLiteral { items: args, .. } => for arg in args {
+            snapshot_expr_names(names, arg);
+        },
+        Send { channel, value } => {
+            snapshot_expr_names(names, channel);
+            snapshot_expr_names(names, value);
+        },
+        Receive { channel } => snapshot_expr_names(names, channel),
+        StructLiteral { fields, .. } => for (_, value) in fields {
+            snapshot_expr_names(names, value);
+        },
+        FuncLit { params, body, .. } => {
+            for (name, _) in params {
+                add_name(names, name);
+            }
+            snapshot_block_names(names, body);
+        },
+        _ => (),
+    }
+}
+
+fn snapshot_stmt_names(names: DceNames, value: Stmt) -> () {
+    match value {
+        Var { name, value, .. } => {
+            add_name(names, name);
+            if let Some(value) = value {
+                snapshot_expr_names(names, value);
+            }
+        },
+        Assign { name, value } => {
+            add_name(names, name);
+            snapshot_expr_names(names, value);
+        },
+        MultiAssign { names: targets, value } => {
+            for name in targets {
+                add_name(names, name);
+            }
+            snapshot_expr_names(names, value);
+        },
+        Expr { expr } | Go { call: expr } | Defer { call: expr } => snapshot_expr_names(names, expr),
+        FieldAssign { target, value, .. } => {
+            snapshot_expr_names(names, target);
+            snapshot_expr_names(names, value);
+        },
+        IndexAssign { base, index, value } => {
+            snapshot_expr_names(names, base);
+            snapshot_expr_names(names, index);
+            snapshot_expr_names(names, value);
+        },
+        Return { expr } => if let Some(value) = expr {
+            snapshot_expr_names(names, value);
+        },
+        ReturnMulti { exprs } => for value in exprs {
+            snapshot_expr_names(names, value);
+        },
+        If { cond, then_, else_ } => {
+            snapshot_expr_names(names, cond);
+            snapshot_block_names(names, then_);
+            if let Some(body) = else_ {
+                snapshot_block_names(names, body);
+            }
+        },
+        Loop { body } | LabeledLoop { body, .. } => snapshot_block_names(names, body),
+        Range { names: targets, expr, body } => {
+            for name in targets {
+                add_name(names, name);
+            }
+            snapshot_expr_names(names, expr);
+            snapshot_block_names(names, body);
+        },
+        Switch { expr, cases, default } => {
+            snapshot_expr_names(names, expr);
+            for case in cases {
+                snapshot_expr_names(names, case.value);
+                snapshot_block_names(names, case.body);
+            }
+            if let Some(body) = default {
+                snapshot_block_names(names, body);
+            }
+        },
+        TypeSwitch { binding, expr, cases, default } => {
+            if let Some(name) = binding {
+                add_name(names, name);
+            }
+            snapshot_expr_names(names, expr);
+            for case in cases {
+                snapshot_block_names(names, case.body);
+            }
+            if let Some(body) = default {
+                snapshot_block_names(names, body);
+            }
+        },
+        Select { cases, default } => {
+            for case in cases {
+                match case.operation {
+                    Receive { names: targets, channel } => {
+                        for name in targets {
+                            add_name(names, name);
+                        }
+                        snapshot_expr_names(names, channel);
+                    },
+                    Send { channel, value } => {
+                        snapshot_expr_names(names, channel);
+                        snapshot_expr_names(names, value);
+                    },
+                }
+                snapshot_block_names(names, case.body);
+            }
+            if let Some(body) = default {
+                snapshot_block_names(names, body);
+            }
+        },
+        _ => (),
+    }
+}
+
+fn snapshot_block_names(names: DceNames, value: Block) -> () {
+    for stmt in value.stmts {
+        snapshot_stmt_names(names, stmt);
+    }
+}
+
+fn snapshot_source(value: Expr, context: SnapshotContext) -> Option[Expr] {
+    match value {
+        Var { .. } => Some(value),
+        Field { expr, field_name } => Some(
+            Field { expr: snapshot_source(expr, context)?, field_name },
+        ),
+        Unary { op: Deref, expr } => Some(
+            Unary { op: UnaryOp::Deref, expr: snapshot_source(expr, context)? },
+        ),
+        Unary { op: Address, expr } => Some(
+            Unary { op: UnaryOp::Address, expr: snapshot_source(expr, context)? },
+        ),
+        Call { func: Var { name }, args } if args.len() == 1 => {
+            let fields = context.getters[name]?;
+            let mut result = snapshot_source(args[0], context)?;
+            for field in fields {
+                result = Field { expr: result, field_name: field };
+            }
+            Some(result)
+        },
+        _ => None,
+    }
+}
+
+fn snapshot_projection(value: Expr, name: string, replacement: Expr) -> Option[Expr] {
+    match value {
+        Var { name: source } if source == name => Some(replacement),
+        Field { expr, field_name } => {
+            let source = snapshot_projection(expr, name, replacement)?;
+            Some(
+                Field {
+                    expr: match source {
+                        Unary { op: Address, expr } => expr,
+                        _ => source,
+                    },
+                    field_name,
+                },
+            )
+        },
+        Index { base, index } => {
+            match index {
+                Var { name: source } if source != name => (),
+                Int { .. } => (),
+                _ => return None,
+            }
+            Some(Expr::Index { base: snapshot_projection(base, name, replacement)?, index })
+        },
+        Unary { op: Deref, expr } => {
+            let source = snapshot_projection(expr, name, replacement)?;
+            Some(
+                match source {
+                    Unary { op: Address, expr } => expr,
+                    _ => Unary { op: UnaryOp::Deref, expr: source },
+                },
+            )
+        },
+        _ => None,
+    }
+}
+
+fn snapshot_consumer(value: Stmt, name: string, replacement: Expr) -> Option[Stmt] {
+    match value {
+        Var { name: target, ty, value: Some(expr) } => {
+            if target == name {
+                return None
+            }
+            if let Func { .. } = ty {
+                return None
+            }
+            match expr {
+                Field { .. } | Index { .. } | Unary { op: Deref, .. } => (),
+                _ => return None,
+            }
+            Some(
+                Var { name: target, ty, value: Some(snapshot_projection(expr, name, replacement)?) },
+            )
+        },
+        _ => None,
+    }
+}
+
+fn snapshot_nested(value: Stmt, context: SnapshotContext) -> Stmt {
+    match value {
+        If { cond, then_, else_ } => If {
+            cond,
+            then_: snapshot_block(then_, context),
+            else_: else_.map(|body| snapshot_block(body, context)),
+        },
+        Loop { body } => Loop { body: snapshot_block(body, context) },
+        LabeledLoop { label, body } => LabeledLoop { label, body: snapshot_block(body, context) },
+        Range { names, expr, body } => Stmt::Range {
+            names,
+            expr,
+            body: snapshot_block(body, context),
+        },
+        Switch { expr, cases, default } => {
+            let lowered: Vec[SwitchCase] = Vec::new();
+            for case in cases {
+                lowered.push(
+                    SwitchCase { value: case.value, body: snapshot_block(case.body, context) },
+                );
+            }
+            Switch {
+                expr,
+                cases: lowered,
+                default: default.map(|body| snapshot_block(body, context)),
+            }
+        },
+        TypeSwitch { binding, expr, cases, default } => {
+            let lowered: Vec[TypeSwitchCase] = Vec::new();
+            for case in cases {
+                lowered.push(
+                    TypeSwitchCase { ty: case.ty, body: snapshot_block(case.body, context) },
+                );
+            }
+            TypeSwitch {
+                binding,
+                expr,
+                cases: lowered,
+                default: default.map(|body| snapshot_block(body, context)),
+            }
+        },
+        Select { cases, default } => {
+            let lowered: Vec[SelectCase] = Vec::new();
+            for case in cases {
+                lowered.push(
+                    SelectCase {
+                        operation: case.operation,
+                        body: snapshot_block(case.body, context),
+                    },
+                );
+            }
+            Select { cases: lowered, default: default.map(|body| snapshot_block(body, context)) }
+        },
+        _ => value,
+    }
+}
+
+fn snapshot_block(value: Block, context: SnapshotContext) -> Block {
+    let mut candidate = false;
+    for stmt in value.stmts {
+        if let Var { ty, value, .. } = stmt {
+            candidate = candidate || snapshot_aggregate(ty, context)
+                || match (ty, value) {
+                    (Pointer { .. }, Some(Unary { op: Address, .. })) => true,
+                    _ => false,
+                };
+        }
+    }
+    if !candidate {
+        let stmts: Vec[Stmt] = Vec::with_capacity(value.stmts.len());
+        for stmt in value.stmts {
+            stmts.push(snapshot_nested(stmt, context));
+        }
+        return Block { stmts }
+    }
+    let counts: HashMap[string, isize] = HashMap::new();
+    let uninitialized: HashMap[string, Type] = HashMap::new();
+    for stmt in value.stmts {
+        let names = new_dce_names();
+        snapshot_stmt_names(names, stmt);
+        for name in names {
+            counts[name] = counts[name].unwrap_or(0) + 1;
+        }
+        if let Var { name, ty, value: None } = stmt {
+            uninitialized[name] = ty;
+        }
+    }
+    let reversed: Vec[Stmt] = Vec::with_capacity(value.stmts.len());
+    let mut index = value.stmts.len();
+    while index > 0 {
+        index -= 1;
+        let stmt = snapshot_nested(value.stmts[index], context);
+        let candidate: Option[(string, Type, Expr)] = match stmt {
+            Var { name, ty, value: Some(source) } if counts[name].unwrap_or(0) == 2 => Some(
+                (name, ty, source),
+            ),
+            Assign { name, value: source } if counts[name].unwrap_or(0) == 3 => uninitialized[name].map(
+                |ty| (name, ty, source),
+            ),
+            _ => None,
+        };
+        let mut fused = false;
+        if let Some((name, ty, source)) = candidate {
+            let address = match (ty, source) {
+                (Pointer { .. }, Unary { op: Address, .. }) => true,
+                _ => false,
+            };
+            if name != "_" && !reversed.is_empty() && (snapshot_aggregate(ty, context) || address) {
+                let used = new_dce_names();
+                snapshot_expr_names(used, source);
+                if !used.contains(name) {
+                    if let Some(source) = snapshot_source(source, context) {
+                        let last = reversed.len() - 1;
+                        if let Some(next) = snapshot_consumer(reversed[last], name, source) {
+                            reversed[last] = next;
+                            fused = true;
+                            context.changed.set(true);
+                        }
+                    }
+                }
+            }
+        }
+        if !fused {
+            reversed.push(stmt);
+        }
+    }
+    let stmts: Vec[Stmt] = Vec::with_capacity(reversed.len());
+    let mut index = reversed.len();
+    while index > 0 {
+        index -= 1;
+        stmts.push(reversed[index]);
+    }
+    Block { stmts }
+}
+
+fn narrow_projection_snapshots(value: File) -> File {
+    let context = SnapshotContext {
+        aggregates: collections::HashSet::new(),
+        getters: HashMap::new(),
+        changed: Ref::new(false),
+    };
+    for item in value.items {
+        match item {
+            Struct(definition) => {
+                let _ = context.aggregates.insert(definition.name);
+            },
+            TypeDef(TypeDef { name, ty: Struct { .. } | Array { .. } }) => {
+                let _ = context.aggregates.insert(name);
+            },
+            _ => (),
+        }
+    }
+    for _ in 0..4 {
+        let mut changed = false;
+        for item in value.items {
+            if let Function(function) = item {
+                if context.getters[function.name].is_none() {
+                    if let Some(path) = snapshot_getter(function, context) {
+                        context.getters[function.name] = path;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break
+        }
+    }
+    let items: Vec[Item] = Vec::with_capacity(value.items.len());
+    for item in value.items {
+        items.push(
+            match item {
+                Function(function) => {
+                    context.changed.set(false);
+                    let body = snapshot_block(function.body, context);
+                    Function(
+                        Function {
+                            name: function.name,
+                            params: function.params,
+                            ret_ty: function.ret_ty,
+                            body: if context.changed.get() {
+                                eliminate_dead_vars(body)
+                            } else {
+                                function.body
+                            },
+                        },
+                    )
+                },
+                _ => item,
+            },
+        );
+    }
+    File { items }
+}

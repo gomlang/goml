@@ -92,3 +92,24 @@ The public PGO example deliberately reports an observed regression:
 Native throughput decreased by 38.63%; all six paired speed ratios were between 0.6126 and 0.6180. Both variants measured zero allocations in the work interval. Training used 40,000,000 interpreter steps. All four build records contain the same generated-source hash, and both supplied-profile builds report successful profile acceptance. Profile coverage remains unmeasured; the cause of this downstream PGO regression has not been isolated.
 
 Native, plain WASM, and PGO WASM all produced checksum `5556bcccd558a435` for 2,000,000 interpreter steps. WASM was executed in Node for correctness only; its raw times are excluded from the performance comparison. `_artifact/performance-pgo/results.json`, `samples.json`, `wasm-validation.json`, and the four `.build.json` files retain the evidence. This example demonstrates collection, application, target validation, and reporting of degradation without promising a speedup.
+
+## Ref snapshot narrowing (2026-10-24)
+
+The next optimization narrows adjacent, single-use aggregate snapshots before final Go function pruning. It recognizes field-only getters and verified forwarding wrappers, then combines immediate field and array projections. For example, `reference.get().nested.flag` can read `reference.value.nested.flag` directly. Intermediate borrowed field pointers can also disappear when their only use is the next value read. Retained snapshots, returned aggregate values, closure captures, escaping addresses, and intervening effects keep their value semantics. An index expression that mutates the reference must still observe the aggregate captured before that mutation. This is a local transformation, without a general alias-analysis or purity annotation contract.
+
+The public benchmark is [`tools/performance/ref-projection`](../tools/performance/ref-projection). Preserve a complete previous toolchain prefix before rebuilding, then compare its compiler with the candidate:
+
+```sh
+python3 tools/performance/projection.py --case ref \
+  --baseline /path/to/previous-prefix/bin/gomlc \
+  --candidate stage2/bin/gomlc \
+  --output _artifact/performance-ref-projection --samples 6
+```
+
+The `value` case remains the default. Both cases use the same harness protocol: all builds finish before sampling, one excluded warmup per executable, six alternating-order rounds pinned to one CPU, a checksum of 528 for each measured call, and recorded generated Go, assembly, escape diagnostics, compiler hashes, and raw allocation/timing samples. The `ref` case reads and sums 32 integers through `Ref[Large]` rather than through a value parameter.
+
+On Linux amd64 with Go 1.26.0 and PGO disabled, the compiler from `b36644100` measured 113.7 ns/call and the candidate measured 8.985 ns/call, approximately 12.65 times the throughput. Both measured 0 B/call and 0 allocations/call. The baseline assembly copies the aggregate inside the indexed loop; the candidate contains direct indexed loads and no aggregate copying in that loop. Results are retained under `_artifact/performance-ref-projection`. These are single-machine microbenchmark results, not whole-emulator or browser throughput.
+
+[`project113_ref_projection`](../gomlc/testdata/module/project113_ref_projection/main.goml) covers nested fields, array reads and writes, retained and returned snapshots, captured shared handles, side effects in indexes, loop/match/select paths, and discarded or observed out-of-bounds reads. Its assertions pass with both stage0 and the candidate. The candidate's generated Go also builds for `js/wasm` and passes the same assertions in Node; this is a functional check, not a WASM performance measurement.
+
+`just update-golden` and `just ci` passed in an isolated worktree containing the same implementation, test sources, and generated snapshots. Validation included 1,314 compiler tests, 407 driver/standard-library tests, stage3 fixed-point verification, extension packaging, and release smoke tests. Isolation avoided replacing stage2 executables being used by a separate emulator test run.

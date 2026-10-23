@@ -30,7 +30,7 @@ Go escape analysis, Go inlining, retained bounds checks, and runtime allocations
 
 GoML has value semantics and shared handles, without Rust-style exclusive borrowing or lifetime syntax. Large named-struct and fixed-array field reads can use generated Go pointers when the local root and binding are not assigned or reused as join parameters. Read-only indexing can then access original immutable storage without copying the containing array.
 
-Assignments, returned values, and closure environments retain ordinary value snapshots. `Ref.get()` and `Vec` lookup materialize a snapshot before field projection. Embedded `Ref` and `Vec` handles still share their storage. Constant array indexes retain bounds-panic semantics. Generated pointer syntax alone does not establish zero allocations; inspect the report and measure the actual workload.
+Assignments, returned values, and closure environments retain ordinary value snapshots. Adjacent, single-use field and array projections can narrow a temporary snapshot to the value actually read. This includes `Ref.get()` and verified forwarding getters: `reference.get().nested.flag` can load the flag directly, and immediate indexing can avoid copying the containing array. The transformation does not cross intervening statements, effectful index expressions, retained snapshots, or escaping addresses. `Vec` lookup still materializes its element snapshot. Embedded `Ref` and `Vec` handles still share their storage. Constant array indexes retain bounds-panic semantics. Generated pointer syntax alone does not establish zero allocations; inspect the report and measure the actual workload.
 
 ## PGO input and build records
 
