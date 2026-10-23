@@ -21,7 +21,7 @@ export GOML_HOME="$smoke_root/home"
 
 (
     cd "$repository_root/dist"
-    release_sha256 -c "$package.tar.gz.sha256"
+    toolchain_sha256 -c "$package.tar.gz.sha256"
 )
 
 tar -xzf "$repository_root/dist/$package.tar.gz" -C "$smoke_root"
@@ -63,9 +63,9 @@ cd "$smoke_root/go-export"
 export GOWORK=off GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off
 "$smoke_root/$package/bin/goml" check --compiler "$smoke_root/$package/bin/gomlc"
 "$smoke_root/$package/bin/goml" export-go . --compiler "$smoke_root/$package/bin/gomlc" --import-path example.com/host/gen/calclib --out ./gen/calclib
-release_sha256 gen/calclib/goml_generated.go gen/calclib/goml_exports.json > export-digests
+toolchain_sha256 gen/calclib/goml_generated.go gen/calclib/goml_exports.json > export-digests
 "$smoke_root/$package/bin/goml" export-go . --compiler "$smoke_root/$package/bin/gomlc" --import-path example.com/host/gen/calclib --out ./gen/calclib
-release_sha256 -c export-digests
+toolchain_sha256 -c export-digests
 rm calc.goml goml.toml
 (
     export PATH="$(dirname "$(command -v go)"):/usr/bin:/bin"
@@ -93,9 +93,9 @@ OUTPUT
 for attempt in 1 2; do
     test "$("$smoke_root/$package/bin/goml" run)" = "$expected_file_read"
     if test "$attempt" = 1; then
-        release_sha256 _artifact/build/pkg/ffi_file_read/goml_generated.go > file-read-digests
+        toolchain_sha256 _artifact/build/pkg/ffi_file_read/goml_generated.go > file-read-digests
     else
-        release_sha256 -c file-read-digests
+        toolchain_sha256 -c file-read-digests
     fi
 done
 test ! -e go.sum
@@ -118,9 +118,9 @@ OUTPUT
 for attempt in 1 2; do
     test "$("$smoke_root/$package/bin/goml" run)" = "$expected_callbacks"
     if test "$attempt" = 1; then
-        release_sha256 _artifact/build/pkg/ffi_callbacks/goml_generated.go > callback-digests
+        toolchain_sha256 _artifact/build/pkg/ffi_callbacks/goml_generated.go > callback-digests
     else
-        release_sha256 -c callback-digests
+        toolchain_sha256 -c callback-digests
     fi
 done
 test ! -e go.sum

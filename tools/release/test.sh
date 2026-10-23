@@ -28,23 +28,23 @@ for platform in linux-amd64 darwin-arm64; do
     printf '%s\n' "$platform" > "$archive_dir/$archive"
     (
         cd "$archive_dir"
-        release_sha256 "$archive" > "$archive.sha256"
+        toolchain_sha256 "$archive" > "$archive.sha256"
     )
 done
 bash tools/release/checksums.sh "$release_version" "$archive_dir"
 test "$(wc -l < "$archive_dir/SHA256SUMS" | tr -d ' ')" = 2
 (
     cd "$archive_dir"
-    release_sha256 -c SHA256SUMS
+    toolchain_sha256 -c SHA256SUMS
     ln -s "$(command -v shasum)" "$temporary/hash-bin/shasum"
     for tool in find sort xargs; do
         ln -s "$(command -v "$tool")" "$temporary/hash-bin/$tool"
     done
     (
         export PATH="$temporary/hash-bin"
-        release_sha256 -c SHA256SUMS
-        release_sha256 "goml-$release_version-linux-amd64.tar.gz" > fallback.sha256
-        release_sha256 -c - < fallback.sha256
+        toolchain_sha256 -c SHA256SUMS
+        toolchain_sha256 "goml-$release_version-linux-amd64.tar.gz" > fallback.sha256
+        toolchain_sha256 -c - < fallback.sha256
     )
     cmp fallback.sha256 "goml-$release_version-linux-amd64.tar.gz.sha256"
     toolchain_hash_files "$archive_dir" > "$temporary/tree.sha256"

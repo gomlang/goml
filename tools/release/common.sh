@@ -6,7 +6,3 @@ release_platform() {
         *) echo "unsupported release target: $1/$2" >&2; return 1 ;;
     esac
 }
-
-release_sha256() {
-    toolchain_sha256 "$@"
-}

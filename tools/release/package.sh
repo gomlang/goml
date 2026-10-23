@@ -51,5 +51,5 @@ done
 tar -C dist -czf "dist/$package.tar.gz" "$package"
 (
     cd dist
-    release_sha256 "$package.tar.gz" > "$package.tar.gz.sha256"
+    toolchain_sha256 "$package.tar.gz" > "$package.tar.gz.sha256"
 )

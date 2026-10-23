@@ -13,7 +13,7 @@ def markdown_files():
         ['git', 'ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', '*.md'],
         cwd=ROOT, check=True, capture_output=True, text=True,
     )
-    return sorted({ROOT / name for name in result.stdout.split('\0') if name})
+    return sorted({ROOT / name for name in result.stdout.split('\0') if name and (ROOT / name).is_file()})
 
 
 def sections(text):

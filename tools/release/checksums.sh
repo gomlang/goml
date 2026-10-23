@@ -9,7 +9,7 @@ cd "${2:-dist}"
 
 archives=("goml-$1-linux-amd64.tar.gz" "goml-$1-darwin-arm64.tar.gz")
 for archive in "${archives[@]}"; do
-    release_sha256 -c "$archive.sha256"
+    toolchain_sha256 -c "$archive.sha256"
 done
-release_sha256 "${archives[@]}" > SHA256SUMS.tmp
+toolchain_sha256 "${archives[@]}" > SHA256SUMS.tmp
 mv SHA256SUMS.tmp SHA256SUMS
