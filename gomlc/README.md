@@ -1,5 +1,7 @@
 # gomlc
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 `gomlc` is the complete self-hosted GoML compiler and language server. It implements:
 
 ```text

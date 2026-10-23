@@ -1,5 +1,7 @@
 # GoML
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 GoML is a statically typed programming language inspired by Go and Rust.
 
 The "ML" in GoML nods to the [ML (programming language)](https://en.wikipedia.org/wiki/ML_(programming_language)), whose descendants have deeply influenced Rust.

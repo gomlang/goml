@@ -1,5 +1,7 @@
 # Developing GoML
 
+[English](development.md) | [简体中文](development.zh-CN.md)
+
 Run recipes from the repository root. The toolchain build requires Linux amd64 or macOS arm64, Go 1.26+, `just`, Bash, curl, tar, and sha256sum or shasum. Tests require a C compiler for Go's race detector; full CI also uses Node 20+, npm, jq, Python 3, Perl's `shasum` for checksum portability tests, and Linux development headers for checking the generated syscall ABI and record layouts. See [.justfile](../.justfile) for all commands. The independent [gomlgo frontend and interpreter](https://github.com/gomlang/gomlgo) targets Go 1.26 and requires Go 1.26.x for execution and differential tests.
 
 ```sh
@@ -32,3 +34,13 @@ Explore [gomlc/testdata/pipeline](../gomlc/testdata/pipeline) for source program
 Direct Go FFI integration fixtures live under [goml/testdata/ffi](../goml/testdata/ffi) and are shared by driver regression tests and release smoke checks. Full SQLite and LLVM integrations are maintained in [gomlang/sqlite](https://github.com/gomlang/sqlite) and [gomlang/llvm](https://github.com/gomlang/llvm).
 
 See the [compiler](../gomlc/README.md) and [project driver](../goml/README.md) documentation for component-specific commands and architecture.
+
+## Bilingual documentation
+
+English documentation remains canonical at its existing paths. Every repository Markdown document has a complete Simplified Chinese translation beside it, named with the `.zh-CN.md` suffix. Keep both versions up to date in the same change when adding or changing documentation, language semantics, public APIs, or development workflows. `AGENTS.md` remains the authoritative instruction file; its Chinese counterpart is a reading reference.
+
+Preserve code examples, commands, API identifiers, and diagnostic/output text in both languages. Use consistent terminology: package (包), module (模块), monomorphization (单态化), closure lifting (闭包提升), and compile-time evaluation (编译期求值); retain `trait` and IR names where they identify language or compiler concepts. Translate explanatory prose fully rather than replacing sections with summaries.
+
+Each document includes an `English | 简体中文` switch. Chinese links point to Chinese counterparts where available. Preserve English heading fragments in Chinese documents with explicit anchors so existing cross-references remain valid. When changing headings, update links and anchors together.
+
+Run `just check-docs` (or `python3 tools/check-docs.py`) from the repository root to check bilingual coverage, language switches, heading structure, code examples, and local links and anchors. These checks detect structural drift; reviewers still need to check translation accuracy and completeness. Documentation-only changes require the applicable documentation checks, not the full compiler CI suite.

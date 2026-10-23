@@ -1,5 +1,7 @@
 # Compile-time evaluation architecture
 
+[English](comptime.md) | [简体中文](comptime.zh-CN.md)
+
 GoML compile-time evaluation is a typed frontend phase:
 
 ```text

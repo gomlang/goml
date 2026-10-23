@@ -1,5 +1,7 @@
 # Unicode data
 
+[English](DATA.md) | [简体中文](DATA.zh-CN.md)
+
 All public tables are pinned to Unicode 15.0.0. The seven tables_*.goml files are
 generated from the Go 1.26 unicode package by tools/generate_unicode_tables.go.
 The generator rejects any other Unicode version, sorts named tables and emits

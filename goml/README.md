@@ -1,5 +1,7 @@
 # goml project driver
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 `goml` is the self-hosted project driver. It provides project creation, package discovery, check/build/run/test plans, named examples, dependency resolution, registry cache management, incremental artifact fingerprints, native linking, and parallel test execution.
 
 See [repository development](../docs/development.md) for requirements,

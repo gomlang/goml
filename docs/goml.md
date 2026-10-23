@@ -1,5 +1,7 @@
 # GoML language guide
 
+[English](goml.md) | [简体中文](goml.zh-CN.md)
+
 This guide describes the GoML syntax, type rules, tools, and built-in prelude implemented in this repository. Standard-library APIs are documented in the [standard library reference](stdlib.md). Use it when writing, modifying, and reviewing `.goml` source. Similarities to Rust, Go, or OCaml do not imply that their syntax or APIs are supported.
 
 GoML is a statically typed language with garbage collection. Its syntax is close to Rust, while its semantics are closer to ML. The compiler monomorphizes generics and lambda-lifts GoML closures before emitting Go. Explicit Go FFI can preserve native generic types and function values. GoML has no ownership, borrowing, lifetimes, or manual memory management.

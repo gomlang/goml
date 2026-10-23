@@ -1,5 +1,7 @@
 # File reading across the Go boundary
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 From the repository root, build the toolchain and run this fixture:
 
 ```sh

@@ -1,0 +1,43 @@
+<a id="goml-vs-code-extension"></a>
+
+# GoML VS Code 扩展
+
+[English](README.md) | [简体中文](README.zh-CN.md)
+
+此扩展为 `.goml` 文件提供语法高亮、诊断、悬停信息、补全、跳转到定义、签名帮助、内嵌提示、格式化、测试 CodeLens 和快速修复。
+
+类型内嵌提示使用简短类型名，长度预算为 25 个字符。较长的类型使用 `…`，同时保留外层结构；将鼠标悬停在提示上可查看包含包路径的完整类型。
+
+未使用的 `Result` 和无效的 `?` 诊断提供稳定的代码和处理建议。传播错误会链接到所在函数的返回类型。未使用 Result 的快速修复通过 `let _ = ...` 显式忽略错误；应用前请确认这一选择。旧文档版本对应的修复会被丢弃。
+
+状态栏显示语言服务器处于启动、就绪、停止或忙碌状态。忙碌时显示当前服务器操作和已用时间。悬停状态项可查看排队中的客户端请求，点击可打开语言服务器输出。耗时至少两秒的操作会以警告形式记录在那里。
+
+编辑暂停后运行诊断，而补全会立即复用最近检查过的类型。保存时立即请求诊断，无需等待编辑延迟。包检查在编辑之间复用未变更的依赖。Go FFI 分析使用 GoML 中声明的签名，将外部 Go 类型视为不透明类型。原生符号、方法和泛型约束错误由最终 Go 构建报告。
+
+在仓库根目录构建自托管语言服务器和扩展：
+
+```sh
+just vscode-ext
+```
+
+将 `editors/vscode` 作为 VS Code 工作区打开，按 F5 启动 Extension Development Host。启动任务会运行 `npm run compile`。
+
+使用 **GoML: Show Expanded Derive** 查看当前文档在 derive 展开后的 AST。**GoML: Show Language Server Output** 打开服务器日志。测试 CodeLens 会保存源文件，然后从该源文件所在目录调用 `goml test`，传入所选测试的名称和种类。请设置 `goml.driverPath` 或将项目驱动器加入 `PATH`；即使工作区包含多个模块，模块发现也会从测试文件开始。保存失败会取消测试运行。
+
+使用 **Format Document** 格式化当前 GoML 缓冲区。语言服务器使用 GoML 的固定格式化规则，语法无效的文档保持不变。
+
+捆绑的服务器针对宿主平台构建。自定义服务器需要完整的可执行文件相对工具链资源，以及匹配的 `goml` 项目驱动器。详情见[语言指南](../../docs/goml.zh-CN.md#lsp-and-editor)和[格式化规则](../../docs/formatting.zh-CN.md)。
+
+配置项：
+
+- `goml.driverPath` 选择用于模块和依赖解析的匹配项目驱动器。
+- `goml.serverPath` 覆盖捆绑的或通过 `PATH` 解析的 `gomllsp`。
+- `goml.trace.server` 控制语言服务器跟踪。
+
+使用以下命令打包 `.vsix`：
+
+```sh
+just package-vscode-ext
+```
+
+包写入 `editors/vscode/goml-<version>.vsix`。打包时，相对于 `editors/vscode` 的 README 链接会解析到仓库的 `main` 分支。CI 也会打包扩展，以验证此步骤。

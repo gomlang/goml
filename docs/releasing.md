@@ -1,5 +1,7 @@
 # Releasing goml
 
+[English](releasing.md) | [简体中文](releasing.zh-CN.md)
+
 Releases use strict `vX.Y.Z` tags and publish Linux amd64 and macOS arm64 binaries.
 
 The Go compatibility baseline is Go 1.26. Build and validate releases with Go 1.26.x; users need Go 1.26 or newer to compile generated programs, including their explicit foreign calls. The archives do not bundle a Go toolchain.

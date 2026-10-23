@@ -1,5 +1,7 @@
 # GoML VS Code extension
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 The extension provides syntax highlighting, diagnostics, hover, completion, go-to-definition, signature help, inlay hints, formatting, test code lenses, and quick fixes for `.goml` files.
 
 Type inlay hints use short type names and a 25-character budget. Long types use `…` while preserving their outer structure; hover over a hint to see its full type, including package paths.

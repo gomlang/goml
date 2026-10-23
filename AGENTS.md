@@ -1,8 +1,12 @@
 # Repository Guidelines
 
+[English](AGENTS.md) | [简体中文](AGENTS.zh-CN.md)
+
 goml is a statically typed, garbage-collected language with Rust-like syntax that compiles to Go. Sources use `.goml`; there is no ownership system or lifetime syntax. The compiler monomorphizes generics and lambda-lifts GoML closures.
 
 ## Documentation and Source Map
+
+This file is the authoritative agent instruction entry point. [AGENTS.zh-CN.md](AGENTS.zh-CN.md) is its Chinese reference translation. Keep both versions synchronized; the translation does not define an additional instruction scope.
 
 Read the documentation relevant to the change:
 
@@ -51,6 +55,7 @@ Run recipes from the repository root; [.justfile](.justfile) is the command refe
 - `goml check`, `goml build`, and `goml test` discover the enclosing `goml.toml` and operate on the complete module, without package targets. `--dry-run` prints planned commands.
 - The driver finds `gomlc` through `--compiler`, `GOMLC`, a sibling binary, `GOML_HOME/bin`, then `PATH`, and verifies the driver protocol.
 - Run checks relevant to the change. Run `just ci` locally for changes affecting bootstrap compatibility, toolchain construction, or packaging, for release preparation, or when explicitly requested. Read-only reviews and documentation-only changes require only applicable checks.
+- Maintain English and Simplified Chinese documentation together: keep existing English paths and pair each Markdown document with a `.zh-CN.md` translation. Update both in the same change, preserve code examples and API names, and validate coverage and local links with `python3 tools/check-docs.py`. See [documentation maintenance](docs/development.md) for details.
 - gomlgo is maintained in its own repository and uses its own test workflow. After checks pass, rerun or broaden them only when new changes, failures, or unresolved concerns warrant it.
 
 ## Coding and Architecture Rules

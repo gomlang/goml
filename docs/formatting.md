@@ -1,5 +1,7 @@
 # GoML formatting
 
+[English](formatting.md) | [简体中文](formatting.zh-CN.md)
+
 `gomlfmt` is the canonical formatter for GoML source code. It parses source into the lossless concrete syntax tree, converts that tree into a document describing possible line breaks, and renders the document at a fixed width.
 
 Formatting never uses the lowered AST. Comments, identifiers, numeric spelling, character and byte escapes, strings, and interpolated-string text are emitted from their original lexer tokens. Multiline strings retain their marker and content text while the layout indentation before each marker is normalized.

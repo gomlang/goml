@@ -1,5 +1,7 @@
 # GoML API documentation
 
+[English](documentation.md) | [简体中文](documentation.zh-CN.md)
+
 `gomldoc` generates documentation from checked GoML source. It shares package analysis, dependency navigation, derive expansion, and type checking with the compiler query engine. Documentation generation does not build a native executable. Compile-time evaluation and Go FFI validation still follow normal analysis rules.
 
 ## Commands

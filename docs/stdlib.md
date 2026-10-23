@@ -1,5 +1,7 @@
 # GoML standard library
 
+[English](stdlib.md) | [简体中文](stdlib.zh-CN.md)
+
 This reference describes the standard-library APIs implemented in this repository. See the [language guide](goml.md) for syntax and type rules, its [prelude reference](goml.md#built-in-prelude) for automatically scoped APIs, and [library boundaries](library-boundaries.md) for the division between standard and ecosystem packages.
 
 Quick navigation: [packages](#packages), [text](#text-and-source-positions), [collections](#slice-algorithms-and-checked-vector-edits), [I/O](#composable-io), [filesystems](#portable-read-only-filesystems), [networking](#networking), [Serde and JSON](#serde-and-json), [concurrency](#structured-concurrency), and [common tasks](#common-tasks).
@@ -812,7 +814,7 @@ fn quotient() -> Result[complex::Complex, complex::DivisionError] {
 }
 ```
 
-The separate [`ecosystem::bigmath`](../../gomlang/bigmath/README.md) module
+The separate [`ecosystem::bigmath`](https://github.com/gomlang/bigmath/blob/HEAD/README.md) module
 provides bounded arbitrary-precision rational and binary floating-point
 arithmetic over `ecosystem::bigint`. `Rational` normalizes fractions exactly;
 `Float` uses an explicit 1–4096-bit precision and rounding context. It reports
@@ -1343,21 +1345,21 @@ This is deliberately stricter than Go's searching decoder: malformed candidates,
 
 For example, `pem::decode(source, 1048576, 65536, 16)` accepts at most a one-MiB input containing a block with 64-KiB decoded content and 16 headers. Existing generic containers, structs, enums and calls express these APIs; no grammar or compiler intrinsic is added.
 
-The separate [`ecosystem::asn1`](../../gomlang/asn1/README.md) module provides
+The separate [`ecosystem::asn1`](https://github.com/gomlang/asn1/blob/HEAD/README.md) module provides
 bounded canonical DER/OID encoding and decoding with explicit `Value` and
 `Schema` trees. It accepts a documented subset of ASN.1 tags, requires a
 caller-supplied schema for typed validation, and uses no reflection. Its
 `Limits` bound bytes, sequence depth, elements and OID arcs.
-The separate [`ecosystem::x509::pkix`](../../gomlang/x509/README.md)
+The separate [`ecosystem::x509::pkix`](https://github.com/gomlang/x509/blob/HEAD/README.md)
 package builds on those bounded DER primitives for distinguished Names,
 algorithm identifiers and extensions. It represents certificate data only;
 chain verification, trust stores and TLS are outside its API.
-The separate [`ecosystem::xml`](../../gomlang/xml/README.md) module offers a
+The separate [`ecosystem::xml`](https://github.com/gomlang/xml/blob/HEAD/README.md) module offers a
 bounded incremental XML token reader/writer with namespace resolution and an
 explicit flat-struct serde schema. It accepts UTF-8 XML 1.0 and rejects DTDs
 and external entities; it does not perform schema validation.
-For object and debug metadata, [`ecosystem::object::elf`](../../gomlang/object/README.md)
-reads bounded ELF32/64 files, and [`ecosystem::dwarf`](../../gomlang/dwarf/README.md)
+For object and debug metadata, [`ecosystem::object::elf`](https://github.com/gomlang/object/blob/HEAD/README.md)
+reads bounded ELF32/64 files, and [`ecosystem::dwarf`](https://github.com/gomlang/dwarf/blob/HEAD/README.md)
 reads selected DWARF32 v2–v5 units and line tables through bounded random
 access. Their supported subsets and error limits are documented by each module.
 
@@ -1368,7 +1370,7 @@ access. Their supported subsets and error limits are documented by each module.
 `Duration` provides checked and saturating scaled constructors, addition, subtraction, and multiplication. Checked operations return `None` on overflow, underflow, or a negative input. Saturating operations clamp to zero or the largest signed 64-bit nanosecond value. `Duration`, `Instant`, and `SystemTime` expose `compare`; `Instant::checked_duration_since` returns `None` when the receiver precedes the supplied instant.
 
 For calendar time and named zones, the separate
-[`ecosystem::datetime::tzdata`](../../gomlang/datetime/tzdata/README.md) package
+[`ecosystem::datetime::tzdata`](https://github.com/gomlang/datetime/blob/HEAD/tzdata/README.md) package
 embeds a versioned 2026c TZif snapshot. `names`, `contains`, `checksum`,
 `zone_bytes`, `load` and `load_versioned` expose the verified zone data through
 the existing `datetime::TimeZone` parser. The embedded snapshot is fixed until
@@ -3464,15 +3466,15 @@ fn connect_example() -> Result[tls::TlsStream, io::Error] {
 
 ## HTTP ecosystem packages
 
-The separate [`ecosystem::request`](../../gomlang/request/README.md) client provides scoped `send_stream` downloads, `send_reader` uploads from `io::Read`, cancellation-aware variants, bounded chunks and copying, and incremental SSE decoding. Response handles expire when the callback returns. Streaming uses HTTP/1.1 over TCP or verified TLS, including CONNECT proxies; the existing buffered client retains its HTTP/2 path. Streamed uploads cannot be automatically replayed for redirects that preserve the body. Compression and SSE reconnection behavior are explicit in the client README.
+The separate [`ecosystem::request`](https://github.com/gomlang/request/blob/HEAD/README.md) client provides scoped `send_stream` downloads, `send_reader` uploads from `io::Read`, cancellation-aware variants, bounded chunks and copying, and incremental SSE decoding. Response handles expire when the callback returns. Streaming uses HTTP/1.1 over TCP or verified TLS, including CONNECT proxies; the existing buffered client retains its HTTP/2 path. Streamed uploads cannot be automatically replayed for redirects that preserve the body. Compression and SSE reconnection behavior are explicit in the client README.
 
-The [`ecosystem::web`](../../gomlang/web/README.md) server supplies a TLS listener, WebSocket response upgrades, incremental multipart extraction, bounded static file serving, CORS and buffered gzip negotiation. TLS uses the public `std::net::tls` pending-accept, handshake, address and abort APIs; the library and its consumers need no user Go FFI or `go.mod`. The listener supports HTTP/1.0 and HTTP/1.1. Multipart fields and upgraded connections follow request lifetime and cancellation rules. Static files reject symlinks and traversal and support ETags, HEAD and single byte ranges. These library APIs use ordinary imports and do not add language grammar.
+The [`ecosystem::web`](https://github.com/gomlang/web/blob/HEAD/README.md) server supplies a TLS listener, WebSocket response upgrades, incremental multipart extraction, bounded static file serving, CORS and buffered gzip negotiation. TLS uses the public `std::net::tls` pending-accept, handshake, address and abort APIs; the library and its consumers need no user Go FFI or `go.mod`. The listener supports HTTP/1.0 and HTTP/1.1. Multipart fields and upgraded connections follow request lifetime and cancellation rules. Static files reject symlinks and traversal and support ETags, HEAD and single byte ranges. These library APIs use ordinary imports and do not add language grammar.
 
 ## Filesystem ecosystem packages
 
 Recursive directory traversal and filesystem notifications are independent
-third-party modules: [`ecosystem::walkdir`](../../gomlang/walkdir/README.md) and
-[`ecosystem::notify`](../../gomlang/notify/README.md). They use public standard
+third-party modules: [`ecosystem::walkdir`](https://github.com/gomlang/walkdir/blob/HEAD/README.md) and
+[`ecosystem::notify`](https://github.com/gomlang/notify/blob/HEAD/README.md). They use public standard
 filesystem, syscall, task and time APIs. Their sources are no longer bundled
 with the toolchain as `std::fs::walkdir` or `std::fs::notify`.
 

@@ -1,3 +1,5 @@
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 These native tests retain the generated and mutated inputs from the former
 standard-library integration fixture. Files in `known_answers/` freeze Go 1.26.0
 `net/url` and `net/netip` reference results for 42568 distinct argument sets.

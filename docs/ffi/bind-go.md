@@ -1,5 +1,7 @@
 # Go interoperability
 
+[English](bind-go.md) | [简体中文](bind-go.zh-CN.md)
+
 GoML calls Go through explicit foreign declarations. The compiler checks the declared GoML types and trusts the binding author's signature. The final Go build checks native symbol existence, assignability, method sets and generic constraints. `goml check` and editor analysis do not load Go package metadata.
 
 ```goml
