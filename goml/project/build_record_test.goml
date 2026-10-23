@@ -1,0 +1,208 @@
+package project;
+
+use module::failure;
+use module::test_support;
+use std::fs;
+use std::json;
+use std::path;
+use std::process;
+use std::testing;
+use std::time;
+
+fn record_test_context(name: string, pgo: Option[string]) -> Context {
+    let root = test_support::workspace(name);
+    let context = cancellation_test_context(root, test_support::gomlc_binary());
+    Context {
+        build_options: BuildOptions { pgo, record: true, explain: None },
+        native_environment: Vec::from_array(
+            [("CGO_ENABLED", "0"), ("GOFLAGS", ""), ("GOTOOLCHAIN", "local")],
+        ),
+        ..context,
+    }
+}
+
+fn record_test_build(context: Context, output: string) -> Result[(), failure::Failure] {
+    execute_plan(
+        context,
+        Plan {
+            commands: Vec::from_array([GoBuild { input: "main.go", output }]),
+            executable: Some(output),
+            test_groups: Vec::new(),
+        },
+        false,
+        1,
+    )
+}
+
+fn read_record(context: Context, output: string) -> json::Value {
+    testing::expect_ok(
+        json::parse(test_support::read_file(build_record_path(context, output))),
+        "build record",
+    )
+}
+
+fn record_text(value: json::Value, key: string) -> string {
+    json::field(value, key).and_then(json::as_string).unwrap_or("")
+}
+
+fn record_bool(value: json::Value, key: string) -> bool {
+    json::field(value, key).and_then(json::as_bool).unwrap_or(false)
+}
+
+#[test]
+fn build_record_resolves_explicit_profiles_from_module_root() -> () {
+    let context = record_test_context("pgo_resolution", Some("training cpu.pgo"));
+    testing::assert_eq(
+        effective_pgo(context).unwrap_or(""),
+        path::join(context.graph.module_dir, "training cpu.pgo"),
+    );
+    let automatic = Context {
+        build_options: BuildOptions { pgo: Some("auto"), ..context.build_options },
+        ..context,
+    };
+    testing::assert_eq(effective_pgo(automatic).unwrap_or(""), "off");
+    test_support::write_file(path::join(context.graph.module_dir, "default.pgo"), "profile");
+    testing::assert_eq(
+        effective_pgo(automatic).unwrap_or(""),
+        path::join(context.graph.module_dir, "default.pgo"),
+    );
+    testing::assert(
+        effective_pgo(Context { build_options: default_build_options(), ..context }).is_none(),
+    );
+}
+
+#[test]
+fn build_record_tracks_native_and_wasm_pgo_and_invalidates_failures() -> () {
+    let context = record_test_context("pgo_build_records", Some("off"));
+    let root = context.graph.module_dir;
+    test_support::write_file(
+        path::join(root, "main.go"),
+        \\package main
+        \\import ("fmt"; "os"; "runtime/pprof"; "time")
+        \\func hot(n int) int { s := 0; for i := 0; i < n; i++ { s += i ^ (s >> 1) }; return s }
+        \\func main() {
+        \\    if len(os.Args) > 1 {
+        \\        f, err := os.Create(os.Args[1]); if err != nil { panic(err) }
+        \\        if err := pprof.StartCPUProfile(f); err != nil { panic(err) }
+        \\        end := time.Now().Add(200*time.Millisecond)
+        \\        for time.Now().Before(end) { hot(100000) }
+        \\        pprof.StopCPUProfile(); if err := f.Close(); err != nil { panic(err) }
+        \\    }
+        \\    fmt.Println(hot(10000))
+        \\}
+        \\
+        ,
+    );
+    testing::expect_ok(record_test_build(context, "plain"), "ordinary build");
+    let plain = read_record(context, "plain");
+    testing::assert(record_bool(plain, "success"));
+    testing::assert(!record_bool(plain, "profile_read"));
+    testing::assert_eq(record_text(plain, "pgo_effective"), "off");
+    testing::assert_eq(
+        record_text(plain, "artifact_sha256"),
+        testing::expect_ok(fs::sha256_file(path::join(root, "plain")), "binary hash"),
+    );
+    testing::assert_eq(
+        record_text(plain, "generated_source_sha256"),
+        testing::expect_ok(fs::sha256_file(path::join(root, "main.go")), "source hash"),
+    );
+    let trained = testing::expect_ok(
+        process::Command::new(path::join(root, "plain")).arg(path::join(root, "training cpu.pgo")).output_timeout_structured(
+            time::Duration::from_milliseconds(10000),
+        ),
+        "profile collection",
+    );
+    test_support::assert_success(trained);
+    let profile_context = Context {
+        build_options: BuildOptions { pgo: Some("training cpu.pgo"), ..context.build_options },
+        ..context,
+    };
+    testing::expect_ok(record_test_build(profile_context, "optimized"), "PGO build");
+    let optimized = read_record(profile_context, "optimized");
+    testing::assert(record_bool(optimized, "success"));
+    testing::assert(record_bool(optimized, "profile_read"));
+    testing::assert_eq(record_text(optimized, "profile_match"), "not-measured");
+    testing::assert_eq(
+        record_text(optimized, "profile_sha256"),
+        testing::expect_ok(fs::sha256_file(path::join(root, "training cpu.pgo")), "profile hash"),
+    );
+    let output = testing::expect_ok(
+        process::Command::new(path::join(root, "optimized")).output_structured(),
+        "PGO execution",
+    );
+    test_support::assert_success(output);
+    testing::assert_eq(test_support::stdout(output), test_support::stdout(trained));
+    let wasm_environment = Vec::new();
+    for entry in context.native_environment {
+        wasm_environment.push(entry);
+    }
+    wasm_environment.push(("GOOS", "js"));
+    wasm_environment.push(("GOARCH", "wasm"));
+    let wasm = Context { native_environment: wasm_environment, ..profile_context };
+    testing::expect_ok(record_test_build(wasm, "optimized.wasm"), "WASM PGO build");
+    let wasm_record = read_record(wasm, "optimized.wasm");
+    testing::assert(record_bool(wasm_record, "success"));
+    testing::assert(record_bool(wasm_record, "profile_read"));
+    let environment = json::field(wasm_record, "go_environment").unwrap_or(Null);
+    testing::assert_eq(record_text(environment, "GOOS"), "js");
+    testing::assert_eq(record_text(environment, "GOARCH"), "wasm");
+    testing::assert_eq(
+        record_text(wasm_record, "artifact_sha256"),
+        testing::expect_ok(fs::sha256_file(path::join(root, "optimized.wasm")), "WASM hash"),
+    );
+    let wasm_plain = Context { build_options: context.build_options, ..wasm };
+    testing::expect_ok(record_test_build(wasm_plain, "plain.wasm"), "ordinary WASM build");
+    testing::assert(!record_bool(read_record(wasm_plain, "plain.wasm"), "profile_read"));
+    let missing = Context {
+        build_options: BuildOptions { pgo: Some("missing.pgo"), ..context.build_options },
+        ..context,
+    };
+    test_support::assert_contains(
+        testing::expect_err(record_test_build(missing, "optimized"), "missing profile").to_string(),
+        "PGO profile",
+    );
+    let missing_record = read_record(missing, "optimized");
+    testing::assert(!record_bool(missing_record, "success"));
+    testing::assert_eq(record_text(missing_record, "artifact_sha256"), "");
+    test_support::write_file(path::join(root, "broken.pgo"), "invalid profile");
+    let corrupt = Context {
+        build_options: BuildOptions { pgo: Some("broken.pgo"), ..context.build_options },
+        ..context,
+    };
+    testing::assert(record_test_build(corrupt, "optimized").is_err());
+    testing::assert(!record_bool(read_record(corrupt, "optimized"), "success"));
+    let unrecorded = Context { build_options: default_build_options(), ..context };
+    testing::expect_ok(record_test_build(unrecorded, "plain"), "unrecorded build");
+    testing::assert(!fs::exists(build_record_path(context, "plain")));
+}
+
+#[test]
+fn build_record_pgo_overrides_inherited_flags_in_plain_and_simd_builds() -> () {
+    let context = record_test_context("pgo_flag_override", Some("off"));
+    let environment = Vec::from_array(
+        [
+            ("CGO_ENABLED", "0"),
+            ("GOFLAGS", "-pgo=missing-profile.pgo"),
+            ("GOTOOLCHAIN", "local"),
+            ("GOML_SIMD", "scalar"),
+        ],
+    );
+    let context = Context { native_environment: environment, ..context };
+    let source = path::join(context.graph.module_dir, "main.go");
+    test_support::write_file(source, "package main\nfunc main() {}\n");
+    testing::expect_ok(
+        record_test_build(context, "plain"),
+        "explicit PGO overrides inherited flags",
+    );
+    test_support::write_file(
+        source,
+        "package main\nconst _goml_simd_native = true\nfunc main() {}\n",
+    );
+    testing::expect_ok(record_test_build(context, "simd"), "SIMD PGO overrides inherited flags");
+    let record = read_record(context, "simd");
+    testing::assert(record_bool(record, "success"));
+    let flags = record_text(json::field(record, "go_environment").unwrap_or(Null), "GOFLAGS");
+    test_support::assert_contains(flags, "-pgo=missing-profile.pgo");
+    testing::assert(flags.ends_with("-pgo=off"));
+    testing::assert_eq(record_text(record, "pgo_effective"), "off");
+}

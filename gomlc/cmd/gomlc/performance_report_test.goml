@@ -1,0 +1,225 @@
+package main;
+
+use module::anf;
+use module::ast;
+use module::go_backend;
+use module::hash;
+use module::parser;
+use module::test_support;
+use std::fs;
+use std::path;
+use std::utf8;
+use utf8::BytesUtf8;
+use std::json;
+use std::testing;
+
+fn performance_test_field(value: json::Value, key: string) -> json::Value {
+    json::field(value, key).unwrap_or(json::Value::Null)
+}
+
+fn performance_test_string(value: json::Value, key: string) -> string {
+    json::as_string(performance_test_field(value, key)).unwrap_or("")
+}
+
+#[test]
+fn performance_report_maps_main_to_source_and_is_deterministic() -> () {
+    let source = "\nfn main() -> () {}\n";
+    let stage = lower_core_stage("cost.goml", source);
+    let lowered = lower_anf_stage(
+        lower_lift_stage(lower_mono_or_fail(stage.file), stage.counter),
+        stage.counter,
+    );
+    let generated = match go_backend::lower_with_source_names(lowered) {
+        Ok(value) => value,
+        Err(error) => return testing::fail(error),
+    };
+    let unit = binary_core_fixture();
+    for origin in artifact_source_origins(
+        "audit::value",
+        Vec::from_array(["cost.goml"]),
+        Vec::from_array([ast::lower(parser::parse(source))]),
+        Vec::from_array([source]),
+    ) {
+        unit.source_origins.push(origin);
+    }
+    let go_source = go_backend::encode(generated.file);
+    let decisions = Vec::from_array(
+        [
+            anf::InlineDecision {
+                caller: "main",
+                callee: "external",
+                allowed: false,
+                reason: "unavailable-body",
+                cost: 0,
+                cost_limit: 0,
+                budget_before: 48,
+            },
+        ],
+    );
+    let encoded = linked_performance_report(
+        Vec::from_array([unit]),
+        Vec::new(),
+        Vec::new(),
+        generated,
+        lowered,
+        decisions,
+        go_source,
+        "audit::value",
+    );
+    testing::assert_eq(
+        encoded,
+        linked_performance_report(
+            Vec::from_array([unit]),
+            Vec::new(),
+            Vec::new(),
+            generated,
+            lowered,
+            decisions,
+            go_source,
+            "audit::value",
+        ),
+    );
+    let value = match json::parse(encoded) {
+        Ok(value) => value,
+        Err(error) => return testing::fail(error.to_string()),
+    };
+    testing::assert_eq(performance_test_string(value, "kind"), "goml-performance");
+    testing::assert_eq(performance_test_string(value, "source_precision"), "enclosing-declaration");
+    testing::assert_eq(
+        performance_test_string(value, "generated_source_sha256"),
+        hash::sha256_hex(go_source),
+    );
+    let sources = json::as_array(performance_test_field(value, "sources")).unwrap_or_else(
+        || Vec::new(),
+    );
+    testing::assert_eq(sources.len(), 1);
+    testing::assert_eq(performance_test_string(sources[0], "source_symbol"), "audit::value::main");
+    testing::assert_eq(performance_test_string(sources[0], "source_file"), "cost.goml");
+    testing::assert_eq(json::encode(performance_test_field(sources[0], "line")), "2");
+    testing::assert_eq(json::encode(performance_test_field(sources[0], "column")), "4");
+    let events = json::as_array(performance_test_field(value, "events")).unwrap_or_else(
+        || Vec::new(),
+    );
+    let decision = events[events.len() - 1];
+    testing::assert_eq(performance_test_string(decision, "stage"), "anf");
+    testing::assert_eq(performance_test_string(decision, "certainty"), "compiler-decision");
+    testing::assert_eq(
+        performance_test_string(performance_test_field(decision, "source"), "source_file"),
+        "cost.goml",
+    );
+    testing::assert(encoded.contains("not dynamic executions or heap allocations"));
+}
+
+#[test]
+fn parses_optional_performance_report_and_rejects_duplicate_flags() -> () {
+    let args = command_args_with(
+        "link",
+        Vec::from_array(["--input", "value.core", "--entry", "audit::value", "--output", "main.go"]),
+    );
+    let normal = match parse_link_command_args(args) {
+        Ok(value) => value,
+        Err(error) => return testing::fail(error.to_string()),
+    };
+    testing::assert(!normal.explain_performance);
+    args.push("--explain-performance");
+    let explain = match parse_link_command_args(args) {
+        Ok(value) => value,
+        Err(error) => return testing::fail(error.to_string()),
+    };
+    testing::assert(explain.explain_performance);
+    args.push("--explain-performance");
+    testing::assert(parse_link_command_args(args).is_err());
+}
+
+fn performance_test_command(arguments: Vec[string]) -> Result[(), string] {
+    let output = test_support::compiler_command(arguments)?.output_structured().map_err(
+        |error| error.to_string(),
+    )?;
+    if output.status().success() {
+        Ok(())
+    } else {
+        Err(output.stderr().to_string_utf8().unwrap_or("compiler command failed"))
+    }
+}
+
+fn exercise_performance_link(directory: string) -> Result[(), string] {
+    fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    let source = path::join(directory, "main.goml");
+    let output = path::join(directory, "generated.go");
+    let report = output + ".performance.json";
+    fs::write_file_structured(source, "package main;\nfn main() -> () { println(42); }\n").map_err(
+        |error| error.to_string(),
+    )?;
+    performance_test_command(
+        Vec::from_array(
+            [
+                "build",
+                "--package",
+                "audit::value",
+                "--module",
+                "audit",
+                "--input",
+                source,
+                "--output",
+                path::join(directory, "value"),
+            ],
+        ),
+    )?;
+    let arguments = Vec::from_array(
+        [
+            "link",
+            "--input",
+            path::join(directory, "value.core"),
+            "--entry",
+            "audit::value",
+            "--output",
+            output,
+        ],
+    );
+    performance_test_command(arguments)?;
+    testing::assert(!fs::is_file(report));
+    let ordinary = fs::read_file_structured(output).map_err(|error| error.to_string())?;
+    let explained = Vec::new();
+    for argument in arguments {
+        explained.push(argument);
+    }
+    explained.push("--explain-performance");
+    performance_test_command(explained)?;
+    testing::assert_eq(
+        ordinary,
+        fs::read_file_structured(output).map_err(|error| error.to_string())?,
+    );
+    let first = fs::read_file_structured(report).map_err(|error| error.to_string())?;
+    let value = json::parse(first)?;
+    testing::assert_eq(
+        performance_test_string(value, "generated_source_sha256"),
+        hash::sha256_hex(ordinary),
+    );
+    let sources = json::as_array(performance_test_field(value, "sources")).ok_or(
+        "missing source records",
+    )?;
+    let mut found_main = false;
+    for source in sources {
+        if performance_test_string(source, "source_symbol") == "audit::value::main" {
+            testing::assert_eq(performance_test_string(source, "source_file"), "main.goml");
+            testing::assert_eq(json::encode(performance_test_field(source, "line")), "2");
+            found_main = true;
+        }
+    }
+    testing::assert(found_main);
+    performance_test_command(explained)?;
+    testing::assert_eq(first, fs::read_file_structured(report).map_err(|error| error.to_string())?);
+    performance_test_command(arguments)?;
+    testing::assert(!fs::is_file(report));
+    Ok(())
+}
+
+#[test]
+fn performance_link_is_opt_in_and_preserves_generated_source() -> () {
+    let temporary = temp_go_path("performance.goml", "report");
+    let result = exercise_performance_link(path::parent(temporary).unwrap_or(""));
+    cleanup_temp_directory(temporary);
+    if let Err(error) = result {
+        testing::fail(error);
+    }
+}
