@@ -30,10 +30,6 @@ func _goml_intrinsic_missing(s string) struct{} {
     return struct{}{}
 }
 
-func array_get__Array_2_3int(arr [2]int, index int) int {
-    return arr[index]
-}
-
 type _goml_vec_uint8 struct {
     items []uint8
 }
@@ -219,7 +215,7 @@ func for_binding() int {
     for {
         var t0 bool = for_index0 < for_limit0
         if t0 {
-            var for_item0 int = array_get__Array_2_3int(for_source0, for_index0)
+            var for_item0 int = for_source0[for_index0]
             var t1 int = for_index0 + 1
             for_index0 = t1
             var t2 int

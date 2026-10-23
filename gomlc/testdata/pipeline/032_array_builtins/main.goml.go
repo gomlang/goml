@@ -80,7 +80,7 @@ func main0() struct{} {
     var inline4 [3]int32 = arr__0
     var inline5 [3]int32 = inline4
     var inline6 int = 1
-    array_get__Array_3_5int32(inline5, inline6)
+    _ = inline5[inline6]
     var inline8 int32 = 42
     var inline9 [3]int32 = array_set__Array_3_5int32(inline5, inline6, inline8)
     inline4 = inline9

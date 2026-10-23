@@ -285,8 +285,8 @@ func decimal_string(value__0 uint64) string {
 }
 
 func _goml_m_inherent_i_closure__en_h058ceb7a4121cc1cd37232df6ad1d333_ader__0_i_apply(env0 closure_env_make_reader_0) int {
-    var value__0 Wide = env0.value_0
-    var t0 int = value__0.a
+    var value__0 *Wide = &env0.value_0
+    var t0 int = (*value__0).a
     return t0
 }
 

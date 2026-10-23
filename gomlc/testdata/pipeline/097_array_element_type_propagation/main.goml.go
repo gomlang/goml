@@ -36,10 +36,6 @@ func _goml_ffi_math_x00_Float32bits_x0__q__m__z_u32_hbbf8d280343f673a9e2fd959393
     return _goml_ffi_import_math_h0cea0c730c0e331b7d5cc103b112df29.Float32bits(arg0)
 }
 
-func array_get__Array_3_5uint8(arr [3]uint8, index int) uint8 {
-    return arr[index]
-}
-
 func array_get__Array_2_7float32(arr [2]float32, index int) float32 {
     return arr[index]
 }
@@ -198,7 +194,7 @@ func main0() struct{} {
             var t10 int
             var inline17 int = ref_get__Ref_3int(i__0)
             t10 = inline17
-            var t11 uint8 = array_get__Array_3_5uint8(arr__0, t10)
+            var t11 uint8 = arr__0[t10]
             var t12 string
             var inline16 string = __goml_builtin_uint8_to_string(t11)
             t12 = inline16

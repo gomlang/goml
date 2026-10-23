@@ -321,7 +321,7 @@ func main0() struct{} {
     var arr2__0 [3]int = [3]int{4, 5, 6}
     var place_root0 [3]int = arr2__0
     var index0 int = 1
-    array_get__Array_3_3int(place_root0, index0)
+    _ = place_root0[index0]
     var value0 int = 50
     var t3 [3]int = array_set__Array_3_3int(place_root0, index0, value0)
     arr2__0 = t3
@@ -386,9 +386,9 @@ func main0() struct{} {
     var matrix__0 [2][2]int32 = [2][2]int32{t19, t20}
     var place_root1 [2][2]int32 = matrix__0
     var index3 int = 1
-    var place3 [2]int32 = array_get__Array_2_14Array_2_5int32(place_root1, index3)
+    var place3 [2]int32 = place_root1[index3]
     var index4 int = 0
-    array_get__Array_2_5int32(place3, index4)
+    _ = place3[index4]
     var value3 int32 = 30
     var t21 [2]int32 = array_set__Array_2_5int32(place3, index4, value3)
     var t22 [2][2]int32 = array_set__Array_2_14Array_2_5int32(place_root1, index3, t21)
@@ -405,7 +405,7 @@ func main0() struct{} {
     var place_root2 Tuple2_11Array2_3int_3int = pair__0
     var place5 [2]int = place_root2._0
     var index5 int = 1
-    array_get__Array_2_3int(place5, index5)
+    _ = place5[index5]
     var value4 int = 150
     var t27 [2]int = array_set__Array_2_3int(place5, index5, value4)
     var t28 int = place_root2._1
@@ -431,11 +431,11 @@ func main0() struct{} {
         vecs: t38,
     }
     var place_root3 Holder = holder__0
-    var place7 [2]int32 = place_root3.data
+    var place7 *[2]int32 = &place_root3.data
     var index6 int = 0
-    array_get__Array_2_5int32(place7, index6)
+    _ = (*place7)[index6]
     var value5 int32 = 160
-    var t39 [2]int32 = array_set__Array_2_5int32(place7, index6, value5)
+    var t39 [2]int32 = array_set__Array_2_5int32(*place7, index6, value5)
     var t40 *_goml_vec_Array_2_5int32 = place_root3.vecs
     var t41 Holder = Holder{
         data: t39,
@@ -451,7 +451,7 @@ func main0() struct{} {
     var index7 int = 1
     var place10 [2]int32 = vec_get__Vec_14Array_2_5int32(place9, index7)
     var index8 int = 0
-    array_get__Array_2_5int32(place10, index8)
+    _ = place10[index8]
     var value6 int32 = 200
     var t45 [2]int32 = array_set__Array_2_5int32(place10, index8, value6)
     vec_set__Vec_14Array_2_5int32(place9, index7, t45)
@@ -466,7 +466,7 @@ func main0() struct{} {
     r__0 = inline3
     var place_root5 [2]int32 = ref_get__Ref_14Array_2_5int32(r__0)
     var index9 int = 1
-    array_get__Array_2_5int32(place_root5, index9)
+    _ = place_root5[index9]
     var value7 int32 = 230
     var t51 [2]int32 = array_set__Array_2_5int32(place_root5, index9, value7)
     ref_set__Ref_14Array_2_5int32(r__0, t51)

@@ -1116,22 +1116,22 @@ func _goml_m_trait__impl_i_ToString_i_string_i_to__string(self__0 string) string
 }
 
 func _goml_m_trait__impl_i_ToString_i_std_p_fs_p_Error_i_to__string(self__0 *_goml_m_std_p_fs_p_Error) string {
-    var t0 _goml_m_std_p_io_p_ErrorDetails = (*self__0).details
-    var inline0 Option__string = t0.context_value
+    var t0 *_goml_m_std_p_io_p_ErrorDetails = &(*self__0).details
+    var inline0 Option__string = (*t0).context_value
     switch inline0._tag {
     case 0:
-        var inline1 string = t0.operation_value
+        var inline1 string = (*t0).operation_value
         var inline2 string = inline1 + ": "
-        var inline3 string = t0.message_value
+        var inline3 string = (*t0).message_value
         var inline4 string = inline2 + inline3
         return inline4
     case 1:
         var inline5 string = inline0._p0
-        var inline6 string = t0.operation_value
+        var inline6 string = (*t0).operation_value
         var inline7 string = inline6 + " "
         var inline8 string = inline7 + inline5
         var inline9 string = inline8 + ": "
-        var inline10 string = t0.message_value
+        var inline10 string = (*t0).message_value
         var inline11 string = inline9 + inline10
         return inline11
     default:

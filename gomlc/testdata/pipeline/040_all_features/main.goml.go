@@ -365,7 +365,7 @@ func main0() struct{} {
     var inline24 [2]int32 = [2]int32{inline22, inline19}
     var inline25 [2]int32 = inline24
     var inline26 int = 1
-    array_get__Array_2_5int32(inline25, inline26)
+    _ = inline25[inline26]
     var inline28 [2]int32 = array_set__Array_2_5int32(inline25, inline26, inline23)
     inline24 = inline28
     results__0 = inline24

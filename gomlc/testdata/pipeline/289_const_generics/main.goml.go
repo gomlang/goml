@@ -132,7 +132,7 @@ func main0() struct{} {
     var inline8 [3]int32 = t2
     var inline9 [3]int32 = inline8
     var inline10 int = 0
-    var inline11 int32 = array_get__Array_3_5int32(inline9, inline10)
+    var inline11 int32 = inline9[inline10]
     var inline12 int32 = 1
     var inline13 int32 = inline11 + inline12
     var inline14 [3]int32 = array_set__Array_3_5int32(inline9, inline10, inline13)
@@ -188,7 +188,7 @@ func _goml_m_total_____d_const__param_k_N___d_const__value_k_3(values__0 [3]int3
     for {
         var t0 bool = for_index0 < for_limit0
         if t0 {
-            var for_item0 int32 = array_get__Array_3_5int32(values__0, for_index0)
+            var for_item0 int32 = values__0[for_index0]
             var t1 int = for_index0 + 1
             for_index0 = t1
             var compound_old0 int32 = result__0

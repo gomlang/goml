@@ -29,17 +29,9 @@ func array_set__Array_2_8Ref_3int(arr [2]*ref_int_x, index int, value *ref_int_x
     return arr
 }
 
-func array_get__Array_1_16Tuple2_3int_3int(arr [1]Tuple2_3int_3int, index int) Tuple2_3int_3int {
-    return arr[index]
-}
-
 func array_set__Array_1_16Tuple2_3int_3int(arr [1]Tuple2_3int_3int, index int, value Tuple2_3int_3int) [1]Tuple2_3int_3int {
     arr[index] = value
     return arr
-}
-
-func array_get__Array_1_24Tuple2_10DerivedKey_3int(arr [1]Tuple2_10DerivedKey_3int, index int) Tuple2_10DerivedKey_3int {
-    return arr[index]
 }
 
 func array_set__Array_1_24Tuple2_10DerivedKey_3int(arr [1]Tuple2_10DerivedKey_3int, index int, value Tuple2_10DerivedKey_3int) [1]Tuple2_10DerivedKey_3int {
@@ -766,7 +758,7 @@ func main0() struct{} {
     _goml_m_inherent_i_Ref_i_Ref_l_T_r__i_set____T__isize(t16, 5)
     var place_root0 [2]*ref_int_x = source__0
     var index0 int = 0
-    array_get__Array_2_8Ref_3int(place_root0, index0)
+    _ = place_root0[index0]
     var value0 *ref_int_x = _goml_m_inherent_i_Ref_i_Ref_l_T_r__i_new____T__isize(9)
     var t17 [2]*ref_int_x = array_set__Array_2_8Ref_3int(place_root0, index0, value0)
     source__0 = t17
@@ -856,7 +848,7 @@ func main0() struct{} {
     hashmap_set__HashMap_3int_3int(native_first__0, t43._0, t43._1)
     var place_root1 [1]Tuple2_3int_3int = native_entries__0
     var index1 int = 0
-    array_get__Array_1_16Tuple2_3int_3int(place_root1, index1)
+    _ = place_root1[index1]
     var value1 Tuple2_3int_3int = Tuple2_3int_3int{
         _0: 2,
         _1: 20,
@@ -909,7 +901,7 @@ func main0() struct{} {
     hashmap_set__HashMap_10DerivedKey_3int(derived_first__0, t61._0, t61._1)
     var place_root2 [1]Tuple2_10DerivedKey_3int = derived_entries__0
     var index2 int = 0
-    array_get__Array_1_24Tuple2_10DerivedKey_3int(place_root2, index2)
+    _ = place_root2[index2]
     var t62 DerivedKey = DerivedKey{
         id: 2,
     }
