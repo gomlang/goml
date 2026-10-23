@@ -60,7 +60,10 @@ bootstrap:
     just make
     just _bootstrap-stage3
 
-_ci-scripts:
+check-docs:
+    python3 tools/check-docs.py
+
+_ci-scripts: check-docs
     go run tools/generate_unicode_tables.go --check
     python3 tools/generate_unicode_casefold.py --check
     python3 tools/syscall/generate.py --check
