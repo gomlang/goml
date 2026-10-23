@@ -947,8 +947,7 @@ func _goml_m_inherent_i_string_i_string_i_slice__chars(self__0 string, start__0 
             case 0:
                 break Loop_loop0
             case 1:
-                var x4 Tuple2_3int_4char = for_next0._p0
-                var x5 int = x4._0
+                var x5 int = for_next0._p0._0
                 var t12 bool = char_index__0 == start__0
                 if t12 {
                     var t17 Option__isize = Option__isize{

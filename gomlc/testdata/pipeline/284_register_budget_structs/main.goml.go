@@ -173,8 +173,7 @@ func main0() struct{} {
     var t3 int = read(&t2, action__0, 2)
     var inline12 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(t3)
     _goml_runtime_core_string_println(inline12)
-    var t4 Wide = ref_get__Ref_4Wide(value__0)
-    var t5 int = t4.a
+    var t5 int = value__0.value.a
     var inline10 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(t5)
     _goml_runtime_core_string_println(inline10)
     var t6 Wide = ref_get__Ref_4Wide(value__0)
@@ -182,8 +181,7 @@ func main0() struct{} {
     var t7 int = result__0.a
     var inline8 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(t7)
     _goml_runtime_core_string_println(inline8)
-    var t8 Wide = ref_get__Ref_4Wide(value__0)
-    var t9 int = t8.a
+    var t9 int = value__0.value.a
     var inline6 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(t9)
     _goml_runtime_core_string_println(inline6)
     var t10 int = result__0.j
@@ -199,8 +197,7 @@ func main0() struct{} {
     var t23 int = reader__0()
     var inline2 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(t23)
     _goml_runtime_core_string_println(inline2)
-    var t24 Wide = ref_get__Ref_4Wide(value__0)
-    var t25 int = t24.a
+    var t25 int = value__0.value.a
     var inline0 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(t25)
     _goml_runtime_core_string_println(inline0)
     return struct{}{}
@@ -285,8 +282,7 @@ func decimal_string(value__0 uint64) string {
 }
 
 func _goml_m_inherent_i_closure__en_h058ceb7a4121cc1cd37232df6ad1d333_ader__0_i_apply(env0 closure_env_make_reader_0) int {
-    var value__0 *Wide = &env0.value_0
-    var t0 int = (*value__0).a
+    var t0 int = env0.value_0.a
     return t0
 }
 

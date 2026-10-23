@@ -297,15 +297,13 @@ func report_pair__Q_i32__T_i32(tag__0 int32, a__0 int32, b__0 int32, combined__0
 }
 
 func combine_scaled__T_Boxed(a__0 Boxed, b__0 Boxed, factor__0 int32) Boxed {
-    var t0 Boxed
     var inline3 int32 = a__0.value
     var inline4 int32 = b__0.value
     var inline5 int32 = inline3 + inline4
     var inline6 Boxed = Boxed{
         value: inline5,
     }
-    t0 = inline6
-    var inline0 int32 = t0.value
+    var inline0 int32 = inline6.value
     var inline1 int32 = inline0 * factor__0
     var inline2 Boxed = Boxed{
         value: inline1,

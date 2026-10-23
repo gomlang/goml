@@ -302,7 +302,6 @@ func main0() struct{} {
             var for_item2 int = for_index0
             var t45 int = for_index0 + 1
             for_index0 = t45
-            var current__1 Outer
             var inline33 [16]int = func(value int) [16]int {
                 var result [16]int
                 for index := range result {
@@ -318,8 +317,7 @@ func main0() struct{} {
             var inline36 Outer = Outer{
                 inner: inline35,
             }
-            current__1 = inline36
-            var value__0 Large = current__1.inner
+            var value__0 Large = inline36.inner
             var t46 closure_env_main_1 = closure_env_main_1{
                 value_0: value__0,
             }
@@ -395,8 +393,7 @@ func main0() struct{} {
             break Loop_loop2
         }
     }
-    var t31 *Large = &first__0.inner
-    var t32 *ref_int_x = (*t31).shared
+    var t32 *ref_int_x = first__0.inner.shared
     var t33 int
     var inline15 int = ref_get__Ref_3int(t32)
     t33 = inline15

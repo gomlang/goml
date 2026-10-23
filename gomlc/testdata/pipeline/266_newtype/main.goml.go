@@ -82,8 +82,7 @@ func main0() struct{} {
     _goml_runtime_core_string_println(inline12)
     var t0 UserId
     var inline5 UserId = id__0
-    var inline6 UserId = inline5
-    var inline7 int32 = inline6._0
+    var inline7 int32 = inline5._0
     var inline8 int32 = 1
     var inline9 int32 = inline7 + inline8
     var inline10 UserId = UserId{

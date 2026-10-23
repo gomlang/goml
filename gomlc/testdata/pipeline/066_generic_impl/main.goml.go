@@ -97,15 +97,13 @@ func main0() struct{} {
         y: inline10,
     }
     p2__0 = inline11
-    var p3__0 Point__string__i32
     var inline6 string = p1__0.y
     var inline7 int32 = p1__0.x
     var inline8 Point__string__i32 = Point__string__i32{
         x: inline6,
         y: inline7,
     }
-    p3__0 = inline8
-    var x__0 int32 = p3__0.y
+    var x__0 int32 = inline8.y
     var t0 string
     var inline5 string = __goml_builtin_int32_to_string(x__0)
     t0 = inline5

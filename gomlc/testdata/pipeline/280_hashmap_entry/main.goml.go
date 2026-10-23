@@ -835,8 +835,7 @@ func _goml_m_inherent_i_closure__env__main__3_i_closure__env__main__3_i_apply(en
 }
 
 func _goml_m_inherent_i_closure__en_h51dad037a23a0205e1d674d00df14e80_size__4_i_apply(env0 closure_env_inherent_HashMapEntry_HashMapEntry_K_V_remove_entry_K_Key_V_isize_4, value__0 int) Tuple2_3Key_3int {
-    var self__0 HashMapEntry__Key__isize = env0.self_0
-    var t0 Key = self__0.key
+    var t0 Key = env0.self_0.key
     var t1 Tuple2_3Key_3int = Tuple2_3Key_3int{
         _0: t0,
         _1: value__0,

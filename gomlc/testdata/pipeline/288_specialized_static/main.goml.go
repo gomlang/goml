@@ -205,15 +205,12 @@ func main0() struct{} {
     var t4 int = second__0.value
     var inline9 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(t4)
     _goml_runtime_core_string_println(inline9)
-    var t5 Box__isize
     var inline8 Box__isize = Box__isize{
         value: 12,
     }
-    t5 = inline8
-    var t6 int = t5.value
+    var t6 int = inline8.value
     var inline6 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(t6)
     _goml_runtime_core_string_println(inline6)
-    var nested__0 _goml_m_Box____Vec_l_string_r_
     var inline2 string = "nested"
     var inline3 [2]string = [2]string{inline2, inline2}
     var inline4 *_goml_vec_string = func(values [2]string) *_goml_vec_string {
@@ -228,8 +225,7 @@ func main0() struct{} {
     var inline5 _goml_m_Box____Vec_l_string_r_ = _goml_m_Box____Vec_l_string_r_{
         value: inline4,
     }
-    nested__0 = inline5
-    var t7 *_goml_vec_string = nested__0.value
+    var t7 *_goml_vec_string = inline5.value
     var t8 string = vec_get__Vec_6string(t7, 1)
     var inline0 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t8)
     _goml_runtime_core_string_println(inline0)

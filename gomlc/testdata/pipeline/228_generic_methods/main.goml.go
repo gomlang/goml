@@ -84,42 +84,36 @@ func main0() struct{} {
     var t1 func(int) string = func(p0 int) string {
         return _goml_m_inherent_i_closure__env__main__0_i_closure__env__main__0_i_apply(t0, p0)
     }
-    var text__0 Box__string
     var inline17 int = 42
     var inline18 string = t1(inline17)
     var inline19 Box__string = Box__string{
         value: inline18,
     }
-    text__0 = inline19
-    var t2 string = text__0.value
+    var t2 string = inline19.value
     var inline15 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t2)
     _goml_runtime_core_string_println(inline15)
     var t3 closure_env_main_1 = closure_env_main_1{}
     var t4 func(int) string = func(p0 int) string {
         return _goml_m_inherent_i_closure__env__main__1_i_closure__env__main__1_i_apply(t3, p0)
     }
-    var explicit__0 Box__string
     var inline12 int = 7
     var inline13 string = t4(inline12)
     var inline14 Box__string = Box__string{
         value: inline13,
     }
-    explicit__0 = inline14
-    var t5 string = explicit__0.value
+    var t5 string = inline14.value
     var inline10 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t5)
     _goml_runtime_core_string_println(inline10)
     var t6 closure_env_main_2 = closure_env_main_2{}
     var t7 func(int) string = func(p0 int) string {
         return _goml_m_inherent_i_closure__env__main__2_i_closure__env__main__2_i_apply(t6, p0)
     }
-    var static_call__0 Box__string
     var inline7 int = 9
     var inline8 string = t7(inline7)
     var inline9 Box__string = Box__string{
         value: inline8,
     }
-    static_call__0 = inline9
-    var t8 string = static_call__0.value
+    var t8 string = inline9.value
     var inline5 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t8)
     _goml_runtime_core_string_println(inline5)
     var rendered__0 string

@@ -446,8 +446,7 @@ func main0() struct{} {
     var t44 int32 = array_get__Array_2_5int32(t43, 0)
     var inline6 string = _goml_m_trait__impl_i_ToString_i_i32_i_to__string(t44)
     _goml_runtime_core_string_println(inline6)
-    var place_root4 Holder = holder__0
-    var place9 *_goml_vec_Array_2_5int32 = place_root4.vecs
+    var place9 *_goml_vec_Array_2_5int32 = holder__0.vecs
     var index7 int = 1
     var place10 [2]int32 = vec_get__Vec_14Array_2_5int32(place9, index7)
     var index8 int = 0

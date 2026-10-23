@@ -138,22 +138,18 @@ func main0() struct{} {
 }
 
 func erased__T_First() int {
-    var token__0 Token__First
     var inline0 Token__First = Token__First{
         value: 42,
     }
-    token__0 = inline0
-    var t0 int = token__0.value
+    var t0 int = inline0.value
     return t0
 }
 
 func erased__T_Second() int {
-    var token__0 Token__Second
     var inline0 Token__Second = Token__Second{
         value: 7,
     }
-    token__0 = inline0
-    var t0 int = token__0.value
+    var t0 int = inline0.value
     return t0
 }
 
