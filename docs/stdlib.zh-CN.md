@@ -2129,9 +2129,7 @@ fn connect_example() -> Result[tls::TlsStream, io::Error] {
 
 ## HTTP 生态包
 
-独立的 [`ecosystem::request`](https://github.com/gomlang/request/blob/HEAD/README.md) 客户端提供带作用域的 `send_stream` 下载、来自 `io::Read` 的 `send_reader` 上传、支持取消的变体、有界分块和复制，以及增量 SSE 解码。回调返回时响应句柄失效。流式操作通过 TCP 或验证过的 TLS 使用 HTTP/1.1，包括 CONNECT 代理；现有缓冲客户端保留 HTTP/2 路径。对于保留请求体的重定向，流式上传不能自动重放。压缩和 SSE 重连行为在客户端 README 中明确说明。
-
-[`ecosystem::web`](https://github.com/gomlang/web/blob/HEAD/README.md) 服务器提供 TLS 监听器、WebSocket 响应升级、增量 multipart 提取、有界静态文件服务、CORS 和缓冲 gzip 协商。TLS 使用公开的 `std::net::tls` 待握手接受、握手、地址和中止 API；库及其使用方不需要用户 Go FFI 或 `go.mod`。监听器支持 HTTP/1.0 和 HTTP/1.1。Multipart 字段和升级连接遵循请求生命周期和取消规则。静态文件拒绝符号链接和路径穿越，支持 ETag、HEAD 和单个字节范围。这些库 API 使用普通导入，不增加语言文法。
+HTTP 客户端和服务器属于独立生态模块：[`ecosystem::request`](https://github.com/gomlang/request/blob/HEAD/README.md) 和 [`ecosystem::web`](https://github.com/gomlang/web/blob/HEAD/README.md)。API、流式传输、协议支持和资源生命周期规则见各模块 README。
 
 <a id="filesystem-ecosystem-packages"></a>
 
@@ -2154,7 +2152,7 @@ use std::fs;
 use std::time;
 ```
 
-公开遍历和通知 API 保持原有名称及行为。遍历器提供惰性迭代遍历、深度限制、剪枝、可选的链接跟随和带上下文的错误。观察器提供递归 inotify 维护、事件过滤、忽略子树剪枝、多路径观察集、带超时/可取消的读取和有界订阅。两者目前都面向 Linux amd64，提前停止时要求显式关闭资源。完整 API 示例、生命周期规则和平台限制见各模块 README。使用普通包/依赖语法；此次迁移不增加语言文法。运行 `goml update` 从[中央索引](https://github.com/gomlang/registry)获取模块，再使用普通的 `goml test` 和 `goml run --example <name>` 命令。
+运行 `goml update` 从[中央索引](https://github.com/gomlang/registry)获取模块。API 示例、生命周期规则和平台限制见各模块 README。
 
 <a id="serde-and-json"></a>
 
@@ -2487,13 +2485,13 @@ for (name, value) in headers {
 | 为领域枚举错误提供可读消息 | `#[derive(ToString, Debug)]` 配合各变体的 `#[to_string("message {field}")]`；无需额外实现 `Error` 方法 |
 | `Simd[T, N]` 或向量 `a + b` | 导入 `std::simd`，选择固定 128/256 位向量类型，使用 `a.add(b)` |
 | `float_value.to_i32()` | 导入 `std::num::TryToInt`，使用 `float_value.try_to_i32()`；处理非有限值和范围错误 |
-| 遍历目录树 | 使用 `ecosystem::walkdir` 依赖，在 Linux amd64 上进行基于系统调用的深度优先迭代，支持深度限制、剪枝、可选链接跟随和逐路径错误 |
+| 遍历目录树 | 使用 [`ecosystem::walkdir`](#filesystem-ecosystem-packages) |
 | 验证 C 兼容字符串 | `std::c::CString` 拒绝内部 NUL；`c::literal` 支持编译期验证 |
 | 操作逻辑斜杠路径或 shell 模式 | `std::path::slash` 提供纯词法操作和有界 Unicode 匹配；宿主路径使用 `std::path` |
-| 监视目录树变化 | 在 Linux amd64 使用 `ecosystem::notify` 依赖及其 `watch_recursive` 或 `WatchSet`，通过 `Options` 剪除忽略路径，使用定时读取或作用域订阅，处理 `Event.rescan` 并关闭句柄 |
+| 监视目录树变化 | 使用 [`ecosystem::notify`](#filesystem-ecosystem-packages) |
 | TCP 和 UDP 网络 | `std::net` 提供套接字、DNS 解析、共享 epoll 就绪机制、显式关闭和感知上下文的等待；`std::net::tls` 提供经过验证的 TLS 客户端和监听器、待处理连接接收、显式握手及对端地址 |
-| 流式 HTTP 请求或消费 SSE | `ecosystem::request` 提供作用域流式回调、`io::Read` 上传、有界响应块，以及 HTTP/1.1 上的增量 SSE 解码 |
-| 提供 HTTPS、WebSocket 或上传文件服务 | `ecosystem::web` 提供 TLS 监听器、显式 WebSocket 升级、multipart 字段、静态文件、CORS 和有界缓冲 gzip 中间件 |
+| 流式 HTTP 请求或消费 SSE | 使用 [`ecosystem::request`](#http-ecosystem-packages) |
+| 提供 HTTPS、WebSocket 或上传文件服务 | 使用 [`ecosystem::web`](#http-ecosystem-packages) |
 | 转义 URL 路径段或查询参数 | `std::net::url` 的有界组件/查询编解码保留解码字节；完整 URL 解析是独立操作 |
 | 解析原始 URL 引用 | `url::Reference::parse` 和 `base.resolve` 保留组件标记并移除字面量点段；authority 验证和 ASCII 序列化是显式独立操作 |
 | 检查 URL 主机或隐藏密码 | `url::Authority::parse` 验证用户信息、主机字面量和十进制端口语法；`redacted` 只隐藏密码，不隐藏查询或其他秘密 |

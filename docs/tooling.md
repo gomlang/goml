@@ -319,7 +319,7 @@ goml fmt --check
 
 Test source code cannot be used to fix a production package that itself fails inspection.
 
-`goml fmt` formats the current module's production files, internal tests, black-box test packages, and examples with their tests using the same package graphs as builds and tests. It can be run from any nested package directory. Package discovery excludes `testdata`, build output, hidden directories, nested modules, and external dependencies. `goml fmt --check` only checks formatting and exits unsuccessfully when any source file would change.
+`goml fmt` formats module sources; `goml fmt --check` reports formatting differences without writing files. See [formatter commands](formatting.md#command-line) for source discovery and options.
 
 Run the test using:
 

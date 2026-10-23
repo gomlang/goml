@@ -87,7 +87,7 @@ enum Entry[T, Marker] {
 }
 ```
 
-All fields or variant payloads used by a derive must support that trait. A `ToString` variant template only uses the fields referenced by its placeholders. For a generic definition, the generated impl constrains each distinct participating field or payload type that mentions a type parameter. An unused phantom parameter receives no constraint. Compiler-owned runtime, intrinsic, and lang-item attributes remain unavailable to ordinary projects. User projects may use the `go_ffi`, `go_type`, `go_method` and `go_interface` attributes described in the next section.
+All fields or variant payloads used by a derive must support that trait. A `ToString` variant template only uses the fields referenced by its placeholders. For a generic definition, the generated impl constrains each distinct participating field or payload type that mentions a type parameter. An unused phantom parameter receives no constraint. Compiler-owned runtime, intrinsic, and lang-item attributes remain unavailable to ordinary projects. User projects may use the `go_ffi`, `go_type`, `go_method` and `go_interface` attributes described in [Go FFI](../ffi/bind-go.md#go-ffi).
 
 The eight prelude derives are supplied by verified handlers in the toolchain's builtin sources. They are not hard-coded code generators in the compiler. The `PartialOrd` and `Ord` traits themselves live in `std::cmp`; import that package when using their derives, and import the traits for unqualified bounds and method calls. Standard-library and third-party derives use the same handler and artifact mechanism, but they are not added to the prelude: import the trait or its package before using the derive name.
 

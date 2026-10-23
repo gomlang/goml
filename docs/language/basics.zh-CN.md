@@ -32,11 +32,7 @@ pub fn increment(value: isize) -> isize {
 }
 ```
 
-`goml doc` 为当前模块的所有生产包生成离线 HTML，默认输出到 `<target-dir>/doc/`。`goml doc --format json` 将带版本的 API 模型写入该目录的 `module.json`。公开声明和成员遵循语言可见性规则；`--document-private-items` 可包含私有 API。命令在替换现有输出前会检查模块并报告依赖或类型错误。
-
-文档支持段落、标题、单层项目列表、行内代码、围栏代码块和链接。`[Name]` 和 `[label](goml:alias::Name)` 根据源文件的导入引用 API 声明。普通链接支持 HTTP、HTTPS、mailto 和片段目标。原始 HTML 会被转义。无法解析或存在歧义的 API 链接产生警告；生成模块之外的目标显示为文本。不支持完整 Markdown、自动生成依赖文档站点或可执行文档测试。
-
-独立 `gomldoc` 命令、输出模式和安装说明见[文档生成](../documentation.zh-CN.md)。
+`goml doc` 根据这些注释生成 API 文档。命令、输出格式、可见性、支持的 Markdown 和 API 链接见 [API 文档生成](../documentation.zh-CN.md)。
 
 <a id="identifiers-and-keywords"></a>
 

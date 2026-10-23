@@ -11,7 +11,7 @@ just ci
 just clean
 ```
 
-`just make` incrementally builds stage2 directly from the pinned stage0. `just test` builds the tools and runs compiler, driver, and standard-library tests; `just all` is an alias for it. `just ci` performs a clean stage2 build, fixed-point verification, tests, extension compilation, and release archive smoke checks. Standard-library behavior tests live beside their implementations in `lib/std/<package>/tests`; run them with `just test-stdlib`.
+`just make` incrementally builds stage2 directly from the pinned stage0. `just test` builds the tools and runs compiler, driver, and standard-library tests; `just all` is an alias for it. `just ci` performs a clean stage2 build, fixed-point verification, tests, extension compilation, and release archive smoke checks. Standard-library behavior tests live beside their implementations in `lib/std/<package>/tests`; run them with `just test-stdlib`. Known-answer provenance, data formats, and update rules are documented in [standard-library known answers](../lib/std/KNOWN_ANSWERS.md).
 
 Local CI runs its check groups concurrently. Set `GOML_CI_SEQUENTIAL=1` to run them sequentially, `GOML_BUILD_JOBS` to limit bootstrap package workers, and `GOML_TEST_JOBS` to override compiler and driver test concurrency. Compiler fixtures may use Yaegi when it is available on `PATH`; they fall back to native Go compilation when it is unavailable or cannot run a fixture.
 

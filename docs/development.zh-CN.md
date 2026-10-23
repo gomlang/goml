@@ -13,7 +13,7 @@ just ci
 just clean
 ```
 
-`just make` 直接使用固定版本的 stage0 增量构建 stage2。`just test` 构建工具并运行编译器、项目驱动器和标准库测试；`just all` 是它的别名。`just ci` 执行干净的 stage2 构建、不动点验证、测试、扩展编译和发布归档冒烟检查。标准库行为测试位于实现旁的 `lib/std/<package>/tests`，使用 `just test-stdlib` 运行。
+`just make` 直接使用固定版本的 stage0 增量构建 stage2。`just test` 构建工具并运行编译器、项目驱动器和标准库测试；`just all` 是它的别名。`just ci` 执行干净的 stage2 构建、不动点验证、测试、扩展编译和发布归档冒烟检查。标准库行为测试位于实现旁的 `lib/std/<package>/tests`，使用 `just test-stdlib` 运行。已知答案的来源、数据格式和更新规则见[标准库已知答案](../lib/std/KNOWN_ANSWERS.zh-CN.md)。
 
 本地 CI 并发运行各检查组。设置 `GOML_CI_SEQUENTIAL=1` 可改为顺序运行，`GOML_BUILD_JOBS` 限制自举包构建的工作线程数，`GOML_TEST_JOBS` 覆盖编译器和驱动器测试的并发度。编译器测试用例可以使用 `PATH` 中的 Yaegi；若不可用或无法运行某个用例，则回退到原生 Go 编译。
 

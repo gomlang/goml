@@ -32,11 +32,7 @@ pub fn increment(value: isize) -> isize {
 }
 ```
 
-`goml doc` generates offline HTML for all production packages in the current module, defaulting to `<target-dir>/doc/`. `goml doc --format json` writes the versioned API model to `module.json` in that directory. Public declarations and members follow the language visibility rules; `--document-private-items` includes private API. The command checks the module and reports dependency or typing failures before replacing existing output.
-
-Documentation supports paragraphs, headings, flat bullet lists, inline code, fenced code blocks, and links. `[Name]` and `[label](goml:alias::Name)` refer to API declarations using the source file's imports. Ordinary links support HTTP, HTTPS, mailto, and fragment destinations. Raw HTML is escaped. Unresolved or ambiguous API links produce warnings; targets outside the generated module are shown as text. Full Markdown, automatic dependency sites, and executable documentation tests are not supported.
-
-See [documentation](../documentation.md) for standalone `gomldoc`, output schemas, and installation.
+`goml doc` generates API documentation from these comments. See [API documentation](../documentation.md) for commands, output formats, visibility, supported Markdown, and API links.
 
 <a id="identifiers-and-keywords"></a>
 

@@ -1,0 +1,29 @@
+<a id="standard-library-known-answers"></a>
+
+# 标准库已知答案
+
+[English](KNOWN_ANSWERS.md) | [简体中文](KNOWN_ANSWERS.zh-CN.md)
+
+这些数值和密码学原生测试用例的已知答案采集自独立的 Go 1.26.0 参考函数，采集发生在移除 Go FFI 声明之前。原始参考实现位于提交 `2e7afb9f102c78d17c280e445fff39c7c77af476`；数值参考实现位于 `gomlc/testdata/module/project093_std_algorithms`。
+
+| 数据文件 | 不同记录数 |
+| --- | ---: |
+| [num/tests/known_answers.tsv](num/tests/known_answers.tsv) | 34,244 |
+| [num/tests/conversion_known_answers.tsv](num/tests/conversion_known_answers.tsv) | 13,300 |
+| [crypto/hash/tests/sha2_known_answers.tsv](crypto/hash/tests/sha2_known_answers.tsv) | 100 |
+| [crypto/hash/tests/sha3_known_answers.tsv](crypto/hash/tests/sha3_known_answers.tsv) | 111 |
+| [crypto/hmac/tests/known_answers.tsv](crypto/hmac/tests/known_answers.tsv) | 133 |
+| [crypto/hkdf/tests/known_answers.tsv](crypto/hkdf/tests/known_answers.tsv) | 58 |
+| [crypto/pbkdf2/tests/known_answers.tsv](crypto/pbkdf2/tests/known_answers.tsv) | 146 |
+
+每条以制表符分隔的记录包含一个输入键及其预期返回值。键由原始参考函数名和以竖线分隔的参数组成。整数字段使用十进制，布尔字段使用小写布尔文本；浮点输入使用其精确 IEEE 754 位模式的十进制表示。字符串和字节切片字段使用小写十六进制字节表示，字符串返回值也采用相同表示。记录按键排序，重复输入的结果必须完全一致。原生加载器会拒绝重复或缺失的键。
+
+测试仍运行原来的确定性输入、边界情况以及流式或有状态检查。更新测试输入时，必须提供经过独立验证的预期答案；不得从被测 GoML 实现重新生成预期答案。运行此测试用例不需要 Go 参考实现或 FFI 声明。
+
+<a id="numeric-aggregate-answers"></a>
+
+## 数值聚合答案
+
+四组最大的参考调用序列在 [aggregate_answers.goml](num/tests/aggregate_answers.goml) 中以固定的 FNV-1a 64 位摘要和调用次数表示，替代数百万字节的逐项测试向量。每次原始调用都被保留：283,786 次浮点格式化调用、358,720 次浮点到整数转换调用，以及有符号和无符号整数解析器各 29,640 次调用。原生检查辅助函数将实际结果计入摘要；预期摘要完全来自原始 Go 参考输出，`numeric_algorithms` 会验证全部四组次数和摘要。已有的精确长度、短缓冲区、往返转换、位宽和错误检查均予以保留。
+
+参与哈希的记录依次为输入键、一个制表符、以制表符分隔的预期值以及换行符，采用 UTF-8 编码，字段编码与向量文件相同。无效整数解析结果归一化为零，因为原始断言在出错时只检查有效性。FNV 初始偏移值为 14695981039346656037，乘数为 1099511628211，运算按无符号 64 位回绕。预期摘要同时固定了输入顺序和输出。摘要不匹配时可定位到受影响的参考调用序列；逐项向量查询仍可定位到准确输入。

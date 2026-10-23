@@ -87,7 +87,7 @@ enum Entry[T, Marker] {
 }
 ```
 
-derive 使用的所有字段或变体载荷必须支持相应 trait。`ToString` 变体模板只使用占位符引用的字段。对泛型定义，生成的 impl 为每个涉及类型参数且实际参与的不同字段/载荷类型添加约束。未使用的 phantom 参数不加约束。编译器拥有的 runtime、intrinsic 和 lang-item 属性仍不可用于普通项目。用户项目可使用下一节的 `go_ffi`、`go_type`、`go_method` 和 `go_interface` 属性。
+derive 使用的所有字段或变体载荷必须支持相应 trait。`ToString` 变体模板只使用占位符引用的字段。对泛型定义，生成的 impl 为每个涉及类型参数且实际参与的不同字段/载荷类型添加约束。未使用的 phantom 参数不加约束。编译器拥有的 runtime、intrinsic 和 lang-item 属性仍不可用于普通项目。用户项目可使用 [Go FFI](../ffi/bind-go.zh-CN.md#go-ffi) 中说明的 `go_ffi`、`go_type`、`go_method` 和 `go_interface` 属性。
 
 八个 prelude derive 由工具链内置源码中的已验证处理函数提供，不是编译器硬编码的生成器。`PartialOrd` 和 `Ord` trait 本身位于 `std::cmp`；使用其 derive 时导入该包，使用未限定约束和方法调用时导入 trait。标准库和第三方 derive 使用相同处理函数与产物机制，但不加入 prelude：使用 derive 名前先导入 trait 或其包。
 

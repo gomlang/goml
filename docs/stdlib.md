@@ -3466,9 +3466,7 @@ fn connect_example() -> Result[tls::TlsStream, io::Error] {
 
 ## HTTP ecosystem packages
 
-The separate [`ecosystem::request`](https://github.com/gomlang/request/blob/HEAD/README.md) client provides scoped `send_stream` downloads, `send_reader` uploads from `io::Read`, cancellation-aware variants, bounded chunks and copying, and incremental SSE decoding. Response handles expire when the callback returns. Streaming uses HTTP/1.1 over TCP or verified TLS, including CONNECT proxies; the existing buffered client retains its HTTP/2 path. Streamed uploads cannot be automatically replayed for redirects that preserve the body. Compression and SSE reconnection behavior are explicit in the client README.
-
-The [`ecosystem::web`](https://github.com/gomlang/web/blob/HEAD/README.md) server supplies a TLS listener, WebSocket response upgrades, incremental multipart extraction, bounded static file serving, CORS and buffered gzip negotiation. TLS uses the public `std::net::tls` pending-accept, handshake, address and abort APIs; the library and its consumers need no user Go FFI or `go.mod`. The listener supports HTTP/1.0 and HTTP/1.1. Multipart fields and upgraded connections follow request lifetime and cancellation rules. Static files reject symlinks and traversal and support ETags, HEAD and single byte ranges. These library APIs use ordinary imports and do not add language grammar.
+HTTP clients and servers belong to the independent ecosystem modules [`ecosystem::request`](https://github.com/gomlang/request/blob/HEAD/README.md) and [`ecosystem::web`](https://github.com/gomlang/web/blob/HEAD/README.md). See their READMEs for APIs, streaming, protocol support, and resource-lifetime rules.
 
 ## Filesystem ecosystem packages
 
@@ -3493,15 +3491,7 @@ use std::fs;
 use std::time;
 ```
 
-The public traversal and notification APIs keep their existing names and
-behavior. Walkers provide lazy iterative traversal, depth bounds, pruning,
-optional link following and contextual errors. Watchers provide recursive
-inotify maintenance, event filters, ignored-subtree pruning, multi-path watch
-sets, timed/cancellable reads and bounded subscriptions. Both currently target
-Linux amd64 and require explicit resource closure when stopping early.
-Their complete API examples, lifecycle rules and platform limits are documented
-in the module READMEs. Normal package/dependency syntax applies; this move adds
-no language grammar. Run `goml update` to fetch these modules from the [central index](https://github.com/gomlang/registry), then use ordinary `goml test` and `goml run --example <name>` commands.
+Run `goml update` to fetch these modules from the [central index](https://github.com/gomlang/registry). Their READMEs document API examples, lifecycle rules, and platform limits.
 
 ## Serde and JSON
 
@@ -3909,13 +3899,13 @@ The implementation uses a sparse open-addressed index table and an insertion-ord
 | Give domain enum errors readable messages | `#[derive(ToString, Debug)]` with per-variant `#[to_string("message {field}")]`; implement no extra `Error` methods |
 | `Simd[T, N]` or vector `a + b` | Import `std::simd`, select a fixed 128/256-bit vector type, and use `a.add(b)` |
 | `float_value.to_i32()` | Import `std::num::TryToInt` and use `float_value.try_to_i32()`; handle nonfinite and range errors |
-| Traverse a directory tree | `ecosystem::walkdir` dependency for Linux amd64 syscall-backed depth-first iteration with depth bounds, pruning, optional link following, and per-path errors |
+| Traverse a directory tree | Use [`ecosystem::walkdir`](#filesystem-ecosystem-packages) |
 | Validate a C-compatible string | `std::c::CString` rejects interior NUL; `c::literal` supports compile-time validation |
 | Manipulate logical slash paths or shell patterns | `std::path::slash` for pure lexical operations and bounded Unicode matching; keep host paths in `std::path` |
-| Watch a directory tree for changes | Use the `ecosystem::notify` dependency and its `watch_recursive` or `WatchSet` on Linux amd64, prune ignored paths through `Options`, consume timed reads or scoped subscriptions, handle `Event.rescan`, and close the handle |
+| Watch a directory tree for changes | Use [`ecosystem::notify`](#filesystem-ecosystem-packages) |
 | TCP and UDP networking | `std::net` sockets, DNS resolution, shared epoll readiness, explicit close, and context-aware waits; `std::net::tls` for verified TLS clients and listeners, pending accepts, explicit handshakes and peer addresses |
-| Stream HTTP requests or consume SSE | `ecosystem::request` scoped streaming callbacks, `io::Read` uploads, bounded response chunks and incremental SSE decoding over HTTP/1.1 |
-| Serve HTTPS, WebSockets or uploaded files | `ecosystem::web` TLS listener, explicit WebSocket upgrades, multipart fields, static files, CORS and bounded buffered gzip middleware |
+| Stream HTTP requests or consume SSE | Use [`ecosystem::request`](#http-ecosystem-packages) |
+| Serve HTTPS, WebSockets or uploaded files | Use [`ecosystem::web`](#http-ecosystem-packages) |
 | Escape URL segments or query parameters | `std::net::url` bounded component/query codecs preserve decoded bytes; full URL parsing is separate |
 | Resolve a raw URL reference | `url::Reference::parse` and `base.resolve` preserve component markers and remove literal dot segments; authority validation and ASCII serialization are explicit separate operations |
 | Inspect a URL host or hide its password | `url::Authority::parse` validates user information, host literals and decimal port syntax; `redacted` hides only passwords, not query or other secrets |
