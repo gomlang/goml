@@ -4,6 +4,12 @@ use std::collections;
 
 type DceNames = collections::IndexSet[string];
 
+struct DceJumpTarget {
+    label: string,
+    break_live: DceNames,
+    continue_live: Option[DceNames],
+}
+
 struct DceResult {
     block: Block,
     live: DceNames,
@@ -417,7 +423,39 @@ fn retain_side_effect(output: Vec[Stmt], live: DceNames, value: Expr) -> () {
     }
 }
 
-fn dce_block_with_live(value: Block, live_out: DceNames) -> DceResult {
+fn push_dce_jump_target(
+    targets: Vec[DceJumpTarget],
+    label: string,
+    break_live: DceNames,
+    continue_live: Option[DceNames],
+) -> () {
+    targets.push(DceJumpTarget { label, break_live: copy_names(break_live), continue_live });
+}
+
+fn restore_dce_jump_live(
+    live: DceNames,
+    targets: Vec[DceJumpTarget],
+    label: string,
+    is_continue: bool,
+) -> () {
+    for index in 0..targets.len() {
+        let target = targets[targets.len() - index - 1];
+        if label != "" && target.label != label {
+            continue;
+        }
+        if is_continue {
+            if let Some(header_live) = target.continue_live {
+                add_names(live, header_live);
+                return
+            }
+        } else {
+            add_names(live, target.break_live);
+            return
+        }
+    }
+}
+
+fn dce_block_with_live(value: Block, live_out: DceNames, targets: Vec[DceJumpTarget]) -> DceResult {
     let live = copy_names(live_out);
     let needs_decl = new_dce_names();
     let output: Vec[Stmt] = Vec::with_capacity(value.stmts.len());
@@ -499,10 +537,10 @@ fn dce_block_with_live(value: Block, live_out: DceNames) -> DceResult {
                 output.push(Stmt::ReturnMulti { exprs })
             },
             If { cond, then_, else_ } => {
-                let then_result = dce_block_with_live(then_, live);
+                let then_result = dce_block_with_live(then_, live, targets);
                 let lowered_else = match else_ {
                     Some(body) => {
-                        let result = dce_block_with_live(body, live);
+                        let result = dce_block_with_live(body, live, targets);
                         add_names(live, result.live);
                         add_names(needs_decl, result.needs_decl);
                         Option::Some(result.block)
@@ -517,7 +555,9 @@ fn dce_block_with_live(value: Block, live_out: DceNames) -> DceResult {
             Loop { body } => {
                 let loop_live = copy_names(live);
                 add_names(loop_live, free_vars_in_block(body));
-                let result = dce_block_with_live(body, loop_live);
+                push_dce_jump_target(targets, "", live, Some(loop_live));
+                let result = dce_block_with_live(body, loop_live, targets);
+                let _ = targets.remove(targets.len() - 1);
                 add_names(live, result.live);
                 add_names(needs_decl, result.needs_decl);
                 output.push(Stmt::Loop { body: result.block })
@@ -525,7 +565,9 @@ fn dce_block_with_live(value: Block, live_out: DceNames) -> DceResult {
             LabeledLoop { label, body } => {
                 let loop_live = copy_names(live);
                 add_names(loop_live, free_vars_in_block(body));
-                let result = dce_block_with_live(body, loop_live);
+                push_dce_jump_target(targets, label, live, Some(loop_live));
+                let result = dce_block_with_live(body, loop_live, targets);
+                let _ = targets.remove(targets.len() - 1);
                 add_names(live, result.live);
                 add_names(needs_decl, result.needs_decl);
                 output.push(Stmt::LabeledLoop { label, body: result.block })
@@ -537,7 +579,9 @@ fn dce_block_with_live(value: Block, live_out: DceNames) -> DceResult {
                     remove_name(body_uses, name)
                 }
                 add_names(loop_live, body_uses);
-                let result = dce_block_with_live(body, loop_live);
+                push_dce_jump_target(targets, "", live, Some(loop_live));
+                let result = dce_block_with_live(body, loop_live, targets);
+                let _ = targets.remove(targets.len() - 1);
                 for name in names {
                     remove_name(result.live, name);
                     remove_name(result.needs_decl, name)
@@ -547,14 +591,27 @@ fn dce_block_with_live(value: Block, live_out: DceNames) -> DceResult {
                 add_expr_uses(live, expr);
                 output.push(Stmt::Range { names, expr, body: result.block })
             },
-            Break => output.push(Stmt::Break),
-            BreakLabel { label } => output.push(Stmt::BreakLabel { label }),
-            Continue => output.push(Stmt::Continue),
-            ContinueLabel { label } => output.push(Stmt::ContinueLabel { label }),
+            Break => {
+                restore_dce_jump_live(live, targets, "", false);
+                output.push(Stmt::Break)
+            },
+            BreakLabel { label } => {
+                restore_dce_jump_live(live, targets, label, false);
+                output.push(Stmt::BreakLabel { label })
+            },
+            Continue => {
+                restore_dce_jump_live(live, targets, "", true);
+                output.push(Stmt::Continue)
+            },
+            ContinueLabel { label } => {
+                restore_dce_jump_live(live, targets, label, true);
+                output.push(Stmt::ContinueLabel { label })
+            },
             Switch { expr, cases, default } => {
+                push_dce_jump_target(targets, "", live, None);
                 let lowered_cases: Vec[SwitchCase] = Vec::with_capacity(cases.len());
                 for case in cases {
-                    let result = dce_block_with_live(case.body, live);
+                    let result = dce_block_with_live(case.body, live, targets);
                     add_expr_uses(live, case.value);
                     add_names(live, result.live);
                     add_names(needs_decl, result.needs_decl);
@@ -562,7 +619,7 @@ fn dce_block_with_live(value: Block, live_out: DceNames) -> DceResult {
                 }
                 let lowered_default = match default {
                     Some(body) => {
-                        let result = dce_block_with_live(body, live);
+                        let result = dce_block_with_live(body, live, targets);
                         add_names(live, result.live);
                         add_names(needs_decl, result.needs_decl);
                         Option::Some(result.block)
@@ -570,12 +627,14 @@ fn dce_block_with_live(value: Block, live_out: DceNames) -> DceResult {
                     None => Option::None,
                 };
                 add_expr_uses(live, expr);
+                let _ = targets.remove(targets.len() - 1);
                 output.push(Stmt::Switch { expr, cases: lowered_cases, default: lowered_default })
             },
             TypeSwitch { binding: bind, expr, cases, default } => {
+                push_dce_jump_target(targets, "", live, None);
                 let lowered_cases: Vec[TypeSwitchCase] = Vec::with_capacity(cases.len());
                 for case in cases {
-                    let result = dce_block_with_live(case.body, live);
+                    let result = dce_block_with_live(case.body, live, targets);
                     if let Some(name) = bind {
                         remove_name(result.live, name);
                         remove_name(result.needs_decl, name)
@@ -586,7 +645,7 @@ fn dce_block_with_live(value: Block, live_out: DceNames) -> DceResult {
                 }
                 let lowered_default = match default {
                     Some(body) => {
-                        let result = dce_block_with_live(body, live);
+                        let result = dce_block_with_live(body, live, targets);
                         if let Some(name) = bind {
                             remove_name(result.live, name);
                             remove_name(result.needs_decl, name)
@@ -598,6 +657,7 @@ fn dce_block_with_live(value: Block, live_out: DceNames) -> DceResult {
                     None => Option::None,
                 };
                 add_expr_uses(live, expr);
+                let _ = targets.remove(targets.len() - 1);
                 output.push(
                     TypeSwitch {
                         binding: bind,
@@ -608,9 +668,10 @@ fn dce_block_with_live(value: Block, live_out: DceNames) -> DceResult {
                 )
             },
             Select { cases, default } => {
+                push_dce_jump_target(targets, "", live, None);
                 let lowered_cases: Vec[SelectCase] = Vec::with_capacity(cases.len());
                 for case in cases {
-                    let result = dce_block_with_live(case.body, live);
+                    let result = dce_block_with_live(case.body, live, targets);
                     let operation = match case.operation {
                         Receive { names, channel } => {
                             let lowered_names: Vec[string] = Vec::with_capacity(names.len());
@@ -639,13 +700,14 @@ fn dce_block_with_live(value: Block, live_out: DceNames) -> DceResult {
                 }
                 let lowered_default = match default {
                     Some(body) => {
-                        let result = dce_block_with_live(body, live);
+                        let result = dce_block_with_live(body, live, targets);
                         add_names(live, result.live);
                         add_names(needs_decl, result.needs_decl);
                         Option::Some(result.block)
                     },
                     None => Option::None,
                 };
+                let _ = targets.remove(targets.len() - 1);
                 output.push(Stmt::Select { cases: lowered_cases, default: lowered_default })
             },
             Panic { message } => output.push(Stmt::Panic { message }),
@@ -657,5 +719,5 @@ fn dce_block_with_live(value: Block, live_out: DceNames) -> DceResult {
 
 pub fn eliminate_dead_vars(value: Block) -> Block {
     let live = new_dce_names();
-    dce_block_with_live(value, live).block
+    dce_block_with_live(value, live, Vec::new()).block
 }

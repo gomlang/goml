@@ -25,6 +25,7 @@ struct LowerEnv {
     collection_array_consumers: HashMap[string, anf::Value],
     emitted_loop_labels: collections::IndexSet[string],
     active_loop_labels: Vec[(string, string)],
+    shared_joins: Vec[(string, string)],
     variants: VariantInfos,
     structs: Vec[repr::StructDef],
     functions: Vec[anf::Function],
@@ -3102,57 +3103,62 @@ fn same_target(lhs: Option[string], rhs: Option[string]) -> Option[string] {
     }
 }
 
-fn match_block_target(arms: Vec[anf::Arm], default: Option[anf::Block]) -> Option[string] {
-    if arms.is_empty() {
-        return default.and_then(|body| block_target(body))
-    }
-    let expected = block_target(arms[0].body)?;
-    for index in 1..arms.len() {
-        if block_target(arms[index].body)? != expected {
-            return None
-        }
-    }
-    if let Some(body) = default {
-        if block_target(body)? != expected {
-            return None
-        }
-    }
-    Some(expected)
+enum ControlTarget {
+    Target(string),
+    Terminated,
+    Divergent,
 }
 
-fn select_block_target(arms: Vec[anf::SelectArm], default: Option[anf::Block]) -> Option[string] {
-    if arms.is_empty() {
-        return default.and_then(|body| block_target(body))
+fn merge_control_targets(left: ControlTarget, right: ControlTarget) -> ControlTarget {
+    match (left, right) {
+        (Terminated, value) | (value, Terminated) => value,
+        (Target(left), Target(right)) => if left == right {
+            Target(left)
+        } else {
+            Divergent
+        },
+        _ => Divergent,
     }
-    let first = match arms[0] {
-        Receive { body, .. } | Send { body, .. } => body,
-    };
-    let expected = block_target(first)?;
-    for index in 1..arms.len() {
-        let body = match arms[index] {
-            Receive { body, .. } | Send { body, .. } => body,
-        };
-        if block_target(body)? != expected {
-            return None
-        }
+}
+
+fn control_term_target(value: anf::Term) -> ControlTarget {
+    match value {
+        Jump { target, .. } => Target(target),
+        If { then_, else_, .. } => merge_control_targets(
+            control_block_target(then_),
+            control_block_target(else_),
+        ),
+        Match { arms, default, .. } => {
+            let mut result = ControlTarget::Terminated;
+            for arm in arms {
+                result = merge_control_targets(result, control_block_target(arm.body));
+            }
+            if let Some(body) = default {
+                result = merge_control_targets(result, control_block_target(body));
+            }
+            result
+        },
+        Select { arms, default, .. } => {
+            let mut result = ControlTarget::Terminated;
+            for arm in arms {
+                let body = match arm {
+                    Receive { body, .. } | Send { body, .. } => body,
+                };
+                result = merge_control_targets(result, control_block_target(body));
+            }
+            if let Some(body) = default {
+                result = merge_control_targets(result, control_block_target(body));
+            }
+            result
+        },
+        Return(_) | Unreachable { .. } => Terminated,
     }
-    if let Some(body) = default {
-        if block_target(body)? != expected {
-            return None
-        }
-    }
-    Some(expected)
 }
 
 fn term_target(value: anf::Term) -> Option[string] {
-    match value {
-        Jump { target, args: _, ret_ty: _ } => Some(target),
-        If { cond: _, then_, else_, ret_ty: _ } => {
-            same_target(block_target(then_), block_target(else_))
-        },
-        Match { scrutinee: _, arms, default, ret_ty: _ } => match_block_target(arms, default),
-        Select { arms, default, .. } => select_block_target(arms, default),
-        Return(_) | Unreachable { ty: _ } => None,
+    match control_term_target(value) {
+        Target(name) => Some(name),
+        Terminated | Divergent => None,
     }
 }
 
@@ -3176,29 +3182,27 @@ fn find_block_join(value: anf::Block, name: string) -> Option[anf::JoinBind] {
     None
 }
 
-fn block_target_with_visited(value: anf::Block, visited: collections::IndexSet[string]) -> Option[
-    string,
-] {
-    match term_target(value.term) {
-        Some(target) => {
+fn control_block_target_with_visited(value: anf::Block, visited: collections::IndexSet[string]) -> ControlTarget {
+    match control_term_target(value.term) {
+        Target(target) => {
             if visited.contains(target) {
-                None
+                Divergent
             } else {
                 match find_block_join(value, target) {
                     Some(join) => {
                         let _ = visited.insert(target);
-                        block_target_with_visited(join.body, visited)
+                        control_block_target_with_visited(join.body, visited)
                     },
-                    None => Some(target),
+                    None => Target(target),
                 }
             }
         },
-        None => None,
+        value => value,
     }
 }
 
-fn block_target(value: anf::Block) -> Option[string] {
-    block_target_with_visited(value, collections::IndexSet::new())
+fn control_block_target(value: anf::Block) -> ControlTarget {
+    control_block_target_with_visited(value, collections::IndexSet::new())
 }
 
 fn blocks_reach_target(
@@ -3618,7 +3622,10 @@ fn compile_term_leaf(env: LowerEnv, value: anf::Term) -> Vec[Stmt] {
         Jump { target, args, ret_ty: _ } => match find_join(env.joins, target) {
             Some(join) => {
                 append_stmts(result, compile_jump_args(env, join, args));
-                append_stmts(result, compile_block(env, join.body).stmts)
+                match shared_join_label(env, target) {
+                    Some(label) => result.push(Stmt::BreakLabel { label }),
+                    None => append_stmts(result, compile_block(env, join.body).stmts),
+                }
             },
             None => result.push(Stmt::Unreachable),
         },
@@ -3740,7 +3747,7 @@ fn compile_term_with_pending(env: LowerEnv, value: anf::Term, pending: Vec[anf::
             },
             None => compile_term_leaf(env, value),
         },
-        None => compile_term_leaf(env, value),
+        None => compile_shared_term(env, value, pending),
     }
 }
 
@@ -4508,8 +4515,19 @@ fn compile_loop_term_leaf(
     let result: Vec[Stmt] = Vec::new();
     match value {
         Jump { target, args, ret_ty: _ } => {
-            if target == loop_name {
-                result.push(Stmt::Continue)
+            if let Some(shared_label) = shared_join_label(env, target) {
+                if let Some(join) = find_join(env.joins, target) {
+                    append_stmts(result, compile_jump_args(env, join, args));
+                }
+                result.push(Stmt::BreakLabel { label: shared_label })
+            } else if target == loop_name {
+                result.push(
+                    if env.shared_joins.is_empty() {
+                        Stmt::Continue
+                    } else {
+                        Stmt::ContinueLabel { label }
+                    },
+                )
             } else if active_loop_label(env, target).is_some() && args.is_empty() {
                 result.push(ContinueLabel { label: active_loop_label(env, target).unwrap_or("") })
             } else if target == exit_name {
@@ -4802,7 +4820,7 @@ fn compile_loop_term_with_pending(
             },
             None => compile_loop_term_leaf(env, value, loop_name, exit_name, label),
         },
-        None => compile_loop_term_leaf(env, value, loop_name, exit_name, label),
+        None => compile_shared_loop_term(env, value, pending, loop_name, exit_name, label),
     }
 }
 
@@ -5766,6 +5784,7 @@ fn compile_function(
         collection_array_consumers,
         emitted_loop_labels: collections::IndexSet::new(),
         active_loop_labels: Vec::new(),
+        shared_joins: Vec::new(),
         variants,
         structs,
         functions,
