@@ -366,7 +366,7 @@ LSP 在各自包上下文中分析生产文件、内部和黑盒测试，因此�
 
 自定义 `goml/expandedDerive` 请求返回所请求文档完成内置和可编程 derive 后的格式化 AST。它使用与 `goml check` 相同的包别名、显式 derive 导入、歧义检查、依赖接口、CTIR 验证器和资源限制。VS Code 命令 `GoML: Show Expanded Derive` 在源文件旁打开结果。
 
-`gomllsp` 通过 `textDocument/formatting` 支持整文档格式化。格式化使用最新未保存文本及[格式化](formatting.zh-CN.md)中的固定规则。无效文档保持不变。
+`textDocument/formatting` 的行为见[编辑器格式化](formatting.zh-CN.md#editor-formatting)。
 
 CLI 和 LSP 诊断共享包含可选稳定代码、备注、帮助和建议编辑的模型。CLI 显示 `error[typer/try_error_mismatch]` 或 `warning[typer/unused_result]`；LSP 在 `Diagnostic.code` 暴露相同标识符，并在 `relatedInformation` 暴露次级位置。备注和帮助出现在显示消息中，也单独放在诊断 `data`，连同修复和文档版本。修复包含标题、一项或多项范围编辑，以及 `machine-applicable` 或 `requires-review` 适用性。代码操作拒绝旧文档版本的修复。目前为未使用 Result 警告及三种 [`?` 诊断](language/basics.zh-CN.md#try-operator)分配代码；其他诊断可能省略。
 

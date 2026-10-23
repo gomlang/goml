@@ -11,54 +11,9 @@ Quick navigation: [packages](#packages), [text](#text-and-source-positions), [co
 The standard library is distinct from both the hidden builtin contract and the automatically scoped prelude. Algorithms are implemented in GoML; host operations use compiler-owned builtin runtime hooks, without user Go FFI declarations or metadata discovery. Its packages must be imported explicitly:
 
 ```goml
-use std::ascii;
-use std::bincode;
-use std::bytes;
-use std::bytes::endian;
-use std::c;
-use std::channel;
-use std::cmp;
-use std::collections;
-use std::collections::imm;
-use std::context;
-use std::crypto;
-use std::encoding::base32;
-use std::encoding::base64;
-use std::encoding::hex;
-use std::error;
-use std::env;
-use std::ffi;
 use std::fs;
-use std::hash;
-use std::hash::adler32;
-use std::hash::crc32;
-use std::hash::crc64;
-use std::hash::fnv;
-use std::io;
-use std::iter;
-use std::json;
-use std::math;
-use std::math::bits;
-use std::math::complex;
-use std::net;
-use std::net::tls;
-use std::num;
-use std::os::linux::syscall;
-use std::path;
-use std::path::slash;
-use std::panic;
-use std::process;
-use std::rand;
-use std::serde;
-use std::task;
-use std::testing;
+use std::collections::imm;
 use std::testing::io as iotest;
-use std::text;
-use std::toml;
-use std::time;
-use std::utf8;
-use std::utf16;
-use std::unicode;
 ```
 
 Public APIs include:

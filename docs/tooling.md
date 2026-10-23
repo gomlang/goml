@@ -366,7 +366,7 @@ Package analysis caches parsed/lowered sources and successful checked packages w
 
 The custom `goml/expandedDerive` request returns the formatted AST after built-in and programmable derives have run for the requested document. It uses the same package aliases, explicit derive imports, ambiguity checks, dependency interfaces, CTIR verifier, and resource limits as `goml check`. The VS Code command `GoML: Show Expanded Derive` opens that result beside the source file.
 
-`gomllsp` supports full-document formatting through `textDocument/formatting`. Formatting uses the latest unsaved document text and the fixed rules described in [formatting.md](formatting.md). Invalid documents are left unchanged.
+See [editor formatting](formatting.md#editor-formatting) for `textDocument/formatting` behavior.
 
 CLI and LSP diagnostics share a model with optional stable codes, notes, help, and suggested edits. The CLI displays codes as `error[typer/try_error_mismatch]` or `warning[typer/unused_result]`; the LSP exposes the same identifier in `Diagnostic.code` and secondary locations in `relatedInformation`. Notes and help appear in the displayed message and separately in diagnostic `data`, alongside fixes and the document version. Fixes carry a title, one or more ranged edits, and `machine-applicable` or `requires-review` applicability. Code actions reject fixes from an older document version. Codes are currently assigned to the unused-Result warning and the three [`?` diagnostics](language/basics.md#try-operator); other diagnostics may omit them.
 

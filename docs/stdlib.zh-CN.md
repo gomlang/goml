@@ -15,54 +15,9 @@
 标准库独立于隐藏的 builtin 契约和自动进入作用域的 prelude。算法由 GoML 实现；宿主操作使用编译器拥有的 builtin 运行时钩子，不使用用户 Go FFI 声明，也不进行元数据发现。标准库的包必须显式导入：
 
 ```goml
-use std::ascii;
-use std::bincode;
-use std::bytes;
-use std::bytes::endian;
-use std::c;
-use std::channel;
-use std::cmp;
-use std::collections;
-use std::collections::imm;
-use std::context;
-use std::crypto;
-use std::encoding::base32;
-use std::encoding::base64;
-use std::encoding::hex;
-use std::error;
-use std::env;
-use std::ffi;
 use std::fs;
-use std::hash;
-use std::hash::adler32;
-use std::hash::crc32;
-use std::hash::crc64;
-use std::hash::fnv;
-use std::io;
-use std::iter;
-use std::json;
-use std::math;
-use std::math::bits;
-use std::math::complex;
-use std::net;
-use std::net::tls;
-use std::num;
-use std::os::linux::syscall;
-use std::path;
-use std::path::slash;
-use std::panic;
-use std::process;
-use std::rand;
-use std::serde;
-use std::task;
-use std::testing;
+use std::collections::imm;
 use std::testing::io as iotest;
-use std::text;
-use std::toml;
-use std::time;
-use std::utf8;
-use std::utf16;
-use std::unicode;
 ```
 
 公共 API 包括：
