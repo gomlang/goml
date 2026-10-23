@@ -963,13 +963,12 @@ func _goml_m_inherent_i_Slice_i_Slice_l_T_r__i_contains____T__isize(self__0 []in
             t3 = inline0
             if t3 {
                 return true
-            } else {
-                var compound_old0 int = index__0
-                var compound_value0 int = 1
-                var t4 int = compound_old0 + compound_value0
-                index__0 = t4
-                continue
-            }
+            } else {}
+            var compound_old0 int = index__0
+            var compound_value0 int = 1
+            var t4 int = compound_old0 + compound_value0
+            index__0 = t4
+            continue
         } else {
             break Loop_loop0
         }
@@ -1035,212 +1034,211 @@ func _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_stable__sort__by____T__isize(self__0 
     var t0 bool = length__0 < 2
     if t0 {
         return struct{}{}
-    } else {
-        var buffer__0 *_goml_vec_int
-        var inline17 *_goml_vec_int = vec_with_capacity__Vec_3int(length__0)
-        buffer__0 = inline17
-        var t1 FnIterator__isize
-        var inline12 int = 0
-        var inline13 *ref_int_x = ref__Ref_3int(inline12)
-        var inline14 closure_env_goml_builtin_range_13 = closure_env_goml_builtin_range_13{
-            current_0: inline13,
-            end_1: length__0,
-        }
-        var inline15 func() Option__isize = func() Option__isize {
-            return _goml_m_inherent_i_closure__en_h705ec68e290747cc19a5685005dd16c1_nge__13_i_apply(inline14)
-        }
-        var inline16 FnIterator__isize = _goml_m_inherent_i_FnIterator_i_FnIterator_l_T_r__i_from__fn____T__isize(inline15)
-        t1 = inline16
-        var for_iter0 FnIterator__isize
-        for_iter0 = t1
-        Loop_loop0:
-        for {
-            var for_next1 Option__isize
-            var inline10 func() Option__isize = for_iter0.next_fn
-            var inline11 Option__isize = inline10()
-            for_next1 = inline11
-            switch for_next1._tag {
-            case 0:
-                break Loop_loop0
-            case 1:
-                var x1 int = for_next1._p0
-                var t37 int = vec_get__Vec_3int(self__0, x1)
-                vec_push__Vec_3int(buffer__0, t37)
-                continue
-            default:
-                panic("non-exhaustive match")
-            }
-        }
-        var width__0 int = 1
-        Loop_loop1:
-        for {
-            var t2 bool = width__0 < length__0
-            if t2 {
-                var left__0 int = 0
-                Loop_loop2:
-                for {
-                    var t8 bool = left__0 < length__0
-                    if t8 {
-                        var t9 int = left__0 + width__0
-                        var middle__0 int
-                        var inline8 bool = t9 < length__0
-                        if inline8 {
-                            middle__0 = t9
-                        } else {
-                            middle__0 = length__0
-                        }
-                        var t10 int = middle__0 + width__0
-                        var right__0 int
-                        var inline7 bool = t10 < length__0
-                        if inline7 {
-                            right__0 = t10
-                        } else {
-                            right__0 = length__0
-                        }
-                        var first__0 int = left__0
-                        var second__0 int = middle__0
-                        var output__0 int = left__0
-                        Loop_loop4:
-                        for {
-                            var t23 bool = first__0 < middle__0
-                            var jp1 bool
-                            if t23 {
-                                var t36 bool = second__0 < right__0
-                                jp1 = t36
-                            } else {
-                                jp1 = false
-                            }
-                            if jp1 {
-                                var t24 int = vec_get__Vec_3int(self__0, first__0)
-                                var t25 int = vec_get__Vec_3int(self__0, second__0)
-                                var t26 int = compare__0(t24, t25)
-                                var t27 bool = t26 <= 0
-                                if t27 {
-                                    var index2 int = output__0
-                                    vec_get__Vec_3int(buffer__0, index2)
-                                    var value3 int = vec_get__Vec_3int(self__0, first__0)
-                                    vec_set__Vec_3int(buffer__0, index2, value3)
-                                    var compound_old5 int = first__0
-                                    var compound_value5 int = 1
-                                    var t31 int = compound_old5 + compound_value5
-                                    first__0 = t31
-                                } else {
-                                    var index3 int = output__0
-                                    vec_get__Vec_3int(buffer__0, index3)
-                                    var value4 int = vec_get__Vec_3int(self__0, second__0)
-                                    vec_set__Vec_3int(buffer__0, index3, value4)
-                                    var compound_old6 int = second__0
-                                    var compound_value6 int = 1
-                                    var t34 int = compound_old6 + compound_value6
-                                    second__0 = t34
-                                }
-                                var compound_old4 int = output__0
-                                var compound_value4 int = 1
-                                var t28 int = compound_old4 + compound_value4
-                                output__0 = t28
-                                continue
-                            } else {
-                                break Loop_loop4
-                            }
-                        }
-                        Loop_loop5:
-                        for {
-                            var t17 bool = first__0 < middle__0
-                            if t17 {
-                                var index1 int = output__0
-                                vec_get__Vec_3int(buffer__0, index1)
-                                var value2 int = vec_get__Vec_3int(self__0, first__0)
-                                vec_set__Vec_3int(buffer__0, index1, value2)
-                                var compound_old2 int = first__0
-                                var compound_value2 int = 1
-                                var t19 int = compound_old2 + compound_value2
-                                first__0 = t19
-                                var compound_old3 int = output__0
-                                var compound_value3 int = 1
-                                var t21 int = compound_old3 + compound_value3
-                                output__0 = t21
-                                continue
-                            } else {
-                                break Loop_loop5
-                            }
-                        }
-                        Loop_loop6:
-                        for {
-                            var t11 bool = second__0 < right__0
-                            if t11 {
-                                var index0 int = output__0
-                                vec_get__Vec_3int(buffer__0, index0)
-                                var value1 int = vec_get__Vec_3int(self__0, second__0)
-                                vec_set__Vec_3int(buffer__0, index0, value1)
-                                var compound_old0 int = second__0
-                                var compound_value0 int = 1
-                                var t13 int = compound_old0 + compound_value0
-                                second__0 = t13
-                                var compound_old1 int = output__0
-                                var compound_value1 int = 1
-                                var t15 int = compound_old1 + compound_value1
-                                output__0 = t15
-                                continue
-                            } else {
-                                break Loop_loop6
-                            }
-                        }
-                        left__0 = right__0
-                        continue
-                    } else {
-                        break Loop_loop2
-                    }
-                }
-                var t3 FnIterator__isize
-                var inline2 int = 0
-                var inline3 *ref_int_x = ref__Ref_3int(inline2)
-                var inline4 closure_env_goml_builtin_range_13 = closure_env_goml_builtin_range_13{
-                    current_0: inline3,
-                    end_1: length__0,
-                }
-                var inline5 func() Option__isize = func() Option__isize {
-                    return _goml_m_inherent_i_closure__en_h705ec68e290747cc19a5685005dd16c1_nge__13_i_apply(inline4)
-                }
-                var inline6 FnIterator__isize = _goml_m_inherent_i_FnIterator_i_FnIterator_l_T_r__i_from__fn____T__isize(inline5)
-                t3 = inline6
-                var for_iter1 FnIterator__isize
-                for_iter1 = t3
-                Loop_loop3:
-                for {
-                    var for_next0 Option__isize
-                    var inline0 func() Option__isize = for_iter1.next_fn
-                    var inline1 Option__isize = inline0()
-                    for_next0 = inline1
-                    switch for_next0._tag {
-                    case 0:
-                        break Loop_loop3
-                    case 1:
-                        var x0 int = for_next0._p0
-                        vec_get__Vec_3int(self__0, x0)
-                        var value0 int = vec_get__Vec_3int(buffer__0, x0)
-                        vec_set__Vec_3int(self__0, x0, value0)
-                        continue
-                    default:
-                        panic("non-exhaustive match")
-                    }
-                }
-                var t4 int = length__0 / 2
-                var t5 bool = width__0 > t4
-                var jp0 int
-                if t5 {
-                    jp0 = length__0
-                } else {
-                    var t6 int = width__0 * 2
-                    jp0 = t6
-                }
-                width__0 = jp0
-                continue
-            } else {
-                break Loop_loop1
-            }
-        }
-        return struct{}{}
+    } else {}
+    var buffer__0 *_goml_vec_int
+    var inline17 *_goml_vec_int = vec_with_capacity__Vec_3int(length__0)
+    buffer__0 = inline17
+    var t1 FnIterator__isize
+    var inline12 int = 0
+    var inline13 *ref_int_x = ref__Ref_3int(inline12)
+    var inline14 closure_env_goml_builtin_range_13 = closure_env_goml_builtin_range_13{
+        current_0: inline13,
+        end_1: length__0,
     }
+    var inline15 func() Option__isize = func() Option__isize {
+        return _goml_m_inherent_i_closure__en_h705ec68e290747cc19a5685005dd16c1_nge__13_i_apply(inline14)
+    }
+    var inline16 FnIterator__isize = _goml_m_inherent_i_FnIterator_i_FnIterator_l_T_r__i_from__fn____T__isize(inline15)
+    t1 = inline16
+    var for_iter0 FnIterator__isize
+    for_iter0 = t1
+    Loop_loop0:
+    for {
+        var for_next1 Option__isize
+        var inline10 func() Option__isize = for_iter0.next_fn
+        var inline11 Option__isize = inline10()
+        for_next1 = inline11
+        switch for_next1._tag {
+        case 0:
+            break Loop_loop0
+        case 1:
+            var x1 int = for_next1._p0
+            var t37 int = vec_get__Vec_3int(self__0, x1)
+            vec_push__Vec_3int(buffer__0, t37)
+            continue
+        default:
+            panic("non-exhaustive match")
+        }
+    }
+    var width__0 int = 1
+    Loop_loop1:
+    for {
+        var t2 bool = width__0 < length__0
+        if t2 {
+            var left__0 int = 0
+            Loop_loop2:
+            for {
+                var t8 bool = left__0 < length__0
+                if t8 {
+                    var t9 int = left__0 + width__0
+                    var middle__0 int
+                    var inline8 bool = t9 < length__0
+                    if inline8 {
+                        middle__0 = t9
+                    } else {
+                        middle__0 = length__0
+                    }
+                    var t10 int = middle__0 + width__0
+                    var right__0 int
+                    var inline7 bool = t10 < length__0
+                    if inline7 {
+                        right__0 = t10
+                    } else {
+                        right__0 = length__0
+                    }
+                    var first__0 int = left__0
+                    var second__0 int = middle__0
+                    var output__0 int = left__0
+                    Loop_loop4:
+                    for {
+                        var t23 bool = first__0 < middle__0
+                        var jp1 bool
+                        if t23 {
+                            var t36 bool = second__0 < right__0
+                            jp1 = t36
+                        } else {
+                            jp1 = false
+                        }
+                        if jp1 {
+                            var t24 int = vec_get__Vec_3int(self__0, first__0)
+                            var t25 int = vec_get__Vec_3int(self__0, second__0)
+                            var t26 int = compare__0(t24, t25)
+                            var t27 bool = t26 <= 0
+                            if t27 {
+                                var index2 int = output__0
+                                vec_get__Vec_3int(buffer__0, index2)
+                                var value3 int = vec_get__Vec_3int(self__0, first__0)
+                                vec_set__Vec_3int(buffer__0, index2, value3)
+                                var compound_old5 int = first__0
+                                var compound_value5 int = 1
+                                var t31 int = compound_old5 + compound_value5
+                                first__0 = t31
+                            } else {
+                                var index3 int = output__0
+                                vec_get__Vec_3int(buffer__0, index3)
+                                var value4 int = vec_get__Vec_3int(self__0, second__0)
+                                vec_set__Vec_3int(buffer__0, index3, value4)
+                                var compound_old6 int = second__0
+                                var compound_value6 int = 1
+                                var t34 int = compound_old6 + compound_value6
+                                second__0 = t34
+                            }
+                            var compound_old4 int = output__0
+                            var compound_value4 int = 1
+                            var t28 int = compound_old4 + compound_value4
+                            output__0 = t28
+                            continue
+                        } else {
+                            break Loop_loop4
+                        }
+                    }
+                    Loop_loop5:
+                    for {
+                        var t17 bool = first__0 < middle__0
+                        if t17 {
+                            var index1 int = output__0
+                            vec_get__Vec_3int(buffer__0, index1)
+                            var value2 int = vec_get__Vec_3int(self__0, first__0)
+                            vec_set__Vec_3int(buffer__0, index1, value2)
+                            var compound_old2 int = first__0
+                            var compound_value2 int = 1
+                            var t19 int = compound_old2 + compound_value2
+                            first__0 = t19
+                            var compound_old3 int = output__0
+                            var compound_value3 int = 1
+                            var t21 int = compound_old3 + compound_value3
+                            output__0 = t21
+                            continue
+                        } else {
+                            break Loop_loop5
+                        }
+                    }
+                    Loop_loop6:
+                    for {
+                        var t11 bool = second__0 < right__0
+                        if t11 {
+                            var index0 int = output__0
+                            vec_get__Vec_3int(buffer__0, index0)
+                            var value1 int = vec_get__Vec_3int(self__0, second__0)
+                            vec_set__Vec_3int(buffer__0, index0, value1)
+                            var compound_old0 int = second__0
+                            var compound_value0 int = 1
+                            var t13 int = compound_old0 + compound_value0
+                            second__0 = t13
+                            var compound_old1 int = output__0
+                            var compound_value1 int = 1
+                            var t15 int = compound_old1 + compound_value1
+                            output__0 = t15
+                            continue
+                        } else {
+                            break Loop_loop6
+                        }
+                    }
+                    left__0 = right__0
+                    continue
+                } else {
+                    break Loop_loop2
+                }
+            }
+            var t3 FnIterator__isize
+            var inline2 int = 0
+            var inline3 *ref_int_x = ref__Ref_3int(inline2)
+            var inline4 closure_env_goml_builtin_range_13 = closure_env_goml_builtin_range_13{
+                current_0: inline3,
+                end_1: length__0,
+            }
+            var inline5 func() Option__isize = func() Option__isize {
+                return _goml_m_inherent_i_closure__en_h705ec68e290747cc19a5685005dd16c1_nge__13_i_apply(inline4)
+            }
+            var inline6 FnIterator__isize = _goml_m_inherent_i_FnIterator_i_FnIterator_l_T_r__i_from__fn____T__isize(inline5)
+            t3 = inline6
+            var for_iter1 FnIterator__isize
+            for_iter1 = t3
+            Loop_loop3:
+            for {
+                var for_next0 Option__isize
+                var inline0 func() Option__isize = for_iter1.next_fn
+                var inline1 Option__isize = inline0()
+                for_next0 = inline1
+                switch for_next0._tag {
+                case 0:
+                    break Loop_loop3
+                case 1:
+                    var x0 int = for_next0._p0
+                    vec_get__Vec_3int(self__0, x0)
+                    var value0 int = vec_get__Vec_3int(buffer__0, x0)
+                    vec_set__Vec_3int(self__0, x0, value0)
+                    continue
+                default:
+                    panic("non-exhaustive match")
+                }
+            }
+            var t4 int = length__0 / 2
+            var t5 bool = width__0 > t4
+            var jp0 int
+            if t5 {
+                jp0 = length__0
+            } else {
+                var t6 int = width__0 * 2
+                jp0 = t6
+            }
+            width__0 = jp0
+            continue
+        } else {
+            break Loop_loop1
+        }
+    }
+    return struct{}{}
 }
 
 func __goml_builtin_string_concat(values__0 *_goml_vec_string) string {
@@ -1321,60 +1319,59 @@ func _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_dedup__by____T__isize(self__0 *_goml_
     var t1 bool = t0 < 2
     if t1 {
         return struct{}{}
-    } else {
-        var output__0 int = 1
-        var t2 int
-        var inline8 int = vec_len__Vec_3int(self__0)
-        t2 = inline8
-        var t3 FnIterator__isize
-        var inline3 int = 1
-        var inline4 *ref_int_x = ref__Ref_3int(inline3)
-        var inline5 closure_env_goml_builtin_range_13 = closure_env_goml_builtin_range_13{
-            current_0: inline4,
-            end_1: t2,
-        }
-        var inline6 func() Option__isize = func() Option__isize {
-            return _goml_m_inherent_i_closure__en_h705ec68e290747cc19a5685005dd16c1_nge__13_i_apply(inline5)
-        }
-        var inline7 FnIterator__isize = _goml_m_inherent_i_FnIterator_i_FnIterator_l_T_r__i_from__fn____T__isize(inline6)
-        t3 = inline7
-        var for_iter0 FnIterator__isize
-        for_iter0 = t3
-        Loop_loop0:
-        for {
-            var for_next0 Option__isize
-            var inline1 func() Option__isize = for_iter0.next_fn
-            var inline2 Option__isize = inline1()
-            for_next0 = inline2
-            switch for_next0._tag {
-            case 0:
-                break Loop_loop0
-            case 1:
-                var x0 int = for_next0._p0
-                var value__0 int = vec_get__Vec_3int(self__0, x0)
-                var t4 int = output__0 - 1
-                var t5 int = vec_get__Vec_3int(self__0, t4)
-                var t6 bool = equal__0(t5, value__0)
-                var t7 bool = !t6
-                if t7 {
-                    var index0 int = output__0
-                    vec_get__Vec_3int(self__0, index0)
-                    vec_set__Vec_3int(self__0, index0, value__0)
-                    var compound_old0 int = output__0
-                    var compound_value0 int = 1
-                    var t9 int = compound_old0 + compound_value0
-                    output__0 = t9
-                    continue
-                } else {
-                    continue
-                }
-            default:
-                panic("non-exhaustive match")
-            }
-        }
-        vec_truncate__Vec_3int(self__0, output__0)
-        return struct{}{}
+    } else {}
+    var output__0 int = 1
+    var t2 int
+    var inline8 int = vec_len__Vec_3int(self__0)
+    t2 = inline8
+    var t3 FnIterator__isize
+    var inline3 int = 1
+    var inline4 *ref_int_x = ref__Ref_3int(inline3)
+    var inline5 closure_env_goml_builtin_range_13 = closure_env_goml_builtin_range_13{
+        current_0: inline4,
+        end_1: t2,
     }
+    var inline6 func() Option__isize = func() Option__isize {
+        return _goml_m_inherent_i_closure__en_h705ec68e290747cc19a5685005dd16c1_nge__13_i_apply(inline5)
+    }
+    var inline7 FnIterator__isize = _goml_m_inherent_i_FnIterator_i_FnIterator_l_T_r__i_from__fn____T__isize(inline6)
+    t3 = inline7
+    var for_iter0 FnIterator__isize
+    for_iter0 = t3
+    Loop_loop0:
+    for {
+        var for_next0 Option__isize
+        var inline1 func() Option__isize = for_iter0.next_fn
+        var inline2 Option__isize = inline1()
+        for_next0 = inline2
+        switch for_next0._tag {
+        case 0:
+            break Loop_loop0
+        case 1:
+            var x0 int = for_next0._p0
+            var value__0 int = vec_get__Vec_3int(self__0, x0)
+            var t4 int = output__0 - 1
+            var t5 int = vec_get__Vec_3int(self__0, t4)
+            var t6 bool = equal__0(t5, value__0)
+            var t7 bool = !t6
+            if t7 {
+                var index0 int = output__0
+                vec_get__Vec_3int(self__0, index0)
+                vec_set__Vec_3int(self__0, index0, value__0)
+                var compound_old0 int = output__0
+                var compound_value0 int = 1
+                var t9 int = compound_old0 + compound_value0
+                output__0 = t9
+                continue
+            } else {
+                continue
+            }
+        default:
+            panic("non-exhaustive match")
+        }
+    }
+    vec_truncate__Vec_3int(self__0, output__0)
+    return struct{}{}
 }
 
 func _goml_m_trait__impl_i_std_p_cmp_p_Ord_i_string_i_cmp(self__0 string, other__0 string) Ordering {
@@ -1474,212 +1471,211 @@ func _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_stable__sort__by____T__string(self__0
     var t0 bool = length__0 < 2
     if t0 {
         return struct{}{}
-    } else {
-        var buffer__0 *_goml_vec_string
-        var inline17 *_goml_vec_string = vec_with_capacity__Vec_6string(length__0)
-        buffer__0 = inline17
-        var t1 FnIterator__isize
-        var inline12 int = 0
-        var inline13 *ref_int_x = ref__Ref_3int(inline12)
-        var inline14 closure_env_goml_builtin_range_13 = closure_env_goml_builtin_range_13{
-            current_0: inline13,
-            end_1: length__0,
-        }
-        var inline15 func() Option__isize = func() Option__isize {
-            return _goml_m_inherent_i_closure__en_h705ec68e290747cc19a5685005dd16c1_nge__13_i_apply(inline14)
-        }
-        var inline16 FnIterator__isize = _goml_m_inherent_i_FnIterator_i_FnIterator_l_T_r__i_from__fn____T__isize(inline15)
-        t1 = inline16
-        var for_iter0 FnIterator__isize
-        for_iter0 = t1
-        Loop_loop0:
-        for {
-            var for_next1 Option__isize
-            var inline10 func() Option__isize = for_iter0.next_fn
-            var inline11 Option__isize = inline10()
-            for_next1 = inline11
-            switch for_next1._tag {
-            case 0:
-                break Loop_loop0
-            case 1:
-                var x1 int = for_next1._p0
-                var t37 string = vec_get__Vec_6string(self__0, x1)
-                vec_push__Vec_6string(buffer__0, t37)
-                continue
-            default:
-                panic("non-exhaustive match")
-            }
-        }
-        var width__0 int = 1
-        Loop_loop1:
-        for {
-            var t2 bool = width__0 < length__0
-            if t2 {
-                var left__0 int = 0
-                Loop_loop2:
-                for {
-                    var t8 bool = left__0 < length__0
-                    if t8 {
-                        var t9 int = left__0 + width__0
-                        var middle__0 int
-                        var inline8 bool = t9 < length__0
-                        if inline8 {
-                            middle__0 = t9
-                        } else {
-                            middle__0 = length__0
-                        }
-                        var t10 int = middle__0 + width__0
-                        var right__0 int
-                        var inline7 bool = t10 < length__0
-                        if inline7 {
-                            right__0 = t10
-                        } else {
-                            right__0 = length__0
-                        }
-                        var first__0 int = left__0
-                        var second__0 int = middle__0
-                        var output__0 int = left__0
-                        Loop_loop4:
-                        for {
-                            var t23 bool = first__0 < middle__0
-                            var jp1 bool
-                            if t23 {
-                                var t36 bool = second__0 < right__0
-                                jp1 = t36
-                            } else {
-                                jp1 = false
-                            }
-                            if jp1 {
-                                var t24 string = vec_get__Vec_6string(self__0, first__0)
-                                var t25 string = vec_get__Vec_6string(self__0, second__0)
-                                var t26 int = compare__0(t24, t25)
-                                var t27 bool = t26 <= 0
-                                if t27 {
-                                    var index2 int = output__0
-                                    vec_get__Vec_6string(buffer__0, index2)
-                                    var value3 string = vec_get__Vec_6string(self__0, first__0)
-                                    vec_set__Vec_6string(buffer__0, index2, value3)
-                                    var compound_old5 int = first__0
-                                    var compound_value5 int = 1
-                                    var t31 int = compound_old5 + compound_value5
-                                    first__0 = t31
-                                } else {
-                                    var index3 int = output__0
-                                    vec_get__Vec_6string(buffer__0, index3)
-                                    var value4 string = vec_get__Vec_6string(self__0, second__0)
-                                    vec_set__Vec_6string(buffer__0, index3, value4)
-                                    var compound_old6 int = second__0
-                                    var compound_value6 int = 1
-                                    var t34 int = compound_old6 + compound_value6
-                                    second__0 = t34
-                                }
-                                var compound_old4 int = output__0
-                                var compound_value4 int = 1
-                                var t28 int = compound_old4 + compound_value4
-                                output__0 = t28
-                                continue
-                            } else {
-                                break Loop_loop4
-                            }
-                        }
-                        Loop_loop5:
-                        for {
-                            var t17 bool = first__0 < middle__0
-                            if t17 {
-                                var index1 int = output__0
-                                vec_get__Vec_6string(buffer__0, index1)
-                                var value2 string = vec_get__Vec_6string(self__0, first__0)
-                                vec_set__Vec_6string(buffer__0, index1, value2)
-                                var compound_old2 int = first__0
-                                var compound_value2 int = 1
-                                var t19 int = compound_old2 + compound_value2
-                                first__0 = t19
-                                var compound_old3 int = output__0
-                                var compound_value3 int = 1
-                                var t21 int = compound_old3 + compound_value3
-                                output__0 = t21
-                                continue
-                            } else {
-                                break Loop_loop5
-                            }
-                        }
-                        Loop_loop6:
-                        for {
-                            var t11 bool = second__0 < right__0
-                            if t11 {
-                                var index0 int = output__0
-                                vec_get__Vec_6string(buffer__0, index0)
-                                var value1 string = vec_get__Vec_6string(self__0, second__0)
-                                vec_set__Vec_6string(buffer__0, index0, value1)
-                                var compound_old0 int = second__0
-                                var compound_value0 int = 1
-                                var t13 int = compound_old0 + compound_value0
-                                second__0 = t13
-                                var compound_old1 int = output__0
-                                var compound_value1 int = 1
-                                var t15 int = compound_old1 + compound_value1
-                                output__0 = t15
-                                continue
-                            } else {
-                                break Loop_loop6
-                            }
-                        }
-                        left__0 = right__0
-                        continue
-                    } else {
-                        break Loop_loop2
-                    }
-                }
-                var t3 FnIterator__isize
-                var inline2 int = 0
-                var inline3 *ref_int_x = ref__Ref_3int(inline2)
-                var inline4 closure_env_goml_builtin_range_13 = closure_env_goml_builtin_range_13{
-                    current_0: inline3,
-                    end_1: length__0,
-                }
-                var inline5 func() Option__isize = func() Option__isize {
-                    return _goml_m_inherent_i_closure__en_h705ec68e290747cc19a5685005dd16c1_nge__13_i_apply(inline4)
-                }
-                var inline6 FnIterator__isize = _goml_m_inherent_i_FnIterator_i_FnIterator_l_T_r__i_from__fn____T__isize(inline5)
-                t3 = inline6
-                var for_iter1 FnIterator__isize
-                for_iter1 = t3
-                Loop_loop3:
-                for {
-                    var for_next0 Option__isize
-                    var inline0 func() Option__isize = for_iter1.next_fn
-                    var inline1 Option__isize = inline0()
-                    for_next0 = inline1
-                    switch for_next0._tag {
-                    case 0:
-                        break Loop_loop3
-                    case 1:
-                        var x0 int = for_next0._p0
-                        vec_get__Vec_6string(self__0, x0)
-                        var value0 string = vec_get__Vec_6string(buffer__0, x0)
-                        vec_set__Vec_6string(self__0, x0, value0)
-                        continue
-                    default:
-                        panic("non-exhaustive match")
-                    }
-                }
-                var t4 int = length__0 / 2
-                var t5 bool = width__0 > t4
-                var jp0 int
-                if t5 {
-                    jp0 = length__0
-                } else {
-                    var t6 int = width__0 * 2
-                    jp0 = t6
-                }
-                width__0 = jp0
-                continue
-            } else {
-                break Loop_loop1
-            }
-        }
-        return struct{}{}
+    } else {}
+    var buffer__0 *_goml_vec_string
+    var inline17 *_goml_vec_string = vec_with_capacity__Vec_6string(length__0)
+    buffer__0 = inline17
+    var t1 FnIterator__isize
+    var inline12 int = 0
+    var inline13 *ref_int_x = ref__Ref_3int(inline12)
+    var inline14 closure_env_goml_builtin_range_13 = closure_env_goml_builtin_range_13{
+        current_0: inline13,
+        end_1: length__0,
     }
+    var inline15 func() Option__isize = func() Option__isize {
+        return _goml_m_inherent_i_closure__en_h705ec68e290747cc19a5685005dd16c1_nge__13_i_apply(inline14)
+    }
+    var inline16 FnIterator__isize = _goml_m_inherent_i_FnIterator_i_FnIterator_l_T_r__i_from__fn____T__isize(inline15)
+    t1 = inline16
+    var for_iter0 FnIterator__isize
+    for_iter0 = t1
+    Loop_loop0:
+    for {
+        var for_next1 Option__isize
+        var inline10 func() Option__isize = for_iter0.next_fn
+        var inline11 Option__isize = inline10()
+        for_next1 = inline11
+        switch for_next1._tag {
+        case 0:
+            break Loop_loop0
+        case 1:
+            var x1 int = for_next1._p0
+            var t37 string = vec_get__Vec_6string(self__0, x1)
+            vec_push__Vec_6string(buffer__0, t37)
+            continue
+        default:
+            panic("non-exhaustive match")
+        }
+    }
+    var width__0 int = 1
+    Loop_loop1:
+    for {
+        var t2 bool = width__0 < length__0
+        if t2 {
+            var left__0 int = 0
+            Loop_loop2:
+            for {
+                var t8 bool = left__0 < length__0
+                if t8 {
+                    var t9 int = left__0 + width__0
+                    var middle__0 int
+                    var inline8 bool = t9 < length__0
+                    if inline8 {
+                        middle__0 = t9
+                    } else {
+                        middle__0 = length__0
+                    }
+                    var t10 int = middle__0 + width__0
+                    var right__0 int
+                    var inline7 bool = t10 < length__0
+                    if inline7 {
+                        right__0 = t10
+                    } else {
+                        right__0 = length__0
+                    }
+                    var first__0 int = left__0
+                    var second__0 int = middle__0
+                    var output__0 int = left__0
+                    Loop_loop4:
+                    for {
+                        var t23 bool = first__0 < middle__0
+                        var jp1 bool
+                        if t23 {
+                            var t36 bool = second__0 < right__0
+                            jp1 = t36
+                        } else {
+                            jp1 = false
+                        }
+                        if jp1 {
+                            var t24 string = vec_get__Vec_6string(self__0, first__0)
+                            var t25 string = vec_get__Vec_6string(self__0, second__0)
+                            var t26 int = compare__0(t24, t25)
+                            var t27 bool = t26 <= 0
+                            if t27 {
+                                var index2 int = output__0
+                                vec_get__Vec_6string(buffer__0, index2)
+                                var value3 string = vec_get__Vec_6string(self__0, first__0)
+                                vec_set__Vec_6string(buffer__0, index2, value3)
+                                var compound_old5 int = first__0
+                                var compound_value5 int = 1
+                                var t31 int = compound_old5 + compound_value5
+                                first__0 = t31
+                            } else {
+                                var index3 int = output__0
+                                vec_get__Vec_6string(buffer__0, index3)
+                                var value4 string = vec_get__Vec_6string(self__0, second__0)
+                                vec_set__Vec_6string(buffer__0, index3, value4)
+                                var compound_old6 int = second__0
+                                var compound_value6 int = 1
+                                var t34 int = compound_old6 + compound_value6
+                                second__0 = t34
+                            }
+                            var compound_old4 int = output__0
+                            var compound_value4 int = 1
+                            var t28 int = compound_old4 + compound_value4
+                            output__0 = t28
+                            continue
+                        } else {
+                            break Loop_loop4
+                        }
+                    }
+                    Loop_loop5:
+                    for {
+                        var t17 bool = first__0 < middle__0
+                        if t17 {
+                            var index1 int = output__0
+                            vec_get__Vec_6string(buffer__0, index1)
+                            var value2 string = vec_get__Vec_6string(self__0, first__0)
+                            vec_set__Vec_6string(buffer__0, index1, value2)
+                            var compound_old2 int = first__0
+                            var compound_value2 int = 1
+                            var t19 int = compound_old2 + compound_value2
+                            first__0 = t19
+                            var compound_old3 int = output__0
+                            var compound_value3 int = 1
+                            var t21 int = compound_old3 + compound_value3
+                            output__0 = t21
+                            continue
+                        } else {
+                            break Loop_loop5
+                        }
+                    }
+                    Loop_loop6:
+                    for {
+                        var t11 bool = second__0 < right__0
+                        if t11 {
+                            var index0 int = output__0
+                            vec_get__Vec_6string(buffer__0, index0)
+                            var value1 string = vec_get__Vec_6string(self__0, second__0)
+                            vec_set__Vec_6string(buffer__0, index0, value1)
+                            var compound_old0 int = second__0
+                            var compound_value0 int = 1
+                            var t13 int = compound_old0 + compound_value0
+                            second__0 = t13
+                            var compound_old1 int = output__0
+                            var compound_value1 int = 1
+                            var t15 int = compound_old1 + compound_value1
+                            output__0 = t15
+                            continue
+                        } else {
+                            break Loop_loop6
+                        }
+                    }
+                    left__0 = right__0
+                    continue
+                } else {
+                    break Loop_loop2
+                }
+            }
+            var t3 FnIterator__isize
+            var inline2 int = 0
+            var inline3 *ref_int_x = ref__Ref_3int(inline2)
+            var inline4 closure_env_goml_builtin_range_13 = closure_env_goml_builtin_range_13{
+                current_0: inline3,
+                end_1: length__0,
+            }
+            var inline5 func() Option__isize = func() Option__isize {
+                return _goml_m_inherent_i_closure__en_h705ec68e290747cc19a5685005dd16c1_nge__13_i_apply(inline4)
+            }
+            var inline6 FnIterator__isize = _goml_m_inherent_i_FnIterator_i_FnIterator_l_T_r__i_from__fn____T__isize(inline5)
+            t3 = inline6
+            var for_iter1 FnIterator__isize
+            for_iter1 = t3
+            Loop_loop3:
+            for {
+                var for_next0 Option__isize
+                var inline0 func() Option__isize = for_iter1.next_fn
+                var inline1 Option__isize = inline0()
+                for_next0 = inline1
+                switch for_next0._tag {
+                case 0:
+                    break Loop_loop3
+                case 1:
+                    var x0 int = for_next0._p0
+                    vec_get__Vec_6string(self__0, x0)
+                    var value0 string = vec_get__Vec_6string(buffer__0, x0)
+                    vec_set__Vec_6string(self__0, x0, value0)
+                    continue
+                default:
+                    panic("non-exhaustive match")
+                }
+            }
+            var t4 int = length__0 / 2
+            var t5 bool = width__0 > t4
+            var jp0 int
+            if t5 {
+                jp0 = length__0
+            } else {
+                var t6 int = width__0 * 2
+                jp0 = t6
+            }
+            width__0 = jp0
+            continue
+        } else {
+            break Loop_loop1
+        }
+    }
+    return struct{}{}
 }
 
 func _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_stable__sort__by____T___o_isize_c_isize_q_(self__0 *_goml_vec_Tuple2_3int_3int, compare__0 func(Tuple2_3int_3int, Tuple2_3int_3int) int) struct{} {
@@ -1689,212 +1685,211 @@ func _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_stable__sort__by____T___o_isize_c_isi
     var t0 bool = length__0 < 2
     if t0 {
         return struct{}{}
-    } else {
-        var buffer__0 *_goml_vec_Tuple2_3int_3int
-        var inline17 *_goml_vec_Tuple2_3int_3int = vec_with_capacity__Vec_16Tuple2_3int_3int(length__0)
-        buffer__0 = inline17
-        var t1 FnIterator__isize
-        var inline12 int = 0
-        var inline13 *ref_int_x = ref__Ref_3int(inline12)
-        var inline14 closure_env_goml_builtin_range_13 = closure_env_goml_builtin_range_13{
-            current_0: inline13,
-            end_1: length__0,
-        }
-        var inline15 func() Option__isize = func() Option__isize {
-            return _goml_m_inherent_i_closure__en_h705ec68e290747cc19a5685005dd16c1_nge__13_i_apply(inline14)
-        }
-        var inline16 FnIterator__isize = _goml_m_inherent_i_FnIterator_i_FnIterator_l_T_r__i_from__fn____T__isize(inline15)
-        t1 = inline16
-        var for_iter0 FnIterator__isize
-        for_iter0 = t1
-        Loop_loop0:
-        for {
-            var for_next1 Option__isize
-            var inline10 func() Option__isize = for_iter0.next_fn
-            var inline11 Option__isize = inline10()
-            for_next1 = inline11
-            switch for_next1._tag {
-            case 0:
-                break Loop_loop0
-            case 1:
-                var x1 int = for_next1._p0
-                var t37 Tuple2_3int_3int = vec_get__Vec_16Tuple2_3int_3int(self__0, x1)
-                vec_push__Vec_16Tuple2_3int_3int(buffer__0, t37)
-                continue
-            default:
-                panic("non-exhaustive match")
-            }
-        }
-        var width__0 int = 1
-        Loop_loop1:
-        for {
-            var t2 bool = width__0 < length__0
-            if t2 {
-                var left__0 int = 0
-                Loop_loop2:
-                for {
-                    var t8 bool = left__0 < length__0
-                    if t8 {
-                        var t9 int = left__0 + width__0
-                        var middle__0 int
-                        var inline8 bool = t9 < length__0
-                        if inline8 {
-                            middle__0 = t9
-                        } else {
-                            middle__0 = length__0
-                        }
-                        var t10 int = middle__0 + width__0
-                        var right__0 int
-                        var inline7 bool = t10 < length__0
-                        if inline7 {
-                            right__0 = t10
-                        } else {
-                            right__0 = length__0
-                        }
-                        var first__0 int = left__0
-                        var second__0 int = middle__0
-                        var output__0 int = left__0
-                        Loop_loop4:
-                        for {
-                            var t23 bool = first__0 < middle__0
-                            var jp1 bool
-                            if t23 {
-                                var t36 bool = second__0 < right__0
-                                jp1 = t36
-                            } else {
-                                jp1 = false
-                            }
-                            if jp1 {
-                                var t24 Tuple2_3int_3int = vec_get__Vec_16Tuple2_3int_3int(self__0, first__0)
-                                var t25 Tuple2_3int_3int = vec_get__Vec_16Tuple2_3int_3int(self__0, second__0)
-                                var t26 int = compare__0(t24, t25)
-                                var t27 bool = t26 <= 0
-                                if t27 {
-                                    var index2 int = output__0
-                                    vec_get__Vec_16Tuple2_3int_3int(buffer__0, index2)
-                                    var value3 Tuple2_3int_3int = vec_get__Vec_16Tuple2_3int_3int(self__0, first__0)
-                                    vec_set__Vec_16Tuple2_3int_3int(buffer__0, index2, value3)
-                                    var compound_old5 int = first__0
-                                    var compound_value5 int = 1
-                                    var t31 int = compound_old5 + compound_value5
-                                    first__0 = t31
-                                } else {
-                                    var index3 int = output__0
-                                    vec_get__Vec_16Tuple2_3int_3int(buffer__0, index3)
-                                    var value4 Tuple2_3int_3int = vec_get__Vec_16Tuple2_3int_3int(self__0, second__0)
-                                    vec_set__Vec_16Tuple2_3int_3int(buffer__0, index3, value4)
-                                    var compound_old6 int = second__0
-                                    var compound_value6 int = 1
-                                    var t34 int = compound_old6 + compound_value6
-                                    second__0 = t34
-                                }
-                                var compound_old4 int = output__0
-                                var compound_value4 int = 1
-                                var t28 int = compound_old4 + compound_value4
-                                output__0 = t28
-                                continue
-                            } else {
-                                break Loop_loop4
-                            }
-                        }
-                        Loop_loop5:
-                        for {
-                            var t17 bool = first__0 < middle__0
-                            if t17 {
-                                var index1 int = output__0
-                                vec_get__Vec_16Tuple2_3int_3int(buffer__0, index1)
-                                var value2 Tuple2_3int_3int = vec_get__Vec_16Tuple2_3int_3int(self__0, first__0)
-                                vec_set__Vec_16Tuple2_3int_3int(buffer__0, index1, value2)
-                                var compound_old2 int = first__0
-                                var compound_value2 int = 1
-                                var t19 int = compound_old2 + compound_value2
-                                first__0 = t19
-                                var compound_old3 int = output__0
-                                var compound_value3 int = 1
-                                var t21 int = compound_old3 + compound_value3
-                                output__0 = t21
-                                continue
-                            } else {
-                                break Loop_loop5
-                            }
-                        }
-                        Loop_loop6:
-                        for {
-                            var t11 bool = second__0 < right__0
-                            if t11 {
-                                var index0 int = output__0
-                                vec_get__Vec_16Tuple2_3int_3int(buffer__0, index0)
-                                var value1 Tuple2_3int_3int = vec_get__Vec_16Tuple2_3int_3int(self__0, second__0)
-                                vec_set__Vec_16Tuple2_3int_3int(buffer__0, index0, value1)
-                                var compound_old0 int = second__0
-                                var compound_value0 int = 1
-                                var t13 int = compound_old0 + compound_value0
-                                second__0 = t13
-                                var compound_old1 int = output__0
-                                var compound_value1 int = 1
-                                var t15 int = compound_old1 + compound_value1
-                                output__0 = t15
-                                continue
-                            } else {
-                                break Loop_loop6
-                            }
-                        }
-                        left__0 = right__0
-                        continue
-                    } else {
-                        break Loop_loop2
-                    }
-                }
-                var t3 FnIterator__isize
-                var inline2 int = 0
-                var inline3 *ref_int_x = ref__Ref_3int(inline2)
-                var inline4 closure_env_goml_builtin_range_13 = closure_env_goml_builtin_range_13{
-                    current_0: inline3,
-                    end_1: length__0,
-                }
-                var inline5 func() Option__isize = func() Option__isize {
-                    return _goml_m_inherent_i_closure__en_h705ec68e290747cc19a5685005dd16c1_nge__13_i_apply(inline4)
-                }
-                var inline6 FnIterator__isize = _goml_m_inherent_i_FnIterator_i_FnIterator_l_T_r__i_from__fn____T__isize(inline5)
-                t3 = inline6
-                var for_iter1 FnIterator__isize
-                for_iter1 = t3
-                Loop_loop3:
-                for {
-                    var for_next0 Option__isize
-                    var inline0 func() Option__isize = for_iter1.next_fn
-                    var inline1 Option__isize = inline0()
-                    for_next0 = inline1
-                    switch for_next0._tag {
-                    case 0:
-                        break Loop_loop3
-                    case 1:
-                        var x0 int = for_next0._p0
-                        vec_get__Vec_16Tuple2_3int_3int(self__0, x0)
-                        var value0 Tuple2_3int_3int = vec_get__Vec_16Tuple2_3int_3int(buffer__0, x0)
-                        vec_set__Vec_16Tuple2_3int_3int(self__0, x0, value0)
-                        continue
-                    default:
-                        panic("non-exhaustive match")
-                    }
-                }
-                var t4 int = length__0 / 2
-                var t5 bool = width__0 > t4
-                var jp0 int
-                if t5 {
-                    jp0 = length__0
-                } else {
-                    var t6 int = width__0 * 2
-                    jp0 = t6
-                }
-                width__0 = jp0
-                continue
-            } else {
-                break Loop_loop1
-            }
-        }
-        return struct{}{}
+    } else {}
+    var buffer__0 *_goml_vec_Tuple2_3int_3int
+    var inline17 *_goml_vec_Tuple2_3int_3int = vec_with_capacity__Vec_16Tuple2_3int_3int(length__0)
+    buffer__0 = inline17
+    var t1 FnIterator__isize
+    var inline12 int = 0
+    var inline13 *ref_int_x = ref__Ref_3int(inline12)
+    var inline14 closure_env_goml_builtin_range_13 = closure_env_goml_builtin_range_13{
+        current_0: inline13,
+        end_1: length__0,
     }
+    var inline15 func() Option__isize = func() Option__isize {
+        return _goml_m_inherent_i_closure__en_h705ec68e290747cc19a5685005dd16c1_nge__13_i_apply(inline14)
+    }
+    var inline16 FnIterator__isize = _goml_m_inherent_i_FnIterator_i_FnIterator_l_T_r__i_from__fn____T__isize(inline15)
+    t1 = inline16
+    var for_iter0 FnIterator__isize
+    for_iter0 = t1
+    Loop_loop0:
+    for {
+        var for_next1 Option__isize
+        var inline10 func() Option__isize = for_iter0.next_fn
+        var inline11 Option__isize = inline10()
+        for_next1 = inline11
+        switch for_next1._tag {
+        case 0:
+            break Loop_loop0
+        case 1:
+            var x1 int = for_next1._p0
+            var t37 Tuple2_3int_3int = vec_get__Vec_16Tuple2_3int_3int(self__0, x1)
+            vec_push__Vec_16Tuple2_3int_3int(buffer__0, t37)
+            continue
+        default:
+            panic("non-exhaustive match")
+        }
+    }
+    var width__0 int = 1
+    Loop_loop1:
+    for {
+        var t2 bool = width__0 < length__0
+        if t2 {
+            var left__0 int = 0
+            Loop_loop2:
+            for {
+                var t8 bool = left__0 < length__0
+                if t8 {
+                    var t9 int = left__0 + width__0
+                    var middle__0 int
+                    var inline8 bool = t9 < length__0
+                    if inline8 {
+                        middle__0 = t9
+                    } else {
+                        middle__0 = length__0
+                    }
+                    var t10 int = middle__0 + width__0
+                    var right__0 int
+                    var inline7 bool = t10 < length__0
+                    if inline7 {
+                        right__0 = t10
+                    } else {
+                        right__0 = length__0
+                    }
+                    var first__0 int = left__0
+                    var second__0 int = middle__0
+                    var output__0 int = left__0
+                    Loop_loop4:
+                    for {
+                        var t23 bool = first__0 < middle__0
+                        var jp1 bool
+                        if t23 {
+                            var t36 bool = second__0 < right__0
+                            jp1 = t36
+                        } else {
+                            jp1 = false
+                        }
+                        if jp1 {
+                            var t24 Tuple2_3int_3int = vec_get__Vec_16Tuple2_3int_3int(self__0, first__0)
+                            var t25 Tuple2_3int_3int = vec_get__Vec_16Tuple2_3int_3int(self__0, second__0)
+                            var t26 int = compare__0(t24, t25)
+                            var t27 bool = t26 <= 0
+                            if t27 {
+                                var index2 int = output__0
+                                vec_get__Vec_16Tuple2_3int_3int(buffer__0, index2)
+                                var value3 Tuple2_3int_3int = vec_get__Vec_16Tuple2_3int_3int(self__0, first__0)
+                                vec_set__Vec_16Tuple2_3int_3int(buffer__0, index2, value3)
+                                var compound_old5 int = first__0
+                                var compound_value5 int = 1
+                                var t31 int = compound_old5 + compound_value5
+                                first__0 = t31
+                            } else {
+                                var index3 int = output__0
+                                vec_get__Vec_16Tuple2_3int_3int(buffer__0, index3)
+                                var value4 Tuple2_3int_3int = vec_get__Vec_16Tuple2_3int_3int(self__0, second__0)
+                                vec_set__Vec_16Tuple2_3int_3int(buffer__0, index3, value4)
+                                var compound_old6 int = second__0
+                                var compound_value6 int = 1
+                                var t34 int = compound_old6 + compound_value6
+                                second__0 = t34
+                            }
+                            var compound_old4 int = output__0
+                            var compound_value4 int = 1
+                            var t28 int = compound_old4 + compound_value4
+                            output__0 = t28
+                            continue
+                        } else {
+                            break Loop_loop4
+                        }
+                    }
+                    Loop_loop5:
+                    for {
+                        var t17 bool = first__0 < middle__0
+                        if t17 {
+                            var index1 int = output__0
+                            vec_get__Vec_16Tuple2_3int_3int(buffer__0, index1)
+                            var value2 Tuple2_3int_3int = vec_get__Vec_16Tuple2_3int_3int(self__0, first__0)
+                            vec_set__Vec_16Tuple2_3int_3int(buffer__0, index1, value2)
+                            var compound_old2 int = first__0
+                            var compound_value2 int = 1
+                            var t19 int = compound_old2 + compound_value2
+                            first__0 = t19
+                            var compound_old3 int = output__0
+                            var compound_value3 int = 1
+                            var t21 int = compound_old3 + compound_value3
+                            output__0 = t21
+                            continue
+                        } else {
+                            break Loop_loop5
+                        }
+                    }
+                    Loop_loop6:
+                    for {
+                        var t11 bool = second__0 < right__0
+                        if t11 {
+                            var index0 int = output__0
+                            vec_get__Vec_16Tuple2_3int_3int(buffer__0, index0)
+                            var value1 Tuple2_3int_3int = vec_get__Vec_16Tuple2_3int_3int(self__0, second__0)
+                            vec_set__Vec_16Tuple2_3int_3int(buffer__0, index0, value1)
+                            var compound_old0 int = second__0
+                            var compound_value0 int = 1
+                            var t13 int = compound_old0 + compound_value0
+                            second__0 = t13
+                            var compound_old1 int = output__0
+                            var compound_value1 int = 1
+                            var t15 int = compound_old1 + compound_value1
+                            output__0 = t15
+                            continue
+                        } else {
+                            break Loop_loop6
+                        }
+                    }
+                    left__0 = right__0
+                    continue
+                } else {
+                    break Loop_loop2
+                }
+            }
+            var t3 FnIterator__isize
+            var inline2 int = 0
+            var inline3 *ref_int_x = ref__Ref_3int(inline2)
+            var inline4 closure_env_goml_builtin_range_13 = closure_env_goml_builtin_range_13{
+                current_0: inline3,
+                end_1: length__0,
+            }
+            var inline5 func() Option__isize = func() Option__isize {
+                return _goml_m_inherent_i_closure__en_h705ec68e290747cc19a5685005dd16c1_nge__13_i_apply(inline4)
+            }
+            var inline6 FnIterator__isize = _goml_m_inherent_i_FnIterator_i_FnIterator_l_T_r__i_from__fn____T__isize(inline5)
+            t3 = inline6
+            var for_iter1 FnIterator__isize
+            for_iter1 = t3
+            Loop_loop3:
+            for {
+                var for_next0 Option__isize
+                var inline0 func() Option__isize = for_iter1.next_fn
+                var inline1 Option__isize = inline0()
+                for_next0 = inline1
+                switch for_next0._tag {
+                case 0:
+                    break Loop_loop3
+                case 1:
+                    var x0 int = for_next0._p0
+                    vec_get__Vec_16Tuple2_3int_3int(self__0, x0)
+                    var value0 Tuple2_3int_3int = vec_get__Vec_16Tuple2_3int_3int(buffer__0, x0)
+                    vec_set__Vec_16Tuple2_3int_3int(self__0, x0, value0)
+                    continue
+                default:
+                    panic("non-exhaustive match")
+                }
+            }
+            var t4 int = length__0 / 2
+            var t5 bool = width__0 > t4
+            var jp0 int
+            if t5 {
+                jp0 = length__0
+            } else {
+                var t6 int = width__0 * 2
+                jp0 = t6
+            }
+            width__0 = jp0
+            continue
+        } else {
+            break Loop_loop1
+        }
+    }
+    return struct{}{}
 }
 
 func _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_iter____T__isize(self__0 *_goml_vec_int) FnIterator__isize {
@@ -1920,58 +1915,57 @@ func decimal_string(value__0 uint64) string {
     var t0 bool = value__0 == 0
     if t0 {
         return "0"
-    } else {
-        var reversed__0 *_goml_vec_uint8 = vec_with_capacity__Vec_5uint8(20)
-        var remaining__0 uint64 = value__0
-        Loop_loop0:
-        for {
-            var t10 bool = remaining__0 > 0
-            if t10 {
-                var t11 uint64 = remaining__0 % 10
-                var t12 uint8 = uint8(uint64(t11))
-                var t13 uint8 = t12 + 48
-                vec_push__Vec_5uint8(reversed__0, t13)
-                var compound_old1 uint64 = remaining__0
-                var compound_value1 uint64 = 10
-                var t14 uint64 = compound_old1 / compound_value1
-                remaining__0 = t14
-                continue
-            } else {
-                break Loop_loop0
-            }
+    } else {}
+    var reversed__0 *_goml_vec_uint8 = vec_with_capacity__Vec_5uint8(20)
+    var remaining__0 uint64 = value__0
+    Loop_loop0:
+    for {
+        var t10 bool = remaining__0 > 0
+        if t10 {
+            var t11 uint64 = remaining__0 % 10
+            var t12 uint8 = uint8(uint64(t11))
+            var t13 uint8 = t12 + 48
+            vec_push__Vec_5uint8(reversed__0, t13)
+            var compound_old1 uint64 = remaining__0
+            var compound_value1 uint64 = 10
+            var t14 uint64 = compound_old1 / compound_value1
+            remaining__0 = t14
+            continue
+        } else {
+            break Loop_loop0
         }
-        var t1 int
-        var inline3 int = vec_len__Vec_5uint8(reversed__0)
-        t1 = inline3
-        var bytes__0 *_goml_vec_uint8 = vec_with_capacity__Vec_5uint8(t1)
-        var offset__0 int = 0
-        Loop_loop1:
-        for {
-            var t2 int
-            var inline2 int = vec_len__Vec_5uint8(reversed__0)
-            t2 = inline2
-            var t3 bool = offset__0 < t2
-            if t3 {
-                var t4 int
-                var inline1 int = vec_len__Vec_5uint8(reversed__0)
-                t4 = inline1
-                var t5 int = t4 - offset__0
-                var t6 int = t5 - 1
-                var t7 uint8 = vec_get__Vec_5uint8(reversed__0, t6)
-                vec_push__Vec_5uint8(bytes__0, t7)
-                var compound_old0 int = offset__0
-                var compound_value0 int = 1
-                var t8 int = compound_old0 + compound_value0
-                offset__0 = t8
-                continue
-            } else {
-                break Loop_loop1
-            }
-        }
-        var mtmp0 Tuple2_4bool_6string = _goml_runtime_core_string_from_utf8(bytes__0)
-        var x0 string = mtmp0._1
-        return x0
     }
+    var t1 int
+    var inline3 int = vec_len__Vec_5uint8(reversed__0)
+    t1 = inline3
+    var bytes__0 *_goml_vec_uint8 = vec_with_capacity__Vec_5uint8(t1)
+    var offset__0 int = 0
+    Loop_loop1:
+    for {
+        var t2 int
+        var inline2 int = vec_len__Vec_5uint8(reversed__0)
+        t2 = inline2
+        var t3 bool = offset__0 < t2
+        if t3 {
+            var t4 int
+            var inline1 int = vec_len__Vec_5uint8(reversed__0)
+            t4 = inline1
+            var t5 int = t4 - offset__0
+            var t6 int = t5 - 1
+            var t7 uint8 = vec_get__Vec_5uint8(reversed__0, t6)
+            vec_push__Vec_5uint8(bytes__0, t7)
+            var compound_old0 int = offset__0
+            var compound_value0 int = 1
+            var t8 int = compound_old0 + compound_value0
+            offset__0 = t8
+            continue
+        } else {
+            break Loop_loop1
+        }
+    }
+    var mtmp0 Tuple2_4bool_6string = _goml_runtime_core_string_from_utf8(bytes__0)
+    var x0 string = mtmp0._1
+    return x0
 }
 
 func _goml_m_inherent_i_closure__env__main__0_i_closure__env__main__0_i_apply(env0 closure_env_main_0, value__0 int) bool {

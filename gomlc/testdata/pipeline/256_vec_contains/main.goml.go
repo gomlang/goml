@@ -189,13 +189,12 @@ func _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_contains____T__isize(self__0 *_goml_v
             t3 = inline0
             if t3 {
                 return true
-            } else {
-                var compound_old0 int = index__0
-                var compound_value0 int = 1
-                var t4 int = compound_old0 + compound_value0
-                index__0 = t4
-                continue
-            }
+            } else {}
+            var compound_old0 int = index__0
+            var compound_value0 int = 1
+            var t4 int = compound_old0 + compound_value0
+            index__0 = t4
+            continue
         } else {
             break Loop_loop0
         }
@@ -218,13 +217,12 @@ func _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_contains____T__string(self__0 *_goml_
             t3 = inline0
             if t3 {
                 return true
-            } else {
-                var compound_old0 int = index__0
-                var compound_value0 int = 1
-                var t4 int = compound_old0 + compound_value0
-                index__0 = t4
-                continue
-            }
+            } else {}
+            var compound_old0 int = index__0
+            var compound_value0 int = 1
+            var t4 int = compound_old0 + compound_value0
+            index__0 = t4
+            continue
         } else {
             break Loop_loop0
         }
@@ -255,24 +253,22 @@ func _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_contains____T__Pair(self__0 *_goml_ve
                 t3 = inline3
                 if t3 {
                     return true
-                } else {
-                    var compound_old0 int = index__0
-                    var compound_value0 int = 1
-                    var t4 int = compound_old0 + compound_value0
-                    index__0 = t4
-                    continue
-                }
+                } else {}
+                var compound_old0 int = index__0
+                var compound_value0 int = 1
+                var t4 int = compound_old0 + compound_value0
+                index__0 = t4
+                continue
             } else {
                 t3 = false
                 if t3 {
                     return true
-                } else {
-                    var compound_old0 int = index__0
-                    var compound_value0 int = 1
-                    var t4 int = compound_old0 + compound_value0
-                    index__0 = t4
-                    continue
-                }
+                } else {}
+                var compound_old0 int = index__0
+                var compound_value0 int = 1
+                var t4 int = compound_old0 + compound_value0
+                index__0 = t4
+                continue
             }
         } else {
             break Loop_loop0

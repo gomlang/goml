@@ -54,142 +54,86 @@ func main0() struct{} {
     var t0 _goml_m_Result_____o__q_____string
     var inline15 bool = true
     var inline16 _goml_m_Result_____o__q_____string = step(inline15)
-    switch inline16._tag {
-    case 0:
+    Shared_inline_cont0:
+    for {
+        Shared_inline_join0:
+        for {
+            switch inline16._tag {
+            case 0:
+                break Shared_inline_join0
+            case 1:
+                var inline18 string = inline16._p0
+                var inline19 _goml_m_Result_____o__q_____string = _goml_m_Result_____o__q_____string{
+                    _p0: inline18,
+                    _tag: 1,
+                }
+                t0 = inline19
+                break Shared_inline_cont0
+            default:
+                panic("non-exhaustive match")
+            }
+        }
         var inline17 _goml_m_Result_____o__q_____string = _goml_m_Result_____o__q_____string{
             _tag: 0,
         }
         t0 = inline17
-        var t1 string
-        switch t0._tag {
-        case 0:
-            t1 = "ok ()"
-        case 1:
-            var inline13 string = t0._p0
-            var inline14 string = "err " + inline13
-            t1 = inline14
-        default:
-            panic("non-exhaustive match")
-        }
-        var inline10 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t1)
-        _goml_runtime_core_string_println(inline10)
-        var t2 _goml_m_Result_____o__q_____string
-        var inline5 bool = false
-        var inline6 _goml_m_Result_____o__q_____string = step(inline5)
-        switch inline6._tag {
-        case 0:
-            var inline7 _goml_m_Result_____o__q_____string = _goml_m_Result_____o__q_____string{
-                _tag: 0,
-            }
-            t2 = inline7
-            var t3 string
-            switch t2._tag {
-            case 0:
-                t3 = "ok ()"
-            case 1:
-                var inline3 string = t2._p0
-                var inline4 string = "err " + inline3
-                t3 = inline4
-            default:
-                panic("non-exhaustive match")
-            }
-            var inline0 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t3)
-            _goml_runtime_core_string_println(inline0)
-            return struct{}{}
-        case 1:
-            var inline8 string = inline6._p0
-            var inline9 _goml_m_Result_____o__q_____string = _goml_m_Result_____o__q_____string{
-                _p0: inline8,
-                _tag: 1,
-            }
-            t2 = inline9
-            var t3 string
-            switch t2._tag {
-            case 0:
-                t3 = "ok ()"
-            case 1:
-                var inline3 string = t2._p0
-                var inline4 string = "err " + inline3
-                t3 = inline4
-            default:
-                panic("non-exhaustive match")
-            }
-            var inline0 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t3)
-            _goml_runtime_core_string_println(inline0)
-            return struct{}{}
-        default:
-            panic("non-exhaustive match")
-        }
+        break Shared_inline_cont0
+    }
+    var t1 string
+    switch t0._tag {
+    case 0:
+        t1 = "ok ()"
     case 1:
-        var inline18 string = inline16._p0
-        var inline19 _goml_m_Result_____o__q_____string = _goml_m_Result_____o__q_____string{
-            _p0: inline18,
-            _tag: 1,
-        }
-        t0 = inline19
-        var t1 string
-        switch t0._tag {
-        case 0:
-            t1 = "ok ()"
-        case 1:
-            var inline13 string = t0._p0
-            var inline14 string = "err " + inline13
-            t1 = inline14
-        default:
-            panic("non-exhaustive match")
-        }
-        var inline10 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t1)
-        _goml_runtime_core_string_println(inline10)
-        var t2 _goml_m_Result_____o__q_____string
-        var inline5 bool = false
-        var inline6 _goml_m_Result_____o__q_____string = step(inline5)
-        switch inline6._tag {
-        case 0:
-            var inline7 _goml_m_Result_____o__q_____string = _goml_m_Result_____o__q_____string{
-                _tag: 0,
-            }
-            t2 = inline7
-            var t3 string
-            switch t2._tag {
-            case 0:
-                t3 = "ok ()"
-            case 1:
-                var inline3 string = t2._p0
-                var inline4 string = "err " + inline3
-                t3 = inline4
-            default:
-                panic("non-exhaustive match")
-            }
-            var inline0 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t3)
-            _goml_runtime_core_string_println(inline0)
-            return struct{}{}
-        case 1:
-            var inline8 string = inline6._p0
-            var inline9 _goml_m_Result_____o__q_____string = _goml_m_Result_____o__q_____string{
-                _p0: inline8,
-                _tag: 1,
-            }
-            t2 = inline9
-            var t3 string
-            switch t2._tag {
-            case 0:
-                t3 = "ok ()"
-            case 1:
-                var inline3 string = t2._p0
-                var inline4 string = "err " + inline3
-                t3 = inline4
-            default:
-                panic("non-exhaustive match")
-            }
-            var inline0 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t3)
-            _goml_runtime_core_string_println(inline0)
-            return struct{}{}
-        default:
-            panic("non-exhaustive match")
-        }
+        var inline13 string = t0._p0
+        var inline14 string = "err " + inline13
+        t1 = inline14
     default:
         panic("non-exhaustive match")
     }
+    var inline10 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t1)
+    _goml_runtime_core_string_println(inline10)
+    var t2 _goml_m_Result_____o__q_____string
+    var inline5 bool = false
+    var inline6 _goml_m_Result_____o__q_____string = step(inline5)
+    Shared_inline_cont3:
+    for {
+        Shared_inline_join1:
+        for {
+            switch inline6._tag {
+            case 0:
+                break Shared_inline_join1
+            case 1:
+                var inline8 string = inline6._p0
+                var inline9 _goml_m_Result_____o__q_____string = _goml_m_Result_____o__q_____string{
+                    _p0: inline8,
+                    _tag: 1,
+                }
+                t2 = inline9
+                break Shared_inline_cont3
+            default:
+                panic("non-exhaustive match")
+            }
+        }
+        var inline7 _goml_m_Result_____o__q_____string = _goml_m_Result_____o__q_____string{
+            _tag: 0,
+        }
+        t2 = inline7
+        break Shared_inline_cont3
+    }
+    var t3 string
+    switch t2._tag {
+    case 0:
+        t3 = "ok ()"
+    case 1:
+        var inline3 string = t2._p0
+        var inline4 string = "err " + inline3
+        t3 = inline4
+    default:
+        panic("non-exhaustive match")
+    }
+    var inline0 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t3)
+    _goml_runtime_core_string_println(inline0)
+    return struct{}{}
 }
 
 func _goml_m_trait__impl_i_ToString_i_string_i_to__string(self__0 string) string {

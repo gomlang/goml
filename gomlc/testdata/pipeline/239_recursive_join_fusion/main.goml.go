@@ -87,9 +87,9 @@ func find(wanted__0 int) Option__isize {
             } else {
                 var t3 int = value__0 + 1
                 ref_set__Ref_3int(current__0, t3)
-                continue
             }
         }
+        continue
     }
 }
 

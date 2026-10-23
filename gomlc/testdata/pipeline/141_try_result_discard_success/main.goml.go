@@ -68,11 +68,6 @@ func check(ok__0 bool) Result__string__string {
     }
     switch mtmp0._tag {
     case 0:
-        var t0 Result__string__string = Result__string__string{
-            _p0: "ok",
-            _tag: 0,
-        }
-        return t0
     case 1:
         var x1 string = mtmp0._p0
         var t1 Result__string__string = Result__string__string{
@@ -83,6 +78,11 @@ func check(ok__0 bool) Result__string__string {
     default:
         panic("non-exhaustive match")
     }
+    var t0 Result__string__string = Result__string__string{
+        _p0: "ok",
+        _tag: 0,
+    }
+    return t0
 }
 
 func main0() struct{} {
@@ -105,55 +105,48 @@ func main0() struct{} {
     var t2 Result__string__string
     var inline6 bool = false
     var inline7 Result__string__string = parse_text(inline6)
-    switch inline7._tag {
-    case 0:
+    Shared_inline_cont2:
+    for {
+        Shared_inline_join0:
+        for {
+            switch inline7._tag {
+            case 0:
+                break Shared_inline_join0
+            case 1:
+                var inline11 string = inline7._p0
+                var inline12 Result__string__string = Result__string__string{
+                    _p0: inline11,
+                    _tag: 1,
+                }
+                t2 = inline12
+                break Shared_inline_cont2
+            default:
+                panic("non-exhaustive match")
+            }
+        }
         var inline9 Result__string__string = Result__string__string{
             _p0: "ok",
             _tag: 0,
         }
         t2 = inline9
-        var t3 string
-        switch t2._tag {
-        case 0:
-            var inline2 string = t2._p0
-            var inline3 string = "ok " + inline2
-            t3 = inline3
-        case 1:
-            var inline4 string = t2._p0
-            var inline5 string = "err " + inline4
-            t3 = inline5
-        default:
-            panic("non-exhaustive match")
-        }
-        var inline0 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t3)
-        _goml_runtime_core_string_println(inline0)
-        return struct{}{}
+        break Shared_inline_cont2
+    }
+    var t3 string
+    switch t2._tag {
+    case 0:
+        var inline2 string = t2._p0
+        var inline3 string = "ok " + inline2
+        t3 = inline3
     case 1:
-        var inline11 string = inline7._p0
-        var inline12 Result__string__string = Result__string__string{
-            _p0: inline11,
-            _tag: 1,
-        }
-        t2 = inline12
-        var t3 string
-        switch t2._tag {
-        case 0:
-            var inline2 string = t2._p0
-            var inline3 string = "ok " + inline2
-            t3 = inline3
-        case 1:
-            var inline4 string = t2._p0
-            var inline5 string = "err " + inline4
-            t3 = inline5
-        default:
-            panic("non-exhaustive match")
-        }
-        var inline0 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t3)
-        _goml_runtime_core_string_println(inline0)
-        return struct{}{}
+        var inline4 string = t2._p0
+        var inline5 string = "err " + inline4
+        t3 = inline5
     default:
         panic("non-exhaustive match")
     }
+    var inline0 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t3)
+    _goml_runtime_core_string_println(inline0)
+    return struct{}{}
 }
 
 func _goml_m_trait__impl_i_ToString_i_string_i_to__string(self__0 string) string {

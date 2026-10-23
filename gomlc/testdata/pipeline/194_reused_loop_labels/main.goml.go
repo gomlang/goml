@@ -70,101 +70,54 @@ func main0() struct{} {
         t0 = inline11
         if t0 {
             var event__0 Event = Open
-            switch event__0 {
-            case Open:
-                var scanning__1 *ref_bool_x
-                var inline9 bool = false
-                var inline10 *ref_bool_x = ref__Ref_4bool(inline9)
-                scanning__1 = inline10
-                Loop_loop2:
-                for {
-                    var t2 bool
-                    var inline8 bool = ref_get__Ref_4bool(scanning__1)
-                    t2 = inline8
-                    if t2 {
-                        continue
-                    } else {
-                        break Loop_loop2
+            Shared_k0:
+            for {
+                switch event__0 {
+                case Open:
+                    var scanning__1 *ref_bool_x
+                    var inline9 bool = false
+                    var inline10 *ref_bool_x = ref__Ref_4bool(inline9)
+                    scanning__1 = inline10
+                    Loop_loop2:
+                    for {
+                        var t2 bool
+                        var inline8 bool = ref_get__Ref_4bool(scanning__1)
+                        t2 = inline8
+                        if t2 {
+                            continue Loop_loop2
+                        } else {
+                            break Loop_loop2
+                        }
                     }
+                    break Shared_k0
+                case Close:
+                    break Shared_k0
+                case Advance:
+                    break Shared_k0
+                case Error:
+                    break Shared_k0
+                default:
+                    panic("non-exhaustive match")
                 }
-                var scanning__0 *ref_bool_x
-                var inline6 bool = false
-                var inline7 *ref_bool_x = ref__Ref_4bool(inline6)
-                scanning__0 = inline7
-                Loop_loop1:
-                for {
-                    var t1 bool
-                    var inline5 bool = ref_get__Ref_4bool(scanning__0)
-                    t1 = inline5
-                    if t1 {
-                        continue
-                    } else {
-                        break Loop_loop1
-                    }
-                }
-                var inline3 bool = false
-                ref_set__Ref_4bool(running__0, inline3)
-                continue
-            case Close:
-                var scanning__0 *ref_bool_x
-                var inline6 bool = false
-                var inline7 *ref_bool_x = ref__Ref_4bool(inline6)
-                scanning__0 = inline7
-                Loop_loop1__2:
-                for {
-                    var t1 bool
-                    var inline5 bool = ref_get__Ref_4bool(scanning__0)
-                    t1 = inline5
-                    if t1 {
-                        continue
-                    } else {
-                        break Loop_loop1__2
-                    }
-                }
-                var inline3 bool = false
-                ref_set__Ref_4bool(running__0, inline3)
-                continue
-            case Advance:
-                var scanning__0 *ref_bool_x
-                var inline6 bool = false
-                var inline7 *ref_bool_x = ref__Ref_4bool(inline6)
-                scanning__0 = inline7
-                Loop_loop1__3:
-                for {
-                    var t1 bool
-                    var inline5 bool = ref_get__Ref_4bool(scanning__0)
-                    t1 = inline5
-                    if t1 {
-                        continue
-                    } else {
-                        break Loop_loop1__3
-                    }
-                }
-                var inline3 bool = false
-                ref_set__Ref_4bool(running__0, inline3)
-                continue
-            case Error:
-                var scanning__0 *ref_bool_x
-                var inline6 bool = false
-                var inline7 *ref_bool_x = ref__Ref_4bool(inline6)
-                scanning__0 = inline7
-                Loop_loop1__4:
-                for {
-                    var t1 bool
-                    var inline5 bool = ref_get__Ref_4bool(scanning__0)
-                    t1 = inline5
-                    if t1 {
-                        continue
-                    } else {
-                        break Loop_loop1__4
-                    }
-                }
-                var inline3 bool = false
-                ref_set__Ref_4bool(running__0, inline3)
-                continue
-            default:
-                panic("non-exhaustive match")
             }
+            var scanning__0 *ref_bool_x
+            var inline6 bool = false
+            var inline7 *ref_bool_x = ref__Ref_4bool(inline6)
+            scanning__0 = inline7
+            Loop_loop1:
+            for {
+                var t1 bool
+                var inline5 bool = ref_get__Ref_4bool(scanning__0)
+                t1 = inline5
+                if t1 {
+                    continue
+                } else {
+                    break Loop_loop1
+                }
+            }
+            var inline3 bool = false
+            ref_set__Ref_4bool(running__0, inline3)
+            continue
         } else {
             break Loop_loop0
         }

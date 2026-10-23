@@ -220,12 +220,6 @@ func lookup(name__0 string, context__0 Context) Result__isize__string {
             case 0:
                 var x2 int = mtmp0._p0
                 jp0 = x2
-                var t4 int = jp0 + 1
-                var t5 Result__isize__string = Result__isize__string{
-                    _p0: t4,
-                    _tag: 0,
-                }
-                return t5
             case 1:
                 var x3 string = mtmp0._p1
                 var t6 Result__isize__string = Result__isize__string{
@@ -236,6 +230,12 @@ func lookup(name__0 string, context__0 Context) Result__isize__string {
             default:
                 panic("non-exhaustive match")
             }
+            var t4 int = jp0 + 1
+            var t5 Result__isize__string = Result__isize__string{
+                _p0: t4,
+                _tag: 0,
+            }
+            return t5
         }
     default:
         panic("non-exhaustive match")
@@ -252,17 +252,6 @@ func translate(term__0 Named, context__0 Context) Result__Term__string {
         case 0:
             var x1 int = mtmp0._p0
             jp0 = x1
-            var t0 Term = Term{
-                _node: &Term_node{
-                    _p0: jp0,
-                    _tag: 0,
-                },
-            }
-            var t1 Result__Term__string = Result__Term__string{
-                _p0: t0,
-                _tag: 0,
-            }
-            return t1
         case 1:
             var x2 string = mtmp0._p1
             var t2 Result__Term__string = Result__Term__string{
@@ -273,6 +262,17 @@ func translate(term__0 Named, context__0 Context) Result__Term__string {
         default:
             panic("non-exhaustive match")
         }
+        var t0 Term = Term{
+            _node: &Term_node{
+                _p0: jp0,
+                _tag: 0,
+            },
+        }
+        var t1 Result__Term__string = Result__Term__string{
+            _p0: t0,
+            _tag: 0,
+        }
+        return t1
     case 1:
         var x3 string = term__0._node._p0
         var x4 Named = term__0._node._p1
@@ -289,17 +289,6 @@ func translate(term__0 Named, context__0 Context) Result__Term__string {
         case 0:
             var x5 Term = mtmp1._p0
             jp1 = x5
-            var t4 Term = Term{
-                _node: &Term_node{
-                    _p1: jp1,
-                    _tag: 1,
-                },
-            }
-            var t5 Result__Term__string = Result__Term__string{
-                _p0: t4,
-                _tag: 0,
-            }
-            return t5
         case 1:
             var x6 string = mtmp1._p1
             var t6 Result__Term__string = Result__Term__string{
@@ -310,6 +299,17 @@ func translate(term__0 Named, context__0 Context) Result__Term__string {
         default:
             panic("non-exhaustive match")
         }
+        var t4 Term = Term{
+            _node: &Term_node{
+                _p1: jp1,
+                _tag: 1,
+            },
+        }
+        var t5 Result__Term__string = Result__Term__string{
+            _p0: t4,
+            _tag: 0,
+        }
+        return t5
     case 2:
         var x7 Named = term__0._node._p1
         var x8 Named = term__0._node._p2
@@ -319,34 +319,6 @@ func translate(term__0 Named, context__0 Context) Result__Term__string {
         case 0:
             var x11 Term = mtmp2._p0
             jp2 = x11
-            var mtmp3 Result__Term__string = translate(x8, context__0)
-            var jp3 Term
-            switch mtmp3._tag {
-            case 0:
-                var x9 Term = mtmp3._p0
-                jp3 = x9
-                var t7 Term = Term{
-                    _node: &Term_node{
-                        _p1: jp2,
-                        _p2: jp3,
-                        _tag: 2,
-                    },
-                }
-                var t8 Result__Term__string = Result__Term__string{
-                    _p0: t7,
-                    _tag: 0,
-                }
-                return t8
-            case 1:
-                var x10 string = mtmp3._p1
-                var t9 Result__Term__string = Result__Term__string{
-                    _p1: x10,
-                    _tag: 1,
-                }
-                return t9
-            default:
-                panic("non-exhaustive match")
-            }
         case 1:
             var x12 string = mtmp2._p1
             var t10 Result__Term__string = Result__Term__string{
@@ -357,6 +329,34 @@ func translate(term__0 Named, context__0 Context) Result__Term__string {
         default:
             panic("non-exhaustive match")
         }
+        var mtmp3 Result__Term__string = translate(x8, context__0)
+        var jp3 Term
+        switch mtmp3._tag {
+        case 0:
+            var x9 Term = mtmp3._p0
+            jp3 = x9
+        case 1:
+            var x10 string = mtmp3._p1
+            var t9 Result__Term__string = Result__Term__string{
+                _p1: x10,
+                _tag: 1,
+            }
+            return t9
+        default:
+            panic("non-exhaustive match")
+        }
+        var t7 Term = Term{
+            _node: &Term_node{
+                _p1: jp2,
+                _p2: jp3,
+                _tag: 2,
+            },
+        }
+        var t8 Result__Term__string = Result__Term__string{
+            _p0: t7,
+            _tag: 0,
+        }
+        return t8
     default:
         panic("non-exhaustive match")
     }
@@ -1346,58 +1346,57 @@ func decimal_string(value__0 uint64) string {
     var t0 bool = value__0 == 0
     if t0 {
         return "0"
-    } else {
-        var reversed__0 *_goml_vec_uint8 = vec_with_capacity__Vec_5uint8(20)
-        var remaining__0 uint64 = value__0
-        Loop_loop0:
-        for {
-            var t10 bool = remaining__0 > 0
-            if t10 {
-                var t11 uint64 = remaining__0 % 10
-                var t12 uint8 = uint8(uint64(t11))
-                var t13 uint8 = t12 + 48
-                vec_push__Vec_5uint8(reversed__0, t13)
-                var compound_old1 uint64 = remaining__0
-                var compound_value1 uint64 = 10
-                var t14 uint64 = compound_old1 / compound_value1
-                remaining__0 = t14
-                continue
-            } else {
-                break Loop_loop0
-            }
+    } else {}
+    var reversed__0 *_goml_vec_uint8 = vec_with_capacity__Vec_5uint8(20)
+    var remaining__0 uint64 = value__0
+    Loop_loop0:
+    for {
+        var t10 bool = remaining__0 > 0
+        if t10 {
+            var t11 uint64 = remaining__0 % 10
+            var t12 uint8 = uint8(uint64(t11))
+            var t13 uint8 = t12 + 48
+            vec_push__Vec_5uint8(reversed__0, t13)
+            var compound_old1 uint64 = remaining__0
+            var compound_value1 uint64 = 10
+            var t14 uint64 = compound_old1 / compound_value1
+            remaining__0 = t14
+            continue
+        } else {
+            break Loop_loop0
         }
-        var t1 int
-        var inline3 int = vec_len__Vec_5uint8(reversed__0)
-        t1 = inline3
-        var bytes__0 *_goml_vec_uint8 = vec_with_capacity__Vec_5uint8(t1)
-        var offset__0 int = 0
-        Loop_loop1:
-        for {
-            var t2 int
-            var inline2 int = vec_len__Vec_5uint8(reversed__0)
-            t2 = inline2
-            var t3 bool = offset__0 < t2
-            if t3 {
-                var t4 int
-                var inline1 int = vec_len__Vec_5uint8(reversed__0)
-                t4 = inline1
-                var t5 int = t4 - offset__0
-                var t6 int = t5 - 1
-                var t7 uint8 = vec_get__Vec_5uint8(reversed__0, t6)
-                vec_push__Vec_5uint8(bytes__0, t7)
-                var compound_old0 int = offset__0
-                var compound_value0 int = 1
-                var t8 int = compound_old0 + compound_value0
-                offset__0 = t8
-                continue
-            } else {
-                break Loop_loop1
-            }
-        }
-        var mtmp0 Tuple2_4bool_6string = _goml_runtime_core_string_from_utf8(bytes__0)
-        var x0 string = mtmp0._1
-        return x0
     }
+    var t1 int
+    var inline3 int = vec_len__Vec_5uint8(reversed__0)
+    t1 = inline3
+    var bytes__0 *_goml_vec_uint8 = vec_with_capacity__Vec_5uint8(t1)
+    var offset__0 int = 0
+    Loop_loop1:
+    for {
+        var t2 int
+        var inline2 int = vec_len__Vec_5uint8(reversed__0)
+        t2 = inline2
+        var t3 bool = offset__0 < t2
+        if t3 {
+            var t4 int
+            var inline1 int = vec_len__Vec_5uint8(reversed__0)
+            t4 = inline1
+            var t5 int = t4 - offset__0
+            var t6 int = t5 - 1
+            var t7 uint8 = vec_get__Vec_5uint8(reversed__0, t6)
+            vec_push__Vec_5uint8(bytes__0, t7)
+            var compound_old0 int = offset__0
+            var compound_value0 int = 1
+            var t8 int = compound_old0 + compound_value0
+            offset__0 = t8
+            continue
+        } else {
+            break Loop_loop1
+        }
+    }
+    var mtmp0 Tuple2_4bool_6string = _goml_runtime_core_string_from_utf8(bytes__0)
+    var x0 string = mtmp0._1
+    return x0
 }
 
 func _goml_m_inherent_i_closure__en_h4945d894b03216ac23e7f2c330830aeb_tion__0_i_apply(env0 closure_env_lift_substitution_0, index__0 int) Term {

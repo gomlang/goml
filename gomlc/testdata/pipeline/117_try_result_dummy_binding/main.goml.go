@@ -56,43 +56,6 @@ func configure_and_format(config_ok__0 bool, read_ok__0 bool) Result__string__st
     }
     switch mtmp0._tag {
     case 0:
-        var mtmp1 Result__string__string
-        if read_ok__0 {
-            var inline1 Result__string__string = Result__string__string{
-                _p0: "2s",
-                _tag: 0,
-            }
-            mtmp1 = inline1
-        } else {
-            var inline2 Result__string__string = Result__string__string{
-                _p0: "duration failed",
-                _tag: 1,
-            }
-            mtmp1 = inline2
-        }
-        var jp0 string
-        switch mtmp1._tag {
-        case 0:
-            var x0 string = mtmp1._p0
-            jp0 = x0
-            var t0 string
-            var inline0 string = "duration=" + jp0
-            t0 = inline0
-            var t1 Result__string__string = Result__string__string{
-                _p0: t0,
-                _tag: 0,
-            }
-            return t1
-        case 1:
-            var x1 string = mtmp1._p0
-            var t2 Result__string__string = Result__string__string{
-                _p0: x1,
-                _tag: 1,
-            }
-            return t2
-        default:
-            panic("non-exhaustive match")
-        }
     case 1:
         var x2 string = mtmp0._p0
         var t3 Result__string__string = Result__string__string{
@@ -103,6 +66,43 @@ func configure_and_format(config_ok__0 bool, read_ok__0 bool) Result__string__st
     default:
         panic("non-exhaustive match")
     }
+    var mtmp1 Result__string__string
+    if read_ok__0 {
+        var inline1 Result__string__string = Result__string__string{
+            _p0: "2s",
+            _tag: 0,
+        }
+        mtmp1 = inline1
+    } else {
+        var inline2 Result__string__string = Result__string__string{
+            _p0: "duration failed",
+            _tag: 1,
+        }
+        mtmp1 = inline2
+    }
+    var jp0 string
+    switch mtmp1._tag {
+    case 0:
+        var x0 string = mtmp1._p0
+        jp0 = x0
+    case 1:
+        var x1 string = mtmp1._p0
+        var t2 Result__string__string = Result__string__string{
+            _p0: x1,
+            _tag: 1,
+        }
+        return t2
+    default:
+        panic("non-exhaustive match")
+    }
+    var t0 string
+    var inline0 string = "duration=" + jp0
+    t0 = inline0
+    var t1 Result__string__string = Result__string__string{
+        _p0: t0,
+        _tag: 0,
+    }
+    return t1
 }
 
 func main0() struct{} {

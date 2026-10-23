@@ -94,18 +94,18 @@ func describe(ok__0 bool) Option__string {
     case 1:
         var x2 Tuple2_6string_6string = mtmp0._p0
         jp0 = x2
-        var x0 string = jp0._0
-        var x1 string = jp0._1
-        var t0 string = x0 + ":"
-        var t1 string = t0 + x1
-        var t2 Option__string = Option__string{
-            _p0: t1,
-            _tag: 1,
-        }
-        return t2
     default:
         panic("non-exhaustive match")
     }
+    var x0 string = jp0._0
+    var x1 string = jp0._1
+    var t0 string = x0 + ":"
+    var t1 string = t0 + x1
+    var t2 Option__string = Option__string{
+        _p0: t1,
+        _tag: 1,
+    }
+    return t2
 }
 
 func main0() struct{} {
@@ -127,28 +127,24 @@ func main0() struct{} {
     var inline4 bool = false
     var inline5 _goml_m_Option_____o_string_c_string_q_ = pair(inline4)
     var inline6 Tuple2_6string_6string
-    switch inline5._tag {
-    case 0:
-        t2 = Option__string{
-            _tag: 0,
+    Shared_inline_cont2:
+    for {
+        Shared_inline_join0:
+        for {
+            switch inline5._tag {
+            case 0:
+                t2 = Option__string{
+                    _tag: 0,
+                }
+                break Shared_inline_cont2
+            case 1:
+                var inline12 Tuple2_6string_6string = inline5._p0
+                inline6 = inline12
+                break Shared_inline_join0
+            default:
+                panic("non-exhaustive match")
+            }
         }
-        var t3 string
-        switch t2._tag {
-        case 0:
-            t3 = "none"
-        case 1:
-            var inline2 string = t2._p0
-            var inline3 string = "some " + inline2
-            t3 = inline3
-        default:
-            panic("non-exhaustive match")
-        }
-        var inline0 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t3)
-        _goml_runtime_core_string_println(inline0)
-        return struct{}{}
-    case 1:
-        var inline12 Tuple2_6string_6string = inline5._p0
-        inline6 = inline12
         var inline7 string = inline6._0
         var inline8 string = inline6._1
         var inline9 string = inline7 + ":"
@@ -158,23 +154,22 @@ func main0() struct{} {
             _tag: 1,
         }
         t2 = inline11
-        var t3 string
-        switch t2._tag {
-        case 0:
-            t3 = "none"
-        case 1:
-            var inline2 string = t2._p0
-            var inline3 string = "some " + inline2
-            t3 = inline3
-        default:
-            panic("non-exhaustive match")
-        }
-        var inline0 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t3)
-        _goml_runtime_core_string_println(inline0)
-        return struct{}{}
+        break Shared_inline_cont2
+    }
+    var t3 string
+    switch t2._tag {
+    case 0:
+        t3 = "none"
+    case 1:
+        var inline2 string = t2._p0
+        var inline3 string = "some " + inline2
+        t3 = inline3
     default:
         panic("non-exhaustive match")
     }
+    var inline0 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t3)
+    _goml_runtime_core_string_println(inline0)
+    return struct{}{}
 }
 
 func _goml_m_trait__impl_i_ToString_i_string_i_to__string(self__0 string) string {

@@ -73,40 +73,6 @@ func use_handle(open_ok__0 bool, close_ok__0 bool) Result__string__string {
     case 0:
         var x1 Handle = mtmp0._p0
         jp0 = x1
-        var name__0 string = jp0.name
-        var mtmp1 _goml_m_Result_____o__q_____string
-        if close_ok__0 {
-            var inline0 _goml_m_Result_____o__q_____string = _goml_m_Result_____o__q_____string{
-                _tag: 0,
-            }
-            mtmp1 = inline0
-        } else {
-            var inline1 string = jp0.name
-            var inline2 string = "close failed for " + inline1
-            var inline3 _goml_m_Result_____o__q_____string = _goml_m_Result_____o__q_____string{
-                _p0: inline2,
-                _tag: 1,
-            }
-            mtmp1 = inline3
-        }
-        switch mtmp1._tag {
-        case 0:
-            var t0 string = "closed " + name__0
-            var t1 Result__string__string = Result__string__string{
-                _p0: t0,
-                _tag: 0,
-            }
-            return t1
-        case 1:
-            var x0 string = mtmp1._p0
-            var t2 Result__string__string = Result__string__string{
-                _p0: x0,
-                _tag: 1,
-            }
-            return t2
-        default:
-            panic("non-exhaustive match")
-        }
     case 1:
         var x2 string = mtmp0._p1
         var t3 Result__string__string = Result__string__string{
@@ -117,6 +83,40 @@ func use_handle(open_ok__0 bool, close_ok__0 bool) Result__string__string {
     default:
         panic("non-exhaustive match")
     }
+    var name__0 string = jp0.name
+    var mtmp1 _goml_m_Result_____o__q_____string
+    if close_ok__0 {
+        var inline0 _goml_m_Result_____o__q_____string = _goml_m_Result_____o__q_____string{
+            _tag: 0,
+        }
+        mtmp1 = inline0
+    } else {
+        var inline1 string = jp0.name
+        var inline2 string = "close failed for " + inline1
+        var inline3 _goml_m_Result_____o__q_____string = _goml_m_Result_____o__q_____string{
+            _p0: inline2,
+            _tag: 1,
+        }
+        mtmp1 = inline3
+    }
+    switch mtmp1._tag {
+    case 0:
+    case 1:
+        var x0 string = mtmp1._p0
+        var t2 Result__string__string = Result__string__string{
+            _p0: x0,
+            _tag: 1,
+        }
+        return t2
+    default:
+        panic("non-exhaustive match")
+    }
+    var t0 string = "closed " + name__0
+    var t1 Result__string__string = Result__string__string{
+        _p0: t0,
+        _tag: 0,
+    }
+    return t1
 }
 
 func main0() struct{} {

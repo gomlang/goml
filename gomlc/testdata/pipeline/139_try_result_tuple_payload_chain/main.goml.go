@@ -83,15 +83,6 @@ func render(ok__0 bool) Result__string__string {
     case _goml_m_Result_____o_string_c_string_q_____string_Ok:
         var x2 Tuple2_6string_6string = mtmp0.(_goml_m_Result_____o_string_c_string_q_____string_Ok)._0
         jp0 = x2
-        var x0 string = jp0._0
-        var x1 string = jp0._1
-        var t0 string = x0 + "="
-        var t1 string = t0 + x1
-        var t2 Result__string__string = Result__string__string{
-            _p0: t1,
-            _tag: 0,
-        }
-        return t2
     case _goml_m_Result_____o_string_c_string_q_____string_Err:
         var x3 string = mtmp0.(_goml_m_Result_____o_string_c_string_q_____string_Err)._0
         var t3 Result__string__string = Result__string__string{
@@ -102,6 +93,15 @@ func render(ok__0 bool) Result__string__string {
     default:
         panic("non-exhaustive match")
     }
+    var x0 string = jp0._0
+    var x1 string = jp0._1
+    var t0 string = x0 + "="
+    var t1 string = t0 + x1
+    var t2 Result__string__string = Result__string__string{
+        _p0: t1,
+        _tag: 0,
+    }
+    return t2
 }
 
 func main0() struct{} {

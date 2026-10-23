@@ -124,13 +124,6 @@ func _goml_m_inherent_i_closure__env__run__0_i_closure__env__run__0_i_apply(env0
     case 0:
         var x0 string = mtmp0._p0
         jp0 = x0
-        var t0 string = prefix__0 + ":"
-        var t1 string = t0 + jp0
-        var t2 Result__string__string = Result__string__string{
-            _p0: t1,
-            _tag: 0,
-        }
-        return t2
     case 1:
         var x1 string = mtmp0._p0
         var t3 Result__string__string = Result__string__string{
@@ -141,6 +134,13 @@ func _goml_m_inherent_i_closure__env__run__0_i_closure__env__run__0_i_apply(env0
     default:
         panic("non-exhaustive match")
     }
+    var t0 string = prefix__0 + ":"
+    var t1 string = t0 + jp0
+    var t2 Result__string__string = Result__string__string{
+        _p0: t1,
+        _tag: 0,
+    }
+    return t2
 }
 
 func main() {

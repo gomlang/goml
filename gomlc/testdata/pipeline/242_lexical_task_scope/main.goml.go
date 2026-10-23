@@ -881,58 +881,57 @@ func decimal_string(value__0 uint64) string {
     var t0 bool = value__0 == 0
     if t0 {
         return "0"
-    } else {
-        var reversed__0 *_goml_vec_uint8 = vec_with_capacity__Vec_5uint8(20)
-        var remaining__0 uint64 = value__0
-        Loop_loop0:
-        for {
-            var t10 bool = remaining__0 > 0
-            if t10 {
-                var t11 uint64 = remaining__0 % 10
-                var t12 uint8 = uint8(uint64(t11))
-                var t13 uint8 = t12 + 48
-                vec_push__Vec_5uint8(reversed__0, t13)
-                var compound_old1 uint64 = remaining__0
-                var compound_value1 uint64 = 10
-                var t14 uint64 = compound_old1 / compound_value1
-                remaining__0 = t14
-                continue
-            } else {
-                break Loop_loop0
-            }
+    } else {}
+    var reversed__0 *_goml_vec_uint8 = vec_with_capacity__Vec_5uint8(20)
+    var remaining__0 uint64 = value__0
+    Loop_loop0:
+    for {
+        var t10 bool = remaining__0 > 0
+        if t10 {
+            var t11 uint64 = remaining__0 % 10
+            var t12 uint8 = uint8(uint64(t11))
+            var t13 uint8 = t12 + 48
+            vec_push__Vec_5uint8(reversed__0, t13)
+            var compound_old1 uint64 = remaining__0
+            var compound_value1 uint64 = 10
+            var t14 uint64 = compound_old1 / compound_value1
+            remaining__0 = t14
+            continue
+        } else {
+            break Loop_loop0
         }
-        var t1 int
-        var inline3 int = vec_len__Vec_5uint8(reversed__0)
-        t1 = inline3
-        var bytes__0 *_goml_vec_uint8 = vec_with_capacity__Vec_5uint8(t1)
-        var offset__0 int = 0
-        Loop_loop1:
-        for {
-            var t2 int
-            var inline2 int = vec_len__Vec_5uint8(reversed__0)
-            t2 = inline2
-            var t3 bool = offset__0 < t2
-            if t3 {
-                var t4 int
-                var inline1 int = vec_len__Vec_5uint8(reversed__0)
-                t4 = inline1
-                var t5 int = t4 - offset__0
-                var t6 int = t5 - 1
-                var t7 uint8 = vec_get__Vec_5uint8(reversed__0, t6)
-                vec_push__Vec_5uint8(bytes__0, t7)
-                var compound_old0 int = offset__0
-                var compound_value0 int = 1
-                var t8 int = compound_old0 + compound_value0
-                offset__0 = t8
-                continue
-            } else {
-                break Loop_loop1
-            }
-        }
-        var mtmp0 Tuple2_4bool_6string = _goml_runtime_core_string_from_utf8(bytes__0)
-        var x0 string = mtmp0._1
-        return x0
     }
+    var t1 int
+    var inline3 int = vec_len__Vec_5uint8(reversed__0)
+    t1 = inline3
+    var bytes__0 *_goml_vec_uint8 = vec_with_capacity__Vec_5uint8(t1)
+    var offset__0 int = 0
+    Loop_loop1:
+    for {
+        var t2 int
+        var inline2 int = vec_len__Vec_5uint8(reversed__0)
+        t2 = inline2
+        var t3 bool = offset__0 < t2
+        if t3 {
+            var t4 int
+            var inline1 int = vec_len__Vec_5uint8(reversed__0)
+            t4 = inline1
+            var t5 int = t4 - offset__0
+            var t6 int = t5 - 1
+            var t7 uint8 = vec_get__Vec_5uint8(reversed__0, t6)
+            vec_push__Vec_5uint8(bytes__0, t7)
+            var compound_old0 int = offset__0
+            var compound_value0 int = 1
+            var t8 int = compound_old0 + compound_value0
+            offset__0 = t8
+            continue
+        } else {
+            break Loop_loop1
+        }
+    }
+    var mtmp0 Tuple2_4bool_6string = _goml_runtime_core_string_from_utf8(bytes__0)
+    var x0 string = mtmp0._1
+    return x0
 }
 
 func _goml_m_inherent_i_closure__env__main__0_i_closure__env__main__0_i_apply(env0 closure_env_main_0, _cancel__0 _goml_m_std_p_task_p_CancelToken) int {
@@ -1008,33 +1007,6 @@ func _goml_m_inherent_i_closure__env__main__3_i_closure__env__main__3_i_apply(en
         case _goml_m_Result____isize____std_p_panic_p_Panic_Ok:
             var inline15 int = inline14.(_goml_m_Result____isize____std_p_panic_p_Panic_Ok)._0
             t6 = inline15
-            var t7 int
-            var inline0 chan struct{} = right__0.ready
-            _goml_m_inherent_i_Channel_i_Channel_l_T_r__i_recv____T___o__q_(inline0)
-            var inline2 *ref__goml_m_Option____Result____isize____std_p_panic_p_Panic_x = right__0.result
-            var inline3 _goml_m_Option____Result____isize____std_p_panic_p_Panic = _goml_m_inherent_i_Ref_i_Ref_l_h80255cab1de9a17c566649cce0d96ab2_c_p_Panic_r__r_(inline2)
-            switch inline3._tag {
-            case 0:
-                _goml_m_std_p_panic_p_raise("task completed without a result")
-                panic("unreachable")
-            case 1:
-                var inline5 _goml_m_Result____isize____std_p_panic_p_Panic = inline3._p0
-                switch inline5.(type) {
-                case _goml_m_Result____isize____std_p_panic_p_Panic_Ok:
-                    var inline6 int = inline5.(_goml_m_Result____isize____std_p_panic_p_Panic_Ok)._0
-                    t7 = inline6
-                    var t8 int = t6 + t7
-                    return t8
-                case _goml_m_Result____isize____std_p_panic_p_Panic_Err:
-                    var inline7 _goml_m_std_p_panic_p_Panic = inline5.(_goml_m_Result____isize____std_p_panic_p_Panic_Err)._0
-                    _goml_m_std_p_panic_p_resume(inline7)
-                    panic("unreachable")
-                default:
-                    panic("non-exhaustive match")
-                }
-            default:
-                panic("non-exhaustive match")
-            }
         case _goml_m_Result____isize____std_p_panic_p_Panic_Err:
             var inline16 _goml_m_std_p_panic_p_Panic = inline14.(_goml_m_Result____isize____std_p_panic_p_Panic_Err)._0
             _goml_m_std_p_panic_p_resume(inline16)
@@ -1045,6 +1017,33 @@ func _goml_m_inherent_i_closure__env__main__3_i_closure__env__main__3_i_apply(en
     default:
         panic("non-exhaustive match")
     }
+    var t7 int
+    var inline0 chan struct{} = right__0.ready
+    _goml_m_inherent_i_Channel_i_Channel_l_T_r__i_recv____T___o__q_(inline0)
+    var inline2 *ref__goml_m_Option____Result____isize____std_p_panic_p_Panic_x = right__0.result
+    var inline3 _goml_m_Option____Result____isize____std_p_panic_p_Panic = _goml_m_inherent_i_Ref_i_Ref_l_h80255cab1de9a17c566649cce0d96ab2_c_p_Panic_r__r_(inline2)
+    switch inline3._tag {
+    case 0:
+        _goml_m_std_p_panic_p_raise("task completed without a result")
+        panic("unreachable")
+    case 1:
+        var inline5 _goml_m_Result____isize____std_p_panic_p_Panic = inline3._p0
+        switch inline5.(type) {
+        case _goml_m_Result____isize____std_p_panic_p_Panic_Ok:
+            var inline6 int = inline5.(_goml_m_Result____isize____std_p_panic_p_Panic_Ok)._0
+            t7 = inline6
+        case _goml_m_Result____isize____std_p_panic_p_Panic_Err:
+            var inline7 _goml_m_std_p_panic_p_Panic = inline5.(_goml_m_Result____isize____std_p_panic_p_Panic_Err)._0
+            _goml_m_std_p_panic_p_resume(inline7)
+            panic("unreachable")
+        default:
+            panic("non-exhaustive match")
+        }
+    default:
+        panic("non-exhaustive match")
+    }
+    var t8 int = t6 + t7
+    return t8
 }
 
 func _goml_m_inherent_i_closure__env__main__4_i_closure__env__main__4_i_apply(env0 closure_env_main_4, _cancel__0 _goml_m_std_p_task_p_CancelToken) int {

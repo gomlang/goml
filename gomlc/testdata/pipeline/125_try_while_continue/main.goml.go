@@ -108,35 +108,39 @@ func accumulate(limit__0 int32) Option__i32 {
             var t4 int32 = cur__0 + 1
             ref_set__Ref_5int32(i__0, t4)
             var t5 bool = cur__0 == 1
-            if t5 {
-                continue
-            } else {
-                var mtmp0 Option__i32
-                var inline3 bool = cur__0 == 2
-                if inline3 {
-                    mtmp0 = Option__i32(0)
+            Shared_k0:
+            for {
+                if t5 {
+                    continue Loop_loop0
                 } else {
-                    var inline4 int32 = cur__0 + 10
-                    var inline5 Option__i32 = Option__i32(uint64(int64(inline4) + 2147483648) + 1)
-                    mtmp0 = inline5
-                }
-                var jp0 int32
-                switch mtmp0 != Option__i32(0) {
-                case false:
-                    return Option__i32(0)
-                case true:
-                    var x0 int32 = int32(int64(uint64(mtmp0) - 1) - 2147483648)
-                    jp0 = x0
-                    var t6 int32
-                    var inline2 int32 = ref_get__Ref_5int32(sum__0)
-                    t6 = inline2
-                    var t7 int32 = t6 + jp0
-                    ref_set__Ref_5int32(sum__0, t7)
-                    continue
-                default:
-                    panic("non-exhaustive match")
+                    break Shared_k0
                 }
             }
+            var mtmp0 Option__i32
+            var inline3 bool = cur__0 == 2
+            if inline3 {
+                mtmp0 = Option__i32(0)
+            } else {
+                var inline4 int32 = cur__0 + 10
+                var inline5 Option__i32 = Option__i32(uint64(int64(inline4) + 2147483648) + 1)
+                mtmp0 = inline5
+            }
+            var jp0 int32
+            switch mtmp0 != Option__i32(0) {
+            case false:
+                return Option__i32(0)
+            case true:
+                var x0 int32 = int32(int64(uint64(mtmp0) - 1) - 2147483648)
+                jp0 = x0
+            default:
+                panic("non-exhaustive match")
+            }
+            var t6 int32
+            var inline2 int32 = ref_get__Ref_5int32(sum__0)
+            t6 = inline2
+            var t7 int32 = t6 + jp0
+            ref_set__Ref_5int32(sum__0, t7)
+            continue
         } else {
             break Loop_loop0
         }
@@ -211,58 +215,57 @@ func decimal_string(value__0 uint64) string {
     var t0 bool = value__0 == 0
     if t0 {
         return "0"
-    } else {
-        var reversed__0 *_goml_vec_uint8 = vec_with_capacity__Vec_5uint8(20)
-        var remaining__0 uint64 = value__0
-        Loop_loop0:
-        for {
-            var t10 bool = remaining__0 > 0
-            if t10 {
-                var t11 uint64 = remaining__0 % 10
-                var t12 uint8 = uint8(uint64(t11))
-                var t13 uint8 = t12 + 48
-                vec_push__Vec_5uint8(reversed__0, t13)
-                var compound_old1 uint64 = remaining__0
-                var compound_value1 uint64 = 10
-                var t14 uint64 = compound_old1 / compound_value1
-                remaining__0 = t14
-                continue
-            } else {
-                break Loop_loop0
-            }
+    } else {}
+    var reversed__0 *_goml_vec_uint8 = vec_with_capacity__Vec_5uint8(20)
+    var remaining__0 uint64 = value__0
+    Loop_loop0:
+    for {
+        var t10 bool = remaining__0 > 0
+        if t10 {
+            var t11 uint64 = remaining__0 % 10
+            var t12 uint8 = uint8(uint64(t11))
+            var t13 uint8 = t12 + 48
+            vec_push__Vec_5uint8(reversed__0, t13)
+            var compound_old1 uint64 = remaining__0
+            var compound_value1 uint64 = 10
+            var t14 uint64 = compound_old1 / compound_value1
+            remaining__0 = t14
+            continue
+        } else {
+            break Loop_loop0
         }
-        var t1 int
-        var inline3 int = vec_len__Vec_5uint8(reversed__0)
-        t1 = inline3
-        var bytes__0 *_goml_vec_uint8 = vec_with_capacity__Vec_5uint8(t1)
-        var offset__0 int = 0
-        Loop_loop1:
-        for {
-            var t2 int
-            var inline2 int = vec_len__Vec_5uint8(reversed__0)
-            t2 = inline2
-            var t3 bool = offset__0 < t2
-            if t3 {
-                var t4 int
-                var inline1 int = vec_len__Vec_5uint8(reversed__0)
-                t4 = inline1
-                var t5 int = t4 - offset__0
-                var t6 int = t5 - 1
-                var t7 uint8 = vec_get__Vec_5uint8(reversed__0, t6)
-                vec_push__Vec_5uint8(bytes__0, t7)
-                var compound_old0 int = offset__0
-                var compound_value0 int = 1
-                var t8 int = compound_old0 + compound_value0
-                offset__0 = t8
-                continue
-            } else {
-                break Loop_loop1
-            }
-        }
-        var mtmp0 Tuple2_4bool_6string = _goml_runtime_core_string_from_utf8(bytes__0)
-        var x0 string = mtmp0._1
-        return x0
     }
+    var t1 int
+    var inline3 int = vec_len__Vec_5uint8(reversed__0)
+    t1 = inline3
+    var bytes__0 *_goml_vec_uint8 = vec_with_capacity__Vec_5uint8(t1)
+    var offset__0 int = 0
+    Loop_loop1:
+    for {
+        var t2 int
+        var inline2 int = vec_len__Vec_5uint8(reversed__0)
+        t2 = inline2
+        var t3 bool = offset__0 < t2
+        if t3 {
+            var t4 int
+            var inline1 int = vec_len__Vec_5uint8(reversed__0)
+            t4 = inline1
+            var t5 int = t4 - offset__0
+            var t6 int = t5 - 1
+            var t7 uint8 = vec_get__Vec_5uint8(reversed__0, t6)
+            vec_push__Vec_5uint8(bytes__0, t7)
+            var compound_old0 int = offset__0
+            var compound_value0 int = 1
+            var t8 int = compound_old0 + compound_value0
+            offset__0 = t8
+            continue
+        } else {
+            break Loop_loop1
+        }
+    }
+    var mtmp0 Tuple2_4bool_6string = _goml_runtime_core_string_from_utf8(bytes__0)
+    var x0 string = mtmp0._1
+    return x0
 }
 
 func main() {

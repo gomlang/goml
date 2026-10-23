@@ -109,24 +109,28 @@ func main0() struct{} {
             var inline26 int = ref_get__Ref_3int(i__0)
             t12 = inline26
             var t13 bool = t12 == 50
-            if t13 {
-                break Loop_loop0
-            } else {
-                var t14 int
-                var inline25 int = ref_get__Ref_3int(sum__0)
-                t14 = inline25
-                var t15 int
-                var inline24 int = ref_get__Ref_3int(i__0)
-                t15 = inline24
-                var t16 int = t14 + t15
-                ref_set__Ref_3int(sum__0, t16)
-                var t17 int
-                var inline22 int = ref_get__Ref_3int(i__0)
-                t17 = inline22
-                var t18 int = t17 + 1
-                ref_set__Ref_3int(i__0, t18)
-                continue
+            Shared_k1:
+            for {
+                if t13 {
+                    break Loop_loop0
+                } else {
+                    break Shared_k1
+                }
             }
+            var t14 int
+            var inline25 int = ref_get__Ref_3int(sum__0)
+            t14 = inline25
+            var t15 int
+            var inline24 int = ref_get__Ref_3int(i__0)
+            t15 = inline24
+            var t16 int = t14 + t15
+            ref_set__Ref_3int(sum__0, t16)
+            var t17 int
+            var inline22 int = ref_get__Ref_3int(i__0)
+            t17 = inline22
+            var t18 int = t17 + 1
+            ref_set__Ref_3int(i__0, t18)
+            continue
         } else {
             break Loop_loop0
         }
@@ -162,16 +166,20 @@ func main0() struct{} {
             var t5 int = cur__0 / 2
             var t6 int = t5 * 2
             var t7 bool = cur__0 == t6
-            if t7 {
-                var t8 int
-                var inline7 int = ref_get__Ref_3int(even_sum__0)
-                t8 = inline7
-                var t9 int = t8 + cur__0
-                ref_set__Ref_3int(even_sum__0, t9)
-                continue
-            } else {
-                continue
+            Shared_k0:
+            for {
+                if t7 {
+                    var t8 int
+                    var inline7 int = ref_get__Ref_3int(even_sum__0)
+                    t8 = inline7
+                    var t9 int = t8 + cur__0
+                    ref_set__Ref_3int(even_sum__0, t9)
+                    continue Loop_loop1
+                } else {
+                    break Shared_k0
+                }
             }
+            continue
         } else {
             break Loop_loop1
         }
@@ -216,58 +224,57 @@ func decimal_string(value__0 uint64) string {
     var t0 bool = value__0 == 0
     if t0 {
         return "0"
-    } else {
-        var reversed__0 *_goml_vec_uint8 = vec_with_capacity__Vec_5uint8(20)
-        var remaining__0 uint64 = value__0
-        Loop_loop0:
-        for {
-            var t10 bool = remaining__0 > 0
-            if t10 {
-                var t11 uint64 = remaining__0 % 10
-                var t12 uint8 = uint8(uint64(t11))
-                var t13 uint8 = t12 + 48
-                vec_push__Vec_5uint8(reversed__0, t13)
-                var compound_old1 uint64 = remaining__0
-                var compound_value1 uint64 = 10
-                var t14 uint64 = compound_old1 / compound_value1
-                remaining__0 = t14
-                continue
-            } else {
-                break Loop_loop0
-            }
+    } else {}
+    var reversed__0 *_goml_vec_uint8 = vec_with_capacity__Vec_5uint8(20)
+    var remaining__0 uint64 = value__0
+    Loop_loop0:
+    for {
+        var t10 bool = remaining__0 > 0
+        if t10 {
+            var t11 uint64 = remaining__0 % 10
+            var t12 uint8 = uint8(uint64(t11))
+            var t13 uint8 = t12 + 48
+            vec_push__Vec_5uint8(reversed__0, t13)
+            var compound_old1 uint64 = remaining__0
+            var compound_value1 uint64 = 10
+            var t14 uint64 = compound_old1 / compound_value1
+            remaining__0 = t14
+            continue
+        } else {
+            break Loop_loop0
         }
-        var t1 int
-        var inline3 int = vec_len__Vec_5uint8(reversed__0)
-        t1 = inline3
-        var bytes__0 *_goml_vec_uint8 = vec_with_capacity__Vec_5uint8(t1)
-        var offset__0 int = 0
-        Loop_loop1:
-        for {
-            var t2 int
-            var inline2 int = vec_len__Vec_5uint8(reversed__0)
-            t2 = inline2
-            var t3 bool = offset__0 < t2
-            if t3 {
-                var t4 int
-                var inline1 int = vec_len__Vec_5uint8(reversed__0)
-                t4 = inline1
-                var t5 int = t4 - offset__0
-                var t6 int = t5 - 1
-                var t7 uint8 = vec_get__Vec_5uint8(reversed__0, t6)
-                vec_push__Vec_5uint8(bytes__0, t7)
-                var compound_old0 int = offset__0
-                var compound_value0 int = 1
-                var t8 int = compound_old0 + compound_value0
-                offset__0 = t8
-                continue
-            } else {
-                break Loop_loop1
-            }
-        }
-        var mtmp0 Tuple2_4bool_6string = _goml_runtime_core_string_from_utf8(bytes__0)
-        var x0 string = mtmp0._1
-        return x0
     }
+    var t1 int
+    var inline3 int = vec_len__Vec_5uint8(reversed__0)
+    t1 = inline3
+    var bytes__0 *_goml_vec_uint8 = vec_with_capacity__Vec_5uint8(t1)
+    var offset__0 int = 0
+    Loop_loop1:
+    for {
+        var t2 int
+        var inline2 int = vec_len__Vec_5uint8(reversed__0)
+        t2 = inline2
+        var t3 bool = offset__0 < t2
+        if t3 {
+            var t4 int
+            var inline1 int = vec_len__Vec_5uint8(reversed__0)
+            t4 = inline1
+            var t5 int = t4 - offset__0
+            var t6 int = t5 - 1
+            var t7 uint8 = vec_get__Vec_5uint8(reversed__0, t6)
+            vec_push__Vec_5uint8(bytes__0, t7)
+            var compound_old0 int = offset__0
+            var compound_value0 int = 1
+            var t8 int = compound_old0 + compound_value0
+            offset__0 = t8
+            continue
+        } else {
+            break Loop_loop1
+        }
+    }
+    var mtmp0 Tuple2_4bool_6string = _goml_runtime_core_string_from_utf8(bytes__0)
+    var x0 string = mtmp0._1
+    return x0
 }
 
 func main() {

@@ -974,62 +974,34 @@ func _goml_m_trait__impl_i_std_p_cmp_p_PartialOrd_i_MaybeNumber_i_partial__cmp(s
     var inline0 bool = t0 < t1
     if inline0 {
         commute_field0 = Less
-        switch commute_field0 {
-        case Equal:
-            var t2 Option__Ordering = Option__Ordering{
-                _p0: Equal,
-                _tag: 1,
-            }
-            return t2
-        default:
-            var t3 Option__Ordering = Option__Ordering{
-                _p0: commute_field0,
-                _tag: 1,
-            }
-            return t3
-        }
     } else {
         var inline1 bool = t0 > t1
         if inline1 {
             commute_field0 = Greater
-            switch commute_field0 {
-            case Equal:
-                var t2 Option__Ordering = Option__Ordering{
-                    _p0: Equal,
-                    _tag: 1,
-                }
-                return t2
-            default:
-                var t3 Option__Ordering = Option__Ordering{
-                    _p0: commute_field0,
-                    _tag: 1,
-                }
-                return t3
-            }
         } else {
             var inline2 bool = t0 == t1
             if inline2 {
                 commute_field0 = Equal
-                switch commute_field0 {
-                case Equal:
-                    var t2 Option__Ordering = Option__Ordering{
-                        _p0: Equal,
-                        _tag: 1,
-                    }
-                    return t2
-                default:
-                    var t3 Option__Ordering = Option__Ordering{
-                        _p0: commute_field0,
-                        _tag: 1,
-                    }
-                    return t3
-                }
             } else {
                 return Option__Ordering{
                     _tag: 0,
                 }
             }
         }
+    }
+    switch commute_field0 {
+    case Equal:
+        var t2 Option__Ordering = Option__Ordering{
+            _p0: Equal,
+            _tag: 1,
+        }
+        return t2
+    default:
+        var t3 Option__Ordering = Option__Ordering{
+            _p0: commute_field0,
+            _tag: 1,
+        }
+        return t3
     }
 }
 
@@ -1078,62 +1050,34 @@ func _goml_m_trait__impl_i_std_p_cmp_p_PartialOrd_i_PartialLevel_i_partial__cmp(
                     var inline0 bool = x1 < x0
                     if inline0 {
                         commute_field0 = Less
-                        switch commute_field0 {
-                        case Equal:
-                            var t4 Option__Ordering = Option__Ordering{
-                                _p0: Equal,
-                                _tag: 1,
-                            }
-                            return t4
-                        default:
-                            var t5 Option__Ordering = Option__Ordering{
-                                _p0: commute_field0,
-                                _tag: 1,
-                            }
-                            return t5
-                        }
                     } else {
                         var inline1 bool = x1 > x0
                         if inline1 {
                             commute_field0 = Greater
-                            switch commute_field0 {
-                            case Equal:
-                                var t4 Option__Ordering = Option__Ordering{
-                                    _p0: Equal,
-                                    _tag: 1,
-                                }
-                                return t4
-                            default:
-                                var t5 Option__Ordering = Option__Ordering{
-                                    _p0: commute_field0,
-                                    _tag: 1,
-                                }
-                                return t5
-                            }
                         } else {
                             var inline2 bool = x1 == x0
                             if inline2 {
                                 commute_field0 = Equal
-                                switch commute_field0 {
-                                case Equal:
-                                    var t4 Option__Ordering = Option__Ordering{
-                                        _p0: Equal,
-                                        _tag: 1,
-                                    }
-                                    return t4
-                                default:
-                                    var t5 Option__Ordering = Option__Ordering{
-                                        _p0: commute_field0,
-                                        _tag: 1,
-                                    }
-                                    return t5
-                                }
                             } else {
                                 return Option__Ordering{
                                     _tag: 0,
                                 }
                             }
                         }
+                    }
+                    switch commute_field0 {
+                    case Equal:
+                        var t4 Option__Ordering = Option__Ordering{
+                            _p0: Equal,
+                            _tag: 1,
+                        }
+                        return t4
+                    default:
+                        var t5 Option__Ordering = Option__Ordering{
+                            _p0: commute_field0,
+                            _tag: 1,
+                        }
+                        return t5
                     }
                 default:
                     var t6 Option__Ordering = Option__Ordering{
@@ -1809,26 +1753,6 @@ func _goml_m_trait__impl_i_std_p_cmp_p_PartialOrd_i__o_isize_c_f64_q__i_partial_
             }
             _structural_partial_ordering_1 = inline1
             commute_field1 = Less
-            var t5 bool
-            switch commute_field1 {
-            case Less:
-                t5 = false
-            case Equal:
-                t5 = true
-            case Greater:
-                t5 = false
-            default:
-                panic("non-exhaustive match")
-            }
-            if t5 {
-                var t6 Option__Ordering = Option__Ordering{
-                    _p0: Equal,
-                    _tag: 1,
-                }
-                return t6
-            } else {
-                return _structural_partial_ordering_1
-            }
         } else {
             var inline2 bool = t3 > t4
             if inline2 {
@@ -1838,26 +1762,6 @@ func _goml_m_trait__impl_i_std_p_cmp_p_PartialOrd_i__o_isize_c_f64_q__i_partial_
                 }
                 _structural_partial_ordering_1 = inline3
                 commute_field1 = Greater
-                var t5 bool
-                switch commute_field1 {
-                case Less:
-                    t5 = false
-                case Equal:
-                    t5 = true
-                case Greater:
-                    t5 = false
-                default:
-                    panic("non-exhaustive match")
-                }
-                if t5 {
-                    var t6 Option__Ordering = Option__Ordering{
-                        _p0: Equal,
-                        _tag: 1,
-                    }
-                    return t6
-                } else {
-                    return _structural_partial_ordering_1
-                }
             } else {
                 var inline4 bool = t3 == t4
                 if inline4 {
@@ -1867,32 +1771,32 @@ func _goml_m_trait__impl_i_std_p_cmp_p_PartialOrd_i__o_isize_c_f64_q__i_partial_
                     }
                     _structural_partial_ordering_1 = inline5
                     commute_field1 = Equal
-                    var t5 bool
-                    switch commute_field1 {
-                    case Less:
-                        t5 = false
-                    case Equal:
-                        t5 = true
-                    case Greater:
-                        t5 = false
-                    default:
-                        panic("non-exhaustive match")
-                    }
-                    if t5 {
-                        var t6 Option__Ordering = Option__Ordering{
-                            _p0: Equal,
-                            _tag: 1,
-                        }
-                        return t6
-                    } else {
-                        return _structural_partial_ordering_1
-                    }
                 } else {
                     return Option__Ordering{
                         _tag: 0,
                     }
                 }
             }
+        }
+        var t5 bool
+        switch commute_field1 {
+        case Less:
+            t5 = false
+        case Equal:
+            t5 = true
+        case Greater:
+            t5 = false
+        default:
+            panic("non-exhaustive match")
+        }
+        if t5 {
+            var t6 Option__Ordering = Option__Ordering{
+                _p0: Equal,
+                _tag: 1,
+            }
+            return t6
+        } else {
+            return _structural_partial_ordering_1
         }
     } else {
         return _structural_partial_ordering_0
