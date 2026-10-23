@@ -1,0 +1,356 @@
+package go_backend;
+
+use std::testing;
+use std::collections;
+
+fn snapshot_test_type() -> Type {
+    Named { name: "State" }
+}
+
+fn snapshot_test_field(root: string, field_name: string) -> Expr {
+    Field { expr: record_test_var(root), field_name }
+}
+
+fn snapshot_test_getter() -> Function {
+    Function {
+        name: "get_state",
+        params: Vec::from_array([("reference", Pointer { elem: Named { name: "Cell" } })]),
+        ret_ty: Some(snapshot_test_type()),
+        body: Block {
+            stmts: Vec::from_array(
+                [Return { expr: Some(snapshot_test_field("reference", "value")) }],
+            ),
+        },
+    }
+}
+
+fn snapshot_test_file(stmts: Vec[Stmt]) -> File {
+    File {
+        items: Vec::from_array(
+            [
+                Struct(
+                    StructDef {
+                        name: "State",
+                        fields: Vec::from_array(
+                            [
+                                ("flag", Type::Int),
+                                ("values", Type::Array { len: 32, elem: Type::Int }),
+                            ],
+                        ),
+                    },
+                ),
+                Function(snapshot_test_getter()),
+                Function(
+                    Function {
+                        name: "read",
+                        params: Vec::from_array(
+                            [
+                                ("reference", Pointer { elem: Named { name: "Cell" } }),
+                                ("index", Type::Int),
+                            ],
+                        ),
+                        ret_ty: Some(Type::Int),
+                        body: Block { stmts },
+                    },
+                ),
+            ],
+        ),
+    }
+}
+
+fn snapshot_test_load() -> Stmt {
+    record_test_binding(
+        "snapshot",
+        snapshot_test_type(),
+        Call {
+            func: record_test_var("get_state"),
+            args: Vec::from_array([record_test_var("reference")]),
+        },
+    )
+}
+
+fn snapshot_test_read() -> Stmt {
+    record_test_binding("result", Type::Int, snapshot_test_field("snapshot", "flag"))
+}
+
+fn snapshot_test_return() -> Stmt {
+    Return { expr: Some(record_test_var("result")) }
+}
+
+#[test]
+fn snapshot_projections_narrow_getters_and_forwarded_join_values() -> () {
+    for forwarded in[false, true] {
+        let stmts = Vec::from_array([snapshot_test_load()]);
+        if forwarded {
+            stmts.push(Var { name: "joined", ty: snapshot_test_type(), value: None });
+            stmts.push(Assign { name: "joined", value: record_test_var("snapshot") });
+            stmts.push(
+                record_test_binding("result", Type::Int, snapshot_test_field("joined", "flag")),
+            );
+        } else {
+            stmts.push(snapshot_test_read());
+        }
+        stmts.push(snapshot_test_return());
+        let output = encode(narrow_projection_snapshots(snapshot_test_file(stmts)));
+        if forwarded {
+            testing::assert(output.contains("var snapshot State = get_state(reference)"));
+            testing::assert(output.contains("var result int = snapshot.flag"));
+        } else {
+            testing::assert(output.contains("var result int = reference.value.flag"));
+            testing::assert(!output.contains("var snapshot State"));
+        }
+    }
+    let stmts = Vec::from_array(
+        [
+            Stmt::Var { name: "joined", ty: snapshot_test_type(), value: None },
+            snapshot_test_load(),
+            Stmt::Assign { name: "joined", value: record_test_var("snapshot") },
+            record_test_binding("result", Type::Int, snapshot_test_field("joined", "flag")),
+            snapshot_test_return(),
+        ],
+    );
+    let output = encode(narrow_projection_snapshots(snapshot_test_file(stmts)));
+    testing::assert(output.contains("var result int = reference.value.flag"));
+    testing::assert(!output.contains("var joined State"));
+}
+
+#[test]
+fn snapshot_projections_fuse_borrowed_array_reads() -> () {
+    let array = Type::Array { len: 32, elem: Type::Int };
+    let output = encode(
+        narrow_projection_snapshots(
+            snapshot_test_file(
+                Vec::from_array(
+                    [
+                        snapshot_test_load(),
+                        record_test_binding(
+                            "values",
+                            Pointer { elem: array },
+                            Unary {
+                                op: UnaryOp::Address,
+                                expr: snapshot_test_field("snapshot", "values"),
+                            },
+                        ),
+                        record_test_binding(
+                            "result",
+                            Type::Int,
+                            Expr::Index {
+                                base: Unary { op: UnaryOp::Deref, expr: record_test_var("values") },
+                                index: record_test_var("index"),
+                            },
+                        ),
+                        snapshot_test_return(),
+                    ],
+                ),
+            ),
+        ),
+    );
+    testing::assert(output.contains("reference.value.values[index]"));
+    testing::assert(!output.contains("var snapshot State"));
+    testing::assert(!output.contains("var values *"));
+}
+
+#[test]
+fn snapshot_projections_preserve_intervening_effects_and_multiple_uses() -> () {
+    let effect = Stmt::Expr {
+        expr: Call {
+            func: record_test_var("replace"),
+            args: Vec::from_array([record_test_var("reference")]),
+        },
+    };
+    for extra in Vec::from_array(
+        [
+            effect,
+            Stmt::Expr {
+                expr: Call {
+                    func: record_test_var("retain"),
+                    args: Vec::from_array([record_test_var("snapshot")]),
+                },
+            },
+        ],
+    ) {
+        let file = snapshot_test_file(
+            Vec::from_array(
+                [snapshot_test_load(), extra, snapshot_test_read(), snapshot_test_return()],
+            ),
+        );
+        testing::assert_eq(encode(narrow_projection_snapshots(file)), encode(file));
+    }
+    let file = snapshot_test_file(
+        Vec::from_array(
+            [
+                snapshot_test_load(),
+                snapshot_test_read(),
+                Stmt::ReturnMulti {
+                    exprs: Vec::from_array([record_test_var("result"), record_test_var("snapshot")]),
+                },
+            ],
+        ),
+    );
+    testing::assert_eq(encode(narrow_projection_snapshots(file)), encode(file));
+}
+
+#[test]
+fn snapshot_projections_keep_effectful_indexes_and_pointer_escapes() -> () {
+    let file = snapshot_test_file(
+        Vec::from_array(
+            [
+                snapshot_test_load(),
+                record_test_binding(
+                    "result",
+                    Type::Int,
+                    Expr::Index {
+                        base: snapshot_test_field("snapshot", "values"),
+                        index: Call {
+                            func: record_test_var("replace"),
+                            args: Vec::from_array([record_test_var("reference")]),
+                        },
+                    },
+                ),
+                snapshot_test_return(),
+            ],
+        ),
+    );
+    testing::assert_eq(encode(narrow_projection_snapshots(file)), encode(file));
+    let file = snapshot_test_file(
+        Vec::from_array(
+            [
+                snapshot_test_load(),
+                record_test_binding(
+                    "result",
+                    Pointer { elem: Type::Int },
+                    Unary { op: UnaryOp::Address, expr: snapshot_test_field("snapshot", "flag") },
+                ),
+                snapshot_test_return(),
+            ],
+        ),
+    );
+    testing::assert_eq(encode(narrow_projection_snapshots(file)), encode(file));
+}
+
+#[test]
+fn snapshot_projections_preserve_captured_and_reassigned_snapshots() -> () {
+    for extra in Vec::from_array(
+        [
+            Stmt::Expr {
+                expr: Call {
+                    func: record_test_var("retain"),
+                    args: Vec::from_array(
+                        [
+                            Expr::FuncLit {
+                                params: Vec::new(),
+                                ret_ty: Type::Unit,
+                                body: Block {
+                                    stmts: Vec::from_array(
+                                        [
+                                            Assign {
+                                                name: "snapshot",
+                                                value: record_test_var("other"),
+                                            },
+                                        ],
+                                    ),
+                                },
+                            },
+                        ],
+                    ),
+                },
+            },
+            Stmt::Assign { name: "snapshot", value: record_test_var("other") },
+            Stmt::Var {
+                name: "snapshot",
+                ty: snapshot_test_type(),
+                value: Some(record_test_var("other")),
+            },
+        ],
+    ) {
+        let stmts = Vec::from_array(
+            [snapshot_test_load(), snapshot_test_read(), extra, snapshot_test_return()],
+        );
+        let context = SnapshotContext {
+            aggregates: collections::HashSet::new(),
+            getters: HashMap::new(),
+            changed: Ref::new(false),
+        };
+        let _ = context.aggregates.insert("State");
+        context.getters["get_state"] = Vec::from_array(["value"]);
+        testing::assert_eq(
+            encode(snapshot_test_file(snapshot_block(Block { stmts }, context).stmts)),
+            encode(snapshot_test_file(stmts)),
+        );
+    }
+}
+
+#[test]
+fn snapshot_getters_require_a_single_effect_free_projection_chain() -> () {
+    let context = SnapshotContext {
+        aggregates: collections::HashSet::new(),
+        getters: HashMap::new(),
+        changed: Ref::new(false),
+    };
+    let _ = context.aggregates.insert("State");
+    testing::assert(snapshot_getter(snapshot_test_getter(), context).is_some());
+    for extra in Vec::from_array(
+        [
+            Stmt::Expr { expr: Call { func: record_test_var("effect"), args: Vec::new() } },
+            record_test_binding(
+                "unused",
+                snapshot_test_type(),
+                snapshot_test_field("reference", "other"),
+            ),
+        ],
+    ) {
+        let getter = snapshot_test_getter();
+        testing::assert(
+            snapshot_getter(
+                Function {
+                    name: getter.name,
+                    params: getter.params,
+                    ret_ty: getter.ret_ty,
+                    body: Block { stmts: Vec::from_array([extra, getter.body.stmts[0]]) },
+                },
+                context,
+            ).is_none(),
+        );
+    }
+}
+
+#[test]
+fn snapshot_projections_fuse_nested_struct_fields_without_borrowing_shared_storage() -> () {
+    let ty = Type::Named { name: "Nested" };
+    let file = snapshot_test_file(
+        Vec::from_array(
+            [
+                snapshot_test_load(),
+                record_test_binding(
+                    "nested",
+                    Pointer { elem: ty },
+                    Unary { op: UnaryOp::Address, expr: snapshot_test_field("snapshot", "nested") },
+                ),
+                record_test_binding("result", Type::Int, snapshot_test_field("nested", "flag")),
+                snapshot_test_return(),
+            ],
+        ),
+    );
+    let output = encode(narrow_projection_snapshots(file));
+    testing::assert(output.contains("var result int = reference.value.nested.flag"));
+    testing::assert(!output.contains("var snapshot State"));
+    testing::assert(!output.contains("var nested *"));
+}
+
+#[test]
+fn snapshot_projections_reject_method_values() -> () {
+    let file = snapshot_test_file(
+        Vec::from_array(
+            [
+                snapshot_test_load(),
+                record_test_binding(
+                    "result",
+                    Type::Func { params: Vec::new(), ret_ty: Type::Int },
+                    snapshot_test_field("snapshot", "method"),
+                ),
+                snapshot_test_return(),
+            ],
+        ),
+    );
+    testing::assert_eq(encode(narrow_projection_snapshots(file)), encode(file));
+}

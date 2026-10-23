@@ -27,6 +27,7 @@ def command(args, cwd, env):
 def main():
     root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(description="Compare generated immutable field and array reads.")
+    parser.add_argument("--case", choices=("value", "ref"), default="value")
     parser.add_argument("--baseline", type=Path, default=root / "stage0/bin/gomlc")
     parser.add_argument("--candidate", type=Path, default=root / "stage2/bin/gomlc")
     parser.add_argument("--goml", type=Path, default=root / "stage2/bin/goml")
@@ -40,7 +41,8 @@ def main():
     for name in ("samples.json", "results.json", "performance.json"):
         (output / name).unlink(missing_ok=True)
     source = output / "source"
-    shutil.copytree(root / "tools/performance/projection", source, dirs_exist_ok=True, ignore=shutil.ignore_patterns("_artifact"))
+    fixture = "projection" if args.case == "value" else "ref-projection"
+    shutil.copytree(root / "tools/performance" / fixture, source, dirs_exist_ok=True, ignore=shutil.ignore_patterns("_artifact"))
     env = dict(os.environ, GOTOOLCHAIN="local", GOFLAGS="-pgo=off", CGO_ENABLED="0")
     cpu = min(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") and shutil.which("taskset") else None
     harness = '''package main
@@ -58,6 +60,8 @@ func BenchmarkProjection(b *testing.B) {
     for i := 0; i < b.N; i++ { sink = project(&value, 1) }
 }
 '''
+    if args.case == "ref":
+        harness = harness.replace("var value Outer", "var value ref_Large_x").replace("value.inner.values", "value.value.values")
     builds = {}
     for name, compiler in (("baseline", args.baseline.resolve()), ("candidate", args.candidate.resolve())):
         directory = output / name
@@ -107,7 +111,7 @@ func BenchmarkProjection(b *testing.B) {
             sample(name, "measured", index, position)
     medians = {name: statistics.median(s["ns_per_op"] for s in samples if s["variant"] == name and s["phase"] == "measured") for name in ("baseline", "candidate")}
     result = {
-        "version": 1, "kind": "goml-projection-comparison", "machine": platform.uname()._asdict(),
+        "version": 1, "kind": "goml-projection-comparison", "case": args.case, "machine": platform.uname()._asdict(),
         "cpu_model": next((line.split(":", 1)[1].strip() for line in Path("/proc/cpuinfo").read_text().splitlines() if line.startswith("model name")), platform.processor()) if Path("/proc/cpuinfo").is_file() else platform.processor(),
         "process_affinity": sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
         "gomaxprocs": os.environ.get("GOMAXPROCS"), "cpu_affinity": cpu,
