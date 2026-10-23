@@ -1,0 +1,290 @@
+package main;
+
+use module::anf;
+use module::artifact;
+use module::go_backend;
+use module::hash;
+use module::version;
+use std::collections;
+use std::json;
+
+struct PerformanceOrigins {
+    names: HashMap[string, string],
+    lifted: HashMap[string, string],
+    records: HashMap[string, json::Value],
+    entry: string,
+}
+
+fn performance_number(value: isize) -> json::Value {
+    json::Value::Number(value.to_string())
+}
+
+fn performance_string(value: string) -> json::Value {
+    json::Value::String(value)
+}
+
+fn performance_origin_record(package_name: string, value: artifact::ArtifactSourceOrigin) -> json::Value {
+    json::object(
+        Vec::from_array(
+            [
+                ("source_symbol", performance_string(value.symbol)),
+                ("source_package", performance_string(package_name)),
+                ("source_file", performance_string(value.source_file)),
+                ("start", performance_number(value.start)),
+                ("end", performance_number(value.end)),
+                ("line", performance_number(value.line)),
+                ("column", performance_number(value.column)),
+            ],
+        ),
+    )
+}
+
+impl PerformanceOrigins {
+    fn source(self: PerformanceOrigins, name: string) -> string {
+        let owner = self.lifted[name].unwrap_or(name);
+        let source = self.names[owner].unwrap_or(owner);
+        if source == "main" {
+            self.entry + "::main"
+        } else {
+            source
+        }
+    }
+
+    fn origin(self: PerformanceOrigins, name: string) -> json::Value {
+        self.records[self.source(name)].unwrap_or(json::Value::Null)
+    }
+}
+
+fn performance_reason(category: string) -> string {
+    match category {
+        "value-copy" => "Aggregate value bindings remain in emitted Go; the Go compiler may remove their copies.",
+        "borrowed-projection" => "Immutable field projections are represented by pointers while value escapes retain value semantics.",
+        "indexed-access" => "Generated indexed accesses require language bounds semantics; Go may prove checks unnecessary.",
+        "shared-continuation" => "A structured exit region shares a continuation among incoming paths; this is not a source loop or runtime iteration count.",
+        "indirect-call" => "Function-value or trait-vtable calls remain in generated Go; Go may devirtualize or inline them.",
+        _ => "Function literals remain in generated Go; this is not a heap allocation count.",
+    }
+}
+
+fn linked_performance_report(
+    units: Vec[artifact::ArtifactCoreUnit],
+    specialized: Vec[(string, string)],
+    lifted: Vec[(string, string)],
+    generated: go_backend::SourceLowering,
+    lowered: anf::File,
+    decisions: Vec[anf::InlineDecision],
+    go_source: string,
+    entry: string,
+) -> string {
+    let origins = PerformanceOrigins {
+        names: HashMap::new(),
+        lifted: HashMap::new(),
+        records: HashMap::new(),
+        entry,
+    };
+    for (name, source) in specialized {
+        origins.names[name] = source;
+    }
+    for (name, source) in lifted {
+        origins.lifted[name] = source;
+    }
+    for unit in units {
+        for origin in unit.source_origins {
+            origins.records[origin.symbol] = performance_origin_record(unit.package_name, origin);
+        }
+    }
+    let source_by_generated: HashMap[string, Vec[string]] = HashMap::new();
+    for (name, source) in generated.source_names {
+        let source = origins.source(source);
+        if origins.records[source].is_some() {
+            let names = source_by_generated[name].unwrap_or_else(|| Vec::new());
+            if !names.contains(source) {
+                names.push(source);
+            }
+            source_by_generated[name] = names;
+        }
+    }
+    let functions = Vec::new();
+    let events = Vec::new();
+    let source_sizes: HashMap[string, isize] = HashMap::new();
+    let source_functions: HashMap[string, isize] = HashMap::new();
+    let source_specializations: HashMap[string, Vec[string]] = HashMap::new();
+    for (name, source) in specialized {
+        let source = origins.source(source);
+        let values = source_specializations[source].unwrap_or_else(|| Vec::new());
+        if !values.contains(name) {
+            values.push(name);
+        }
+        source_specializations[source] = values;
+    }
+    let mut generated_bytes = 0;
+    for function in go_backend::performance_functions(generated.file) {
+        generated_bytes += function.bytes;
+        let function_sources = Vec::new();
+        for source in source_by_generated[function.name].unwrap_or_else(|| Vec::new()) {
+            function_sources.push(origins.records[source].unwrap_or(json::Value::Null));
+            source_sizes[source] = source_sizes[source].unwrap_or(0) + function.bytes;
+            source_functions[source] = source_functions[source].unwrap_or(0) + 1;
+        }
+        let metrics = Vec::from_array(
+            [
+                ("value-copy", function.value_copies),
+                ("borrowed-projection", function.borrowed_projections),
+                ("indexed-access", function.indexed_accesses),
+                ("indirect-call", function.indirect_calls),
+                ("function-literal", function.function_literals),
+                ("shared-continuation", function.shared_continuations),
+            ],
+        );
+        let values = Vec::new();
+        for (category, count) in metrics {
+            values.push((category, performance_number(count)));
+            if count > 0 {
+                events.push(
+                    json::object(
+                        Vec::from_array(
+                            [
+                                ("category", performance_string(category)),
+                                ("stage", performance_string("go-lowering")),
+                                ("certainty", performance_string("generated-code-fact")),
+                                ("reason", performance_string(performance_reason(category))),
+                                ("generated_symbol", performance_string(function.name)),
+                                ("source_origins", json::Value::Array(function_sources)),
+                                (
+                                    "source",
+                                    if function_sources.is_empty() {
+                                        json::Value::Null
+                                    } else {
+                                        function_sources[0]
+                                    },
+                                ),
+                                ("count", performance_number(count)),
+                            ],
+                        ),
+                    ),
+                );
+            }
+        }
+        functions.push(
+            json::object(
+                Vec::from_array(
+                    [
+                        ("generated_symbol", performance_string(function.name)),
+                        ("generated_bytes", performance_number(function.bytes)),
+                        ("source_origins", json::Value::Array(function_sources)),
+                        ("metrics", json::object(values)),
+                    ],
+                ),
+            ),
+        );
+    }
+    for decision in decisions {
+        events.push(
+            json::object(
+                Vec::from_array(
+                    [
+                        ("category", performance_string("inline")),
+                        ("stage", performance_string("anf")),
+                        ("certainty", performance_string("compiler-decision")),
+                        ("reason", performance_string(decision.reason)),
+                        ("source", origins.origin(decision.caller)),
+                        ("callee_source", origins.origin(decision.callee)),
+                        ("caller", performance_string(decision.caller)),
+                        ("callee", performance_string(decision.callee)),
+                        ("allowed", json::Value::Bool(decision.allowed)),
+                        ("cost", performance_number(decision.cost)),
+                        ("cost_limit", performance_number(decision.cost_limit)),
+                        ("budget_before", performance_number(decision.budget_before)),
+                    ],
+                ),
+            ),
+        );
+    }
+    let keys = Vec::new();
+    for (name, _) in source_sizes.entries() {
+        keys.push(name);
+    }
+    collections::sort_by(
+        keys,
+        |a, b| if a < b {
+            -1
+        } else if a == b {
+            0
+        } else {
+            1
+        },
+    );
+    let sources = Vec::new();
+    for source in keys {
+        let record = origins.records[source].unwrap_or(json::Value::Null);
+        let fields = Vec::new();
+        for key in[
+            "source_symbol",
+            "source_package",
+            "source_file",
+            "start",
+            "end",
+            "line",
+            "column",
+        ] {
+            fields.push((key, json::field(record, key).unwrap_or(json::Value::Null)));
+        }
+        fields.push(("generated_bytes", performance_number(source_sizes[source].unwrap_or(0))));
+        fields.push(
+            ("generated_functions", performance_number(source_functions[source].unwrap_or(0))),
+        );
+        fields.push(
+            (
+                "specializations",
+                performance_number(
+                    source_specializations[source].map(|values| values.len()).unwrap_or(0),
+                ),
+            ),
+        );
+        sources.push(json::object(fields));
+    }
+    let limitations = Vec::from_array(
+        [
+            performance_string(
+                "Source positions identify enclosing declarations, not individual expressions or inline call sites.",
+            ),
+            performance_string(
+                "Function bytes cover top-level function declarations, excluding method wrappers, types, globals and separators.",
+            ),
+            performance_string(
+                "Static operation metrics identify selected syntax patterns, not a complete census of all copies or calls.",
+            ),
+            performance_string(
+                "Counts are static generated-code counts, not dynamic executions or heap allocations.",
+            ),
+            performance_string(
+                "Shared generated adapters can have multiple source origins; their attributed byte totals must not be added together.",
+            ),
+            performance_string(
+                "Go escape analysis, Go inlining, retained bounds checks and runtime allocation counts are not measured by this report.",
+            ),
+            performance_string(
+                "Specialization counts include concrete functions before final generated-code pruning; ordinary monomorphic functions count as one.",
+            ),
+        ],
+    );
+    json::encode(
+        json::object(
+            Vec::from_array(
+                [
+                    ("version", performance_number(1)),
+                    ("kind", performance_string("goml-performance")),
+                    ("compiler_version", performance_string(version::current())),
+                    ("generated_source_sha256", performance_string(hash::sha256_hex(go_source))),
+                    ("source_precision", performance_string("enclosing-declaration")),
+                    ("anf_functions", performance_number(lowered.functions.len())),
+                    ("generated_function_bytes", performance_number(generated_bytes)),
+                    ("functions", json::Value::Array(functions)),
+                    ("sources", json::Value::Array(sources)),
+                    ("events", json::Value::Array(events)),
+                    ("limitations", json::Value::Array(limitations)),
+                ],
+            ),
+        ),
+    )
+}

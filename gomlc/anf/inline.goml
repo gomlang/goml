@@ -716,6 +716,40 @@ fn inline_preserves_simd_kernel(value: Function) -> bool {
     has_simd
 }
 
+pub struct InlineDecision {
+    pub caller: string,
+    pub callee: string,
+    pub allowed: bool,
+    pub reason: string,
+    pub cost: isize,
+    pub cost_limit: isize,
+    pub budget_before: isize,
+}
+
+fn record_inline_decision(
+    report: Option[Vec[InlineDecision]],
+    caller: string,
+    callee: string,
+    reason: string,
+    cost: isize,
+    cost_limit: isize,
+    budget: isize,
+) -> () {
+    if let Some(values) = report {
+        values.push(
+            InlineDecision {
+                caller,
+                callee,
+                allowed: reason == "within-budget",
+                reason,
+                cost,
+                cost_limit,
+                budget_before: budget,
+            },
+        );
+    }
+}
+
 fn indexed_inline_candidate(
     functions: HashMap[string, Function],
     caller: string,
@@ -725,12 +759,18 @@ fn indexed_inline_candidate(
     bind_ty: repr::Type,
     recursive_consumer: bool,
     budget: Ref[isize],
+    report: Option[Vec[InlineDecision]],
 ) -> Option[Function] {
-    if name == caller {
+    if report.is_none() && name == caller {
         return None
     }
-    let value = functions[name]?;
-    if inline_preserves_simd_kernel(value) {
+    let value = functions[name];
+    let Some(value) = value else {
+        record_inline_decision(report, caller, name, "unavailable-body", 0, 0, budget.get());
+        return None
+    };
+    let preserves_simd = inline_preserves_simd_kernel(value);
+    if report.is_none() && preserves_simd {
         return None
     }
     let cost = inline_block_cost(value.body);
@@ -740,15 +780,31 @@ fn indexed_inline_candidate(
     } else {
         16
     };
-    if cost > cost_limit || cost > budget.get() || recursive && !recursive_consumer
-        || inline_block_calls(value.body, value.name)
-        || !repr::types_equal(value.ret_ty, ty)
-        || !repr::types_equal(value.ret_ty, bind_ty)
-        || !inline_params_safe(value, args) {
-        None
+    let reason = if name == caller {
+        "recursive-call"
+    } else if preserves_simd {
+        "preserve-simd-kernel"
+    } else if cost > cost_limit {
+        "callee-cost-limit"
+    } else if cost > budget.get() {
+        "caller-budget"
+    } else if recursive && !recursive_consumer {
+        "loop-continuation"
+    } else if inline_block_calls(value.body, value.name) {
+        "recursive-call"
+    } else if !repr::types_equal(value.ret_ty, ty) || !repr::types_equal(value.ret_ty, bind_ty) {
+        "result-type"
+    } else if !inline_params_safe(value, args) {
+        "parameter-semantics"
     } else {
+        "within-budget"
+    };
+    record_inline_decision(report, caller, name, reason, cost, cost_limit, budget.get());
+    if reason == "within-budget" {
         budget.set(budget.get() - cost);
         Some(value)
+    } else {
+        None
     }
 }
 
@@ -802,12 +858,13 @@ fn inline_term(
     caller: string,
     budget: Ref[isize],
     counter: Ref[isize],
+    report: Option[Vec[InlineDecision]],
 ) -> Term {
     match value {
         If { cond, then_, else_, ret_ty } => If {
             cond,
-            then_: inline_block(then_, functions, caller, budget, counter),
-            else_: inline_block(else_, functions, caller, budget, counter),
+            then_: inline_block(then_, functions, caller, budget, counter, report),
+            else_: inline_block(else_, functions, caller, budget, counter, report),
             ret_ty,
         },
         Match { scrutinee, arms, default, ret_ty } => {
@@ -816,14 +873,16 @@ fn inline_term(
                 lowered.push(
                     Arm {
                         lhs: arm.lhs,
-                        body: inline_block(arm.body, functions, caller, budget, counter),
+                        body: inline_block(arm.body, functions, caller, budget, counter, report),
                     },
                 )
             }
             Match {
                 scrutinee,
                 arms: lowered,
-                default: default.map(|body| inline_block(body, functions, caller, budget, counter)),
+                default: default.map(
+                    |body| inline_block(body, functions, caller, budget, counter, report),
+                ),
                 ret_ty,
             }
         },
@@ -837,13 +896,13 @@ fn inline_term(
                             guard,
                             binding,
                             binding_ty,
-                            body: inline_block(body, functions, caller, budget, counter),
+                            body: inline_block(body, functions, caller, budget, counter, report),
                         },
                         Send { channel, value, guard, body } => Send {
                             channel,
                             value,
                             guard,
-                            body: inline_block(body, functions, caller, budget, counter),
+                            body: inline_block(body, functions, caller, budget, counter, report),
                         },
                     },
                 )
@@ -851,7 +910,9 @@ fn inline_term(
             Select {
                 mode,
                 arms: lowered,
-                default: default.map(|body| inline_block(body, functions, caller, budget, counter)),
+                default: default.map(
+                    |body| inline_block(body, functions, caller, budget, counter, report),
+                ),
                 ret_ty,
             }
         },
@@ -869,12 +930,13 @@ fn inline_binds(
     caller: string,
     budget: Ref[isize],
     counter: Ref[isize],
+    report: Option[Vec[InlineDecision]],
 ) -> Block {
     if index >= values.len() {
         Block { binds: Vec::new(), term }
     } else {
         let bind = values[index];
-        let rest = inline_binds(values, index + 1, term, functions, caller, budget, counter);
+        let rest = inline_binds(values, index + 1, term, functions, caller, budget, counter, report);
         match bind {
             Let(value) => match value.value {
                 Call { func: Var { name, ty: _ }, args, ty } => {
@@ -887,6 +949,7 @@ fn inline_binds(
                         value.ty,
                         inline_block_consumes(rest, value.name),
                         budget,
+                        report,
                     ) {
                         Some(callee) => inline_call(value, callee, args, rest, counter),
                         None => prepend_bind(Bind::Let(value), rest),
@@ -901,6 +964,7 @@ fn inline_binds(
                     value.ty,
                     inline_block_consumes(rest, value.name),
                     budget,
+                    report,
                 ) {
                     Some(callee) => inline_call(value, callee, args, rest, counter),
                     None => prepend_bind(Bind::Let(value), rest),
@@ -914,7 +978,7 @@ fn inline_binds(
                         role: value.role,
                         params: value.params,
                         ret_ty: value.ret_ty,
-                        body: inline_block(value.body, functions, caller, budget, counter),
+                        body: inline_block(value.body, functions, caller, budget, counter, report),
                     },
                 ),
                 rest,
@@ -928,7 +992,14 @@ fn inline_binds(
                             role: value.role,
                             params: value.params,
                             ret_ty: value.ret_ty,
-                            body: inline_block(value.body, functions, caller, budget, counter),
+                            body: inline_block(
+                                value.body,
+                                functions,
+                                caller,
+                                budget,
+                                counter,
+                                report,
+                            ),
                         },
                     )
                 }
@@ -944,19 +1015,26 @@ fn inline_block(
     caller: string,
     budget: Ref[isize],
     counter: Ref[isize],
+    report: Option[Vec[InlineDecision]],
 ) -> Block {
     inline_binds(
         value.binds,
         0,
-        inline_term(value.term, functions, caller, budget, counter),
+        inline_term(value.term, functions, caller, budget, counter, report),
         functions,
         caller,
         budget,
         counter,
+        report,
     )
 }
 
-fn inline_function(value: Function, functions: HashMap[string, Function], counter: Ref[isize]) -> Function {
+fn inline_function(
+    value: Function,
+    functions: HashMap[string, Function],
+    counter: Ref[isize],
+    report: Option[Vec[InlineDecision]],
+) -> Function {
     let budget = Ref::new(48);
     Function {
         name: value.name,
@@ -965,15 +1043,15 @@ fn inline_function(value: Function, functions: HashMap[string, Function], counte
         trait_impl: value.trait_impl,
         params: value.params,
         ret_ty: value.ret_ty,
-        body: inline_block(value.body, functions, value.name, budget, counter),
+        body: inline_block(value.body, functions, value.name, budget, counter, report),
     }
 }
 
-pub fn inline(value: File, counter: Ref[isize]) -> File {
+pub fn inline_with_report(value: File, counter: Ref[isize], report: Option[Vec[InlineDecision]]) -> File {
     let function_index = inline_function_index(value.functions);
     let functions: Vec[Function] = Vec::with_capacity(value.functions.len());
     for function in value.functions {
-        functions.push(inline_function(function, function_index, counter))
+        functions.push(inline_function(function, function_index, counter, report))
     }
     File {
         functions,
@@ -984,4 +1062,8 @@ pub fn inline(value: File, counter: Ref[isize]) -> File {
         statics: value.statics,
         closure_defs: value.closure_defs,
     }
+}
+
+pub fn inline(value: File, counter: Ref[isize]) -> File {
+    inline_with_report(value, counter, None)
 }

@@ -68,6 +68,8 @@ members = ["app", "http", "model"]
 
 可以省略 `[build]`；`build.target-dir` 默认为模块根目录下的 `_artifact`。清单值必须是非空相对路径，且不能包含 `..` 段。`goml check`、`goml build`、`goml run` 和 `goml test` 可以用 `--target-dir <path>` 临时覆盖；命令行覆盖可为相对或绝对路径。`goml clean` 删除配置的目标目录，其可选的 `--target-dir <path>` 覆盖必须仍位于模块内部。
 
+`goml build` 和 `goml run` 接受 `--pgo off|auto|<path>` 和 `--build-record`。显式 PGO 选项会写入带版本的 `<executable>.build.json` 记录，其中包含工具链、目标、构建参数、生成源码/性能剖析文件/产物的指纹及构建结果。路径相对于模块根目录解析；`auto` 选择该目录的 `default.pgo`，不存在时则禁用 PGO。未指定此选项时保留现有 Go 环境行为。原生和 WASM 记录均使用构建时证据，无需检查可执行文件元数据。`goml build --explain-performance --format text|json` 报告生成代码大小、特化数量、部分静态成本以及 GoML 内联决策，并标明所属源码声明。默认构建既不收集解释报告，也不收集构建记录。确切语义、机器可读格式、示例和局限见[性能解释与 PGO](performance.zh-CN.md)。
+
 模块路径每段必须非空，可包含 ASCII 字母、数字、`_` 和 `-`。以 `builtin` 或 `prelude` 为根的路径保留给工具链，不能用作模块路径或依赖。`[module]` 节目前没有 `name`、`kind`、`root` 或类似字段。
 
 <a id="package-registry"></a>

@@ -1,0 +1,447 @@
+package project;
+
+use module::failure;
+use failure::DriverResult;
+use module::version;
+use std::fs;
+use std::io;
+use std::json;
+use std::path;
+use std::process;
+use std::task;
+use std::text;
+use std::time;
+use std::utf8;
+use utf8::BytesUtf8;
+
+fn go_build_process(context: Context, program: string, args: Vec[string]) -> process::Command {
+    let command = apply_native_environment(
+        process::Command::new(program).args(args).current_dir(context.graph.module_dir),
+        context,
+    );
+    let _ = command.env("GOWORK", "off");
+    let _ = command.env(
+        "GO111MODULE",
+        if fs::is_file(path::join(context.graph.module_dir, "go.mod")) {
+            "on"
+        } else {
+            "off"
+        },
+    );
+    command
+}
+
+fn record_command_output(command: process::Command) -> Result[string, failure::Failure] {
+    let output = command.output_timeout_structured(time::Duration::from_milliseconds(30000)).driver_result()?;
+    if !output.status().success() {
+        return Err(
+            failure::convert(output.stderr().to_string_utf8().unwrap_or("toolchain query failed")),
+        )
+    }
+    output.stdout().to_string_utf8().driver_result()
+}
+
+fn record_go_environment(context: Context, simd: bool) -> Result[json::Value, failure::Failure] {
+    let command = go_build_process(
+        context,
+        "go",
+        Vec::from_array(
+            [
+                "env",
+                "-json",
+                "GOVERSION",
+                "GOOS",
+                "GOARCH",
+                "GOAMD64",
+                "GOARM64",
+                "GOWASM",
+                "CGO_ENABLED",
+                "GOFLAGS",
+                "GOEXPERIMENT",
+                "GOTOOLCHAIN",
+                "GO111MODULE",
+                "GOWORK",
+            ],
+        ),
+    );
+    if simd {
+        let _ = command.env("GOTOOLCHAIN", "local");
+    }
+    json::parse(record_command_output(command)?).driver_result()
+}
+
+fn effective_pgo(context: Context) -> Option[string] {
+    context.build_options.pgo.map(
+        |value| {
+            if value == "off" {
+                "off"
+            } else if value == "auto" {
+                let candidate = path::join(context.graph.module_dir, "default.pgo");
+                if fs::is_file(candidate) {
+                    candidate
+                } else {
+                    "off"
+                }
+            } else {
+                absolute_from_module(context.graph.module_dir, value)
+            }
+        },
+    )
+}
+
+fn record_strings(values: Vec[string]) -> json::Value {
+    let result = Vec::new();
+    for value in values {
+        result.push(json::Value::String(value));
+    }
+    json::Value::Array(result)
+}
+
+fn build_record_path(context: Context, output: string) -> string {
+    absolute_from_module(context.graph.module_dir, output) + ".build.json"
+}
+
+fn build_record_fields(
+    context: Context,
+    input: string,
+    output: string,
+    program: string,
+    arguments: Vec[string],
+    environment: json::Value,
+    pgo: Option[string],
+) -> Vec[(string, json::Value)] {
+    Vec::from_array(
+        [
+            ("version", json::Value::Number("1")),
+            ("kind", json::Value::String("goml-build")),
+            ("goml_version", json::Value::String(version::current())),
+            ("compiler", json::Value::String(context.compiler)),
+            ("module", json::Value::String(context.graph.module_path)),
+            ("module_directory", json::Value::String(context.graph.module_dir)),
+            (
+                "generated_source",
+                json::Value::String(absolute_from_module(context.graph.module_dir, input)),
+            ),
+            (
+                "artifact",
+                json::Value::String(absolute_from_module(context.graph.module_dir, output)),
+            ),
+            ("command", record_strings(Vec::from_array([program]))),
+            ("arguments", record_strings(arguments)),
+            ("go_environment", environment),
+            ("pgo_requested", json::Value::String(context.build_options.pgo.unwrap_or("inherit"))),
+            ("pgo_effective", json::Value::String(pgo.unwrap_or("inherited"))),
+            ("profile_match", json::Value::String("not-measured")),
+            (
+                "limitations",
+                record_strings(
+                    Vec::from_array(
+                        [
+                            "A successfully read profile does not prove application hot spots matched or performance improved.",
+                            "Generated-source fingerprints precede optional native SIMD extraction.",
+                            "Inherited GOFLAGS and automatic Go profile selection are recorded but not interpreted; use --pgo for profile provenance.",
+                        ],
+                    ),
+                ),
+            ),
+        ],
+    )
+}
+
+fn write_build_record(
+    file: string,
+    fields: Vec[(string, json::Value)],
+    success: bool,
+    error: Option[string],
+    profile_read: bool,
+    artifact_hash: Option[string],
+) -> Result[(), failure::Failure] {
+    let record = Vec::new();
+    for field in fields {
+        record.push(field);
+    }
+    record.push(("success", json::Value::Bool(success)));
+    record.push(("profile_read", json::Value::Bool(profile_read)));
+    record.push(
+        ("error", error.map(|value| json::Value::String(value)).unwrap_or(json::Value::Null)),
+    );
+    record.push(
+        (
+            "artifact_sha256",
+            artifact_hash.map(|value| json::Value::String(value)).unwrap_or(json::Value::Null),
+        ),
+    );
+    fs::atomic_write(file, json::encode(json::object(record)) + "\n").driver_result()
+}
+
+fn run_recorded_go_build(cancel: task::CancelToken, context: Context, input: string, output: string) -> Result[
+    (),
+    failure::Failure,
+] {
+    let file = build_record_path(context, output);
+    if fs::is_file(file) {
+        fs::remove_file(file).driver_result()?;
+    }
+    let simd = go_build_uses_simd(absolute_from_module(context.graph.module_dir, input))?;
+    let pgo = effective_pgo(context);
+    let program = if simd {
+        context.compiler
+    } else {
+        "go"
+    };
+    let arguments = if simd {
+        Vec::from_array(["__simd-go-build", "--input", input, "--output", output])
+    } else {
+        let arguments = Vec::from_array(["build", "-o", output]);
+        if let Some(value) = pgo {
+            arguments.push("-pgo=" + value);
+        }
+        arguments.push(input);
+        arguments
+    };
+    let environment = if context.build_options.record || simd && pgo.is_some() {
+        record_go_environment(context, simd)?
+    } else {
+        json::Value::Null
+    };
+    let command = go_build_process(context, program, arguments);
+    let environment = if simd {
+        if let Some(value) = pgo {
+            let flags = json::field(environment, "GOFLAGS").and_then(json::as_string).unwrap_or("");
+            let flags = text::trim(flags + " " + native_flag("-pgo=" + value)?);
+            let _ = command.env("GOFLAGS", flags);
+            let fields = match environment {
+                Object(fields) => fields,
+                _ => Vec::new(),
+            };
+            let updated = Vec::new();
+            for entry in fields {
+                if entry.0 != "GOFLAGS" {
+                    updated.push(entry);
+                }
+            }
+            updated.push(("GOFLAGS", json::Value::String(flags)));
+            json::object(updated)
+        } else {
+            environment
+        }
+    } else {
+        environment
+    };
+    let fields = build_record_fields(context, input, output, program, arguments, environment, pgo);
+    if context.build_options.record {
+        write_build_record(file, fields, false, Some("build did not complete"), false, None)?;
+    }
+    let result = execute_recorded_go_build(cancel, context, command, input, output, pgo, fields);
+    if context.build_options.record {
+        match result {
+            Ok(hash) => write_build_record(
+                file,
+                fields,
+                true,
+                None,
+                pgo.is_some() && pgo.unwrap_or("off") != "off",
+                Some(hash),
+            )?,
+            Err(error) => write_build_record(
+                file,
+                fields,
+                false,
+                Some(error.to_string()),
+                false,
+                None,
+            )?,
+        }
+    }
+    result.map(|_| ())
+}
+
+fn execute_recorded_go_build(
+    cancel: task::CancelToken,
+    context: Context,
+    command: process::Command,
+    input: string,
+    output: string,
+    pgo: Option[string],
+    fields: Vec[(string, json::Value)],
+) -> Result[string, failure::Failure] {
+    let recorded = context.build_options.record;
+    let source_hash = if recorded {
+        file_digest(context.graph.module_dir, input)?
+    } else {
+        ""
+    };
+    let mut profile_hash = "";
+    if recorded {
+        fields.push(("generated_source_sha256", json::Value::String(source_hash)));
+        fields.push(
+            (
+                "compiler_sha256",
+                json::Value::String(fs::sha256_file(context.compiler).driver_result()?),
+            ),
+        );
+        fields.push(
+            (
+                "compiler_version",
+                json::Value::String(
+                    text::trim(
+                        record_command_output(
+                            process::Command::new(context.compiler).arg("version"),
+                        )?,
+                    ),
+                ),
+            ),
+        );
+    }
+    if let Some(profile) = pgo {
+        if profile != "off" {
+            profile_hash = fs::sha256_file(profile).map_err(
+                |error| failure::convert(error).context("PGO profile"),
+            )?;
+            fields.push(("profile_path", json::Value::String(profile)));
+            fields.push(("profile_sha256", json::Value::String(profile_hash)));
+        }
+    }
+    let status = command.status_cancel_structured(cancel).map_err(
+        |error| {
+            if error.kind() == io::ErrorKind::Interrupted {
+                failure::convert("build cancelled")
+            } else {
+                failure::convert(error)
+            }
+        },
+    )?;
+    if !status.success() {
+        return Err(failure::convert("Go build failed for " + output))
+    }
+    if recorded && source_hash != file_digest(context.graph.module_dir, input)? {
+        return Err(failure::convert("generated Go source changed during build"))
+    }
+    if let Some(profile) = pgo {
+        if profile != "off" && profile_hash != fs::sha256_file(profile).driver_result()? {
+            return Err(failure::convert("PGO profile changed during build"))
+        }
+    }
+    if recorded {
+        file_digest(context.graph.module_dir, output)
+    } else {
+        Ok("")
+    }
+}
+
+pub fn print_performance_reports(context: Context, plan: Plan) -> Result[(), failure::Failure] {
+    let Some(format) = context.build_options.explain else {
+        return Ok(())
+    };
+    let reports = Vec::new();
+    for command in plan.commands {
+        if let Link { output, .. } = command {
+            let report = json::parse(
+                fs::read_file_structured(
+                    absolute_from_module(context.graph.module_dir, output) + ".performance.json",
+                ).driver_result()?,
+            ).driver_result()?;
+            if json::field(report, "version").and_then(json::as_int).unwrap_or(0) != 1 {
+                return Err(failure::convert("unsupported performance report version"))
+            }
+            if json::field(report, "generated_source_sha256").and_then(json::as_string).unwrap_or(
+                "",
+            )
+                != file_digest(context.graph.module_dir, output)? {
+                return Err(
+                    failure::convert("performance report does not match generated Go source"),
+                )
+            }
+            if format == "json" {
+                reports.push(report);
+            } else {
+                print_performance_report(report);
+            }
+        }
+    }
+    if format == "json" {
+        io::println(
+            json::encode(
+                json::object(
+                    Vec::from_array(
+                        [
+                            ("version", json::Value::Number("1")),
+                            ("kind", json::Value::String("goml-performance-build")),
+                            ("reports", json::Value::Array(reports)),
+                        ],
+                    ),
+                ),
+            ),
+        );
+    }
+    Ok(())
+}
+
+fn performance_text(value: json::Value, name: string) -> string {
+    json::field(value, name).map(
+        |value| match value {
+            String(value) | Number(value) => value,
+            _ => "unknown",
+        },
+    ).unwrap_or("unknown")
+}
+
+fn print_performance_report(report: json::Value) -> () {
+    io::println("GoML performance explanation (source positions identify enclosing declarations)");
+    for source in json::field(report, "sources").and_then(json::as_array).unwrap_or(Vec::new()) {
+        io::println(
+            performance_text(source, "source_file") + ":" + performance_text(source, "line") + " "
+                + performance_text(source, "source_symbol")
+                + ": "
+                + performance_text(source, "generated_bytes")
+                + " generated bytes, "
+                + performance_text(source, "generated_functions")
+                + " functions, "
+                + performance_text(source, "specializations")
+                + " specializations",
+        );
+    }
+    for event in json::field(report, "events").and_then(json::as_array).unwrap_or(Vec::new()) {
+        let source = json::field(event, "source").unwrap_or(json::Value::Null);
+        let location = if json::field(source, "source_file").is_some() {
+            performance_text(source, "source_file") + ":" + performance_text(source, "line") + ":"
+                + performance_text(source, "column")
+                + " "
+                + performance_text(source, "source_symbol")
+        } else {
+            json::field(event, "caller").and_then(json::as_string).unwrap_or(
+                performance_text(event, "generated_symbol"),
+            )
+        };
+        let mut detail = "";
+        if let Some(count) = json::field(event, "count").and_then(json::as_int) {
+            detail += " count=" + count.to_string();
+        }
+        if let Some(allowed) = json::field(event, "allowed").and_then(json::as_bool) {
+            detail += " allowed=" + allowed.to_string() + " callee="
+                + performance_text(event, "callee")
+                + " cost="
+                + performance_text(event, "cost")
+                + " limit="
+                + performance_text(event, "cost_limit")
+                + " budget_before="
+                + performance_text(event, "budget_before");
+        }
+        io::println(
+            "[" + performance_text(event, "stage") + "/" + performance_text(event, "category")
+                + "] "
+                + location
+                + ": "
+                + performance_text(event, "reason")
+                + detail
+                + " ("
+                + performance_text(event, "certainty")
+                + ")",
+        );
+    }
+    for limit in json::field(report, "limitations").and_then(json::as_array).unwrap_or(Vec::new()) {
+        if let Some(value) = json::as_string(limit) {
+            io::println("limitation: " + value);
+        }
+    }
+}

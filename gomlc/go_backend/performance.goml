@@ -1,0 +1,218 @@
+package go_backend;
+
+use module::pretty;
+use std::collections;
+
+pub struct PerformanceFunction {
+    pub name: string,
+    pub bytes: isize,
+    pub value_copies: isize,
+    pub borrowed_projections: isize,
+    pub indexed_accesses: isize,
+    pub indirect_calls: isize,
+    pub function_literals: isize,
+    pub shared_continuations: isize,
+}
+
+struct PerformanceWalk {
+    counts: Vec[isize],
+    aggregates: collections::HashSet[string],
+    callables: collections::HashSet[string],
+}
+
+fn performance_aggregate(value: Type, names: collections::HashSet[string]) -> bool {
+    match value {
+        Array { .. } | Struct { .. } => true,
+        Named { name } => names.contains(name),
+        _ => false,
+    }
+}
+
+impl PerformanceWalk {
+    fn expr(self: PerformanceWalk, value: Expr) -> () {
+        match value {
+            Call { func, args } | CallSpread { func, args, .. } => {
+                let indirect = match func {
+                    Var { name } => self.callables.contains(name),
+                    Field { expr: Field { field_name, .. }, .. } => field_name == "vtable",
+                    _ => false,
+                };
+                if indirect {
+                    self.counts[3] += 1;
+                }
+                self.expr(func);
+                for argument in args {
+                    self.expr(argument);
+                }
+                if let CallSpread { spread, .. } = value {
+                    self.expr(spread);
+                }
+            },
+            Index { base, index } => {
+                self.counts[2] += 1;
+                self.expr(base);
+                self.expr(index);
+            },
+            Unary { expr, .. } | Field { expr, .. } | Cast { expr, .. } | Convert { expr, .. } | Instantiate {
+                expr,
+                ..,
+            } => self.expr(expr),
+            Binary { lhs, rhs, .. } => {
+                self.expr(lhs);
+                self.expr(rhs);
+            },
+            Slice { base, start, end } => {
+                self.expr(base);
+                self.expr(start);
+                self.expr(end);
+            },
+            Make { args, .. } | ArrayLiteral { items: args, .. } => for argument in args {
+                self.expr(argument);
+            },
+            Send { channel, value } => {
+                self.expr(channel);
+                self.expr(value);
+            },
+            Receive { channel } => self.expr(channel),
+            StructLiteral { fields, .. } => for (_, value) in fields {
+                self.expr(value);
+            },
+            FuncLit { body, .. } => {
+                self.counts[4] += 1;
+                self.block(body);
+            },
+            _ => (),
+        }
+    }
+
+    fn block(self: PerformanceWalk, value: Block) -> () {
+        for statement in value.stmts {
+            match statement {
+                Var { name, ty, value } => {
+                    if let Func { .. } = ty {
+                        let _ = self.callables.insert(name);
+                    }
+                    if let Some(value) = value {
+                        if performance_aggregate(ty, self.aggregates) {
+                            match value {
+                                Var { .. } | Field { .. } | Unary { op: Deref, .. } | Index { .. } => {
+                                    self.counts[0] += 1;
+                                },
+                                _ => (),
+                            }
+                        }
+                        if let Unary { op: Address, expr: Field { .. } } = value {
+                            self.counts[1] += 1;
+                        }
+                        self.expr(value);
+                    }
+                },
+                Expr { expr } | Assign { value: expr, .. } | MultiAssign { value: expr, .. } | Go {
+                    call: expr,
+                } | Defer { call: expr } => self.expr(expr),
+                Return { expr } => if let Some(value) = expr {
+                    self.expr(value);
+                },
+                ReturnMulti { exprs } => for value in exprs {
+                    self.expr(value);
+                },
+                If { cond, then_, else_ } => {
+                    self.expr(cond);
+                    self.block(then_);
+                    if let Some(body) = else_ {
+                        self.block(body);
+                    }
+                },
+                Loop { body } => self.block(body),
+                LabeledLoop { label, body } => {
+                    if label.starts_with("Shared_") {
+                        self.counts[5] += 1;
+                    }
+                    self.block(body);
+                },
+                Range { expr, body, .. } => {
+                    self.expr(expr);
+                    self.block(body);
+                },
+                Switch { expr, cases, default } => {
+                    self.expr(expr);
+                    for case in cases {
+                        self.expr(case.value);
+                        self.block(case.body);
+                    }
+                    if let Some(body) = default {
+                        self.block(body);
+                    }
+                },
+                TypeSwitch { expr, cases, default, .. } => {
+                    self.expr(expr);
+                    for case in cases {
+                        self.block(case.body);
+                    }
+                    if let Some(body) = default {
+                        self.block(body);
+                    }
+                },
+                Select { cases, default } => {
+                    for case in cases {
+                        match case.operation {
+                            Receive { channel, .. } => self.expr(channel),
+                            Send { channel, value } => {
+                                self.expr(channel);
+                                self.expr(value);
+                            },
+                        }
+                        self.block(case.body);
+                    }
+                    if let Some(body) = default {
+                        self.block(body);
+                    }
+                },
+                _ => (),
+            }
+        }
+    }
+}
+
+pub fn performance_functions(file: File) -> Vec[PerformanceFunction] {
+    let aggregates: collections::HashSet[string] = collections::HashSet::new();
+    for item in file.items {
+        if let Struct(value) = item {
+            let _ = aggregates.insert(value.name);
+        }
+        if let TypeDef(value) = item {
+            if performance_aggregate(value.ty, aggregates) {
+                let _ = aggregates.insert(value.name);
+            }
+        }
+    }
+    let result = Vec::new();
+    for item in file.items {
+        if let Function(value) = item {
+            let walk = PerformanceWalk {
+                counts: Vec::from_array([0, 0, 0, 0, 0, 0]),
+                aggregates,
+                callables: collections::HashSet::new(),
+            };
+            for (name, ty) in value.params {
+                if let Func { .. } = ty {
+                    let _ = walk.callables.insert(name);
+                }
+            }
+            walk.block(value.body);
+            result.push(
+                PerformanceFunction {
+                    name: value.name,
+                    bytes: pretty::pretty(100, function_doc(value)).byte_len(),
+                    value_copies: walk.counts[0],
+                    borrowed_projections: walk.counts[1],
+                    indexed_accesses: walk.counts[2],
+                    indirect_calls: walk.counts[3],
+                    function_literals: walk.counts[4],
+                    shared_continuations: walk.counts[5],
+                },
+            );
+        }
+    }
+    result
+}
