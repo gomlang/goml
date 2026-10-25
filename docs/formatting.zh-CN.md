@@ -75,6 +75,7 @@ enum Pair[T] {
 - `::`、`.`、后缀 `?`、调用和索引周围不添加空格。
 - 前缀运算符与操作数之间不加空格。
 - 圆括号和方括号的内侧边缘不加空格。
+- 模块可见性写作 `pub(module)`，与后面的声明或字段之间留一个空格。
 
 数组重复语法保留初始化器和长度之间的分号，如 `[value; N]`。let 链分隔符和 trait 约束分隔符采用普通运算符间距：`if let Some(x) = value && x > 0`、`impl Source[Item = T] + Label` 和 `dyn Consumer[string] + Close`。
 

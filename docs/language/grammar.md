@@ -55,6 +55,7 @@ When type inference fails, annotate local results, empty containers, or closure 
 | Expect `[initializer(); N]` to call once per element | The initializer runs once, including for zero length; use a loop for per-element work |
 | `if let Some(x) = value || ready` | Use nested control flow, or `&& (first || second)` for a boolean term within a let chain |
 | Use `type UserId = u64;` when `UserId` must be distinct | Use `struct UserId(u64);` and construct it explicitly |
+| Share implementation APIs across packages without exporting them to external modules | Use `pub(module)` on declarations, fields, methods, and re-exports |
 | `use pkg::*` | List the required public items explicitly with `use pkg::{A, B};` |
 | `mod`, `crate::`, `super::` | Directory packages, `module::path` for the current module, and canonical paths for dependencies |
 | Develop several modules together | `goml.work` lists members; dependency `{ path = "../library" }` and root `[replace]` select local sources while preserving declared dependencies and canonical identities; `--workspace` or `-p` selects modules |
@@ -113,7 +114,7 @@ The following EBNF only describes the canonical form that should be generated; `
 ```text
 file          = package_decl? use_decl* item*
 package_decl  = "package" lower_ident ";"
-use_decl      = "pub"? "use" use_path ("as" ident | "::" "{" use_items "}")? ";"
+use_decl      = visibility? "use" use_path ("as" ident | "::" "{" use_items "}")? ";"
 use_items     = use_item ("," use_item)* ","?
 use_item      = ident ("as" ident)?
 use_path      = path | "module" "::" path
@@ -129,7 +130,7 @@ item          = attribute* visibility? function
               | attribute* impl_def
               | go_ffi_extern
               | attribute* visibility? extern_type
-visibility    = "pub"
+visibility    = "pub" ("(" "module" ")")?
 attribute     = "#[" attribute_body "]"
 go_export_attribute = "#[" "go_export" "(" string_literal ")" "]"
 comptime_attribute = "#[" "comptime" "]"

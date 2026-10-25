@@ -67,6 +67,7 @@ enum Pair[T] {
 - `::`, `.`, postfix `?`, calls, and indexing have no surrounding padding.
 - Prefix operators have no space before their operand.
 - Parentheses and brackets have no inner edge padding.
+- Module visibility is written `pub(module)` with one space before the declaration or field.
 
 Array repetition keeps the semicolon between its initializer and length, as in `[value; N]`. Let-chain separators and trait-bound separators receive normal operator spacing: `if let Some(x) = value && x > 0`, `impl Source[Item = T] + Label`, and `dyn Consumer[string] + Close`.
 

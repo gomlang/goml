@@ -1,0 +1,466 @@
+package query;
+
+use module::ast;
+use module::diagnostic;
+use module::hir;
+use module::tast;
+
+fn query_module_access(
+    modules: Result[Vec[ResolvedModule], string],
+    importer: string,
+    package_name: string,
+) -> bool {
+    match modules {
+        Ok(values) => match import_owner(values, package_name) {
+            Some(owner) => owner.name == importer,
+            None => false,
+        },
+        Err(_) => false,
+    }
+}
+
+fn dependency_symbol_visible(symbols: Vec[Symbol], name: string, allow_module: bool) -> bool {
+    let mut found = false;
+    for symbol in symbols {
+        if symbol.qualified_name == name {
+            found = true;
+            if symbol.public || (allow_module && symbol.module_visible) {
+                return true
+            }
+        }
+    }
+    !found
+}
+
+fn visible_dependency_environment(
+    value: tast::DependencyEnvironment,
+    file: hir::File,
+    sources: Vec[SourceFile],
+    module_name: string,
+    package_name: string,
+    modules: Result[Vec[ResolvedModule], string],
+) -> tast::DependencyEnvironment {
+    if file.package_name == package_name || file.package_name == "builtin"
+        || file.package_name == "prelude"
+        || file.package_name == "std"
+        || file.package_name.starts_with("std::") {
+        return value
+    }
+    let matching = Vec::new();
+    for source in sources {
+        if source.package_name == file.package_name {
+            matching.push(source)
+        }
+    }
+    let symbols = build_symbol_index_from_sources(matching).symbols;
+    let allow_module = query_module_access(modules, module_name, file.package_name);
+    let enums = Vec::new();
+    for item in value.enums {
+        if dependency_symbol_visible(symbols, item.name, allow_module) {
+            enums.push(item)
+        }
+    }
+    let structs = Vec::new();
+    for item in value.structs {
+        if dependency_symbol_visible(symbols, item.name, allow_module) {
+            let fields = Vec::new();
+            for field in item.fields {
+                if item.public_fields.contains(field.0)
+                    || (allow_module && item.module_fields.contains(field.0)) {
+                    fields.push(field)
+                }
+            }
+            structs.push(
+                tast::StructInfo {
+                    fields,
+                    has_hidden_fields: item.has_hidden_fields || fields.len() != item.fields.len(),
+                    ..item,
+                },
+            )
+        }
+    }
+    let type_aliases = Vec::new();
+    for item in value.type_aliases {
+        if dependency_symbol_visible(symbols, item.name, allow_module) {
+            type_aliases.push(item)
+        }
+    }
+    let constants = Vec::new();
+    for item in value.constants {
+        if dependency_symbol_visible(symbols, item.name, allow_module) {
+            constants.push(item)
+        }
+    }
+    let traits = Vec::new();
+    for item in value.traits {
+        if dependency_symbol_visible(symbols, item.name, allow_module) {
+            traits.push(item)
+        }
+    }
+    let functions = Vec::new();
+    for item in value.functions {
+        if dependency_symbol_visible(symbols, item.name, allow_module) {
+            functions.push(item)
+        }
+    }
+    let methods = Vec::new();
+    for item in value.methods {
+        if item.trait_ref.is_some()
+            || dependency_symbol_visible(
+                symbols,
+                method_owner(item) + "::" + short_type_name(item.function.name),
+                allow_module,
+            ) {
+            methods.push(item)
+        }
+    }
+    let reexports = Vec::new();
+    for item in value.reexports {
+        reexports.push(item)
+    }
+    if allow_module {
+        for item in file.module_reexports {
+            reexports.push((file.package_name + "::" + item.0, item.1))
+        }
+    }
+    tast::DependencyEnvironment {
+        enums,
+        structs,
+        type_aliases,
+        constants,
+        traits,
+        functions,
+        methods,
+        reexports,
+        ..value,
+    }
+}
+
+fn query_module_only_name(symbols: Vec[Symbol], files: Vec[hir::File], name: string) -> bool {
+    let mut current = name;
+    for _ in 0..64 {
+        for symbol in symbols {
+            if symbol.qualified_name == current {
+                return symbol.module_visible
+            }
+        }
+        let mut next = current;
+        for file in files {
+            for item in file.module_reexports {
+                if file.package_name + "::" + item.0 == current {
+                    return true
+                }
+            }
+            for item in file.public_reexports {
+                if file.package_name + "::" + item.0 == current {
+                    next = item.1;
+                }
+            }
+        }
+        if next == current {
+            return false
+        }
+        current = next;
+    }
+    true
+}
+
+fn query_visibility_const_names(value: hir::ConstExpr, names: Vec[(string, Option[ast::Span])]) -> () {
+    match value.kind {
+        Reference(name) => names.push((name, value.span)),
+        Unary { value, .. } => query_visibility_const_names(value, names),
+        Binary { left, right, .. } => {
+            query_visibility_const_names(left, names);
+            query_visibility_const_names(right, names)
+        },
+        _ => (),
+    }
+}
+
+fn query_visibility_arg_names(value: hir::GenericArg, names: Vec[(string, Option[ast::Span])]) -> () {
+    match value {
+        Type(ty) => query_visibility_type_names(ty, names),
+        Const(value) => query_visibility_const_names(value, names),
+        Unresolved { name, span } => names.push((name, span)),
+    }
+}
+
+fn query_visibility_type_names(value: hir::TypeExpr, names: Vec[(string, Option[ast::Span])]) -> () {
+    match value.kind {
+        Named { reference } => names.push((hir::type_reference_name(reference), value.span)),
+        Tuple { items } => for item in items {
+            query_visibility_type_names(item, names)
+        },
+        Projection { base, .. } => query_visibility_type_names(base, names),
+        App { ty, args } => {
+            query_visibility_type_names(ty, names);
+            for arg in args {
+                query_visibility_arg_names(arg, names)
+            }
+        },
+        Array { len, elem } => {
+            query_visibility_const_names(len, names);
+            query_visibility_type_names(elem, names)
+        },
+        Func { params, ret_ty } => {
+            for param in params {
+                query_visibility_type_names(param, names)
+            }
+            query_visibility_type_names(ret_ty, names)
+        },
+        Dyn { bounds } => for bound in bounds {
+            names.push((hir::type_reference_name(bound.reference), value.span));
+            for arg in bound.args {
+                query_visibility_arg_names(arg, names)
+            }
+            for associated in bound.associated_types {
+                query_visibility_type_names(associated.1, names)
+            }
+        },
+        _ => (),
+    }
+}
+
+fn query_visibility_trait_names(value: hir::TraitRef, names: Vec[(string, Option[ast::Span])]) -> () {
+    names.push((hir::type_reference_name(value.reference), value.span));
+    for arg in value.args {
+        query_visibility_arg_names(arg, names)
+    }
+}
+
+fn query_visibility_bound_names(
+    bounds: Vec[(string, Vec[hir::TraitRef])],
+    predicates: Vec[hir::Predicate],
+    names: Vec[(string, Option[ast::Span])],
+) -> () {
+    for bounds in bounds {
+        for bound in bounds.1 {
+            query_visibility_trait_names(bound, names)
+        }
+    }
+    for predicate in predicates {
+        match predicate {
+            Trait { ty, trait_ref } => {
+                query_visibility_type_names(ty, names);
+                query_visibility_trait_names(trait_ref, names)
+            },
+            Equality { lhs, rhs } => {
+                query_visibility_type_names(lhs, names);
+                query_visibility_type_names(rhs, names)
+            },
+        }
+    }
+}
+
+fn query_visibility_function_names(value: hir::Function, names: Vec[(string, Option[ast::Span])]) -> () {
+    for param in value.params {
+        query_visibility_type_names(param.1, names)
+    }
+    if let Some(ret_ty) = value.ret_ty {
+        query_visibility_type_names(ret_ty, names)
+    }
+    query_visibility_bound_names(value.generic_bounds, value.predicates, names)
+}
+
+fn query_visibility_type_public(symbols: Vec[Symbol], value: hir::TypeExpr) -> bool {
+    let names = Vec::new();
+    query_visibility_type_names(value, names);
+    for name in names {
+        for symbol in symbols {
+            if symbol.qualified_name == name.0 && !symbol.public {
+                return false
+            }
+        }
+    }
+    true
+}
+
+fn query_public_symbol(symbols: Vec[Symbol], name: string) -> bool {
+    for symbol in symbols {
+        if symbol.qualified_name == name {
+            return symbol.public
+        }
+    }
+    false
+}
+
+fn query_module_visibility_diagnostics(
+    entries: Vec[hir::File],
+    dependencies: Vec[hir::File],
+    sources: Vec[SourceFile],
+    diagnostics: Vec[diagnostic::Diagnostic],
+) -> () {
+    let symbols = build_symbol_index_from_sources(sources).symbols;
+    let files = Vec::new();
+    for file in entries {
+        files.push(file)
+    }
+    for file in dependencies {
+        files.push(file)
+    }
+    for file in entries {
+        for reexport in file.public_reexports {
+            if query_module_only_name(symbols, files, reexport.1) {
+                diagnostics.push(
+                    query_diagnostic(
+                        file.source_path,
+                        "typer",
+                        "Public API " + file.package_name + "::" + reexport.0
+                            + " exposes module-private item "
+                            + reexport.1,
+                        None,
+                    ),
+                )
+            }
+        }
+        for item in file.items {
+            let names = Vec::new();
+            let mut owner = "";
+            match item {
+                Function(value) => if let Public = value.visibility {
+                    owner = value.name;
+                    query_visibility_function_names(value, names)
+                },
+                ExternFunction(value) => if query_public_symbol(symbols, value.name) {
+                    owner = value.name;
+                    for param in value.params {
+                        query_visibility_type_names(param.1, names)
+                    }
+                    if let Some(ret_ty) = value.ret_ty {
+                        query_visibility_type_names(ret_ty, names)
+                    }
+                    query_visibility_bound_names(value.generic_bounds, value.predicates, names)
+                },
+                Constant(value) => if let Public = value.visibility {
+                    owner = value.name;
+                    query_visibility_type_names(value.ty, names)
+                },
+                Static(value) => if let Public = value.visibility {
+                    owner = value.name;
+                    query_visibility_type_names(value.ty, names)
+                },
+                StructDef(value) => if query_public_symbol(symbols, value.name) {
+                    owner = value.name;
+                    for field in value.fields {
+                        if value.public_fields.contains(field.0) {
+                            let field_names = Vec::new();
+                            query_visibility_type_names(field.1, field_names);
+                            for name in field_names {
+                                if query_module_only_name(symbols, files, name.0) {
+                                    diagnostics.push(
+                                        query_diagnostic(
+                                            file.source_path,
+                                            "typer",
+                                            "Public API " + value.name + "." + field.0
+                                                + " exposes module-private item "
+                                                + name.0,
+                                            name.1,
+                                        ),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                },
+                TypeAlias(value) => if query_public_symbol(symbols, value.name) {
+                    owner = value.name;
+                    query_visibility_type_names(value.ty, names)
+                },
+                EnumDef(value) => if query_public_symbol(symbols, value.name) {
+                    owner = value.name;
+                    for variant in value.variants {
+                        match variant.fields {
+                            Unit => (),
+                            Tuple(fields) => for field in fields {
+                                query_visibility_type_names(field, names)
+                            },
+                            Struct(fields) => for field in fields {
+                                query_visibility_type_names(field.1, names)
+                            },
+                        }
+                    }
+                },
+                TraitDef(value) => if query_public_symbol(symbols, value.name) {
+                    owner = value.name;
+                    query_visibility_bound_names(value.generic_bounds, value.predicates, names);
+                    for bound in value.supertraits {
+                        query_visibility_trait_names(bound, names)
+                    }
+                    for associated in value.associated_types {
+                        for bound in associated.bounds {
+                            query_visibility_trait_names(bound, names)
+                        }
+                    }
+                    for method in value.method_sigs {
+                        query_visibility_bound_names(
+                            method.generic_bounds,
+                            method.predicates,
+                            names,
+                        );
+                        for param in method.params {
+                            query_visibility_type_names(param, names)
+                        }
+                        query_visibility_type_names(method.ret_ty, names)
+                    }
+                },
+                ImplBlock(value) => if query_visibility_type_public(symbols, value.for_type) {
+                    if let Some(trait_ref) = value.trait_ref {
+                        if dependency_symbol_visible(
+                            symbols,
+                            hir::type_reference_name(trait_ref.reference),
+                            false,
+                        ) {
+                            owner = file.package_name;
+                            query_visibility_trait_names(trait_ref, names);
+                            query_visibility_bound_names(
+                                value.generic_bounds,
+                                value.predicates,
+                                names,
+                            );
+                            for associated in value.associated_types {
+                                query_visibility_type_names(associated.1, names)
+                            }
+                            for method in value.methods {
+                                query_visibility_function_names(method, names)
+                            }
+                        }
+                    } else {
+                        for method in value.methods {
+                            if let Public = method.visibility {
+                                let method_names = Vec::new();
+                                query_visibility_function_names(method, method_names);
+                                for name in method_names {
+                                    if query_module_only_name(symbols, files, name.0) {
+                                        diagnostics.push(
+                                            query_diagnostic(
+                                                file.source_path,
+                                                "typer",
+                                                "Public API " + method.name
+                                                    + " exposes module-private item "
+                                                    + name.0,
+                                                name.1,
+                                            ),
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                _ => (),
+            }
+            for name in names {
+                if query_module_only_name(symbols, files, name.0) {
+                    diagnostics.push(
+                        query_diagnostic(
+                            file.source_path,
+                            "typer",
+                            "Public API " + owner + " exposes module-private item " + name.0,
+                            name.1,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+}

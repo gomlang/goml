@@ -1,0 +1,235 @@
+package compiler;
+
+use module::artifact;
+use module::ast;
+use module::hir;
+
+fn module_visibility_export_names(value: artifact::ArtifactPackageExports) -> Vec[string] {
+    let result = Vec::new();
+    for value in value.enums {
+        result.push(value.name)
+    }
+    for value in value.structs {
+        result.push(value.name)
+    }
+    for value in value.traits {
+        result.push(value.name)
+    }
+    for value in value.type_aliases {
+        result.push(value.name)
+    }
+    for value in value.functions {
+        result.push(value.name)
+    }
+    for value in value.constants {
+        result.push(value.name)
+    }
+    for value in value.reexports {
+        result.push(value.0)
+    }
+    result
+}
+
+fn reject_module_private_references(owner: string, references: Vec[string], hidden: Vec[string]) -> Result[
+    (),
+    string,
+] {
+    for name in references {
+        if hidden.contains(name) {
+            return Err("Public API " + owner + " exposes module-private item " + name)
+        }
+    }
+    Ok(())
+}
+
+fn collect_public_item_references(
+    item: hir::Item,
+    package_name: string,
+    public_names: Vec[string],
+    scope_package: string,
+    references: Vec[(string, Vec[string])],
+) -> () {
+    let names = Vec::new();
+    let empty = Vec::new();
+    match item {
+        Function(value) => if public_names.contains(value.name) {
+            references.push(
+                (value.name, function_exposed_private_names(value, scope_package, empty)),
+            )
+        },
+        ExternFunction(value) => if public_names.contains(value.name) {
+            collect_private_bounds_names(names, scope_package, empty, value.generic_bounds);
+            for predicate in value.predicates {
+                collect_private_predicate_names(names, scope_package, empty, predicate)
+            }
+            for param in value.params {
+                collect_private_type_names(names, scope_package, empty, param.1)
+            }
+            if let Some(ty) = value.ret_ty {
+                collect_private_type_names(names, scope_package, empty, ty)
+            }
+            references.push((value.name, names))
+        },
+        TypeAlias(value) => if public_names.contains(value.name) {
+            collect_private_type_names(names, scope_package, empty, value.ty);
+            references.push((value.name, names))
+        },
+        Constant(value) => if public_names.contains(value.name) {
+            collect_private_type_names(names, scope_package, empty, value.ty);
+            references.push((value.name, names))
+        },
+        Static(value) => if public_names.contains(value.name) {
+            collect_private_type_names(names, scope_package, empty, value.ty);
+            references.push((value.name, names))
+        },
+        StructDef(value) => if public_names.contains(value.name) {
+            for field in value.fields {
+                if value.public_fields.contains(field.0) {
+                    let names = Vec::new();
+                    collect_private_type_names(names, scope_package, empty, field.1);
+                    references.push((value.name + "." + field.0, names))
+                }
+            }
+        },
+        EnumDef(value) => if public_names.contains(value.name) {
+            for variant in value.variants {
+                match variant.fields {
+                    Unit => (),
+                    Tuple(fields) => for ty in fields {
+                        collect_private_type_names(names, scope_package, empty, ty)
+                    },
+                    Struct(fields) => for field in fields {
+                        collect_private_type_names(names, scope_package, empty, field.1)
+                    },
+                }
+            }
+            references.push((value.name, names))
+        },
+        TraitDef(value) => if public_names.contains(value.name) {
+            collect_private_bounds_names(names, scope_package, empty, value.generic_bounds);
+            for predicate in value.predicates {
+                collect_private_predicate_names(names, scope_package, empty, predicate)
+            }
+            for bound in value.supertraits {
+                collect_private_trait_ref_names(names, scope_package, empty, bound)
+            }
+            for associated in value.associated_types {
+                for bound in associated.bounds {
+                    collect_private_trait_ref_names(names, scope_package, empty, bound)
+                }
+            }
+            for method in value.method_sigs {
+                collect_private_bounds_names(names, scope_package, empty, method.generic_bounds);
+                for predicate in method.predicates {
+                    collect_private_predicate_names(names, scope_package, empty, predicate)
+                }
+                for ty in method.params {
+                    collect_private_type_names(names, scope_package, empty, ty)
+                }
+                collect_private_type_names(names, scope_package, empty, method.ret_ty)
+            }
+            references.push((value.name, names))
+        },
+        ImplBlock(value) => {
+            if value.trait_ref.is_some() {
+                if trait_impl_header_is_public(value, package_name, public_names) {
+                    references.push(
+                        (
+                            package_name,
+                            trait_impl_exposed_private_names(value, scope_package, empty),
+                        ),
+                    )
+                }
+            } else {
+                let owner_private = Vec::new();
+                collect_private_type_names(
+                    owner_private,
+                    package_name,
+                    public_names,
+                    value.for_type,
+                );
+                if owner_private.is_empty() {
+                    for method in value.methods {
+                        if let Public = method.visibility {
+                            references.push(
+                                (
+                                    method.name,
+                                    function_exposed_private_names(method, scope_package, empty),
+                                ),
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        ExternType(_) => (),
+    }
+}
+
+fn validate_module_public_api_scope(
+    file: hir::File,
+    public_names: Vec[string],
+    scope_package: string,
+    hidden: Vec[string],
+) -> Result[(), string] {
+    if hidden.is_empty() {
+        return Ok(())
+    }
+    let references = Vec::new();
+    for item in file.items {
+        collect_public_item_references(
+            item,
+            file.package_name,
+            public_names,
+            scope_package,
+            references,
+        )
+    }
+    for value in references {
+        reject_module_private_references(value.0, value.1, hidden)?
+    }
+    for value in file.public_reexports {
+        reject_module_private_references(
+            package_item_name(file.package_name, value.0),
+            Vec::from_array([value.1]),
+            hidden,
+        )?
+    }
+    Ok(())
+}
+
+fn validate_module_public_api(
+    file: hir::File,
+    ast_values: Vec[ast::LowerResult],
+    module_name: string,
+    dependencies: Vec[artifact::ArtifactInterfaceUnit],
+) -> Result[(), string] {
+    let public_names = public_item_names(ast_values, file.package_name);
+    let hidden = Vec::new();
+    for name in module_item_names(ast_values, file.package_name) {
+        if !public_names.contains(name) {
+            hidden.push(name)
+        }
+    }
+    validate_module_public_api_scope(file, public_names, file.package_name, hidden)?;
+    for dependency in dependencies {
+        if let Some(scope) = dependency.module_scope {
+            if scope.module_name == module_name {
+                let public_dependency = module_visibility_export_names(dependency.exports);
+                let hidden = Vec::new();
+                for name in module_visibility_export_names(scope.exports) {
+                    if !public_dependency.contains(name) {
+                        hidden.push(name)
+                    }
+                }
+                validate_module_public_api_scope(
+                    file,
+                    public_names,
+                    dependency.package_name,
+                    hidden,
+                )?
+            }
+        }
+    }
+    Ok(())
+}

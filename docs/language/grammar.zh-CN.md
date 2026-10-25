@@ -55,6 +55,7 @@
 | 期望 `[initializer(); N]` 为每个元素调用一次 | 初始化器只运行一次，长度为零也一样；逐元素工作使用循环 |
 | `if let Some(x) = value || ready` | 使用嵌套控制流，或在 let 链的布尔项中使用 `&& (first || second)` |
 | `UserId` 必须独立却使用 `type UserId = u64;` | 使用 `struct UserId(u64);` 并显式构造 |
+| 跨包共享实现 API，但不向外部模块公开 | 对声明、字段、方法和重导出使用 `pub(module)` |
 | `use pkg::*` | 用 `use pkg::{A, B};` 显式列出所需公开项 |
 | `mod`, `crate::`, `super::` | 使用目录包，当前模块用 `module::path`，依赖用规范路径 |
 | 同时开发多个模块 | `goml.work` 列出成员；依赖 `{ path = "../library" }` 和根 `[replace]` 选择本地来源，同时保留声明依赖和规范身份；`--workspace` 或 `-p` 选择模块 |
@@ -113,7 +114,7 @@ I/O trait、取消上下文、DNS/TLS 客户端和监听器、标量转换 trait
 ```text
 file          = package_decl? use_decl* item*
 package_decl  = "package" lower_ident ";"
-use_decl      = "pub"? "use" use_path ("as" ident | "::" "{" use_items "}")? ";"
+use_decl      = visibility? "use" use_path ("as" ident | "::" "{" use_items "}")? ";"
 use_items     = use_item ("," use_item)* ","?
 use_item      = ident ("as" ident)?
 use_path      = path | "module" "::" path
@@ -129,7 +130,7 @@ item          = attribute* visibility? function
               | attribute* impl_def
               | go_ffi_extern
               | attribute* visibility? extern_type
-visibility    = "pub"
+visibility    = "pub" ("(" "module" ")")?
 attribute     = "#[" attribute_body "]"
 go_export_attribute = "#[" "go_export" "(" string_literal ")" "]"
 comptime_attribute = "#[" "comptime" "]"

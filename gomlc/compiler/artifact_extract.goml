@@ -4,6 +4,8 @@ use module::artifact::core_codec as core_codec;
 use module::artifact::interface_codec as interface_codec;
 use module::artifact::wire as wire;
 use module::artifact;
+use module::ast;
+use module::hir;
 use module::ctir;
 use module::tast;
 use module::checker;
@@ -291,9 +293,10 @@ fn artifact_method_scheme(
     }
 }
 
-fn artifact_method_is_public(value: tast::Function) -> bool {
+fn artifact_method_is_public(value: tast::Function, include_module: bool) -> bool {
     match value.visibility {
         Public => true,
+        Module => include_module,
         Private => false,
     }
 }
@@ -303,10 +306,11 @@ fn artifact_impl_methods(
     owner_generic_count: isize,
     constraint_start: isize,
     public_only: bool,
+    include_module: bool,
 ) -> Vec[artifact::ArtifactFnScheme] {
     let result: Vec[artifact::ArtifactFnScheme] = Vec::new();
     for method in value.methods {
-        if !public_only || artifact_method_is_public(method) {
+        if !public_only || artifact_method_is_public(method, include_module) {
             result.push(artifact_method_scheme(method, owner_generic_count, constraint_start))
         }
     }
@@ -333,13 +337,14 @@ fn artifact_trait_impl(value: tast::ImplBlock) -> artifact::ArtifactTraitImpl {
                 value.generics.len(),
                 value.predicates.len(),
                 false,
+                false,
             ),
             valid: true,
         },
     }
 }
 
-fn artifact_inherent_impl(value: tast::ImplBlock, public_only: bool) -> artifact::ArtifactInherentImpl {
+fn artifact_inherent_impl(value: tast::ImplBlock, public_only: bool, include_module: bool) -> artifact::ArtifactInherentImpl {
     artifact::ArtifactInherentImpl {
         key: artifact::ArtifactInherentImplKey::Exact(value.for_type),
         definition: artifact::ArtifactImplDef {
@@ -351,20 +356,22 @@ fn artifact_inherent_impl(value: tast::ImplBlock, public_only: bool) -> artifact
                 value.generics.len(),
                 value.predicates.len(),
                 public_only,
+                include_module,
             ),
             valid: true,
         },
     }
 }
 
-fn artifact_struct_def(value: tast::StructDef, public_only: bool) -> tast::StructDef {
+fn artifact_struct_def(value: tast::StructDef, public_only: bool, include_module: bool) -> tast::StructDef {
     if !public_only {
         value
     } else {
         let fields: Vec[(string, tast::Type)] = Vec::new();
         let public_fields: Vec[string] = Vec::new();
         for field in value.fields {
-            if value.public_fields.contains(field.0) {
+            if value.public_fields.contains(field.0)
+                || (include_module && value.module_fields.contains(field.0)) {
                 fields.push(field);
                 public_fields.push(field.0)
             }
@@ -375,6 +382,7 @@ fn artifact_struct_def(value: tast::StructDef, public_only: bool) -> tast::Struc
             generics: value.generics,
             fields,
             public_fields,
+            module_fields: Vec::new(),
             has_hidden_fields: value.has_hidden_fields || fields.len() != value.fields.len(),
             go_comparable: value.go_comparable,
         }
@@ -505,6 +513,7 @@ fn artifact_package_exports_with_contract(
     public_names: Vec[string],
     public_reexports: Vec[(string, string)],
     public_only: bool,
+    include_module: bool,
     enum_type_names: Vec[string],
     struct_type_names: Vec[string],
 ) -> artifact::ArtifactPackageExports {
@@ -528,7 +537,7 @@ fn artifact_package_exports_with_contract(
     for definition in file.structs {
         artifact_add_type_name(result.struct_type_names, definition.name);
         if !public_only || public_names.contains(definition.name) {
-            result.structs.push(artifact_struct_def(definition, public_only))
+            result.structs.push(artifact_struct_def(definition, public_only, include_module))
         }
     }
     for alias in signatures.type_aliases {
@@ -581,7 +590,7 @@ fn artifact_package_exports_with_contract(
                     result.trait_impls.push(artifact_trait_impl(value))
                 },
                 None => {
-                    let implementation = artifact_inherent_impl(value, public_only);
+                    let implementation = artifact_inherent_impl(value, public_only, include_module);
                     if !public_only || !implementation.definition.methods.is_empty() {
                         result.inherent_impls.push(implementation)
                     }
@@ -612,6 +621,7 @@ fn artifact_package_exports(
             public_names,
             public_reexports,
             public_only,
+            false,
             enum_type_names,
             struct_type_names,
         ),
@@ -740,4 +750,103 @@ fn exported_constant_primitive(file: tast::File, name: string) -> Option[tast::P
         }
     }
     None
+}
+
+fn artifact_module_package_exports(
+    file: tast::File,
+    signatures: tast::PackageSignatures,
+    package_name: string,
+    module_names: Vec[string],
+    reexports: Vec[(string, string)],
+    enum_type_names: Vec[string],
+    struct_type_names: Vec[string],
+) -> Result[artifact::ArtifactPackageExports, string] {
+    Ok(
+        artifact_package_exports_with_contract(
+            tast::builtin_contract()?,
+            file,
+            signatures,
+            package_name,
+            module_names,
+            reexports,
+            true,
+            true,
+            enum_type_names,
+            struct_type_names,
+        ),
+    )
+}
+
+fn artifact_module_interface(
+    value: artifact::ArtifactInterfaceUnit,
+    ast_values: Vec[ast::LowerResult],
+    hir_file: hir::File,
+    file: tast::File,
+    signatures: tast::PackageSignatures,
+    module_name: string,
+    constant_values: Vec[tast::ConstantScheme],
+    comptime: ctir::CtModule,
+    enum_names: Vec[string],
+    struct_names: Vec[string],
+) -> Result[artifact::ArtifactInterfaceUnit, string] {
+    if !package_has_module_visibility(ast_values) {
+        return Ok(value)
+    }
+    let reexports = Vec::new();
+    for reexport in hir_file.public_reexports {
+        reexports.push(reexport)
+    }
+    for reexport in hir_file.module_reexports {
+        reexports.push(reexport)
+    }
+    let exports = artifact_module_package_exports(
+        file,
+        signatures,
+        value.package_name,
+        module_item_names(ast_values, value.package_name),
+        reexports,
+        enum_names,
+        struct_names,
+    )?;
+    for index in 0..exports.constants.len() {
+        let current = exports.constants[index];
+        for resolved in constant_values {
+            if resolved.name == current.name {
+                exports.constants[index] = tast::ConstantScheme { value: resolved.value, ..current };
+            }
+        }
+    }
+    Ok(
+        interface_codec::with_module_scope(
+            value,
+            artifact::ArtifactModuleScope {
+                module_name,
+                exports,
+                package_interface: artifact_package_interface(
+                    value.package_name,
+                    value.package_interface.name,
+                    exports,
+                ),
+                comptime: artifact_comptime_unit(
+                    artifact_comptime_visibility(
+                        comptime,
+                        module_item_names(ast_values, value.package_name),
+                    ),
+                    exports,
+                ),
+            },
+        ),
+    )
+}
+
+fn artifact_comptime_visibility(value: ctir::CtModule, names: Vec[string]) -> ctir::CtModule {
+    let entries = Vec::new();
+    for entry in value.entries {
+        entries.push(ctir::CtEntry { public: names.contains(entry.name), ..entry })
+    }
+    let derive_entries = Vec::new();
+    for entry in value.derive_entries {
+        derive_entries.push(ctir::CtDeriveEntry { public: names.contains(entry.name), ..entry })
+    }
+    ctir::CtModule { entries, derive_entries, ..value }
 }

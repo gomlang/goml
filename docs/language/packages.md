@@ -130,7 +130,7 @@ super::x
 
 ### Visibility
 
-Top-level items are only visible within the package by default. Top-level functions, structures, enumerations and traits are exported using `pub`; structure fields and inherent impl methods are also private by default and need to be marked `pub` separately for cross-package access:
+Top-level items are only visible within the package by default. `pub(module)` permits access from other packages belonging to the same module; `pub` permits access from external modules too. Structure fields and inherent impl methods are private by default and need their own visibility annotation for cross-package access:
 
 ```goml
 pub struct Point {
@@ -149,4 +149,20 @@ impl Point {
 }
 ```
 
-All files in the same package can use private top-level items. The trait impl method inherits the visibility of the trait method and cannot write `pub`.
+All files in the same package can use private top-level items. Trait impl methods inherit the trait contract and cannot declare either `pub` or `pub(module)`.
+
+```goml
+pub(module) struct DeviceState {
+    pub(module) cycles: u64,
+}
+
+pub(module) fn restore_clock(state: DeviceState) -> u64 {
+    state.cycles
+}
+```
+
+Module membership follows the canonical module identity from `goml.toml`, not a shared workspace or a common path prefix. Workspace members, path dependencies, replacements, and registry dependencies do not gain access to another module's internal items. Fields, newtype fields, inherent methods, and top-level declarations use the same three visibility levels.
+
+`pub(module) use` can expose an imported item to sibling packages without exposing it externally. A `pub use` cannot promote a module-internal declaration to public visibility. Public signatures must not expose module-internal types; use a public type or reduce the signature's visibility. Public documentation hides module-internal declarations; documentation requested with private items includes them.
+
+Module-internal visibility is available to production code, not only tests. To verify the external public API, place consumer tests in a separate module.
