@@ -1,0 +1,675 @@
+package build_plan;
+
+use module::project::{CompilerWorld, Context, ExternalTest, Graph, default_build_options, discover_toolchain_graph, external_test_graphs, internal_test_graphs, module_relative, package_by_name, source_files};
+use module::build_model::{Command, Plan, TestGroup};
+use module::failure;
+use failure::DriverResult;
+use module::util;
+use std::collections;
+use std::fs;
+use std::io;
+use std::path;
+use std::process;
+use std::task;
+use std::text;
+use std::time;
+use module::build_model;
+
+fn package_artifact_base(root: string, graph: Graph, package_name: string) -> string {
+    let Some(package_value) = package_by_name(graph, package_name) else {
+        return path::join(root, package_name)
+    };
+    let mut result = path::join(root, package_value.artifact_prefix);
+    for segment in text::split(package_name, "::") {
+        result = path::join(result, segment);
+    }
+    path::join(result, last_segment(package_name))
+}
+
+fn linked_go_output(root: string, graph: Graph, package_name: string) -> string {
+    match path::parent(package_artifact_base(root, graph, package_name)) {
+        Some(value) => path::join(value, "goml_generated.go"),
+        None => path::join(root, "goml_generated.go"),
+    }
+}
+
+fn extension(value: string, suffix: string) -> string {
+    path::with_extension(value, suffix)
+}
+
+fn last_segment(value: string) -> string {
+    let segments = text::split(value, "::");
+    if segments.is_empty() {
+        value
+    } else {
+        segments[segments.len() - 1]
+    }
+}
+
+fn executable_path_for(context: Context, entry_package: string) -> string {
+    let mut result = path::join(context.artifact_root, "bin");
+    let module_segments = text::split(context.graph.module_path, "::");
+    let entry_segments = text::split(entry_package, "::");
+    for index in module_segments.len()..entry_segments.len() {
+        result = path::join(result, entry_segments[index]);
+    }
+    path::join(result, last_segment(entry_package))
+}
+
+fn collect_dependencies(graph: Graph, package_name: string, result: collections::BTreeSet[string]) -> Result[
+    (),
+    failure::Failure,
+] {
+    let Some(package_value) = package_by_name(graph, package_name) else {
+        return Err(failure::convert(f"missing package {package_name}"))
+    };
+    for dependency in package_value.imports {
+        if result.insert(dependency) {
+            collect_dependencies(graph, dependency, result)?
+        }
+    }
+    Ok(())
+}
+
+fn mark_reachable(graph: Graph, package_name: string, seen: collections::HashSet[string]) -> Result[
+    (),
+    failure::Failure,
+] {
+    if !seen.insert(package_name) {
+        return Ok(())
+    }
+    let Some(package_value) = package_by_name(graph, package_name) else {
+        return Err(failure::convert(f"missing package {package_name}"))
+    };
+    for dependency in package_value.imports {
+        mark_reachable(graph, dependency, seen)?
+    }
+    Ok(())
+}
+
+pub fn reachable_packages(graph: Graph, entries: Vec[string]) -> Result[
+    Vec[string],
+    failure::Failure,
+] {
+    let seen: collections::HashSet[string] = collections::HashSet::new();
+    for entry in entries {
+        mark_reachable(graph, entry, seen)?
+    }
+    let result: Vec[string] = Vec::new();
+    for package_name in graph.order {
+        if seen.contains(package_name) {
+            result.push(package_name)
+        }
+    }
+    Ok(result)
+}
+
+fn dependency_interfaces(graph: Graph, package_name: string, output_root: string) -> Result[
+    Vec[string],
+    failure::Failure,
+] {
+    let names: collections::BTreeSet[string] = collections::BTreeSet::new();
+    collect_dependencies(graph, package_name, names)?;
+    let result: Vec[string] = Vec::new();
+    for name in names {
+        result.push(extension(package_artifact_base(output_root, graph, name), "interface"))
+    }
+    Ok(result)
+}
+
+pub fn compile_commands(
+    context: Context,
+    output_root: string,
+    entry_command: string,
+    dependency_command: string,
+    packages: Vec[string],
+) -> Result[Vec[Command], failure::Failure] {
+    let result: Vec[Command] = Vec::new();
+    for package_name in packages {
+        let command = if package_name == context.graph.entry_package {
+            entry_command
+        } else {
+            dependency_command
+        };
+        let compiled = compile_package_command(
+            context.graph,
+            context.graph.module_dir,
+            package_name,
+            output_root,
+            output_root,
+            command,
+            compiler_world_path(context),
+        )?;
+        result.push(compiled)
+    }
+    Ok(result)
+}
+
+pub fn compiler_world_path(context: Context) -> Option[string] {
+    match context.compiler_world {
+        Source => None,
+        Installed { path } => Some(path),
+    }
+}
+
+fn compile_package_command(
+    graph: Graph,
+    module_dir: string,
+    package_name: string,
+    interface_root: string,
+    output_root: string,
+    command: string,
+    world: Option[string],
+) -> Result[Command, failure::Failure] {
+    let Some(package_value) = package_by_name(graph, package_name) else {
+        return Err(failure::convert(f"missing package {package_name}"))
+    };
+    let inputs: Vec[string] = Vec::new();
+    for file in package_value.files {
+        inputs.push(module_relative(module_dir, file))
+    }
+    let interfaces = dependency_interfaces(graph, package_name, interface_root)?;
+    let relative_interfaces: Vec[string] = Vec::new();
+    for value in interfaces {
+        relative_interfaces.push(module_relative(module_dir, value))
+    }
+    Ok(
+        Compile {
+            subcommand: command,
+            package_name,
+            module_name: package_value.module_name,
+            input_files: util::sorted(inputs),
+            interface_files: relative_interfaces,
+            output: module_relative(
+                module_dir,
+                package_artifact_base(output_root, graph, package_name),
+            ),
+            world,
+        },
+    )
+}
+
+fn compile_test_package_command(
+    graph: Graph,
+    module_dir: string,
+    package_name: string,
+    dependency_root: string,
+    output_root: string,
+    production_interface: bool,
+    world: Option[string],
+) -> Result[Command, failure::Failure] {
+    let compiled = compile_package_command(
+        graph,
+        module_dir,
+        package_name,
+        dependency_root,
+        output_root,
+        build_model::TEST_BUILD_SUBCOMMAND,
+        world,
+    )?;
+    match compiled {
+        Compile {
+            subcommand,
+            package_name,
+            module_name,
+            input_files,
+            interface_files,
+            output,
+            world,
+        } => {
+            if production_interface {
+                interface_files.push(
+                    module_relative(
+                        module_dir,
+                        extension(
+                            package_artifact_base(dependency_root, graph, package_name),
+                            "interface",
+                        ),
+                    ),
+                )
+            }
+            Ok(
+                Compile {
+                    subcommand,
+                    package_name,
+                    module_name,
+                    input_files,
+                    interface_files,
+                    output,
+                    world,
+                },
+            )
+        },
+        _ => Err(failure::convert("test package did not produce a compile command")),
+    }
+}
+
+pub fn core_outputs(context: Context, output_root: string, packages: Vec[string]) -> Vec[string] {
+    let result: Vec[string] = Vec::new();
+    for package_name in packages {
+        result.push(
+            module_relative(
+                context.graph.module_dir,
+                extension(package_artifact_base(output_root, context.graph, package_name), "core"),
+            ),
+        )
+    }
+    result
+}
+
+pub fn check_plan(context: Context, include_tests: bool) -> Result[Plan, failure::Failure] {
+    let output_root = path::join(context.artifact_root, build_model::CHECK_SUBCOMMAND);
+    let commands = compile_commands(
+        context,
+        output_root,
+        build_model::CHECK_SUBCOMMAND,
+        build_model::CHECK_SUBCOMMAND,
+        context.graph.order,
+    )?;
+    if include_tests {
+        let internal = internal_test_graphs(context)?;
+        for graph in internal {
+            let target = Context {
+                build_options: default_build_options(),
+                native_environment: Vec::new(),
+                graph,
+                compiler: context.compiler,
+                compiler_world: context.compiler_world,
+                artifact_root: context.artifact_root,
+            };
+            let values = compile_commands(
+                target,
+                output_root,
+                build_model::TEST_CHECK_SUBCOMMAND,
+                build_model::CHECK_SUBCOMMAND,
+                target.graph.order,
+            )?;
+            for value in values {
+                commands.push(value)
+            }
+        }
+        let external = external_test_graphs(context)?;
+        for test in external {
+            let target = Context {
+                build_options: default_build_options(),
+                native_environment: Vec::new(),
+                graph: test.graph,
+                compiler: context.compiler,
+                compiler_world: context.compiler_world,
+                artifact_root: context.artifact_root,
+            };
+            let values = compile_commands(
+                target,
+                output_root,
+                build_model::TEST_CHECK_SUBCOMMAND,
+                build_model::CHECK_SUBCOMMAND,
+                target.graph.order,
+            )?;
+            for value in values {
+                commands.push(value)
+            }
+        }
+    }
+    Ok(Plan { commands, executable: None, test_groups: Vec::new() })
+}
+
+pub fn build_plan(context: Context) -> Result[Plan, failure::Failure] {
+    let output_root = path::join(context.artifact_root, build_model::BUILD_SUBCOMMAND);
+    let entries: Vec[string] = Vec::new();
+    for package_name in context.graph.order {
+        let Some(package_value) = package_by_name(context.graph, package_name) else {
+            return Err(failure::convert(f"missing package {package_name}"))
+        };
+        if package_value.declared_name == "main" {
+            entries.push(package_name)
+        }
+    }
+    let packages = if entries.is_empty() {
+        context.graph.order
+    } else {
+        reachable_packages(context.graph, entries)?
+    };
+    let commands = compile_commands(
+        context,
+        output_root,
+        build_model::BUILD_SUBCOMMAND,
+        build_model::BUILD_SUBCOMMAND,
+        packages,
+    )?;
+    for entry_package in util::sorted(entries) {
+        let main_go = linked_go_output(output_root, context.graph, entry_package);
+        let packages = reachable_packages(context.graph, Vec::from_array([entry_package]))?;
+        commands.push(
+            Link {
+                input_cores: core_outputs(context, output_root, packages),
+                entry_package,
+                output: module_relative(context.graph.module_dir, main_go),
+                world: compiler_world_path(context),
+            },
+        );
+        let executable = executable_path_for(context, entry_package);
+        commands.push(
+            GoBuild {
+                input: module_relative(context.graph.module_dir, main_go),
+                output: module_relative(context.graph.module_dir, executable),
+            },
+        )
+    }
+    Ok(Plan { commands, executable: None, test_groups: Vec::new() })
+}
+
+pub fn load_toolchain_context(prefix: string, compiler: string) -> Result[Context, failure::Failure] {
+    let lib_dir = path::join(prefix, "lib");
+    let artifact_root = path::join(path::join(lib_dir, "compiler"), "build");
+    let graph = discover_toolchain_graph(compiler, lib_dir, artifact_root)?;
+    Ok(
+        Context {
+            build_options: default_build_options(),
+            native_environment: Vec::new(),
+            graph,
+            compiler,
+            compiler_world: CompilerWorld::Source,
+            artifact_root,
+        },
+    )
+}
+
+pub fn toolchain_world_plan(context: Context, output: string) -> Result[Plan, failure::Failure] {
+    let commands: Vec[Command] = Vec::new();
+    let package_outputs: Vec[string] = Vec::new();
+    let source_files: Vec[string] = Vec::new();
+    let counter_output = path::join(context.artifact_root, "builtin-counter");
+    for package_name in context.graph.order {
+        let Some(package_value) = package_by_name(context.graph, package_name) else {
+            return Err(failure::convert("missing toolchain package " + package_name))
+        };
+        let output = package_artifact_base(context.artifact_root, context.graph, package_name);
+        let inputs: Vec[string] = Vec::new();
+        for value in package_value.files {
+            let value = module_relative(context.graph.module_dir, value);
+            inputs.push(value);
+            source_files.push(value)
+        }
+        let interfaces = dependency_interfaces(context.graph, package_name, context.artifact_root)?;
+        let relative_interfaces: Vec[string] = Vec::new();
+        for value in interfaces {
+            relative_interfaces.push(module_relative(context.graph.module_dir, value))
+        }
+        commands.push(
+            ToolchainCompile {
+                package_name,
+                module_name: package_value.module_name,
+                input_files: util::sorted(inputs),
+                interface_files: relative_interfaces,
+                output: module_relative(context.graph.module_dir, output),
+                builtin_contract: package_value.module_name == "builtin",
+                without_roots: package_value.module_name == "prelude",
+                counter_output: if package_value.module_name == "builtin" {
+                    Some(module_relative(context.graph.module_dir, counter_output))
+                } else {
+                    None
+                },
+            },
+        );
+        package_outputs.push(module_relative(context.graph.module_dir, output))
+    }
+    commands.push(
+        PackToolchainWorld {
+            input_packages: package_outputs,
+            source_files: util::sorted_unique(source_files),
+            counter_file: module_relative(context.graph.module_dir, counter_output),
+            output: module_relative(context.graph.module_dir, output),
+        },
+    );
+    Ok(Plan { commands, executable: None, test_groups: Vec::new() })
+}
+
+fn target_build_plan(context: Context, build_executable: bool) -> Result[Plan, failure::Failure] {
+    let output_root = path::join(context.artifact_root, build_model::BUILD_SUBCOMMAND);
+    let packages = reachable_packages(context.graph, Vec::from_array([context.graph.entry_package]))?;
+    let commands = compile_commands(
+        context,
+        output_root,
+        build_model::BUILD_SUBCOMMAND,
+        build_model::BUILD_SUBCOMMAND,
+        packages,
+    )?;
+    let main_go = linked_go_output(output_root, context.graph, context.graph.entry_package);
+    let packages = reachable_packages(context.graph, Vec::from_array([context.graph.entry_package]))?;
+    commands.push(
+        Link {
+            input_cores: core_outputs(context, output_root, packages),
+            entry_package: context.graph.entry_package,
+            output: module_relative(context.graph.module_dir, main_go),
+            world: compiler_world_path(context),
+        },
+    );
+    let executable = executable_path_for(context, context.graph.entry_package);
+    if build_executable {
+        commands.push(
+            GoBuild {
+                input: module_relative(context.graph.module_dir, main_go),
+                output: module_relative(context.graph.module_dir, executable),
+            },
+        )
+    }
+    Ok(
+        Plan {
+            commands,
+            executable: if build_executable {
+                Some(executable)
+            } else {
+                None
+            },
+            test_groups: Vec::new(),
+        },
+    )
+}
+
+pub fn build_target_artifacts_plan(context: Context) -> Result[Plan, failure::Failure] {
+    target_build_plan(context, false)
+}
+
+pub fn run_plan(context: Context) -> Result[Plan, failure::Failure] {
+    target_build_plan(context, true)
+}
+
+fn append_test_package(
+    context: Context,
+    graph: Graph,
+    dependency_root: string,
+    output_root: string,
+    compiled_dependencies: collections::HashSet[string],
+    commands: Vec[Command],
+) -> Result[(), failure::Failure] {
+    for package_name in graph.order {
+        if package_name == graph.entry_package || compiled_dependencies.contains(package_name) {} else {
+            let compiled = compile_package_command(
+                graph,
+                context.graph.module_dir,
+                package_name,
+                dependency_root,
+                dependency_root,
+                build_model::BUILD_SUBCOMMAND,
+                compiler_world_path(context),
+            )?;
+            commands.push(compiled);
+            let _ = compiled_dependencies.insert(package_name);
+        }
+    }
+    let compiled = compile_test_package_command(
+        graph,
+        context.graph.module_dir,
+        graph.entry_package,
+        dependency_root,
+        output_root,
+        compiled_dependencies.contains(graph.entry_package),
+        compiler_world_path(context),
+    )?;
+    commands.push(compiled);
+    Ok(())
+}
+
+fn append_test_group(
+    context: Context,
+    graphs: Vec[Graph],
+    dependency_root: string,
+    output_root: string,
+    kind: string,
+    packages: Vec[string],
+    commands: Vec[Command],
+    groups: Vec[TestGroup],
+) -> () {
+    let test_packages: collections::HashSet[string] = collections::HashSet::new();
+    for graph in graphs {
+        let _ = test_packages.insert(graph.entry_package);
+    }
+    let input_cores: Vec[string] = Vec::new();
+    let added: collections::HashSet[string] = collections::HashSet::new();
+    for package_name in context.graph.order {
+        let root = if test_packages.contains(package_name) {
+            output_root
+        } else {
+            dependency_root
+        };
+        input_cores.push(
+            module_relative(
+                context.graph.module_dir,
+                extension(package_artifact_base(root, context.graph, package_name), "core"),
+            ),
+        );
+        let _ = added.insert(package_name);
+    }
+    for graph in graphs {
+        for package_name in graph.order {
+            if added.contains(package_name) {} else {
+                let root = if test_packages.contains(package_name) {
+                    output_root
+                } else {
+                    dependency_root
+                };
+                input_cores.push(
+                    module_relative(
+                        context.graph.module_dir,
+                        extension(package_artifact_base(root, graph, package_name), "core"),
+                    ),
+                );
+                let _ = added.insert(package_name);
+            }
+        }
+    }
+    let main_go = path::join(output_root, "goml_generated.go");
+    let manifest = path::join(output_root, "tests.json");
+    commands.push(
+        TestLink {
+            input_cores,
+            packages,
+            output: module_relative(context.graph.module_dir, main_go),
+            manifest: module_relative(context.graph.module_dir, manifest),
+            world: compiler_world_path(context),
+        },
+    );
+    let runner = path::join(output_root, "runner");
+    commands.push(
+        GoBuild {
+            input: module_relative(context.graph.module_dir, main_go),
+            output: module_relative(context.graph.module_dir, runner),
+        },
+    );
+    groups.push(TestGroup { kind, manifest, runner });
+}
+
+pub fn test_plan(context: Context, kind: string) -> Result[Plan, failure::Failure] {
+    if context.graph.module_path == "std" {
+        return standard_library_test_plan(context, kind)
+    }
+    let dependency_root = path::join(path::join(context.artifact_root, "test"), "base");
+    let commands = compile_commands(
+        context,
+        dependency_root,
+        build_model::BUILD_SUBCOMMAND,
+        build_model::BUILD_SUBCOMMAND,
+        context.graph.order,
+    )?;
+    let compiled_dependencies: collections::HashSet[string] = collections::HashSet::new();
+    for package_name in context.graph.order {
+        let _ = compiled_dependencies.insert(package_name);
+    }
+    let groups: Vec[TestGroup] = Vec::new();
+    let internal: Vec[Graph] = match kind {
+        build_model::INTERNAL_TEST_KIND | build_model::ALL_TEST_KIND => internal_test_graphs(
+            context,
+        )?,
+        _ => Vec::new(),
+    };
+    let internal_root = path::join(
+        path::join(context.artifact_root, "test"),
+        build_model::INTERNAL_TEST_KIND,
+    );
+    let internal_graphs: Vec[Graph] = Vec::new();
+    let internal_packages: Vec[string] = Vec::new();
+    for graph in internal {
+        let package_name = graph.entry_package;
+        append_test_package(
+            context,
+            graph,
+            dependency_root,
+            internal_root,
+            compiled_dependencies,
+            commands,
+        )?;
+        internal_graphs.push(graph);
+        internal_packages.push(package_name)
+    }
+    if !internal_graphs.is_empty() {
+        append_test_group(
+            context,
+            internal_graphs,
+            dependency_root,
+            internal_root,
+            build_model::INTERNAL_TEST_KIND,
+            internal_packages,
+            commands,
+            groups,
+        )
+    }
+    let external: Vec[ExternalTest] = match kind {
+        build_model::EXTERNAL_TEST_KIND | build_model::ALL_TEST_KIND => external_test_graphs(
+            context,
+        )?,
+        _ => Vec::new(),
+    };
+    let external_root = path::join(
+        path::join(context.artifact_root, "test"),
+        build_model::EXTERNAL_TEST_KIND,
+    );
+    let external_graphs: Vec[Graph] = Vec::new();
+    let external_packages: Vec[string] = Vec::new();
+    for test in external {
+        let package_name = test.graph.entry_package;
+        append_test_package(
+            context,
+            test.graph,
+            dependency_root,
+            external_root,
+            compiled_dependencies,
+            commands,
+        )?;
+        external_graphs.push(test.graph);
+        external_packages.push(package_name);
+        external_packages.push(test.target_package)
+    }
+    if !external_graphs.is_empty() {
+        append_test_group(
+            context,
+            external_graphs,
+            dependency_root,
+            external_root,
+            build_model::EXTERNAL_TEST_KIND,
+            external_packages,
+            commands,
+            groups,
+        )
+    }
+    Ok(Plan { commands, executable: None, test_groups: groups })
+}

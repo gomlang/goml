@@ -1,0 +1,610 @@
+package build;
+
+use module::project::{Context, apply_native_environment, module_relative};
+use module::build_model::{Command, Plan};
+use module::failure;
+use failure::DriverResult;
+use module::util;
+use std::collections;
+use std::fs;
+use std::io;
+use std::path;
+use std::process;
+use std::task;
+use std::text;
+use std::time;
+use module::build_model;
+
+struct BuildNode {
+    index: isize,
+    command: Command,
+    dependencies: collections::IndexSet[isize],
+}
+
+struct BuildGraph {
+    nodes: Vec[BuildNode],
+}
+
+struct BuildLock {
+    path: string,
+}
+
+fn build_lock_path(context: Context) -> string {
+    path::join(context.artifact_root, ".goml-build-lock")
+}
+
+fn build_lock_is_stale(path_value: string) -> bool {
+    match fs::metadata(path_value) {
+        Ok(metadata) => {
+            let age = time::SystemTime::now().unix_nanoseconds()
+                - metadata.modified_unix_nanoseconds();
+            age > 86400000000000
+        },
+        Err(_) => false,
+    }
+}
+
+fn acquire_build_lock(context: Context) -> Result[BuildLock, failure::Failure] {
+    fs::create_dir_all(context.artifact_root).driver_result()?;
+    let lock_path = build_lock_path(context);
+    let started = time::Instant::now();
+    loop {
+        match fs::create_dir(lock_path) {
+            Ok(()) => return Ok(BuildLock { path: lock_path }),
+            Err(error) => if error.kind() == io::ErrorKind::AlreadyExists {
+                if build_lock_is_stale(lock_path) {
+                    fs::remove_dir_all(lock_path).driver_result()?
+                } else if started.elapsed().as_seconds() >= 30 {
+                    return Err(failure::convert("timed out waiting for build lock " + lock_path))
+                } else {
+                    time::sleep(time::Duration::from_milliseconds(1))
+                }
+            } else {
+                return Err(failure::convert(error))
+            },
+        }
+    }
+}
+
+impl BuildLock {
+    fn release(self) -> Result[(), failure::Failure] {
+        fs::remove_dir_all(self.path).map_err(failure::convert)
+    }
+}
+
+pub fn with_build_lock[T](context: Context, action: () -> Result[T, failure::Failure]) -> Result[
+    T,
+    failure::Failure,
+] {
+    let lock = acquire_build_lock(context)?;
+    let result = action();
+    match result {
+        Ok(value) => match lock.release() {
+            Ok(()) => Ok(value),
+            Err(error) => Err(error),
+        },
+        Err(error) => match lock.release() {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(failure::combine(error, cleanup.context("release build lock"))),
+        },
+    }
+}
+
+pub fn display_args(program: string, args: Vec[string]) -> string {
+    let builder = text::StringBuilder::new();
+    builder.write_string(program);
+    for argument in args {
+        builder.write_char(' ');
+        builder.write_string(util::shell_escape(argument))
+    }
+    builder.finish()
+}
+
+pub fn display_command(value: Command) -> string {
+    let command = value.args();
+    display_args(command.0, command.1)
+}
+
+fn ensure_output_parent(value: Command, module_dir: string) -> Result[(), failure::Failure] {
+    let output = match value {
+        Compile { output, .. } | ToolchainCompile { output, .. } | PackToolchainWorld { output, .. } | Link {
+            output,
+            ..,
+        } | TestLink { output, .. } | GoBuild { output, .. } => output,
+    };
+    let absolute = if path::is_absolute(output) {
+        output
+    } else {
+        path::join(module_dir, output)
+    };
+    match path::parent(absolute) {
+        Some(parent) => fs::create_dir_all(parent).map_err(failure::convert),
+        None => Ok(()),
+    }
+}
+
+fn execute_command(cancel: task::CancelToken, context: Context, value: Command) -> Result[
+    (),
+    failure::Failure,
+] {
+    ensure_output_parent(value, context.graph.module_dir)?;
+    if let GoBuild { input, output } = value {
+        return run_recorded_go_build(cancel, context, input, output)
+    }
+    let command = value.args();
+    if context.build_options.explain.is_some() {
+        if let Link { .. } = value {
+            command.1.push("--explain-performance");
+        }
+    }
+    let program = match command.0 {
+        build_model::GOMLC_PROGRAM => context.compiler,
+        _ => command.0,
+    };
+    let process = process::Command::new(program).args(command.1).current_dir(
+        context.graph.module_dir,
+    );
+    match apply_native_environment(process, context).status_cancel_structured(cancel) {
+        Ok(status) => if process::ExitStatus::success(status) {
+            Ok(())
+        } else {
+            Err(failure::convert(f"{display_command(value)} failed"))
+        },
+        Err(error) => if error.kind() == io::ErrorKind::Interrupted {
+            Err(failure::convert("build cancelled"))
+        } else {
+            Err(failure::convert(error))
+        },
+    }
+}
+
+struct PreparedCache {
+    spec: CacheSpec,
+    fingerprint: string,
+}
+
+enum CachePreparation {
+    Fresh,
+    Execute(Option[PreparedCache]),
+}
+
+fn prepare_cached_command(
+    digests: DigestCache,
+    context: Context,
+    command: Command,
+    identity: string,
+) -> Result[CachePreparation, failure::Failure] {
+    match command {
+        GoBuild { .. } => return Ok(CachePreparation::Execute(None)),
+        Link { .. } if context.build_options.explain.is_some() => {
+            let spec = cache_spec(command);
+            prepare_cache_execution(context, spec)?;
+            return Ok(CachePreparation::Execute(None))
+        },
+        _ => (),
+    }
+    let spec = cache_spec(command);
+    let fingerprint = command_fingerprint(digests, context, identity, spec)?;
+    let fresh = cache_is_fresh(digests, context, spec, fingerprint)?;
+    if fresh {
+        Ok(CachePreparation::Fresh)
+    } else {
+        invalidate_output_digests(digests, context.graph.module_dir, spec.outputs);
+        prepare_cache_execution(context, spec)?;
+        Ok(CachePreparation::Execute(Some(PreparedCache { spec, fingerprint })))
+    }
+}
+
+fn execute_prepared_command(
+    cancel: task::CancelToken,
+    context: Context,
+    command: Command,
+    cache: Option[PreparedCache],
+) -> Result[(), failure::Failure] {
+    match execute_command(cancel, context, command) {
+        Ok(()) => Ok(()),
+        Err(message) => {
+            if let Some(value) = cache {
+                let _ = prepare_cache_execution(context, value.spec);
+            }
+            Err(failure::convert(message))
+        },
+    }
+}
+
+fn finish_prepared_command(
+    digests: DigestCache,
+    context: Context,
+    identity: string,
+    cache: Option[PreparedCache],
+) -> Result[(), failure::Failure] {
+    match cache {
+        Some(value) => store_cache(digests, context, value.spec, identity, value.fingerprint),
+        None => Ok(()),
+    }
+}
+
+fn abandon_prepared_command(context: Context, cache: Option[PreparedCache]) -> () {
+    if let Some(value) = cache {
+        let _ = prepare_cache_execution(context, value.spec);
+    }
+}
+
+pub fn build_graph(commands: Vec[Command]) -> BuildGraph {
+    let producers: HashMap[string, Vec[isize]] = HashMap::new();
+    for index in 0..commands.len() {
+        for output in cache_spec(commands[index]).outputs {
+            producers.entry(output).or_insert_with(|| Vec::new()).push(index)
+        }
+    }
+    let result: Vec[BuildNode] = Vec::new();
+    for index in 0..commands.len() {
+        let command = commands[index];
+        let dependencies: collections::IndexSet[isize] = collections::IndexSet::new();
+        let spec = cache_spec(command);
+        for input in spec.inputs {
+            let mut previous = -1;
+            let mut following = -1;
+            if let Some(values) = producers[input] {
+                for candidate in values {
+                    if candidate < index && candidate > previous {
+                        previous = candidate;
+                    } else if candidate > index && following < 0 {
+                        following = candidate;
+                    }
+                }
+            }
+            let producer = if previous >= 0 {
+                previous
+            } else {
+                following
+            };
+            if producer >= 0 {
+                let _ = dependencies.insert(producer);
+            }
+        }
+        for output in spec.outputs {
+            let mut previous = -1;
+            if let Some(values) = producers[output] {
+                for candidate in values {
+                    if candidate < index && candidate > previous {
+                        previous = candidate;
+                    }
+                }
+            }
+            if previous >= 0 {
+                let _ = dependencies.insert(previous);
+            }
+        }
+        result.push(BuildNode { index, command, dependencies })
+    }
+    BuildGraph { nodes: result }
+}
+
+fn build_node(nodes: Vec[BuildNode], index: isize) -> Option[BuildNode] {
+    if index >= 0 && index < nodes.len() {
+        Some(nodes[index])
+    } else {
+        None
+    }
+}
+
+impl BuildNode {
+    fn is_ready(self, completed: collections::BitSet) -> bool {
+        for dependency in self.dependencies {
+            if !completed.contains(dependency) {
+                return false
+            }
+        }
+        true
+    }
+}
+
+fn take_ready_build_node(nodes: Vec[BuildNode], pending: Vec[isize], completed: collections::BitSet) -> Result[
+    Option[BuildNode],
+    failure::Failure,
+] {
+    let mut position = 0;
+    while position < pending.len() {
+        let index = pending[position];
+        let Some(node) = build_node(nodes, index) else {
+            return Err(failure::convert(f"build graph omitted node {index}"))
+        };
+        if node.is_ready(completed) {
+            let _ = pending.remove(position);
+            return Ok(Some(node))
+        } else {
+            position += 1;
+        }
+    }
+    Ok(None)
+}
+
+struct BuildWork {
+    index: isize,
+    command: Command,
+    cache: Option[PreparedCache],
+}
+
+struct BuildWorkResult {
+    index: isize,
+    cache: Option[PreparedCache],
+    result: Result[(), failure::Failure],
+    completion: Option[Channel[bool]],
+}
+
+fn accept_build_result(
+    scope: task::Scope,
+    digests: DigestCache,
+    context: Context,
+    identity: string,
+    received: Option[BuildWorkResult],
+    completed_nodes: collections::BitSet,
+    completed: Ref[isize],
+) -> Result[(), failure::Failure] {
+    let Some(value) = received else {
+        scope.cancel();
+        return Err(failure::convert("build result channel closed early"))
+    };
+    completed.set(completed.get() + 1);
+    match value.result {
+        Ok(()) => match finish_prepared_command(digests, context, identity, value.cache) {
+            Ok(()) => {
+                if let Some(completion) = value.completion {
+                    completion.send(true)
+                }
+                let _ = completed_nodes.insert(value.index);
+                Ok(())
+            },
+            Err(message) => {
+                if let Some(completion) = value.completion {
+                    completion.send(false)
+                }
+                scope.cancel();
+                Err(failure::convert(message))
+            },
+        },
+        Err(message) => {
+            scope.cancel();
+            Err(failure::convert(message))
+        },
+    }
+}
+
+fn execute_plan_worker(
+    cancel: task::CancelToken,
+    context: Context,
+    work: Channel[BuildWork],
+    results: Channel[BuildWorkResult],
+) -> Result[(), failure::Failure] {
+    loop {
+        match task::recv_with(cancel, work) {
+            Completed(Some(value)) => {
+                let result = execute_prepared_command(cancel, context, value.command, value.cache);
+                let completion: Channel[bool] = Channel::new(1);
+                results.send(
+                    BuildWorkResult {
+                        index: value.index,
+                        cache: value.cache,
+                        result,
+                        completion: if result.is_ok() {
+                            Some(completion)
+                        } else {
+                            None
+                        },
+                    },
+                );
+                result?;
+                match task::recv_with(cancel, completion) {
+                    Completed(Some(true)) => (),
+                    Completed(Some(false)) | Completed(None) | Cancelled => abandon_prepared_command(
+                        context,
+                        value.cache,
+                    ),
+                }
+            },
+            Completed(None) | Cancelled => break,
+        }
+    }
+    Ok(())
+}
+
+fn execute_plan_concurrently(
+    scope: task::Scope,
+    digests: DigestCache,
+    context: Context,
+    graph: BuildGraph,
+    identity: string,
+    jobs: isize,
+    completed: Ref[isize],
+) -> Result[(), failure::Failure] {
+    let total = graph.nodes.len();
+    let pending: Vec[isize] = Vec::new();
+    for node in graph.nodes {
+        pending.push(node.index)
+    }
+    let completed_nodes = collections::BitSet::new();
+    let mut running = 0;
+    let worker_count = if jobs < total {
+        jobs
+    } else {
+        total
+    };
+    let work: Channel[BuildWork] = Channel::new(0);
+    let results: Channel[BuildWorkResult] = Channel::new(worker_count);
+    for _ in 0..worker_count {
+        let _ = scope.spawn_try(
+            |cancel: task::CancelToken| execute_plan_worker(cancel, context, work, results),
+        );
+    }
+    let mut prepared: Option[BuildWork] = None;
+    while !pending.is_empty() || prepared.is_some() || running > 0 {
+        while prepared.is_none() && running < worker_count {
+            let next = match take_ready_build_node(graph.nodes, pending, completed_nodes) {
+                Ok(value) => value,
+                Err(message) => {
+                    scope.cancel();
+                    return Err(failure::convert(message))
+                },
+            };
+            let Some(node) = next else {
+                break
+            };
+            util::display_progress(completed.get(), total, node.command.progress_label(), false);
+            match prepare_cached_command(digests, context, node.command, identity) {
+                Ok(Fresh) => {
+                    let _ = completed_nodes.insert(node.index);
+                    completed.set(completed.get() + 1);
+                },
+                Ok(Execute(cache)) => {
+                    prepared = Some(BuildWork { index: node.index, command: node.command, cache });
+                },
+                Err(message) => {
+                    scope.cancel();
+                    return Err(failure::convert(message))
+                },
+            }
+        }
+        match prepared {
+            Some(value) => if running == 0 {
+                match task::send_with(scope.token(), work, value) {
+                    Completed(()) => {
+                        prepared = None;
+                        running += 1;
+                    },
+                    Cancelled => {
+                        abandon_prepared_command(context, value.cache);
+                        return Err(failure::convert("build cancelled"))
+                    },
+                }
+            } else if scope.token().is_cancelled() {
+                match accept_build_result(
+                    scope,
+                    digests,
+                    context,
+                    identity,
+                    results.recv(),
+                    completed_nodes,
+                    completed,
+                ) {
+                    Ok(()) => {
+                        running -= 1;
+                    },
+                    Err(message) => {
+                        abandon_prepared_command(context, value.cache);
+                        return Err(failure::convert(message))
+                    },
+                }
+            } else {
+                select {
+                    send(work, value) => {
+                        prepared = None;
+                        running += 1;
+                    },
+                    recv(results) as received => match accept_build_result(
+                        scope,
+                        digests,
+                        context,
+                        identity,
+                        received,
+                        completed_nodes,
+                        completed,
+                    ) {
+                        Ok(()) => {
+                            running -= 1;
+                        },
+                        Err(message) => {
+                            abandon_prepared_command(context, value.cache);
+                            return Err(failure::convert(message))
+                        },
+                    },
+                }
+            },
+            None => if running > 0 {
+                accept_build_result(
+                    scope,
+                    digests,
+                    context,
+                    identity,
+                    results.recv(),
+                    completed_nodes,
+                    completed,
+                )?;
+                running -= 1;
+            } else if !pending.is_empty() {
+                scope.cancel();
+                return Err(failure::convert("build plan contains a dependency cycle"))
+            },
+        }
+    }
+    work.close();
+    results.close();
+    Ok(())
+}
+
+pub fn execute_plan(context: Context, plan: Plan, dry_run: bool, jobs: isize) -> Result[
+    (),
+    failure::Failure,
+] {
+    if !dry_run && jobs < 1 {
+        return Err(failure::convert("build jobs must be greater than zero"))
+    }
+    if dry_run {
+        for command in plan.commands {
+            let invocation = command.args();
+            if let GoBuild { .. } = command {
+                if let Some(value) = effective_pgo(context) {
+                    invocation.1.insert(1, "-pgo=" + value);
+                }
+            }
+            if context.build_options.explain.is_some() {
+                if let Link { .. } = command {
+                    invocation.1.push("--explain-performance");
+                }
+            }
+            io::println(display_args(invocation.0, invocation.1))
+        }
+        return Ok(())
+    }
+    let total = plan.commands.len();
+    let completed = Ref::new(0);
+    let identity = compiler_digest(context)?;
+    let graph = build_graph(plan.commands);
+    let digests = digest_cache();
+    task::try_scope(
+        |scope: task::Scope| execute_plan_concurrently(
+            scope,
+            digests,
+            context,
+            graph,
+            identity,
+            jobs,
+            completed,
+        ),
+    )?;
+    util::display_progress(completed.get(), total, "finished", true);
+    Ok(())
+}
+
+pub fn run_executable(context: Context, executable: string, args: Vec[string], dry_run: bool) -> Result[
+    (),
+    failure::Failure,
+] {
+    let relative = module_relative(context.graph.module_dir, executable);
+    if dry_run {
+        io::println(display_args(relative, args));
+        Ok(())
+    } else {
+        match process::Command::new(executable).args(args).current_dir(context.graph.module_dir).status_structured() {
+            Ok(status) => if process::ExitStatus::success(status) {
+                Ok(())
+            } else {
+                match process::ExitStatus::code(status) {
+                    Some(code) => Err(failure::convert(f"program exited with status {code}")),
+                    None => Err(failure::convert("program terminated by signal")),
+                }
+            },
+            Err(error) => Err(failure::convert(error)),
+        }
+    }
+}
