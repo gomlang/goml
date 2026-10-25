@@ -1,0 +1,309 @@
+package registry;
+
+use module::failure;
+use failure::DriverResult;
+use module::manifest;
+use module::registry::index as index;
+use module::registry::resolver;
+use std::bytes;
+use std::collections;
+use std::crypto::hash;
+use std::crypto::rand;
+use std::fs;
+use std::path;
+use std::process;
+use std::json;
+
+fn locked_checkout_directory(root: string, entry: LockedModule) -> string {
+    path::join(
+        path::join(root, "revisions"),
+        hash::sha256(bytes::Bytes::from_string(entry.source)) + "/" + entry.revision,
+    )
+}
+
+fn checkout_files(directory: string, prefix: string, result: Vec[string]) -> Result[
+    (),
+    failure::Failure,
+] {
+    for entry in fs::read_dir_structured(path::join(directory, prefix)).driver_result()? {
+        if prefix == "" && entry.name() == ".git" {
+            continue
+        }
+        let name = if prefix == "" {
+            entry.name()
+        } else {
+            prefix + "/" + entry.name()
+        };
+        let kind = fs::symlink_metadata(path::join(directory, name)).driver_result()?.file_type();
+        if kind.is_dir() {
+            checkout_files(directory, name, result)?;
+        } else if kind.is_file() {
+            result.push(name);
+        } else {
+            return Err(
+                failure::convert(
+                    "locked sources require regular files, not symlinks or special files: " + name,
+                ),
+            )
+        }
+    }
+    Ok(())
+}
+
+fn checkout_checksum(directory: string) -> Result[string, failure::Failure] {
+    let tree = git(Vec::from_array(["-C", directory, "ls-tree", "-r", "-z", "--full-tree", "HEAD"]))?;
+    let tracked = collections::HashSet::new();
+    let entries = Vec::new();
+    for entry in tree.split("\u0000") {
+        if entry == "" {
+            continue
+        }
+        let Some((header, name)) = entry.split_once("\t") else {
+            return Err(failure::convert("invalid locked Git tree"))
+        };
+        let fields = header.split(" ");
+        if fields.len() != 3 || (fields[0] != "100644" && fields[0] != "100755") {
+            return Err(
+                failure::convert(
+                    "locked Git sources do not support symlinks, submodules or special files: "
+                        + name,
+                ),
+            )
+        }
+        let filename = path::join(directory, name);
+        let metadata = fs::symlink_metadata(filename).driver_result()?;
+        if !metadata.file_type().is_file() {
+            return Err(failure::convert("locked source is not a regular file: " + filename))
+        }
+        let executable = metadata.permissions().mode() & 0o111 != 0;
+        if executable != (fields[0] == "100755") {
+            return Err(failure::convert("locked source permission mismatch: " + filename))
+        }
+        let actual_blob = git(
+            Vec::from_array(["-C", directory, "hash-object", "--no-filters", "--", name]),
+        )?;
+        if actual_blob != fields[2] {
+            return Err(failure::convert("locked source has modified or extra files at " + filename))
+        }
+        let _ = tracked.insert(name);
+        entries.push(
+            json::Value::Array(
+                Vec::from_array(
+                    [
+                        json::Value::String(name),
+                        json::Value::String(fields[0]),
+                        json::Value::String(fs::sha256_file(filename).driver_result()?),
+                    ],
+                ),
+            ),
+        );
+    }
+    let actual = Vec::new();
+    checkout_files(directory, "", actual)?;
+    if actual.len() != tracked.len() {
+        return Err(failure::convert("locked source has modified or extra files at " + directory))
+    }
+    for name in actual {
+        if !tracked.contains(name) {
+            return Err(
+                failure::convert("locked source has modified or extra files at " + directory),
+            )
+        }
+    }
+    Ok(hash::sha256(bytes::Bytes::from_string(json::encode(json::Value::Array(entries)))))
+}
+
+fn verify_checkout(directory: string, entry: LockedModule) -> Result[(), failure::Failure] {
+    let revision = git(Vec::from_array(["-C", directory, "rev-parse", "HEAD"]))?;
+    if revision != entry.revision {
+        return Err(
+            failure::convert("locked revision mismatch for " + entry.name + " at " + directory),
+        )
+    }
+    let state = git(
+        Vec::from_array(
+            ["-C", directory, "status", "--porcelain", "--untracked-files=all", "--ignored"],
+        ),
+    )?;
+    if state != "" {
+        return Err(
+            failure::convert(
+                "locked source has modified or extra files for " + entry.name + " at " + directory,
+            ),
+        )
+    }
+    if checkout_checksum(directory)? != entry.checksum {
+        return Err(
+            failure::convert(
+                "locked source checksum mismatch for " + entry.name + " at " + directory,
+            ),
+        )
+    }
+    Ok(())
+}
+
+fn ensure_locked_checkout(root: string, entry: LockedModule, fetch: bool, seed: Option[string]) -> Result[
+    string,
+    failure::Failure,
+] {
+    let directory = locked_checkout_directory(root, entry);
+    if fs::exists(directory) {
+        verify_checkout(directory, entry)?;
+        return fs::canonicalize(directory).driver_result()
+    }
+    if !fetch && seed.is_none() {
+        return Err(
+            failure::convert(
+                "locked source is not cached: " + entry.name + " from " + entry.source + " at "
+                    + entry.revision
+                    + "; offline/read-only resolution cannot fetch it",
+            ),
+        )
+    }
+    let parent = path::parent(directory).unwrap_or(root);
+    fs::create_dir_all(parent).driver_result()?;
+    let temporary = path::join(parent, ".lock-" + hash::sha256(rand::bytes(32).driver_result()?));
+    let prepare = || {
+        let _ = git(Vec::from_array(["init", "--quiet", temporary]))?;
+        let _ = git(Vec::from_array(["-C", temporary, "config", "core.autocrlf", "false"]))?;
+        let _ = git(
+            Vec::from_array(
+                [
+                    "-C",
+                    temporary,
+                    "-c",
+                    "protocol.file.allow=always",
+                    "fetch",
+                    "--no-tags",
+                    "--depth",
+                    "1",
+                    "--",
+                    seed.unwrap_or(entry.source),
+                    entry.revision,
+                ],
+            ),
+        )?;
+        let _ = git(
+            Vec::from_array(["-C", temporary, "checkout", "--detach", "--quiet", "FETCH_HEAD"]),
+        )?;
+        let tracked = git(Vec::from_array(["-C", temporary, "ls-files", "--stage"]))?;
+        for line in tracked.split("\n") {
+            if line.starts_with("160000 ") {
+                return Err(
+                    failure::convert("locked git submodules are not supported: " + entry.name),
+                )
+            }
+        }
+        verify_checkout(temporary, entry)?;
+        match fs::rename(temporary, directory) {
+            Ok(()) => (),
+            Err(error) => {
+                if !fs::is_dir(directory) {
+                    return Err(failure::convert(error))
+                }
+                verify_checkout(directory, entry)?;
+            },
+        }
+        fs::canonicalize(directory).driver_result()
+    };
+    let result = prepare();
+    if fs::exists(temporary) {
+        fs::remove_dir_all(temporary).driver_result()?;
+    }
+    result
+}
+
+pub fn lock_dependencies(module_root: string, root: string, offline: bool, refresh: bool) -> Result[
+    (),
+    failure::Failure,
+] {
+    let module_root = fs::canonicalize(module_root).driver_result()?;
+    let metadata = manifest::load_structured(path::join(module_root, manifest::FILENAME))?;
+    let overrides = manifest::local_overrides(module_root, metadata).driver_result()?;
+    let lock_path = path::join(module_root, "goml.lock");
+    let existing: Option[DependencyLock] = if !refresh && fs::exists(lock_path) {
+        Some(parse_lock(fs::read_file_structured(lock_path).driver_result()?)?)
+    } else {
+        None
+    };
+    let provider = RegistryProvider {
+        fetch: !offline,
+        refresh: refresh && !offline,
+        lock: existing,
+        lock_fetch: !offline,
+        lock_updates: true,
+        allow_unlocked_offline: true,
+        ..cached_provider(),
+    };
+    let resolved = resolver::resolve_development(
+        provider,
+        module_root,
+        resolver::Manifest {
+            module_path: metadata.module_path,
+            dependencies: metadata.dependencies,
+        },
+        metadata.dev_dependencies,
+        overrides,
+        root,
+    )?;
+    let modules = Vec::new();
+    for module in resolved {
+        let dependencies = lock_dependency_names(module.dependencies);
+        if module.local {
+            modules.push(
+                LockedModule {
+                    name: module.name,
+                    source_kind: "local",
+                    source: path::relative(module_root, module.root).driver_result()?,
+                    revision: "",
+                    checksum: "",
+                    dependencies,
+                },
+            );
+        } else {
+            let pinned: Option[LockedModule] = existing.and_then(
+                |lock| match locked_module(lock, module.name) {
+                    Ok(value) => Some(value),
+                    Err(_) => None,
+                },
+            );
+            let source: Option[string] = match pinned {
+                Some(entry) => if entry.source_kind == "git" {
+                    Some(entry.source)
+                } else {
+                    None
+                },
+                None => index::find(load_index(root)?, module.name).driver_result()?.git,
+            };
+            if let Some(source) = source {
+                let value = LockedModule {
+                    name: module.name,
+                    source_kind: "git",
+                    source,
+                    revision: git(Vec::from_array(["-C", module.root, "rev-parse", "HEAD"]))?,
+                    checksum: checkout_checksum(module.root)?,
+                    dependencies,
+                };
+                verify_checkout(module.root, value)?;
+                let _ = ensure_locked_checkout(root, value, false, Some(module.root))?;
+                modules.push(value);
+            } else {
+                modules.push(
+                    LockedModule {
+                        name: module.name,
+                        source_kind: "local",
+                        source: module.root,
+                        revision: "",
+                        checksum: "",
+                        dependencies,
+                    },
+                );
+            }
+        }
+    }
+    let value = DependencyLock {
+        fingerprint: lock_fingerprint(module_root, metadata, overrides)?,
+        modules,
+    };
+    fs::atomic_write(path::join(module_root, "goml.lock"), encode_lock(value)).driver_result()
+}

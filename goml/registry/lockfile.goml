@@ -1,0 +1,284 @@
+package registry;
+
+use module::failure;
+use failure::DriverResult;
+use module::manifest;
+use module::manifest::config;
+use std::bytes;
+use std::collections;
+use std::crypto::hash;
+use std::fs;
+use std::json;
+use std::path;
+
+pub struct ResolutionOptions {
+    pub locked: bool,
+    pub offline: bool,
+}
+
+static RESOLUTION_OPTIONS: OnceCell[ResolutionOptions] = OnceCell::new();
+
+pub fn configure_resolution(locked: bool, offline: bool) -> () {
+    let _ = RESOLUTION_OPTIONS.get_or_init(|| ResolutionOptions { locked, offline });
+}
+
+pub fn resolution_options() -> ResolutionOptions {
+    RESOLUTION_OPTIONS.get_or_init(|| ResolutionOptions { locked: false, offline: false })
+}
+
+pub struct LockedModule {
+    pub name: string,
+    pub source_kind: string,
+    pub source: string,
+    pub revision: string,
+    pub checksum: string,
+    pub dependencies: Vec[string],
+}
+
+struct DependencyLock {
+    fingerprint: string,
+    modules: Vec[LockedModule],
+}
+
+fn lock_strings(values: Vec[string]) -> json::Value {
+    let sorted = Vec::new();
+    for value in values {
+        sorted.push(value);
+    }
+    collections::sort(sorted);
+    let result = Vec::new();
+    for value in sorted {
+        result.push(json::Value::String(value));
+    }
+    json::Value::Array(result)
+}
+
+fn lock_dependency_names(dependencies: Vec[config::Dependency]) -> Vec[string] {
+    let result = Vec::new();
+    for value in dependencies {
+        result.push(value.name);
+    }
+    collections::sort(result);
+    result
+}
+
+fn lock_requirements(dependencies: Vec[config::Dependency]) -> json::Value {
+    let values = Vec::new();
+    for dependency in dependencies {
+        values.push(dependency.name + "=" + dependency.path.unwrap_or("<registry>"));
+    }
+    lock_strings(values)
+}
+
+fn lock_fingerprint(
+    module_root: string,
+    metadata: manifest::Manifest,
+    overrides: Vec[config::LocalModule],
+) -> Result[string, failure::Failure] {
+    let replacements = Vec::new();
+    for value in overrides {
+        replacements.push(
+            value.name + "=" + path::relative(module_root, value.root).driver_result()?,
+        );
+    }
+    let value = json::Value::Array(
+        Vec::from_array(
+            [
+                json::Value::String(metadata.module_path),
+                lock_requirements(metadata.dependencies),
+                lock_requirements(metadata.dev_dependencies),
+                lock_strings(replacements),
+            ],
+        ),
+    );
+    Ok(hash::sha256(bytes::Bytes::from_string(json::encode(value))))
+}
+
+fn lock_string(value: json::Value, key: string) -> Result[string, failure::Failure] {
+    json::field(value, key).and_then(json::as_string).ok_or(
+        failure::convert("invalid goml.lock field " + key),
+    )
+}
+
+fn lock_hex(value: string, lengths: Vec[isize]) -> bool {
+    if !lengths.contains(value.byte_len()) {
+        return false
+    }
+    for byte in value.to_bytes() {
+        if !((byte >= b'0' && byte <= b'9') || (byte >= b'a' && byte <= b'f')) {
+            return false
+        }
+    }
+    true
+}
+
+fn parse_lock(source: string) -> Result[DependencyLock, failure::Failure] {
+    let value = json::parse(source).driver_result()?;
+    if json::field(value, "version").and_then(json::as_int) != Option::Some(1) {
+        return Err(failure::convert("unsupported goml.lock version"))
+    }
+    let fingerprint = lock_string(value, "fingerprint")?;
+    if !lock_hex(fingerprint, Vec::from_array([64])) {
+        return Err(failure::convert("invalid goml.lock fingerprint"))
+    }
+    let entries = json::field(value, "modules").and_then(json::as_array).ok_or(
+        failure::convert("goml.lock requires modules"),
+    )?;
+    let modules = Vec::new();
+    let seen = collections::HashSet::new();
+    for entry in entries {
+        let name = lock_string(entry, "name")?;
+        if !seen.insert(name) {
+            return Err(failure::convert("duplicate goml.lock module " + name))
+        }
+        let source_kind = lock_string(entry, "source_kind")?;
+        let source = lock_string(entry, "source")?;
+        let revision = lock_string(entry, "revision")?;
+        let checksum = lock_string(entry, "checksum")?;
+        if source == "" || source.starts_with("-") {
+            return Err(failure::convert("invalid locked source for " + name))
+        }
+        if source_kind == "git" {
+            if !lock_hex(revision, Vec::from_array([40, 64]))
+                || !lock_hex(checksum, Vec::from_array([64])) {
+                return Err(failure::convert("invalid locked revision or checksum for " + name))
+            }
+        } else if source_kind != "local" || revision != "" || checksum != "" {
+            return Err(failure::convert("invalid locked source kind for " + name))
+        }
+        let dependencies = Vec::new();
+        for dependency in json::field(entry, "dependencies").and_then(json::as_array).ok_or(
+            failure::convert("invalid locked dependencies for " + name),
+        )? {
+            dependencies.push(
+                json::as_string(dependency).ok_or(
+                    failure::convert("invalid locked dependency for " + name),
+                )?,
+            );
+        }
+        collections::sort(dependencies);
+        modules.push(LockedModule { name, source_kind, source, revision, checksum, dependencies });
+    }
+    Ok(DependencyLock { fingerprint, modules })
+}
+
+fn encode_lock(value: DependencyLock) -> string {
+    let names = Vec::new();
+    for entry in value.modules {
+        names.push(entry.name);
+    }
+    collections::sort(names);
+    let modules = Vec::new();
+    for name in names {
+        for entry in value.modules {
+            if entry.name == name {
+                modules.push(
+                    json::Value::Object(
+                        Vec::from_array(
+                            [
+                                ("name", json::Value::String(entry.name)),
+                                ("source_kind", json::Value::String(entry.source_kind)),
+                                ("source", json::Value::String(entry.source)),
+                                ("revision", json::Value::String(entry.revision)),
+                                ("checksum", json::Value::String(entry.checksum)),
+                                ("dependencies", lock_strings(entry.dependencies)),
+                            ],
+                        ),
+                    ),
+                );
+            }
+        }
+    }
+    json::encode(
+        json::Value::Object(
+            Vec::from_array(
+                [
+                    ("version", json::Value::Number("1")),
+                    ("fingerprint", json::Value::String(value.fingerprint)),
+                    ("modules", json::Value::Array(modules)),
+                ],
+            ),
+        ),
+    )
+        + "\n"
+}
+
+fn load_dependency_lock(
+    module_root: string,
+    metadata: manifest::Manifest,
+    overrides: Vec[config::LocalModule],
+    required: bool,
+) -> Result[Option[DependencyLock], failure::Failure] {
+    let filename = path::join(module_root, "goml.lock");
+    if !fs::exists(filename) {
+        if required {
+            return Err(failure::convert("goml.lock is required by --locked; run `goml lock`"))
+        }
+        return Ok(None)
+    }
+    let value = parse_lock(fs::read_file_structured(filename).driver_result()?)?;
+    if value.fingerprint != lock_fingerprint(module_root, metadata, overrides)? {
+        return Err(
+            failure::convert(
+                "goml.lock does not match manifest or workspace sources; run `goml lock`",
+            ),
+        )
+    }
+    Ok(Some(value))
+}
+
+fn locked_module(value: DependencyLock, name: string) -> Result[LockedModule, failure::Failure] {
+    for entry in value.modules {
+        if entry.name == name {
+            return Ok(entry)
+        }
+    }
+    Err(failure::convert("goml.lock is missing module " + name + "; run `goml lock`"))
+}
+
+fn verify_locked_graph(module_root: string, value: DependencyLock, modules: Vec[ResolvedModule]) -> Result[
+    (),
+    failure::Failure,
+] {
+    for module in modules {
+        let entry = locked_module(value, module.name)?;
+        if entry.dependencies != lock_dependency_names(module.dependencies) {
+            return Err(
+                failure::convert(
+                    "locked dependency graph changed for " + module.name + "; run `goml lock`",
+                ),
+            )
+        }
+        if module.local
+            && (entry.source_kind != "local"
+                || path::relative(module_root, module.root).driver_result()? != entry.source) {
+            return Err(
+                failure::convert(
+                    "locked local source changed for " + module.name + "; run `goml lock`",
+                ),
+            )
+        }
+        if !module.local && entry.source_kind == "local"
+            && fs::canonicalize(entry.source).driver_result()? != module.root {
+            return Err(failure::convert("locked registry path changed for " + module.name))
+        }
+    }
+    Ok(())
+}
+
+pub fn locked_provenance(module_root: string, name: string) -> Result[
+    Option[LockedModule],
+    failure::Failure,
+] {
+    let filename = path::join(module_root, "goml.lock");
+    if !fs::is_file(filename) {
+        return Ok(None)
+    }
+    let lock = parse_lock(fs::read_file_structured(filename).driver_result()?)?;
+    for entry in lock.modules {
+        if entry.name == name {
+            return Ok(Some(entry))
+        }
+    }
+    Ok(None)
+}
