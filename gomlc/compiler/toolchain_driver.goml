@@ -1,0 +1,417 @@
+package compiler;
+
+use module::diagnostic;
+use module::artifact;
+use module::artifact::interface_codec as interface_codec;
+use module::artifact::wire as wire;
+use module::ast;
+use module::core;
+use module::ctir;
+use module::hir;
+use module::expand;
+use module::hash;
+use module::parser;
+use module::resources;
+use module::tast;
+use module::checker;
+use module::version;
+use std::fs;
+use std::text;
+
+struct ToolchainParsedPackage {
+    ast_values: Vec[ast::LowerResult],
+    hir_files: Vec[hir::File],
+    declared_name: string,
+    public_names: Vec[string],
+}
+
+fn toolchain_parse_sources(command: PackageCommandArgs) -> Result[
+    (Vec[ast::LowerResult], Vec[(ast::LowerResult, string)]),
+    string,
+] {
+    let ast_values: Vec[ast::LowerResult] = Vec::new();
+    let inputs: Vec[(ast::LowerResult, string)] = Vec::new();
+    for source_path in command.inputs {
+        let parsed = parser::parse(read_source(source_path));
+        if !parsed.diagnostics.is_empty() {
+            return Err("failed to parse toolchain source " + source_path)
+        }
+        let ast_value = ast::resolve_module_paths(ast::lower(parsed), command.module_name);
+        if !ast_value.diagnostics.is_empty() {
+            return Err("failed to lower toolchain source " + source_path)
+        }
+        ast_values.push(ast_value);
+        inputs.push((ast_value, source_path))
+    }
+    Ok((ast_values, inputs))
+}
+
+fn toolchain_lower_hir(
+    command: PackageCommandArgs,
+    ast_values: Vec[ast::LowerResult],
+    inputs: Vec[(ast::LowerResult, string)],
+    expanded: bool,
+) -> Result[ToolchainParsedPackage, string] {
+    let hir_files: Vec[hir::File] = Vec::new();
+    let lowered_values = if expanded {
+        hir::lower_expanded_package_files(inputs, command.package_name)
+    } else {
+        hir::lower_package_files(inputs, command.package_name)
+    };
+    for lowered in lowered_values {
+        if !lowered.diagnostics.is_empty() {
+            return Err("failed to lower toolchain source " + lowered.source_path)
+        }
+        match lowered.hir {
+            Some(file) => hir_files.push(file),
+            None => return Err("missing toolchain source " + lowered.source_path),
+        }
+    }
+    Ok(
+        ToolchainParsedPackage {
+            ast_values,
+            hir_files,
+            declared_name: artifact_declared_package_name(ast_values, command.inputs)?,
+            public_names: public_item_names(ast_values, command.package_name),
+        },
+    )
+}
+
+fn toolchain_find_interface(values: Vec[artifact::ArtifactInterfaceUnit], package_name: string) -> Option[
+    artifact::ArtifactInterfaceUnit,
+] {
+    for value in values {
+        if value.package_name == package_name {
+            return Some(value)
+        }
+    }
+    None
+}
+
+fn toolchain_sorted_interfaces(values: Vec[artifact::ArtifactInterfaceUnit]) -> Result[
+    Vec[artifact::ArtifactInterfaceUnit],
+    string,
+] {
+    let names: Vec[string] = Vec::new();
+    for value in values {
+        names.push(value.package_name)
+    }
+    let names = wire::sort_artifact_names(names);
+    let result: Vec[artifact::ArtifactInterfaceUnit] = Vec::new();
+    let mut previous: Option[string] = Option::None;
+    for name in names {
+        if let Some(value) = previous {
+            if value == name {
+                return Err("duplicate toolchain dependency " + name)
+            }
+        }
+        match toolchain_find_interface(values, name) {
+            Some(value) => result.push(value),
+            None => return Err("missing toolchain dependency " + name),
+        }
+        previous = Option::Some(name);
+    }
+    Ok(result)
+}
+
+fn toolchain_dependency_hashes(values: Vec[artifact::ArtifactInterfaceUnit]) -> Vec[
+    (string, string),
+] {
+    let result: Vec[(string, string)] = Vec::new();
+    for value in values {
+        result.push((value.package_name, value.interface_hash))
+    }
+    result
+}
+
+fn toolchain_dependency_environments_from_interfaces(values: Vec[artifact::ArtifactInterfaceUnit]) -> Result[
+    Vec[tast::DependencyEnvironment],
+    string,
+] {
+    let modules: Vec[ctir::CtModule] = Vec::new();
+    for value in values {
+        if let Some(value) = value.comptime {
+            modules.push(value.module)
+        }
+    }
+    artifact_verify_comptime_modules(modules)?;
+    let result: Vec[tast::DependencyEnvironment] = Vec::new();
+    for value in values {
+        let environment = artifact_dependency_environment_from_exports(value.exports)?;
+        let environment = if value.package_name == "builtin" {
+            checker::append_builtin_collection_methods(environment.methods)?;
+            tast::dependency_environment(
+                environment.reexports,
+                environment.enums,
+                environment.structs,
+                environment.type_aliases,
+                environment.constants,
+                Vec::new(),
+                environment.functions,
+                environment.methods,
+                Vec::new(),
+            )
+        } else {
+            environment
+        };
+        result.push(
+            tast::dependency_environment_with_comptime(
+                environment,
+                value.comptime.map(|value| value.module),
+            ),
+        )
+    }
+    Ok(result)
+}
+
+fn toolchain_derive_environment(values: Vec[artifact::ArtifactInterfaceUnit]) -> expand::DeriveEnvironment {
+    let dependencies: Vec[ctir::CtModule] = Vec::new();
+    let reexports: Vec[(string, string)] = Vec::new();
+    let mut builtin: Option[ctir::CtModule] = Option::None;
+    for value in values {
+        if let Some(comptime) = value.comptime {
+            if value.package_name == "builtin" {
+                builtin = Option::Some(comptime.module);
+            } else {
+                dependencies.push(comptime.module)
+            }
+        }
+        for reexport in value.exports.reexports {
+            reexports.push(reexport)
+        }
+    }
+    expand::DeriveEnvironment { local: Option::None, builtin, dependencies, reexports }
+}
+
+fn toolchain_expand_and_lower(
+    command: PackageCommandArgs,
+    ast_values: Vec[ast::LowerResult],
+    dependencies: Vec[artifact::ArtifactInterfaceUnit],
+) -> Result[ToolchainParsedPackage, string] {
+    let inputs: Vec[(ast::LowerResult, string)] = Vec::new();
+    let local_inputs = Vec::new();
+    for index in 0..ast_values.len() {
+        local_inputs.push((ast_values[index], command.inputs[index]))
+    }
+    let local = checker::local_derive_module(
+        local_inputs,
+        command.package_name,
+        toolchain_dependency_environments_from_interfaces(dependencies)?,
+        Vec::new(),
+    )?;
+    let environment = expand::DeriveEnvironment {
+        local,
+        ..toolchain_derive_environment(dependencies),
+    };
+    for index in 0..ast_values.len() {
+        let expanded = expand::expand_derives_with_environment(ast_values[index], environment);
+        if !expanded.diagnostics.is_empty() {
+            return Err("failed to expand toolchain source " + command.inputs[index])
+        }
+        inputs.push((expanded, command.inputs[index]))
+    }
+    toolchain_lower_hir(command, ast_values, inputs, true)
+}
+
+pub fn compile_builtin_contract_request(command: PackageCommandArgs) -> Result[
+    (PackageCompilation, isize),
+    string,
+] {
+    let parsed = toolchain_parse_sources(command)?;
+    let package_value = toolchain_lower_hir(command, parsed.0, parsed.1, false)?;
+    let checked = checker::check_builtin_package_files(package_value.hir_files);
+    if diagnostic::diagnostics_have_errors(checked.diagnostics) || checked.tast.is_none() {
+        return Err(render_typer_diagnostics(checked.diagnostics, "", ""))
+    } else {
+        emit_typer_warnings(checked.diagnostics, "", "")
+    }
+    let counter = Ref::new(0);
+    let core_value = core::lower_with_counter(checked.tast, counter);
+    let interface_unit = builtin_artifact_interface_unit_from_files(package_value.hir_files);
+    Ok(
+        (
+            PackageCompilation {
+                hir_file: merge_hir_files(package_value.hir_files, command.package_name),
+                core_value,
+                interface_unit,
+                exports: interface_unit.exports,
+            },
+            counter.get(),
+        ),
+    )
+}
+
+pub fn compile_toolchain_project_request(command: PackageCommandArgs, without_roots: bool) -> Result[
+    PackageCompilation,
+    string,
+] {
+    let dependencies = toolchain_sorted_interfaces(
+        artifact_read_interface_units(command.interface_paths)?,
+    )?;
+    let parsed = toolchain_parse_sources(command)?;
+    let package_value = toolchain_expand_and_lower(command, parsed.0, dependencies)?;
+    artifact_apply_declared_package_aliases(
+        package_value.hir_files,
+        package_value.ast_values,
+        dependencies,
+    );
+    let checked = checker::check_package_files_for_link_with_environments(
+        package_value.hir_files,
+        toolchain_dependency_environments_from_interfaces(dependencies)?,
+    );
+    if diagnostic::diagnostics_have_errors(checked.diagnostics) || checked.tast.is_none() {
+        return Err(render_typer_diagnostics(checked.diagnostics, "", ""))
+    } else {
+        emit_typer_warnings(checked.diagnostics, "", "")
+    }
+    let hir_file = merge_hir_files(package_value.hir_files, command.package_name);
+    let public_reexports = if command.package_name == "prelude" {
+        let values: Vec[(string, string)] = Vec::new();
+        for name in resources::prelude_builtin_export_names() {
+            values.push((name, name))
+        }
+        values
+    } else {
+        hir_file.public_reexports
+    };
+    let signatures = checker::package_signatures(hir_file)?;
+    let comptime_module = checked.comptime;
+    let Some(tast_file) = checked.tast else {
+        return Err("missing typed toolchain package " + command.package_name)
+    };
+    let dependency_core = artifact_dependency_core_types(dependencies);
+    let empty = empty_core_file();
+    let enum_names = artifact_dependency_type_names(empty, dependency_core, true);
+    let struct_names = artifact_dependency_type_names(empty, dependency_core, false);
+    let public_exports = artifact_package_exports(
+        tast_file,
+        signatures,
+        command.package_name,
+        package_value.public_names,
+        public_reexports,
+        true,
+        enum_names,
+        struct_names,
+    )?;
+    let exports = artifact_package_exports(
+        tast_file,
+        signatures,
+        command.package_name,
+        package_value.public_names,
+        public_reexports,
+        false,
+        enum_names,
+        struct_names,
+    )?;
+    let interface_unit = interface_codec::new_unit_with_comptime(
+        command.package_name,
+        public_exports,
+        artifact_package_interface(
+            command.package_name,
+            package_value.declared_name,
+            public_exports,
+        ),
+        artifact_comptime_unit(comptime_module, public_exports),
+        toolchain_dependency_hashes(dependencies),
+    );
+    let core_value = core::eliminate_dead_locals(
+        core::lower_with_counter_types_and_options(
+            checked.tast,
+            Ref::new(0),
+            dependency_enums(empty, dependency_core),
+            dependency_structs(empty, dependency_core),
+            true,
+        ),
+    );
+    Ok(
+        PackageCompilation {
+            hir_file,
+            core_value: if without_roots {
+                core::without_roots(core_value)
+            } else {
+                core_value
+            },
+            interface_unit,
+            exports,
+        },
+    )
+}
+
+pub fn write_toolchain_package(
+    command: PackageCommandArgs,
+    compilation: PackageCompilation,
+    counter_output: Option[(string, string)],
+) -> Result[(), string] {
+    output_snapshot(
+        command.output,
+        || {
+            if let Some((path, value)) = counter_output {
+                ensure_parent(path)?;
+                atomic_write_text(path, value)?
+            }
+            ensure_parent(interface_output_path(command.output))?;
+            write_artifact_interface(
+                interface_output_path(command.output),
+                compilation.interface_unit,
+            )?;
+            ensure_parent(core_output_path(command.output))?;
+            write_artifact_core(
+                core_output_path(command.output),
+                artifact::ArtifactCoreUnit {
+                    source_origins: Vec::new(),
+                    package_name: command.package_name,
+                    declared_name: compilation.interface_unit.package_interface.name,
+                    interface_hash: compilation.interface_unit.interface_hash,
+                    exports: compilation.exports,
+                    core_ir: compilation.core_value,
+                    deps: compilation.interface_unit.deps,
+                    sources: command.inputs,
+                    tests: Vec::new(),
+                },
+            )
+        },
+    )
+}
+
+pub fn toolchain_source_digest(paths: Vec[string]) -> Result[string, string] {
+    let paths = wire::sort_artifact_names(paths);
+    let builder = text::StringBuilder::new();
+    for path in paths {
+        builder.write_string(path);
+        builder.write_char('\u0000');
+        builder.write_string(
+            hash::sha256_hex(fs::read_file_structured(path).map_err(|error| error.to_string())?),
+        );
+        builder.write_char('\n')
+    }
+    Ok(hash::sha256_hex(builder.finish()))
+}
+
+pub fn read_toolchain_package(base: string) -> Result[ToolchainPackage, string] {
+    output_transaction(
+        base,
+        || {
+            let interface = decode_artifact_interface_bytes(
+                fs::read_bytes_structured(interface_output_path(base)).map_err(
+                    |error| error.to_string(),
+                )?,
+            )?;
+            let core = decode_artifact_core_bytes(
+                fs::read_bytes_structured(core_output_path(base)).map_err(|error| error.to_string())?,
+            )?;
+            if interface.package_name != core.package_name
+                || interface.interface_hash != core.interface_hash
+                || !world_dependencies_equal(interface.deps, core.deps) {
+                Err("toolchain package identity does not match for " + base)
+            } else {
+                Ok(
+                    ToolchainPackage {
+                        core_value: core.core_ir,
+                        interface_unit: interface,
+                        environment_exports: core.exports,
+                    },
+                )
+            }
+        },
+    )
+}
