@@ -1,0 +1,344 @@
+package api;
+
+use module::artifact::interface_codec as interface_codec;
+use module::artifact;
+use module::ctir;
+use module::ffi;
+use module::tast;
+use std::json;
+use std::testing;
+
+fn unit(exports: artifact::ArtifactPackageExports) -> artifact::ArtifactInterfaceUnit {
+    artifact::ArtifactInterfaceUnit {
+        module_scope: None,
+        package_name: "sample",
+        exports,
+        package_interface: artifact::ArtifactPackageInterface {
+            package_name: "sample",
+            name: "sample",
+            value_exports: Vec::new(),
+            enum_variants: Vec::new(),
+        },
+        comptime: None,
+        deps: Vec::new(),
+        interface_hash: "ignored",
+    }
+}
+
+fn function(name: string, ret_ty: tast::Type) -> artifact::ArtifactFnScheme {
+    artifact::ArtifactFnScheme {
+        name,
+        comptime: tast::ComptimeCapability::RuntimeOnly,
+        type_params: Vec::new(),
+        constraints: Vec::new(),
+        ty: tast::Type::Func { params: Vec::new(), ret_ty },
+        body: tast::Callable::Function(name),
+    }
+}
+
+#[test]
+fn api_snapshot_preserves_paths_identity_and_structured_contracts() -> () {
+    let exports = interface_codec::empty_exports();
+    exports.functions.push(function("sample::inner::value", tast::Type::Int));
+    exports.reexports.push(("sample::value", "sample::inner::value"));
+    let output = testing::expect_ok(
+        snapshot("sample", Vec::from_array([unit(exports)])),
+        "snapshot",
+    );
+    let value = testing::expect_ok(json::parse(output), "json");
+    let symbols = json::field(value, "symbols").unwrap_or(json::Value::Null);
+    let alias = json::field(symbols, "sample::value").unwrap_or(json::Value::Null);
+    testing::assert(
+        json::field(alias, "declaration").and_then(json::as_string)
+            == Option::Some("sample::inner::value"),
+    );
+    let contract = json::field(alias, "contract").unwrap_or(json::Value::Null);
+    testing::assert(json::field(contract, "type").is_some());
+    testing::assert(!output.contains("interface_hash"));
+    testing::assert(!output.contains("body"));
+}
+
+#[test]
+fn api_diff_reports_removed_facade_and_changed_constraints() -> () {
+    let old = interface_codec::empty_exports();
+    old.functions.push(function("sample::inner::value", tast::Type::Int));
+    old.reexports.push(("sample::value", "sample::inner::value"));
+    let current = interface_codec::empty_exports();
+    let f = function("sample::inner::value", tast::Type::Int);
+    current.functions.push(
+        artifact::ArtifactFnScheme {
+            constraints: Vec::from_array([tast::TypePredicate::GoComparable(tast::Type::Int)]),
+            ..f,
+        },
+    );
+    let before = testing::expect_ok(snapshot("sample", Vec::from_array([unit(old)])), "old");
+    let after = testing::expect_ok(snapshot("sample", Vec::from_array([unit(current)])), "new");
+    let report = testing::expect_ok(diff(before, after), "diff");
+    testing::assert(report.requires_review);
+    testing::assert(report.output.contains("sample::value"));
+    testing::assert(report.output.contains("constraints"));
+    testing::assert(report.output.contains("public path removed"));
+}
+
+#[test]
+fn api_snapshot_ignores_callable_implementation_and_input_order() -> () {
+    let a = function("sample::a", tast::Type::Int);
+    let b = function("sample::b", tast::Type::Bool);
+    let old = interface_codec::empty_exports();
+    old.functions.push(a);
+    old.functions.push(b);
+    let current = interface_codec::empty_exports();
+    current.functions.push(b);
+    current.functions.push(
+        artifact::ArtifactFnScheme { body: tast::Callable::Function("private_helper"), ..a },
+    );
+    let before = testing::expect_ok(snapshot("sample", Vec::from_array([unit(old)])), "old");
+    let after = testing::expect_ok(snapshot("sample", Vec::from_array([unit(current)])), "new");
+    testing::assert_eq(before, after);
+    testing::assert(!testing::expect_ok(diff(before, after), "diff").requires_review);
+}
+
+#[test]
+fn api_diff_rejects_unknown_schema_and_duplicate_public_paths() -> () {
+    testing::assert(diff("{}", "{}").is_err());
+    let exports = interface_codec::empty_exports();
+    exports.functions.push(function("sample::a", tast::Type::Int));
+    exports.functions.push(function("sample::a", tast::Type::Int));
+    testing::assert(snapshot("sample", Vec::from_array([unit(exports)])).is_err());
+}
+
+#[test]
+fn api_methods_keep_receiver_identity_and_follow_type_facades() -> () {
+    let exports = interface_codec::empty_exports();
+    for name in["sample::A", "sample::B"] {
+        exports.structs.push(
+            tast::StructDef {
+                map_requirements: Vec::new(),
+                name,
+                generics: Vec::new(),
+                fields: Vec::new(),
+                public_fields: Vec::new(),
+                module_fields: Vec::new(),
+                has_hidden_fields: false,
+                go_comparable: Some(ffi::GoComparability::Always),
+            },
+        );
+        exports.inherent_impls.push(
+            artifact::ArtifactInherentImpl {
+                key: artifact::ArtifactInherentImplKey::Constr(name),
+                definition: artifact::ArtifactImplDef {
+                    params: Vec::new(),
+                    constraints: Vec::new(),
+                    associated_types: Vec::new(),
+                    valid: true,
+                    methods: Vec::from_array([function("new", tast::Type::Int)]),
+                },
+            },
+        );
+    }
+    exports.reexports.push(("sample::Alias", "sample::A"));
+    let output = testing::expect_ok(snapshot("sample", Vec::from_array([unit(exports)])), "methods");
+    testing::assert(output.contains("sample::A::new"));
+    testing::assert(output.contains("sample::B::new"));
+    testing::assert(output.contains("sample::Alias::new"));
+}
+
+#[test]
+fn api_snapshot_tracks_hidden_comparability_and_constant_values() -> () {
+    let before_exports = interface_codec::empty_exports();
+    let after_exports = interface_codec::empty_exports();
+    let definition = tast::StructDef {
+        map_requirements: Vec::new(),
+        name: "sample::Key",
+        generics: Vec::new(),
+        fields: Vec::new(),
+        public_fields: Vec::new(),
+        module_fields: Vec::new(),
+        has_hidden_fields: true,
+        go_comparable: Some(ffi::GoComparability::Always),
+    };
+    before_exports.structs.push(definition);
+    after_exports.structs.push(
+        tast::StructDef { go_comparable: Some(ffi::GoComparability::Never), ..definition },
+    );
+    let constant = tast::ConstantScheme {
+        def_id: None,
+        name: "sample::SIZE",
+        ty: tast::Type::Int,
+        value: Some(tast::Primitive::Int { value: "4" }),
+    };
+    before_exports.constants.push(constant);
+    after_exports.constants.push(
+        tast::ConstantScheme { value: Some(tast::Primitive::Int { value: "8" }), ..constant },
+    );
+    let before = testing::expect_ok(
+        snapshot("sample", Vec::from_array([unit(before_exports)])),
+        "before",
+    );
+    let after = testing::expect_ok(
+        snapshot("sample", Vec::from_array([unit(after_exports)])),
+        "after",
+    );
+    let difference = testing::expect_ok(diff(before, after), "difference");
+    testing::assert(difference.requires_review);
+    testing::assert(difference.output.contains("go_comparable"));
+    testing::assert(difference.output.contains("sample::SIZE"));
+}
+
+#[test]
+fn api_specializations_and_private_receivers_have_distinct_visibility() -> () {
+    let exports = interface_codec::empty_exports();
+    exports.type_aliases.push(
+        tast::TypeAliasInfo {
+            name: "sample::Box",
+            generics: Vec::from_array(["T"]),
+            ty: tast::Type::Param { name: "T" },
+        },
+    );
+    for ty in[tast::Type::Int32, tast::Type::String] {
+        exports.inherent_impls.push(
+            artifact::ArtifactInherentImpl {
+                key: artifact::ArtifactInherentImplKey::Exact(
+                    tast::Type::App {
+                        ty: tast::Type::Con { name: "sample::Box" },
+                        args: Vec::from_array([ty]),
+                    },
+                ),
+                definition: artifact::ArtifactImplDef {
+                    params: Vec::new(),
+                    constraints: Vec::new(),
+                    associated_types: Vec::new(),
+                    valid: true,
+                    methods: Vec::from_array([function("get", ty)]),
+                },
+            },
+        );
+    }
+    exports.inherent_impls.push(
+        artifact::ArtifactInherentImpl {
+            key: artifact::ArtifactInherentImplKey::Constr("sample::Private"),
+            definition: artifact::ArtifactImplDef {
+                params: Vec::new(),
+                constraints: Vec::new(),
+                associated_types: Vec::new(),
+                valid: true,
+                methods: Vec::from_array([function("secret", tast::Type::Int)]),
+            },
+        },
+    );
+    let output = testing::expect_ok(
+        snapshot("sample", Vec::from_array([unit(exports)])),
+        "specialized methods",
+    );
+    testing::assert(!output.contains("Private"));
+    let parsed = testing::expect_ok(json::parse(output), "JSON");
+    if let Some(json::Value::Object(symbols)) = json::field(parsed, "symbols") {
+        testing::assert_eq(symbols.len(), 3)
+    } else {
+        testing::fail("symbols missing")
+    }
+}
+
+#[test]
+fn api_dependency_ownership_is_explicit_and_alias_contracts_are_reachable() -> () {
+    let exports = interface_codec::empty_exports();
+    exports.type_aliases.push(
+        tast::TypeAliasInfo {
+            name: "sample::Alias",
+            generics: Vec::new(),
+            ty: tast::Type::Con { name: "sample::dependency::Data" },
+        },
+    );
+    let dependency_exports = interface_codec::empty_exports();
+    dependency_exports.type_aliases.push(
+        tast::TypeAliasInfo {
+            name: "sample::dependency::Data",
+            generics: Vec::new(),
+            ty: tast::Type::Int,
+        },
+    );
+    dependency_exports.functions.push(function("sample::dependency::unrelated", tast::Type::Int));
+    let dependency = artifact::ArtifactInterfaceUnit {
+        package_name: "sample::dependency",
+        ..unit(dependency_exports),
+    };
+    let output = testing::expect_ok(
+        snapshot_with_dependencies(
+            "sample",
+            Vec::from_array([unit(exports)]),
+            Vec::from_array([dependency]),
+        ),
+        "dependency snapshot",
+    );
+    let value = testing::expect_ok(json::parse(output), "JSON");
+    let symbols = json::field(value, "symbols").unwrap_or(json::Value::Null);
+    testing::assert(json::field(symbols, "sample::dependency::Data").is_none());
+    let referenced = json::field(value, "referenced_contracts").unwrap_or(json::Value::Null);
+    testing::assert(json::field(referenced, "sample::dependency::Data").is_some());
+    testing::assert(!output.contains("unrelated"));
+}
+
+#[test]
+fn api_composite_constants_and_derive_entrypoints_affect_contracts() -> () {
+    let exports = interface_codec::empty_exports();
+    exports.constants.push(
+        tast::ConstantScheme {
+            def_id: None,
+            name: "sample::DIMENSIONS",
+            ty: tast::Type::Tuple { items: Vec::from_array([tast::Type::Int]) },
+            value: None,
+        },
+    );
+    let before_module = ctir::empty_module("sample");
+    before_module.constants.push(
+        ctir::CtConstant {
+            name: "sample::DIMENSIONS",
+            value: ctir::CtValue::Tuple(
+                Vec::from_array([ctir::CtValue::Integer { signed: true, width: 64, bits: 4 }]),
+            ),
+        },
+    );
+    before_module.derive_entries.push(
+        ctir::CtDeriveEntry {
+            name: "sample::derive_display",
+            function_id: 0,
+            public: true,
+            export_name: Some("Display"),
+        },
+    );
+    let after_module = ctir::empty_module("sample");
+    after_module.constants.push(
+        ctir::CtConstant {
+            name: "sample::DIMENSIONS",
+            value: ctir::CtValue::Tuple(
+                Vec::from_array([ctir::CtValue::Integer { signed: true, width: 64, bits: 8 }]),
+            ),
+        },
+    );
+    let before = artifact::ArtifactInterfaceUnit {
+        comptime: Some(
+            artifact::ArtifactComptimeUnit {
+                version: 1,
+                module: before_module,
+                semantic_hash: "ignored",
+            },
+        ),
+        ..unit(exports),
+    };
+    let after = artifact::ArtifactInterfaceUnit {
+        comptime: Some(
+            artifact::ArtifactComptimeUnit {
+                version: 1,
+                module: after_module,
+                semantic_hash: "ignored",
+            },
+        ),
+        ..unit(exports),
+    };
+    let old = testing::expect_ok(snapshot("sample", Vec::from_array([before])), "before");
+    let current = testing::expect_ok(snapshot("sample", Vec::from_array([after])), "after");
+    let report = testing::expect_ok(diff(old, current), "diff");
+    testing::assert(report.requires_review);
+    testing::assert(report.output.contains("sample::DIMENSIONS"));
+    testing::assert(report.output.contains("sample::Display"));
+}

@@ -1,0 +1,95 @@
+package compiler;
+
+use module::artifact;
+use module::ast;
+use module::hir;
+use module::ctir;
+use module::parser;
+use module::artifact::interface_codec as interface_codec;
+use std::testing;
+
+#[test]
+fn module_scope_interfaces_roundtrip_without_exposing_internal_symbols() -> () {
+    let external = binary_interface_fixture();
+    let internal = binary_comptime_interface(17, "module.goml");
+    let value = interface_codec::with_module_scope(
+        external,
+        artifact::ArtifactModuleScope {
+            module_name: "audit",
+            exports: internal.exports,
+            package_interface: artifact::ArtifactPackageInterface {
+                package_name: external.package_name,
+                name: external.package_interface.name,
+                value_exports: internal.package_interface.value_exports,
+                enum_variants: Vec::new(),
+            },
+            comptime: internal.comptime,
+        },
+    );
+    testing::assert(value.interface_hash != external.interface_hash);
+    let encoded = testing::expect_ok(interface_codec::encode_binary(value), "encode module scope");
+    let decoded = testing::expect_ok(interface_codec::decode_binary(encoded), "decode module scope");
+    testing::assert_eq(decoded.interface_hash, value.interface_hash);
+    testing::assert(decoded.exports.functions.is_empty());
+    testing::assert(decoded.package_interface.value_exports.is_empty());
+    let same_module = interface_codec::for_module(decoded, "audit");
+    testing::assert_eq(same_module.exports.functions.len(), 1);
+    testing::assert_eq(same_module.package_interface.value_exports.len(), 1);
+    testing::assert(same_module.comptime.is_some());
+    let other_module = interface_codec::for_module(decoded, "audit::consumer");
+    testing::assert(other_module.exports.functions.is_empty());
+    testing::assert(other_module.comptime.is_none());
+    testing::assert(interface_codec::for_module(decoded, "other").exports.functions.is_empty());
+}
+
+#[test]
+fn public_signatures_reject_module_private_types_and_reexports() -> () {
+    let sources = Vec::from_array(
+        [
+            "package api; pub(module) struct Hidden {} pub fn leak(value: Hidden) -> () {}",
+            "package api; pub(module) struct Hidden {} pub enum Leak { Value(Hidden) }",
+            "package api; pub(module) struct Hidden {} pub struct Leak { pub value: Hidden }",
+            "package api; pub(module) trait Hidden {} pub fn leak[T: Hidden](value: T) -> () {}",
+        ],
+    );
+    for source in sources {
+        let lowered = ast::lower(parser::parse(source));
+        let file = testing::expect_some(
+            hir::lower_package(lowered, "api.goml", "audit::api").hir,
+            "module visibility HIR",
+        );
+        let error = testing::expect_err(
+            validate_module_public_api(file, Vec::from_array([lowered]), "audit", Vec::new()),
+            "module private signature",
+        );
+        testing::assert(error.contains("exposes module-private item audit::api::Hidden"));
+    }
+}
+
+#[test]
+fn internal_signatures_can_use_module_private_types() -> () {
+    let lowered = ast::lower(
+        parser::parse(
+            "package api; pub(module) struct Hidden {} pub(module) fn internal(value: Hidden) -> () {}",
+        ),
+    );
+    let file = testing::expect_some(
+        hir::lower_package(lowered, "api.goml", "audit::api").hir,
+        "module visibility HIR",
+    );
+    testing::expect_ok(
+        validate_module_public_api(file, Vec::from_array([lowered]), "audit", Vec::new()),
+        "internal signature",
+    );
+}
+
+#[test]
+fn module_visibility_filters_ordinary_comptime_exports() -> () {
+    let value = ctir::empty_module("audit::api");
+    value.entries.push(ctir::CtEntry { name: "audit::api::external", function_id: 0, public: true });
+    value.entries.push(ctir::CtEntry { name: "audit::api::internal", function_id: 1, public: true });
+    let filtered = artifact_comptime_visibility(value, Vec::from_array(["audit::api::external"]));
+    testing::assert(filtered.entries[0].public);
+    testing::assert(!filtered.entries[1].public);
+    testing::assert(value.entries[1].public);
+}

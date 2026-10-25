@@ -1,0 +1,246 @@
+package registry;
+
+use module::test_support;
+use std::fs;
+use std::path;
+use std::testing;
+
+fn lock_git(arguments: Vec[string]) -> string {
+    testing::expect_ok(git(arguments), "local git fixture")
+}
+
+fn locked_git_fixture(name: string) -> (string, string, string) {
+    let root = test_support::workspace(name);
+    let source = path::join(root, "source");
+    test_support::create_dir(source);
+    let _ = lock_git(Vec::from_array(["init", "--quiet", source]));
+    let _ = lock_git(
+        Vec::from_array(["-C", source, "config", "user.email", "fixture@example.invalid"]),
+    );
+    let _ = lock_git(Vec::from_array(["-C", source, "config", "user.name", "Fixture"]));
+    test_support::write_file(path::join(source, "goml.toml"), "[module]\npath = \"demo::leaf\"\n");
+    test_support::write_file(
+        path::join(source, "value.goml"),
+        "package leaf; pub fn value() -> isize { 1 }\n",
+    );
+    let _ = lock_git(Vec::from_array(["-C", source, "add", "."]));
+    let _ = lock_git(Vec::from_array(["-C", source, "commit", "--quiet", "-m", "initial"]));
+    let registry = path::join(root, "registry");
+    test_support::write_file(
+        path::join(registry, "index.toml"),
+        "[modules]\n\"demo::leaf\" = { git = \"" + source + "\" }\n",
+    );
+    let app = path::join(root, "app");
+    test_support::write_file(
+        path::join(app, "goml.toml"),
+        "[module]\npath = \"demo::app\"\n[dependencies]\n\"demo::leaf\" = true\n",
+    );
+    (app, registry, source)
+}
+
+#[test]
+fn dependency_lock_keeps_exact_git_revision_after_default_branch_moves() -> () {
+    let (app, registry, source) = locked_git_fixture("lock_git_revision");
+    testing::expect_ok(lock_dependencies(app, registry, false, false), "create lock");
+    let before = testing::expect_ok(resolve_at(app, registry), "locked resolution");
+    testing::assert(before[0].root.contains("/revisions/"));
+    let lock_before = testing::expect_ok(
+        fs::read_file_structured(path::join(app, "goml.lock")),
+        "lock bytes",
+    );
+    test_support::write_file(
+        path::join(source, "value.goml"),
+        "package leaf; pub fn value() -> isize { 2 }\n",
+    );
+    let _ = lock_git(Vec::from_array(["-C", source, "commit", "--quiet", "-am", "next"]));
+    testing::expect_ok(fetch_dependencies(app, registry, true), "refresh mutable cache");
+    let after = testing::expect_ok(resolve_at(app, registry), "same locked resolution");
+    testing::assert_eq(before[0].root, after[0].root);
+    testing::assert(
+        testing::expect_ok(
+            fs::read_file_structured(path::join(after[0].root, "value.goml")),
+            "locked source",
+        ).contains("{ 1 }"),
+    );
+    testing::assert_eq(
+        lock_before,
+        testing::expect_ok(fs::read_file_structured(path::join(app, "goml.lock")), "unchanged lock"),
+    );
+    testing::expect_ok(lock_dependencies(app, registry, false, true), "explicit update");
+    let updated = testing::expect_ok(resolve_at(app, registry), "updated resolution");
+    testing::assert(updated[0].root != before[0].root);
+}
+
+#[test]
+fn dependency_lock_offline_missing_cache_and_tampering_never_fall_back() -> () {
+    let (app, registry, _) = locked_git_fixture("lock_offline_integrity");
+    testing::expect_ok(lock_dependencies(app, registry, false, false), "create lock");
+    let lock = testing::expect_ok(
+        parse_lock(
+            testing::expect_ok(fs::read_file_structured(path::join(app, "goml.lock")), "lock"),
+        ),
+        "parse lock",
+    );
+    let entry = lock.modules[0];
+    let directory = locked_checkout_directory(registry, entry);
+    testing::expect_ok(fs::remove_dir_all(directory), "remove immutable cache");
+    let error = testing::expect_err(
+        resolve_tracked_readonly(app, registry, false, Vec::new()),
+        "read-only missing exact revision",
+    );
+    testing::assert(error.to_string().contains(entry.revision));
+    testing::assert(!fs::exists(directory));
+    let restored = testing::expect_ok(resolve_at(app, registry), "fetch exact locked revision");
+    test_support::write_file(path::join(restored[0].root, "value.goml"), "tampered");
+    let error = testing::expect_err(resolve_at(app, registry), "reject changed contents");
+    testing::assert(error.to_string().contains("modified or extra files"));
+}
+
+#[test]
+fn dependency_lock_detects_manifest_and_local_dependency_graph_changes() -> () {
+    let root = test_support::workspace("lock_local_graph");
+    local_module(
+        root,
+        "app",
+        "demo::app",
+        "[dependencies]\n\"demo::leaf\" = { path = \"../leaf\" }\n",
+    );
+    local_module(root, "leaf", "demo::leaf", "");
+    let app = path::join(root, "app");
+    let registry = path::join(root, "missing-registry");
+    testing::expect_ok(lock_dependencies(app, registry, true, false), "lock local sources offline");
+    let modules = testing::expect_ok(resolve_at(app, registry), "locked local sources");
+    testing::assert(modules[0].local);
+    test_support::write_file(
+        path::join(root, "leaf/value.goml"),
+        "package leaf; pub fn value() -> isize { 99 }",
+    );
+    testing::expect_ok(resolve_at(app, registry), "local source remains mutable");
+    local_module(
+        root,
+        "leaf",
+        "demo::leaf",
+        "[dependencies]\n\"demo::extra\" = { path = \"../extra\" }\n",
+    );
+    local_module(root, "extra", "demo::extra", "");
+    let error = testing::expect_err(resolve_at(app, registry), "reject changed local graph");
+    testing::assert(error.to_string().contains("locked dependency graph changed"));
+    testing::expect_ok(lock_dependencies(app, registry, true, false), "repair local graph offline");
+    testing::assert_eq(testing::expect_ok(resolve_at(app, registry), "repaired graph").len(), 2);
+    local_module(root, "app", "demo::app", "");
+    let error = testing::expect_err(resolve_at(app, registry), "reject changed root manifest");
+    testing::assert(error.to_string().contains("does not match manifest"));
+}
+
+#[test]
+fn dependency_lock_parser_rejects_unknown_versions_and_unsafe_revisions() -> () {
+    testing::assert(parse_lock("{\"version\":2}").is_err());
+    let (app, registry, _) = locked_git_fixture("lock_invalid_revision");
+    testing::expect_ok(lock_dependencies(app, registry, false, false), "create lock");
+    let original = testing::expect_ok(
+        parse_lock(
+            testing::expect_ok(fs::read_file_structured(path::join(app, "goml.lock")), "lock"),
+        ),
+        "parse lock",
+    );
+    let entry = LockedModule { revision: "../outside", ..original.modules[0] };
+    testing::assert(
+        parse_lock(encode_lock(DependencyLock { modules: Vec::from_array([entry]), ..original })).is_err(),
+    );
+    let entry = LockedModule { checksum: "0".repeat(64), ..original.modules[0] };
+    testing::expect_err(
+        verify_checkout(locked_checkout_directory(registry, entry), entry),
+        "reject checksum mismatch",
+    );
+}
+
+#[test]
+fn dependency_lock_preserves_workspace_overrides_and_records_root_development_edges() -> () {
+    let root = test_support::workspace("lock_workspace_development");
+    local_module(
+        root,
+        "app",
+        "demo::app",
+        "[dependencies]\n\"demo::leaf\" = true\n[dev-dependencies]\n\"demo::helper\" = { path = \"../helper\" }\n",
+    );
+    local_module(root, "leaf", "demo::leaf", "");
+    local_module(root, "replacement", "demo::leaf", "");
+    local_module(root, "helper", "demo::helper", "[dependencies]\n\"demo::leaf\" = true\n");
+    test_support::write_file(
+        path::join(root, "goml.work"),
+        "[workspace]\nmembers = [\"app\", \"leaf\"]\n[replace]\n\"demo::leaf\" = \"replacement\"\n",
+    );
+    let app = path::join(root, "app");
+    let registry = path::join(root, "absent");
+    testing::expect_ok(lock_dependencies(app, registry, true, false), "lock workspace offline");
+    let production = testing::expect_ok(resolve_at(app, registry), "production lock selection");
+    testing::assert_eq(production.len(), 1);
+    testing::assert_eq(production[0].root, path::join(root, "replacement"));
+    let development = testing::expect_ok(
+        resolve_at_with_development(app, registry, true),
+        "development lock selection",
+    );
+    testing::assert_eq(development.len(), 2);
+    let value = testing::expect_ok(
+        parse_lock(
+            testing::expect_ok(fs::read_file_structured(path::join(app, "goml.lock")), "lock bytes"),
+        ),
+        "parse lock",
+    );
+    testing::assert(
+        testing::expect_ok(locked_module(value, "demo::helper"), "helper entry").dependencies
+            == Vec::from_array(["demo::leaf"]),
+    );
+    test_support::write_file(
+        path::join(root, "goml.work"),
+        "[workspace]\nmembers = [\"app\", \"leaf\"]\n",
+    );
+    testing::assert(
+        testing::expect_err(resolve_at(app, registry), "changed workspace").to_string().contains(
+            "does not match",
+        ),
+    );
+}
+
+#[test]
+fn dependency_lock_checks_raw_files_even_when_git_index_hides_changes() -> () {
+    let (app, registry, _) = locked_git_fixture("lock_hidden_modification");
+    testing::expect_ok(lock_dependencies(app, registry, false, false), "create lock");
+    let modules = testing::expect_ok(resolve_at(app, registry), "locked source");
+    let directory = modules[0].root;
+    let _ = lock_git(
+        Vec::from_array(["-C", directory, "update-index", "--skip-worktree", "value.goml"]),
+    );
+    test_support::write_file(path::join(directory, "value.goml"), "hidden changed source");
+    let error = testing::expect_err(resolve_at(app, registry), "raw bytes override git index hints");
+    testing::assert(error.to_string().contains("modified or extra files"));
+}
+
+#[test]
+fn dependency_lock_rejects_source_symlinks() -> () {
+    let (app, registry, source) = locked_git_fixture("lock_source_symlink");
+    testing::expect_ok(
+        fs::symbolic_link("value.goml", path::join(source, "alias.goml")),
+        "source symlink",
+    );
+    let _ = lock_git(Vec::from_array(["-C", source, "add", "alias.goml"]));
+    let _ = lock_git(Vec::from_array(["-C", source, "commit", "--quiet", "-m", "symlink"]));
+    let error = testing::expect_err(
+        lock_dependencies(app, registry, false, false),
+        "reject symlink sources",
+    );
+    testing::assert(error.to_string().contains("symlinks"));
+    testing::assert(!fs::exists(path::join(app, "goml.lock")));
+}
+
+#[test]
+fn dependency_lock_can_be_created_offline_from_cached_git_sources() -> () {
+    let (app, registry, source) = locked_git_fixture("lock_offline_create");
+    configure_resolution(false, true);
+    testing::expect_ok(
+        sync_repository(source, path::join(registry, "sources/demo/leaf"), false),
+        "seed local cache",
+    );
+    testing::expect_ok(lock_dependencies(app, registry, true, false), "offline lock from cache");
+    testing::expect_ok(resolve_at(app, registry), "offline exact source");
+}
