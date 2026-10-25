@@ -27,7 +27,7 @@ target-dir = "_artifact"
 "alice::http" = true
 ```
 
-注册表依赖使用 `true` 声明存在（也接受空内联表）。包目前跟随其仓库的默认分支；没有包版本、版本约束、最低版本选择或 `goml.lock`。迁移期间仍可读取严格的 `X.Y.Z` 字符串和内联 `version` 字段，但它们不选择或约束来源。新声明应使用 `true` 或本地 `path`。
+注册表依赖使用 `true` 声明存在（也接受空内联表）。未锁定的包使用缓存仓库的默认分支。`goml.lock` 可以锁定精确的 Git 来源；尚未实现包版本、版本约束和最低版本选择。迁移期间仍可读取严格的 `X.Y.Z` 字符串和内联 `version` 字段，但它们不选择或约束来源。新声明应使用 `true` 或本地 `path`。
 
 `[dev-dependencies]` 使用相同的无版本和路径形式。这些依赖可用于调用模块的 `*_test.goml` 文件、`tests/` 包和根目录 `examples/` 树。生产源码即使在测试构建期间也不能导入它们。其他模块的依赖不会继承其开发依赖。测试和示例命令解析普通依赖与开发依赖的并集；普通 check/build/run 命令只解析普通依赖。开发辅助模块可以反向依赖当前库：该依赖边使用当前源码，不引入第二份副本。生产依赖循环仍是错误。导入被测包的辅助模块必须用于黑盒测试或示例；从同包白盒测试导入它仍会形成不受支持的包循环。
 
@@ -85,9 +85,24 @@ goml update
 goml remove ecosystem::ansi
 ```
 
-`goml add` 写入无版本依赖并获取所需源码。`goml update` 刷新索引以及当前模块的普通和开发依赖闭包，并遵循本地路径和工作区替换。在模块外执行时仅更新索引。不获取依赖模块自身的开发依赖。构建和编译器/LSP 查询使用缓存源码，不访问网络；缺失缓存是可恢复错误，会提示用户运行 `goml update`。源码内容更新会使生成产物失效。
+`goml add` 写入无版本依赖并获取所需源码。`goml update` 刷新索引以及当前模块的普通和开发依赖闭包，遵循本地路径和工作区替换，然后写入 `goml.lock`。在模块外执行时仅更新索引。不获取依赖模块自身的开发依赖。没有锁文件时，构建使用缓存源码；缺失缓存是可恢复错误，会提示用户运行 `goml update`。有锁文件时，普通构建可以获取尚未缓存的精确提交。编译器/LSP 元数据查询保持只读，报告缺失的锁定源码而不获取它。源码内容更新会使生成产物失效。
 
 默认主目录为 `~/.goml`，可用 `GOML_HOME` 覆盖。索引检出位于 `<home>/cache/registry`；Git 包检出位于该目录下的 `sources/<owner>/<module>/`。每个检出跟随默认分支。更新使用快进拉取，不重置本地修改。更改缓存仓库的来源会产生诊断，要求用户先删除该缓存目录再更新。
+
+`goml lock` 根据选定的普通依赖和根模块开发依赖闭包创建版本 1 的 JSON `goml.lock`。已有锁文件仍匹配时保留它；使用 `goml update` 推进 Git 提交。应将锁文件随项目提交。每个条目记录规范模块身份、来源类型、源 URL 或本地路径、精确 Git 提交、排序后的 Git 文件记录（路径、可执行模式及原始文件字节的 SHA-256）的 SHA-256，以及直接依赖。根指纹覆盖依赖声明和实际工作区/替换来源，不包含构建设置和注释。不继承依赖模块自身的开发依赖。
+
+```sh
+goml lock
+goml build --locked
+goml test --locked --offline
+goml lock --offline
+```
+
+`--locked` 要求存在匹配的锁文件，并且不更新它。`--offline` 禁止依赖网络访问；注册表 Git 依赖必须有锁文件和精确提交的缓存，不能接受其他可变检出。两者独立：`--locked` 可以下载缺失的锁定提交。`goml lock --offline` 可以根据已有缓存创建锁文件，但不能刷新索引。`goml update --offline` 会被拒绝。手动修改清单、工作区选择或本地依赖图后，需要显式运行 `goml lock` 或 `goml update`。`goml add` 和 `goml remove` 会刷新已有锁文件，同时保留既有 Git 提交。
+
+锁定的 Git 检出在注册表缓存的 `revisions/<source-sha256>/<commit>/` 下共存。解析验证提交、工作文件原始字节与已提交 Git blob 的一致性、可执行模式和文件记录的 SHA-256 校验和，包括额外文件；损坏时不会回退到可变检出。锁定来源暂不支持 Git 子模块、符号链接和改变原始文件字节的检出过滤器。工作区成员、替换和路径依赖保留现有来源优先级，且仍然可变：记录其来源选择和依赖边，但不声称其内容不可变。本地注册表路径条目同样可变，并记录绝对路径。这类锁需要相同的本地布局，不是可移植的源码归档。相对于根模块的本地依赖和工作区布局可以一起搬移。
+
+锁文件固定依赖源码，不固定编译器版本或二进制 ABI。工具链和目标证据属于构建记录；相同锁文件本身不保证跨工具链产生相同二进制。
 
 Git 索引条目如下：
 
@@ -402,3 +417,46 @@ goml run
 需要检查编译阶段时，在 `gomlc run-single` 后加 `--dump-ast`、`--dump-expanded-ast`、`--dump-hir`、`--dump-tast`、`--dump-ctir`、`--dump-core`、`--dump-mono`、`--dump-lift`、`--dump-anf` 或 `--dump-go`。`--dump-ast` 展示 derive 展开前的源码降级，`--dump-expanded-ast` 则包含所有生成实现。
 
 修改仓库时，按[开发指南](development.zh-CN.md)运行相关检查。
+
+<a id="architecture-dependency-rules"></a>
+
+## 架构依赖规则
+
+`goml architecture` 根据模块根目录的 `goml.architecture.json` 检查包的直接依赖。它使用 `goml metadata` 提供的解析包图，包括别名导入和重导出，不编译包或下载依赖。`--rules PATH` 选择其他规则文件，相对路径以当前目录为基准；`--compiler PROGRAM` 选择用于解析导入的编译器。
+
+```sh
+goml architecture
+goml architecture --rules goml.architecture.json
+```
+
+版本 1 的规则文件声明带名称的禁止关系：
+
+```json
+{
+  "schema_version": 1,
+  "rules": [
+    {
+      "name": "reusable-no-app",
+      "from": [{"package": "demo::device", "subpackages": true}],
+      "forbid": [{"package": "demo::web", "subpackages": true}],
+      "scope": "production"
+    }
+  ]
+}
+```
+
+选择器使用规范包名。默认仅匹配该包；`subpackages` 为 `true` 时也匹配以 `::` 分隔的后代包。`demo::web` 不会匹配 `demo::website`。列表中任一选择器匹配即可，不支持隐式通配符。`scope` 默认为 `production`；`tests` 检查白盒和黑盒测试导入，`all` 还包括示例。重导出按其源文件类别计入依赖。
+
+违规诊断包含规则名称、来源包、目标包和导入的源码位置。结果排序不受发现顺序影响。包图不完整、依赖未解析、元数据不受支持或规则文件无效时，检查失败，不会报告通过。未知字段和重复规则名均为错误。版本 1 只检查直接依赖，不支持传递禁止、允许列表或例外。该命令检查项目架构，不检查符号可见性或源码 API 兼容性。
+
+<a id="package-metadata"></a>
+
+## 包元数据
+
+`goml metadata --format json` 为外部工具输出带版本、顺序确定的包图。`--mode files` 只发现文件，不需要编译器；默认的 `--mode graph` 调用匹配编译器的 package-info 解析器，解析包依赖。`--compiler PATH` 指定编译器。两种模式均为只读：不获取依赖、不编译包、不写构建产物。存在锁文件时，使用本地已有源码遵守锁定结果。
+
+协议版本 1 包含 `schema_version`、`toolchain_version`、`root_module`、`mode`、`complete`、`modules`、`packages`、`edges` 和 `diagnostics`。模块和包 ID 使用规范身份。包目录和源文件路径相对于所属模块；文件区分生产代码、内部测试、外部测试和示例。模块来源区分根模块、路径、工作区成员、替换和注册表依赖。存在锁定来源时，`locked` 对象记录所选来源、提交、校验和及依赖名称；否则为 null。依赖边包含来源与目标包、导入写法、文件类别、重导出标记和源码位置。边的源码路径为绝对路径；行号和 UTF-8 字节列号从一开始。
+
+缺失依赖、无法解析包导入或编译器元数据不受支持时，输出 `complete: false`、诊断消息，并以非零状态退出。JSON 保留在 stdout，诊断文本输出到 stderr。包图模式解析所属包和导入别名，不检查导入成员的类型或访问权限。标准库端点通过可执行文件相对位置的库源码解析，不展开其完整传递依赖图。
+
+文件元数据可替代测试快照和源码归档中手工维护的包清单。发布者仍需明确选择额外的资源文件和许可证文件。

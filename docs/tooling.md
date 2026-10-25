@@ -27,7 +27,7 @@ target-dir = "_artifact"
 "alice::http" = true
 ```
 
-Registry dependencies declare presence with `true` (an empty inline table is also accepted). Packages currently follow their repository default branch; there are no package versions, version constraints, minimum-version selection, or `goml.lock`. Existing strict `X.Y.Z` strings and inline `version` fields remain readable during migration, but do not select or constrain a source. New declarations should use `true` or a local `path`.
+Registry dependencies declare presence with `true` (an empty inline table is also accepted). Unpinned packages use the cached repository default branch. `goml.lock` can pin exact Git sources; package versions, version constraints, and minimum-version selection are not implemented. Existing strict `X.Y.Z` strings and inline `version` fields remain readable during migration, but do not select or constrain a source. New declarations should use `true` or a local `path`.
 
 `[dev-dependencies]` uses the same unversioned and path forms. These dependencies are available to the invoking module's `*_test.goml` files, `tests/` packages and root `examples/` tree. Production sources cannot import them, even during a test build. Dependencies of another module do not inherit its development dependencies. Test and example commands resolve the union of normal and development dependencies; ordinary check/build/run commands resolve only normal requirements. A development helper may depend back on the current library: that edge uses the current source without introducing a second copy. Production dependency cycles remain errors. A helper that imports the package under test must be used from black-box tests or examples; importing it from that same package's white-box tests still creates an unsupported package cycle.
 
@@ -85,9 +85,24 @@ goml update
 goml remove ecosystem::ansi
 ```
 
-`goml add` writes an unversioned dependency and fetches required sources. `goml update` refreshes the index and the current module's normal and development dependency closure, honoring local paths and workspace replacements. Outside a module it updates only the index. Dependencies' own development dependencies are not fetched. Builds and compiler/LSP queries use the cached sources without network access; a missing cache is a recoverable error directing the user to `goml update`. Updated source contents invalidate generated artifacts.
+`goml add` writes an unversioned dependency and fetches required sources. `goml update` refreshes the index and the current module's normal and development dependency closure, honoring local paths and workspace replacements, then writes `goml.lock`. Outside a module it updates only the index. Dependencies' own development dependencies are not fetched. Without a lock, builds use cached sources; a missing cache is a recoverable error directing the user to `goml update`. With a lock, ordinary builds may fetch an absent exact revision. Compiler/LSP metadata queries remain read-only and report missing pinned sources without fetching. Updated source contents invalidate generated artifacts.
 
 The default home is `~/.goml`, overridden by `GOML_HOME`. The index checkout lives in `<home>/cache/registry`; Git package checkouts live in `sources/<owner>/<module>/` below that directory. Each checkout follows its default branch. Updates use fast-forward pulls and do not reset local changes. Changing a cached repository's source produces a diagnostic asking the user to remove that cache directory before updating.
+
+`goml lock` creates a version 1 JSON `goml.lock` from the selected normal and root development dependency closure. It retains an existing matching lock; use `goml update` to advance Git revisions. Commit the lock with the project. Each entry records canonical module identity, source kind, source URL or local path, exact Git commit, SHA-256 of its sorted Git file records (path, executable mode and SHA-256 of raw file bytes), and direct dependencies. The root fingerprint covers dependency declarations and effective workspace/replacement sources, excluding build settings and comments. Dependency development requirements are not inherited.
+
+```sh
+goml lock
+goml build --locked
+goml test --locked --offline
+goml lock --offline
+```
+
+`--locked` requires a matching lock and never updates it. `--offline` prohibits dependency network access; registry Git dependencies require a lock and its exact cached revision, rather than accepting a different mutable checkout. The flags are independent: `--locked` may download a missing pinned commit. `goml lock --offline` can create a lock from already cached sources, but cannot refresh the index. `goml update --offline` is rejected. Manual manifest, workspace selection, or local dependency graph changes require an explicit `goml lock` or `goml update`. `goml add` and `goml remove` refresh an existing lock while retaining existing Git pins.
+
+Pinned Git checkouts coexist under `revisions/<source-sha256>/<commit>/` in the registry cache. Resolution verifies the commit, raw working files against committed Git blobs, executable modes and the SHA-256 file-record checksum, including extra files; corruption never falls back to a mutable checkout. Git submodules, symlinks and checkout filters that change raw file bytes are not supported in locked sources. Workspace members, replacements and path dependencies retain the existing source precedence and remain mutable: their source selection and dependency edges are recorded, but their contents are not claimed to be immutable. Local registry path entries are likewise mutable and record absolute paths. Such locks require the same local layout; they are not portable source archives. Root-relative local dependencies and workspace layouts can move together.
+
+Locks fix dependency sources, not compiler versions or binary ABI. Toolchain and target evidence belongs in build records; identical locks alone do not guarantee identical binaries across toolchains.
 
 A Git index entry is:
 
@@ -402,3 +417,42 @@ goml run
 When you need to inspect a compilation phase, add `--dump-ast`, `--dump-expanded-ast`, `--dump-hir`, `--dump-tast`, `--dump-ctir`, `--dump-core`, `--dump-mono`, `--dump-lift`, `--dump-anf`, or `--dump-go` to `gomlc run-single`. `--dump-ast` shows source lowering before derive expansion, while `--dump-expanded-ast` includes every generated implementation.
 
 For repository changes, follow the checks in the [development guide](development.md).
+
+## Architecture dependency rules
+
+`goml architecture` checks direct package dependencies against the module-root `goml.architecture.json`. It uses the parsed graph from `goml metadata`, including alias imports and reexports, and does not compile packages or fetch dependencies. `--rules PATH` selects another rules file, relative to the current directory; `--compiler PROGRAM` selects the compiler used to parse imports.
+
+```sh
+goml architecture
+goml architecture --rules goml.architecture.json
+```
+
+A version 1 rules file declares named prohibitions:
+
+```json
+{
+  "schema_version": 1,
+  "rules": [
+    {
+      "name": "reusable-no-app",
+      "from": [{"package": "demo::device", "subpackages": true}],
+      "forbid": [{"package": "demo::web", "subpackages": true}],
+      "scope": "production"
+    }
+  ]
+}
+```
+
+Selectors use canonical package names. A selector matches only that package unless `subpackages` is `true`, which includes descendants separated by `::`; `demo::web` never matches `demo::website`. Lists match any selector. There are no implicit wildcards. `scope` defaults to `production`; `tests` checks white-box and black-box test imports, while `all` also includes examples. Reexports count as dependencies in the source file's category.
+
+Violations name the rule, the source and target packages, and the import's source location. Results are sorted independently of discovery order. An incomplete graph, unresolved dependency, unsupported metadata, or invalid rules file fails the check rather than reporting success. Unknown fields and duplicate rule names are errors. Version 1 checks direct edges only; it does not enforce transitive prohibitions, allowances, or exceptions. This command checks project architecture, not symbol visibility or source API compatibility.
+
+## Package metadata
+
+`goml metadata --format json` emits a versioned, deterministic package graph for external tools. `--mode files` only discovers files and needs no compiler; the default `--mode graph` calls the matching compiler's package-info parser to resolve package dependencies. `--compiler PATH` selects that compiler. Both modes are read-only: they do not fetch dependencies, compile packages, or write build artifacts. Existing locks are respected using locally available sources.
+
+Schema version 1 contains `schema_version`, `toolchain_version`, `root_module`, `mode`, `complete`, `modules`, `packages`, `edges`, and `diagnostics`. Module and package IDs are canonical. Package directories and source files are module-relative; files distinguish production, internal tests, external tests, and examples. Module source kinds distinguish the root, paths, workspace members, replacements, and registry dependencies. A `locked` object records the selected locked source, revision, checksum, and dependency names when available; otherwise it is null. Edges identify the source and target packages, import spelling, file category, reexport status, and source location. Edge source paths are absolute; lines and UTF-8 byte columns start at one.
+
+Missing dependencies, unresolved package imports, or unsupported compiler metadata produce `complete: false`, diagnostic messages, and a nonzero exit status. JSON remains on stdout, while diagnostic text goes to stderr. Graph mode resolves owning packages and import aliases; it does not type-check imported members or validate access permissions. Standard-library endpoints resolve through executable-relative library sources; their full transitive graph is not expanded.
+
+File metadata can replace manually maintained package lists in test snapshots and source archives. Publishers must still choose additional resources and license files explicitly.

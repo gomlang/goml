@@ -91,10 +91,10 @@ goml 是一门采用静态类型和垃圾回收、具有类似 Rust 语法并编
 
 - 模块通过根目录 `goml.toml` 的 `[module].path` 拥有规范路径；目录路径决定包身份。项目源文件声明所属包，同一目录中的文件共享包名。独立单文件命令可省略该声明。
 - 导入具有文件作用域。声明的包名提供默认别名；使用 `as` 消歧。`module::path` 从模块根解析，`use alias::Trait` 将导入的 trait 带入方法调用作用域。
-- 跨包 API 需要 `pub`。结构体字段和固有方法默认私有；trait 实现方法继承 trait 可见性，不得声明 `pub`。
+- 跨包 API 需要 `pub` 或 `pub(module)`；后者仅限相同规范模块，工作区中的不同成员不共享访问权限。结构体字段和固有方法默认私有；trait 实现方法继承 trait 可见性，不得声明 `pub`。
 - 接口和依赖环境公开公共 API，同时保留使用它所需的元数据。当前包代码生成必须保留私有辅助函数和完整内部环境。
 - 可执行文件来自包含 `fn main()` 的 `package main` 包。直接子目录 `tests/` 是其父包的一个黑盒测试包，声明 `package tests`；不支持嵌套测试套件。
-- 依赖只能放在模块根清单中。默认注册表为 `https://github.com/gomlang/registry.git`。其权威 `index.toml` 将模块映射到 Git 源。依赖使用 `true` 或本地路径；包源码跟随默认分支，不进行版本选择，也不使用 `goml.lock`。旧版版本字符串仅作为无版本迁移输入接受。
+- 依赖只能放在模块根清单中。默认注册表为 `https://github.com/gomlang/registry.git`。其权威 `index.toml` 将模块映射到 Git 源。依赖使用 `true` 或本地路径；未锁定的包源码跟随缓存默认分支，不进行版本选择。`goml lock` 记录精确 Git 来源和依赖边；`--locked` 要求匹配锁文件，`--offline` 禁止获取依赖。旧版版本字符串仅作为无版本迁移输入接受。
 - 全局状态默认存放在 `~/.goml`，可由 `GOML_HOME` 覆盖。依赖源码位于其中的 `cache/registry`；生成的构建产物放在项目配置的目标目录中，默认为 `_artifact/`。
 
 <a id="tests-and-golden-files"></a>
