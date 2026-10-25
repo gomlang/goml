@@ -1,0 +1,238 @@
+package api;
+
+use std::json;
+
+pub struct Difference {
+    pub output: string,
+    pub requires_review: bool,
+}
+
+fn parse_snapshot(source: string) -> Result[json::Value, string] {
+    let value = json::parse(source)?;
+    if json::field(value, "schema_version").and_then(json::as_int) != Option::Some(1)
+        || json::field(value, "scope").and_then(json::as_string) != Option::Some("source_api") {
+        return Err("unsupported API snapshot schema; expected source_api version 1")
+    }
+    let _ = json::field(value, "module").and_then(json::as_string).ok_or(
+        "API snapshot is missing module",
+    )?;
+    let symbols = json::field(value, "symbols").ok_or("API snapshot is missing symbols")?;
+    let Object(fields) = symbols else {
+        return Err("API snapshot symbols must be an object")
+    };
+    let seen = Vec::new();
+    for field in fields {
+        if seen.contains(field.0) {
+            return Err("duplicate API snapshot symbol: " + field.0)
+        }
+        seen.push(field.0);
+        let _ = json::field(field.1, "declaration").and_then(json::as_string).ok_or(
+            "API symbol is missing declaration: " + field.0,
+        )?;
+        let _ = json::field(field.1, "contract").and_then(|value| json::field(value, "kind")).and_then(
+            json::as_string,
+        ).ok_or("API symbol is missing contract kind: " + field.0)?;
+    }
+    let _ = json::field(value, "implementations").and_then(json::as_array).ok_or(
+        "API snapshot is missing implementations",
+    )?;
+    Ok(canonical(value))
+}
+
+fn change(
+    changes: Vec[json::Value],
+    severity: string,
+    symbol: string,
+    member: string,
+    reason: string,
+    before: json::Value,
+    after: json::Value,
+) -> () {
+    changes.push(
+        json::Value::Object(
+            Vec::from_array(
+                [
+                    ("severity", json::Value::String(severity)),
+                    ("path", json::Value::String(symbol)),
+                    ("member", json::Value::String(member)),
+                    ("reason", json::Value::String(reason)),
+                    ("before", before),
+                    ("after", after),
+                ],
+            ),
+        ),
+    )
+}
+
+fn compare_contract(
+    changes: Vec[json::Value],
+    symbol: string,
+    member: string,
+    before: json::Value,
+    after: json::Value,
+) -> () {
+    if json::encode(before) == json::encode(after) {
+        return
+    }
+    if let (Object(left), Object(right)) = (before, after) {
+        for field in left {
+            let next = if member == "" {
+                field.0
+            } else {
+                member + "." + field.0
+            };
+            if let Some(value) = json::field(after, field.0) {
+                compare_contract(changes, symbol, next, field.1, value)
+            } else {
+                change(
+                    changes,
+                    "breaking",
+                    symbol,
+                    next,
+                    "public contract member removed",
+                    field.1,
+                    json::Value::Null,
+                )
+            }
+        }
+        for field in right {
+            if json::field(before, field.0).is_none() {
+                let next = if member == "" {
+                    field.0
+                } else {
+                    member + "." + field.0
+                };
+                change(
+                    changes,
+                    "potential",
+                    symbol,
+                    next,
+                    "public contract member added; review construction, trait implementation, and exhaustive matches",
+                    json::Value::Null,
+                    field.1,
+                )
+            }
+        }
+    } else {
+        change(changes, "potential", symbol, member, "public contract changed", before, after)
+    }
+}
+
+pub fn diff(baseline: string, current: string) -> Result[Difference, string] {
+    let before = parse_snapshot(baseline).map_err(|error| "baseline: " + error)?;
+    let after = parse_snapshot(current).map_err(|error| "current: " + error)?;
+    let old_module = json::field(before, "module").unwrap_or(json::Value::Null);
+    let new_module = json::field(after, "module").unwrap_or(json::Value::Null);
+    if json::encode(old_module) != json::encode(new_module) {
+        return Err("cannot compare API snapshots from different modules")
+    }
+    let old_symbols = json::field(before, "symbols").unwrap_or(json::Value::Null);
+    let new_symbols = json::field(after, "symbols").unwrap_or(json::Value::Null);
+    let changes = Vec::new();
+    if let Object(values) = old_symbols {
+        for symbol in values {
+            if let Some(value) = json::field(new_symbols, symbol.0) {
+                let old_identity = json::field(symbol.1, "declaration").unwrap_or(json::Value::Null);
+                let new_identity = json::field(value, "declaration").unwrap_or(json::Value::Null);
+                if json::encode(old_identity) != json::encode(new_identity) {
+                    change(
+                        changes,
+                        "potential",
+                        symbol.0,
+                        "declaration",
+                        "canonical declaration changed; validate independent consumers",
+                        old_identity,
+                        new_identity,
+                    )
+                }
+                compare_contract(
+                    changes,
+                    symbol.0,
+                    "contract",
+                    json::field(symbol.1, "contract").unwrap_or(json::Value::Null),
+                    json::field(value, "contract").unwrap_or(json::Value::Null),
+                );
+            } else {
+                change(
+                    changes,
+                    "breaking",
+                    symbol.0,
+                    "",
+                    "public path removed or visibility reduced",
+                    symbol.1,
+                    json::Value::Null,
+                )
+            }
+        }
+    }
+    if let Object(values) = new_symbols {
+        for symbol in values {
+            if json::field(old_symbols, symbol.0).is_none() {
+                change(
+                    changes,
+                    "added",
+                    symbol.0,
+                    "",
+                    "public path added",
+                    json::Value::Null,
+                    symbol.1,
+                )
+            }
+        }
+    }
+    compare_contract(
+        changes,
+        "",
+        "implementations",
+        json::field(before, "implementations").unwrap_or(json::Value::Null),
+        json::field(after, "implementations").unwrap_or(json::Value::Null),
+    );
+    for snapshot in[before, after] {
+        if let Some(unresolved) = json::field(snapshot, "unresolved_reexports").and_then(
+            json::as_array,
+        ) {
+            for symbol in unresolved {
+                change(
+                    changes,
+                    "potential",
+                    json::as_string(symbol).unwrap_or(""),
+                    "contract",
+                    "reexport target contract unavailable; supply dependency interfaces",
+                    json::Value::Null,
+                    json::Value::Null,
+                )
+            }
+        }
+    }
+    let mut breaking = 0;
+    let mut potential = 0;
+    for value in changes {
+        match json::field(value, "severity").and_then(json::as_string).unwrap_or("") {
+            "breaking" => {
+                breaking += 1;
+            },
+            "potential" => {
+                potential += 1;
+            },
+            _ => (),
+        }
+    }
+    let report = json::Value::Object(
+        Vec::from_array(
+            [
+                ("schema_version", json::Value::Number("1")),
+                ("scope", json::Value::String("source_api")),
+                ("module", old_module),
+                ("breaking_changes", json::Value::Number(breaking.to_string())),
+                ("potential_changes", json::Value::Number(potential.to_string())),
+                ("changes", sorted_values(changes)),
+            ],
+        ),
+    );
+    Ok(
+        Difference {
+            output: json::encode(canonical(report)) + "\n",
+            requires_review: breaking > 0 || potential > 0,
+        },
+    )
+}

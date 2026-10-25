@@ -96,3 +96,23 @@ JSON 输出为 `module.json`：
 实现位于 `gomlc/doc_comment`、`gomlc/query/documentation*`、`gomlc/doc` 和 `gomlc/cmd/gomldoc`。项目集成位于 `goml/commands/doc.goml` 和 `goml/cmd/goml/doc.goml`。测试覆盖附着关系、可见性、导入、输出、错误和 CLI 集成。工具链及打包改动需要运行 `just ci`，包括不动点和归档迁移位置后的检查。
 
 依赖文档站点、搜索、HTTP 服务器、自动启动浏览器和文档测试属于后续工作。
+
+<a id="source-api-snapshots"></a>
+
+## 源码 API 快照
+
+`goml api snapshot` 检查模块，并将带版本的 JSON 快照写入标准输出。它复用正常的依赖发现和接口产物流水线，因此可能创建检查产物，并需要所选编译器。构建进度和诊断保留在标准错误。可以重定向标准输出保存基线：
+
+```sh
+goml api snapshot > baseline.json
+goml api snapshot --target-dir build > current.json
+goml api diff baseline.json current.json
+```
+
+两个操作都可使用 `--compiler PROGRAM` 选择编译器。`api diff` 不重新构建模块，而是输出 JSON 报告：没有破坏性或潜在破坏性变化时退出 0，需要审阅时退出 1，编译器无法读取或验证快照时退出 2。
+
+快照模式版本 1 记录模块、公开路径、规范声明、结构化类型、泛型参数与约束、公开字段、枚举变体、trait 成员及实现、已求值的常量值和公开 derive 入口。重导出同时保留消费者路径和目标声明。对象键和无序声明会排序；私有函数体、文档、源码位置、产物哈希和函数参数名称不进入快照。模块内部声明也不进入快照。固有方法路径包含接收者及其特化参数；公开签名可达的依赖类型和 trait 契约单独保存在 `referenced_contracts`。重导出契约通过依赖接口解析；无法获得的目标会出现在 `unresolved_reexports` 中，比较此类快照需要审阅。
+
+报告区分删除的公开路径或契约成员（`breaking`）、变化的契约或声明身份（`potential`），以及新增公开路径（`added`）。因此，保留 facade 但移动目标声明时，会报告声明变化，不会默认为身份保持不变。泛型参数重命名、等价但表达方式不同的约束仍可能需要审阅。新增枚举变体或 trait 成员可能影响穷尽匹配或下游实现，因此会保守报告。
+
+检查范围是源码 API 结构，不是运行时行为或二进制 ABI。它不证明常量初始化过程的行为、宏展开行为、与平台有关的外部 ABI 兼容性，以及所有下游类型推断交互都兼容。当前接口产物不能单独保留 trait 方法首参数是否拼写为 `self`；此类源码语法区别不在版本 1 的检查范围内。无法表示的动态编译期常量会使快照失败，而不是生成不完整的常量契约。重要的 facade 迁移除快照报告外，还应使用独立编译的消费者模块验证。

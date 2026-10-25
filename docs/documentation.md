@@ -84,3 +84,21 @@ Output ordering is deterministic. Generated contents contain neither timestamps 
 The implementation lives in `gomlc/doc_comment`, `gomlc/query/documentation*`, `gomlc/doc`, and `gomlc/cmd/gomldoc`. Project integration lives in `goml/commands/doc.goml` and `goml/cmd/goml/doc.goml`. Tests cover attachment, visibility, imports, output, errors, and CLI integration. Toolchain and packaging changes require `just ci`, including fixed-point and relocated archive checks.
 
 Dependency documentation sites, search, an HTTP server, automatic browser launch, and doctests are future work.
+
+## Source API snapshots
+
+`goml api snapshot` checks the module and writes a versioned JSON snapshot to standard output. It reuses the normal dependency discovery and interface artifact pipeline; it may create check artifacts and requires the selected compiler. Build progress and diagnostics stay on standard error. Redirect standard output to save a baseline:
+
+```sh
+goml api snapshot > baseline.json
+goml api snapshot --target-dir build > current.json
+goml api diff baseline.json current.json
+```
+
+`--compiler PROGRAM` selects the compiler for either operation. `api diff` does not rebuild the module. It writes a JSON report and exits 0 when there are no breaking or potentially breaking changes, 1 when review is required, and 2 when the compiler cannot read or validate the snapshots.
+
+Snapshot schema version 1 records the module, public paths, canonical declarations, structured types, generic parameters and predicates, public fields, enum variants, trait members and implementations, evaluated constant values, and public derive entry points. Re-exports preserve both the consumer path and the target declaration. Object keys and unordered declarations are sorted; private bodies, documentation, source positions, artifact hashes, and function parameter names are excluded. Module-internal declarations are excluded. Inherent method paths include their receiver and specialization arguments; dependency type and trait contracts reachable from public signatures are retained separately in `referenced_contracts`. Dependency interfaces are used to resolve re-export contracts; unavailable targets appear in `unresolved_reexports`, and comparing such snapshots requires review.
+
+The report distinguishes removed public paths or contract members (`breaking`), changed contracts or declaration identities (`potential`), and new public paths (`added`). A preserved facade with a moved target is therefore reported as a declaration change, not silently accepted as identity-preserving. Generic parameter renaming and equivalent but differently expressed constraints may still require review. Adding enum variants or trait members can affect exhaustive matches or downstream implementations and is conservatively reported.
+
+This checks source API structure, not runtime behavior or binary ABI. Constant initializer behavior, macro expansion behavior, platform-dependent foreign ABI compatibility, and all possible downstream inference interactions are not proven compatible. Current interface artifacts do not independently retain whether a trait method first parameter was spelled `self`; that source syntax distinction is outside version 1 coverage. Unrepresentable dynamic compile-time constants make snapshot generation fail instead of producing an incomplete constant contract. Validate important facade migrations with an independently compiled consumer module as well as the snapshot report.

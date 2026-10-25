@@ -1,0 +1,507 @@
+package api;
+
+use module::artifact;
+use module::tast;
+use std::collections;
+use std::json;
+
+fn canonical(value: json::Value) -> json::Value {
+    match value {
+        Object(fields) => {
+            let result = Vec::new();
+            for field in fields {
+                result.push((field.0, canonical(field.1)))
+            }
+            collections::sort_by(
+                result,
+                |a, b| if a.0 < b.0 {
+                    -1
+                } else if a.0 > b.0 {
+                    1
+                } else {
+                    0
+                },
+            );
+            Object(result)
+        },
+        Array(items) => {
+            let result = Vec::new();
+            for item in items {
+                result.push(canonical(item))
+            }
+            Array(result)
+        },
+        _ => value,
+    }
+}
+
+fn function_value(value: artifact::ArtifactFnScheme) -> json::Value {
+    object(
+        "function",
+        Vec::from_array(
+            [
+                ("generics", strings(value.type_params)),
+                ("constraints", predicates(value.constraints)),
+                ("type", type_value(value.ty)),
+                (
+                    "comptime",
+                    json::Value::String(
+                        match value.comptime {
+                            RuntimeOnly => "runtime",
+                            Capable => "capable",
+                            Derive => "derive",
+                        },
+                    ),
+                ),
+            ],
+        ),
+    )
+}
+
+fn methods(values: Vec[artifact::ArtifactFnScheme], trait_methods: bool) -> json::Value {
+    let result = Vec::new();
+    for value in values {
+        let fields = Vec::from_array([("signature", function_value(value))]);
+        if trait_methods {
+            let required = match value.body {
+                Function(name) => name == value.name,
+                _ => true,
+            };
+            fields.push(("required", json::Value::Bool(required)))
+        }
+        result.push((value.name, json::Value::Object(fields)))
+    }
+    Object(result)
+}
+
+fn impl_value(value: artifact::ArtifactImplDef) -> json::Value {
+    object(
+        "implementation",
+        Vec::from_array(
+            [
+                ("generics", strings(value.params)),
+                ("constraints", predicates(value.constraints)),
+                ("associated_types", named_types(value.associated_types)),
+                ("methods", methods(value.methods, false)),
+            ],
+        ),
+    )
+}
+
+fn add_symbol(
+    result: Vec[(string, json::Value)],
+    name: string,
+    declaration: string,
+    contract: json::Value,
+) -> () {
+    result.push(
+        (
+            name,
+            json::Value::Object(
+                Vec::from_array(
+                    [("declaration", json::Value::String(declaration)), ("contract", contract)],
+                ),
+            ),
+        ),
+    )
+}
+
+fn package_symbols(unit: artifact::ArtifactInterfaceUnit) -> Result[
+    Vec[(string, json::Value)],
+    string,
+] {
+    let result = Vec::new();
+    let exports = unit.exports;
+    for value in exports.functions {
+        add_symbol(result, value.name, value.name, function_value(value))
+    }
+    for value in exports.constants {
+        let mut evaluated = value.value.map(constant_value).unwrap_or(json::Value::Null);
+        if value.value.is_none() {
+            if let Some(comptime) = unit.comptime {
+                for constant in comptime.module.constants {
+                    if constant.name == value.name {
+                        evaluated = compile_time_value(constant.value)?;
+                    }
+                }
+            }
+        }
+        add_symbol(
+            result,
+            value.name,
+            value.name,
+            object(
+                "constant",
+                Vec::from_array([("type", type_value(value.ty)), ("value", evaluated)]),
+            ),
+        )
+    }
+    if let Some(comptime) = unit.comptime {
+        for entry in comptime.module.derive_entries {
+            if entry.public {
+                let exported = entry.export_name.unwrap_or(entry.name);
+                let public_path = if exported.contains("::") {
+                    exported
+                } else {
+                    unit.package_name + "::" + exported
+                };
+                add_symbol(result, public_path, entry.name, object("derive", Vec::new()))
+            }
+        }
+    }
+    for value in exports.type_aliases {
+        add_symbol(
+            result,
+            value.name,
+            value.name,
+            object(
+                "alias",
+                Vec::from_array(
+                    [("generics", strings(value.generics)), ("type", type_value(value.ty))],
+                ),
+            ),
+        )
+    }
+    for value in exports.structs {
+        let fields = Vec::new();
+        for field in value.fields {
+            if value.public_fields.contains(field.0) {
+                fields.push(field)
+            }
+        }
+        add_symbol(
+            result,
+            value.name,
+            value.name,
+            object(
+                "struct",
+                Vec::from_array(
+                    [
+                        ("generics", strings(value.generics)),
+                        ("fields", named_types(fields)),
+                        ("hidden_fields", json::Value::Bool(value.has_hidden_fields)),
+                        (
+                            "go_comparable",
+                            value.go_comparable.map(comparability).unwrap_or(json::Value::Null),
+                        ),
+                        ("map_requirements", types(value.map_requirements)),
+                    ],
+                ),
+            ),
+        )
+    }
+    for value in exports.enums {
+        let variants = Vec::new();
+        for variant in value.variants {
+            variants.push(
+                (
+                    variant.name,
+                    match variant.fields {
+                        Unit => object("unit", Vec::new()),
+                        Tuple(items) => object("tuple", Vec::from_array([("fields", types(items))])),
+                        Struct(fields) => object(
+                            "struct",
+                            Vec::from_array([("fields", named_types(fields))]),
+                        ),
+                    },
+                ),
+            )
+        }
+        add_symbol(
+            result,
+            value.name,
+            value.name,
+            object(
+                "enum",
+                Vec::from_array(
+                    [
+                        ("generics", strings(value.generics)),
+                        ("variants", json::Value::Object(variants)),
+                        ("map_requirements", types(value.map_requirements)),
+                    ],
+                ),
+            ),
+        )
+    }
+    for value in exports.traits {
+        let default_requirements = Vec::new();
+        for requirement in value.default_map_requirements {
+            default_requirements.push((requirement.0, types(requirement.1)))
+        }
+        let associated = Vec::new();
+        for item in value.associated_types {
+            associated.push((item.name, traits(item.bounds)))
+        }
+        add_symbol(
+            result,
+            value.name,
+            value.name,
+            object(
+                "trait",
+                Vec::from_array(
+                    [
+                        ("generics", strings(value.params)),
+                        ("constraints", predicates(value.predicates)),
+                        ("supertraits", traits(value.supertraits)),
+                        ("associated_types", json::Value::Object(associated)),
+                        ("methods", methods(value.methods, true)),
+                        ("default_map_requirements", json::Value::Object(default_requirements)),
+                    ],
+                ),
+            ),
+        )
+    }
+    for value in exports.inherent_impls {
+        let receiver_ty = match value.key {
+            Exact(ty) => ty,
+            Constr(name) => tast::Type::Con { name },
+        };
+        if !receiver_visible(receiver_ty, unit) {
+            continue
+        }
+        let receiver = type_value(receiver_ty);
+        for method in value.definition.methods {
+            let name = receiver_name(receiver_ty) + "::" + method.name;
+            add_symbol(
+                result,
+                name,
+                name,
+                object(
+                    "method",
+                    Vec::from_array(
+                        [
+                            ("receiver", receiver),
+                            ("generics", strings(value.definition.params)),
+                            ("constraints", predicates(value.definition.constraints)),
+                            ("signature", function_value(method)),
+                        ],
+                    ),
+                ),
+            )
+        }
+    }
+    Ok(result)
+}
+
+fn receiver_visible(value: tast::Type, unit: artifact::ArtifactInterfaceUnit) -> bool {
+    match tast::resolve_type(value) {
+        App { ty, .. } => receiver_visible(ty, unit),
+        Con { name } => {
+            if !name.starts_with(unit.package_name + "::") {
+                return true
+            }
+            for item in unit.exports.structs {
+                if item.name == name {
+                    return true
+                }
+            }
+            for item in unit.exports.enums {
+                if item.name == name {
+                    return true
+                }
+            }
+            for item in unit.exports.type_aliases {
+                if item.name == name {
+                    return true
+                }
+            }
+            false
+        },
+        _ => true,
+    }
+}
+
+fn references(value: json::Value, names: Vec[string]) -> () {
+    match value {
+        Object(fields) => {
+            let kind = json::field(value, "kind").and_then(json::as_string).unwrap_or("");
+            if kind == "named" || kind == "trait" || kind == "dyn" || kind == "bound" {
+                if let Some(name) = json::field(value, "name").and_then(json::as_string) {
+                    if !names.contains(name) {
+                        names.push(name)
+                    }
+                }
+            }
+            for field in fields {
+                references(field.1, names)
+            }
+        },
+        Array(items) => for item in items {
+            references(item, names)
+        },
+        _ => (),
+    }
+}
+
+pub fn snapshot(module_name: string, units: Vec[artifact::ArtifactInterfaceUnit]) -> Result[
+    string,
+    string,
+] {
+    snapshot_with_dependencies(module_name, units, Vec::new())
+}
+
+pub fn snapshot_with_dependencies(
+    module_name: string,
+    owned: Vec[artifact::ArtifactInterfaceUnit],
+    dependencies: Vec[artifact::ArtifactInterfaceUnit],
+) -> Result[string, string] {
+    let units = Vec::new();
+    let local_packages = Vec::new();
+    for unit in owned {
+        units.push(unit);
+        local_packages.push(unit.package_name)
+    }
+    for unit in dependencies {
+        units.push(unit)
+    }
+    let symbols = Vec::new();
+    let available = Vec::new();
+    let unresolved = Vec::new();
+    let implementations = Vec::new();
+    let aliases = Vec::new();
+    for unit in units {
+        let local = local_packages.contains(unit.package_name);
+        for symbol in package_symbols(unit)? {
+            available.push(symbol);
+            if local {
+                symbols.push(symbol)
+            }
+        }
+        for value in unit.exports.reexports {
+            aliases.push(value)
+        }
+        if !local {
+            continue
+        }
+        for value in unit.exports.trait_impls {
+            implementations.push(
+                object(
+                    "trait_implementation",
+                    Vec::from_array(
+                        [
+                            ("package", json::Value::String(unit.package_name)),
+                            ("trait", trait_value(value.trait_ref)),
+                            ("type", type_value(value.for_ty)),
+                            ("definition", impl_value(value.definition)),
+                        ],
+                    ),
+                ),
+            )
+        }
+    }
+    for alias in aliases {
+        let mut local_alias = false;
+        for unit in owned {
+            for candidate in unit.exports.reexports {
+                if candidate.0 == alias.0 {
+                    local_alias = true;
+                }
+            }
+        }
+        if !local_alias {
+            continue
+        }
+        let mut target = alias.1;
+        let visited = Vec::new();
+        loop {
+            if visited.contains(target) {
+                return Err("cyclic API reexport: " + alias.0)
+            }
+            visited.push(target);
+            let mut next = Option::None;
+            for candidate in aliases {
+                if candidate.0 == target {
+                    next = Some(candidate.1);
+                }
+            }
+            if let Some(value) = next {
+                target = value;
+            } else {
+                break
+            }
+        }
+        let mut contract = Option::None;
+        for symbol in available {
+            if symbol.0 == target {
+                contract = json::field(symbol.1, "contract");
+            }
+        }
+        if contract.is_none() {
+            unresolved.push(alias.0)
+        }
+        add_symbol(
+            symbols,
+            alias.0,
+            target,
+            contract.unwrap_or(object("external_reexport", Vec::new())),
+        );
+        for symbol in available {
+            if symbol.0.starts_with(target + "::") || symbol.0.starts_with(target + "[") {
+                add_symbol(
+                    symbols,
+                    alias.0 + symbol.0.byte_slice(target.byte_len(), symbol.0.byte_len()),
+                    symbol.0,
+                    json::field(symbol.1, "contract").unwrap_or(json::Value::Null),
+                )
+            }
+        }
+    }
+    let referenced: Vec[(string, json::Value)] = Vec::new();
+    let pending = Vec::new();
+    for symbol in symbols {
+        references(symbol.1, pending)
+    }
+    for implementation in implementations {
+        references(implementation, pending)
+    }
+    let mut reference_index = 0;
+    while reference_index < pending.len() {
+        let name = pending[reference_index];
+        reference_index += 1;
+        for symbol in available {
+            if symbol.0 == name || symbol.0.starts_with(name + "::")
+                || symbol.0.starts_with(name + "[") {
+                let mut owned_symbol = false;
+                for candidate in symbols {
+                    if candidate.0 == symbol.0 {
+                        owned_symbol = true;
+                    }
+                }
+                if !owned_symbol {
+                    let mut seen = false;
+                    for candidate in referenced {
+                        if candidate.0 == symbol.0 {
+                            seen = true;
+                        }
+                    }
+                    if !seen {
+                        referenced.push(symbol);
+                        references(symbol.1, pending)
+                    }
+                }
+            }
+        }
+    }
+    let names = Vec::new();
+    for symbol in symbols {
+        if names.contains(symbol.0) {
+            return Err("duplicate public API path: " + symbol.0)
+        }
+        names.push(symbol.0)
+    }
+    collections::sort(unresolved);
+    let result = json::Value::Object(
+        Vec::from_array(
+            [
+                ("schema_version", json::Value::Number("1")),
+                ("scope", json::Value::String("source_api")),
+                ("module", json::Value::String(module_name)),
+                ("symbols", json::Value::Object(symbols)),
+                ("unresolved_reexports", strings(unresolved)),
+                ("referenced_contracts", json::Value::Object(referenced)),
+                ("implementations", sorted_values(implementations)),
+            ],
+        ),
+    );
+    Ok(json::encode(canonical(result)) + "\n")
+}
