@@ -46,3 +46,5 @@ The [language guide](goml.md) is an overview and reading map. Maintain language 
 Each document includes an `English | 简体中文` switch. Chinese links point to Chinese counterparts where available. Preserve English heading fragments in Chinese documents with explicit anchors so existing cross-references remain valid. When changing headings, update links and anchors together.
 
 Run `just check-docs` (or `python3 tools/check-docs.py`) from the repository root to check bilingual coverage, language switches, heading structure, code examples, and local links and anchors. These checks detect structural drift; reviewers still need to check translation accuracy and completeness. Documentation-only changes require the applicable documentation checks, not the full compiler CI suite.
+
+Run `just check-package-boundaries` to verify compiler and driver production imports, dependency layers, and cycles. This check also runs in CI.

@@ -46,3 +46,23 @@ just update-golden
 See the [language guide](../docs/goml.md), [formatter rules](../docs/formatting.md), [API documentation](../docs/documentation.md), and [compile-time evaluation architecture](../docs/comptime.md) for the corresponding compiler contracts.
 
 Project-aware queries obtain module descriptions from the matching `goml` driver through `project_info/`; `query::analyze_with_project` also accepts an explicit description from its caller. Manifest, workspace, and registry interpretation remain in the driver. Source import resolution, package analysis, and navigation remain in `query/`. Standalone compiler commands keep their existing inputs and do not need project dependency resolution. Set `GOML_PROJECT_DRIVER` when the driver is not installed beside the compiler or language server and cannot be discovered through `GOML_HOME/bin` or `PATH`.
+
+`compiler/` owns source compilation, package worlds, artifact loading and linking;
+`cmd/gomlc/` owns command parsing and command execution. Compiler service tests
+live alongside the services, while CLI tests remain with the command.
+
+`diagnostic/` owns shared diagnostic values and formatting. `builtin_source/`
+owns builtin source loading, parsing and cached HIR metadata; `tast/` retains
+typed builtin conversion and contract validation. Installed worlds inject builtin
+metadata through the same loader, and the lazy source fallback remains available.
+`names/` supplies shared name matching without depending on typed representations.
+
+`go_ir/` owns the Go representation and printer, `go_types/` owns representation
+type lowering and mangling, and `go_runtime/` emits runtime support. `go_backend/`
+assembles these pieces, lowers control flow and performs Go dead-code elimination.
+Standard-package selection uses the resource catalog and its dependency closure,
+rather than a separate boolean field for every package.
+
+`just check-package-boundaries` checks production imports, dependency layers and
+cycles for both compiler and driver packages. It also rejects imports of command
+packages from reusable packages.

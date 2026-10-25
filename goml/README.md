@@ -28,3 +28,10 @@ See [project tools](../docs/tooling.md) for user commands: [module and workspace
 CLI integration tests live in `cmd/goml/*_test.goml`, with shared helpers in `test_support/`; other packages also contain their own unit tests. Their isolated integration workspaces are written below `goml/_artifact/test-work` relative to the repository root.
 
 The driver owns project configuration and module dependency resolution. `goml __project-info --source <PATH>` is an internal, read-only protocol for editor and compiler query clients. Its JSON response has `protocol: 1`, a nullable `project`, and absolute `watched` paths. A project contains `root`, `module`, `target`, `development`, `modules`, and a nullable dependency-resolution `error`. Module entries contain `name`, `root`, `dependencies`, and `dev_dependencies`; only the root module exposes its development dependencies. Files outside modules return a null project. Invalid root manifests fail the command. Dependency failures preserve root metadata and report the error in the description. The command does not locate a compiler, fetch dependencies, or create artifacts. `--registry-root` provides an explicit cache directory for isolated tests.
+
+Package responsibilities follow the build flow: `project/` discovers and describes
+projects, `build_model/` defines commands and plans, `build_plan/` constructs those
+plans, and `build/` executes them with caching and scheduling. `go_export/` owns
+Go export paths and output assembly. Planning and execution share the command
+model without depending on each other; discovery does not import either layer.
+Their tests live in the corresponding packages.

@@ -63,7 +63,10 @@ bootstrap:
 check-docs:
     python3 tools/check-docs.py
 
-_ci-scripts: check-docs
+check-package-boundaries:
+    python3 tools/check-package-boundaries.py
+
+_ci-scripts: check-docs check-package-boundaries
     go run tools/generate_unicode_tables.go --check
     python3 tools/generate_unicode_casefold.py --check
     python3 tools/syscall/generate.py --check

@@ -78,6 +78,7 @@ goml 是一门采用静态类型和垃圾回收、具有类似 Rust 语法并编
 - 接收者明确时，将具体对象上的操作定义为方法，并通过接收者调用。独立构造函数及没有自然接收者的操作仍使用自由函数。
 - 前端流水线为 `lexer → parser → CST → AST → HIR → TAST → Core → Mono → Lift → ANF → Go`。
 - `gomlc/hir/` 负责 AST 到 HIR 的降级和名称解析。`gomlc/checker/` 负责推断、检查、约束、诊断、查询事实和类型驱动的决策，包括上下文枚举模式解析。`gomlc/tast/` 负责带类型的表示、共享类型和签名元数据、遍历、打印和验证。检查器依赖 TAST；生产用 TAST 和后端代码不得依赖检查器。
+- 编译服务放在 `gomlc/compiler/`，命令处理放在 `gomlc/cmd/`。共享诊断属于 `gomlc/diagnostic/`，内建源码加载属于 `gomlc/builtin_source/`。Go 表示、类型降级和运行时生成分别放在 `go_ir/`、`go_types/` 和 `go_runtime/`。驱动器的项目发现、命令模型、规划、执行和导出分别属于 `project/`、`build_model/`、`build_plan/`、`build/` 和 `go_export/`。修改导入或包归属时运行 `just check-package-boundaries`。
 - 歧义、查找缺失、无效缓存和依赖失败必须产生可恢复的诊断。环境和查找代码必须返回失败值，而不能终止编译器。
 - 只有 `lib/builtin/` 拥有编译器运行时 extern 和语言项。此契约必须与普通用户 Go FFI 区分；标准库算法使用 GoML 和编译器拥有的运行时钩子。用户 FFI 信任显式签名，将原生验证留给最终 Go 构建；外部 Go 类型是不透明的。受支持绑定见语言指南和 FFI 文档。
 - LSP 功能应复用 `gomlc/query/`。保留文件作用域导入、规范包身份、依赖导航和现有文档分析缓存。

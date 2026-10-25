@@ -29,3 +29,5 @@ cd goml
 CLI 集成测试位于 `cmd/goml/*_test.goml`，共享辅助工具位于 `test_support/`；其他包也包含各自的单元测试。隔离的集成工作区写入相对于仓库根目录的 `goml/_artifact/test-work` 下。
 
 驱动器负责项目配置和模块依赖解析。`goml __project-info --source <PATH>` 是供编辑器和编译器查询客户端使用的内部只读协议。其 JSON 响应包含 `protocol: 1`、可为空的 `project` 和绝对 `watched` 路径。项目包含 `root`、`module`、`target`、`development`、`modules` 和可为空的依赖解析 `error`。模块条目包含 `name`、`root`、`dependencies` 和 `dev_dependencies`；只有根模块暴露其开发依赖。模块外的文件返回空项目。无效的根清单使命令失败。依赖失败会保留根元数据，并在描述中报告错误。此命令不查找编译器、不获取依赖，也不创建产物。`--registry-root` 为隔离测试提供显式缓存目录。
+
+包职责按构建流程划分：`project/` 发现和描述项目，`build_model/` 定义命令和计划，`build_plan/` 构造计划，`build/` 负责执行、缓存和调度。`go_export/` 负责 Go 导出路径和输出组装。规划与执行共享命令模型，但互不依赖；项目发现也不导入这两层。相关测试放在各自包中。
