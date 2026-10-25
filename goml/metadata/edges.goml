@@ -1,0 +1,290 @@
+package metadata;
+
+use module::project;
+use std::fs;
+use std::json;
+use std::num;
+use std::path;
+use std::process;
+use std::text;
+use std::utf8;
+use utf8::BytesUtf8;
+
+fn string_field(value: json::Value, name: string) -> Result[string, string] {
+    json::field(value, name).and_then(json::as_string).ok_or("package-info omitted " + name)
+}
+
+fn byte_position(source: string, offset: isize) -> (isize, isize) {
+    let mut line = 1;
+    let mut column = 1;
+    for index in 0..offset {
+        if index >= source.byte_len() {
+            break
+        }
+        if source.byte_get(index) == b'\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    let position = (line, column);
+    position
+}
+
+fn import_package(module_name: string, imported: string, packages: Vec[Package]) -> Option[Package] {
+    let imported = if imported == "module" {
+        module_name
+    } else if imported.starts_with("module::") {
+        module_name + imported.byte_slice(6, imported.byte_len())
+    } else {
+        imported
+    };
+    for package_value in packages {
+        if imported == package_value.id {
+            return Some(package_value)
+        }
+    }
+    let segments = text::split(imported, "::");
+    if segments.is_empty() {
+        return None
+    }
+    let last = segments[segments.len() - 1];
+    if last.byte_len() == 0 || last.byte_get(0) < b'A' || last.byte_get(0) > b'Z' {
+        return None
+    }
+    let parent = imported.byte_slice(0, imported.byte_len() - last.byte_len() - 2);
+    for package_value in packages {
+        if parent == package_value.id {
+            return Some(package_value)
+        }
+    }
+    None
+}
+
+fn toolchain_package(compiler: string, imported: string) -> Option[string] {
+    if imported != "std" && !imported.starts_with("std::") {
+        return None
+    }
+    let bin = path::parent(compiler)?;
+    let prefix = path::parent(bin)?;
+    let segments = text::split(imported, "::");
+    let last = segments[segments.len() - 1];
+    let package_name = if last.byte_len() > 0 && last.byte_get(0) >= b'A'
+        && last.byte_get(0) <= b'Z' {
+        imported.byte_slice(0, imported.byte_len() - last.byte_len() - 2)
+    } else {
+        imported
+    };
+    let mut directory = path::join(prefix, "lib");
+    for segment in text::split(package_name, "::") {
+        directory = path::join(directory, segment);
+    }
+    if fs::is_dir(directory) {
+        if let Ok(files) = project::source_files(directory, false) {
+            if !files.is_empty() {
+                return Some(package_name)
+            }
+        }
+    }
+    None
+}
+
+fn dependency_allowed(owner: Module, target: Package, kind: string) -> bool {
+    if text::split(target.id, "::").contains("tests") {
+        return false
+    }
+    if target.id.starts_with(target.module_name + "::examples::")
+        && (kind == "production" || owner.name != target.module_name) {
+        return false
+    }
+    if owner.name == target.module_name {
+        return true
+    }
+    for dependency in owner.manifest.dependencies {
+        if dependency.name == target.module_name {
+            return true
+        }
+    }
+    if kind != "production" {
+        for dependency in owner.manifest.dev_dependencies {
+            if dependency.name == target.module_name {
+                return true
+            }
+        }
+    }
+    false
+}
+
+fn add_edges(
+    compiler: string,
+    module: Module,
+    package_value: Package,
+    file: SourceFile,
+    info: json::Value,
+    packages: Vec[Package],
+    edges: Vec[json::Value],
+    diagnostics: Vec[json::Value],
+) -> Result[(), string] {
+    let uses = json::field(info, "uses").and_then(json::as_array).ok_or("package-info omitted uses")?;
+    let source = fs::read_file_structured(file.path).map_err(|error| error.to_string())?;
+    for value in uses {
+        let imported = string_field(value, "path")?;
+        let offset_text = match json::field(value, "offset") {
+            Some(Number(value)) => value,
+            _ => return Err(
+                "compiler package-info lacks import locations; use the matching compiler",
+            ),
+        };
+        let offset = num::parse_int_structured(offset_text).map_err(
+            |_| "invalid package-info import offset",
+        )?;
+        let reexport = json::field(value, "reexport").and_then(json::as_bool).ok_or(
+            "package-info omitted reexport",
+        )?;
+        let position = byte_position(source, offset);
+        let target: Option[string] = match import_package(module.name, imported, packages) {
+            Some(value) => if dependency_allowed(module, value, file.kind) {
+                Some(value.id)
+            } else {
+                diagnostic(
+                    diagnostics,
+                    file.path + ": undeclared module dependency " + value.module_name,
+                );
+                None
+            },
+            None => toolchain_package(compiler, imported),
+        };
+        if target.is_none() {
+            diagnostic(diagnostics, file.path + ": unresolved package import " + imported);
+        }
+        edges.push(
+            Object(
+                Vec::from_array(
+                    [
+                        ("from", json::Value::String(package_value.id)),
+                        ("to", target.map(json::Value::String).unwrap_or(json::Value::Null)),
+                        ("import", json::Value::String(imported)),
+                        ("kind", json::Value::String(file.kind)),
+                        ("reexport", json::Value::Bool(reexport)),
+                        ("source", json::Value::String(file.path)),
+                        ("line", json::Value::Number(position.0.to_string())),
+                        ("column", json::Value::Number(position.1.to_string())),
+                    ],
+                ),
+            ),
+        );
+    }
+    Ok(())
+}
+
+fn module_info(compiler: string, module: Module, packages: Vec[Package]) -> Result[
+    Vec[json::Value],
+    string,
+] {
+    let files: Vec[string] = Vec::new();
+    for package_value in packages {
+        if package_value.module_name == module.name {
+            for file in package_value.files {
+                files.push(file.path);
+            }
+        }
+    }
+    if files.is_empty() {
+        return Ok(Vec::new())
+    }
+    let command = process::Command::new(compiler).arg("package-info").arg("--format").arg("json").arg(
+        "--input",
+    );
+    for file in files {
+        let _ = command.arg(file);
+    }
+    let output = command.output_structured().map_err(|error| error.to_string())?;
+    if !output.status().success() {
+        return Err(
+            output.stderr().to_string_utf8().unwrap_or("package-info failed with non-UTF-8 output"),
+        )
+    }
+    let value = json::parse(output.stdout().to_string_utf8().map_err(|error| error.to_string())?).map_err(
+        |error| error.to_string(),
+    )?;
+    let protocol = match json::field(value, "protocol_version") {
+        Some(Number(value)) => value,
+        _ => "",
+    };
+    if protocol != "1" {
+        return Err("unsupported compiler package-info protocol")
+    }
+    json::field(value, "files").and_then(json::as_array).ok_or("package-info omitted files")
+}
+
+fn collect_edges(
+    compiler: string,
+    modules: Vec[Module],
+    packages: Vec[Package],
+    edges: Vec[json::Value],
+    diagnostics: Vec[json::Value],
+) -> () {
+    for module in modules {
+        let info = match module_info(compiler, module, packages) {
+            Ok(value) => value,
+            Err(error) => {
+                diagnostic(diagnostics, error);
+                continue
+            },
+        };
+        for package_value in packages {
+            if package_value.module_name != module.name {
+                continue
+            }
+            let declared: Ref[Option[string]] = Ref::new(None);
+            for file in package_value.files {
+                let mut found = false;
+                for value in info {
+                    if string_field(value, "path").unwrap_or("") == file.path {
+                        found = true;
+                        let name = string_field(value, "package").unwrap_or("");
+                        if json::field(value, "package_explicit").and_then(json::as_bool)
+                            != Option::Some(true) {
+                            diagnostic(
+                                diagnostics,
+                                file.path + ": project source requires a package declaration",
+                            );
+                        }
+                        if let Some(expected) = declared.get() {
+                            if name != expected {
+                                diagnostic(
+                                    diagnostics,
+                                    file.path + ": inconsistent package declaration " + name,
+                                );
+                            }
+                        } else {
+                            declared.set(Some(name));
+                        }
+                        if file.kind == "external_test" && name != "tests" {
+                            diagnostic(
+                                diagnostics,
+                                file.path + ": black-box tests must declare package tests",
+                            );
+                        }
+                        if let Err(error) = add_edges(
+                            compiler,
+                            module,
+                            package_value,
+                            file,
+                            value,
+                            packages,
+                            edges,
+                            diagnostics,
+                        ) {
+                            diagnostic(diagnostics, error);
+                        }
+                    }
+                }
+                if !found {
+                    diagnostic(diagnostics, "package-info omitted source " + file.path);
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,159 @@
+package metadata;
+
+use module::manifest;
+use module::manifest::config;
+use module::project;
+use module::registry;
+use std::fs;
+use std::json;
+use std::path;
+
+fn local_origin(root: string, root_manifest: manifest::Manifest, name: string) -> string {
+    let workspace = config::find_workspace(
+        root,
+        |filename| manifest::load(filename).map(|value| value.module_path),
+        manifest::validate_dependency_name,
+    );
+    if let Ok(Some(workspace)) = workspace {
+        let mut member = false;
+        for value in workspace.members {
+            if value.root == root {
+                member = true;
+            }
+        }
+        if member {
+            for value in workspace.replacements {
+                if value.name == name {
+                    return "replacement"
+                }
+            }
+            for value in root_manifest.replacements {
+                if value.name == name {
+                    return "replacement"
+                }
+            }
+            for value in workspace.members {
+                if value.name == name {
+                    return "workspace"
+                }
+            }
+        }
+    }
+    for value in root_manifest.replacements {
+        if value.name == name {
+            return "replacement"
+        }
+    }
+    "path"
+}
+
+fn load_modules(root: string, diagnostics: Vec[json::Value]) -> Result[Vec[Module], string] {
+    let manifest = manifest::load(path::join(root, manifest::FILENAME))?;
+    let modules = Vec::from_array(
+        [Module { name: manifest.module_path, root, origin: "root", manifest }],
+    );
+    if manifest.dependencies.is_empty() && manifest.dev_dependencies.is_empty() {
+        return Ok(modules)
+    }
+    let root_manifest = manifest;
+    let resolved = registry::cached_root().and_then(
+        |cache| registry::resolve_tracked_readonly(root, cache, true, Vec::new()),
+    );
+    match resolved {
+        Ok(values) => for value in values {
+            match manifest::load(path::join(value.root, manifest::FILENAME)) {
+                Ok(manifest) => modules.push(
+                    Module {
+                        name: value.name,
+                        root: value.root,
+                        origin: if value.local {
+                            local_origin(root, root_manifest, value.name)
+                        } else {
+                            "registry"
+                        },
+                        manifest,
+                    },
+                ),
+                Err(error) => diagnostic(diagnostics, error),
+            }
+        },
+        Err(error) => diagnostic(diagnostics, error.to_string()),
+    }
+    Ok(modules)
+}
+
+fn package_files(directory: string, kind: string, include_tests: bool) -> Result[
+    Vec[SourceFile],
+    string,
+] {
+    let result = Vec::new();
+    for value in project::source_files(directory, include_tests).map_err(|error| error.to_string())? {
+        result.push(
+            SourceFile {
+                path: value,
+                kind: if kind == "production" && config::is_test_source(value) {
+                    "internal_test"
+                } else {
+                    kind
+                },
+            },
+        );
+    }
+    Ok(result)
+}
+
+fn collect_packages(module: Module) -> Result[Vec[Package], string] {
+    let result = Vec::new();
+    let target = path::absolute_structured(path::join(module.root, module.manifest.target_dir)).map_err(
+        |error| error.to_string(),
+    )?;
+    for directory in project::package_directories(module.root, target).map_err(
+        |error| error.to_string(),
+    )? {
+        let id = project::package_name_for_directory(module.root, module.name, directory).map_err(
+            |error| error.to_string(),
+        )?;
+        result.push(
+            Package {
+                id,
+                module_name: module.name,
+                directory,
+                files: package_files(directory, "production", module.origin == "root")?,
+            },
+        );
+        let tests = path::join(directory, "tests");
+        if module.origin == "root" && fs::is_dir(tests) {
+            let files = project::black_box_test_files(tests).map_err(|error| error.to_string())?;
+            if !files.is_empty() {
+                result.push(
+                    Package {
+                        id: id + "::tests",
+                        module_name: module.name,
+                        directory: tests,
+                        files: package_files(tests, "external_test", true)?,
+                    },
+                );
+            }
+        }
+    }
+    if module.origin == "root" {
+        for name in project::example_names_in(module.root).map_err(|error| error.to_string())? {
+            let directory = path::join(path::join(module.root, "examples"), name);
+            for directory in project::package_directories_under(module.root, directory, target).map_err(
+                |error| error.to_string(),
+            )? {
+                result.push(
+                    Package {
+                        id: project::package_name_for_directory(module.root, module.name, directory).map_err(
+                            |error| error.to_string(),
+                        )?,
+                        module_name: module.name,
+                        directory,
+                        files: package_files(directory, "example", true)?,
+                    },
+                );
+            }
+        }
+    }
+    Ok(result)
+}
