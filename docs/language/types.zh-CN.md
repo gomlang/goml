@@ -554,13 +554,13 @@ match character {
 
 编译器检查 `match` 是否穷尽被匹配类型，未穷尽时给出缺失模式示例。分析覆盖 bool、枚举、元组、结构体、定长数组、Vec/Slice/MutSlice、整数和字符范围、别名与或模式，也会警告永远无法匹配的分支。
 
-空 `match` 仅适用于没有可构造值的类型：
+空 `match` 仅适用于没有可构造值的类型。这种穷尽匹配的类型为 `never`，即使没有预期结果类型也能推断；包含不可构造类型的元组、结构体或非空定长数组也适用：
 
 ```goml
 enum Never {}
 
 fn absurd(value: Never) -> i32 {
-    match value {}
+    let unreachable = match value {};
 }
 ```
 

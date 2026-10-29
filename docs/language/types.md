@@ -554,13 +554,13 @@ Both endpoints must be integer or character literals of the same concrete type. 
 
 The compiler checks whether `match` is exhaustive for the matched type and gives examples of missing patterns when it is not. The analysis covers bool, enumerations, tuples, structures, fixed arrays, Vec/Slice/MutSlice, integer and character ranges, aliases and or-patterns, and will also warn about branches that are never matched.
 
-An empty `match` is only valid for types that have no constructible value:
+An empty `match` is only valid for types that have no constructible value. Such an exhaustive match has type `never`, even without an expected result type, including matches on tuples, structs, or nonempty arrays containing an uninhabited type:
 
 ```goml
 enum Never {}
 
 fn absurd(value: Never) -> i32 {
-    match value {}
+    let unreachable = match value {};
 }
 ```
 
