@@ -378,7 +378,7 @@ GoML monomorphizes generic calls. Recursive generic code must produce a limited 
 
 ### Const generic parameters
 
-Functions, structs, enums, aliases, traits and implementations can declare `const N: usize` alongside type parameters. A const parameter is a value in an expression and an integer argument in a generic application; it cannot be used as an element type. Each concrete argument participates in monomorphization and nominal type identity. A trait method implementation must preserve the number, order, and kind (type or const) of its method generic parameters; parameter names may differ.
+Functions, structs, enums, aliases, traits and implementations can declare `const N: usize` alongside type parameters. A const parameter is a value in an expression and an integer argument in a generic application; it cannot be used as an element type. Each concrete argument participates in monomorphization and nominal type identity. Array-length requirements inside struct and enum fields also apply to every concrete type application, including unused signatures, unselected enum payloads, and private fields imported from another package. A trait method implementation must preserve the number, order, and kind (type or const) of its method generic parameters; parameter names may differ.
 
 ```goml
 struct Buffer[T, const N: usize] {

@@ -1,0 +1,251 @@
+package checker;
+
+use module::consts;
+use module::tast::{Type, any_child_type, map_child_types, const_type, const_type_value, enum_variant_field_types, for_each_child_type, prune, substitute_params, symbolic_array, types_equal};
+
+const NOMINAL_CONST_COMPLEXITY_ERROR: string = "Nominal constant requirement exceeds the 4096-node or 128-level expression limit";
+
+fn const_requirement_size_allowed(
+    value: Type,
+    parameters: Vec[string],
+    arguments: Vec[Type],
+    remaining: Ref[isize],
+    depth: isize,
+) -> bool {
+    if depth >= 128 || remaining.get() <= 0 {
+        return false
+    }
+    let value = prune(value);
+    if let Param { name } = value {
+        for index in 0..parameters.len() {
+            if parameters[index] == name && index < arguments.len() {
+                return const_requirement_size_allowed(
+                    arguments[index],
+                    Vec::new(),
+                    Vec::new(),
+                    remaining,
+                    depth,
+                )
+            }
+        }
+    }
+    remaining.set(remaining.get() - 1);
+    !any_child_type(
+        value,
+        |child| !const_requirement_size_allowed(child, parameters, arguments, remaining, depth + 1),
+    )
+}
+
+fn const_requirement_substitution_allowed(
+    value: Type,
+    parameters: Vec[string],
+    arguments: Vec[Type],
+) -> bool {
+    const_requirement_size_allowed(value, parameters, arguments, Ref::new(4096), 0)
+}
+
+fn canonical_const_requirement(value: Type) -> Type {
+    let value = map_child_types(prune(value), canonical_const_requirement);
+    if let App { ty: Con { name }, args } = value {
+        if args.len() == 2 {
+            let left = const_type_value(args[0]);
+            let right = const_type_value(args[1]);
+            if (name == "$const_op:+" || name == "$const_op:-") && right == Option::Some(0) {
+                return args[0]
+            }
+            if name == "$const_op:+" && left == Option::Some(0) {
+                return args[1]
+            }
+            if (name == "$const_op:*" || name == "$const_op:/") && right == Option::Some(1) {
+                return args[0]
+            }
+            if name == "$const_op:*" && left == Option::Some(1) {
+                return args[1]
+            }
+        }
+    }
+    value
+}
+
+fn push_const_type_requirement(values: Vec[Type], value: Type) -> bool {
+    let value = canonical_const_requirement(value);
+    if let Some(number) = const_type_value(value) {
+        if number >= 0 {
+            return false
+        }
+    }
+    for previous in values {
+        if types_equal(previous, value) {
+            return false
+        }
+    }
+    values.push(value);
+    true
+}
+
+fn collect_applied_const_requirements(
+    ctx: Checker,
+    parameters: Vec[string],
+    arguments: Vec[Type],
+    requirements: Vec[Type],
+    result: Vec[Type],
+) -> bool {
+    for requirement in requirements {
+        if !const_requirement_substitution_allowed(requirement, parameters, arguments) {
+            return false
+        }
+        let _ = push_const_type_requirement(
+            result,
+            normalize_type(ctx, substitute_params(requirement, parameters, arguments)),
+        );
+    }
+    true
+}
+
+fn collect_type_const_requirements(ctx: Checker, value: Type, result: Vec[Type]) -> bool {
+    let pending = Vec::from_array([value]);
+    while let Some(value) = pending.pop() {
+        let value = prune(normalize_type(ctx, value));
+        if let Some(parts) = symbolic_array(value) {
+            if !const_requirement_substitution_allowed(parts.0, Vec::new(), Vec::new()) {
+                return false
+            }
+            let _ = push_const_type_requirement(result, parts.0);
+            pending.push(parts.1);
+            continue
+        }
+        if let Array { len, .. } = value {
+            if len < 0 {
+                let _ = push_const_type_requirement(result, const_type(len));
+            }
+        }
+        if let Some(parts) = struct_application_parts(value) {
+            let parameters = nominal_parameters(ctx, parts.0);
+            for index in 0..parts.1.len() {
+                if index < parameters.len() && consts::parameter_name(parameters[index]).is_some() {
+                    if !const_requirement_substitution_allowed(
+                        parts.1[index],
+                        Vec::new(),
+                        Vec::new(),
+                    ) {
+                        return false
+                    }
+                    let _ = push_const_type_requirement(result, parts.1[index]);
+                }
+            }
+            if let Some(info) = find_struct_by_name(ctx, parts.0) {
+                if !collect_applied_const_requirements(
+                    ctx,
+                    info.generics,
+                    parts.1,
+                    info.const_requirements,
+                    result,
+                ) {
+                    return false
+                }
+            } else if let Some(info) = find_enum_by_name(ctx, parts.0) {
+                if !collect_applied_const_requirements(
+                    ctx,
+                    info.generics,
+                    parts.1,
+                    info.const_requirements,
+                    result,
+                ) {
+                    return false
+                }
+            }
+        }
+        match value {
+            App { args, .. } => for argument in args {
+                pending.push(argument)
+            },
+            _ => for_each_child_type(value, |child| pending.push(child)),
+        }
+    }
+    true
+}
+
+fn infer_nominal_const_requirements(ctx: Checker) -> () {
+    for attempt in 0..256 {
+        let mut changed = false;
+        for info in ctx.structs {
+            let found = Vec::new();
+            for field in info.fields {
+                if !collect_type_const_requirements(ctx, field.1, found) {
+                    push_diagnostic(ctx, NOMINAL_CONST_COMPLEXITY_ERROR);
+                    return
+                }
+            }
+            for requirement in found {
+                if push_const_type_requirement(info.const_requirements, requirement) {
+                    changed = true;
+                    if info.const_requirements.len() > 4096 {
+                        push_diagnostic(
+                            ctx,
+                            "Nominal constant requirements exceed the 4096-expression limit",
+                        );
+                        return
+                    }
+                }
+            }
+        }
+        for info in ctx.enums {
+            let found = Vec::new();
+            for variant in info.variants {
+                for field in enum_variant_field_types(variant.fields) {
+                    if !collect_type_const_requirements(ctx, field, found) {
+                        push_diagnostic(ctx, NOMINAL_CONST_COMPLEXITY_ERROR);
+                        return
+                    }
+                }
+            }
+            for requirement in found {
+                if push_const_type_requirement(info.const_requirements, requirement) {
+                    changed = true;
+                    if info.const_requirements.len() > 4096 {
+                        push_diagnostic(
+                            ctx,
+                            "Nominal constant requirements exceed the 4096-expression limit",
+                        );
+                        return
+                    }
+                }
+            }
+        }
+        if !changed {
+            return
+        }
+    }
+    push_diagnostic(ctx, "Nominal constant requirements exceed the 256-pass inference limit")
+}
+
+fn nominal_const_argument_error(ctx: Checker, name: string, arguments: Vec[Type]) -> Option[string] {
+    let requirements = Vec::new();
+    if let Some(info) = find_struct_by_name(ctx, name) {
+        if !collect_applied_const_requirements(
+            ctx,
+            info.generics,
+            arguments,
+            info.const_requirements,
+            requirements,
+        ) {
+            return Some(NOMINAL_CONST_COMPLEXITY_ERROR)
+        }
+    } else if let Some(info) = find_enum_by_name(ctx, name) {
+        if !collect_applied_const_requirements(
+            ctx,
+            info.generics,
+            arguments,
+            info.const_requirements,
+            requirements,
+        ) {
+            return Some(NOMINAL_CONST_COMPLEXITY_ERROR)
+        }
+    }
+    for requirement in requirements {
+        if let Some(error) = instantiated_const_argument_error(requirement) {
+            return Some(error)
+        }
+    }
+    None
+}
