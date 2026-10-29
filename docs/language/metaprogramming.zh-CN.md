@@ -41,7 +41,7 @@ fn table() -> [isize; 4] {
 
 编译期代码可使用局部绑定和赋值、块、`if`、`match`、`while`、`loop`、受限的 `for`、`break`、`continue`、`return`、递归、直接调用、整数转换方法、整数 `to_string()` 和受支持运算符。编译期 `for` 仅接受定长数组或内置 `isize` 范围 `start..end` 和 `start..=end`；源值和范围端点求值一次，模式必须不可反驳。还支持确定性的字符串方法 `len`、`byte_len`、`get`、`byte_get`、`byte_slice`、`is_char_boundary`、`starts_with`、`ends_with` 和 `contains`。字符串索引和切片使用字节偏移，拒绝无效的 UTF-8 字符边界。整数格式化接受有符号和无符号的 8、16、32、64 位值，包括 `byte`、`isize` 和 `usize`，生成完整保留取值范围的十进制文本。此能力仅限内置 `ToString` 实现；同名用户 trait 不会成为编译期内建操作。例如，`const BITS: u64 = 18446744073709551615; const MASK: string = BITS.to_string();` 无需运行时格式化即可求值。
 
-编译期代码不能捕获外部运行时参数或局部变量。一次求值内支持闭包、函数参数和间接调用，包括共享可变捕获。具体的 `#[comptime]` 方法支持静态调用和通过本地实现进行动态分派。`Ref` 支持 `new`、`get`、`set`；`Vec` 支持 `new`、`with_capacity`、`from_array`、`get`、`set`、`push`、`len`、`is_empty`、`clear` 和 `truncate`。这些操作保留普通别名关系和边界检查。函数值、动态对象、引用和向量不能作为运行时常量逃逸。不支持泛型编译期函数和实现、通用迭代器、浮点计算、`HashMap`、通道、goroutine、extern 调用、宿主 I/O、环境访问、时间、随机性、网络访问、通用类型反射、任意声明生成和通用类型级计算。下文的受限可编程 derive 接口是唯一的反射和代码生成机制。
+编译期代码不能捕获外部运行时参数或局部变量。一次求值内支持闭包、函数参数和间接调用，包括共享可变捕获。具体的 `#[comptime]` 方法支持静态调用和通过本地实现进行动态分派。动态分派保留全部附加和继承 trait 约束，包括其类型实参。同名方法保持独立：方法语法优先选择子 trait 方法，UFCS 选择指定的声明 trait。每个组成实现都必须在本地，且其方法必须标记为 `#[comptime]`。`Ref` 支持 `new`、`get`、`set`；`Vec` 支持 `new`、`with_capacity`、`from_array`、`get`、`set`、`push`、`len`、`is_empty`、`clear` 和 `truncate`。这些操作保留普通别名关系和边界检查。函数值、动态对象、引用和向量不能作为运行时常量逃逸。不支持泛型编译期函数和实现、通用迭代器、浮点计算、`HashMap`、通道、goroutine、extern 调用、宿主 I/O、环境访问、时间、随机性、网络访问、通用类型反射、任意声明生成和通用类型级计算。下文的受限可编程 derive 接口是唯一的反射和代码生成机制。
 
 `compile_error` 只能用于 `#[comptime]` 函数、`comptime` 块或顶层常量初始化器。它以给定消息终止编译期求值。如果运行时执行 `#[comptime]` 函数到达它，程序会陷入失败：
 
