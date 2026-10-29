@@ -658,6 +658,8 @@ trait Ord: Eq + PartialOrd {
 
 A default method's generic parameters belong to its trait declaration and remain independent of the implementing type's parameters, even when their names match. This also applies to const parameters.
 
+Explicit method generic arguments remain part of specialization even when they appear only in the method body. This applies to method values and default implementations as well as direct calls. Arguments that cannot be inferred from the receiver, arguments, result, or constraints must be supplied explicitly.
+
 Trait methods may provide a default body. An impl may omit such a method and will inherit the default; an explicitly declared impl method overrides it. Default bodies are checked using the trait's generic parameters, predicates, associated types, and `Self`, and remain available across package boundaries:
 
 ```goml
