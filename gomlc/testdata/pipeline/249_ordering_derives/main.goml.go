@@ -387,8 +387,8 @@ type Tuple2_3int_3int struct {
     _1 int
 }
 
-type Tuple2_3int_7float64 struct {
-    _0 int
+type Tuple2_7float64_7float64 struct {
+    _0 float64
     _1 float64
 }
 
@@ -1355,11 +1355,11 @@ func main0() struct{} {
     var inline21 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t66)
     _goml_runtime_core_string_println(inline21)
     var t67 float64 = zero__0 / zero__0
-    var tuple_nan__0 Tuple2_3int_7float64 = Tuple2_3int_7float64{
-        _0: 0.0,
+    var tuple_nan__0 Tuple2_7float64_7float64 = Tuple2_7float64_7float64{
+        _0: 0,
         _1: t67,
     }
-    var t68 Option__Ordering = _goml_m_trait__impl_i_std_p_cmp_p_PartialOrd_i__o_isize_c_f64_q__i_partial__cmp(tuple_nan__0, tuple_nan__0)
+    var t68 Option__Ordering = _goml_m_trait__impl_i_std_p_cmp_p_PartialOrd_i__o_f64_c_f64_q__i_partial__cmp(tuple_nan__0, tuple_nan__0)
     var t69 bool
     var inline19 bool = _goml_m_inherent_i_Option_i_Option_l_T_r__i_is__some____T__Ordering(t68)
     var inline20 bool = !inline19
@@ -1706,29 +1706,44 @@ func _goml_m_trait__impl_i_std_p_cmp_p_Ord_i__l_isize_x3b_2_r__i_cmp(self [2]int
     }
 }
 
-func _goml_m_trait__impl_i_std_p_cmp_p_PartialOrd_i__o_isize_c_f64_q__i_partial__cmp(self Tuple2_3int_7float64, other Tuple2_3int_7float64) Option__Ordering {
-    var t0 int = self._0
-    var t1 int = other._0
+func _goml_m_trait__impl_i_std_p_cmp_p_PartialOrd_i__o_f64_c_f64_q__i_partial__cmp(self Tuple2_7float64_7float64, other Tuple2_7float64_7float64) Option__Ordering {
+    var t0 float64 = self._0
+    var t1 float64 = other._0
     var _structural_partial_ordering_0 Option__Ordering
     var commute_field0 Ordering
     var inline6 bool = t0 < t1
-    var inline7 Ordering
     if inline6 {
-        inline7 = Less
+        var inline7 Option__Ordering = Option__Ordering{
+            _p0: Less,
+            _tag: 1,
+        }
+        _structural_partial_ordering_0 = inline7
+        commute_field0 = Less
     } else {
-        var inline9 bool = t0 > t1
-        if inline9 {
-            inline7 = Greater
+        var inline8 bool = t0 > t1
+        if inline8 {
+            var inline9 Option__Ordering = Option__Ordering{
+                _p0: Greater,
+                _tag: 1,
+            }
+            _structural_partial_ordering_0 = inline9
+            commute_field0 = Greater
         } else {
-            inline7 = Equal
+            var inline10 bool = t0 == t1
+            if inline10 {
+                var inline11 Option__Ordering = Option__Ordering{
+                    _p0: Equal,
+                    _tag: 1,
+                }
+                _structural_partial_ordering_0 = inline11
+                commute_field0 = Equal
+            } else {
+                return Option__Ordering{
+                    _tag: 0,
+                }
+            }
         }
     }
-    var inline8 Option__Ordering = Option__Ordering{
-        _p0: inline7,
-        _tag: 1,
-    }
-    _structural_partial_ordering_0 = inline8
-    commute_field0 = inline7
     var t2 bool
     switch commute_field0 {
     case Less:
