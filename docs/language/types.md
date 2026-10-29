@@ -744,7 +744,7 @@ impl Iterator for Counter {
 }
 ```
 
-When implementing a trait with supertraits, you also need to provide the impl of the target type for each supertrait. The compiler rejects overlapping impls and enforces the orphan rule: at least one of the trait or the nominal type being implemented must belong to the current package. The target nominal type of inherent impl must belong to the current package.
+When implementing a trait with supertraits, you also need to provide the impl of the target type for each supertrait. An invalid instantiated const argument cannot establish an overlap or select an implementation. The compiler rejects overlapping impls and enforces the orphan rule: at least one of the trait or the nominal type being implemented must belong to the current package. The target nominal type of inherent impl must belong to the current package.
 
 <a id="inherent-impl"></a>
 

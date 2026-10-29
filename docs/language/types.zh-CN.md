@@ -744,7 +744,7 @@ impl Iterator for Counter {
 }
 ```
 
-实现有父 trait 的 trait 时，还必须为目标类型提供每个父 trait 的 impl。编译器拒绝重叠 impl，并实施孤儿规则：trait 或被实现的名义类型至少一个属于当前包。固有 impl 的目标名义类型必须属于当前包。
+实现有父 trait 的 trait 时，还必须为目标类型提供每个父 trait 的 impl。实例化后无效的常量实参不能用于证明 impl 重叠，也不能用于选择实现。编译器拒绝重叠 impl，并实施孤儿规则：trait 或被实现的名义类型至少一个属于当前包。固有 impl 的目标名义类型必须属于当前包。
 
 <a id="inherent-impl"></a>
 
