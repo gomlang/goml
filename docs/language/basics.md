@@ -913,7 +913,7 @@ let next = || {
 };
 ```
 
-`return` in a closure exits that closure and supplies its result.
+`return` in a closure exits that closure and supplies its result. Explicit return values participate in result-type inference just like the tail expression, including numeric literals and parameters whose types are inferred from later calls. Returns inside a nested closure affect only that nested closure.
 
 <a id="no-let-polymorphism"></a>
 
