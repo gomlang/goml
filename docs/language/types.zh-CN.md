@@ -865,7 +865,7 @@ fn show_dynamic(value: dyn Display) -> string {
 }
 ```
 
-预期 `dyn Trait` 值时，具体值不会隐式装箱。赋值、实参、返回、分支、构造器和集合操作都必须在转换处写 `as dyn Trait`。已有 `dyn Trait` 值仍可在兼容类型上下文间传递，无需再次转换。
+预期 `dyn Trait` 值时，具体值不会隐式装箱。赋值、实参、返回、分支、构造器和集合操作都必须在转换处写 `as dyn Trait`。已有 `dyn Trait` 值仍可在兼容类型上下文间传递，无需再次转换。类型为 `never` 的源表达式会在转换前发散；转换表达式也具有 `never` 类型，不要求该类型实现目标 trait。
 
 `dyn` 值支持方法语法，也可使用 UFCS；父 trait 方法同样可用：
 

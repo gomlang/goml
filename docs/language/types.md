@@ -865,7 +865,7 @@ fn show_dynamic(value: dyn Display) -> string {
 }
 ```
 
-Concrete values are never boxed implicitly when a `dyn Trait` value is expected. Assignments, arguments, returns, branches, constructors, and collection operations must place `as dyn Trait` at the conversion site. Existing `dyn Trait` values can still flow through compatible typed contexts without another conversion.
+Concrete values are never boxed implicitly when a `dyn Trait` value is expected. Assignments, arguments, returns, branches, constructors, and collection operations must place `as dyn Trait` at the conversion site. Existing `dyn Trait` values can still flow through compatible typed contexts without another conversion. A source expression of type `never` diverges before conversion; the cast also has type `never` and does not require that type to implement the target trait.
 
 The `dyn` value supports method syntax, and UFCS can also be used; it can be seen that supertrait methods are also available:
 

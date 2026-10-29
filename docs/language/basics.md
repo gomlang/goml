@@ -113,7 +113,7 @@ let multiline = r##"first line
 second line"##;
 ```
 
-Interpolated strings use `f"..."`. Each `{expression}` is evaluated once from left to right and converted with `ToString`; a value that is already `string` is inserted directly. Write `{{` and `}}` for literal braces. Formatting specifications and interpolated multiline strings are not supported:
+Interpolated strings use `f"..."`. Each `{expression}` is evaluated once from left to right and converted with `ToString`; a value that is already `string` is inserted directly. If an embedded expression diverges, conversion and later parts are not evaluated, and the interpolation has type `never`. Write `{{` and `}}` for literal braces. Formatting specifications and interpolated multiline strings are not supported:
 
 ```goml
 let name = "Ada";
