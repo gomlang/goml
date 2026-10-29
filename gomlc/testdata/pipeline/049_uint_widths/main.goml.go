@@ -69,13 +69,13 @@ func main0() struct{} {
     var start8__0 uint8 = 200
     var add8__0 uint8 = 55
     var sum8__0 uint8 = start8__0 + add8__0
-    var neg8__0 uint8 = -start8__0
+    var neg8__0 uint8 = 0 - start8__0
     var start16__0 uint16 = 50000
     var add16__0 uint16 = 12000
     var sum16__0 uint16 = start16__0 + add16__0
     var diff16__0 uint16 = sum16__0 - start16__0
     var add32__0 uint32 = 123456789
-    var neg32__0 uint32 = -add32__0
+    var neg32__0 uint32 = 0 - add32__0
     var start64__0 uint64 = 6000000000
     var add64__0 uint64 = 4000000000
     var sum64__0 uint64 = start64__0 + add64__0
