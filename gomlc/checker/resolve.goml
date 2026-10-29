@@ -1888,6 +1888,9 @@ fn deferred_method_candidate(
 }
 
 fn method_shape_is_ambiguous(ctx: Checker, receiver: Type, name: string) -> bool {
+    if predicate_method_references(ctx, receiver, name, true).len() > 1 {
+        return true
+    }
     let mut matches = 0;
     for value in ctx.methods {
         if value.function.name == name && receiver_matches(ctx.builtin, value.for_type, receiver)
@@ -2089,7 +2092,15 @@ fn resolve_method(
         Dyn { trait_name: owner, .. } => {
             resolve_dyn_method(ctx, owner, receiver, name, method_explicit)
         },
-        _ => match resolve_predicate_method(ctx, receiver, name, method_explicit, true) {
+        _ => match resolve_predicate_method(
+            ctx,
+            receiver,
+            name,
+            method_explicit,
+            true,
+            Some(args),
+            expected,
+        ) {
             Some(value) => Some(value),
             None => resolve_user_method_for_call(
                 ctx,
@@ -3334,65 +3345,113 @@ fn context_predicates_for_type(ctx: Checker, value: Type) -> Vec[TypePredicate] 
     result
 }
 
+fn predicate_method_references(ctx: Checker, receiver: Type, name: string, require_receiver: bool) -> Vec[
+    TraitRef,
+] {
+    let result = Vec::new();
+    for predicate in context_predicates_for_type(ctx, receiver) {
+        if let Trait { for_ty, trait_ref: reference } = predicate {
+            if !types_equal(normalize_type(ctx, for_ty), normalize_type(ctx, receiver)) {
+                continue
+            }
+            let reference = normalize_trait_ref(ctx, reference);
+            if contains_trait_ref(result, reference) {
+                continue
+            }
+            if let Some(info) = find_trait(ctx, reference.name) {
+                if let Some(method) = find_trait_method(info, name) {
+                    if !require_receiver || method.has_receiver
+                        || name.starts_with("$associated_const:") {
+                        result.push(reference)
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
 fn resolve_predicate_method(
     ctx: Checker,
     receiver: Type,
     name: string,
     method_explicit: Vec[Type],
     require_receiver: bool,
+    args: Option[Vec[Type]],
+    expected: Option[Type],
 ) -> Option[ResolvedCallable] {
-    let resolved: Vec[ResolvedCallable] = Vec::new();
-    let seen: Vec[TraitRef] = Vec::new();
-    let candidates = text::StringBuilder::new();
-    for predicate in context_predicates_for_type(ctx, receiver) {
-        match predicate {
-            GoComparable(_) => (),
-            Trait { for_ty: bound_ty, trait_ref: reference } => {
-                if types_equal(normalize_type(ctx, bound_ty), receiver) {
-                    let reference = normalize_trait_ref(ctx, reference);
-                    if contains_trait_ref(seen, reference) {
-                        continue
-                    }
-                    seen.push(reference);
-                    if let Some(value) = resolve_trait_reference_method(
-                        ctx,
-                        reference,
-                        name,
-                        Some(receiver),
-                        method_explicit,
-                        require_receiver,
-                    ) {
-                        if candidates.is_empty() {} else {
-                            candidates.write_string(", ")
-                        }
-                        candidates.write_string(short_name(reference.name));
-                        resolved.push(value)
-                    }
-                }
-            },
-            Equality { lhs: _, rhs: _ } => (),
-        }
+    let references = predicate_method_references(ctx, receiver, name, require_receiver);
+    if references.len() == 1 {
+        return resolve_trait_reference_method(
+            ctx,
+            references[0],
+            name,
+            Some(receiver),
+            method_explicit,
+            require_receiver,
+        )
     }
-    if resolved.len() == 1 {
-        Some(resolved[0])
-    } else {
-        if resolved.len() > 1 {
-            push_diagnostic(
-                ctx,
-                f"Ambiguous method {name} for type {type_text(receiver)} (candidates: {candidates.finish()}). Use UFCS like Trait::{name}(...) to disambiguate",
-            )
-        }
-        if resolved.len() > 1 {
-            Some(
-                ResolvedCallable {
-                    callable: Callable::Function("<error>"),
-                    ty: Type::Error,
-                    predicates: Vec::new(),
+    let matching = Vec::new();
+    for reference in references {
+        let snapshot = method_inference_snapshot(
+            receiver,
+            args.unwrap_or_else(|| Vec::new()),
+            expected,
+            method_explicit,
+        );
+        let diagnostic_start = ctx.diagnostics.len();
+        if let Some(value) = resolve_trait_reference_method(
+            ctx,
+            reference,
+            name,
+            Some(receiver),
+            method_explicit,
+            require_receiver,
+        ) {
+            let compatible = match args {
+                Some(args) => method_matches_call(ctx, value, receiver, args, expected),
+                None => match (expected, prune(value.ty)) {
+                    (Some(expected), Func { ret_ty, .. }) => call_value_types_compatible(
+                        normalize_type(ctx, ret_ty),
+                        normalize_type(ctx, expected),
+                    ),
+                    _ => true,
                 },
-            )
-        } else {
-            None
+            };
+            if compatible {
+                matching.push(reference)
+            }
         }
+        snapshot.restore();
+        ctx.diagnostics.truncate(diagnostic_start);
+    }
+    if matching.len() == 1 {
+        resolve_trait_reference_method(
+            ctx,
+            matching[0],
+            name,
+            Some(receiver),
+            method_explicit,
+            require_receiver,
+        )
+    } else if matching.is_empty() {
+        None
+    } else {
+        let candidates = Vec::new();
+        for reference in matching {
+            candidates.push(short_name(reference.name))
+        }
+        push_diagnostic(
+            ctx,
+            f"Ambiguous method {name} for type {type_text(receiver)} (candidates: {text::join(candidates, ", ")}). Use UFCS like Trait::{name}(...) to disambiguate",
+        );
+        Some(
+            ResolvedCallable {
+                callable: Callable::Function("<error>"),
+                ty: Type::Error,
+                predicates: Vec::new(),
+            },
+        )
     }
 }
 
@@ -3573,6 +3632,8 @@ fn resolve_static_member(
                     member,
                     method_explicit,
                     false,
+                    None,
+                    expected,
                 ) {
                     Some(value) => Some(value),
                     None => resolve_user_method(ctx, owner_ty, member, method_explicit, expected),
