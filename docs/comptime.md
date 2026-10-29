@@ -38,6 +38,8 @@ An interface artifact exports public comptime entries and the reachable closure 
 
 Index lowering selects the operation from the checked receiver type: fixed arrays use CTIR indexing and vectors use evaluator buffer reads. Receiver and index evaluation order is preserved, and each operation retains its own bounds checks.
 
+CTIR block result types account for statements that cannot complete normally, even when there is no tail expression or the tail is unreachable. Lowering evaluates a diverging `let` initializer without emitting an unreachable pattern binding. Evaluation propagates `return`, `break`, and `continue` from binding initializers and assignment values before changing local cells. Capability checks and CTIR verification still visit unreachable operations and validate their types and slots.
+
 CTFE failures are recoverable compiler diagnostics. They identify the failing source origin, the requesting comptime site, and the compile-time call stack. A failed or resource-exhausted evaluation never terminates the compiler process.
 
 ## Programmable derive phase

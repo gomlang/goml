@@ -58,6 +58,8 @@ fn checked_size(value: isize) -> isize {
 }
 ```
 
+A block that returns, breaks, or continues before reaching its end retains its `never` type during compile-time evaluation. Such a block may initialize a typed binding or appear in a branch or assignment; the initializer exits before pattern binding occurs. Unreachable code still undergoes compile-time capability checking.
+
 Failures include the compile-time call stack and source locations. Evaluation uses deterministic instruction, call-depth, temporary-value-node, temporary-memory, and final-value-size limits. Exceeding a limit is a compile error; no wall-clock timeout participates in the language semantics. Successful direct calls are memoized within one evaluation. Memoization is not observable because compile-time code has no user-visible side effects.
 
 Public `#[comptime]` functions can be called from another package. The defining package's interface contains verified compile-time IR for the public entry and the private compile-time helpers and constants it reaches. Public compile-time constant values are also exported. A compile-time body or value change affects the interface hash; source formatting, local names, and source locations do not. A downstream package needs only the dependency interface for checking and evaluation. A value containing hidden fields from another package cannot currently be reified.
