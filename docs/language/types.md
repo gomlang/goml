@@ -372,7 +372,7 @@ An in-scope generic type parameter takes precedence over an unqualified package 
 
 A free function may use a type parameter only in its body, with no occurrence in its parameter or result types. Supply such arguments explicitly, for example `schema::[User]()`, including when taking a function value. Those arguments are retained across package interfaces and specialization; an unused generic definition does not generate an unspecialized executable body.
 
-GoML monomorphizes generic calls. Recursive generic code must produce a limited number of concrete instances and cannot continually change to a new nested type with each recursive call.
+GoML monomorphizes generic calls. Recursive generic code must produce a limited number of concrete instances and cannot continually change to a new nested type with each recursive call. Constant arguments are subject to the same requirement. Specialization reports a diagnostic after 256 recursive instances of the same function along one call chain or 4096 total instances of one function. Calls that reuse an existing instance do not consume another instance.
 
 <a id="const-generic-parameters"></a>
 
