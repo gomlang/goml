@@ -391,7 +391,7 @@ let counts: HashMap[string, i32] = HashMap::new();
 counts["answer"] = 42;
 ```
 
-`Slice[T]` is a read-only view and cannot be assigned by index. `MutSlice[T]` is a mutable bounded view and supports indexed assignment without copying its `Vec[T]` backing storage.
+`Slice[T]` is a read-only view and cannot be assigned by index, including through fields, tuple projections, or array indexes within an element. Interior mutation through an element's `Ref`, `Vec`, or other mutable container remains available. `MutSlice[T]` is a mutable bounded view and supports indexed assignment without copying its `Vec[T]` backing storage.
 
 <a id="expressions-and-operators"></a>
 

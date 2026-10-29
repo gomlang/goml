@@ -3952,10 +3952,77 @@ fn check_index_expr(ctx: Checker, base_source: hir::Expr, index_source: hir::Exp
     }
 }
 
+fn assignment_constant_root(ctx: Checker, value: hir::Expr) -> Option[string] {
+    match value.kind {
+        NameRef { name_ref } => {
+            let found = match name_ref {
+                Def(definition) => find_constant_by_def(ctx, definition),
+                Unresolved(name) => find_constant_by_name(ctx, name),
+                _ => None,
+            };
+            match found {
+                Some(constant) => if once_cell_type(ctx.builtin, constant.ty) {
+                    None
+                } else {
+                    Some(constant.name)
+                },
+                None => None,
+            }
+        },
+        Field { expr: base, .. } | Proj { tuple: base, .. } | Index { base, .. } => assignment_constant_root(
+            ctx,
+            base,
+        ),
+        _ => None,
+    }
+}
+
+fn assignment_crosses_readonly_slice(ctx: Checker, value: Expr) -> bool {
+    match value {
+        Field { expr: base, .. } | Proj { tuple: base, .. } => assignment_crosses_readonly_slice(
+            ctx,
+            base,
+        ),
+        Index { base, .. } => match prune(normalize_type(ctx, expr_type(base))) {
+            Slice { .. } => true,
+            Array { .. } => assignment_crosses_readonly_slice(ctx, base),
+            other if symbolic_array(other).is_some() => assignment_crosses_readonly_slice(ctx, base),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn validate_assignment_slice_path(ctx: Checker, value: Expr, span: ast::Span) -> () {
+    if assignment_crosses_readonly_slice(ctx, value) {
+        push_diagnostic_at(
+            ctx,
+            "cannot assign through Slice indexing; Slice is read-only",
+            Some(span),
+        )
+    }
+}
+
 fn check_assign_target(ctx: Checker, target: hir::Expr, compound: bool) -> (Expr, Type) {
     let target_span = target.span;
     match target.kind {
         NameRef { name_ref: reference } => {
+            if let Local(local) = reference {
+                if !local_is_mutable(ctx, local) {
+                    push_diagnostic_at(
+                        ctx,
+                        "cannot reassign immutable binding `" + local.hint + "`",
+                        Some(target_span),
+                    )
+                }
+            }
+            if let ConstParam(name) = reference {
+                push_diagnostic_at(
+                    ctx,
+                    "cannot assign to const parameter `" + name + "`",
+                    Some(target_span),
+                )
+            }
             let static_value = match reference {
                 Def(definition) => find_constant_by_def(ctx, definition),
                 hir::NameRef::Unresolved(name) => find_constant_by_name(ctx, name),
@@ -3984,6 +4051,7 @@ fn check_assign_target(ctx: Checker, target: hir::Expr, compound: bool) -> (Expr
             let base = with_expr_type(base, normalize_type(ctx, expr_type(base)));
             let parts = match prune(expr_type(base)) {
                 other if symbolic_array(other).is_some() => {
+                    validate_assignment_slice_path(ctx, base, target_span);
                     validate_array_assignment_root(ctx, local_root, base, target_span);
                     (
                         Type::Int,
@@ -3992,6 +4060,7 @@ fn check_assign_target(ctx: Checker, target: hir::Expr, compound: bool) -> (Expr
                     )
                 },
                 Array { len: _, elem } => {
+                    validate_assignment_slice_path(ctx, base, target_span);
                     validate_array_assignment_root(ctx, local_root, base, target_span);
                     (Type::Int, Type::Unit, elem)
                 },
@@ -4033,7 +4102,21 @@ fn check_assign_target(ctx: Checker, target: hir::Expr, compound: bool) -> (Expr
             )
         },
         _ => {
+            match target.kind {
+                Field { .. } | Proj { .. } => if let Some(name) = assignment_constant_root(
+                    ctx,
+                    target,
+                ) {
+                    push_diagnostic_at(
+                        ctx,
+                        "cannot assign through constant `" + name + "`",
+                        Some(target_span),
+                    )
+                },
+                _ => (),
+            }
             let typed = check_expr(ctx, target, Option::None);
+            validate_assignment_slice_path(ctx, typed, target_span);
             (typed, expr_type(typed))
         },
     }

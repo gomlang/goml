@@ -391,7 +391,7 @@ let counts: HashMap[string, i32] = HashMap::new();
 counts["answer"] = 42;
 ```
 
-`Slice[T]` 是只读视图，不能按索引赋值。`MutSlice[T]` 是有界可变视图，支持索引赋值且不会复制其 `Vec[T]` 底层存储。
+`Slice[T]` 是只读视图，不能按索引赋值，也不能通过元素内的字段、元组投影或数组索引赋值。通过元素中的 `Ref`、`Vec` 或其他可变容器进行内部修改仍然可用。`MutSlice[T]` 是有界可变视图，支持索引赋值且不会复制其 `Vec[T]` 底层存储。
 
 <a id="expressions-and-operators"></a>
 
