@@ -484,7 +484,7 @@ let valid = !values[0];
 
 ### Operator type rules
 
-- The two numeric operands of `+ - * /` must be of the same concrete numeric type; there is no implicit numeric promotion.
+- The two numeric operands of `+ - * /` must be of the same concrete numeric type; there is no implicit numeric promotion. Nominal structs and enums, and unconstrained generic parameters, do not acquire arithmetic operations from their representation or eventual instantiation. These rules also apply to compound assignments.
 - `%` only accepts integers of the same type.
 - `& | ^ ~` only accepts integers, and both sides of binary bitwise operations must be of the same type. Both sides of `<< >>` must be integers and the result type is the same as the left operand.
 - `+` also supports `string + string`.
