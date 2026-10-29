@@ -1,0 +1,310 @@
+package checker;
+
+use module::tast::{TraitRef, Type, TypePredicate, map_child_types, opaque_bounds, prune, short_name, substitute_type, symbolic_array, types_equal};
+
+struct OverlapSearch {
+    roots: Vec[TypePredicate],
+    steps: Ref[isize],
+    exhausted: Ref[bool],
+}
+
+fn overlap_search_step(search: OverlapSearch, goals: Vec[string]) -> bool {
+    if search.steps.get() >= 8192 || goals.len() >= 256 {
+        search.exhausted.set(true);
+        return false
+    }
+    search.steps.set(search.steps.get() + 1);
+    true
+}
+
+struct OverlapObligation {
+    predicate: TypePredicate,
+    goals: Vec[string],
+}
+
+fn overlap_remaining(obligations: Vec[OverlapObligation], selected: isize) -> Vec[OverlapObligation] {
+    let result = Vec::new();
+    for index in 0..obligations.len() {
+        if index != selected {
+            result.push(obligations[index])
+        }
+    }
+    result
+}
+
+fn overlap_extend(
+    remaining: Vec[OverlapObligation],
+    predicates: Vec[TypePredicate],
+    goals: Vec[string],
+) -> Vec[OverlapObligation] {
+    let result = Vec::new();
+    for predicate in predicates {
+        result.push(OverlapObligation { predicate, goals })
+    }
+    for obligation in remaining {
+        result.push(obligation)
+    }
+    result
+}
+
+fn overlap_obligation_priority(ctx: Checker, predicate: TypePredicate) -> isize {
+    match predicate {
+        Equality { lhs, rhs } => {
+            if has_unresolved_projection(normalize_type(ctx, lhs))
+                || has_unresolved_projection(normalize_type(ctx, rhs)) {
+                7
+            } else {
+                0
+            }
+        },
+        GoComparable(ty) => if contains_unbound_type_variable(normalize_type(ctx, ty)) {
+            6
+        } else {
+            1
+        },
+        Trait { for_ty, trait_ref } => match prune(normalize_type(ctx, for_ty)) {
+            Projection { .. } => 7,
+            Var(_) | Param { .. } => if trait_reference_uses_builtin(ctx, trait_ref) {
+                5
+            } else {
+                3
+            },
+            _ => 2,
+        },
+    }
+}
+
+fn overlap_snapshot(search: OverlapSearch, obligations: Vec[OverlapObligation]) -> InferenceSnapshot {
+    let snapshot = inference_snapshot(Vec::new());
+    snapshot.include_predicates(search.roots);
+    for obligation in obligations {
+        snapshot.include_predicates(Vec::from_array([obligation.predicate]))
+    }
+    snapshot
+}
+
+fn overlap_structural_requirements(ctx: Checker, ty: Type, reference: TraitRef) -> Option[
+    Vec[TypePredicate],
+] {
+    if !reference.args.is_empty()
+        || !(trait_reference_matches_name(ctx, reference, ctx.builtin.partial_eq.name)
+            || trait_reference_matches_name(ctx, reference, ctx.builtin.eq.name)
+            || trait_reference_matches_name(ctx, reference, ctx.builtin.hash.name)
+            || trait_reference_matches_name(ctx, reference, ctx.builtin.default.name)
+            || trait_reference_matches_name(ctx, reference, ctx.builtin.ordering.partial_ord)
+            || trait_reference_matches_name(ctx, reference, ctx.builtin.ordering.ord)) {
+        return None
+    }
+    let elements: Vec[Type] = Vec::new();
+    if let Some(parts) = symbolic_array(ty) {
+        elements.push(parts.1)
+    } else {
+        match prune(ty) {
+            Tuple { items } => for item in items {
+                elements.push(item)
+            },
+            Array { elem, .. } => elements.push(elem),
+            _ => return None,
+        }
+    }
+    let result = Vec::new();
+    for element in elements {
+        result.push(TypePredicate::Trait { for_ty: element, trait_ref: reference })
+    }
+    Some(result)
+}
+
+fn overlap_goal_type(value: Type, variables: Vec[isize]) -> Type {
+    match prune(value) {
+        Var(variable) => match variable.get() {
+            Unbound { id, kind } => {
+                let mut index = variables.len();
+                for candidate in 0..variables.len() {
+                    if variables[candidate] == id {
+                        index = candidate;
+                        break
+                    }
+                }
+                if index == variables.len() {
+                    variables.push(id)
+                }
+                let prefix = match kind {
+                    Any => "type",
+                    Integer => "integer",
+                    Float => "float",
+                };
+                Type::Param { name: f"#overlap_{prefix}{index}" }
+            },
+            Link(inner) => overlap_goal_type(inner, variables),
+        },
+        other => map_child_types(other, |child| overlap_goal_type(child, variables)),
+    }
+}
+
+fn overlap_goal_key(bound_ty: Type, reference: TraitRef) -> string {
+    let variables = Vec::new();
+    let owner = overlap_goal_type(bound_ty, variables);
+    let args = Vec::new();
+    for arg in reference.args {
+        args.push(overlap_goal_type(arg, variables))
+    }
+    trait_goal_key(owner, TraitRef { name: reference.name, args })
+}
+
+fn overlap_trait_satisfied(
+    ctx: Checker,
+    search: OverlapSearch,
+    bound_ty: Type,
+    reference: TraitRef,
+    goals: Vec[string],
+    remaining: Vec[OverlapObligation],
+) -> bool {
+    let bound_ty = normalize_type(ctx, bound_ty);
+    let reference = normalize_trait_ref(ctx, reference);
+    if types_equal(bound_ty, Type::Error) || context_trait_bound_satisfied(ctx, bound_ty, reference) {
+        return overlap_obligations_satisfied(ctx, search, remaining)
+    }
+    for application in dyn_applications(ctx, opaque_bounds(bound_ty)) {
+        if trait_ref_equal(application, reference) {
+            return overlap_obligations_satisfied(ctx, search, remaining)
+        }
+    }
+    let key = overlap_goal_key(bound_ty, reference);
+    if goals.contains(key) {
+        return false
+    }
+    let goals = extend_trait_goals(goals, key);
+    let builtin_snapshot = overlap_snapshot(search, remaining);
+    builtin_snapshot.include_types(Vec::from_array([bound_ty]));
+    builtin_snapshot.include_types(reference.args);
+    if let Some(requirements) = overlap_structural_requirements(ctx, bound_ty, reference) {
+        if overlap_obligations_satisfied(
+            ctx,
+            search,
+            overlap_extend(remaining, requirements, goals),
+        ) {
+            return true
+        }
+    } else if builtin_trait_bound_satisfied(ctx, bound_ty, reference, goals)
+        && overlap_obligations_satisfied(ctx, search, remaining) {
+        return true
+    }
+    builtin_snapshot.restore();
+    let canonical = canonical_imported_name(ctx, reference.name);
+    let uses_builtin = trait_reference_uses_builtin_with_canonical(ctx, reference, canonical);
+    if let Some(indices) = impl_candidate_indices(ctx, reference.name) {
+        for generic_pass in[false, true] {
+            for index in indices {
+                let implementation = ctx.impls[index];
+                if implementation.generics.is_empty() == generic_pass
+                    || ctx.invalid_impl_origins.contains(implementation.origin)
+                    || !impl_matches_trait_with_builtin(
+                        ctx,
+                        implementation,
+                        uses_builtin,
+                        canonical,
+                        short_name(reference.name),
+                    ) {
+                    continue
+                }
+                let snapshot = overlap_snapshot(search, remaining);
+                snapshot.include_types(Vec::from_array([bound_ty]));
+                snapshot.include_types(reference.args);
+                let substitutions = instantiate_substitutions(
+                    ctx.inference.counter,
+                    implementation.generics,
+                    Vec::new(),
+                );
+                let owner = substitute_type(implementation.for_type, substitutions);
+                let application = substitute_trait_ref(implementation.trait_ref, substitutions);
+                if unify(owner, bound_ty)
+                    && unify_types(normalize_trait_ref(ctx, application).args, reference.args) {
+                    let requirements = expand_implied_predicates(
+                        ctx,
+                        substitute_predicates(implementation.predicates, substitutions),
+                    );
+                    if overlap_obligations_satisfied(
+                        ctx,
+                        search,
+                        overlap_extend(remaining, requirements, goals),
+                    ) {
+                        return true
+                    }
+                }
+                snapshot.restore();
+                if search.exhausted.get() {
+                    return false
+                }
+            }
+        }
+    }
+    false
+}
+
+fn overlap_comparable_satisfied(ctx: Checker, ty: Type) -> bool {
+    let requirements = Vec::new();
+    if !collect_go_comparable_requirements(ctx, ty, requirements, Vec::new()) {
+        return false
+    }
+    for requirement in requirements {
+        if !go_comparable_satisfied(ctx, requirement) && !unify(requirement, Type::Int) {
+            return false
+        }
+    }
+    true
+}
+
+fn overlap_obligations_satisfied(
+    ctx: Checker,
+    search: OverlapSearch,
+    obligations: Vec[OverlapObligation],
+) -> bool {
+    if obligations.is_empty() {
+        return true
+    }
+    let mut selected = 0;
+    let mut priority = overlap_obligation_priority(ctx, obligations[0].predicate);
+    for index in 1..obligations.len() {
+        let candidate = overlap_obligation_priority(ctx, obligations[index].predicate);
+        if candidate < priority {
+            selected = index;
+            priority = candidate;
+        }
+    }
+    let obligation = obligations[selected];
+    if !overlap_search_step(search, obligation.goals) {
+        return false
+    }
+    let snapshot = overlap_snapshot(search, obligations);
+    let remaining = overlap_remaining(obligations, selected);
+    let result = match obligation.predicate {
+        Equality { lhs, rhs } => unify(normalize_type(ctx, lhs), normalize_type(ctx, rhs))
+            && overlap_obligations_satisfied(ctx, search, remaining),
+        GoComparable(ty) => overlap_comparable_satisfied(ctx, ty)
+            && overlap_obligations_satisfied(ctx, search, remaining),
+        Trait { for_ty, trait_ref } => overlap_trait_satisfied(
+            ctx,
+            search,
+            for_ty,
+            trait_ref,
+            obligation.goals,
+            remaining,
+        ),
+    };
+    if !result {
+        snapshot.restore()
+    }
+    result
+}
+
+fn overlap_predicates_satisfied(ctx: Checker, predicates: Vec[TypePredicate]) -> bool {
+    let search = OverlapSearch { roots: predicates, steps: Ref::new(0), exhausted: Ref::new(false) };
+    let obligations = overlap_extend(Vec::new(), predicates, Vec::new());
+    let snapshot = overlap_snapshot(search, obligations);
+    let result = overlap_obligations_satisfied(ctx, search, obligations);
+    snapshot.restore();
+    if search.exhausted.get() {
+        push_diagnostic(ctx, "Trait implementation overlap search exceeded its complexity limit")
+    }
+    result
+}
