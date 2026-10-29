@@ -332,6 +332,8 @@ fn collect_items[T, I: Iterator](iterator: I) -> Vec[T] where I::Item = T {
 }
 ```
 
+Trait 约束检查采用有界搜索。递归要求持续展开为更大的类型，或其他证明超过搜索限制时，会报告类型诊断。搜索耗尽不会被当作证明成功，也不会被当作某个实现不适用的证据。仍支持有限的递归约束。
+
 当前支持两种 `where` 谓词：
 
 ```text

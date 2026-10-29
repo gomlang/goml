@@ -332,6 +332,8 @@ fn collect_items[T, I: Iterator](iterator: I) -> Vec[T] where I::Item = T {
 }
 ```
 
+Trait-bound checking uses bounded search. Recursive requirements that keep expanding to larger types, or other proofs that exceed the search limits, report a type diagnostic. An exhausted search is not treated as a successful proof or as evidence that an implementation cannot apply. Finite recursive requirements remain supported.
+
 There are currently two types of `where` predicates:
 
 ```text
