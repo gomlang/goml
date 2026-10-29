@@ -816,6 +816,8 @@ let number = Convert::[i32]::convert(token, 0);
 let text = Convert::[string]::convert(token, "");
 ```
 
+Trait methods implemented for tuples and function types are available through ordinary method calls as well as UFCS. Type aliases can name these receiver types in associated calls and method values.
+
 Trait implementation and method candidate searches do not retain type bindings from rejected candidates. Reordering otherwise equivalent implementation declarations does not select a different inferred type.
 
 Trait bounds make the corresponding methods available on generic values. Calls through generic bounds use argument types and the expected result to filter same-name candidates, including associated calls through a type parameter. A bound also permits associated calls and method values through the type parameter, such as `T::method()` and `T::method`; methods without receivers still cannot be called through a value. Imported short trait names, renamed imports, and public re-exports retain the defining trait identity in generic bounds and `where` predicates through specialization. Supertraits and associated type bounds also participate in method resolution as implied constraints.
