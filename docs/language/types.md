@@ -623,6 +623,8 @@ trait Provider: Render {
 }
 ```
 
+In a trait method declaration, `Self::Item` refers to that trait's own `Item` when it declares one, even if a supertrait declares the same name. This identity is preserved inside nested types, including `dyn` arguments, associated type bindings, and additional bounds. Bounds on another trait's same-named associated type do not apply.
+
 Associated type projections may be chained when every step is constrained by its declaring trait. For example, `I::IntoIter::Item` projects `IntoIter` from `I`, then projects `Item` from that iterator type. Associated type bounds may be recursive, such as `trait Node { type Next: Node; }`; each finite chain of `Next` projections retains the `Node` bound. Chained projections can appear in signatures and `where` equalities:
 
 ```goml
