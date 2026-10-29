@@ -339,6 +339,8 @@ TypeA = TypeB
 
 A type equality exposes the operations of the equal type inside the function. For example, `where T = Vec[i32]` permits indexing a `T` value, and `where T = (i32, bool)` permits `.0` and `.1` access. A parameter constrained by `where F = (i32) -> i32` can be called as a function, with the usual argument count and type checks. Index assignments retain the underlying container restrictions: `Slice` remains read-only, arrays require a writable root, and `HashMap` indexing does not support compound assignment.
 
+Equal dyn types also imply equality of corresponding trait arguments and associated type bindings. Trait bounds and associated bindings are matched by name, so reordering them does not change the inferred equality.
+
 Ordinary generic function calls usually infer the type arguments from the argument and expected result types:
 
 ```goml
