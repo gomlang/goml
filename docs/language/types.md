@@ -94,7 +94,7 @@ type Pair[T] = (T, T);
 pub type Names = Vec[string];
 ```
 
-Aliases do not create nominally distinct types and recursive alias cycles are rejected. Public aliases can be referenced across packages.
+Aliases do not create nominally distinct types and recursive alias cycles are rejected. Public aliases can be referenced across packages. Associated method calls and method values through an alias use the underlying type's methods; generic alias arguments may be explicit or inferred from the call and expected type.
 
 Use a single-field tuple struct when a value needs a distinct nominal type instead of an alias:
 
