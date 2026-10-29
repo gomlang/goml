@@ -6,7 +6,7 @@ use module::ctfe;
 use module::ctir;
 use module::derive;
 use std::text;
-use module::tast::{Arm, Block, BuiltinContract, Callable, ConstExpr, Constant, Constructor, EnumDef, EnumVariantFields, Expr, File, Function, ImplBlock, Item, Pat, Primitive, SelectArm, Stmt, StructDef, Type, builtin_numeric_conversion_target, diagnostic_type_text, expr_type, resolve_type, substitute_params};
+use module::tast::{Arm, Block, BuiltinContract, Callable, ConstExpr, Constant, Constructor, EnumDef, EnumVariantFields, Expr, File, Function, ImplBlock, Item, Pat, Primitive, SelectArm, Stmt, StructDef, Type, any_child_type, builtin_numeric_conversion_target, diagnostic_type_text, expr_type, prune, resolve_type, substitute_params, types_equal};
 
 pub struct ComptimeFinalizeResult {
     pub file: File,
@@ -264,7 +264,56 @@ fn nominal_type_arguments(value: Type) -> Vec[Type] {
     }
 }
 
-fn nominal_ct_type(ctx: CtLowerContext, name: string, args: Vec[Type]) -> Result[
+struct CtTypeExpansion {
+    path: Vec[Type],
+    nodes: Ref[isize],
+    error: Ref[Option[string]],
+}
+
+fn ct_type_expansion_shape_exceeds(value: Type, depth: isize, expansion: CtTypeExpansion) -> bool {
+    if depth >= 256 {
+        expansion.error.set(Some("comptime type expansion depth limit exceeded"));
+        return true
+    }
+    if expansion.nodes.get() >= 65536 {
+        expansion.error.set(Some("comptime type expansion node limit exceeded"));
+        return true
+    }
+    expansion.nodes.set(expansion.nodes.get() + 1);
+    any_child_type(
+        prune(value),
+        |child| ct_type_expansion_shape_exceeds(child, depth + 1, expansion),
+    )
+}
+
+fn lower_ct_type_at(ctx: CtLowerContext, value: Type, expansion: CtTypeExpansion) -> Result[
+    ctir::CtType,
+    string,
+] {
+    if ct_type_expansion_shape_exceeds(value, expansion.path.len(), expansion) {
+        return Err(expansion.error.get().unwrap_or("comptime type expansion limit exceeded"))
+    }
+    let value = resolve_type(value);
+    for active in expansion.path {
+        if types_equal(active, value) {
+            return Err("recursive types are not available in comptime")
+        }
+    }
+    expansion.path.push(value);
+    let result = lower_ct_type_inner(ctx, value, expansion);
+    let _ = expansion.path.pop();
+    result
+}
+
+fn lower_ct_type(ctx: CtLowerContext, value: Type) -> Result[ctir::CtType, string] {
+    lower_ct_type_at(
+        ctx,
+        value,
+        CtTypeExpansion { path: Vec::new(), nodes: Ref::new(0), error: Ref::new(None) },
+    )
+}
+
+fn nominal_ct_type(ctx: CtLowerContext, name: string, args: Vec[Type], expansion: CtTypeExpansion) -> Result[
     ctir::CtType,
     string,
 ] {
@@ -276,7 +325,7 @@ fn nominal_ct_type(ctx: CtLowerContext, name: string, args: Vec[Type]) -> Result
                 } else {
                     "ref"
                 },
-                elem: lower_ct_type(ctx, args[0])?,
+                elem: lower_ct_type_at(ctx, args[0], expansion)?,
             },
         )
     }
@@ -285,7 +334,11 @@ fn nominal_ct_type(ctx: CtLowerContext, name: string, args: Vec[Type]) -> Result
             let fields: Vec[ctir::CtType] = Vec::new();
             for field in definition.fields {
                 fields.push(
-                    lower_ct_type(ctx, substitute_ct_type(field.1, definition.generics, args))?,
+                    lower_ct_type_at(
+                        ctx,
+                        substitute_ct_type(field.1, definition.generics, args),
+                        expansion,
+                    )?,
                 )
             }
             Ok(ctir::CtType::Struct { name: definition.name, fields })
@@ -299,17 +352,19 @@ fn nominal_ct_type(ctx: CtLowerContext, name: string, args: Vec[Type]) -> Result
                         EnumVariantFields::Unit => (),
                         EnumVariantFields::Tuple(values) => for value in values {
                             fields.push(
-                                lower_ct_type(
+                                lower_ct_type_at(
                                     ctx,
                                     substitute_ct_type(value, definition.generics, args),
+                                    expansion,
                                 )?,
                             )
                         },
                         EnumVariantFields::Struct(values) => for value in values {
                             fields.push(
-                                lower_ct_type(
+                                lower_ct_type_at(
                                     ctx,
                                     substitute_ct_type(value.1, definition.generics, args),
+                                    expansion,
                                 )?,
                             )
                         },
@@ -323,11 +378,18 @@ fn nominal_ct_type(ctx: CtLowerContext, name: string, args: Vec[Type]) -> Result
     }
 }
 
-fn lower_ct_type(ctx: CtLowerContext, value: Type) -> Result[ctir::CtType, string] {
-    match resolve_type(value) {
+fn lower_ct_type_inner(ctx: CtLowerContext, value: Type, expansion: CtTypeExpansion) -> Result[
+    ctir::CtType,
+    string,
+] {
+    match value {
         Dyn { .. } => Ok(ctir::CtType::Dynamic(diagnostic_type_text(value))),
-        VecType { elem } => Ok(Buffer { kind: "vec", elem: lower_ct_type(ctx, elem)? }),
-        RefType { elem } => Ok(Buffer { kind: "ref", elem: lower_ct_type(ctx, elem)? }),
+        VecType { elem } => Ok(
+            Buffer { kind: "vec", elem: lower_ct_type_at(ctx, elem, expansion)? },
+        ),
+        RefType { elem } => Ok(
+            Buffer { kind: "ref", elem: lower_ct_type_at(ctx, elem, expansion)? },
+        ),
         Unit => Ok(ctir::CtType::Unit),
         Never => Ok(ctir::CtType::Never),
         Bool => Ok(ctir::CtType::Bool),
@@ -346,28 +408,33 @@ fn lower_ct_type(ctx: CtLowerContext, value: Type) -> Result[ctir::CtType, strin
         Tuple { items } => {
             let result: Vec[ctir::CtType] = Vec::new();
             for item in items {
-                result.push(lower_ct_type(ctx, item)?)
+                result.push(lower_ct_type_at(ctx, item, expansion)?)
             }
             Ok(ctir::CtType::Tuple(result))
         },
         Array { len, elem } => {
-            Ok(ctir::CtType::Array { len, elem: lower_ct_type(ctx, elem)? })
+            Ok(ctir::CtType::Array { len, elem: lower_ct_type_at(ctx, elem, expansion)? })
         },
         Con { name } => if derive::is_meta_type(name) {
             Ok(ctir::CtType::Meta(name))
         } else {
-            nominal_ct_type(ctx, name, Vec::new())
+            nominal_ct_type(ctx, name, Vec::new(), expansion)
         },
         App { ty, args } => match resolve_type(ty) {
-            Con { name } => nominal_ct_type(ctx, name, args),
+            Con { name } => nominal_ct_type(ctx, name, args, expansion),
             _ => Err("comptime does not support this applied type"),
         },
         Func { params, ret_ty } => {
             let parameters = Vec::new();
             for param in params {
-                parameters.push(lower_ct_type(ctx, param)?)
+                parameters.push(lower_ct_type_at(ctx, param, expansion)?)
             }
-            Ok(ctir::CtType::Function { params: parameters, result: lower_ct_type(ctx, ret_ty)? })
+            Ok(
+                ctir::CtType::Function {
+                    params: parameters,
+                    result: lower_ct_type_at(ctx, ret_ty, expansion)?,
+                },
+            )
         },
         Float32 | Float64 => Err("comptime floating-point evaluation is not supported"),
         _ => Err("type is not available in comptime"),
