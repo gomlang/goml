@@ -362,7 +362,7 @@ for mut item in values {
 
 `mut` inside a pattern is allowed only on a binding and does not introduce borrowing or reference semantics. The existing `let mut pattern = value;` form remains supported and recursively makes every binding in that pattern mutable. Per-binding `mut` composes with tuple, struct, enum, array, `match`, and `for` patterns.
 
-Ordinary local bindings without `mut` cannot be reassigned. Assignment targets include mutable locals, tuple projections, structure fields, and supported index locations. Compound assignment supports `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, and `>>=`:
+Ordinary local bindings without `mut` cannot be reassigned. Assignment targets include mutable locals, tuple projections, structure fields, and supported index locations. Literals, computed values, function definitions, and method values are not assignable locations. Compound assignment supports `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, and `>>=`:
 
 ```goml
 count += 1;
