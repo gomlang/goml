@@ -619,7 +619,7 @@ trait Provider: Render {
 }
 ```
 
-Associated type projections may be chained when every step is constrained by its declaring trait. For example, `I::IntoIter::Item` projects `IntoIter` from `I`, then projects `Item` from that iterator type. Chained projections can appear in signatures and `where` equalities:
+Associated type projections may be chained when every step is constrained by its declaring trait. For example, `I::IntoIter::Item` projects `IntoIter` from `I`, then projects `Item` from that iterator type. Associated type bounds may be recursive, such as `trait Node { type Next: Node; }`; each finite chain of `Next` projections retains the `Node` bound. Chained projections can appear in signatures and `where` equalities:
 
 ```goml
 trait IntoIterator where Self::Item = Self::IntoIter::Item {

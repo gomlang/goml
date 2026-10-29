@@ -619,7 +619,7 @@ trait Provider: Render {
 }
 ```
 
-每一步都有其声明 trait 的约束时，关联类型投影可链式连接。例如，`I::IntoIter::Item` 先从 `I` 投影 `IntoIter`，再从迭代器类型投影 `Item`。链式投影可出现在签名和 `where` 等式中：
+每一步都有其声明 trait 的约束时，关联类型投影可链式连接。例如，`I::IntoIter::Item` 先从 `I` 投影 `IntoIter`，再从迭代器类型投影 `Item`。关联类型约束可以递归，例如 `trait Node { type Next: Node; }`；任意有限的 `Next` 投影链都保留 `Node` 约束。链式投影可出现在签名和 `where` 等式中：
 
 ```goml
 trait IntoIterator where Self::Item = Self::IntoIter::Item {

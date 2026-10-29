@@ -1199,7 +1199,7 @@ fn method_matches_call(
 fn context_trait_bound_satisfied(ctx: Checker, bound_ty: Type, reference: TraitRef) -> bool {
     let bound_ty = normalize_type(ctx, bound_ty);
     let reference = normalize_trait_ref(ctx, reference);
-    for predicate in ctx.predicates {
+    for predicate in context_predicates_for_type(ctx, bound_ty) {
         match predicate {
             GoComparable(_) => (),
             Trait { for_ty: candidate_ty, trait_ref: candidate_ref } => {
@@ -2397,9 +2397,20 @@ fn resolve_projection_type(
                 ),
                 None => {
                     let matches: Vec[TraitRef] = Vec::new();
+                    let applicable: Vec[ProjectionCandidate] = Vec::new();
                     for candidate in candidates {
+                        applicable.push(candidate)
+                    }
+                    for candidate in projection_candidates_from_predicates(
+                        ctx,
+                        projection_implied_predicates(ctx, for_ty),
+                    ) {
+                        applicable.push(candidate)
+                    }
+                    for candidate in applicable {
                         if types_equal(candidate.for_ty, for_ty)
-                            && candidate.associated_names.contains(name) {
+                            && candidate.associated_names.contains(name)
+                            && !contains_trait_ref(matches, candidate.trait_ref) {
                             matches.push(candidate.trait_ref)
                         }
                     }
@@ -3260,22 +3271,47 @@ fn resolve_trait_reference_method(
     }
 }
 
+fn push_implied_predicate(
+    result: Vec[TypePredicate],
+    pending: Vec[(TypePredicate, Vec[string])],
+    predicate: TypePredicate,
+    ancestry: Vec[string],
+) -> () {
+    let count = result.len();
+    push_predicate(result, predicate);
+    if result.len() > count {
+        pending.push((predicate, ancestry))
+    }
+}
+
 fn expand_implied_predicates(ctx: Checker, predicates: Vec[TypePredicate]) -> Vec[TypePredicate] {
     let result: Vec[TypePredicate] = Vec::new();
+    let pending: Vec[(TypePredicate, Vec[string])] = Vec::new();
     for predicate in predicates {
-        push_predicate(result, predicate)
+        push_implied_predicate(result, pending, predicate, Vec::new())
     }
     let mut index = 0;
-    while index < result.len() {
-        let predicate = result[index];
+    while index < pending.len() {
+        let (predicate, ancestry) = pending[index];
         index += 1;
         match predicate {
-            GoComparable(_) => (),
+            GoComparable(_) | Equality { .. } => (),
             Trait { for_ty, trait_ref: reference } => {
                 for application in trait_ref_closure(ctx, reference) {
-                    push_predicate(result, TypePredicate::Trait { for_ty, trait_ref: application });
+                    push_implied_predicate(
+                        result,
+                        pending,
+                        TypePredicate::Trait { for_ty, trait_ref: application },
+                        ancestry,
+                    );
                     if let Some(info) = find_trait(ctx, application.name) {
-                        if info.generics.len() == application.args.len() {
+                        if info.generics.len() == application.args.len()
+                            && !ancestry.contains(info.name) {
+                            let next: Vec[string] = Vec::new();
+                            for name in ancestry {
+                                next.push(name)
+                            }
+                            next.push(info.name);
                             let substitutions = trait_substitutions(
                                 ctx,
                                 info,
@@ -3283,21 +3319,24 @@ fn expand_implied_predicates(ctx: Checker, predicates: Vec[TypePredicate]) -> Ve
                                 Some(for_ty),
                             );
                             for declared in info.predicates {
-                                push_predicate(
+                                push_implied_predicate(
                                     result,
+                                    pending,
                                     substitute_predicate(declared, substitutions),
+                                    next,
                                 )
                             }
                             for associated in info.associated_types {
                                 let projection = Type::Projection {
                                     for_ty,
                                     name: associated.name,
-                                    trait_ref: Option::Some(application),
+                                    trait_ref: Some(application),
                                 };
                                 for bound in associated.bounds {
                                     let resolved = substitute_trait_ref(bound, substitutions);
-                                    push_predicate(
+                                    push_implied_predicate(
                                         result,
+                                        pending,
                                         TypePredicate::Trait {
                                             for_ty: projection,
                                             trait_ref: TraitRef {
@@ -3309,6 +3348,7 @@ fn expand_implied_predicates(ctx: Checker, predicates: Vec[TypePredicate]) -> Ve
                                                 args: resolved.args,
                                             },
                                         },
+                                        next,
                                     )
                                 }
                             }
@@ -3316,7 +3356,58 @@ fn expand_implied_predicates(ctx: Checker, predicates: Vec[TypePredicate]) -> Ve
                     }
                 }
             },
-            Equality { lhs: _, rhs: _ } => (),
+        }
+    }
+    result
+}
+
+fn projection_implied_predicates(ctx: Checker, value: Type) -> Vec[TypePredicate] {
+    let result: Vec[TypePredicate] = Vec::new();
+    if let Projection { for_ty, name, trait_ref: Some(reference) } = prune(value) {
+        if let Some(info) = find_trait(ctx, reference.name) {
+            if info.generics.len() == reference.args.len() {
+                let substitutions = trait_substitutions(ctx, info, reference, Some(for_ty));
+                for associated in info.associated_types {
+                    if associated.name == name {
+                        for bound in associated.bounds {
+                            let resolved = substitute_trait_ref(bound, substitutions);
+                            push_predicate(
+                                result,
+                                TypePredicate::Trait {
+                                    for_ty: value,
+                                    trait_ref: TraitRef {
+                                        name: canonical_supertrait_scope_name(
+                                            ctx,
+                                            info.name,
+                                            resolved.name,
+                                        ),
+                                        args: resolved.args,
+                                    },
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+    expand_implied_predicates(ctx, result)
+}
+
+fn context_predicates_for_type(ctx: Checker, value: Type) -> Vec[TypePredicate] {
+    let result: Vec[TypePredicate] = Vec::new();
+    for predicate in ctx.predicates {
+        push_predicate(result, predicate)
+    }
+    for predicate in projection_implied_predicates(ctx, value) {
+        push_predicate(result, predicate)
+    }
+    let normalized = normalize_type(ctx, value);
+    for alias in ctx.projection_aliases {
+        if types_equal(normalize_type(ctx, alias.ty), normalized) {
+            for predicate in projection_implied_predicates(ctx, alias.projection) {
+                push_predicate(result, predicate)
+            }
         }
     }
     result
@@ -3332,7 +3423,7 @@ fn resolve_predicate_method(
     let resolved: Vec[ResolvedCallable] = Vec::new();
     let seen: Vec[TraitRef] = Vec::new();
     let candidates = text::StringBuilder::new();
-    for predicate in ctx.predicates {
+    for predicate in context_predicates_for_type(ctx, receiver) {
         match predicate {
             GoComparable(_) => (),
             Trait { for_ty: bound_ty, trait_ref: reference } => {
