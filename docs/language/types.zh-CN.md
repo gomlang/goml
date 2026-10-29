@@ -750,6 +750,8 @@ impl Iterator for Counter {
 
 实现有父 trait 的 trait 时，还必须为目标类型提供每个父 trait 的 impl。实例化后无效的常量实参不能用于证明 impl 重叠，也不能用于选择实现。编译器拒绝重叠 impl，并实施孤儿规则：trait 或被实现的名义类型至少一个属于当前包。固有 impl 的目标名义类型必须属于当前包。
 
+归属以声明所在的包为准，包括该包其他文件中的声明，而不是只要求属于同一模块。透明别名不会建立本地归属。对于泛型目标，只看最外层名义类型构造器：`Local[foreign::Value]` 属于本地，`foreign::Wrapper[Local]` 属于外部。`extern type` 绑定不会使底层 Go 类型变成本地类型；应使用本地声明的 trait 或名义包装类型。
+
 <a id="inherent-impl"></a>
 
 ### 固有 impl
