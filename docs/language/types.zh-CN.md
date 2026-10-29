@@ -96,6 +96,15 @@ pub type Names = Vec[string];
 
 别名不会创建名义上不同的类型，递归别名循环会被拒绝。公开别名可以跨包引用。通过别名进行的关联方法调用和方法值引用使用底层类型的方法；泛型别名的实参可以显式提供，也可以从调用和预期类型中推断。
 
+枚举构造器调用、构造器值和限定模式也接受枚举类型的别名。特化别名保留其固定实参：
+
+```goml
+type Maybe[T] = Option[T];
+type Flag = Maybe[bool];
+let present = Maybe::[i32]::Some(1);
+let flag = Flag::Some(true);
+```
+
 需要独立的名义类型而非别名时，使用单字段元组结构体：
 
 ```goml
