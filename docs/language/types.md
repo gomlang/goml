@@ -105,6 +105,8 @@ let present = Maybe::[i32]::Some(1);
 let flag = Flag::Some(true);
 ```
 
+Struct literals, struct updates, newtype constructors, and their patterns also accept aliases. Fixed alias arguments and the underlying fields' visibility still apply.
+
 Use a single-field tuple struct when a value needs a distinct nominal type instead of an alias:
 
 ```goml
