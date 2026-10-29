@@ -919,7 +919,7 @@ fn finish(value: dyn Consumer[string] + Close) -> string {
 }
 ```
 
-父 trait 方法仍可用。不同组成 trait 提供同名方法时，使用 UFCS 选择 trait，例如 `A::render(value)` 或 `B::render(value)`。泛型 trait 使用 `Consumer::[string]::consume(value, "hello")`。
+父 trait 方法仍可用。 只要 trait 实参匹配，dyn 类型也满足其主 trait、附加 trait 和父 trait 对应的泛型约束。泛型代码中的调用仍使用动态分派。不同组成 trait 提供同名方法时，使用 UFCS 选择 trait，例如 `A::render(value)` 或 `B::render(value)`。泛型 trait 使用 `Consumer::[string]::consume(value, "hello")`。
 
 约束顺序不改变对象类型：`dyn A + B` 与 `dyn B + A` 兼容。重复 trait 名会被拒绝，即使泛型实参不同。父 trait 路径对同一 trait 的泛型实参必须一致。子 trait 方法优先于从父 trait 继承的方法；无关同名方法需要 UFCS。
 
