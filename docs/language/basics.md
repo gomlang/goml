@@ -92,6 +92,8 @@ Floating-point literals are rounded directly from their source text to the conte
 
 Unsuffixed numbers can get the width from the context:
 
+Integer and floating-point literals can share an inferred numeric type. Without a concrete numeric context, a group containing a floating-point literal defaults to `f64`, so `[1, 2.5]` has type `[f64; 2]`. A concrete integer context still requires every literal to be exactly representable in that integer type.
+
 ```goml
 let small: u8 = 42;
 let ratio: f32 = 0.5;
