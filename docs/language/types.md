@@ -337,6 +337,8 @@ Type: TraitA + TraitB
 TypeA = TypeB
 ```
 
+A type equality exposes the operations of the equal type inside the function. For example, `where T = Vec[i32]` permits indexing a `T` value, and `where T = (i32, bool)` permits `.0` and `.1` access. Index assignments retain the underlying container restrictions: `Slice` remains read-only, arrays require a writable root, and `HashMap` indexing does not support compound assignment.
+
 Ordinary generic function calls usually infer the type arguments from the argument and expected result types:
 
 ```goml
