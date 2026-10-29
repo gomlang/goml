@@ -3230,12 +3230,13 @@ fn check_match_expr(ctx: Checker, source: hir::Expr, arms: Vec[hir::Arm], expect
     let scrutinee_always_exits = hir_expr_always_exits_loop_control(source);
     let scrutinee = check_expr(ctx, source, Option::None);
     let scrutinee = with_expr_type(scrutinee, normalize_type(ctx, expr_type(scrutinee)));
+    let scrutinee_never = tast_expr_never(scrutinee);
     let scrutinee = if scrutinee_always_exits {
         with_expr_type(scrutinee, fresh_type(ctx.inference.counter, VarKind::Any))
     } else {
         scrutinee
     };
-    let result_ty = expected.unwrap_or_else(|| fresh_type(ctx.inference.counter, VarKind::Any));
+    let result_ty = control_branch_result_type(ctx, expected, scrutinee_never);
     let typed_arms: Vec[Arm] = Vec::new();
     let pattern_spans: Vec[ast::Span] = Vec::new();
     let invalid_pattern_arms: Vec[bool] = Vec::new();
@@ -3261,8 +3262,9 @@ fn check_match_expr(ctx: Checker, source: hir::Expr, arms: Vec[hir::Arm], expect
     }
     let invalid_coverage = bool_values_contain(pattern_errors, true)
         || bool_values_contain(guard_errors, true);
-    let match_ty: Type = if !invalid_coverage && match_arms_all_never(typed_arms)
-        && match_is_exhaustive(coverage_context(ctx), expr_type(scrutinee), typed_arms) {
+    let match_ty: Type = if scrutinee_never
+        || (!invalid_coverage && match_arms_all_never(typed_arms)
+            && match_is_exhaustive(coverage_context(ctx), expr_type(scrutinee), typed_arms)) {
         Never
     } else {
         result_ty
@@ -3326,63 +3328,124 @@ fn select_send_channel_element(ctx: Checker, channel: Expr, span: ast::Span) -> 
     }
 }
 
+enum PendingSelectArm {
+    Receive {
+        channel: Expr,
+        guard: Option[Expr],
+        binding: hir::LocalId,
+        binding_ty: Type,
+        body: hir::Expr,
+    },
+    Send {
+        channel: Expr,
+        value: Expr,
+        guard: Option[Expr],
+        body: hir::Expr,
+    },
+    Default {
+        body: hir::Expr,
+    },
+}
+
+fn select_guard_never(value: Option[Expr]) -> bool {
+    match value {
+        Some(value) => tast_expr_never(value),
+        None => false,
+    }
+}
+
+fn control_branch_result_type(ctx: Checker, expected: Option[Type], input_never: bool) -> Type {
+    if input_never {
+        if let Some(value) = expected {
+            if let Never = normalize_type(ctx, value) {
+                return fresh_type(ctx.inference.counter, VarKind::Any)
+            }
+        }
+    }
+    expected.unwrap_or_else(|| fresh_type(ctx.inference.counter, VarKind::Any))
+}
+
+fn check_control_input(ctx: Checker, source: hir::Expr, expected: Option[Type]) -> Expr {
+    let value = check_expr(ctx, source, expected);
+    match normalize_type(ctx, expr_type(value)) {
+        Never => with_expr_type(value, Type::Never),
+        _ => value,
+    }
+}
+
 fn check_select_expr(
     ctx: Checker,
     mode: ast::SelectMode,
     arms: Vec[hir::SelectArm],
     expected: Option[Type],
 ) -> Expr {
-    let result_ty = expected.unwrap_or_else(|| fresh_type(ctx.inference.counter, VarKind::Any));
-    let typed_arms: Vec[SelectArm] = Vec::with_capacity(arms.len());
+    let pending_arms: Vec[PendingSelectArm] = Vec::with_capacity(arms.len());
+    let mut input_never = false;
     for arm in arms {
         match arm {
-            Receive { channel: source, guard, binding, body: body_source } => {
-                let channel_span = source.span;
-                let channel = check_expr(ctx, source, Option::None);
-                let elem = select_receive_channel_element(ctx, channel, channel_span);
+            Receive { channel: source, guard, binding, body } => {
+                let channel = check_control_input(ctx, source, Option::None);
+                let elem = select_receive_channel_element(ctx, channel, source.span);
                 let binding_ty = nominal_type(ctx.builtin, ctx.builtin.option.name, one_type(elem));
-                insert_local(ctx, binding, binding_ty);
-                typed_arms.push(
-                    Receive {
-                        channel,
-                        guard: guard.map(|value| check_expr(ctx, value, Option::Some(Type::Bool))),
-                        binding: local_name(binding),
-                        binding_ty,
-                        body: check_expr(ctx, body_source, Option::Some(result_ty)),
-                    },
-                )
+                let guard = guard.map(
+                    |value| check_control_input(ctx, value, Option::Some(Type::Bool)),
+                );
+                input_never = input_never || tast_expr_never(channel) || select_guard_never(guard);
+                pending_arms.push(
+                    PendingSelectArm::Receive { channel, guard, binding, binding_ty, body },
+                );
             },
-            Send { channel: source, value: value_source, guard, body: body_source } => {
-                let channel_span = source.span;
-                let channel = check_expr(ctx, source, Option::None);
-                let elem = select_send_channel_element(ctx, channel, channel_span);
-                typed_arms.push(
-                    Send {
-                        channel,
-                        value: check_expr(ctx, value_source, Option::Some(elem)),
-                        guard: guard.map(|value| check_expr(ctx, value, Option::Some(Type::Bool))),
-                        body: check_expr(ctx, body_source, Option::Some(result_ty)),
-                    },
-                )
+            Send { channel: source, value: value_source, guard, body } => {
+                let channel = check_control_input(ctx, source, Option::None);
+                let elem = select_send_channel_element(ctx, channel, source.span);
+                let value = check_control_input(ctx, value_source, Option::Some(elem));
+                let guard = guard.map(
+                    |value| check_control_input(ctx, value, Option::Some(Type::Bool)),
+                );
+                input_never = input_never || tast_expr_never(channel) || tast_expr_never(value)
+                    || select_guard_never(guard);
+                pending_arms.push(PendingSelectArm::Send { channel, value, guard, body });
             },
-            Default { body } => typed_arms.push(
-                Default { body: check_expr(ctx, body, Option::Some(result_ty)) },
-            ),
+            Default { body } => pending_arms.push(PendingSelectArm::Default { body }),
         }
     }
-    let mut all_never = !typed_arms.is_empty();
-    for arm in typed_arms {
-        let body = match arm {
+    let result_ty = control_branch_result_type(ctx, expected, input_never);
+    let typed_arms: Vec[SelectArm] = Vec::with_capacity(pending_arms.len());
+    let mut all_never = !pending_arms.is_empty();
+    for arm in pending_arms {
+        let typed = match arm {
+            PendingSelectArm::Receive { channel, guard, binding, binding_ty, body } => {
+                insert_local(ctx, binding, binding_ty);
+                SelectArm::Receive {
+                    channel,
+                    guard,
+                    binding: local_name(binding),
+                    binding_ty,
+                    body: check_expr(ctx, body, Some(result_ty)),
+                }
+            },
+            PendingSelectArm::Send { channel, value, guard, body } => SelectArm::Send {
+                channel,
+                value,
+                guard,
+                body: check_expr(ctx, body, Some(result_ty)),
+            },
+            PendingSelectArm::Default { body } => SelectArm::Default {
+                body: check_expr(ctx, body, Some(result_ty)),
+            },
+        };
+        let body = match typed {
             Receive { body, .. } | Send { body, .. } | Default { body } => body,
         };
         if !tast_expr_never(body) {
             all_never = false;
         }
+        typed_arms.push(typed);
     }
     Select {
         mode,
         arms: typed_arms,
-        ty: if all_never {
+        ty: if input_never || all_never {
             Never
         } else {
             result_ty
@@ -3417,15 +3480,16 @@ fn check_if_expr(
     else_branch: hir::Expr,
     expected: Option[Type],
 ) -> Expr {
-    let result_ty = expected.unwrap_or_else(|| fresh_type(ctx.inference.counter, VarKind::Any));
-    let cond = check_expr(ctx, cond, Option::Some(Type::Bool));
+    let cond = check_control_input(ctx, cond, Option::Some(Type::Bool));
+    let input_never = tast_expr_never(cond);
+    let result_ty = control_branch_result_type(ctx, expected, input_never);
     let then_branch = check_expr(ctx, then_branch, Option::Some(result_ty));
     let else_branch = check_expr(ctx, else_branch, Option::Some(result_ty));
     If {
         cond,
         then_branch,
         else_branch,
-        ty: if tast_expr_never(then_branch) && tast_expr_never(else_branch) {
+        ty: if input_never || (tast_expr_never(then_branch) && tast_expr_never(else_branch)) {
             Never
         } else {
             result_ty
@@ -4415,7 +4479,7 @@ fn check_while_expr(
     let previous_condition_loop_depth = ctx.condition_loop_depth.get();
     ctx.condition_depth.set(previous_condition_depth + 1);
     ctx.condition_loop_depth.set(ctx.loop_depth.get());
-    let cond = check_expr(
+    let cond = check_control_input(
         ctx,
         cond_source,
         if cond_always_exits {
@@ -4424,6 +4488,7 @@ fn check_while_expr(
             Some(Type::Bool)
         },
     );
+    let input_never = tast_expr_never(cond);
     let cond = if cond_always_exits {
         with_expr_type(cond, Type::Bool)
     } else {
@@ -4436,7 +4501,15 @@ fn check_while_expr(
     let body = check_expr(ctx, body_source, Option::Some(Type::Unit));
     ctx.loop_depth.set(ctx.loop_depth.get() - 1);
     let _ = ctx.loop_results.pop();
-    While { cond, body, ty: Type::Unit }
+    While {
+        cond,
+        body,
+        ty: if input_never {
+            Type::Never
+        } else {
+            Type::Unit
+        },
+    }
 }
 
 fn check_loop_expr(
