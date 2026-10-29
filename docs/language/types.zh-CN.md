@@ -656,6 +656,8 @@ trait Ord: Eq + PartialOrd {
 
 `Eq` 是无方法的标记 trait。相等行为属于 `PartialEq`；全等价类型通过 `fn eq` 实现 `PartialEq`，再添加空的 `impl Eq`。`Eq::eq` 和 `impl Eq` 内的 `eq` 方法均无效。
 
+默认方法的泛型参数属于其 trait 声明，与实现类型的参数保持独立，即使名称相同也不会混淆。const 参数也遵循此规则。
+
 Trait 方法可以提供默认方法体。impl 可省略该方法并继承默认实现；显式声明的 impl 方法会覆盖它。默认方法体使用 trait 的泛型参数、谓词、关联类型和 `Self` 检查，且跨包仍可用：
 
 ```goml

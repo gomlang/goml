@@ -656,6 +656,8 @@ trait Ord: Eq + PartialOrd {
 
 `Eq` is a marker trait and has no methods. Equality behavior belongs in `PartialEq`; a total-equivalence type implements `PartialEq` with `fn eq` and adds an empty `impl Eq`. `Eq::eq` and an `eq` method inside `impl Eq` are invalid.
 
+A default method's generic parameters belong to its trait declaration and remain independent of the implementing type's parameters, even when their names match. This also applies to const parameters.
+
 Trait methods may provide a default body. An impl may omit such a method and will inherit the default; an explicitly declared impl method overrides it. Default bodies are checked using the trait's generic parameters, predicates, associated types, and `Self`, and remain available across package boundaries:
 
 ```goml
