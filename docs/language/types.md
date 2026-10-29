@@ -798,7 +798,7 @@ use acme::render;
 use render::Render;
 ```
 
-If multiple visible traits define methods with the same name, `value.render()` will be ambiguous. Use UFCS to explicitly select:
+If multiple visible traits define methods with the same name, an expected result type can filter incompatible candidates. For `dyn` results, this includes all trait arguments, associated type bindings, and additional bounds. If multiple candidates remain, `value.render()` is ambiguous. Use UFCS to explicitly select:
 
 ```goml
 let a = A::render(value);

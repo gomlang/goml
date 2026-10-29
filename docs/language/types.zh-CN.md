@@ -798,7 +798,7 @@ use acme::render;
 use render::Render;
 ```
 
-多个可见 trait 定义同名方法时，`value.render()` 会有歧义。使用 UFCS 显式选择：
+多个可见 trait 定义同名方法时，预期结果类型可过滤不兼容的候选。对于 `dyn` 结果，这包括所有 trait 实参、关联类型绑定和附加约束。如果仍有多个候选，`value.render()` 会有歧义。使用 UFCS 显式选择：
 
 ```goml
 let a = A::render(value);
