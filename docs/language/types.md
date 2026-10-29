@@ -402,7 +402,7 @@ fn use_buffers() -> () {
 }
 ```
 
-A direct length parameter can be inferred from an array argument, expected type, or array type equality such as `where [T; N] = [i32; 2]`. For a length expression such as `N + 1`, provide `N` explicitly; inference does not solve arithmetic equations. Generic arguments use literals or names, and compound integer arguments use braces, such as `Buffer[i32, {2 + 1}]`. Const parameters currently have type `usize`, have no defaults, and use values in `0..=9223372036854775807`. Array repetition accepts these parameters, for example `[value; N]`. Type-dependent associated constants in array lengths are not supported.
+A direct length parameter can be inferred from an array argument, expected type, or array type equality such as `where [T; N] = [i32; 2]`. For a length expression such as `N + 1`, provide `N` explicitly; inference does not solve arithmetic equations. Generic arguments use literals or names, and compound integer arguments use braces, such as `Buffer[i32, {2 + 1}]`. Const parameters currently have type `usize`, have no defaults, and use values in `0..=9223372036854775807`. Trait constraints are checked again after generic substitution, including constraints required by an implementation; negative const arguments and invalid constant arithmetic are rejected even when they do not appear in a function signature. Array repetition accepts these parameters, for example `[value; N]`. Type-dependent associated constants in array lengths are not supported.
 
 <a id="patterns"></a>
 
