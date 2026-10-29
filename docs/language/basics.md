@@ -897,7 +897,7 @@ let increment = |value: i32| {
 let greet = || println("hello");
 ```
 
-Closure parameter types can be inferred from the expected function type or the calling location. Deferred method calls also resolve inside nested expressions, including tuples, arrays, and control-flow branches. When inference is ambiguous, annotate the closure parameter or expected function type:
+Closure parameter types can be inferred from the expected function type or the calling location. Deferred method calls also resolve inside nested expressions, including tuples, arrays, and control-flow branches. Method results and field accesses can constrain one another; these dependencies are resolved before numeric literals receive their default types. When inference is ambiguous, annotate the closure parameter or expected function type:
 
 ```goml
 let transform: (i32) -> string = |value| value.to_string();
