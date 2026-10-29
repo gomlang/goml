@@ -35,7 +35,7 @@ fn table() -> [isize; 4] {
 }
 ```
 
-`#[comptime]` marks a non-generic free function or concrete implementation method as compile-time-capable. The function remains callable at runtime. A compile-time call may call other `#[comptime]` free functions, the builtin operations listed below, or the `compile_error(string) -> never` intrinsic. The compiler validates the complete body of every marked function, including branches not taken by a particular invocation. Attributes with arguments, duplicate attributes, generic functions or implementations, extern functions, and other declarations are rejected.
+`#[comptime]` marks a non-generic free function or concrete implementation method as compile-time-capable. The function remains callable at runtime. A concrete implementation may apply a generic trait to fixed type or const arguments; each trait application retains its own method identity and compile-time capability. A compile-time call may call other `#[comptime]` free functions, the builtin operations listed below, or the `compile_error(string) -> never` intrinsic. The compiler validates the complete body of every marked function, including branches not taken by a particular invocation. Attributes with arguments, duplicate attributes, generic functions or implementations, extern functions, and other declarations are rejected.
 
 A top-level constant initializer is an implicit compile-time context, so `const SIX: isize = factorial(3);` and an initializer wrapped in `comptime { ... }` are equivalent. A top-level constant may produce a recursively immutable tuple, fixed array, struct, or enum in addition to scalar values. A `comptime` expression in ordinary code supports the same reifiable value shapes.
 
