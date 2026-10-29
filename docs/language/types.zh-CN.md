@@ -928,7 +928,7 @@ fn finish(value: dyn Consumer[string] + Close) -> string {
 当前 dyn 安全条件：
 
 - 每个方法的第一个接收者参数必须恰为 `Self` 类型；
-- 其他参数或返回类型不能直接出现 `Self`，但允许 `Self::Item` 这样的已绑定投影；
+- 其他参数或返回类型不能直接出现 `Self`，包括嵌套 `dyn` 的实参、关联类型绑定和附加约束内部；允许 `Self::Item` 这样的已绑定投影；
 - 方法不能声明类型参数；
 - Trait 不能声明关联常量；
 - 每个组成 trait 和父 trait 都必须满足这些规则。

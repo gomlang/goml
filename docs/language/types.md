@@ -928,7 +928,7 @@ An inherited associated type with a unique name may be bound on the child, for e
 Current dyn-safe conditions:
 
 - Each method must have a first receiver parameter of exactly type `Self`;
-- Direct `Self` cannot appear in other parameters or return types, while a bound projection such as `Self::Item` is allowed;
+- Direct `Self` cannot appear in other parameters or return types, including inside nested `dyn` arguments, associated type bindings, or additional bounds; a bound projection such as `Self::Item` is allowed;
 - Methods cannot declare type parameters;
 - Traits cannot declare associated constants;
 - Every component trait and supertrait must satisfy these rules.
