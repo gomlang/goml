@@ -34,6 +34,8 @@ Integer `to_string` lowers to a typed `comptime.to_string.iN` or `comptime.to_st
 
 An interface artifact exports public comptime entries and the reachable closure of private comptime helpers and constants. Public constants carry canonical values. Source origins are debug metadata, use package-relative paths, and do not participate in the CTIR semantic hash. Function bodies, local slot types, target semantics, public values, and referenced dependency interface hashes do participate. The artifact decoder checks its format and semantic hash, and dependency loading then runs the CTIR verifier with the complete imported module set.
 
+Index lowering selects the operation from the checked receiver type: fixed arrays use CTIR indexing and vectors use evaluator buffer reads. Receiver and index evaluation order is preserved, and each operation retains its own bounds checks.
+
 CTFE failures are recoverable compiler diagnostics. They identify the failing source origin, the requesting comptime site, and the compile-time call stack. A failed or resource-exhausted evaluation never terminates the compiler process.
 
 ## Programmable derive phase

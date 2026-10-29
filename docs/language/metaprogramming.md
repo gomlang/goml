@@ -62,6 +62,8 @@ Public `#[comptime]` functions can be called from another package. The defining 
 
 Compile-time integer evaluation uses the same fixed-width, wrapping representation as generated runtime code. Division by zero, a negative shift count, and an out-of-bounds index fail compilation. Signed minimum divided by `-1` yields the signed minimum, and its remainder is zero. Narrowing conversions retain the low bits of the destination width; widening a signed source sign-extends before conversion to the destination signedness. The CTIR target specification is part of its semantic hash. `isize` and `usize` currently use the 64-bit Linux amd64 toolchain target width.
 
+Compile-time indexing with `value[index]` supports fixed arrays and vectors. It evaluates the receiver before the index, exactly once each. Vector reads observe mutations through aliases. Invalid indexes produce compile-time diagnostics.
+
 At runtime, integer addition, subtraction, and multiplication use the same fixed-width wrapping representation. Integer division or remainder by zero terminates the current process with the generated Go runtime failure. Integer conversion methods use the same narrowing, sign-extension, and signedness rules as compile-time evaluation.
 
 <a id="attributes-and-derive"></a>
