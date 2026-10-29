@@ -612,6 +612,8 @@ fn default_value[T: Default]() -> T {
 
 An impl method must preserve whether the trait declaration has a `self: Self` receiver. Associated functions use static dispatch, cannot be called with method syntax, and do not participate in `dyn` dispatch. If neither arguments nor the expected result determine `Self`, the call is rejected as ambiguous.
 
+In supertrait arguments, `Self` denotes the type satisfying the child bound. For example, `T: Child` with `trait Child: Parent[Self]` implies `T: Parent[T]`. This substitution also applies inside nested arguments and associated type projections.
+
 Traits can have supertraits, generic constraints, and associated types:
 
 ```goml
@@ -933,6 +935,7 @@ Current dyn-safe conditions:
 - Direct `Self` cannot appear in other parameters or return types, including inside nested `dyn` arguments, associated type bindings, or additional bounds; a bound projection such as `Self::Item` is allowed;
 - Methods cannot declare type parameters;
 - Traits cannot declare associated constants;
+- Supertrait arguments cannot contain `Self` directly; associated type projections such as `Self::Item` may use the object's bindings;
 - Every component trait and supertrait must satisfy these rules.
 
 Current limitations:

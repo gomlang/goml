@@ -612,6 +612,8 @@ fn default_value[T: Default]() -> T {
 
 impl 方法必须保持 trait 声明是否具有 `self: Self` 接收者这一特征。关联函数使用静态分派，不能用方法语法调用，也不参与 `dyn` 分派。若实参和预期结果都不能确定 `Self`，调用因歧义被拒绝。
 
+父 trait 参数中的 `Self` 表示满足子 trait 约束的类型。例如，声明 `trait Child: Parent[Self]` 后，`T: Child` 蕴含 `T: Parent[T]`。这一替换也适用于嵌套参数和关联类型投影。
+
 Trait 可以有父 trait、泛型约束和关联类型：
 
 ```goml
@@ -933,6 +935,7 @@ fn finish(value: dyn Consumer[string] + Close) -> string {
 - 其他参数或返回类型不能直接出现 `Self`，包括嵌套 `dyn` 的实参、关联类型绑定和附加约束内部；允许 `Self::Item` 这样的已绑定投影；
 - 方法不能声明类型参数；
 - Trait 不能声明关联常量；
+- 父 trait 参数不能直接包含 `Self`；由对象绑定解析的 `Self::Item` 等关联类型投影可以使用；
 - 每个组成 trait 和父 trait 都必须满足这些规则。
 
 当前限制：
