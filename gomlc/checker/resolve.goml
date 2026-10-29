@@ -1067,6 +1067,9 @@ fn instantiate_method_candidate(
 }
 
 fn static_method_owner_predicates_possible(ctx: Checker, predicates: Vec[TypePredicate]) -> bool {
+    let snapshot = inference_snapshot(Vec::new());
+    snapshot.include_predicates(predicates);
+    snapshot.include_predicates(ctx.predicates);
     let known: Vec[TypePredicate] = Vec::new();
     for predicate in predicates {
         let unresolved = match predicate {
@@ -1084,7 +1087,137 @@ fn static_method_owner_predicates_possible(ctx: Checker, predicates: Vec[TypePre
             known.push(predicate)
         }
     }
-    method_predicates_satisfied(ctx, known)
+    let result = method_predicates_satisfied(ctx, known);
+    snapshot.restore();
+    if result {
+        infer_unique_predicate_applications(ctx, known, Vec::new())
+    }
+    result
+}
+
+fn infer_unique_predicate_applications(
+    ctx: Checker,
+    predicates: Vec[TypePredicate],
+    goals: Vec[string],
+) -> () {
+    infer_unique_predicate_applications_at(ctx, predicates, goals, Ref::new(8192))
+}
+
+fn infer_unique_predicate_applications_at(
+    ctx: Checker,
+    predicates: Vec[TypePredicate],
+    goals: Vec[string],
+    remaining: Ref[isize],
+) -> () {
+    apply_predicate_equalities(predicates);
+    for predicate in predicates {
+        if let Trait { for_ty, trait_ref } = predicate {
+            infer_unique_trait_application_at(ctx, for_ty, trait_ref, goals, remaining)
+        }
+    }
+}
+
+fn infer_unique_trait_application(
+    ctx: Checker,
+    owner: Type,
+    reference: TraitRef,
+    goals: Vec[string],
+) -> () {
+    infer_unique_trait_application_at(ctx, owner, reference, goals, Ref::new(8192))
+}
+
+fn trait_inference_type_exceeds(value: Type, depth: isize, remaining: Ref[isize]) -> bool {
+    if depth >= 256 || remaining.get() <= 0 {
+        return true
+    }
+    remaining.set(remaining.get() - 1);
+    any_child_type(prune(value), |child| trait_inference_type_exceeds(child, depth + 1, remaining))
+}
+
+fn trait_application_has_nonimpl_evidence(ctx: Checker, owner: Type, reference: TraitRef) -> bool {
+    for application in exposed_trait_applications(ctx, owner) {
+        if trait_ref_equal(application, reference) {
+            return true
+        }
+    }
+    if context_trait_bound_satisfied(ctx, owner, reference) {
+        return true
+    }
+    if !reference.args.is_empty() {
+        return false
+    }
+    let structural = trait_reference_matches_name(ctx, reference, ctx.builtin.partial_eq.name)
+        || trait_reference_matches_name(ctx, reference, ctx.builtin.eq.name)
+        || trait_reference_matches_name(ctx, reference, ctx.builtin.hash.name)
+        || trait_reference_matches_name(ctx, reference, ctx.builtin.default.name)
+        || trait_reference_matches_name(ctx, reference, ctx.builtin.ordering.partial_ord)
+        || trait_reference_matches_name(ctx, reference, ctx.builtin.ordering.ord);
+    if structural {
+        match prune(owner) {
+            Tuple { .. } | Array { .. } => true,
+            _ => symbolic_array(owner).is_some(),
+        }
+    } else {
+        false
+    }
+}
+
+fn infer_unique_trait_application_at(
+    ctx: Checker,
+    owner: Type,
+    reference: TraitRef,
+    goals: Vec[string],
+    remaining: Ref[isize],
+) -> () {
+    if goals.len() >= 256 || trait_inference_type_exceeds(owner, 0, remaining)
+        || any_type(reference.args, |arg| trait_inference_type_exceeds(arg, 0, remaining)) {
+        return
+    }
+    if !contains_unbound_type_variable(owner)
+        && !any_type(reference.args, contains_unbound_type_variable) {
+        return
+    }
+    if is_unbound_any_type(owner) {
+        return
+    }
+    let evidence = inference_snapshot(Vec::from_array([owner]));
+    evidence.include_types(reference.args);
+    evidence.include_predicates(ctx.predicates);
+    let already_supported = trait_application_has_nonimpl_evidence(ctx, owner, reference);
+    evidence.restore();
+    if already_supported {
+        return
+    }
+    let goal = trait_goal_key(owner, reference);
+    if goals.contains(goal) {
+        return
+    }
+    let matches: Vec[(InferenceSnapshot, Vec[TypePredicate])] = Vec::new();
+    if let Some(indices) = impl_candidate_indices(ctx, reference.name) {
+        for index in indices {
+            let info = ctx.impls[index];
+            if ctx.invalid_impl_origins.contains(info.origin)
+                || !impl_matches_trait(ctx, info, reference) {
+                continue
+            }
+            let snapshot = inference_snapshot(Vec::from_array([owner]));
+            snapshot.include_types(reference.args);
+            let parts = instantiated_impl_parts(ctx, info);
+            if unify(parts.0, owner) && unify_types(parts.1.args, reference.args) {
+                matches.push((snapshot.capture(), parts.2))
+            }
+            snapshot.restore();
+        }
+    }
+    if matches.len() == 1 {
+        matches[0].0.restore();
+        infer_unique_predicate_applications_at(
+            ctx,
+            matches[0].1,
+            extend_trait_goals(goals, goal),
+            remaining,
+        )
+    }
 }
 
 fn resolve_user_method(
@@ -1945,7 +2078,7 @@ fn resolve_user_method_for_call(
                 Some(_) => {
                     method_matches_call(ctx, candidate.callable, receiver, args, expected)
                         && unify(candidate.owner, receiver)
-                        && method_predicates_satisfied(ctx, candidate.owner_predicates)
+                        && static_method_owner_predicates_possible(ctx, candidate.owner_predicates)
                 },
                 None => {
                     unify(candidate.owner, receiver)
@@ -1963,7 +2096,14 @@ fn resolve_user_method_for_call(
                     Some(_) => trait_methods.push(
                         MethodMatch {
                             method_generics: candidate.method_generics,
-                            value: candidate.callable,
+                            value: ResolvedCallable {
+                                callable: candidate.callable.callable,
+                                ty: candidate.callable.ty,
+                                predicates: append_predicates(
+                                    candidate.owner_predicates,
+                                    candidate.callable.predicates,
+                                ),
+                            },
                             inference: snapshot.capture(),
                         },
                     ),
