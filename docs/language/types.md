@@ -505,6 +505,8 @@ let [first, middle @ .., last] = values;
 
 For fixed arrays, the number of elements must be exactly equal to `N` when rest is omitted; when rest is included, the total number of elements of explicit prefixes and suffixes cannot exceed `N`. In the above example, the type of `middle` is `[i32; 2]`.
 
+When `N` is a const generic parameter whose value is not yet known, array patterns check their required length at each concrete instantiation. A rest-only pattern such as `[rest @ ..]` is irrefutable and preserves `[T; N]`. Patterns requiring a particular length or a nonempty prefix or suffix need a fallback unless the length is known. A named rest remains an array; its length is the original length minus the explicit elements in a matching arm. Shorter instantiations take the fallback and do not evaluate the rest binding.
+
 For `Vec[T]`, `Slice[T]` and `MutSlice[T]`, the binding type of `name @ ..` is read-only `Slice[T]`. For example `[head, tail @ ..]` requires at least one element, `tail` will not be copied into a new Vec. Since dynamic sequences may not be long enough, such patterns are usually placed inside a `match`, `if let` or `while let`.
 
 <a id="alias-and-or-pattern"></a>
