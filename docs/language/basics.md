@@ -934,5 +934,5 @@ fn identity[T](value: T) -> T {
 }
 ```
 
-Top-level functions, closures, and tuple variant constructors can all be passed or returned as function values.
+Top-level functions, closures, and tuple variant constructors can all be passed or returned as function values. Trait method references such as `Read::read` are also function values, with the receiver as their first argument. Calls through these values preserve dynamic dispatch when that receiver is a `dyn` object.
 Closures can be nested and return another closure that captures the environment, but each resulting closure expression still has only one concrete function type.
