@@ -127,7 +127,7 @@ On Linux amd64, `std::os::linux::syscall` accepts numeric machine words, scoped 
 
 `A + B` combines trait bounds in generic constraints, supertrait lists, `dyn A + B` objects, and `impl A + B` returns. It is not a general intersection type for concrete values.
 
-`Self` is only used in the trait signature and the type position of impl; ordinary top-level functions cannot use `Self` as an implicit type parameter.
+`Self` names the implementing type in trait signatures and impls; ordinary top-level functions cannot use `Self` as an implicit type parameter. In an impl whose owner is a known struct or enum, constructors and patterns may use `Self { ... }` or `Self(value)` for a struct or `Self::Variant(...)` and `Self::Variant { ... }` for an enum. These forms retain the owner's generic arguments. A type parameter constrained to that nominal type by an equality can use the same constructor and pattern forms; unconstrained parameters cannot select constructors.
 
 <a id="structs"></a>
 
