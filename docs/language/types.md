@@ -302,6 +302,8 @@ let value: isize = number.get();
 
 Every return path of one function must produce the same concrete type for a given generic instantiation, and that type must satisfy all declared bounds. Different generic instantiations may use different concrete types. A public function may hide a private type, including across package boundaries. Callers can use the declared trait bounds and associated type bindings, but cannot access the hidden type's fields or additional inherent methods. Each function defines its own opaque type even if two functions return the same concrete type.
 
+Associated type bindings must name a type declared by the bound or a unique supertrait. Each name may appear only once per bound. When several supertraits declare the same name, specify the binding on its declaring trait, such as `impl Child + A[Item = i32] + B[Item = string]`.
+
 Dispatch remains static and participates in monomorphization; `impl Trait` does not create a trait object or require dyn-safe bounds. Use an explicit `as dyn Trait` conversion when a trait object is needed. `impl Trait` is supported only as the complete return type of a top-level function or inherent method. It cannot appear in parameters, type aliases, local type annotations, nested return types such as `Option[impl Trait]`, or trait method declarations.
 
 Opaque bounds currently accept positional type arguments and associated type bindings, but not integer const arguments such as `impl Fixed[4]`.
