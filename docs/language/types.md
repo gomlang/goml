@@ -57,7 +57,7 @@ An expression of type `never` does not produce a value and can appear where anot
 
 `A -> B -> C` is parsed by right associative analysis. It is recommended to always write function argument lists in parentheses, especially for higher-order functions: `(A) -> (B) -> C`.
 
-Array lengths are nonnegative integer constant expressions. They accept integer literals in the usual bases, named integer constants, const generic parameters, parentheses, unary `+`, `-`, `~`, and `+`, `-`, `*`, `/`, `%`, `<<`, `>>`, `&`, `|`, `^`. Integer overflow, division by zero, invalid shifts, negative lengths, and cyclic constant references are diagnostics. Lengths fit the target signed indexing range. These expressions do not execute function calls:
+Array lengths are nonnegative integer constant expressions. They accept integer literals in the usual bases, named integer constants, const generic parameters, parentheses, unary `+`, `-`, `~`, and `+`, `-`, `*`, `/`, `%`, `<<`, `>>`, `&`, `|`, `^`. Integer overflow, division by zero, invalid shifts, negative lengths, and cyclic constant references are diagnostics. For the smallest signed index value, `% -1` is zero, while `/ -1` overflows. Lengths fit the target signed indexing range. These expressions do not execute function calls:
 
 ```goml
 const WIDTH: usize = 2;
