@@ -300,7 +300,7 @@ let number = source(42);
 let value: isize = number.get();
 ```
 
-Every return path of one function must produce the same concrete type for a given generic instantiation, and that type must satisfy all declared bounds. Different generic instantiations may use different concrete types. A public function may hide a private type, including across package boundaries. Callers can use the declared trait bounds and associated type bindings, but cannot access the hidden type's fields or additional inherent methods. Each function defines its own opaque type even if two functions return the same concrete type.
+Every return path of one function must produce the same concrete type for a given generic instantiation, and that type must satisfy all declared bounds. Different generic instantiations may use different concrete types. A public function may hide a private type, including across package boundaries. Callers can use the declared trait bounds and associated type bindings, but cannot access the hidden type's fields or additional inherent methods. Each function defines its own opaque type even if two functions return the same concrete type. When a subtrait redeclares a supertrait method, method calls select the subtrait declaration. Same-named methods from unrelated bounds remain ambiguous and require an explicitly qualified trait call.
 
 Associated type bindings must name a type declared by the bound or a unique supertrait. Each name may appear only once per bound. When several supertraits declare the same name, specify the binding on its declaring trait, such as `impl Child + A[Item = i32] + B[Item = string]`.
 
@@ -570,7 +570,7 @@ Exhaustive analysis ignores enumeration variants with no value for the payload t
 
 Branches with normal guards do not provide exhaustive coverage because guard may be false; subsequent unguarded branches are usually required. String and floating-point literals cannot enumerate the entire type, and `_` is also usually required when matching these types. In floating-point patterns, `-0.0` and `0.0` are regarded as the same value.
 
-There are no `ref` or `ref mut` patterns. `mut name` is supported for individual bindings, while pattern matching on `dyn Trait` is not supported.
+There are no `ref` or `ref mut` patterns. `mut name` is supported for individual bindings, `dyn Trait` values support variable, wildcard, alias (`name @ _`), and or-patterns composed of these bindings, but cannot be destructured.
 
 <a id="trait-and-impl"></a>
 
@@ -950,4 +950,4 @@ Current limitations:
 
 - Integer const arguments such as `dyn Fixed[4]` are not supported in dyn argument lists;
 - Conversion from one dyn object type to another, including dropping a bound, is not supported;
-- Pattern matching on `dyn Trait` is not supported.
+- Destructuring patterns on `dyn Trait` are not supported; binding and wildcard patterns, including alias and or-pattern wrappers, are supported.
