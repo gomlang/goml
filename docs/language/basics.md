@@ -761,6 +761,8 @@ for (key, value) in pairs {
 }
 ```
 
+If the source expression diverges, the `for` expression has type `never`; it evaluates that source once without requiring `IntoIterator` or entering the loop body. The body is still checked for errors.
+
 Fixed arrays use a native indexed loop. `Vec[T]`, `Slice[T]`, `MutSlice[T]` and all `Iterator` values have corresponding `IntoIterator` implementations.
 
 <a id="break-continue-and-return"></a>

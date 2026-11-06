@@ -761,6 +761,8 @@ for (key, value) in pairs {
 }
 ```
 
+若源表达式发散，`for` 表达式的类型为 `never`；它只求值源表达式一次，不要求 `IntoIterator`，也不会进入循环体。循环体仍会接受错误检查。
+
 定长数组使用原生索引循环。`Vec[T]`、`Slice[T]`、`MutSlice[T]` 和所有 `Iterator` 值都有相应的 `IntoIterator` 实现。
 
 <a id="break-continue-and-return"></a>
