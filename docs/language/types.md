@@ -766,6 +766,8 @@ Ownership follows the declaring package, including declarations in another file 
 
 ### Inherent impl
 
+Inherent impls may define methods and constants. Associated type definitions are supported only in trait implementations.
+
 ```goml
 impl Point {
     fn new(x: i32, y: i32) -> Self {

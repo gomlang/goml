@@ -766,6 +766,8 @@ impl Iterator for Counter {
 
 ### 固有 impl
 
+固有 impl 可定义方法和常量。关联类型定义仅支持用于 trait 实现。
+
 ```goml
 impl Point {
     fn new(x: i32, y: i32) -> Self {
