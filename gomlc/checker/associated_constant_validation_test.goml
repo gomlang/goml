@@ -1,0 +1,154 @@
+package checker;
+
+use module::ast;
+use module::hir;
+use module::parser;
+use std::testing;
+
+#[test]
+fn associated_constant_cycles_use_resolved_owners() -> () {
+    for source in[
+        "struct V {} type Alias = V; impl V { const A: i32 = Alias::A; }",
+        "struct V[T] { value: T } impl V[i32] { const A: i32 = V::[bool]::A; } impl V[bool] { const A: i32 = V::[i32]::A; }",
+        "trait Values { const A: i32 = Self::B; const B: i32 = Self::A; } struct V {} impl Values for V {}",
+        "struct V[T] { value: T } impl[T] V[T] { const A: i32 = Self::A; }",
+    ] {
+        testing::assert(
+            has_diagnostic_containing(checked_diagnostics(source), "cyclic associated constant"),
+        )
+    }
+    for source in[
+        "struct V[T] { value: T } impl V[i32] { const A: i32 = V::[bool]::A; } impl V[bool] { const A: i32 = 7; } fn read() -> i32 { V::[i32]::A }",
+        "struct V {} type Alias = V; impl V { const A: i32 = Alias::B; const B: i32 = 7; }",
+        "trait Values { const A: i32 = Self::B; const B: i32 = Self::A; } struct V {} impl Values for V { const B: i32 = 7; } fn read() -> i32 { V::A }",
+        "struct V[T] { value: T } impl[T] V[T] { const A: i32 = Self::B; const B: i32 = 7; }",
+    ] {
+        let diagnostics = checked_diagnostics(source);
+        if !diagnostics.is_empty() {
+            testing::fail(source)
+        }
+    }
+}
+
+fn long_associated_constant_chain(cyclic: bool) -> string {
+    let mut source = "struct V {} impl V { const C0: i32 = ";
+    source += if cyclic {
+        "Self::C139;"
+    } else {
+        "7;"
+    };
+    for index in 1..140 {
+        source += "const C" + index.to_string() + ": i32 = Self::C" + (index - 1).to_string() + ";";
+    }
+    source + "} fn read() -> i32 { V::C139 }"
+}
+
+#[test]
+fn finite_associated_constant_chains_are_not_cycles() -> () {
+    testing::assert(checked_diagnostics(long_associated_constant_chain(false)).is_empty());
+    testing::assert(
+        has_diagnostic_containing(
+            checked_diagnostics(long_associated_constant_chain(true)),
+            "cyclic associated constant",
+        ),
+    )
+}
+
+#[test]
+fn associated_constant_alias_cycles_cross_package_files() -> () {
+    let parsed = Vec::from_array(
+        [
+            parser::parse(
+                "package values; struct V {} type Alias = V; impl V { const A: i32 = Alias::B; }",
+            ),
+            parser::parse("package values; impl V { const B: i32 = V::A; }"),
+        ],
+    );
+    let ast_files = ast::lower_package(parsed);
+    let inputs = Vec::from_array([(ast_files[0], "first.goml"), (ast_files[1], "second.goml")]);
+    let files = Vec::new();
+    for lowered in hir::lower_package_files(inputs, "example::values") {
+        match lowered.hir {
+            Some(file) => files.push(file),
+            None => testing::fail("expected associated constant HIR"),
+        }
+    }
+    let checked = check_package_files_for_link_with_dependencies(files, Vec::new());
+    testing::assert(
+        has_diagnostic_containing(checked.diagnostics, "cyclic associated constant V::A"),
+    );
+    testing::assert(checked.tast.is_none())
+}
+
+#[test]
+fn trait_qualified_constants_require_inferred_self() -> () {
+    testing::assert(
+        has_diagnostic_containing(
+            checked_diagnostics(
+                "trait Values { const A: i32 = 7; } struct V {} impl Values for V {} fn read() -> i32 { Values::A }",
+            ),
+            "Could not infer the Self type for associated constant Values::A",
+        ),
+    );
+    for source in[
+        "trait Values { const A: Self; } struct V { value: i32 } impl Values for V { const A: Self = V { value: 7 }; } fn read() -> V { Values::A }",
+        "trait Values { const A: i32; } fn read[T: Values]() -> i32 { T::A }",
+    ] {
+        testing::assert(checked_diagnostics(source).is_empty())
+    }
+}
+
+#[test]
+fn expanding_constant_owners_report_complexity_without_exponential_substitution() -> () {
+    let diagnostics = checked_diagnostics(
+        "struct Wrapper[T] { value: T } impl[T] Wrapper[T] { const A: i32 = Wrapper::[(T, T)]::A; }",
+    );
+    testing::assert(
+        has_diagnostic_containing(
+            diagnostics,
+            "associated constant dependency expansion exceeds compiler limit",
+        ),
+    );
+    testing::assert(!has_diagnostic_containing(diagnostics, "cyclic associated constant"));
+    testing::assert(
+        checked_diagnostics(
+            "struct Wrapper[T] { value: T } trait Values { const A: i32; } impl Values for i32 { const A: i32 = 7; } impl[T: Values] Values for Wrapper[T] { const A: i32 = T::A; } struct Final {} impl Final { const A: i32 = Wrapper::[Wrapper[Wrapper[i32]]]::A; } fn read() -> i32 { Final::A }",
+        ).is_empty(),
+    )
+}
+
+#[test]
+fn dependency_constant_edges_close_generic_bridge_cycles() -> () {
+    let environment = checked_dependency_environment(
+        "package values; pub trait Value { const A: i32; } pub struct Wrap[T] { pub value: T } impl[T: Value] Value for Wrap[T] { const A: i32 = T::A; }",
+        "example::values",
+    );
+    for cyclic in[false, true] {
+        let initializer = if cyclic {
+            "values::Wrap::[Local]::A"
+        } else {
+            "7"
+        };
+        let source = "package main; use example::values; use values::Value; struct Local {} impl Value for Local { const A: i32 = "
+            + initializer
+            + "; } struct Root {} impl Root { const A: i32 = values::Wrap::[values::Wrap[Local]]::A; } fn read() -> i32 { Root::A }";
+        let checked = check_for_link_with_environments(
+            hir::lower_package(
+                ast::lower(parser::parse(source)),
+                "consumer.goml",
+                "example::consumer",
+            ),
+            Vec::from_array([environment]),
+        );
+        if cyclic {
+            testing::assert(
+                has_diagnostic_containing(checked.diagnostics, "cyclic associated constant"),
+            );
+            testing::assert(checked.tast.is_none())
+        } else {
+            for diagnostic in checked.diagnostics {
+                testing::fail(diagnostic.message)
+            }
+        }
+    }
+}
