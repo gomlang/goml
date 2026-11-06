@@ -412,7 +412,7 @@ fn use_buffers() -> () {
 }
 ```
 
-A direct length parameter can be inferred from an array argument, expected type, or array type equality such as `where [T; N] = [i32; 2]`. For a length expression such as `N + 1`, provide `N` explicitly; inference does not solve arithmetic equations. Equality of two length expressions does not imply equality of their operands; for example, equal `N * 0` and `M * 0` lengths do not constrain `N` and `M` to be equal. Generic arguments use literals or names, and compound integer arguments use braces, such as `Buffer[i32, {2 + 1}]`. Const parameters currently have type `usize`, have no defaults, and use values in `0..=9223372036854775807`. Trait constraints are checked again after generic substitution, including constraints required by an implementation; negative const arguments and invalid constant arithmetic are rejected even when they do not appear in a function signature. Array repetition accepts these parameters, for example `[value; N]`. Type-dependent associated constants in array lengths are not supported.
+A direct length parameter can be inferred from an array argument, expected type, or array type equality such as `where [T; N] = [i32; 2]`. For a length expression such as `N + 1`, provide `N` explicitly; inference does not solve arithmetic equations. Equality of two length expressions does not imply equality of their operands; for example, equal `N * 0` and `M * 0` lengths do not constrain `N` and `M` to be equal. Generic arguments use literals or names, and compound integer arguments use braces, such as `Buffer[i32, {2 + 1}]`. Const parameters currently have type `usize`, have no defaults, and use values in `0..=9223372036854775807`. Trait constraints are checked again after generic substitution, including constraints required by an implementation; negative const arguments and invalid constant arithmetic are rejected even when they do not appear in a function signature. Constant requirements from generic function bodies are retained at call and function-value boundaries, including unused local types, forwarded const arguments, and APIs imported from another package. Array repetition accepts these parameters, for example `[value; N]`. Type-dependent associated constants in array lengths are not supported.
 
 <a id="patterns"></a>
 
@@ -770,6 +770,8 @@ Ownership follows the declaring package, including declarations in another file 
 
 Inherent impls may define methods and constants. Associated type definitions are supported only in trait implementations.
 
+A type may have multiple inherent impls. Members with the same name must have disjoint owner types or impl constraints; parameter and return types do not distinguish overlapping members. Methods and associated constants share the member namespace.
+
 ```goml
 impl Point {
     fn new(x: i32, y: i32) -> Self {
@@ -889,7 +891,7 @@ fn show_dynamic(value: dyn Display) -> string {
 }
 ```
 
-At conversion, the concrete source type must also satisfy the predicates of every exposed instance method, including inherited methods, so each generated dispatch entry is valid.
+At conversion, the concrete source type must also satisfy the predicates of every exposed instance method, including inherited methods, so each generated dispatch entry is valid. Calls and method values use this validated evidence for the corresponding dispatch entry; the object does not gain additional trait bounds.
 
 Concrete values are never boxed implicitly when a `dyn Trait` value is expected. Assignments, arguments, returns, branches, constructors, and collection operations must place `as dyn Trait` at the conversion site. Existing `dyn Trait` values can still flow through compatible typed contexts without another conversion. A source expression of type `never` diverges before conversion; the cast also has type `never` and does not require that type to implement the target trait. Numeric conversion inference first uses type constraints from the complete function body, including uses after the conversion. An inferred numeric literal uses its default type (`isize` or `f64`) when that type satisfies all target bounds. Otherwise, there must be exactly one matching numeric type; multiple matches require an explicit type annotation and are not resolved by impl declaration order.
 

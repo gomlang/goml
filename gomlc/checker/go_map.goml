@@ -1,10 +1,13 @@
 package checker;
 
 use module::ffi;
-use module::tast::{Type, TypeSubst, find_substitution, go_map_key_definitely_uncomparable, prune, substitute_params, symbolic_array, type_text, types_equal};
+use module::tast::{Type, TypeSubst, find_substitution, go_map_key_definitely_uncomparable, opaque_hidden, prune, substitute_params, symbolic_array, type_text, types_equal};
 
 fn go_map_key_uncomparable(ctx: Checker, value: Type, active: Vec[string]) -> bool {
     let normalized = prune(normalize_type(ctx, value));
+    if let Some(hidden) = opaque_hidden(normalized) {
+        return go_map_key_uncomparable(ctx, hidden, active)
+    }
     if let Some(parts) = symbolic_array(normalized) {
         return go_map_key_uncomparable(ctx, parts.1, active)
     }
@@ -22,50 +25,55 @@ fn go_map_key_uncomparable(ctx: Checker, value: Type, active: Vec[string]) -> bo
             }
             false
         },
-        value => match struct_application_parts(value) {
-            Some(parts) if !active.contains(type_text(value)) => match find_struct_by_name(
-                ctx,
-                parts.0,
-            ) {
-                Some(info) => {
-                    if let Some(rule) = info.go_comparable {
-                        return external_map_rule_uncomparable(
-                            ctx,
-                            rule,
-                            info.generics,
-                            struct_comparability_substitutions(info, parts.1),
-                            active,
-                        )
-                    }
-                    for field in info.fields {
-                        if by_value_type_has_cycle(ctx, field.1, Vec::from_array([info.name])) {
-                            push_diagnostic(ctx, "Go map key has a recursive struct layout");
-                            return false
-                        }
-                    }
-                    if active.len() >= 64 {
-                        push_diagnostic(
-                            ctx,
-                            "Go map key comparability exceeds the structural depth limit",
-                        );
-                        return false
-                    }
+        value => {
+            let Some(parts) = struct_application_parts(value) else {
+                return false
+            };
+            if let Some(layout) = nominal_map_layout(ctx, parts.0) {
+                if by_value_type_has_cycle(ctx, value, Vec::new()) {
+                    push_diagnostic(ctx, "Go map key has a recursive struct layout");
+                    return false
+                }
+                if let Some(result) = planned_map_key_uncomparable(ctx, value) {
+                    return result
+                }
+                if active.contains(type_text(value)) {
+                    return false
+                }
+                if active.len() >= 64 {
+                    push_diagnostic(
+                        ctx,
+                        "Go map key comparability exceeds the structural depth limit",
+                    );
+                    return false
+                }
+                if let Struct(fields) = layout.shape {
                     let next = copied_names(active);
                     next.push(type_text(value));
-                    for field in info.fields {
+                    for field in fields {
                         if go_map_key_uncomparable(
                             ctx,
-                            substitute_params(field.1, info.generics, parts.1),
+                            substitute_params(field, layout.generics, parts.1),
                             next,
                         ) {
                             return true
                         }
                     }
-                    false
-                },
-                None => false,
-            },
-            _ => false,
+                }
+                return false
+            }
+            if let Some(info) = find_struct_by_name(ctx, parts.0) {
+                if let Some(rule) = info.go_comparable {
+                    return external_map_rule_uncomparable(
+                        ctx,
+                        rule,
+                        info.generics,
+                        struct_comparability_substitutions(info, parts.1),
+                        active,
+                    )
+                }
+            }
+            false
         },
     }
 }
@@ -153,6 +161,13 @@ fn collect_go_comparable_requirements(
     active: Vec[string],
 ) -> bool {
     let value = prune(normalize_type(ctx, value));
+    if let Some(hidden) = opaque_hidden(value) {
+        if contains_unbound_type_variable(hidden) {
+            let _ = push_map_type_requirement(result, value);
+            return true
+        }
+        return collect_go_comparable_requirements(ctx, hidden, result, active)
+    }
     if let Some(parts) = symbolic_array(value) {
         return collect_go_comparable_requirements(ctx, parts.1, result, active)
     }
@@ -179,48 +194,58 @@ fn collect_go_comparable_requirements(
             true
         },
         External { .. } => true,
-        value => match struct_application_parts(value) {
-            Some(parts) => match find_struct_by_name(ctx, parts.0) {
-                Some(info) => {
-                    if let Some(rule) = info.go_comparable {
-                        return collect_go_comparability_rule(
-                            ctx,
-                            rule,
-                            info.generics,
-                            struct_comparability_substitutions(info, parts.1),
-                            result,
-                            active,
-                        )
-                    }
-                    if info.has_hidden_fields {
-                        return false
-                    }
-                    for field in info.fields {
-                        if by_value_type_has_cycle(ctx, field.1, Vec::from_array([info.name])) {
+        value => {
+            let Some(parts) = struct_application_parts(value) else {
+                return true
+            };
+            if let Some(layout) = nominal_map_layout(ctx, parts.0) {
+                if by_value_type_has_cycle(ctx, value, Vec::new()) {
+                    push_diagnostic(ctx, "Go map key has a recursive struct layout");
+                    return false
+                }
+                match layout.shape {
+                    Enum(_) => {
+                        if let Some(uncomparable) = planned_map_key_uncomparable(ctx, value) {
+                            return !uncomparable
+                        }
+                        let _ = push_map_type_requirement(result, value);
+                        return true
+                    },
+                    Struct(fields) => {
+                        let identity = type_text(value);
+                        if active.contains(identity) || active.len() >= 64 {
                             return false
                         }
-                    }
-                    let identity = type_text(value);
-                    if active.contains(identity) || active.len() >= 64 {
-                        return false
-                    }
-                    let next = copied_names(active);
-                    next.push(identity);
-                    for field in info.fields {
-                        if !collect_go_comparable_requirements(
-                            ctx,
-                            substitute_params(field.1, info.generics, parts.1),
-                            result,
-                            next,
-                        ) {
-                            return false
+                        let next = copied_names(active);
+                        next.push(identity);
+                        for field in fields {
+                            if !collect_go_comparable_requirements(
+                                ctx,
+                                substitute_params(field, layout.generics, parts.1),
+                                result,
+                                next,
+                            ) {
+                                return false
+                            }
                         }
-                    }
-                    true
-                },
-                None => true,
-            },
-            None => true,
+                        return true
+                    },
+                }
+            }
+            if let Some(info) = find_struct_by_name(ctx, parts.0) {
+                if let Some(rule) = info.go_comparable {
+                    return collect_go_comparability_rule(
+                        ctx,
+                        rule,
+                        info.generics,
+                        struct_comparability_substitutions(info, parts.1),
+                        result,
+                        active,
+                    )
+                }
+                return !info.has_hidden_fields
+            }
+            true
         },
     }
 }

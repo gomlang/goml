@@ -7,6 +7,7 @@ use module::consts;
 use module::hir;
 use std::collections;
 use std::text;
+use std::path;
 use module::tast::{AssociatedTypeInfo, Block, BuiltinContract, Callable, ComptimeCapability, ConstExpr, Constant, ConstantScheme, DependencyEnvironment, EnumDef, EnumVariantDef, Expr, File, Function, FunctionScheme, ImplBlock, ImplInfo, Item, MethodInfo, Static, StructDef, TraitInfo, TraitMethodInfo, TraitRef, Type, TypeAliasInfo, TypePredicate, TypeSubst, any_child_type, builtin_contract, enum_variant_field_types, expr_type, for_each_child_type, names_match, opaque_hidden, predicates_from_hir, prune, resolve_type, short_name, substitute_params, substitute_type, symbolic_array, trait_ref_from_hir, trait_ref_text, type_from_hir, type_text, types_equal, verify};
 
 fn function_context(
@@ -276,6 +277,15 @@ fn check_function_with_trait(
     self_ty: Option[Type],
     self_trait: Option[TraitRef],
 ) -> Function {
+    let previous_const_origin = base.const_requirement_origin.get();
+    base.const_requirement_origin.set(
+        Some(
+            base.package_name + "::" + path::file_name(base.source_path).unwrap_or("") + "::"
+                + value.name
+                + "::"
+                + value.name_span.start.to_string(),
+        ),
+    );
     let previous = base.current_function.get();
     base.current_function.set(
         if self_ty.is_none() {
@@ -292,6 +302,7 @@ fn check_function_with_trait(
         self_ty,
         self_trait,
     );
+    base.const_requirement_origin.set(previous_const_origin);
     base.current_function.set(previous);
     result
 }
@@ -1562,6 +1573,7 @@ fn normalize_method_signature_predicate(ctx: Checker, value: TypePredicate) -> T
     match value {
         GoComparable(ty) => GoComparable(normalize_type(ctx, ty)),
         GoFunction(ty) => GoFunction(normalize_type(ctx, ty)),
+        ConstValid { ty, origins } => ConstValid { ty: normalize_type(ctx, ty), origins },
         Trait { for_ty, trait_ref } => TypePredicate::Trait {
             for_ty: normalize_type(ctx, for_ty),
             trait_ref: normalize_trait_ref(ctx, trait_ref),
@@ -1709,6 +1721,7 @@ fn predicate_text(value: TypePredicate) -> string {
     match value {
         GoComparable(ty) => "go_comparable(" + type_text(ty) + ")",
         GoFunction(ty) => "go_function(" + type_text(ty) + ")",
+        ConstValid { ty, .. } => "const_valid(" + type_text(ty) + ")",
         Trait { for_ty, trait_ref } => {
             type_text(for_ty) + ": " + trait_ref_text(trait_ref)
         },
@@ -1785,6 +1798,7 @@ fn resolve_impl_alias_predicate(ctx: Checker, value: TypePredicate) -> TypePredi
     match value {
         GoComparable(ty) => GoComparable(resolve_impl_alias_type(ctx, ty)),
         GoFunction(ty) => GoFunction(resolve_impl_alias_type(ctx, ty)),
+        ConstValid { ty, origins } => ConstValid { ty: resolve_impl_alias_type(ctx, ty), origins },
         Trait { for_ty, trait_ref } => TypePredicate::Trait {
             for_ty: resolve_impl_alias_type(ctx, for_ty),
             trait_ref: resolve_impl_alias_trait_ref(ctx, trait_ref),
@@ -1876,6 +1890,7 @@ fn predicate_contains_any_parameter(value: TypePredicate, parameters: Vec[string
     match value {
         GoComparable(ty) => type_contains_any_parameter(ty, parameters),
         GoFunction(ty) => type_contains_any_parameter(ty, parameters),
+        ConstValid { ty, .. } => type_contains_any_parameter(ty, parameters),
         Trait { for_ty, trait_ref } => {
             type_contains_any_parameter(for_ty, parameters)
                 || trait_ref_contains_any_parameter(trait_ref, parameters)
@@ -2080,6 +2095,7 @@ fn canonical_default_predicates(ctx: Checker, values: Vec[TypePredicate]) -> Vec
             match value {
                 GoComparable(ty) => GoComparable(ty),
                 GoFunction(ty) => GoFunction(ty),
+                ConstValid { ty, origins } => ConstValid { ty: ty, origins },
                 Trait { for_ty, trait_ref } => TypePredicate::Trait {
                     for_ty,
                     trait_ref: canonical_resolved_trait_ref(ctx, trait_ref),
@@ -2274,16 +2290,19 @@ fn by_value_layout(ctx: Checker, value: Type, active: Vec[string]) -> Option[Typ
         Array { len: _, elem } => by_value_layout(ctx, elem, active),
         Param { name } => Some(Type::Param { name }),
         value => match struct_application_parts(value) {
-            Some(parts) => match find_struct_by_name(ctx, parts.0) {
+            Some(parts) => match nominal_map_layout(ctx, parts.0) {
                 Some(info) => {
+                    let Struct(fields) = info.shape else {
+                        return Some(Type::Unit)
+                    };
                     if active.contains(info.name) {
                         return None
                     }
                     let next = copied_names(active);
                     next.push(info.name);
                     let layouts: Vec[Type] = Vec::new();
-                    for field in info.fields {
-                        let template = match by_value_layout(ctx, field.1, next) {
+                    for field in fields {
+                        let template = match by_value_layout(ctx, field, next) {
                             Some(layout) => layout,
                             None => return None,
                         };
@@ -2396,10 +2415,12 @@ fn validate_local_definitions(
     validate_supertrait_cycles(ctx, trait_count);
     for index in 0..trait_count {
         let info = ctx.traits[index];
+        let _ = resolve_trait_signature_projections(ctx, info, true);
         for predicate in info.predicates {
             match predicate {
                 GoComparable(ty) => validate_signature_type(ctx, ty),
                 GoFunction(ty) => validate_signature_type(ctx, ty),
+                ConstValid { ty, .. } => validate_signature_type(ctx, ty),
                 Trait { for_ty, trait_ref: reference } => {
                     validate_signature_type(ctx, for_ty);
                     validate_trait_reference(ctx, reference)
@@ -2423,6 +2444,7 @@ fn validate_local_definitions(
                 match predicate {
                     GoComparable(ty) => validate_signature_type(ctx, ty),
                     GoFunction(ty) => validate_signature_type(ctx, ty),
+                    ConstValid { ty, .. } => validate_signature_type(ctx, ty),
                     Trait { for_ty, trait_ref: reference } => {
                         validate_signature_type(ctx, for_ty);
                         validate_trait_reference(ctx, reference)
@@ -3734,6 +3756,7 @@ fn check_file_with_package_inferred(
             _ => (),
         }
     }
+    validate_finished_opaque_map_predicates(ctx, items);
     validate_go_interface_members(ctx, value, package_files, items);
     attach_file_diagnostic_spans(ctx, value);
     let enums = if include_builtin_types {
@@ -4302,6 +4325,7 @@ fn check_package_files_for_link_with_environments_pass(
             },
         }
     }
+    validate_package_opaque_map_predicates(values, dependencies, items, diagnostics);
     warn_unused_functions(values, diagnostics);
     let diagnostic_source = if !values.is_empty() {
         values[0].source_path

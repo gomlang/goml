@@ -1,0 +1,303 @@
+package checker;
+
+use module::go_types;
+use module::repr;
+use module::tast::{EnumInfo, Type, NominalLayout, NominalLayoutShape, const_type_value, enum_variant_field_types, prune, substitute_params, symbolic_array, any_child_type, opaque_hidden, type_text};
+
+struct MapLayoutContext {
+    checker: Checker,
+    structs: Vec[repr::StructDef],
+    enums: Vec[repr::EnumDef],
+    instances: Vec[repr::TypeInstance],
+    seen: Vec[string],
+    active: Vec[(string, bool)],
+}
+
+fn nominal_map_layout(ctx: Checker, name: string) -> Option[NominalLayout] {
+    for layout in ctx.layouts {
+        if layout.name == name {
+            return Some(layout)
+        }
+    }
+    if let Some(info) = find_struct_by_name(ctx, name) {
+        if info.has_hidden_fields {
+            return None
+        }
+        let fields = Vec::new();
+        for field in info.fields {
+            fields.push(field.1);
+        }
+        return Some(
+            NominalLayout {
+                name: info.name,
+                generics: info.generics,
+                shape: NominalLayoutShape::Struct(fields),
+            },
+        )
+    }
+    let enum_info: Option[EnumInfo] = match find_enum_by_name(ctx, name) {
+        Some(info) => Some(info),
+        None => builtin_source_enum_info(name),
+    };
+    if let Some(info) = enum_info {
+        let variants = Vec::new();
+        for variant in info.variants {
+            variants.push(enum_variant_field_types(variant.fields));
+        }
+        return Some(
+            NominalLayout {
+                name: info.name,
+                generics: info.generics,
+                shape: NominalLayoutShape::Enum(variants),
+            },
+        )
+    }
+    None
+}
+
+fn map_layout_reference(ctx: Checker, ty: Type) -> repr::Type {
+    repr::Type::Named { name: "$map_element:" + type_text(prune(normalize_type(ctx, ty))) }
+}
+
+fn map_layout_fields(
+    state: MapLayoutContext,
+    fields: Vec[Type],
+    parameters: Vec[string],
+    args: Vec[Type],
+) -> Option[Vec[repr::Type]] {
+    let result = Vec::new();
+    for field in fields {
+        result.push(map_layout_type(state, substitute_params(field, parameters, args))?);
+    }
+    Some(result)
+}
+
+fn map_layout_nominal(state: MapLayoutContext, ty: Type, name: string, args: Vec[Type]) -> Option[
+    repr::Type,
+] {
+    let layout = nominal_map_layout(state.checker, name)?;
+    if by_value_type_has_cycle(state.checker, ty, Vec::new()) {
+        push_diagnostic(state.checker, "Go map key has a recursive struct layout");
+        return None
+    }
+    let identity = type_text(ty);
+    let result = repr::Type::Named { name: identity };
+    if state.seen.contains(identity) {
+        for index in 0..state.active.len() {
+            if state.active[index].0 == identity {
+                let mut through_enum = false;
+                for next in index..state.active.len() {
+                    if state.active[next].1 {
+                        through_enum = true;
+                    }
+                }
+                if !through_enum {
+                    push_diagnostic(state.checker, "Go map key has a recursive struct layout");
+                    return None
+                }
+            }
+        }
+        return Some(result)
+    }
+    if state.active.len() >= 64 {
+        push_diagnostic(
+            state.checker,
+            "Go map key comparability exceeds the structural depth limit",
+        );
+        return None
+    }
+    if layout.generics.len() != args.len() {
+        return None
+    }
+    state.seen.push(identity);
+    let is_enum = match layout.shape {
+        Enum(_) => true,
+        Struct(_) => false,
+    };
+    state.active.push((identity, is_enum));
+    state.instances.push(
+        repr::TypeInstance { base_name: layout.name, args: Vec::new(), name: identity },
+    );
+    match layout.shape {
+        Struct(fields) => {
+            let converted = map_layout_fields(state, fields, layout.generics, args)?;
+            let named = Vec::new();
+            for index in 0..converted.len() {
+                named.push((index.to_string(), converted[index]));
+            }
+            state.structs.push(
+                repr::StructDef {
+                    name: identity,
+                    fields: named,
+                    public_fields: Vec::new(),
+                    has_hidden_fields: false,
+                },
+            );
+        },
+        Enum(variants) => {
+            let converted = Vec::new();
+            for index in 0..variants.len() {
+                converted.push(
+                    repr::EnumVariantDef {
+                        name: index.to_string(),
+                        fields: repr::EnumVariantFields::Tuple(
+                            map_layout_fields(state, variants[index], layout.generics, args)?,
+                        ),
+                    },
+                );
+            }
+            state.enums.push(
+                repr::EnumDef { name: identity, variants: converted, option_variants: None },
+            );
+        },
+    }
+    state.active.truncate(state.active.len() - 1);
+    Some(result)
+}
+
+fn map_layout_type(state: MapLayoutContext, value: Type) -> Option[repr::Type] {
+    let value = prune(normalize_type(state.checker, value));
+    if let Some(hidden) = opaque_hidden(value) {
+        return map_layout_type(state, hidden)
+    }
+    if let Some(parts) = symbolic_array(value) {
+        return Some(
+            repr::Type::Array {
+                len: const_type_value(parts.0)?,
+                elem: map_layout_type(state, parts.1)?,
+            },
+        )
+    }
+    Some(
+        match value {
+            Unit => repr::Type::Unit,
+            Never => repr::Type::Never,
+            Bool => repr::Type::Bool,
+            Int => repr::Type::Int,
+            Int8 => repr::Type::Int8,
+            Int16 => repr::Type::Int16,
+            Int32 => repr::Type::Int32,
+            Int64 => repr::Type::Int64,
+            Uint => repr::Type::Uint,
+            Uint8 => repr::Type::Uint8,
+            Uint16 => repr::Type::Uint16,
+            Uint32 => repr::Type::Uint32,
+            Uint64 => repr::Type::Uint64,
+            Float32 => repr::Type::Float32,
+            Float64 => repr::Type::Float64,
+            String => repr::Type::String,
+            Char => repr::Type::Char,
+            External { import_path, name, args } => {
+                let converted = Vec::new();
+                for arg in args {
+                    converted.push(map_layout_reference(state.checker, arg));
+                }
+                repr::Type::External { import_path, name, args: converted }
+            },
+            Array { len, elem } => repr::Type::Array { len, elem: map_layout_type(state, elem)? },
+            Tuple { items } => {
+                let converted = Vec::new();
+                for item in items {
+                    converted.push(map_layout_type(state, item)?);
+                }
+                repr::Type::Tuple { items: converted }
+            },
+            Slice { elem } => repr::Type::Slice { elem: map_layout_reference(state.checker, elem) },
+            MutSlice { elem } => repr::Type::MutSlice {
+                elem: map_layout_reference(state.checker, elem),
+            },
+            VecType { elem } => repr::Type::VecType {
+                elem: map_layout_reference(state.checker, elem),
+            },
+            RefType { elem } => repr::Type::RefType {
+                elem: map_layout_reference(state.checker, elem),
+            },
+            GoPointer { elem } => repr::Type::GoPointer {
+                elem: map_layout_reference(state.checker, elem),
+            },
+            GoFunction { signature } => repr::Type::GoFunction {
+                signature: map_layout_reference(state.checker, signature),
+            },
+            HashMap { key, value } => repr::Type::HashMap {
+                key: map_layout_reference(state.checker, key),
+                value: map_layout_reference(state.checker, value),
+            },
+            GoMap { key, value } => repr::Type::GoMap {
+                key: map_layout_reference(state.checker, key),
+                value: map_layout_reference(state.checker, value),
+            },
+            Channel { elem, direction } => repr::Type::Channel {
+                elem: map_layout_reference(state.checker, elem),
+                direction,
+            },
+            Func { params, ret_ty } => {
+                let converted = Vec::new();
+                for param in params {
+                    converted.push(map_layout_reference(state.checker, param));
+                }
+                repr::Type::Func {
+                    params: converted,
+                    ret_ty: map_layout_reference(state.checker, ret_ty),
+                }
+            },
+            Dyn { .. } => repr::Type::Dyn {
+                trait_name: type_text(value),
+                args: Vec::new(),
+                associated_types: Vec::new(),
+                additional_bounds: Vec::new(),
+            },
+            Con { name } => map_layout_nominal(state, value, name, Vec::new())?,
+            App { ty: Con { name }, args } => map_layout_nominal(state, value, name, args)?,
+            _ => return None,
+        },
+    )
+}
+
+fn planned_map_key_uncomparable(ctx: Checker, value: Type) -> Option[bool] {
+    if !map_layout_is_concrete(ctx, value) {
+        return None
+    }
+    let state = MapLayoutContext {
+        checker: ctx,
+        structs: Vec::new(),
+        enums: Vec::new(),
+        instances: Vec::new(),
+        seen: Vec::new(),
+        active: Vec::new(),
+    };
+    let ty = map_layout_type(state, value)?;
+    let variants = go_types::plan_variant_infos(
+        ctx.builtin,
+        state.enums,
+        state.structs,
+        state.instances,
+        |owner, variant| owner + "::" + variant,
+    );
+    Some(go_types::planned_map_key_uncomparable(ty, state.structs, variants))
+}
+
+fn checker_nominal_layouts(ctx: Checker) -> Vec[NominalLayout] {
+    let result = Vec::new();
+    for info in ctx.structs {
+        if let Some(layout) = nominal_map_layout(ctx, info.name) {
+            result.push(layout);
+        }
+    }
+    for info in ctx.enums {
+        if let Some(layout) = nominal_map_layout(ctx, info.name) {
+            result.push(layout);
+        }
+    }
+    result
+}
+
+fn map_layout_is_concrete(ctx: Checker, value: Type) -> bool {
+    let value = prune(normalize_type(ctx, value));
+    if let Some(hidden) = opaque_hidden(value) {
+        return map_layout_is_concrete(ctx, hidden)
+    }
+    match value {
+        Param { .. } | Var(_) | Projection { .. } => false,
+        _ => !any_child_type(value, |child| !map_layout_is_concrete(ctx, child)),
+    }
+}

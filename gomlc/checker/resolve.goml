@@ -1090,6 +1090,7 @@ fn static_method_owner_predicates_possible(ctx: Checker, predicates: Vec[TypePre
         let unresolved = match predicate {
             GoComparable(ty) => contains_unbound_any_variable(normalize_type(ctx, ty)),
             GoFunction(ty) => contains_unbound_any_variable(normalize_type(ctx, ty)),
+            ConstValid { ty, .. } => contains_unbound_any_variable(normalize_type(ctx, ty)),
             Trait { for_ty, trait_ref } => {
                 contains_unbound_any_variable(normalize_type(ctx, for_ty))
                     || any_type(normalize_types(ctx, trait_ref.args), contains_unbound_any_variable)
@@ -1273,7 +1274,14 @@ fn resolve_user_method(
                             traits.push((candidate, snapshot.capture()))
                         }
                     },
-                    None => inherent.push((candidate, snapshot.capture())),
+                    None => if !method_shape_is_ambiguous(ctx, receiver, name)
+                        || (unify(candidate.owner, receiver)
+                            && static_method_owner_predicates_possible(
+                                ctx,
+                                candidate.owner_predicates,
+                            )) {
+                        inherent.push((candidate, snapshot.capture()))
+                    },
                 }
             }
             snapshot.restore();
@@ -1361,7 +1369,7 @@ fn context_trait_bound_satisfied(ctx: Checker, bound_ty: Type, reference: TraitR
     let reference = normalize_trait_ref(ctx, reference);
     for predicate in context_predicates_for_type(ctx, bound_ty) {
         match predicate {
-            GoComparable(_) | GoFunction(_) => (),
+            GoComparable(_) | GoFunction(_) | ConstValid { .. } => (),
             Trait { for_ty: candidate_ty, trait_ref: candidate_ref } => {
                 if types_equal(normalize_type(ctx, candidate_ty), bound_ty)
                     && trait_ref_equal(normalize_trait_ref(ctx, candidate_ref), reference) {
@@ -1394,6 +1402,9 @@ fn predicates_satisfied_inner(ctx: Checker, predicates: Vec[TypePredicate], goal
             GoFunction(signature) => if !raw_function_predicate_satisfied(ctx, signature) {
                 return false
             },
+            ConstValid { ty, .. } => if const_valid_predicate_error(ctx, ty).is_some() {
+                return false
+            },
             Trait { for_ty: bound_ty, trait_ref: reference } => {
                 if !trait_bound_satisfied_at(ctx, bound_ty, reference, goals) {
                     return false
@@ -1414,6 +1425,7 @@ fn require_predicates(ctx: Checker, predicates: Vec[TypePredicate]) -> () {
     for predicate in predicates {
         ctx.inference.required_predicates.push(
             PredicateRequirement {
+                dyn_method: None,
                 predicate,
                 message: "type predicate not satisfied",
                 span: ctx.current_span.get(),
@@ -1424,7 +1436,7 @@ fn require_predicates(ctx: Checker, predicates: Vec[TypePredicate]) -> () {
 
 fn require_predicate(ctx: Checker, predicate: TypePredicate, message: string) -> () {
     ctx.inference.required_predicates.push(
-        PredicateRequirement { predicate, message, span: ctx.current_span.get() },
+        PredicateRequirement { predicate, message, span: ctx.current_span.get(), dyn_method: None },
     )
 }
 
@@ -1449,6 +1461,7 @@ fn predicate_requirement_message(ctx: Checker, value: TypePredicate, fallback: s
                 + type_text(normalize_type(ctx, ty)),
             GoFunction(signature) => "Go function signature is not ABI-compatible: "
                 + type_text(normalize_type(ctx, signature)),
+            ConstValid { ty, .. } => const_valid_predicate_error(ctx, ty).unwrap_or(fallback),
             Trait { for_ty, trait_ref: reference } => {
                 let mut unresolved = contains_unbound_type_variable(for_ty);
                 let mut ambiguous = contains_unbound_any_variable(for_ty);
@@ -1484,6 +1497,7 @@ fn predicate_contains_error(value: TypePredicate) -> bool {
     match value {
         GoComparable(ty) => type_contains_error(ty),
         GoFunction(ty) => type_contains_error(ty),
+        ConstValid { ty, .. } => type_contains_error(ty),
         Trait { for_ty, trait_ref: reference } => {
             if type_contains_error(for_ty) {
                 true
@@ -1521,6 +1535,7 @@ fn mark_unresolved_inference_predicate(ctx: Checker, value: TypePredicate) -> ()
     match value {
         GoComparable(ty) => mark_unresolved_inference_type(ctx, ty),
         GoFunction(ty) => mark_unresolved_inference_type(ctx, ty),
+        ConstValid { ty, .. } => mark_unresolved_inference_type(ctx, ty),
         Trait { for_ty, trait_ref } => {
             mark_unresolved_inference_type(ctx, for_ty);
             for arg in trait_ref.args {
@@ -1550,8 +1565,11 @@ fn predicate_message_present(
 
 fn solve_required_predicates(ctx: Checker) -> () {
     for requirement in ctx.inference.required_predicates {
+        if predicate_has_dyn_method_evidence(ctx, requirement) {
+            continue
+        }
         match requirement.predicate {
-            GoComparable(ty) | GoFunction(ty) => {
+            GoComparable(ty) | GoFunction(ty) | ConstValid { ty, .. } => {
                 let _ = default_numeric_type(ty);
             },
             Trait { for_ty, trait_ref } => {
@@ -1569,9 +1587,15 @@ fn solve_required_predicates(ctx: Checker) -> () {
     for _ in 0..ctx.inference.required_predicates.len() + 1 {
         let snapshot = inference_snapshot(Vec::new());
         for requirement in ctx.inference.required_predicates {
+            if predicate_has_dyn_method_evidence(ctx, requirement) {
+                continue
+            }
             snapshot.include_predicates(Vec::from_array([requirement.predicate]))
         }
         for requirement in ctx.inference.required_predicates {
+            if predicate_has_dyn_method_evidence(ctx, requirement) {
+                continue
+            }
             let _ = predicates_satisfied_at(
                 ctx,
                 Vec::from_array([requirement.predicate]),
@@ -1589,7 +1613,11 @@ fn resolve_required_predicates(ctx: Checker) -> bool {
     let messages: Vec[string] = Vec::new();
     let spans: Vec[Option[ast::Span]] = Vec::new();
     for requirement in ctx.inference.required_predicates {
+        if predicate_has_dyn_method_evidence(ctx, requirement) {
+            continue
+        }
         let constant_error = match requirement.predicate {
+            ConstValid { ty, .. } => const_valid_predicate_error(ctx, ty),
             Trait { for_ty, trait_ref: reference } => instantiated_trait_const_error(
                 ctx,
                 for_ty,
@@ -1613,7 +1641,8 @@ fn resolve_required_predicates(ctx: Checker) -> bool {
                     requirement.message,
                 ),
             };
-            if predicate_message_present(messages, spans, message, requirement.span) {} else {
+            if (constant_error.is_some() && messages.contains(message))
+                || predicate_message_present(messages, spans, message, requirement.span) {} else {
                 let inference_prefix = "Could not infer the type required to prove";
                 if message.starts_with(inference_prefix) {
                     mark_unresolved_inference_predicate(ctx, requirement.predicate)
@@ -2147,6 +2176,11 @@ fn resolve_user_method_for_call(
                             args,
                             inherent_expected,
                         )
+                        && (!method_shape_is_ambiguous(ctx, receiver, name)
+                            || static_method_owner_predicates_possible(
+                                ctx,
+                                candidate.owner_predicates,
+                            ))
                 },
             };
             if matches {
@@ -2426,10 +2460,10 @@ fn contains_trait_ref(values: Vec[TraitRef], expected: TraitRef) -> bool {
 
 fn predicate_equal(left: TypePredicate, right: TypePredicate) -> bool {
     match (left, right) {
-        (GoComparable(left), GoComparable(right)) | (GoFunction(left), GoFunction(right)) => types_equal(
-            left,
-            right,
-        ),
+        (GoComparable(left), GoComparable(right)) | (GoFunction(left), GoFunction(right)) | (
+            ConstValid { ty: left, .. },
+            ConstValid { ty: right, .. },
+        ) => types_equal(left, right),
         (
             Trait { for_ty: left_ty, trait_ref: left_ref },
             Trait { for_ty: right_ty, trait_ref: right_ref },
@@ -2519,7 +2553,7 @@ fn projection_candidates_from_predicates(ctx: Checker, predicates: Vec[TypePredi
     let result: Vec[ProjectionCandidate] = Vec::new();
     for predicate in predicates {
         match predicate {
-            GoComparable(_) | GoFunction(_) => (),
+            GoComparable(_) | GoFunction(_) | ConstValid { .. } => (),
             Trait { for_ty, trait_ref } => {
                 for application in trait_ref_closure_with_self(ctx, trait_ref, for_ty) {
                     if let Some(info) = find_trait(ctx, application.name) {
@@ -2715,6 +2749,10 @@ fn resolve_projection_predicates(
                     resolve_projection_type(ctx, ty, candidates, report),
                 ),
                 GoFunction(ty) => GoFunction(resolve_projection_type(ctx, ty, candidates, report)),
+                ConstValid { ty, origins } => ConstValid {
+                    ty: resolve_projection_type(ctx, ty, candidates, report),
+                    origins,
+                },
                 Trait { for_ty, trait_ref } => TypePredicate::Trait {
                     for_ty: resolve_projection_type(ctx, for_ty, candidates, report),
                     trait_ref: resolve_projection_trait_ref(ctx, trait_ref, candidates, report),
@@ -2738,6 +2776,7 @@ fn resolve_signature_predicates(ctx: Checker, predicates: Vec[TypePredicate], re
             match predicate {
                 GoComparable(ty) => validate_signature_type(ctx, ty),
                 GoFunction(ty) => validate_signature_type(ctx, ty),
+                ConstValid { ty, .. } => validate_signature_type(ctx, ty),
                 Trait { for_ty, trait_ref: reference } => {
                     validate_signature_type(ctx, for_ty);
                     validate_trait_reference(ctx, reference)
@@ -3338,6 +3377,10 @@ fn expand_type_alias_predicates(ctx: Checker, values: Vec[TypePredicate], report
             match value {
                 GoComparable(ty) => GoComparable(expand_type_aliases(ctx, ty, report)),
                 GoFunction(ty) => GoFunction(expand_type_aliases(ctx, ty, report)),
+                ConstValid { ty, origins } => ConstValid {
+                    ty: expand_type_aliases(ctx, ty, report),
+                    origins,
+                },
                 Trait { for_ty, trait_ref } => TypePredicate::Trait {
                     for_ty: expand_type_aliases(ctx, for_ty, report),
                     trait_ref: expand_type_alias_trait_ref(ctx, trait_ref, report),
@@ -3418,7 +3461,9 @@ fn resolve_trait_reference_method(
                         ctx,
                         substitute_predicates(method.predicates, substitutions),
                     );
-                    apply_predicate_equalities(predicates);
+                    if !method.has_receiver || !method.generics.is_empty() {
+                        apply_predicate_equalities(predicates);
+                    }
                     Some(
                         ResolvedCallable {
                             callable: instantiate_method_callable(
@@ -3465,7 +3510,7 @@ fn expand_implied_predicates(ctx: Checker, predicates: Vec[TypePredicate]) -> Ve
         let (predicate, ancestry) = pending[index];
         index += 1;
         match predicate {
-            GoComparable(_) | GoFunction(_) | Equality { .. } => (),
+            GoComparable(_) | GoFunction(_) | ConstValid { .. } | Equality { .. } => (),
             Trait { for_ty, trait_ref: reference } => {
                 for application in trait_ref_closure_with_self(ctx, reference, for_ty) {
                     push_predicate(result, TypePredicate::Trait { for_ty, trait_ref: application });
