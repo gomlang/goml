@@ -1,0 +1,193 @@
+package checker;
+
+use module::tast::{Type, enum_variant_field_types, for_each_child_type, foreign_bridge_type, foreign_function_bridge, prune, substitute_params, symbolic_array, type_is_concrete};
+
+fn push_raw_parameter_requirement(result: Vec[Type], value: Type) -> () {
+    let _ = push_map_type_requirement(
+        result,
+        Type::GoFunction {
+            signature: Type::Func { params: Vec::from_array([value]), ret_ty: Type::Unit },
+        },
+    );
+}
+
+fn collect_raw_bridge_requirements(ctx: Checker, value: Type, result: Vec[Type]) -> () {
+    let value = prune(normalize_type(ctx, value));
+    if let Some(parts) = symbolic_array(value) {
+        collect_raw_bridge_requirements(ctx, parts.1, result);
+        return
+    }
+    match value {
+        Param { .. } | Projection { .. } | Var(_) => push_raw_parameter_requirement(result, value),
+        GoFunction { signature } => collect_raw_signature_requirements(ctx, signature, result),
+        Array { elem, .. } | Slice { elem } | MutSlice { elem } | GoPointer { elem } | Channel {
+            elem,
+            ..,
+        } => {
+            collect_raw_bridge_requirements(ctx, elem, result)
+        },
+        GoMap { key, value } => {
+            collect_raw_bridge_requirements(ctx, key, result);
+            collect_raw_bridge_requirements(ctx, value, result)
+        },
+        External { args, .. } => for arg in args {
+            collect_raw_bridge_requirements(ctx, arg, result)
+        },
+        other => if let Err(_) = foreign_bridge_type(other, ctx.traits, false) {
+            push_raw_parameter_requirement(result, Type::Unit)
+        },
+    }
+}
+
+fn collect_raw_result_requirements(ctx: Checker, value: Type, result: Vec[Type]) -> () {
+    let value = prune(normalize_type(ctx, value));
+    match value {
+        Unit => (),
+        Tuple { items } => for item in items {
+            collect_raw_bridge_requirements(ctx, item, result)
+        },
+        Param { .. } | Projection { .. } | Var(_) => {
+            let _ = push_map_type_requirement(
+                result,
+                Type::GoFunction { signature: Type::Func { params: Vec::new(), ret_ty: value } },
+            );
+        },
+        other => collect_raw_bridge_requirements(ctx, other, result),
+    }
+}
+
+fn collect_raw_signature_requirements(ctx: Checker, signature: Type, result: Vec[Type]) -> () {
+    let signature = prune(normalize_type(ctx, signature));
+    match signature {
+        Func { params, ret_ty } => {
+            for param in params {
+                collect_raw_bridge_requirements(ctx, param, result)
+            }
+            collect_raw_result_requirements(ctx, ret_ty, result)
+        },
+        Param { .. } | Projection { .. } | Var(_) => {
+            let _ = push_map_type_requirement(result, Type::GoFunction { signature });
+        },
+        _ => {
+            let _ = push_map_type_requirement(result, Type::GoFunction { signature: Type::Unit });
+        },
+    }
+}
+
+fn collect_applied_raw_function_requirements(
+    ctx: Checker,
+    parameters: Vec[string],
+    args: Vec[Type],
+    requirements: Vec[Type],
+    result: Vec[Type],
+) -> () {
+    for requirement in requirements {
+        if let GoFunction { signature } = substitute_params(requirement, parameters, args) {
+            collect_raw_signature_requirements(ctx, signature, result)
+        }
+    }
+}
+
+fn collect_type_raw_function_requirements(ctx: Checker, value: Type, result: Vec[Type]) -> () {
+    let value = prune(normalize_type(ctx, value));
+    if let GoFunction { signature } = value {
+        collect_raw_signature_requirements(ctx, signature, result)
+    }
+    if let Some(parts) = struct_application_parts(value) {
+        if let Some(info) = find_struct_by_name(ctx, parts.0) {
+            collect_applied_raw_function_requirements(
+                ctx,
+                info.generics,
+                parts.1,
+                info.raw_function_requirements,
+                result,
+            )
+        } else if let Some(info) = find_enum_by_name(ctx, parts.0) {
+            collect_applied_raw_function_requirements(
+                ctx,
+                info.generics,
+                parts.1,
+                info.raw_function_requirements,
+                result,
+            )
+        }
+    }
+    match value {
+        App { args, .. } => for arg in args {
+            collect_type_raw_function_requirements(ctx, arg, result)
+        },
+        other => for_each_child_type(
+            other,
+            |child| collect_type_raw_function_requirements(ctx, child, result),
+        ),
+    }
+}
+
+fn infer_nominal_raw_function_requirements(ctx: Checker) -> () {
+    let diagnostic_count = ctx.diagnostics.len();
+    for _ in 0..256 {
+        let mut changed = false;
+        for info in ctx.structs {
+            let found = Vec::new();
+            for field in info.fields {
+                collect_type_raw_function_requirements(ctx, field.1, found)
+            }
+            for requirement in found {
+                if push_map_type_requirement(info.raw_function_requirements, requirement) {
+                    changed = true;
+                }
+            }
+        }
+        for info in ctx.enums {
+            let found = Vec::new();
+            for variant in info.variants {
+                for field in enum_variant_field_types(variant.fields) {
+                    collect_type_raw_function_requirements(ctx, field, found)
+                }
+            }
+            for requirement in found {
+                if push_map_type_requirement(info.raw_function_requirements, requirement) {
+                    changed = true;
+                }
+            }
+        }
+        ctx.diagnostics.truncate(diagnostic_count);
+        if !changed {
+            return
+        }
+    }
+    push_diagnostic(ctx, "Go function type requirements exceed the 256-pass inference limit")
+}
+
+fn nominal_raw_function_argument_error(ctx: Checker, name: string, args: Vec[Type]) -> Option[
+    string,
+] {
+    let required = Vec::new();
+    if let Some(info) = find_struct_by_name(ctx, name) {
+        collect_applied_raw_function_requirements(
+            ctx,
+            info.generics,
+            args,
+            info.raw_function_requirements,
+            required,
+        )
+    } else if let Some(info) = find_enum_by_name(ctx, name) {
+        collect_applied_raw_function_requirements(
+            ctx,
+            info.generics,
+            args,
+            info.raw_function_requirements,
+            required,
+        )
+    }
+    for requirement in required {
+        if let GoFunction { signature } = requirement {
+            if type_is_concrete(signature) {
+                if let Err(error) = foreign_function_bridge(signature, ctx.traits) {
+                    return Some(error)
+                }
+            }
+        }
+    }
+    None
+}

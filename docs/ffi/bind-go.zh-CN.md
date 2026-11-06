@@ -216,7 +216,7 @@ fn wrap(raw: GoReader) -> ReaderAdapter {
 
 ### 原始 Go 函数值
 
-`ffi::Func[F]` 是可空原始 Go 函数值，不同于签名 F 的 GoML 闭包。例如，`ffi::Func[(i64) -> (i64, ffi::Error)]` 表示 Go `func(int64) (int64, error)`，`ffi::Func[() -> ()]` 表示 `func()`。F 必须解析为参数和结果均 FFI 安全的函数签名；函数不能作原始映射键。
+`ffi::Func[F]` 是可空原始 Go 函数值，不同于签名 F 的 GoML 闭包。例如，`ffi::Func[(i64) -> (i64, ffi::Error)]` 表示 Go `func(int64) (int64, error)`，`ffi::Func[() -> ()]` 表示 `func()`。F 必须解析为参数和结果均 FFI 安全的函数签名；函数不能作原始映射键。这些要求也适用于泛型结构体和枚举实例化之后，包括未使用的签名以及从其他包导入的私有字段。
 
 `ffi::func_nil()` 构造签名从上下文推断的 nil，`ffi::func_is_nil(value)` 检查它。Go 返回的值可通过包、泛型函数、容器和捕获它的 GoML 闭包传递，不丢失 Go 闭包环境。包含 nil 函数的 `Option::Some` 仍不同于 `Option::None`。Go 绑定可接收这些原始值并在 Go 中调用。不能用 GoML 调用语法直接调用原始函数，不支持隐式闭包转换或结构体构造。
 
