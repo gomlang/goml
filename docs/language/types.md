@@ -947,7 +947,7 @@ fn finish(value: dyn Consumer[string] + Close) -> string {
 }
 ```
 
-Supertrait methods remain available. A dyn type also satisfies generic constraints for its primary, additional, and inherited trait bounds, provided the trait arguments match. Calls from generic code preserve dynamic dispatch. Methods supplied by blanket implementations are also available when the object's exposed bounds satisfy the implementation requirements. If different component traits provide the same method name, use UFCS to choose the trait, for example `A::render(value)` or `B::render(value)`. For a generic trait, use `Consumer::[string]::consume(value, "hello")`.
+Supertrait methods remain available. A dyn type also satisfies generic constraints for its primary, additional, and inherited trait bounds, provided the trait arguments match. Calls from generic code preserve dynamic dispatch. Generic function values also retain associated type bindings when specialized with dyn arguments. Methods supplied by blanket implementations are also available when the object's exposed bounds satisfy the implementation requirements. If different component traits provide the same method name, use UFCS to choose the trait, for example `A::render(value)` or `B::render(value)`. For a generic trait, use `Consumer::[string]::consume(value, "hello")`.
 
 The order of bounds does not change the object type: `dyn A + B` and `dyn B + A` are compatible. Repeating a trait name is rejected, even with different generic arguments. Supertrait paths must agree on a trait's generic arguments. A child trait's method takes precedence over a method inherited from its parent; unrelated methods with the same name require UFCS.
 
