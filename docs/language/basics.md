@@ -765,6 +765,8 @@ for (key, value) in pairs {
 
 If the source expression diverges, the `for` expression has type `never`; it evaluates that source once without requiring `IntoIterator` or entering the loop body. The body is still checked for errors.
 
+When a closure parameter is used as a `for` source, later calls can determine its iterator type and item type. The compiler waits for that information before checking the iteration protocol and pattern; it does not select an iterator implementation for an unconstrained source.
+
 Fixed arrays use a native indexed loop. `Vec[T]`, `Slice[T]`, `MutSlice[T]` and all `Iterator` values have corresponding `IntoIterator` implementations.
 
 <a id="break-continue-and-return"></a>
@@ -905,7 +907,7 @@ let increment = |value: i32| {
 let greet = || println("hello");
 ```
 
-Closure parameter types can be inferred from the expected function type or the calling location. Deferred method calls also resolve inside nested expressions, including tuples, arrays, and control-flow branches. Method results, field accesses, and tuple projections such as `pair.0` can constrain one another; these dependencies are resolved before numeric literals receive their default types. When inference is ambiguous, annotate the closure parameter or expected function type:
+Closure parameter types can be inferred from the expected function type or the calling location. Associated function calls such as `Make::make()` can also infer `Self` from a later call to their enclosing closure; a missing `Self` type remains an error. Numeric method receivers retain their inferred type until surrounding constraints settle, and use the usual numeric defaults only when no concrete type is selected. Deferred method calls also resolve inside nested expressions, including tuples, arrays, and control-flow branches. Method results, field accesses, and tuple projections such as `pair.0` can constrain one another; these dependencies are resolved before numeric literals receive their default types. When inference is ambiguous, annotate the closure parameter or expected function type:
 
 ```goml
 let transform: (i32) -> string = |value| value.to_string();
