@@ -1,0 +1,188 @@
+package mono;
+
+use module::ast;
+use module::checker;
+use module::core;
+use module::hir;
+use module::parser;
+use module::tast;
+use std::collections;
+use std::testing;
+
+fn structural_proof_context(source: string) -> SpecializeCtx {
+    let checked = checker::check(hir::lower(ast::lower(parser::parse(source)), "proof.goml"));
+    for diagnostic in checked.diagnostics {
+        testing::fail(diagnostic.message);
+    }
+    let lowered = core::lower(checked.tast);
+    let index: FunctionIndex = HashMap::new();
+    for function in lowered.functions {
+        if let Some(metadata) = function.trait_impl {
+            add_indexed_function(index, metadata.trait_ref.name, function);
+        }
+    }
+    SpecializeCtx {
+        builtin: testing::expect_ok(tast::builtin_contract(), "builtin contract"),
+        functions: lowered.functions,
+        function_index: HashMap::new(),
+        inherent_method_index: HashMap::new(),
+        trait_function_index: index,
+        trait_method_index: HashMap::new(),
+        trait_method_names: HashMap::new(),
+        instances: Vec::new(),
+        instance_index: HashMap::new(),
+        instance_counts: HashMap::new(),
+        work: Vec::new(),
+        used_names: collections::HashSet::new(),
+        active: Ref::new(None),
+        error: Ref::new(None),
+        trait_goals: Vec::new(),
+        trait_selection_goals: Vec::new(),
+        trait_steps: Ref::new(0),
+    }
+}
+
+#[test]
+fn structural_proofs_use_user_member_implementations() -> () {
+    let ctx = structural_proof_context(
+        "struct Value {} impl PartialEq for Value { fn eq(self: Self, other: Self) -> bool { true } } impl Eq for Value {} impl Hash for Value { fn hash(self: Self) -> u64 { 7 } } struct Missing {} struct Wrap[T] {} impl[T: Hash] Hash for Wrap[T] { fn hash(self: Self) -> u64 { 8 } }",
+    );
+    let member = core::Type::Con { name: "Value" };
+    let array = core::Type::Array { len: 1, elem: member };
+    let tuple = core::Type::Tuple { items: Vec::from_array([member, core::Type::Int32]) };
+    let nested = core::Type::Array {
+        len: 2,
+        elem: core::Type::Tuple { items: Vec::from_array([array, tuple]) },
+    };
+    for name in[ctx.builtin.hash.name, ctx.builtin.eq.name, ctx.builtin.partial_eq.name] {
+        let reference = core::TraitRef { name, args: Vec::new() };
+        for value in[array, tuple, nested] {
+            testing::assert(trait_predicate_satisfied(ctx, value, reference, Vec::new()));
+        }
+        testing::assert(
+            !trait_predicate_satisfied(
+                ctx,
+                core::Type::Array { len: 1, elem: core::Type::Con { name: "Missing" } },
+                reference,
+                Vec::new(),
+            ),
+        );
+    }
+    for argument in[member, core::Type::Con { name: "Missing" }] {
+        let wrap = core::Type::App {
+            ty: core::Type::Con { name: "Wrap" },
+            args: Vec::from_array([argument]),
+        };
+        testing::assert_eq(
+            trait_predicate_satisfied(
+                ctx,
+                core::Type::Array { len: 1, elem: wrap },
+                core::TraitRef { name: ctx.builtin.hash.name, args: Vec::new() },
+                Vec::new(),
+            ),
+            core::types_equal(argument, member),
+        );
+    }
+}
+
+fn check_recursive_structural_proof(growing: bool) -> () {
+    let ctx = structural_proof_context(
+        "struct Wrap[T] {} impl[T: Hash] Hash for Wrap[T] { fn hash(self: Self) -> u64 { 8 } }",
+    );
+    let reference = core::TraitRef { name: ctx.builtin.hash.name, args: Vec::new() };
+    for function in ctx.functions {
+        if let Some(metadata) = function.trait_impl {
+            if metadata.trait_ref.name == reference.name {
+                let parameter = core::Type::Param { name: function.generics[0] };
+                let argument = if growing {
+                    core::Type::Tuple { items: Vec::from_array([parameter, parameter]) }
+                } else {
+                    parameter
+                };
+                function.predicates.truncate(0);
+                function.predicates.push(
+                    core::TypePredicate::Trait {
+                        for_ty: core::Type::App {
+                            ty: core::Type::Con { name: "Wrap" },
+                            args: Vec::from_array([argument]),
+                        },
+                        trait_ref: reference,
+                    },
+                );
+                metadata.predicate_count = 1;
+            }
+        }
+    }
+    let value = core::Type::App {
+        ty: core::Type::Con { name: "Wrap" },
+        args: Vec::from_array([core::Type::Int32]),
+    };
+    testing::assert(
+        !trait_predicate_satisfied(
+            ctx,
+            core::Type::Array { len: 1, elem: value },
+            reference,
+            Vec::new(),
+        ),
+    );
+    if growing {
+        testing::assert(ctx.error.get().unwrap_or("").contains("Trait proof exceeds"));
+    }
+    testing::assert(ctx.trait_goals.is_empty());
+    testing::assert(ctx.trait_selection_goals.is_empty());
+}
+
+#[test]
+fn structural_proof_cycles_terminate() -> () {
+    check_recursive_structural_proof(false)
+}
+
+#[test]
+fn structural_proof_growing_obligations_terminate() -> () {
+    check_recursive_structural_proof(true)
+}
+
+#[test]
+fn trait_proof_goal_identity_retains_projection_qualifiers() -> () {
+    let owner = tast::Type::Param { name: "T" };
+    let first = tast::Type::Projection {
+        for_ty: owner,
+        name: "Item",
+        trait_ref: Some(
+            tast::TraitRef { name: "First", args: Vec::from_array([tast::Type::Int32]) },
+        ),
+    };
+    let reference = tast::TraitRef { name: "Hash", args: Vec::new() };
+    for other in[
+        tast::Type::Projection { for_ty: owner, name: "Item", trait_ref: None },
+        tast::Type::Projection {
+            for_ty: owner,
+            name: "Item",
+            trait_ref: Some(
+                tast::TraitRef { name: "Second", args: Vec::from_array([tast::Type::Int32]) },
+            ),
+        },
+        tast::Type::Projection {
+            for_ty: owner,
+            name: "Item",
+            trait_ref: Some(
+                tast::TraitRef { name: "First", args: Vec::from_array([tast::Type::Bool]) },
+            ),
+        },
+    ] {
+        let goals = Vec::from_array([(tast::Type::Array { len: 1, elem: first }, reference)]);
+        testing::assert(
+            trait_proof_goal_active(goals, (tast::Type::Array { len: 1, elem: first }, reference)),
+        );
+        testing::assert(
+            !trait_proof_goal_active(goals, (tast::Type::Array { len: 1, elem: other }, reference)),
+        );
+        let bound = tast::TraitRef { name: "Read", args: Vec::from_array([first]) };
+        testing::assert(
+            !trait_proof_goal_active(
+                Vec::from_array([(owner, bound)]),
+                (owner, tast::TraitRef { name: "Read", args: Vec::from_array([other]) }),
+            ),
+        );
+    }
+}
