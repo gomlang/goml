@@ -56,6 +56,8 @@ fn main() -> () {
 }
 ```
 
+An executable entrypoint must satisfy its own declared `where` predicates using the available implementations. The compiler does not assume these predicates merely because they appear on `main`; ordinary functions still require callers to prove their predicates.
+
 <a id="use"></a>
 
 ### `use`
