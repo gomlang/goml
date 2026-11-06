@@ -1,0 +1,207 @@
+package go_types;
+
+use module::repr;
+use module::tast;
+use std::testing;
+
+fn map_key_test_enum(name: string, fields: Vec[repr::Type]) -> repr::EnumDef {
+    repr::EnumDef {
+        name,
+        variants: Vec::from_array(
+            [
+                repr::EnumVariantDef { name: "Empty", fields: repr::EnumVariantFields::Unit },
+                repr::EnumVariantDef {
+                    name: "Value",
+                    fields: repr::EnumVariantFields::Tuple(fields),
+                },
+            ],
+        ),
+        option_variants: None,
+    }
+}
+
+#[test]
+fn map_key_comparability_uses_actual_enum_storage() -> () {
+    let Ok(builtin) = tast::builtin_contract() else {
+        testing::fail("missing builtin contract");
+        return
+    };
+    let slice = repr::Type::Slice { elem: repr::Type::Int };
+    let enums = Vec::from_array(
+        [
+            map_key_test_enum("UserSlice", Vec::from_array([slice])),
+            map_key_test_enum("OptionSlice", Vec::from_array([slice])),
+            map_key_test_enum(
+                "FlatFunction",
+                Vec::from_array(
+                    [
+                        repr::Type::GoFunction {
+                            signature: repr::Type::Func {
+                                params: Vec::new(),
+                                ret_ty: repr::Type::Unit,
+                            },
+                        },
+                    ],
+                ),
+            ),
+            map_key_test_enum("FlatString", Vec::from_array([repr::Type::String])),
+            map_key_test_enum(
+                "Recursive",
+                Vec::from_array([repr::Type::Named { name: "Recursive" }, slice]),
+            ),
+        ],
+    );
+    let instances = Vec::from_array(
+        [
+            repr::TypeInstance {
+                name: "OptionSlice",
+                base_name: builtin.option.name,
+                args: Vec::from_array([slice]),
+            },
+        ],
+    );
+    let planned = plan_variant_infos(
+        builtin,
+        enums,
+        Vec::new(),
+        instances,
+        |owner, variant| owner + "::" + variant,
+    );
+    for expected in[
+        ("UserSlice", false),
+        ("OptionSlice", true),
+        ("FlatFunction", true),
+        ("FlatString", false),
+        ("Recursive", false),
+    ] {
+        let ty = repr::Type::Named { name: expected.0 };
+        testing::assert_eq(planned_map_key_uncomparable(ty, Vec::new(), planned), expected.1);
+        let info = testing::expect_some(find_enum_info(planned, ty), "planned enum");
+        let correct_storage = match info.storage {
+            Interface => expected.0 == "UserSlice",
+            Flat => expected.0 == "OptionSlice" || expected.0 == "FlatFunction"
+                || expected.0 == "FlatString",
+            Node => expected.0 == "Recursive",
+            _ => false,
+        };
+        testing::assert(correct_storage);
+    }
+}
+
+#[test]
+fn map_key_comparability_walks_value_fields_and_stops_at_pointer_storage() -> () {
+    let variants = VariantInfos { owners: HashMap::new(), by_owner: HashMap::new() };
+    let slice = repr::Type::Slice { elem: repr::Type::Int };
+    let structs = Vec::from_array(
+        [
+            repr::StructDef {
+                name: "Cycle",
+                fields: Vec::from_array(
+                    [("next", repr::Type::Named { name: "Cycle" }), ("hidden", slice)],
+                ),
+                public_fields: Vec::new(),
+                has_hidden_fields: false,
+            },
+        ],
+    );
+    testing::assert(
+        planned_map_key_uncomparable(repr::Type::Named { name: "Cycle" }, structs, variants),
+    );
+    testing::assert(
+        planned_map_key_uncomparable(
+            repr::Type::Tuple {
+                items: Vec::from_array([repr::Type::Array { len: 0, elem: slice }]),
+            },
+            structs,
+            variants,
+        ),
+    );
+    for ty in[
+        repr::Type::GoPointer { elem: slice },
+        repr::Type::RefType { elem: slice },
+        repr::Type::VecType { elem: slice },
+        repr::Type::HashMap { key: slice, value: slice },
+        repr::Type::External {
+            import_path: "example.com/opaque",
+            name: "Value",
+            args: Vec::from_array([slice]),
+        },
+        repr::Type::Dyn {
+            trait_name: "Marker",
+            args: Vec::new(),
+            associated_types: Vec::new(),
+            additional_bounds: Vec::new(),
+        },
+    ] {
+        testing::assert(!planned_map_key_uncomparable(ty, structs, variants));
+    }
+}
+
+#[test]
+fn recursive_enum_layout_and_map_keys_do_not_depend_on_definition_order() -> () {
+    let Ok(builtin) = tast::builtin_contract() else {
+        testing::fail("missing builtin contract");
+        return
+    };
+    let first = map_key_test_enum(
+        "First",
+        Vec::from_array(
+            [
+                repr::Type::Named { name: "Second" },
+                repr::Type::Array { len: 7, elem: repr::Type::Int64 },
+            ],
+        ),
+    );
+    let second = map_key_test_enum(
+        "Second",
+        Vec::from_array(
+            [
+                repr::Type::Named { name: "First" },
+                repr::Type::Array { len: 6, elem: repr::Type::Int64 },
+            ],
+        ),
+    );
+    let key = map_key_test_enum(
+        "Key",
+        Vec::from_array(
+            [
+                repr::Type::Named { name: "Second" },
+                repr::Type::GoFunction {
+                    signature: repr::Type::Func { params: Vec::new(), ret_ty: repr::Type::Unit },
+                },
+            ],
+        ),
+    );
+    for definitions in Vec::from_array(
+        [
+            Vec::from_array([first, second, key]),
+            Vec::from_array([second, first, key]),
+            Vec::from_array([key, first, second]),
+            Vec::from_array([key, second, first]),
+            Vec::from_array([first, key, second]),
+            Vec::from_array([second, key, first]),
+        ],
+    ) {
+        let planned = plan_variant_infos(
+            builtin,
+            definitions,
+            Vec::new(),
+            Vec::new(),
+            |owner, variant| owner + "::" + variant,
+        );
+        for name in["First", "Second", "Key"] {
+            let ty = repr::Type::Named { name };
+            let info = testing::expect_some(find_enum_info(planned, ty), "planned enum");
+            testing::assert(
+                match info.storage {
+                    Interface => true,
+                    _ => false,
+                },
+            );
+            testing::assert(!planned_map_key_uncomparable(ty, Vec::new(), planned));
+            let variants = testing::expect_some(planned.by_owner[name], "planned variants");
+            testing::assert_eq(variants.len(), 2);
+            testing::assert_eq(variants[1].variant_name, name + "::Value");
+        }
+    }
+}
