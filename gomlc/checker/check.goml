@@ -7,7 +7,7 @@ use module::hir;
 use module::numeric;
 use std::num;
 use std::text;
-use module::tast::{Arm, ArrayPatRest, BinaryResolution, Block, BuiltinContract, Callable, ClosureParam, ComptimeCapability, Constant, ConstantScheme, Constructor, Expr, FunctionScheme, MatchCoverageInfo, Pat, Primitive, SelectArm, Stmt, TraitRef, Type, TypePredicate, TypeVar, VarKind, any_child_type, any_type, binary_symbol, builtin_numeric_conversion_target, builtin_numeric_conversion_types_valid, callable_base, const_application, const_expr_from_hir, const_type, diagnostic_type_text, enum_variant_field_types, expr_type, integer_range_pattern_endpoint, names_match, nominal_type, pat_type, prune, resolve_type, short_name, substitute_params, symbolic_array, type_constructor_name, type_from_hir, type_text, types_equal};
+use module::tast::{Arm, ArrayPatRest, BinaryResolution, Block, BuiltinContract, Callable, ClosureParam, ComptimeCapability, Constant, ConstantScheme, Constructor, Expr, FunctionScheme, MatchCoverageInfo, Pat, Primitive, SelectArm, Stmt, TraitRef, Type, TypePredicate, TypeVar, VarKind, any_child_type, any_type, binary_symbol, builtin_numeric_conversion_target, builtin_numeric_conversion_types_valid, callable_base, const_application, const_expr_from_hir, const_type, diagnostic_type_text, enum_variant_field_types, expr_type, integer_range_pattern_endpoint, names_match, nominal_type, pat_type, prune, resolve_type, short_name, strict_expr_inputs, substitute_params, symbolic_array, type_constructor_name, type_from_hir, type_text, types_equal};
 
 struct FloatDecimal {
     negative: bool,
@@ -591,8 +591,8 @@ fn require_explicit_dyn_conversion(ctx: Checker, value: Expr, expected_ty: Type)
 }
 
 fn coerce_expr(ctx: Checker, value: Expr, expected: Option[Type]) -> Expr {
-    if let Never = prune(expr_type(value)) {
-        return value
+    if tast_expr_never(ctx, value) {
+        return with_expr_type(value, Type::Never)
     }
     let value = specialize_array_callable_expected(value, expected);
     match value {
@@ -686,7 +686,7 @@ fn constrain_callable_return(ctx: Checker, callable_ty: Type, expected: Option[T
         if let Func { params: _, ret_ty } = prune(callable_ty) {
             let ret_ty = normalize_type(ctx, ret_ty);
             if has_unresolved_projection(ret_ty) {} else {
-                expect_type(ctx, ret_ty, expected_ty)
+                hint_expression_type(ctx, ret_ty, expected_ty)
             }
         }
     }
@@ -1068,7 +1068,7 @@ fn check_resolved_constructor_expr(
         }
     }
     if let Some(ty) = propagated_expected(expected) {
-        expect_type(ctx, info.ty, ty)
+        hint_expression_type(ctx, info.ty, ty)
     }
     let arity_mismatch = args.len() != info.fields.len();
     if arity_mismatch {
@@ -1172,7 +1172,7 @@ fn check_struct_update_expr(
     match resolve_struct(ctx, name) {
         Some(info) => {
             if let Some(ty) = propagated_expected(expected) {
-                expect_type(ctx, info.ty, ty)
+                hint_expression_type(ctx, info.ty, ty)
             }
             let stmts: Vec[Stmt] = Vec::new();
             let checked_fields: Vec[(string, string, Type)] = Vec::new();
@@ -1295,7 +1295,7 @@ fn check_struct_expr(
                 }
             }
             if let Some(ty) = propagated_expected(expected) {
-                expect_type(ctx, info.ty, ty)
+                hint_expression_type(ctx, info.ty, ty)
             }
             for index in 0..fields.len() {
                 let provided = fields[index];
@@ -1403,7 +1403,7 @@ fn check_positional_struct_expr(
         return Expr::Constr { constructor: info.constructor, args: Vec::new(), ty: Type::Error }
     }
     if let Some(ty) = propagated_expected(expected) {
-        expect_type(ctx, info.ty, ty)
+        hint_expression_type(ctx, info.ty, ty)
     }
     let arity_mismatch = args.len() != info.fields.len();
     if arity_mismatch {
@@ -1441,7 +1441,7 @@ fn check_tuple_expr(ctx: Checker, values: Vec[hir::Expr], expected: Option[Type]
         types.push(fresh_type(ctx.inference.counter, VarKind::Any))
     }
     if let Some(ty) = propagated_expected(expected) {
-        expect_type(ctx, Type::Tuple { items: types }, ty)
+        hint_expression_type(ctx, Type::Tuple { items: types }, ty)
     }
     for index in 0..values.len() {
         let item = check_expr(ctx, values[index], Option::Some(types[index]));
@@ -1457,11 +1457,18 @@ fn check_array_expr(ctx: Checker, values: Vec[hir::Expr], expected: Option[Type]
     let elem = fresh_type(ctx.inference.counter, VarKind::Any);
     let array_ty = Type::Array { len: values.len(), elem };
     if let Some(ty) = propagated_expected(expected) {
-        expect_type(ctx, array_ty, ty)
+        hint_expression_type(ctx, array_ty, ty)
     }
     let items: Vec[Expr] = Vec::new();
     for value in values {
         items.push(check_expr(ctx, value, Option::Some(elem)))
+    }
+    if is_unbound_any_type(elem) {
+        for item in items {
+            if tast_expr_never(ctx, item) {
+                let _ = unify(elem, Type::Never);
+            }
+        }
     }
     coerce_expr(ctx, Expr::Array { items, ty: array_ty }, expected)
 }
@@ -1879,6 +1886,12 @@ fn apply_typed_call(
                 value
             },
         )
+    }
+    for index in 0..values.len() {
+        if index < params.len() && is_unbound_any_type(params[index])
+            && tast_expr_never(ctx, values[index]) {
+            let _ = unify(params[index], Type::Never);
+        }
     }
     let arity_mismatch = !types_equal(ret_ty, Type::Error) && values.len() != params.len();
     let trait_method = trait_method_callable(function);
@@ -4790,6 +4803,7 @@ fn infer_expr(ctx: Checker, value: hir::Expr) -> Expr {
                 let value = normalize_function_expr(ctx, check_expr(ctx, value, Option::None));
                 let actual = resolve_type(expr_type(value));
                 let valid = match actual {
+                    Never => true,
                     Func { params, ret_ty } => {
                         params.is_empty() && types_equal(ret_ty, Type::Unit)
                     },
@@ -5156,6 +5170,11 @@ fn check_expr(ctx: Checker, value: hir::Expr, expected: Option[Type]) -> Expr {
     let previous = ctx.current_span.get();
     ctx.current_span.set(Option::Some(value.span));
     let result = check_expr_inner(ctx, value, expected);
+    let result = if tast_expr_never(ctx, result) {
+        with_expr_type(result, Type::Never)
+    } else {
+        result
+    };
     contextual_expression_reference(ctx, value, result);
     let ty = expr_type(result);
     ctx.typeck_results.exprs.push(
@@ -6354,10 +6373,23 @@ fn hir_stmt_span(value: hir::Stmt) -> ast::Span {
 }
 
 fn tast_expr_never(ctx: Checker, value: Expr) -> bool {
-    match normalize_type(ctx, expr_type(value)) {
-        Never => true,
-        _ => false,
+    if let Never = normalize_type(ctx, expr_type(value)) {
+        return true
     }
+    if let Expr::Block { block, .. } = value {
+        for stmt in block.stmts {
+            if tast_stmt_always_exits(ctx, stmt) {
+                return true
+            }
+        }
+        return block.tail.map(|tail| tast_expr_never(ctx, tail)).unwrap_or(false)
+    }
+    for input in strict_expr_inputs(value) {
+        if tast_expr_never(ctx, input) {
+            return true
+        }
+    }
+    false
 }
 
 fn tast_stmt_always_exits(ctx: Checker, value: Stmt) -> bool {
