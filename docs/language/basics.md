@@ -664,6 +664,8 @@ let outcome = select {
 
 A receive arm has the form `recv(channel) as binding => body`. The channel must have type `Channel[T]` or `Receiver[T]`, and the binding has type `Option[T]`; a closed and drained channel selects immediately and supplies `None`. Write `_` when the received value and close state are not needed. A send arm has the form `send(channel, value) => body`, accepts `Channel[T]` or `Sender[T]`, and requires the value to match the channel element type.
 
+In a closure, a select channel operand may be inferred from later calls, including whether it is a bidirectional `Channel`, a `Sender`, or a `Receiver`. Direction and element-type restrictions still apply.
+
 Communication arms may have a `when` guard after their operands. Operands and guards are evaluated exactly once in source order. A false guard disables its arm by selecting on a nil directional channel; if every arm is disabled, a select without `default` blocks and one with `default` runs immediately. The receive binding is not in scope in its guard.
 
 ```goml

@@ -664,6 +664,8 @@ let outcome = select {
 
 接收分支形式为 `recv(channel) as binding => body`。通道必须是 `Channel[T]` 或 `Receiver[T]`，绑定类型为 `Option[T]`；已关闭且排空的通道立即就绪，并提供 `None`。不需要接收值和关闭状态时写 `_`。发送分支形式为 `send(channel, value) => body`，接受 `Channel[T]` 或 `Sender[T]`，要求值匹配通道元素类型。
 
+闭包中 select 的通道操作数可根据后续调用推断，包括它是双向 `Channel`、`Sender` 还是 `Receiver`。通道方向和元素类型限制仍然适用。
+
 通信分支的操作数后可带 `when` 守卫。操作数和守卫按源码顺序恰好求值一次。假守卫通过选择 nil 单向通道禁用该分支；若全部分支被禁用，无 `default` 的 select 阻塞，有 `default` 的立即运行。接收绑定在其守卫中不在作用域内。
 
 ```goml
