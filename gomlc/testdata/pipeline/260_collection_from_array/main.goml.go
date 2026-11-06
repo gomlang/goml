@@ -725,15 +725,15 @@ func main0() struct{} {
     var t0 [3]int = [3]int{1, 2, 3}
     var values__0 *_goml_vec_int = make_vec__0(t0)
     var t1 int = _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_len____T__isize(values__0)
-    var t2 string = _goml_m_inherent_i_isize_i_isize_i_to__string(t1)
+    var t2 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(t1)
     var t3 string = "" + t2
     var t4 string = t3 + ":"
     var t5 int = vec_get__Vec_3int(values__0, 0)
-    var t6 string = _goml_m_inherent_i_isize_i_isize_i_to__string(t5)
+    var t6 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(t5)
     var t7 string = t4 + t6
     var t8 string = t7 + ":"
     var t9 int = vec_get__Vec_3int(values__0, 2)
-    var t10 string = _goml_m_inherent_i_isize_i_isize_i_to__string(t9)
+    var t10 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(t9)
     var t11 string = t8 + t10
     println__T_string(t11)
     var empty__0 *_goml_vec_int = _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_new____T__isize()
@@ -764,12 +764,12 @@ func main0() struct{} {
     source__0 = t17
     var t19 *ref_int_x = vec_get__Vec_8Ref_3int(copied__0, 0)
     var t20 int = _goml_m_inherent_i_Ref_i_Ref_l_T_r__i_get____T__isize(t19)
-    var t21 string = _goml_m_inherent_i_isize_i_isize_i_to__string(t20)
+    var t21 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(t20)
     var t22 string = "" + t21
     var t23 string = t22 + ":"
     var t24 *ref_int_x = array_get__Array_2_8Ref_3int(source__0, 0)
     var t25 int = _goml_m_inherent_i_Ref_i_Ref_l_T_r__i_get____T__isize(t24)
-    var t26 string = _goml_m_inherent_i_isize_i_isize_i_to__string(t25)
+    var t26 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(t25)
     var t27 string = t23 + t26
     println__T_string(t27)
     var log__0 *ref_string_x = _goml_m_inherent_i_Ref_i_Ref_l_T_r__i_new____T__string("")
@@ -864,7 +864,7 @@ func main0() struct{} {
     }(native_entries__0)
     var t46 Option__isize = _goml_m_inherent_i_HashMap_i_H_h88d6726b495dc8a2b4c136dc6a1e64ba_ize____V__isize(native_first__0, 1)
     var t47 int = _goml_m_inherent_i_Option_i_Option_l_T_r__i_unwrap__or____T__isize(t46, 0)
-    var t48 string = _goml_m_inherent_i_isize_i_isize_i_to__string(t47)
+    var t48 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(t47)
     var t49 string = "" + t48
     var t50 string = t49 + ":"
     var t51 Option__isize = _goml_m_inherent_i_HashMap_i_H_h88d6726b495dc8a2b4c136dc6a1e64ba_ize____V__isize(native_second__0, 1)
@@ -1105,7 +1105,7 @@ func _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_len____T__isize(self__0 *_goml_vec_in
     return t0
 }
 
-func _goml_m_inherent_i_isize_i_isize_i_to__string(self__0 int) string {
+func _goml_m_trait__impl_i_ToString_i_isize_i_to__string(self__0 int) string {
     var inline0 int64 = int64(int(self__0))
     var inline1 string = signed_decimal_string(inline0)
     return inline1

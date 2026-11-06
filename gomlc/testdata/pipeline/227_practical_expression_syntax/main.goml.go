@@ -279,11 +279,11 @@ func main0() struct{} {
     }
     direct__0 = t9
     var t11 int = direct__0.x
-    var t12 string = _goml_m_inherent_i_isize_i_isize_i_to__string(t11)
+    var t12 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(t11)
     var t13 string = "" + t12
     var t14 string = t13 + ","
     var t15 int = direct__0.y
-    var t16 string = _goml_m_inherent_i_isize_i_isize_i_to__string(t15)
+    var t16 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(t15)
     var t17 string = t14 + t16
     println__T_string(t17)
     var pair__0 Tuple2_3int_3int = Tuple2_3int_3int{
@@ -301,11 +301,11 @@ func main0() struct{} {
     }
     pair__0 = t20
     var t22 int = pair__0._0
-    var t23 string = _goml_m_inherent_i_isize_i_isize_i_to__string(t22)
+    var t23 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(t22)
     var t24 string = "" + t23
     var t25 string = t24 + ","
     var t26 int = pair__0._1
-    var t27 string = _goml_m_inherent_i_isize_i_isize_i_to__string(t26)
+    var t27 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(t26)
     var t28 string = t25 + t27
     println__T_string(t28)
     var log__0 *ref_string_x = _goml_m_inherent_i_Ref_i_Ref_l_T_r__i_new____T__string("")
@@ -318,10 +318,10 @@ func main0() struct{} {
     var t29 int = struct_update_base__0.y
     var t30 string = _goml_m_inherent_i_Ref_i_Ref_l_T_r__i_get____T__string(log__0)
     println__T_string(t30)
-    var t31 string = _goml_m_inherent_i_isize_i_isize_i_to__string(struct_update_field__789__0)
+    var t31 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(struct_update_field__789__0)
     var t32 string = "" + t31
     var t33 string = t32 + ","
-    var t34 string = _goml_m_inherent_i_isize_i_isize_i_to__string(t29)
+    var t34 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(t29)
     var t35 string = t33 + t34
     println__T_string(t35)
     _goml_m_inherent_i_Ref_i_Ref_l_T_r__i_set____T__string(log__0, "")
@@ -346,11 +346,11 @@ func main0() struct{} {
     var t41 string = _goml_m_inherent_i_Ref_i_Ref_l_T_r__i_get____T__string(log__0)
     println__T_string(t41)
     var t42 int = _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_get____T__isize(values__0, 0)
-    var t43 string = _goml_m_inherent_i_isize_i_isize_i_to__string(t42)
+    var t43 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(t42)
     var t44 string = "" + t43
     var t45 string = t44 + ","
     var t46 int = _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_get____T__isize(values__0, 1)
-    var t47 string = _goml_m_inherent_i_isize_i_isize_i_to__string(t46)
+    var t47 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(t46)
     var t48 string = t45 + t47
     var inline38 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t48)
     _goml_runtime_core_string_println(inline38)
@@ -473,6 +473,12 @@ func println__T_string(value__0 string) struct{} {
 }
 
 func _goml_m_inherent_i_isize_i_isize_i_to__string(self__0 int) string {
+    var inline0 int64 = int64(int(self__0))
+    var inline1 string = signed_decimal_string(inline0)
+    return inline1
+}
+
+func _goml_m_trait__impl_i_ToString_i_isize_i_to__string(self__0 int) string {
     var inline0 int64 = int64(int(self__0))
     var inline1 string = signed_decimal_string(inline0)
     return inline1

@@ -1291,7 +1291,7 @@ func _goml_m_std_p_utf8_p_decode(bytes__0 *_goml_vec_uint8) _goml_m_Result____st
     return t1
 }
 
-func _goml_m_inherent_i_isize_i_isize_i_to__string(self__0 int) string {
+func _goml_m_trait__impl_i_ToString_i_isize_i_to__string(self__0 int) string {
     var inline0 int64 = int64(int(self__0))
     var inline1 string = signed_decimal_string(inline0)
     return inline1
@@ -2195,7 +2195,7 @@ func _goml_m_inherent_i_closure__en_h74ab45f391b6ea2ae0616526325e29f2_ured__0_i_
     var t1 string
     var inline3 string = "" + "invalid UTF-8 at byte "
     var inline4 int = error__0.valid_up_to_value
-    var inline5 string = _goml_m_inherent_i_isize_i_isize_i_to__string(inline4)
+    var inline5 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(inline4)
     var inline6 string = inline3 + inline5
     t1 = inline6
     var inline0 string = "read file"
