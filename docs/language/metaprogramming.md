@@ -45,7 +45,7 @@ Compile-time code cannot capture a surrounding runtime parameter or local. Closu
 
 Compile-time value types must have finite structural layouts. Recursive type layouts, including recursion through `Ref`, `Vec`, or function signatures, are not supported and produce a compile error. Finite nested instantiations of the same generic type are supported. Type expansion also has deterministic depth and visited-node limits; exceeding either limit produces a diagnostic instead of terminating the compiler.
 
-`compile_error` is accepted only in a `#[comptime]` function, a `comptime` block, or a top-level constant initializer. It terminates compile-time evaluation with its message. If runtime execution of a `#[comptime]` function reaches it, the program traps:
+`compile_error` is accepted only in a `#[comptime]` function, a `comptime` block, or a top-level constant initializer. The same context restriction applies when referring to it as a function value. Derive-only functions and intrinsics may likewise be referenced only from derive handlers; storing a callable in a local, tuple, or closure does not remove its restriction. Ordinary `#[comptime]` functions remain usable as runtime function values. It terminates compile-time evaluation with its message. If runtime execution of a `#[comptime]` function reaches it, the program traps:
 
 ```goml
 #[comptime]
