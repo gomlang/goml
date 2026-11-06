@@ -265,6 +265,17 @@ fn check_function(
     inherited_predicates: Vec[TypePredicate],
     self_ty: Option[Type],
 ) -> Function {
+    check_function_with_trait(base, value, inherited_generics, inherited_predicates, self_ty, None)
+}
+
+fn check_function_with_trait(
+    base: Checker,
+    value: hir::Function,
+    inherited_generics: Vec[string],
+    inherited_predicates: Vec[TypePredicate],
+    self_ty: Option[Type],
+    self_trait: Option[TraitRef],
+) -> Function {
     let previous = base.current_function.get();
     base.current_function.set(
         if self_ty.is_none() {
@@ -279,6 +290,7 @@ fn check_function(
         inherited_generics,
         inherited_predicates,
         self_ty,
+        self_trait,
     );
     base.current_function.set(previous);
     result
@@ -290,6 +302,7 @@ fn check_function_inner(
     inherited_generics: Vec[string],
     inherited_predicates: Vec[TypePredicate],
     self_ty: Option[Type],
+    self_trait: Option[TraitRef],
 ) -> Function {
     let diagnostics_start = base.diagnostics.len();
     let derive_export_name = comptime_derive_export_name(value.attrs);
@@ -337,26 +350,42 @@ fn check_function_inner(
             None => Type::Unit,
         },
     };
+    let raw_predicates = append_predicates(
+        inherited_predicates,
+        predicates_from_hir(
+            base.builtin,
+            value.generic_bounds,
+            value.predicates,
+            type_params,
+            self_ty,
+        ),
+    );
+    let self_predicates: Vec[TypePredicate] = Vec::new();
+    if let Some(reference) = self_trait {
+        if let Some(for_ty) = self_ty {
+            self_predicates.push(TypePredicate::Trait { for_ty, trait_ref: reference })
+        }
+    }
     let predicates = resolve_signature_predicates(
         base,
-        append_predicates(
-            inherited_predicates,
-            predicates_from_hir(
-                base.builtin,
-                value.generic_bounds,
-                value.predicates,
-                type_params,
-                self_ty,
+        resolve_projection_predicates(
+            base,
+            raw_predicates,
+            projection_candidates_from_predicates(
+                base,
+                append_predicates(raw_predicates, self_predicates),
             ),
+            false,
         ),
         true,
     );
+    let signature_predicates = append_predicates(predicates, self_predicates);
     let signature_ctx = function_context(
         base,
         Type::Unit,
         self_ty,
         type_params,
-        predicates,
+        signature_predicates,
         false,
         false,
         false,
@@ -367,7 +396,7 @@ fn check_function_inner(
     let ret_ty = if opaque_return.is_some() {
         raw_ret_ty
     } else {
-        resolve_signature_type(signature_ctx, raw_ret_ty, predicates, true)
+        resolve_signature_type(signature_ctx, raw_ret_ty, signature_predicates, true)
     };
     base.current_span.set(previous_span);
     let mut ctx = function_context(
@@ -375,7 +404,7 @@ fn check_function_inner(
         ret_ty,
         self_ty,
         type_params,
-        predicates,
+        signature_predicates,
         attribute_allows(value.attrs, "unstructured_go"),
         attribute_allows(value.attrs, "unreachable_code"),
         base.allow_unused_result || attribute_allows(value.attrs, "unused_result"),
@@ -390,7 +419,7 @@ fn check_function_inner(
         let ty = resolve_signature_type(
             ctx,
             type_from_hir(ctx.builtin, param.1, type_params, self_ty),
-            predicates,
+            signature_predicates,
             true,
         );
         ctx.current_span.set(previous_span);
@@ -1222,12 +1251,13 @@ fn check_impl(base: Checker, value: hir::ImplBlock) -> ImplBlock {
             }
         }
         methods.push(
-            check_function(
+            check_function_with_trait(
                 method_base,
                 method,
                 hir::generic_names(value.generics),
                 predicates,
                 Some(for_type),
+                trait_ref,
             ),
         )
     }
@@ -1298,6 +1328,7 @@ fn validate_method_signature(
     owner_generic_count: isize,
     owner_predicate_count: isize,
 ) -> () {
+    let bounds_ctx = ctx;
     let signature_ctx = function_context(
         ctx,
         actual.ret_ty,
@@ -1384,12 +1415,17 @@ fn validate_method_signature(
         )
     }
     let expected_predicates: Vec[TypePredicate] = Vec::new();
-    for predicate in expected.predicates {
-        expected_predicates.push(substitute_predicate(predicate, substitutions))
+    for predicate in expand_implied_predicates(
+        bounds_ctx,
+        substitute_predicates(expected.predicates, substitutions),
+    ) {
+        expected_predicates.push(normalize_method_signature_predicate(bounds_ctx, predicate))
     }
     let actual_predicates: Vec[TypePredicate] = Vec::new();
     for index in owner_predicate_count..actual.predicates.len() {
-        actual_predicates.push(actual.predicates[index])
+        actual_predicates.push(
+            normalize_method_signature_predicate(bounds_ctx, actual.predicates[index]),
+        )
     }
     if !type_predicate_sets_equal(expected_predicates, actual_predicates) {
         push_diagnostic(
@@ -1397,6 +1433,20 @@ fn validate_method_signature(
             "Trait " + trait_name + "::" + actual.name
                 + " method bounds do not match the trait declaration",
         )
+    }
+}
+
+fn normalize_method_signature_predicate(ctx: Checker, value: TypePredicate) -> TypePredicate {
+    match value {
+        GoComparable(ty) => GoComparable(normalize_type(ctx, ty)),
+        Trait { for_ty, trait_ref } => TypePredicate::Trait {
+            for_ty: normalize_type(ctx, for_ty),
+            trait_ref: normalize_trait_ref(ctx, trait_ref),
+        },
+        Equality { lhs, rhs } => Equality {
+            lhs: normalize_type(ctx, lhs),
+            rhs: normalize_type(ctx, rhs),
+        },
     }
 }
 
