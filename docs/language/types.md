@@ -846,7 +846,7 @@ Trait bounds make the corresponding methods available on generic values. Calls t
 
 ### Associated constants
 
-Traits can require constants or provide defaults. Inherent constants follow method visibility rules; trait implementation constants inherit trait visibility. Read a constant through `Type::NAME`, `Type::[Arguments]::NAME`, or a bound parameter such as `T::NAME`.
+Traits can require constants or provide defaults. A trait cannot give a method and a constant the same name; associated type names belong to a separate namespace. Inherent constants follow method visibility rules; trait implementation constants inherit trait visibility. Read a constant through `Type::NAME`, `Type::[Arguments]::NAME`, or a bound parameter such as `T::NAME`.
 
 ```goml
 trait Capacity {

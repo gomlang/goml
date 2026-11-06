@@ -846,7 +846,7 @@ Trait 约束使相应方法可用于泛型值。通过泛型约束调用时，�
 
 ### 关联常量
 
-Trait 可要求常量或提供默认值。固有常量遵循方法可见性规则；trait 实现常量继承 trait 可见性。通过 `Type::NAME`、`Type::[Arguments]::NAME` 或 `T::NAME` 这样的受约束参数读取常量。
+Trait 可要求常量或提供默认值。同一 trait 的方法和常量不能同名；关联类型名称属于独立的名称空间。固有常量遵循方法可见性规则；trait 实现常量继承 trait 可见性。通过 `Type::NAME`、`Type::[Arguments]::NAME` 或 `T::NAME` 这样的受约束参数读取常量。
 
 ```goml
 trait Capacity {
