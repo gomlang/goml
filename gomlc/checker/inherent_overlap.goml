@@ -1,0 +1,119 @@
+package checker;
+
+use module::ast;
+use module::hir;
+use module::tast::{Type, TypePredicate, predicates_from_hir, substitute_type, type_from_hir, type_text, types_equal};
+use std::collections;
+
+struct InherentImplementation {
+    generics: Vec[string],
+    predicates: Vec[TypePredicate],
+    owner: Type,
+    members: Vec[string],
+    source_path: string,
+    span: Option[ast::Span],
+}
+
+fn inherent_member_name(name: string) -> string {
+    if name.starts_with("$associated_const:") {
+        name.byte_slice(18, name.byte_len())
+    } else {
+        name
+    }
+}
+
+fn inherent_implementations(ctx: Checker, files: Vec[hir::File]) -> Vec[InherentImplementation] {
+    let result: Vec[InherentImplementation] = Vec::new();
+    for file in files {
+        for item in file.items {
+            if let ImplBlock(block) = item {
+                if block.trait_ref.is_some() || block.methods.is_empty() {
+                    continue
+                }
+                let generics = hir::generic_names(block.generics);
+                let raw_owner = type_from_hir(ctx.builtin, block.for_type, generics, None);
+                let predicates = resolve_signature_predicates(
+                    ctx,
+                    predicates_from_hir(
+                        ctx.builtin,
+                        block.generic_bounds,
+                        block.predicates,
+                        generics,
+                        Some(raw_owner),
+                    ),
+                    false,
+                );
+                let owner = resolve_signature_type(ctx, raw_owner, predicates, false);
+                let members: collections::IndexSet[string] = collections::IndexSet::new();
+                for method in block.methods {
+                    let _ = members.insert(inherent_member_name(method.name));
+                }
+                result.push(
+                    InherentImplementation {
+                        generics,
+                        predicates,
+                        owner,
+                        members: members.to_vec(),
+                        source_path: file.source_path,
+                        span: block.for_type.span,
+                    },
+                )
+            }
+        }
+    }
+    result
+}
+
+fn inherent_owners_overlap(
+    ctx: Checker,
+    left: InherentImplementation,
+    right: InherentImplementation,
+) -> bool {
+    if types_equal(left.owner, Type::Error) || types_equal(right.owner, Type::Error) {
+        return false
+    }
+    let left_substitutions = instantiate_explicit_substitutions(ctx, left.generics, Vec::new());
+    let right_substitutions = instantiate_explicit_substitutions(ctx, right.generics, Vec::new());
+    let left_owner = substitute_type(left.owner, left_substitutions);
+    let right_owner = substitute_type(right.owner, right_substitutions);
+    if !unify(left_owner, right_owner) {
+        return false
+    }
+    let predicates = append_predicates(
+        substitute_predicates(left.predicates, left_substitutions),
+        substitute_predicates(right.predicates, right_substitutions),
+    );
+    overlap_predicates_satisfied(ctx, expand_implied_predicates(ctx, predicates))
+}
+
+fn validate_inherent_impl_overlaps(ctx: Checker, value: hir::File, package_files: Vec[hir::File]) -> () {
+    let files = Vec::from_array([value]);
+    for file in package_files {
+        files.push(file)
+    }
+    let implementations = inherent_implementations(ctx, files);
+    for left in 0..implementations.len() {
+        for right in(left + 1)..implementations.len() {
+            let shared: Vec[string] = Vec::new();
+            for name in implementations[left].members {
+                if implementations[right].members.contains(name) {
+                    shared.push(name)
+                }
+            }
+            if !shared.is_empty()
+                && inherent_owners_overlap(ctx, implementations[left], implementations[right]) {
+                for name in shared {
+                    ctx.diagnostics.push(
+                        new_diagnostic(
+                            TYPER_STAGE,
+                            "Inherent member " + name + " has overlapping implementations for "
+                                + type_text(implementations[right].owner),
+                            implementations[right].source_path,
+                            implementations[right].span,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+}
