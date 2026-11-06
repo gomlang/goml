@@ -18,15 +18,40 @@ fn index_operand_types(ctx: Checker, receiver: Type) -> Option[(Type, Type)] {
     }
 }
 
+fn constrained_index_types(ctx: Checker, constraint: IndexConstraint) -> Option[(Type, Type)] {
+    if constraint.write.is_some() {
+        match prune(normalize_type(ctx, constraint.receiver)) {
+            HashMap { key, value } => return Some((key, value)),
+            String => return None,
+            _ => (),
+        }
+    }
+    index_operand_types(ctx, constraint.receiver)
+}
+
+fn constrain_index_types(ctx: Checker, constraint: IndexConstraint, parts: (Type, Type)) -> () {
+    expect_type_at(ctx, constraint.index_ty, parts.0, constraint.span);
+    expect_type_at(ctx, parts.1, constraint.result_ty, constraint.span);
+    if let Some(write) = constraint.write {
+        if write.compound {
+            if let Some(read) = index_operand_types(ctx, constraint.receiver) {
+                expect_type_at(ctx, read.1, write.read_ty, constraint.span);
+            }
+        }
+    }
+}
+
 fn infer_deferred_index(ctx: Checker, constraint: IndexConstraint) -> bool {
     let snapshot = deferred_dependency_snapshot(
         ctx,
         Vec::from_array([constraint.receiver, constraint.index_ty, constraint.result_ty]),
     );
+    if let Some(write) = constraint.write {
+        snapshot.include(write.read_ty);
+    }
     let diagnostic_start = ctx.diagnostics.len();
-    if let Some(parts) = index_operand_types(ctx, constraint.receiver) {
-        expect_type_at(ctx, constraint.index_ty, parts.0, constraint.span);
-        expect_type_at(ctx, parts.1, constraint.result_ty, constraint.span);
+    if let Some(parts) = constrained_index_types(ctx, constraint) {
+        constrain_index_types(ctx, constraint, parts);
     }
     if ctx.diagnostics.len() != diagnostic_start {
         snapshot.restore();
@@ -39,10 +64,12 @@ fn infer_deferred_index(ctx: Checker, constraint: IndexConstraint) -> bool {
 
 fn resolve_index_constraints(ctx: Checker) -> () {
     for constraint in ctx.inference.index_constraints {
-        match index_operand_types(ctx, constraint.receiver) {
+        match constrained_index_types(ctx, constraint) {
             Some(parts) => {
-                expect_type_at(ctx, constraint.index_ty, parts.0, constraint.span);
-                expect_type_at(ctx, parts.1, constraint.result_ty, constraint.span);
+                constrain_index_types(ctx, constraint, parts);
+                if let Some(write) = constraint.write {
+                    validate_deferred_index_write(ctx, constraint, write);
+                }
             },
             None => if !type_contains_error(constraint.receiver) {
                 push_diagnostic_at(
@@ -65,5 +92,42 @@ fn resolve_index_constraints(ctx: Checker) -> () {
                 Some(constraint.span),
             );
         }
+    }
+}
+
+fn validate_deferred_index_write(ctx: Checker, constraint: IndexConstraint, write: IndexWrite) -> () {
+    let receiver = prune(normalize_type(ctx, constraint.receiver));
+    match receiver {
+        Slice { .. } => push_diagnostic_at(
+            ctx,
+            "cannot assign through Slice indexing; Slice is read-only",
+            constraint.span,
+        ),
+        HashMap { .. } if write.compound => push_diagnostic_at(
+            ctx,
+            "compound assignment is not supported for HashMap indexing because reads return Option[V]",
+            constraint.span,
+        ),
+        Array { .. } => validate_deferred_array_write(ctx, constraint, write),
+        _ => if symbolic_array(receiver).is_some() {
+            validate_deferred_array_write(ctx, constraint, write)
+        },
+    }
+}
+
+fn validate_deferred_array_write(ctx: Checker, constraint: IndexConstraint, write: IndexWrite) -> () {
+    if assignment_crosses_readonly_slice(ctx, write.base) {
+        push_diagnostic_at(
+            ctx,
+            "cannot assign through Slice indexing; Slice is read-only",
+            constraint.span,
+        );
+    }
+    if !write.mutable_root {
+        let message = match write.local_root {
+            Some(name) => "cannot assign through array indexing on immutable binding `" + name + "`",
+            None => "array indexed assignment requires a writable root such as a mutable local or `ref.get()`",
+        };
+        push_diagnostic_at(ctx, message, constraint.span);
     }
 }
