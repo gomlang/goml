@@ -861,7 +861,7 @@ fn read_number(flag: bool) -> Result[i32, string] {
 }
 ```
 
-对 `Option[T]` 使用 `?` 时，最近的函数或闭包必须返回 `Option[_]`。对 `Result[T, E]` 使用时，必须返回具有相同错误类型的 `Result[_, E]`；目前没有 Rust `From` 风格的错误转换。`?` 只求值操作数一次。
+对 `Option[T]` 使用 `?` 时，最近的函数或闭包必须返回 `Option[_]`。对 `Result[T, E]` 使用时，必须返回具有相同错误类型的 `Result[_, E]`；目前没有 Rust `From` 风格的错误转换。`?` 只求值操作数一次。即使成功值的类型需要推断，已知的外围返回类型也会为操作数提供 `Option` 或 `Result` 上下文，例如 `let value = Ok(1)?;`。尚未确定的错误类型会从外围 `Result` 的错误类型推断。
 
 诊断区分不支持的操作数（`try_invalid_operand`）、不兼容的外层返回类型（`try_invalid_return`）和不同的 `Result` 错误类型（`try_error_mismatch`）。它们高亮 `?`；传播失败还会指出外层返回标注，没有标注时指出函数名或闭包表达式。错误类型不匹配时显示两种类型，并建议在 `?` 前使用 `map_err` 或修改外层错误类型。这些建议不添加隐式转换。
 

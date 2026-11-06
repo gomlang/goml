@@ -861,7 +861,7 @@ fn read_number(flag: bool) -> Result[i32, string] {
 }
 ```
 
-When using `?` with `Option[T]`, the nearest function or closure must return `Option[_]`. Use of `Result[T, E]` must return `Result[_, E]` with the same error type; there is currently no Rust `From`-style error conversion. `?` will evaluate the operand once.
+When using `?` with `Option[T]`, the nearest function or closure must return `Option[_]`. Use of `Result[T, E]` must return `Result[_, E]` with the same error type; there is currently no Rust `From`-style error conversion. `?` will evaluate the operand once. A known enclosing return type supplies the `Option` or `Result` context for the operand even when its success type is inferred, as in `let value = Ok(1)?;`. An unconstrained error type is inferred from the enclosing `Result` error type.
 
 Diagnostics distinguish an unsupported operand (`try_invalid_operand`), an incompatible enclosing return type (`try_invalid_return`), and different `Result` error types (`try_error_mismatch`). They highlight `?`; propagation failures also identify the enclosing return annotation, or the function name or closure expression when no annotation is available. Error-type mismatches show both types and suggest `map_err` before `?` or changing the enclosing error type. These suggestions do not add implicit conversions.
 
