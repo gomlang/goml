@@ -1,0 +1,211 @@
+package mono;
+
+use module::core;
+use module::ast;
+use module::checker;
+use module::hir;
+use module::parser;
+use module::tast;
+use std::collections;
+use std::testing;
+
+#[test]
+fn specialization_retries_projection_arguments_after_injective_bindings() -> () {
+    let parameter = core::Type::Param { name: "T" };
+    let projection = core::Type::Projection {
+        for_ty: parameter,
+        name: "Item",
+        trait_ref: Some(core::TraitRef { name: "Make", args: Vec::new() }),
+    };
+    for templates in[
+        Vec::from_array([projection, parameter]),
+        Vec::from_array([parameter, projection]),
+    ] {
+        let actuals = if let Projection { .. } = templates[0] {
+            Vec::from_array([core::Type::Int32, core::Type::Bool])
+        } else {
+            Vec::from_array([core::Type::Bool, core::Type::Int32])
+        };
+        let bindings = Vec::new();
+        testing::assert(unify_types(templates, actuals, bindings));
+        testing::assert_eq(
+            compact_type(find_binding(bindings, "T").unwrap_or(core::Type::Error)),
+            compact_type(core::Type::Bool),
+        );
+    }
+    let signature = core::Type::Func { params: Vec::from_array([projection]), ret_ty: parameter };
+    let concrete = core::Type::Func {
+        params: Vec::from_array([core::Type::Int32]),
+        ret_ty: core::Type::Bool,
+    };
+    testing::assert(unify_type(signature, concrete, Vec::new()));
+}
+
+#[test]
+fn specialization_rejects_unresolved_projections_and_incompatible_siblings() -> () {
+    let parameter = core::Type::Param { name: "T" };
+    let projection = core::Type::Projection {
+        for_ty: parameter,
+        name: "Item",
+        trait_ref: Some(core::TraitRef { name: "Make", args: Vec::new() }),
+    };
+    testing::assert(
+        !unify_types(
+            Vec::from_array([projection]),
+            Vec::from_array([core::Type::Int32]),
+            Vec::new(),
+        ),
+    );
+    testing::assert(
+        !unify_types(
+            Vec::from_array([projection, parameter, core::Type::String]),
+            Vec::from_array([core::Type::Int32, core::Type::Bool, core::Type::Int32]),
+            Vec::new(),
+        ),
+    );
+    testing::assert(!unify_types(Vec::from_array([parameter]), Vec::new(), Vec::new()));
+}
+
+#[test]
+fn specialization_retries_dependent_tuple_and_map_siblings() -> () {
+    let parameter = core::Type::Param { name: "T" };
+    let projection = core::Type::Projection {
+        for_ty: parameter,
+        name: "Item",
+        trait_ref: Some(core::TraitRef { name: "Make", args: Vec::new() }),
+    };
+    for pair in[
+        (
+            core::Type::Tuple { items: Vec::from_array([projection, parameter]) },
+            core::Type::Tuple { items: Vec::from_array([core::Type::Int32, core::Type::Bool]) },
+        ),
+        (
+            core::Type::HashMap { key: projection, value: parameter },
+            core::Type::HashMap { key: core::Type::Int32, value: core::Type::Bool },
+        ),
+        (
+            core::Type::GoMap { key: projection, value: parameter },
+            core::Type::GoMap { key: core::Type::Int32, value: core::Type::Bool },
+        ),
+    ] {
+        testing::assert(unify_type(pair.0, pair.1, Vec::new()));
+    }
+}
+
+#[test]
+fn specialization_retries_dependent_dyn_bounds_by_identity() -> () {
+    let parameter = core::Type::Param { name: "T" };
+    let projection = core::Type::Projection {
+        for_ty: parameter,
+        name: "Item",
+        trait_ref: Some(core::TraitRef { name: "Make", args: Vec::new() }),
+    };
+    let template = core::Type::Dyn {
+        trait_name: "Read",
+        args: Vec::from_array([projection]),
+        associated_types: Vec::new(),
+        additional_bounds: Vec::from_array(
+            [
+                core::DynTraitBound {
+                    trait_name: "Write",
+                    args: Vec::from_array([parameter]),
+                    associated_types: Vec::new(),
+                },
+            ],
+        ),
+    };
+    let actual = core::Type::Dyn {
+        trait_name: "Write",
+        args: Vec::from_array([core::Type::Bool]),
+        associated_types: Vec::new(),
+        additional_bounds: Vec::from_array(
+            [
+                core::DynTraitBound {
+                    trait_name: "Read",
+                    args: Vec::from_array([core::Type::Int32]),
+                    associated_types: Vec::new(),
+                },
+            ],
+        ),
+    };
+    testing::assert(unify_type(template, actual, Vec::new()));
+}
+
+#[test]
+fn specialization_retries_array_lengths_after_element_bindings() -> () {
+    let parameter = core::Type::Param { name: "N" };
+    let length = core::const_application(
+        core::Type::Con { name: "$const_op:+" },
+        Vec::from_array([parameter, core::Type::Con { name: "$const_value:1" }]),
+    );
+    let template = core::const_application(
+        core::Type::Con { name: "$array" },
+        Vec::from_array(
+            [
+                length,
+                core::Type::App {
+                    ty: core::Type::Con { name: "Wrap" },
+                    args: Vec::from_array([parameter]),
+                },
+            ],
+        ),
+    );
+    let actual = core::Type::Array {
+        len: 3,
+        elem: core::Type::App {
+            ty: core::Type::Con { name: "Wrap" },
+            args: Vec::from_array([core::Type::Con { name: "$const_value:2" }]),
+        },
+    };
+    testing::assert(unify_type(template, actual, Vec::new()));
+}
+
+#[test]
+fn function_value_inference_checks_associated_types_against_impl_metadata() -> () {
+    let source = "trait Make { type Item; fn make(value: Self::Item) -> Self; } impl Make for bool { type Item = i32; fn make(value: i32) -> bool { true } } fn create[T: Make](value: T::Item) -> T { T::make(value) }";
+    let checked = checker::check(hir::lower(ast::lower(parser::parse(source)), "main.goml"));
+    let lowered = core::lower(checked.tast);
+    let trait_function_index: FunctionIndex = HashMap::new();
+    for function in lowered.functions {
+        if let Some(metadata) = function.trait_impl {
+            add_indexed_function(trait_function_index, metadata.trait_ref.name, function)
+        }
+    }
+    let Ok(builtin) = tast::builtin_contract() else {
+        testing::fail("missing builtin contract");
+        return
+    };
+    let ctx = SpecializeCtx {
+        builtin,
+        functions: lowered.functions,
+        function_index: HashMap::new(),
+        inherent_method_index: HashMap::new(),
+        trait_function_index,
+        trait_method_index: HashMap::new(),
+        trait_method_names: HashMap::new(),
+        instances: Vec::new(),
+        instance_index: HashMap::new(),
+        instance_counts: HashMap::new(),
+        work: Vec::new(),
+        used_names: collections::HashSet::new(),
+        active: Ref::new(None),
+        error: Ref::new(None),
+    };
+    let mut tested = false;
+    for function in lowered.functions {
+        if function.generics.len() > 0 && function.trait_impl.is_none() {
+            tested = true;
+            for argument in[core::Type::Int32, core::Type::String] {
+                let actual = core::Type::Func {
+                    params: Vec::from_array([argument]),
+                    ret_ty: core::Type::Bool,
+                };
+                testing::assert_eq(
+                    infer_function_signature_bindings(ctx, function, actual, Vec::new(), false),
+                    compact_type(argument) == compact_type(core::Type::Int32),
+                );
+            }
+        }
+    }
+    testing::assert(tested);
+}
