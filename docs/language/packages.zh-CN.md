@@ -153,6 +153,8 @@ impl Point {
 
 同包中的所有文件都可以使用私有顶层项。trait impl 方法遵循 trait 契约，不能声明 `pub` 或 `pub(module)`。
 
+公开 API 可以要求私有 trait 约束。依赖会保留验证这些要求和特化公开 API 所需的 trait 及实现信息，但消费者仍不能访问该私有 trait 及其方法。
+
 ```goml
 pub(module) struct DeviceState {
     pub(module) cycles: u64,

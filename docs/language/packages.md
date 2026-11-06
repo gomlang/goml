@@ -153,6 +153,8 @@ impl Point {
 
 All files in the same package can use private top-level items. Trait impl methods inherit the trait contract and cannot declare either `pub` or `pub(module)`.
 
+Public APIs may require a private trait bound. Dependencies retain the trait and implementation information needed to verify those requirements and specialize the public API, while the private trait and its methods remain inaccessible to consumers.
+
 ```goml
 pub(module) struct DeviceState {
     pub(module) cycles: u64,
