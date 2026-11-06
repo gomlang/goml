@@ -336,7 +336,7 @@ fn require_value(value: Option[isize]) -> isize {
 }
 ```
 
-初始化器求值一次。模式必须可反驳，绑定在语句之后可见，`else` 块不能使用这些绑定。`else` 块必须通过 `return`、`break`、`continue`、无限 `loop` 或其他 `never` 类型表达式发散。两条路径都要在本地继续时，使用 `if let` 或 `match`。
+初始化器求值一次。模式必须可反驳，绑定在语句之后可见，`else` 块不能使用这些绑定。`else` 块必须通过 `return`、`break`、`continue`、无限 `loop` 或其他 `never` 类型表达式发散。此退出要求在类型推断完成后检查，因此后续闭包调用可以确定 `else` 块中使用的回调返回 `never`。两条路径都要在本地继续时，使用 `if let` 或 `match`。
 
 <a id="mut-and-assignment"></a>
 

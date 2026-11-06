@@ -336,7 +336,7 @@ fn require_value(value: Option[isize]) -> isize {
 }
 ```
 
-The initializer is evaluated once. The pattern must be refutable, bindings become visible after the statement, and the `else` block cannot use those bindings. The `else` block must diverge with `return`, `break`, `continue`, an infinite `loop`, or another expression of type `never`. Use `if let` or `match` when both paths continue locally.
+The initializer is evaluated once. The pattern must be refutable, bindings become visible after the statement, and the `else` block cannot use those bindings. The `else` block must diverge with `return`, `break`, `continue`, an infinite `loop`, or another expression of type `never`. This exit requirement is checked after inference, so later closure calls may establish that a callback used in the `else` block returns `never`. Use `if let` or `match` when both paths continue locally.
 
 <a id="mut-and-assignment"></a>
 
