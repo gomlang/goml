@@ -622,7 +622,7 @@ fn default_value[T: Default]() -> T {
 }
 ```
 
-An impl method must preserve whether the trait declaration has a `self: Self` receiver. Associated functions use static dispatch, cannot be called with method syntax, and do not participate in `dyn` dispatch. If neither arguments nor the expected result determine `Self`, the call is rejected as ambiguous.
+An impl method must preserve whether the trait declaration has a `self: Self` receiver. Associated functions use static dispatch, cannot be called with method syntax, and do not participate in `dyn` dispatch. A concrete implementation whose first ordinary parameter happens to match its owner type is still an associated function; it does not compete with receiver methods during dot-call selection. If neither arguments nor the expected result determine `Self`, the call is rejected as ambiguous.
 
 In supertrait arguments, `Self` denotes the type satisfying the child bound. For example, `T: Child` with `trait Child: Parent[Self]` implies `T: Parent[T]`. This substitution also applies inside nested arguments and associated type projections.
 
@@ -784,7 +784,7 @@ impl Point {
 }
 ```
 
-The associated function without a receiver is called with `Point::new(1, 2)`; the method whose first parameter is the receiver can be called with `point.sum()` or `Point::sum(point)`.
+A receiver is identified by the first parameter name `self`; an ordinary parameter with the owner type does not make an associated function callable with dot syntax. The associated function without a receiver is called with `Point::new(1, 2)`; the method whose first parameter is the receiver can be called with `point.sum()` or `Point::sum(point)`.
 
 Inherent impl of generic types:
 
@@ -869,7 +869,7 @@ fn capacity[T: Capacity]() -> usize {
 }
 ```
 
-Initializers support literals, constant paths, unary and binary operations, casts, and composite constant construction. They cannot perform ordinary function or method calls or access runtime locals. A generic implementation can use its const parameters in the initializer. Non-generic inherent integer constants can also supply array lengths. Associated constant patterns and trait-associated constants in length expressions are not supported. Traits with associated constants cannot be used as `dyn` traits. Constant dependencies are checked after resolving aliases and concrete owner arguments, across all files in a package and through imported generic constant dependencies; cyclic dependencies are rejected, while finite dependency chains have no cycle-depth cutoff. Trait-qualified access such as `Capacity::LIMIT` requires context that determines `Self`; use a concrete owner when the constant type does not determine it.
+Initializers support literals, constant paths, unary and binary operations, casts, and composite constant construction. They cannot perform ordinary function or method calls, reference runtime statics, or contain function values. Comparisons must use builtin scalar operations; equality also permits fixed arrays and tuples whose elements satisfy that rule. User-defined comparison implementations are not allowed, even when written with operator syntax. Generic comparisons retain this requirement through function and method signatures and are checked after substitution, including across package interfaces. Replacing a trait constant default replaces its comparison requirements as well. A generic implementation can use its const parameters in the initializer. Non-generic inherent integer constants can also supply array lengths. Associated constant patterns and trait-associated constants in length expressions are not supported. Traits with associated constants cannot be used as `dyn` traits. Constant dependencies are checked after resolving aliases and concrete owner arguments, across all files in a package and through imported generic constant dependencies; cyclic dependencies are rejected, while finite dependency chains have no cycle-depth cutoff. Trait-qualified access such as `Capacity::LIMIT` requires context that determines `Self`; use a concrete owner when the constant type does not determine it.
 
 <a id="dyn-trait"></a>
 

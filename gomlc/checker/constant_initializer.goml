@@ -1,0 +1,178 @@
+package checker;
+
+use module::consts;
+use module::tast::{Block, Callable, Expr, Pat, Type, TypePredicate, callable_base, constant_comparison_supported, expr_type, map_child_exprs, prune, symbolic_array, type_text};
+
+fn constant_comparison_satisfied(ctx: Checker, ty: Type, ordering: bool) -> bool {
+    let ty = normalize_type(ctx, ty);
+    if constant_comparison_supported(ty, ordering) {
+        return true
+    }
+    if !ordering {
+        if let Some(parts) = symbolic_array(ty) {
+            return constant_comparison_satisfied(ctx, parts.1, false)
+        }
+    }
+    for predicate in ctx.predicates {
+        if let ConstComparison { ty: required, ordering: expected } = predicate {
+            if expected == ordering
+                && projection_search_types_equal(normalize_type(ctx, required), ty) {
+                return true
+            }
+        }
+    }
+    match prune(ty) {
+        Tuple { items } if !ordering => {
+            for item in items {
+                if !constant_comparison_satisfied(ctx, item, false) {
+                    return false
+                }
+            }
+            true
+        },
+        Array { elem, .. } if !ordering => constant_comparison_satisfied(ctx, elem, false),
+        _ => false,
+    }
+}
+
+fn constant_comparison_can_defer(value: Type, ordering: bool) -> bool {
+    if constant_comparison_supported(value, ordering) {
+        return true
+    }
+    if !ordering {
+        if let Some(parts) = symbolic_array(value) {
+            return constant_comparison_can_defer(parts.1, false)
+        }
+    }
+    match prune(value) {
+        Param { .. } | Projection { .. } => true,
+        Tuple { items } if !ordering => {
+            for item in items {
+                if !constant_comparison_can_defer(item, false) {
+                    return false
+                }
+            }
+            true
+        },
+        Array { elem, .. } if !ordering => constant_comparison_can_defer(elem, false),
+        _ => false,
+    }
+}
+
+fn infer_constant_comparison(ctx: Checker, ty: Type, ordering: bool, predicates: Vec[TypePredicate]) -> () {
+    let ty = normalize_type(ctx, ty);
+    if !ordering {
+        if let Some(parts) = symbolic_array(ty) {
+            infer_constant_comparison(ctx, parts.1, false, predicates);
+            return
+        }
+        match prune(ty) {
+            Tuple { items } => {
+                for item in items {
+                    infer_constant_comparison(ctx, item, false, predicates)
+                }
+                return
+            },
+            Array { elem, .. } => {
+                infer_constant_comparison(ctx, elem, false, predicates);
+                return
+            },
+            _ => (),
+        }
+    }
+    if constant_comparison_can_defer(ty, ordering)
+        && type_contains_any_parameter(ty, ctx.type_params)
+        && !contains_unbound_type_variable(ty) {
+        let predicate = TypePredicate::ConstComparison { ty, ordering };
+        push_predicate(ctx.predicates, predicate);
+        push_predicate(predicates, predicate)
+    }
+}
+
+fn constant_comparison_message(ty: Type, ordering: bool) -> string {
+    let kind = if ordering {
+        "ordering"
+    } else {
+        "equality"
+    };
+    "associated constant comparison requires builtin " + kind + " without runtime method calls: "
+        + type_text(ty)
+}
+
+fn constant_initializer_callable(value: Callable) -> bool {
+    match callable_base(value) {
+        TraitMethod { method_name, .. } | InherentMethod { method_name, .. } => method_name.starts_with(
+            "$associated_const:",
+        ),
+        Function(name) | FunctionInstance { name, .. } => name.contains("$associated_const:"),
+        Intrinsic(name) => name == "array.repeat",
+        _ => false,
+    }
+}
+
+fn validate_constant_initializer_block(ctx: Checker, block: Block, locals: Vec[string]) -> () {
+    let scope = copied_names(locals);
+    for statement in block.stmts {
+        match statement {
+            Let { is_mut: false, pat: Pat::Var { name, .. }, value } => {
+                let _ = validate_constant_initializer_expr(ctx, value, scope);
+                scope.push(name)
+            },
+            _ => push_diagnostic(
+                ctx,
+                "associated constant initializer must be a constant expression",
+            ),
+        }
+    }
+    if let Some(value) = block.tail {
+        let _ = validate_constant_initializer_expr(ctx, value, scope);
+    }
+}
+
+fn constant_initializer_named_value(ctx: Checker, name: string) -> bool {
+    match find_constant_by_name(ctx, name) {
+        Some(value) => !once_cell_type(ctx.builtin, normalize_type(ctx, value.ty)),
+        None => false,
+    }
+}
+
+fn validate_constant_initializer_expr(ctx: Checker, value: Expr, locals: Vec[string]) -> Expr {
+    match value {
+        Prim { .. } | Constr { .. } | Tuple { .. } | Array { .. } | Unary { .. } | Cast { .. } | Field {
+            ..,
+        } | Proj { .. } => (),
+        Var { name, .. } => if !locals.contains(name) && consts::parameter_name(name).is_none()
+            && !constant_initializer_named_value(ctx, name) {
+            push_diagnostic(
+                ctx,
+                "associated constant initializer cannot reference runtime value " + name,
+            )
+        },
+        Binary { op, lhs, .. } => if is_equality_op(op) || is_order_op(op) {
+            let ty = expr_type(lhs);
+            let ordering = is_order_op(op);
+            require_predicate(
+                ctx,
+                TypePredicate::ConstComparison { ty, ordering },
+                constant_comparison_message(ty, ordering),
+            )
+        },
+        Call { func: Expr::Callable { callable, .. }, args, .. } if constant_initializer_callable(
+            callable,
+        ) => {
+            for argument in args {
+                let _ = validate_constant_initializer_expr(ctx, argument, locals);
+            }
+            return value
+        },
+        Block { block, .. } => {
+            validate_constant_initializer_block(ctx, block, locals);
+            return value
+        },
+        _ => push_diagnostic(
+            ctx,
+            "associated constant initializer must be a constant expression without runtime calls or function values",
+        ),
+    }
+    map_child_exprs(value, |child| validate_constant_initializer_expr(ctx, child, locals))
+}

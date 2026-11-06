@@ -1091,6 +1091,7 @@ fn static_method_owner_predicates_possible(ctx: Checker, predicates: Vec[TypePre
             GoComparable(ty) => contains_unbound_any_variable(normalize_type(ctx, ty)),
             GoFunction(ty) => contains_unbound_any_variable(normalize_type(ctx, ty)),
             GoCallback(ty) => contains_unbound_any_variable(normalize_type(ctx, ty)),
+            ConstComparison { ty, .. } => contains_unbound_any_variable(normalize_type(ctx, ty)),
             ConstValid { ty, .. } => contains_unbound_any_variable(normalize_type(ctx, ty)),
             Trait { for_ty, trait_ref } => {
                 contains_unbound_any_variable(normalize_type(ctx, for_ty))
@@ -1275,7 +1276,7 @@ fn resolve_user_method(
                             traits.push((candidate, snapshot.capture()))
                         }
                     },
-                    None => if !method_shape_is_ambiguous(ctx, receiver, name)
+                    None => if !method_shape_is_ambiguous(ctx, receiver, name, false)
                         || (unify(candidate.owner, receiver)
                             && static_method_owner_predicates_possible(
                                 ctx,
@@ -1370,7 +1371,9 @@ fn context_trait_bound_satisfied(ctx: Checker, bound_ty: Type, reference: TraitR
     let reference = normalize_trait_ref(ctx, reference);
     for predicate in context_predicates_for_type(ctx, bound_ty) {
         match predicate {
-            GoComparable(_) | GoFunction(_) | GoCallback(_) | ConstValid { .. } => (),
+            GoComparable(_) | GoFunction(_) | GoCallback(_) | ConstComparison { .. } | ConstValid {
+                ..,
+            } => (),
             Trait { for_ty: candidate_ty, trait_ref: candidate_ref } => {
                 if types_equal(normalize_type(ctx, candidate_ty), bound_ty)
                     && trait_ref_equal(normalize_trait_ref(ctx, candidate_ref), reference) {
@@ -1404,6 +1407,9 @@ fn predicates_satisfied_inner(ctx: Checker, predicates: Vec[TypePredicate], goal
                 return false
             },
             GoCallback(signature) => if !callback_predicate_satisfied(ctx, signature) {
+                return false
+            },
+            ConstComparison { ty, ordering } => if !constant_comparison_satisfied(ctx, ty, ordering) {
                 return false
             },
             ConstValid { ty, .. } => if const_valid_predicate_error(ctx, ty).is_some() {
@@ -1467,6 +1473,10 @@ fn predicate_requirement_message(ctx: Checker, value: TypePredicate, fallback: s
                 + type_text(normalize_type(ctx, signature)),
             GoCallback(signature) => "Go callback conversions require ffi::String and ffi::Rune for text values: "
                 + type_text(normalize_type(ctx, signature)),
+            ConstComparison { ty, ordering } => constant_comparison_message(
+                normalize_type(ctx, ty),
+                ordering,
+            ),
             ConstValid { ty, .. } => const_valid_predicate_error(ctx, ty).unwrap_or(fallback),
             Trait { for_ty, trait_ref: reference } => {
                 let mut unresolved = contains_unbound_type_variable(for_ty);
@@ -1504,6 +1514,7 @@ fn predicate_contains_error(value: TypePredicate) -> bool {
         GoComparable(ty) => type_contains_error(ty),
         GoFunction(ty) => type_contains_error(ty),
         GoCallback(ty) => type_contains_error(ty),
+        ConstComparison { ty, .. } => type_contains_error(ty),
         ConstValid { ty, .. } => type_contains_error(ty),
         Trait { for_ty, trait_ref: reference } => {
             if type_contains_error(for_ty) {
@@ -1543,6 +1554,7 @@ fn mark_unresolved_inference_predicate(ctx: Checker, value: TypePredicate) -> ()
         GoComparable(ty) => mark_unresolved_inference_type(ctx, ty),
         GoFunction(ty) => mark_unresolved_inference_type(ctx, ty),
         GoCallback(ty) => mark_unresolved_inference_type(ctx, ty),
+        ConstComparison { ty, .. } => mark_unresolved_inference_type(ctx, ty),
         ConstValid { ty, .. } => mark_unresolved_inference_type(ctx, ty),
         Trait { for_ty, trait_ref } => {
             mark_unresolved_inference_type(ctx, for_ty);
@@ -1577,7 +1589,10 @@ fn solve_required_predicates(ctx: Checker) -> () {
             continue
         }
         match requirement.predicate {
-            GoComparable(ty) | GoFunction(ty) | GoCallback(ty) | ConstValid { ty, .. } => {
+            GoComparable(ty) | GoFunction(ty) | GoCallback(ty) | ConstComparison { ty, .. } | ConstValid {
+                ty,
+                ..,
+            } => {
                 let _ = default_numeric_type(ty);
             },
             Trait { for_ty, trait_ref } => {
@@ -2078,6 +2093,7 @@ fn deferred_method_candidate(
     let candidates: Vec[Type] = Vec::new();
     for value in ctx.methods {
         if value.function.name == name && method_trait_in_scope(ctx, value)
+            && method_has_dot_receiver(ctx, value)
             && value.trait_ref.is_some() {
             let snapshot = method_inference_snapshot(receiver, args, expected, method_explicit);
             let candidate = instantiate_method_candidate(ctx, value, Vec::new(), method_explicit);
@@ -2142,14 +2158,15 @@ fn deferred_method_candidate(
     }
 }
 
-fn method_shape_is_ambiguous(ctx: Checker, receiver: Type, name: string) -> bool {
-    if predicate_method_references(ctx, receiver, name, true).len() > 1 {
+fn method_shape_is_ambiguous(ctx: Checker, receiver: Type, name: string, require_receiver: bool) -> bool {
+    if predicate_method_references(ctx, receiver, name, require_receiver).len() > 1 {
         return true
     }
     let mut matches = 0;
     for value in ctx.methods {
         if value.function.name == name && receiver_matches(ctx.builtin, value.for_type, receiver)
-            && method_trait_in_scope(ctx, value) {
+            && method_trait_in_scope(ctx, value)
+            && (!require_receiver || method_has_dot_receiver(ctx, value)) {
             matches += 1;
         }
     }
@@ -2166,14 +2183,15 @@ fn resolve_user_method_for_call(
 ) -> Option[ResolvedCallable] {
     let inherent: Vec[MethodMatch] = Vec::new();
     let trait_methods: Vec[MethodMatch] = Vec::new();
-    let inherent_expected = if method_shape_is_ambiguous(ctx, receiver, name) {
+    let inherent_expected = if method_shape_is_ambiguous(ctx, receiver, name, true) {
         expected
     } else {
         None
     };
     for value in ctx.methods {
         if value.function.name == name && receiver_matches(ctx.builtin, value.for_type, receiver)
-            && method_trait_in_scope(ctx, value) {
+            && method_trait_in_scope(ctx, value)
+            && method_has_dot_receiver(ctx, value) {
             let snapshot = method_inference_snapshot(receiver, args, expected, method_explicit);
             let candidate = instantiate_method_candidate(ctx, value, Vec::new(), method_explicit);
             let matches = match value.trait_ref {
@@ -2191,7 +2209,7 @@ fn resolve_user_method_for_call(
                             args,
                             inherent_expected,
                         )
-                        && (!method_shape_is_ambiguous(ctx, receiver, name)
+                        && (!method_shape_is_ambiguous(ctx, receiver, name, true)
                             || static_method_owner_predicates_possible(
                                 ctx,
                                 candidate.owner_predicates,
@@ -2483,6 +2501,10 @@ fn predicate_equal(left: TypePredicate, right: TypePredicate) -> bool {
             Trait { for_ty: left_ty, trait_ref: left_ref },
             Trait { for_ty: right_ty, trait_ref: right_ref },
         ) => types_equal(left_ty, right_ty) && trait_ref_equal(left_ref, right_ref),
+        (
+            ConstComparison { ty: left, ordering: first },
+            ConstComparison { ty: right, ordering: second },
+        ) => first == second && projection_search_types_equal(left, right),
         (Equality { lhs: left_lhs, rhs: left_rhs }, Equality { lhs: right_lhs, rhs: right_rhs }) => {
             (types_equal(left_lhs, right_lhs) && types_equal(left_rhs, right_rhs))
                 || (types_equal(left_lhs, right_rhs) && types_equal(left_rhs, right_lhs))
@@ -2568,7 +2590,9 @@ fn projection_candidates_from_predicates(ctx: Checker, predicates: Vec[TypePredi
     let result: Vec[ProjectionCandidate] = Vec::new();
     for predicate in predicates {
         match predicate {
-            GoComparable(_) | GoFunction(_) | GoCallback(_) | ConstValid { .. } => (),
+            GoComparable(_) | GoFunction(_) | GoCallback(_) | ConstComparison { .. } | ConstValid {
+                ..,
+            } => (),
             Trait { for_ty, trait_ref } => {
                 for application in trait_ref_closure_with_self(ctx, trait_ref, for_ty) {
                     if let Some(info) = find_trait(ctx, application.name) {
@@ -2769,6 +2793,10 @@ fn resolve_projection_predicates(
                 ),
                 GoFunction(ty) => GoFunction(resolve_projection_type(ctx, ty, candidates, report)),
                 GoCallback(ty) => GoCallback(resolve_projection_type(ctx, ty, candidates, report)),
+                ConstComparison { ty, ordering } => ConstComparison {
+                    ty: resolve_projection_type(ctx, ty, candidates, report),
+                    ordering,
+                },
                 ConstValid { ty, origins } => ConstValid {
                     ty: resolve_projection_type(ctx, ty, candidates, report),
                     origins,
@@ -2797,6 +2825,7 @@ fn resolve_signature_predicates(ctx: Checker, predicates: Vec[TypePredicate], re
                 GoComparable(ty) => validate_signature_type(ctx, ty),
                 GoFunction(ty) => validate_signature_type(ctx, ty),
                 GoCallback(ty) => validate_signature_type(ctx, ty),
+                ConstComparison { ty, .. } => validate_signature_type(ctx, ty),
                 ConstValid { ty, .. } => validate_signature_type(ctx, ty),
                 Trait { for_ty, trait_ref: reference } => {
                     validate_signature_type(ctx, for_ty);
@@ -3400,6 +3429,10 @@ fn expand_type_alias_predicates(ctx: Checker, values: Vec[TypePredicate], report
                 GoComparable(ty) => GoComparable(expand_type_aliases(ctx, ty, report)),
                 GoFunction(ty) => GoFunction(expand_type_aliases(ctx, ty, report)),
                 GoCallback(ty) => GoCallback(expand_type_aliases(ctx, ty, report)),
+                ConstComparison { ty, ordering } => ConstComparison {
+                    ty: expand_type_aliases(ctx, ty, report),
+                    ordering,
+                },
                 ConstValid { ty, origins } => ConstValid {
                     ty: expand_type_aliases(ctx, ty, report),
                     origins,
@@ -3534,7 +3567,9 @@ fn expand_implied_predicates(ctx: Checker, predicates: Vec[TypePredicate]) -> Ve
         let (predicate, ancestry) = pending[index];
         index += 1;
         match predicate {
-            GoComparable(_) | GoFunction(_) | GoCallback(_) | ConstValid { .. } | Equality { .. } => (),
+            GoComparable(_) | GoFunction(_) | GoCallback(_) | ConstComparison { .. } | ConstValid {
+                ..,
+            } | Equality { .. } => (),
             Trait { for_ty, trait_ref: reference } => {
                 for application in trait_ref_closure_with_self(ctx, reference, for_ty) {
                     push_predicate(result, TypePredicate::Trait { for_ty, trait_ref: application });
