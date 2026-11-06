@@ -721,7 +721,7 @@ while remaining > 0 && let Some(value) = iterator.next() && value > 0 {
 
 每次迭代从第一项重新求值链。假布尔值或失败模式退出循环。模式绑定对后续项和本轮循环体可见，下次迭代重新创建。
 
-`break` 和 `continue` 不能直接退出 `while` 条件，包括 `while let` 初始化器或 let 链中的项。嵌套在条件内部的循环可以正常使用自己的 `break` 和 `continue`。
+`break` 和 `continue` 不能直接退出 `while` 条件，包括 `while let` 初始化器或 let 链中的项。嵌套在条件内部的循环可以正常使用自己的 `break` 和 `continue`。标签不能绕过此规则：目标循环也必须位于当前条件内部。
 
 <a id="loop"></a>
 

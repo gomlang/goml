@@ -721,7 +721,7 @@ while remaining > 0 && let Some(value) = iterator.next() && value > 0 {
 
 Each iteration evaluates the chain again from its first term. A false boolean or failed pattern exits the loop. Pattern bindings are visible to later terms and the body of that iteration, and are recreated for the next iteration.
 
-`break` and `continue` cannot directly exit a `while` condition, including a `while let` initializer or a term in a let chain. A loop nested inside the condition may use its own `break` and `continue` normally.
+`break` and `continue` cannot directly exit a `while` condition, including a `while let` initializer or a term in a let chain. A loop nested inside the condition may use its own `break` and `continue` normally. Labels do not bypass this rule: the target loop must also be inside the current condition.
 
 <a id="loop"></a>
 
