@@ -494,7 +494,7 @@ The number of constructor parameters of the enumeration pattern must be consiste
 
 ### Fixed arrays, Vec, Slice and MutSlice
 
-Fixed arrays `[T; N]`, `Vec[T]`, `Slice[T]` and `MutSlice[T]` share square-bracket pattern syntax. Without `..`, the pattern requires the exact length; with `..`, the prefix and suffix only specify the minimum length:
+Fixed arrays `[T; N]`, `Vec[T]`, `Slice[T]` and `MutSlice[T]` share square-bracket pattern syntax. When a closure parameter has no annotation, later calls can determine the sequence kind and array length before pattern validation. Without `..`, the pattern requires the exact length; with `..`, the prefix and suffix only specify the minimum length:
 
 ```goml
 match values {
