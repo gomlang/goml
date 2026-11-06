@@ -156,7 +156,7 @@ fn increment(value: UserId) -> UserId {
 
 与 `type UserId = u64;` 不同，newtype 不能与 `u64` 互换，必须显式构造或解构。newtype 可为泛型，字段默认私有，括号内允许尾逗号。此语法要求恰好一个字段；不支持零字段或多字段元组结构体。
 
-结构体和枚举的类型参数列表不接受约束。约束应放在使用该类型的函数、trait 或 impl 上。
+结构体和枚举的类型参数列表不接受约束。约束应放在使用该类型的函数、trait 或 impl 上。字段不能引用 `T::Item` 这样没有约束的关联类型。应改用载荷类型参数，例如 `struct Holder[Item] { value: Item }`，并在 `T` 具有所需 trait 约束的位置实例化 `Holder[T::Item]`。
 
 构造时写出字段，允许字段简写：
 

@@ -156,7 +156,7 @@ fn increment(value: UserId) -> UserId {
 
 Unlike `type UserId = u64;`, the newtype is not interchangeable with `u64`. It must be explicitly constructed or destructured. Newtypes may be generic, their field is private by default, and a trailing comma inside the parentheses is accepted. This syntax requires exactly one field; tuple structs with zero or multiple fields are not supported.
 
-Struct and enum type parameter lists do not accept bounds. Put constraints on the functions, traits, or impls that use the type.
+Struct and enum type parameter lists do not accept bounds. Put constraints on the functions, traits, or impls that use the type. A field cannot refer to an unconstrained associated type such as `T::Item`. Use a payload parameter instead, such as `struct Holder[Item] { value: Item }`, and instantiate `Holder[T::Item]` where `T` has the required trait bound.
 
 Write out the fields during construction, allowing field abbreviations:
 
