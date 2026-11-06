@@ -584,6 +584,8 @@ There are no `ref` or `ref mut` patterns. `mut name` is supported for individual
 
 ### Define traits
 
+Trait names must be unique within a package, including across source files. Redeclaring a trait cannot replace or erase its earlier methods or associated types.
+
 Trait method signatures must include parameter names. The first receiver can be written as `self`, which is short for `self: Self`:
 
 ```goml

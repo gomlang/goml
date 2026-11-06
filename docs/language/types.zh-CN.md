@@ -584,6 +584,8 @@ fn absurd(value: Never) -> i32 {
 
 ### 定义 trait
 
+同一包内的 trait 名称必须唯一，包括分布在不同源文件中的声明。重复声明不能替换或抹除先前的 trait 方法或关联类型。
+
 Trait 方法签名必须包含参数名。第一个接收者可写作 `self`，是 `self: Self` 的简写：
 
 ```goml
