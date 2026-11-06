@@ -10,6 +10,7 @@ struct DeferredMethod {
     span: Option[ast::Span],
     ty: Type,
     resolved: Ref[Option[ResolvedCallable]],
+    field: Ref[Option[Type]],
 }
 
 fn common_deferred_method_type(candidates: Vec[Type], parameter: Option[isize]) -> Option[Type] {
@@ -54,14 +55,38 @@ fn resolve_deferred_signature(ctx: Checker, pending: DeferredMethod) -> Option[R
     for index in 1..params.len() {
         args.push(params[index])
     }
-    let resolved = resolve_method(
+    pending.field.set(None);
+    let diagnostic_start = ctx.diagnostics.len();
+    let resolved = match resolve_method(
         ctx,
         params[0],
         pending.name,
         args,
         Some(ret_ty),
         pending.explicit,
-    )?;
+    ) {
+        Some(value) => value,
+        None => {
+            if ctx.diagnostics.len() != diagnostic_start {
+                return None
+            }
+            let field_ty = resolve_field_type(ctx, params[0], pending.name)?;
+            if !pending.explicit.is_empty() {
+                push_diagnostic(ctx, "Function-valued fields do not accept generic arguments");
+            }
+            let parts = callable_parts(ctx, field_ty, args.len());
+            let actual_params = Vec::from_array([params[0]]);
+            for ty in parts.0 {
+                actual_params.push(ty);
+            }
+            pending.field.set(Some(field_ty));
+            ResolvedCallable {
+                callable: Callable::Function(pending.name),
+                ty: Type::Func { params: actual_params, ret_ty: parts.1 },
+                predicates: Vec::new(),
+            }
+        },
+    };
     match prune(resolved.ty) {
         Func { params: actual_params, ret_ty: actual_ret } if actual_params.len() == params.len() => {
             for index in 0..params.len() {
@@ -96,7 +121,7 @@ fn resolve_deferred_method(ctx: Checker, id: isize) -> ResolvedCallable {
         }
         pending.resolved.set(Some(result));
         ctx.current_span.set(previous);
-        update_deferred_facts(ctx.typeck_results, id, result);
+        update_deferred_facts(ctx.typeck_results, id, result, pending.field.get());
         return result
     }
     push_diagnostic(ctx, "invalid deferred method reference");
@@ -110,15 +135,25 @@ fn is_deferred_target(value: ReferenceTarget, id: isize) -> bool {
     }
 }
 
-fn update_deferred_facts(results: TypeckResults, id: isize, value: ResolvedCallable) -> () {
+fn update_deferred_facts(
+    results: TypeckResults,
+    id: isize,
+    value: ResolvedCallable,
+    field: Option[Type],
+) -> () {
+    let target = if field.is_some() {
+        match value.callable {
+            Function(name) => ReferenceTarget::Unresolved(name),
+            _ => ReferenceTarget::Callable(value.callable),
+        }
+    } else {
+        ReferenceTarget::Callable(value.callable)
+    };
+    let callee_ty = field.unwrap_or(value.ty);
     for index in 0..results.references.len() {
         let fact = results.references[index];
         if is_deferred_target(fact.target, id) {
-            results.references[index] = ReferenceFact {
-                target: ReferenceTarget::Callable(value.callable),
-                ty: value.ty,
-                ..fact,
-            };
+            results.references[index] = ReferenceFact { target, ty: callee_ty, ..fact };
         }
     }
     for index in 0..results.calls.len() {
@@ -128,12 +163,7 @@ fn update_deferred_facts(results: TypeckResults, id: isize, value: ResolvedCalla
                 Func { ret_ty, .. } if types_equal(prune(ret_ty), Type::Never) => Type::Never,
                 _ => fact.result_ty,
             };
-            results.calls[index] = CallFact {
-                target: ReferenceTarget::Callable(value.callable),
-                callee_ty: value.ty,
-                result_ty,
-                ..fact,
-            };
+            results.calls[index] = CallFact { target, callee_ty, result_ty, ..fact };
             if types_equal(result_ty, Type::Never) {
                 for expr_index in 0..results.exprs.len() {
                     let expr = results.exprs[expr_index];
@@ -152,6 +182,32 @@ fn resolve_deferred_expr(ctx: Checker, value: Expr) -> Expr {
         && ctx.inference.comparison_operand_constraints.is_empty()
         && ctx.inference.projection_constraints.is_empty() {
         return value
+    }
+    if let Call { func: Callable { callable: DeferredMethod(id), .. }, args, ty } = value {
+        let resolved = resolve_deferred_method(ctx, id);
+        for pending in ctx.inference.deferred_methods {
+            if pending.id == id {
+                if let Some(field_ty) = pending.field.get() {
+                    if !args.is_empty() {
+                        let receiver = resolve_deferred_expr(ctx, args[0]);
+                        let arguments = Vec::new();
+                        for index in 1..args.len() {
+                            arguments.push(resolve_deferred_expr(ctx, args[index]));
+                        }
+                        let result_ty = match prune(field_ty) {
+                            Func { ret_ty, .. } if types_equal(prune(ret_ty), Type::Never) => Type::Never,
+                            _ => ty,
+                        };
+                        return Call {
+                            func: Field { expr: receiver, field_name: pending.name, ty: field_ty },
+                            args: arguments,
+                            ty: result_ty,
+                        }
+                    }
+                }
+            }
+        }
+        let _ = resolved;
     }
     let value = map_child_exprs(value, |child| resolve_deferred_expr(ctx, child));
     match value {
