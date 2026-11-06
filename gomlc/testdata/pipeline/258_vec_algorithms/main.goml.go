@@ -228,7 +228,7 @@ type closure_env_main_8 struct {}
 
 type closure_env_main_9 struct {}
 
-type closure_env_inherent_Vec_Vec_T_dedup_T_isize_10 struct {}
+type closure_env_inherent_Vec_Vec_T_dedup_trait_T_PartialEq_T_isize_10 struct {}
 
 type closure_env_inherent_Vec_Vec_T_sort_by_ordering_T_string_11 struct {
     compare_0 func(string, string) Ordering
@@ -298,10 +298,10 @@ func main0() struct{} {
         return _goml_m_inherent_i_closure__env__main__2_i_closure__env__main__2_i_apply(t11, p0, p1)
     }
     _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_sort__by____T__isize(values__0, t12)
-    var t13 string = _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_join____T__isize(values__0, ",")
+    var t13 string = _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_join_i_trait_l_T_k_ToString_r_____T__isize(values__0, ",")
     println__T_string(t13)
-    _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_dedup____T__isize(values__0)
-    var t14 string = _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_join____T__isize(values__0, ",")
+    _goml_m_inherent_i_Vec_i_Vec_l_h99246cf06b1f6a1ec4292b4253e63795__r_____T__isize(values__0)
+    var t14 string = _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_join_i_trait_l_T_k_ToString_r_____T__isize(values__0, ",")
     println__T_string(t14)
     var t15 [5]int = [5]int{1, 2, 4, 4, 5}
     var ordered__0 *_goml_vec_int = func(values [5]int) *_goml_vec_int {
@@ -360,7 +360,7 @@ func main0() struct{} {
         return _goml_m_inherent_i_closure__env__main__7_i_closure__env__main__7_i_apply(t37, p0, p1)
     }
     _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_sort__by__ordering____T__string(names__0, t38)
-    var t39 string = _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_join____T__string(names__0, "|")
+    var t39 string = _goml_m_inherent_i_Vec_i_Vec_l_h0d4be567e01fffa31a1f75bd82f98c36_r_____T__string(names__0, "|")
     var inline29 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t39)
     _goml_runtime_core_string_println(inline29)
     var t40 Tuple2_3int_3int = Tuple2_3int_3int{
@@ -413,13 +413,13 @@ func main0() struct{} {
     var inline23 int = 2
     var inline24 []int = t49.items[inline22:inline23]
     view__0 = inline24
-    var t50 bool = _goml_m_inherent_i_Slice_i_Slice_l_T_r__i_contains____T__isize(view__0, 8)
+    var t50 bool = _goml_m_inherent_i_Slice_i_Sli_hfc2badcf008f24f13dfd1f7c6962d40b__r_____T__isize(view__0, 8)
     var t51 string
     var inline21 string = _goml_runtime_core_bool_to_string(t50)
     t51 = inline21
     var inline19 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t51)
     _goml_runtime_core_string_println(inline19)
-    var t52 bool = _goml_m_inherent_i_Slice_i_Slice_l_T_r__i_contains____T__isize(view__0, 9)
+    var t52 bool = _goml_m_inherent_i_Slice_i_Sli_hfc2badcf008f24f13dfd1f7c6962d40b__r_____T__isize(view__0, 9)
     var t53 string
     var inline18 string = _goml_runtime_core_bool_to_string(t52)
     t53 = inline18
@@ -441,13 +441,13 @@ func main0() struct{} {
         values: inline14,
     }
     frozen__0 = inline15
-    var t56 bool = _goml_m_inherent_i_FrozenVec_i_FrozenVec_l_T_r__i_contains____T__isize(frozen__0, 1)
+    var t56 bool = _goml_m_inherent_i_FrozenVec_i_hb6c9e6d1cb3a15cd7871da0cec92d41c__r_____T__isize(frozen__0, 1)
     var t57 string
     var inline13 string = _goml_runtime_core_bool_to_string(t56)
     t57 = inline13
     var inline11 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t57)
     _goml_runtime_core_string_println(inline11)
-    var t58 bool = _goml_m_inherent_i_FrozenVec_i_FrozenVec_l_T_r__i_contains____T__isize(frozen__0, 3)
+    var t58 bool = _goml_m_inherent_i_FrozenVec_i_hb6c9e6d1cb3a15cd7871da0cec92d41c__r_____T__isize(frozen__0, 3)
     var t59 string
     var inline10 string = _goml_runtime_core_bool_to_string(t58)
     t59 = inline10
@@ -456,7 +456,7 @@ func main0() struct{} {
     var empty__0 *_goml_vec_int
     var inline7 *_goml_vec_int = vec_new__Vec_3int()
     empty__0 = inline7
-    var t60 string = _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_join____T__isize(empty__0, ",")
+    var t60 string = _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_join_i_trait_l_T_k_ToString_r_____T__isize(empty__0, ",")
     var inline5 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t60)
     _goml_runtime_core_string_println(inline5)
     var t61 closure_env_main_9 = closure_env_main_9{}
@@ -555,7 +555,7 @@ func _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_sort__by____T__isize(self__0 *_goml_v
     return struct{}{}
 }
 
-func _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_join____T__isize(self__0 *_goml_vec_int, separator__0 string) string {
+func _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_join_i_trait_l_T_k_ToString_r_____T__isize(self__0 *_goml_vec_int, separator__0 string) string {
     var t0 int
     var inline23 int = vec_len__Vec_3int(self__0)
     t0 = inline23
@@ -650,10 +650,10 @@ func _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_join____T__isize(self__0 *_goml_vec_i
     return t7
 }
 
-func _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_dedup____T__isize(self__0 *_goml_vec_int) struct{} {
-    var t0 closure_env_inherent_Vec_Vec_T_dedup_T_isize_10 = closure_env_inherent_Vec_Vec_T_dedup_T_isize_10{}
+func _goml_m_inherent_i_Vec_i_Vec_l_h99246cf06b1f6a1ec4292b4253e63795__r_____T__isize(self__0 *_goml_vec_int) struct{} {
+    var t0 closure_env_inherent_Vec_Vec_T_dedup_trait_T_PartialEq_T_isize_10 = closure_env_inherent_Vec_Vec_T_dedup_trait_T_PartialEq_T_isize_10{}
     var t1 func(int, int) bool = func(p0 int, p1 int) bool {
-        return _goml_m_inherent_i_closure__en_h5b5a2c4c0a397a14d2b6a2dc409e76d2_ize__10_i_apply(t0, p0, p1)
+        return _goml_m_inherent_i_closure__en_hb0305f9339097f3e2f053be9b83c0db3_ize__10_i_apply(t0, p0, p1)
     }
     _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_dedup__by____T__isize(self__0, t1)
     return struct{}{}
@@ -843,7 +843,7 @@ func _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_sort__by__ordering____T__string(self_
     return struct{}{}
 }
 
-func _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_join____T__string(self__0 *_goml_vec_string, separator__0 string) string {
+func _goml_m_inherent_i_Vec_i_Vec_l_h0d4be567e01fffa31a1f75bd82f98c36_r_____T__string(self__0 *_goml_vec_string, separator__0 string) string {
     var t0 int
     var inline22 int = vec_len__Vec_6string(self__0)
     t0 = inline22
@@ -948,7 +948,7 @@ func _goml_m_inherent_i_Vec_i_Vec_l_hfde7b787e35869a5469e590f5ee0e2ea_size_c_isi
     return struct{}{}
 }
 
-func _goml_m_inherent_i_Slice_i_Slice_l_T_r__i_contains____T__isize(self__0 []int, expected__0 int) bool {
+func _goml_m_inherent_i_Slice_i_Sli_hfc2badcf008f24f13dfd1f7c6962d40b__r_____T__isize(self__0 []int, expected__0 int) bool {
     var index__0 int = 0
     Loop_loop0:
     for {
@@ -976,7 +976,7 @@ func _goml_m_inherent_i_Slice_i_Slice_l_T_r__i_contains____T__isize(self__0 []in
     return false
 }
 
-func _goml_m_inherent_i_FrozenVec_i_FrozenVec_l_T_r__i_contains____T__isize(self__0 FrozenVec__isize, expected__0 int) bool {
+func _goml_m_inherent_i_FrozenVec_i_hb6c9e6d1cb3a15cd7871da0cec92d41c__r_____T__isize(self__0 FrozenVec__isize, expected__0 int) bool {
     var t0 *_goml_vec_int = self__0.values
     var for_iter0 FnIterator__isize
     var inline3 FnIterator__isize = _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_iter____T__isize(t0)
@@ -2020,7 +2020,7 @@ func _goml_m_inherent_i_closure__env__main__9_i_closure__env__main__9_i_apply(en
     return t0
 }
 
-func _goml_m_inherent_i_closure__en_h5b5a2c4c0a397a14d2b6a2dc409e76d2_ize__10_i_apply(env0 closure_env_inherent_Vec_Vec_T_dedup_T_isize_10, left__0 int, right__0 int) bool {
+func _goml_m_inherent_i_closure__en_hb0305f9339097f3e2f053be9b83c0db3_ize__10_i_apply(env0 closure_env_inherent_Vec_Vec_T_dedup_trait_T_PartialEq_T_isize_10, left__0 int, right__0 int) bool {
     var inline0 bool = left__0 == right__0
     return inline0
 }

@@ -262,7 +262,7 @@ func main0() struct{} {
     var inline22 string = "first"
     hashmap_set__HashMap_9Ref_4Node_6string(map__0, first__0, inline22)
     print_lookup(map__0, first__0)
-    var inline18 Option__string = _goml_m_inherent_i_HashMap_i_H_h9ede9e5e4b19497ae51b9af572b3f34a_r_____V__string(map__0, distinct__0)
+    var inline18 Option__string = _goml_m_inherent_i_HashMap_i_H_h0690575ad938bd0a58b5bd5f665705a0_r_____V__string(map__0, distinct__0)
     switch inline18._tag {
     case 0:
         println__T_string("missing")
@@ -276,7 +276,7 @@ func main0() struct{} {
         value: 2,
     }
     ref_set__Ref_4Node(first__0, t7)
-    var inline13 Option__string = _goml_m_inherent_i_HashMap_i_H_h9ede9e5e4b19497ae51b9af572b3f34a_r_____V__string(map__0, first__0)
+    var inline13 Option__string = _goml_m_inherent_i_HashMap_i_H_h0690575ad938bd0a58b5bd5f665705a0_r_____V__string(map__0, first__0)
     switch inline13._tag {
     case 0:
         println__T_string("missing")
@@ -293,7 +293,7 @@ func main0() struct{} {
     t8 = inline10
     var inline8 string = _goml_m_trait__impl_i_ToString_i_isize_i_to__string(t8)
     _goml_runtime_core_string_println(inline8)
-    var inline4 Option__string = _goml_m_inherent_i_HashMap_i_H_h9ede9e5e4b19497ae51b9af572b3f34a_r_____V__string(map__0, first__0)
+    var inline4 Option__string = _goml_m_inherent_i_HashMap_i_H_h0690575ad938bd0a58b5bd5f665705a0_r_____V__string(map__0, first__0)
     switch inline4._tag {
     case 0:
         println__T_string("missing")
@@ -303,7 +303,7 @@ func main0() struct{} {
     default:
         panic("non-exhaustive match")
     }
-    var inline0 Option__string = _goml_m_inherent_i_HashMap_i_H_h9ede9e5e4b19497ae51b9af572b3f34a_r_____V__string(map__0, distinct__0)
+    var inline0 Option__string = _goml_m_inherent_i_HashMap_i_H_h0690575ad938bd0a58b5bd5f665705a0_r_____V__string(map__0, distinct__0)
     switch inline0._tag {
     case 0:
         println__T_string("missing")
@@ -317,7 +317,7 @@ func main0() struct{} {
     }
 }
 
-func _goml_m_inherent_i_HashMap_i_H_h9ede9e5e4b19497ae51b9af572b3f34a_r_____V__string(self__0 *hashmap_Ref_4Node_string_x, key__0 *ref_Node_x) Option__string {
+func _goml_m_inherent_i_HashMap_i_H_h0690575ad938bd0a58b5bd5f665705a0_r_____V__string(self__0 *hashmap_Ref_4Node_string_x, key__0 *ref_Node_x) Option__string {
     var t0 Option__string = hashmap_get__HashMap_9Ref_4Node_6string(self__0, key__0)
     return t0
 }

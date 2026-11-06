@@ -616,10 +616,10 @@ func main0() struct{} {
     _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_clear____T__i32(values__0)
     var t30 int = _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_len____T__i32(values__0)
     println__T_isize(t30)
-    var map__0 *hashmap_string_int32_x = _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_new____K__string____V__i32()
-    _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_set____K__string____V__i32(map__0, "a", 1)
-    _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_set____K__string____V__i32(map__0, "b", 2)
-    var entries__0 *_goml_vec_Tuple2_6string_5int32 = _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_entries____K__string____V__i32(map__0)
+    var map__0 *hashmap_string_int32_x = _goml_m_inherent_i_HashMap_i_H_had2a34eebdd0d51a9c0e6295112aa7b5_tring____V__i32()
+    _goml_m_inherent_i_HashMap_i_H_hff45fa3d9453bf606860376b181d4f54_tring____V__i32(map__0, "a", 1)
+    _goml_m_inherent_i_HashMap_i_H_hff45fa3d9453bf606860376b181d4f54_tring____V__i32(map__0, "b", 2)
+    var entries__0 *_goml_vec_Tuple2_6string_5int32 = _goml_m_inherent_i_HashMap_i_H_h5e32eb713a59777b851dab1cbcc8093c_tring____V__i32(map__0)
     var t31 int = _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_len____T___o_string_c_i32_q_(entries__0)
     println__T_isize(t31)
     var inline19 string = "c"
@@ -1090,17 +1090,17 @@ func _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_clear____T__i32(self__0 *_goml_vec_in
     return struct{}{}
 }
 
-func _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_new____K__string____V__i32() *hashmap_string_int32_x {
+func _goml_m_inherent_i_HashMap_i_H_had2a34eebdd0d51a9c0e6295112aa7b5_tring____V__i32() *hashmap_string_int32_x {
     var t0 *hashmap_string_int32_x = hashmap_new__HashMap_6string_5int32()
     return t0
 }
 
-func _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_set____K__string____V__i32(self__0 *hashmap_string_int32_x, key__0 string, value__0 int32) struct{} {
+func _goml_m_inherent_i_HashMap_i_H_hff45fa3d9453bf606860376b181d4f54_tring____V__i32(self__0 *hashmap_string_int32_x, key__0 string, value__0 int32) struct{} {
     hashmap_set__HashMap_6string_5int32(self__0, key__0, value__0)
     return struct{}{}
 }
 
-func _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_entries____K__string____V__i32(self__0 *hashmap_string_int32_x) *_goml_vec_Tuple2_6string_5int32 {
+func _goml_m_inherent_i_HashMap_i_H_h5e32eb713a59777b851dab1cbcc8093c_tring____V__i32(self__0 *hashmap_string_int32_x) *_goml_vec_Tuple2_6string_5int32 {
     var t0 *_goml_vec_Tuple2_6string_5int32 = hashmap_entries__HashMap_6string_5int32(self__0)
     return t0
 }

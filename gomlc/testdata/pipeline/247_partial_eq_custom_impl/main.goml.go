@@ -348,8 +348,8 @@ func main0() struct{} {
     var t8 bool = !t7
     var t9 string = _goml_m_trait__impl_i_ToString_i_bool_i_to__string(t8)
     println__T_string(t9)
-    var derived_map__0 *hashmap_DerivedKey_string_x = _goml_m_inherent_i_HashMap_i_H_h11367fd98aaafe315368863eb9d8e24f_ey____V__string()
-    _goml_m_inherent_i_HashMap_i_H_h1cee44072715470f45f5985ef34cf1f9_ey____V__string(derived_map__0, derived__0, "derived")
+    var derived_map__0 *hashmap_DerivedKey_string_x = _goml_m_inherent_i_HashMap_i_H_h789ef2f69242ba4b5acc919e77c05588_ey____V__string()
+    _goml_m_inherent_i_HashMap_i_H_h1322d89074d0c1e5bcf00e47af3794f1_ey____V__string(derived_map__0, derived__0, "derived")
     var t10 DerivedKey = DerivedKey{
         value: 7,
     }
@@ -595,12 +595,12 @@ func _goml_m_trait__impl_i_ToString_i_bool_i_to__string(self__0 bool) string {
     return t0
 }
 
-func _goml_m_inherent_i_HashMap_i_H_h11367fd98aaafe315368863eb9d8e24f_ey____V__string() *hashmap_DerivedKey_string_x {
+func _goml_m_inherent_i_HashMap_i_H_h789ef2f69242ba4b5acc919e77c05588_ey____V__string() *hashmap_DerivedKey_string_x {
     var t0 *hashmap_DerivedKey_string_x = hashmap_new__HashMap_10DerivedKey_6string()
     return t0
 }
 
-func _goml_m_inherent_i_HashMap_i_H_h1cee44072715470f45f5985ef34cf1f9_ey____V__string(self__0 *hashmap_DerivedKey_string_x, key__0 DerivedKey, value__0 string) struct{} {
+func _goml_m_inherent_i_HashMap_i_H_h1322d89074d0c1e5bcf00e47af3794f1_ey____V__string(self__0 *hashmap_DerivedKey_string_x, key__0 DerivedKey, value__0 string) struct{} {
     hashmap_set__HashMap_10DerivedKey_6string(self__0, key__0, value__0)
     return struct{}{}
 }

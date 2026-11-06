@@ -400,7 +400,7 @@ type closure_env_main_2 struct {}
 
 type closure_env_main_3 struct {}
 
-type closure_env_inherent_HashMapEntry_HashMapEntry_K_V_remove_entry_K_Key_V_isize_4 struct {
+type closure_env_inherent_HashMapEn_h1223ced5d6b657dc820ae32765b9e640_K_Key_V_isize_4 struct {
     self_0 HashMapEntry__Key__isize
 }
 
@@ -445,29 +445,29 @@ func key(value__0 int, hashes__0 *ref_int_x) Key {
 func main0() struct{} {
     var hashes__0 *ref_int_x = _goml_m_inherent_i_Ref_i_Ref_l_T_r__i_new____T__isize(0)
     var created__0 *ref_int_x = _goml_m_inherent_i_Ref_i_Ref_l_T_r__i_new____T__isize(0)
-    var map__0 *hashmap_Key_int_x = _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_new____K__Key____V__isize()
+    var map__0 *hashmap_Key_int_x = _goml_m_inherent_i_HashMap_i_H_hefcd8eac755e1b91f89f49fc52a8868f_Key____V__isize()
     var t0 Key = key(1, hashes__0)
-    var t1 HashMapEntry__Key__isize = _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_entry____K__Key____V__isize(map__0, t0)
+    var t1 HashMapEntry__Key__isize = _goml_m_inherent_i_HashMap_i_H_h77de294f462c3d70aefec7306fc4cdc7_Key____V__isize(map__0, t0)
     var t2 closure_env_main_0 = closure_env_main_0{
         created_0: created__0,
     }
     var t3 func() int = func() int {
         return _goml_m_inherent_i_closure__env__main__0_i_closure__env__main__0_i_apply(t2)
     }
-    var t4 int = _goml_m_inherent_i_HashMapEntr_h08451cacc3f0db11c02874f35c8558b6_Key____V__isize(t1, t3)
+    var t4 int = _goml_m_inherent_i_HashMapEntr_h97af1d97a0acef4959dd64be6c72e86e_Key____V__isize(t1, t3)
     println__T_isize(t4)
     var t5 int = _goml_m_inherent_i_Ref_i_Ref_l_T_r__i_get____T__isize(hashes__0)
     println__T_isize(t5)
     _goml_m_inherent_i_Ref_i_Ref_l_T_r__i_set____T__isize(hashes__0, 0)
     var t6 Key = key(1, hashes__0)
-    var t7 HashMapEntry__Key__isize = _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_entry____K__Key____V__isize(map__0, t6)
+    var t7 HashMapEntry__Key__isize = _goml_m_inherent_i_HashMap_i_H_h77de294f462c3d70aefec7306fc4cdc7_Key____V__isize(map__0, t6)
     var t8 closure_env_main_1 = closure_env_main_1{
         created_0: created__0,
     }
     var t9 func() int = func() int {
         return _goml_m_inherent_i_closure__env__main__1_i_closure__env__main__1_i_apply(t8)
     }
-    var t10 int = _goml_m_inherent_i_HashMapEntr_h08451cacc3f0db11c02874f35c8558b6_Key____V__isize(t7, t9)
+    var t10 int = _goml_m_inherent_i_HashMapEntr_h97af1d97a0acef4959dd64be6c72e86e_Key____V__isize(t7, t9)
     println__T_isize(t10)
     var t11 int = _goml_m_inherent_i_Ref_i_Ref_l_T_r__i_get____T__isize(hashes__0)
     println__T_isize(t11)
@@ -475,20 +475,20 @@ func main0() struct{} {
     println__T_isize(t12)
     _goml_m_inherent_i_Ref_i_Ref_l_T_r__i_set____T__isize(hashes__0, 0)
     var t13 Key = key(1, hashes__0)
-    var t14 HashMapEntry__Key__isize = _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_entry____K__Key____V__isize(map__0, t13)
+    var t14 HashMapEntry__Key__isize = _goml_m_inherent_i_HashMap_i_H_h77de294f462c3d70aefec7306fc4cdc7_Key____V__isize(map__0, t13)
     var t15 closure_env_main_2 = closure_env_main_2{}
     var t16 func(int) int = func(p0 int) int {
         return _goml_m_inherent_i_closure__env__main__2_i_closure__env__main__2_i_apply(t15, p0)
     }
-    var t17 Option__isize = _goml_m_inherent_i_HashMapEntr_h9abc9eb3d8ded3aa79581ab7c647c1de_Key____V__isize(t14, t16)
+    var t17 Option__isize = _goml_m_inherent_i_HashMapEntr_h306ba44e6bcc73d824a24ed5050f1f10_Key____V__isize(t14, t16)
     var t18 int = _goml_m_inherent_i_Option_i_Option_l_T_r__i_unwrap__or____T__isize(t17, -1)
     println__T_isize(t18)
     var t19 int = _goml_m_inherent_i_Ref_i_Ref_l_T_r__i_get____T__isize(hashes__0)
     println__T_isize(t19)
     _goml_m_inherent_i_Ref_i_Ref_l_T_r__i_set____T__isize(hashes__0, 0)
     var t20 Key = key(1, hashes__0)
-    var t21 HashMapEntry__Key__isize = _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_entry____K__Key____V__isize(map__0, t20)
-    var t22 _goml_m_Option_____o_Key_c_isize_q_ = _goml_m_inherent_i_HashMapEntr_he7df3efa35857dbe82e86ebc4eb03056_Key____V__isize(t21)
+    var t21 HashMapEntry__Key__isize = _goml_m_inherent_i_HashMap_i_H_h77de294f462c3d70aefec7306fc4cdc7_Key____V__isize(map__0, t20)
+    var t22 _goml_m_Option_____o_Key_c_isize_q_ = _goml_m_inherent_i_HashMapEntr_hba372ab8db573651de496b27460f225b_Key____V__isize(t21)
     var t23 Key = key(0, hashes__0)
     var t24 Tuple2_3Key_3int = Tuple2_3Key_3int{
         _0: t23,
@@ -535,12 +535,12 @@ func main0() struct{} {
     var t34 HashMapEntry__string__isize
     var inline13 *hashmap_string_int_x = t31.values
     var inline14 string = t31.key
-    _goml_m_inherent_i_HashMap_i_H_hfcee0d24f3f45608afc229b1d5b5eca7_ing____V__isize(inline13, inline14, t33)
+    _goml_m_inherent_i_HashMap_i_H_ha8c97071ec043079f7afd33cd97792bc_ing____V__isize(inline13, inline14, t33)
     t34 = t31
     var t35 Option__isize
     var inline10 *hashmap_string_int_x = t34.values
     var inline11 string = t34.key
-    var inline12 Option__isize = _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_get____K__string____V__isize(inline10, inline11)
+    var inline12 Option__isize = _goml_m_inherent_i_HashMap_i_H_hf6c5171fdfb6ae69d96216f289ceca8e_ing____V__isize(inline10, inline11)
     t35 = inline12
     var t36 int
     var inline8 int = 0
@@ -590,7 +590,7 @@ func _goml_m_inherent_i_Ref_i_Ref_l_T_r__i_new____T__isize(value__0 int) *ref_in
     return t0
 }
 
-func _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_new____K__Key____V__isize() *hashmap_Key_int_x {
+func _goml_m_inherent_i_HashMap_i_H_hefcd8eac755e1b91f89f49fc52a8868f_Key____V__isize() *hashmap_Key_int_x {
     var t0 *hashmap_Key_int_x = hashmap_new__HashMap_3Key_3int()
     return t0
 }
@@ -603,7 +603,7 @@ func println__T_isize(value__0 int) struct{} {
     return struct{}{}
 }
 
-func _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_entry____K__Key____V__isize(self__0 *hashmap_Key_int_x, key__0 Key) HashMapEntry__Key__isize {
+func _goml_m_inherent_i_HashMap_i_H_h77de294f462c3d70aefec7306fc4cdc7_Key____V__isize(self__0 *hashmap_Key_int_x, key__0 Key) HashMapEntry__Key__isize {
     var t0 HashMapEntry__Key__isize = HashMapEntry__Key__isize{
         values: self__0,
         key: key__0,
@@ -611,14 +611,14 @@ func _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_entry____K__Key____V__isi
     return t0
 }
 
-func _goml_m_inherent_i_HashMapEntr_h08451cacc3f0db11c02874f35c8558b6_Key____V__isize(self__0 HashMapEntry__Key__isize, create__0 func() int) int {
+func _goml_m_inherent_i_HashMapEntr_h97af1d97a0acef4959dd64be6c72e86e_Key____V__isize(self__0 HashMapEntry__Key__isize, create__0 func() int) int {
     var t0 *hashmap_Key_int_x = self__0.values
     var t1 Key = self__0.key
     var inline0 int = hashmap_get_or_insert_with__HashMap_3Key_3int(t0, t1, create__0)
     return inline0
 }
 
-func _goml_m_inherent_i_HashMapEntr_h9abc9eb3d8ded3aa79581ab7c647c1de_Key____V__isize(self__0 HashMapEntry__Key__isize, update__0 func(int) int) Option__isize {
+func _goml_m_inherent_i_HashMapEntr_h306ba44e6bcc73d824a24ed5050f1f10_Key____V__isize(self__0 HashMapEntry__Key__isize, update__0 func(int) int) Option__isize {
     var t0 *hashmap_Key_int_x = self__0.values
     var t1 Key = self__0.key
     var inline0 Option__isize = hashmap_update__HashMap_3Key_3int(t0, t1, update__0)
@@ -637,17 +637,17 @@ func _goml_m_inherent_i_Option_i_Option_l_T_r__i_unwrap__or____T__isize(self__0 
     }
 }
 
-func _goml_m_inherent_i_HashMapEntr_he7df3efa35857dbe82e86ebc4eb03056_Key____V__isize(self__0 HashMapEntry__Key__isize) _goml_m_Option_____o_Key_c_isize_q_ {
+func _goml_m_inherent_i_HashMapEntr_hba372ab8db573651de496b27460f225b_Key____V__isize(self__0 HashMapEntry__Key__isize) _goml_m_Option_____o_Key_c_isize_q_ {
     var t0 Option__isize
     var inline3 *hashmap_Key_int_x = self__0.values
     var inline4 Key = self__0.key
-    var inline5 Option__isize = _goml_m_inherent_i_HashMap_i_H_h0e46f47d3ada08b881ff6860cdc9491c_Key____V__isize(inline3, inline4)
+    var inline5 Option__isize = _goml_m_inherent_i_HashMap_i_H_he7fa92414f351eb800432582b5909367_Key____V__isize(inline3, inline4)
     t0 = inline5
-    var t1 closure_env_inherent_HashMapEntry_HashMapEntry_K_V_remove_entry_K_Key_V_isize_4 = closure_env_inherent_HashMapEntry_HashMapEntry_K_V_remove_entry_K_Key_V_isize_4{
+    var t1 closure_env_inherent_HashMapEn_h1223ced5d6b657dc820ae32765b9e640_K_Key_V_isize_4 = closure_env_inherent_HashMapEn_h1223ced5d6b657dc820ae32765b9e640_K_Key_V_isize_4{
         self_0: self__0,
     }
     var t2 func(int) Tuple2_3Key_3int = func(p0 int) Tuple2_3Key_3int {
-        return _goml_m_inherent_i_closure__en_h51dad037a23a0205e1d674d00df14e80_size__4_i_apply(t1, p0)
+        return _goml_m_inherent_i_closure__en_hb8860798f56bcf355ada2ae1a88ffcd5_size__4_i_apply(t1, p0)
     }
     switch t0._tag {
     case 0:
@@ -701,12 +701,12 @@ func _goml_m_inherent_i_Option_i_Option_l_T_r__i_is__some____T__isize(self__0 Op
     }
 }
 
-func _goml_m_inherent_i_HashMap_i_H_hfcee0d24f3f45608afc229b1d5b5eca7_ing____V__isize(self__0 *hashmap_string_int_x, key__0 string, update__0 func(int) int) Option__isize {
+func _goml_m_inherent_i_HashMap_i_H_ha8c97071ec043079f7afd33cd97792bc_ing____V__isize(self__0 *hashmap_string_int_x, key__0 string, update__0 func(int) int) Option__isize {
     var t0 Option__isize = hashmap_update__HashMap_6string_3int(self__0, key__0, update__0)
     return t0
 }
 
-func _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_get____K__string____V__isize(self__0 *hashmap_string_int_x, key__0 string) Option__isize {
+func _goml_m_inherent_i_HashMap_i_H_hf6c5171fdfb6ae69d96216f289ceca8e_ing____V__isize(self__0 *hashmap_string_int_x, key__0 string) Option__isize {
     var t0 Option__isize = hashmap_get__HashMap_6string_3int(self__0, key__0)
     return t0
 }
@@ -727,7 +727,7 @@ func __goml_builtin_int_to_string(value__0 int) string {
     }
 }
 
-func _goml_m_inherent_i_HashMap_i_H_h0e46f47d3ada08b881ff6860cdc9491c_Key____V__isize(self__0 *hashmap_Key_int_x, key__0 Key) Option__isize {
+func _goml_m_inherent_i_HashMap_i_H_he7fa92414f351eb800432582b5909367_Key____V__isize(self__0 *hashmap_Key_int_x, key__0 Key) Option__isize {
     var t0 Option__isize = hashmap_remove_value__HashMap_3Key_3int(self__0, key__0)
     return t0
 }
@@ -834,7 +834,7 @@ func _goml_m_inherent_i_closure__env__main__3_i_closure__env__main__3_i_apply(en
     return t0
 }
 
-func _goml_m_inherent_i_closure__en_h51dad037a23a0205e1d674d00df14e80_size__4_i_apply(env0 closure_env_inherent_HashMapEntry_HashMapEntry_K_V_remove_entry_K_Key_V_isize_4, value__0 int) Tuple2_3Key_3int {
+func _goml_m_inherent_i_closure__en_hb8860798f56bcf355ada2ae1a88ffcd5_size__4_i_apply(env0 closure_env_inherent_HashMapEn_h1223ced5d6b657dc820ae32765b9e640_K_Key_V_isize_4, value__0 int) Tuple2_3Key_3int {
     var t0 Key = env0.self_0.key
     var t1 Tuple2_3Key_3int = Tuple2_3Key_3int{
         _0: t0,

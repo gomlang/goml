@@ -481,43 +481,43 @@ func float_comparison_contracts() struct{} {
 }
 
 func collision_contracts() struct{} {
-    var values__0 *hashmap_CollisionKey_int32_x = _goml_m_inherent_i_HashMap_i_H_hc55bb71e9219d0c59c91622ae099ea85_onKey____V__i32()
+    var values__0 *hashmap_CollisionKey_int32_x = _goml_m_inherent_i_HashMap_i_H_hc5d9691f57defd26c5981cedc7e81a37_onKey____V__i32()
     var t0 CollisionKey = CollisionKey{
         value: 1,
     }
-    _goml_m_inherent_i_HashMap_i_H_h13877db3209e2e8534a556971ced5ab2_onKey____V__i32(values__0, t0, 10)
+    _goml_m_inherent_i_HashMap_i_H_h9574f4df06593df238bf9de087578d54_onKey____V__i32(values__0, t0, 10)
     var t1 CollisionKey = CollisionKey{
         value: 2,
     }
-    _goml_m_inherent_i_HashMap_i_H_h13877db3209e2e8534a556971ced5ab2_onKey____V__i32(values__0, t1, 20)
+    _goml_m_inherent_i_HashMap_i_H_h9574f4df06593df238bf9de087578d54_onKey____V__i32(values__0, t1, 20)
     var t2 CollisionKey = CollisionKey{
         value: 3,
     }
-    _goml_m_inherent_i_HashMap_i_H_h13877db3209e2e8534a556971ced5ab2_onKey____V__i32(values__0, t2, 30)
+    _goml_m_inherent_i_HashMap_i_H_h9574f4df06593df238bf9de087578d54_onKey____V__i32(values__0, t2, 30)
     var t3 CollisionKey = CollisionKey{
         value: 2,
     }
-    _goml_m_inherent_i_HashMap_i_H_h1189b7c51290244a02a1a6d496e4da69_onKey____V__i32(values__0, t3)
+    _goml_m_inherent_i_HashMap_i_H_hc5cac495932899c9b4bc889605fe4707_onKey____V__i32(values__0, t3)
     var t4 CollisionKey = CollisionKey{
         value: 1,
     }
-    var t5 Option__i32 = _goml_m_inherent_i_HashMap_i_H_h7d750efaf8a1803c39420b89990faf20_onKey____V__i32(values__0, t4)
+    var t5 Option__i32 = _goml_m_inherent_i_HashMap_i_H_h53e44cef7539a51bbb07e199bd89200d_onKey____V__i32(values__0, t4)
     print_opt_int(t5)
     var t6 CollisionKey = CollisionKey{
         value: 2,
     }
-    var t7 Option__i32 = _goml_m_inherent_i_HashMap_i_H_h7d750efaf8a1803c39420b89990faf20_onKey____V__i32(values__0, t6)
+    var t7 Option__i32 = _goml_m_inherent_i_HashMap_i_H_h53e44cef7539a51bbb07e199bd89200d_onKey____V__i32(values__0, t6)
     print_opt_int(t7)
     var t8 CollisionKey = CollisionKey{
         value: 3,
     }
-    var t9 Option__i32 = _goml_m_inherent_i_HashMap_i_H_h7d750efaf8a1803c39420b89990faf20_onKey____V__i32(values__0, t8)
+    var t9 Option__i32 = _goml_m_inherent_i_HashMap_i_H_h53e44cef7539a51bbb07e199bd89200d_onKey____V__i32(values__0, t8)
     print_opt_int(t9)
     var t10 CollisionKey = CollisionKey{
         value: 4,
     }
-    _goml_m_inherent_i_HashMap_i_H_h13877db3209e2e8534a556971ced5ab2_onKey____V__i32(values__0, t10, 40)
-    var t11 int = _goml_m_inherent_i_HashMap_i_H_h282dac09c2296c58cbcd9cfca496474b_onKey____V__i32(values__0)
+    _goml_m_inherent_i_HashMap_i_H_h9574f4df06593df238bf9de087578d54_onKey____V__i32(values__0, t10, 40)
+    var t11 int = _goml_m_inherent_i_HashMap_i_H_h79b179cb4bcd384fc293fbc731599572_onKey____V__i32(values__0)
     println__T_isize(t11)
     var t12 CollisionKey = CollisionKey{
         value: 4,
@@ -606,7 +606,7 @@ func collision_contracts() struct{} {
 }
 
 func reference_contracts() struct{} {
-    var values__0 *hashmap_Ref_12CollisionKey_string_x = _goml_m_inherent_i_HashMap_i_H_h88509d3b0dfc2392ba920998ecb79184_r_____V__string()
+    var values__0 *hashmap_Ref_12CollisionKey_string_x = _goml_m_inherent_i_HashMap_i_H_h6565388ad287ea469d74d729ce49f62a_r_____V__string()
     var t0 CollisionKey = CollisionKey{
         value: 1,
     }
@@ -712,22 +712,22 @@ func _goml_m_trait__impl_i_ToString_i_bool_i_to__string(self__0 bool) string {
     return t0
 }
 
-func _goml_m_inherent_i_HashMap_i_H_hc55bb71e9219d0c59c91622ae099ea85_onKey____V__i32() *hashmap_CollisionKey_int32_x {
+func _goml_m_inherent_i_HashMap_i_H_hc5d9691f57defd26c5981cedc7e81a37_onKey____V__i32() *hashmap_CollisionKey_int32_x {
     var t0 *hashmap_CollisionKey_int32_x = hashmap_new__HashMap_12CollisionKey_5int32()
     return t0
 }
 
-func _goml_m_inherent_i_HashMap_i_H_h13877db3209e2e8534a556971ced5ab2_onKey____V__i32(self__0 *hashmap_CollisionKey_int32_x, key__0 CollisionKey, value__0 int32) struct{} {
+func _goml_m_inherent_i_HashMap_i_H_h9574f4df06593df238bf9de087578d54_onKey____V__i32(self__0 *hashmap_CollisionKey_int32_x, key__0 CollisionKey, value__0 int32) struct{} {
     hashmap_set__HashMap_12CollisionKey_5int32(self__0, key__0, value__0)
     return struct{}{}
 }
 
-func _goml_m_inherent_i_HashMap_i_H_h1189b7c51290244a02a1a6d496e4da69_onKey____V__i32(self__0 *hashmap_CollisionKey_int32_x, key__0 CollisionKey) struct{} {
+func _goml_m_inherent_i_HashMap_i_H_hc5cac495932899c9b4bc889605fe4707_onKey____V__i32(self__0 *hashmap_CollisionKey_int32_x, key__0 CollisionKey) struct{} {
     hashmap_remove__HashMap_12CollisionKey_5int32(self__0, key__0)
     return struct{}{}
 }
 
-func _goml_m_inherent_i_HashMap_i_H_h7d750efaf8a1803c39420b89990faf20_onKey____V__i32(self__0 *hashmap_CollisionKey_int32_x, key__0 CollisionKey) Option__i32 {
+func _goml_m_inherent_i_HashMap_i_H_h53e44cef7539a51bbb07e199bd89200d_onKey____V__i32(self__0 *hashmap_CollisionKey_int32_x, key__0 CollisionKey) Option__i32 {
     var t0 Option__i32 = hashmap_get__HashMap_12CollisionKey_5int32(self__0, key__0)
     return t0
 }
@@ -740,12 +740,12 @@ func println__T_isize(value__0 int) struct{} {
     return struct{}{}
 }
 
-func _goml_m_inherent_i_HashMap_i_H_h282dac09c2296c58cbcd9cfca496474b_onKey____V__i32(self__0 *hashmap_CollisionKey_int32_x) int {
+func _goml_m_inherent_i_HashMap_i_H_h79b179cb4bcd384fc293fbc731599572_onKey____V__i32(self__0 *hashmap_CollisionKey_int32_x) int {
     var t0 int = hashmap_len__HashMap_12CollisionKey_5int32(self__0)
     return t0
 }
 
-func _goml_m_inherent_i_HashMap_i_H_h88509d3b0dfc2392ba920998ecb79184_r_____V__string() *hashmap_Ref_12CollisionKey_string_x {
+func _goml_m_inherent_i_HashMap_i_H_h6565388ad287ea469d74d729ce49f62a_r_____V__string() *hashmap_Ref_12CollisionKey_string_x {
     var t0 *hashmap_Ref_12CollisionKey_string_x = hashmap_new__HashMap_18Ref_12CollisionKey_6string()
     return t0
 }

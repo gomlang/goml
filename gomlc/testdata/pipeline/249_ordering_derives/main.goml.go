@@ -1281,8 +1281,8 @@ func main0() struct{} {
     var t45 bool = _goml_m_trait__impl_i_std_p_cmp_p_PartialOrd_i_Slice_l_isize_r__i_lt(t43, t44)
     var t46 string = _goml_m_trait__impl_i_ToString_i_bool_i_to__string(t45)
     println__T_string(t46)
-    var values__0 *hashmap_Vec_3int_string_x = _goml_m_inherent_i_HashMap_i_H_hca0cffb759e2572d7286850a43f94208_r_____V__string()
-    _goml_m_inherent_i_HashMap_i_H_hfc6d57fdfd8ace95a78adbd7155c7d4b_r_____V__string(values__0, first_values__0, "vector")
+    var values__0 *hashmap_Vec_3int_string_x = _goml_m_inherent_i_HashMap_i_H_hf77e89757ecb72b2d2edda5b220e658b_r_____V__string()
+    _goml_m_inherent_i_HashMap_i_H_h28e4f859aee62c4bd0dd4521c31d50d4_r_____V__string(values__0, first_values__0, "vector")
     var t47 [2]int = [2]int{1, 2}
     var t48 *_goml_vec_int = func(values [2]int) *_goml_vec_int {
         var storage struct {
@@ -1293,7 +1293,7 @@ func main0() struct{} {
         storage.vector.items = storage.values[0:len(storage.values)]
         return &storage.vector
     }(t47)
-    var t49 Option__string = _goml_m_inherent_i_HashMap_i_H_h0069152d187f39ec37f55a9b6f59774d_r_____V__string(values__0, t48)
+    var t49 Option__string = _goml_m_inherent_i_HashMap_i_H_hfd91eada8a739ebd06fce398ec6f06ce_r_____V__string(values__0, t48)
     var t50 string = _goml_m_inherent_i_Option_i_Option_l_T_r__i_unwrap__or____T__string(t49, "missing")
     println__T_string(t50)
     var default_tuple__0 Tuple2_3int_6string = _goml_m_trait__impl_i_Default_i__o_isize_c_string_q__i_default()
@@ -1566,17 +1566,17 @@ func _goml_m_trait__impl_i_std_p_cmp_p_PartialOrd_i_Slice_l_isize_r__i_lt(defaul
     }
 }
 
-func _goml_m_inherent_i_HashMap_i_H_hca0cffb759e2572d7286850a43f94208_r_____V__string() *hashmap_Vec_3int_string_x {
+func _goml_m_inherent_i_HashMap_i_H_hf77e89757ecb72b2d2edda5b220e658b_r_____V__string() *hashmap_Vec_3int_string_x {
     var t0 *hashmap_Vec_3int_string_x = hashmap_new__HashMap_8Vec_3int_6string()
     return t0
 }
 
-func _goml_m_inherent_i_HashMap_i_H_hfc6d57fdfd8ace95a78adbd7155c7d4b_r_____V__string(self__0 *hashmap_Vec_3int_string_x, key__0 *_goml_vec_int, value__0 string) struct{} {
+func _goml_m_inherent_i_HashMap_i_H_h28e4f859aee62c4bd0dd4521c31d50d4_r_____V__string(self__0 *hashmap_Vec_3int_string_x, key__0 *_goml_vec_int, value__0 string) struct{} {
     hashmap_set__HashMap_8Vec_3int_6string(self__0, key__0, value__0)
     return struct{}{}
 }
 
-func _goml_m_inherent_i_HashMap_i_H_h0069152d187f39ec37f55a9b6f59774d_r_____V__string(self__0 *hashmap_Vec_3int_string_x, key__0 *_goml_vec_int) Option__string {
+func _goml_m_inherent_i_HashMap_i_H_hfd91eada8a739ebd06fce398ec6f06ce_r_____V__string(self__0 *hashmap_Vec_3int_string_x, key__0 *_goml_vec_int) Option__string {
     var t0 Option__string = hashmap_get__HashMap_8Vec_3int_6string(self__0, key__0)
     return t0
 }

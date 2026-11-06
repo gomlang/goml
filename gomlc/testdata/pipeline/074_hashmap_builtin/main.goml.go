@@ -604,18 +604,18 @@ func print_opt_int(x__0 Option__i32) struct{} {
 }
 
 func main0() struct{} {
-    var m1__0 *hashmap_Key_int32_x = _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_new____K__Key____V__i32()
-    _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_set____K__Key____V__i32(m1__0, Key{
+    var m1__0 *hashmap_Key_int32_x = _goml_m_inherent_i_HashMap_i_H_hf682f16fd316637dff2ca715af6e7b42___Key____V__i32()
+    _goml_m_inherent_i_HashMap_i_H_h915e14b20545da34afb16ffe34ebf508___Key____V__i32(m1__0, Key{
         _tag: 0,
     }, 10)
     var t0 Key = Key{
         _p0: 1,
         _tag: 1,
     }
-    _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_set____K__Key____V__i32(m1__0, t0, 20)
-    var t1 int = _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_len____K__Key____V__i32(m1__0)
+    _goml_m_inherent_i_HashMap_i_H_h915e14b20545da34afb16ffe34ebf508___Key____V__i32(m1__0, t0, 20)
+    var t1 int = _goml_m_inherent_i_HashMap_i_H_h2e3f422399915927d0bc6934c7d13c3c___Key____V__i32(m1__0)
     println__T_isize(t1)
-    var t2 Option__i32 = _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_get____K__Key____V__i32(m1__0, Key{
+    var t2 Option__i32 = _goml_m_inherent_i_HashMap_i_H_h91c2eeafd3c06db61e22857d7f2ec13d___Key____V__i32(m1__0, Key{
         _tag: 0,
     })
     print_opt_int(t2)
@@ -623,22 +623,22 @@ func main0() struct{} {
         _p0: 1,
         _tag: 1,
     }
-    var t4 bool = _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_contains____K__Key____V__i32(m1__0, t3)
+    var t4 bool = _goml_m_inherent_i_HashMap_i_H_h0b4345f7607680f900856a740f91e58e___Key____V__i32(m1__0, t3)
     println__T_bool(t4)
     var t5 Key = Key{
         _p0: 1,
         _tag: 1,
     }
-    _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_remove____K__Key____V__i32(m1__0, t5)
+    _goml_m_inherent_i_HashMap_i_H_he891f667b273f98ec6e0d1dd0a9828af___Key____V__i32(m1__0, t5)
     var t6 Key = Key{
         _p0: 1,
         _tag: 1,
     }
-    var t7 bool = _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_contains____K__Key____V__i32(m1__0, t6)
+    var t7 bool = _goml_m_inherent_i_HashMap_i_H_h0b4345f7607680f900856a740f91e58e___Key____V__i32(m1__0, t6)
     println__T_bool(t7)
-    var t8 int = _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_len____K__Key____V__i32(m1__0)
+    var t8 int = _goml_m_inherent_i_HashMap_i_H_h2e3f422399915927d0bc6934c7d13c3c___Key____V__i32(m1__0)
     println__T_isize(t8)
-    var m2__0 *hashmap_Ref_5Point_int32_x = _goml_m_inherent_i_HashMap_i_H_h32f703bdb7b587c4ce71a39164c77ac4_nt_r_____V__i32()
+    var m2__0 *hashmap_Ref_5Point_int32_x = _goml_m_inherent_i_HashMap_i_H_hb018e2bfedf377be6adcbdf248fd69fc_nt_r_____V__i32()
     var t9 Point = Point{
         x: 1,
         y: 2,
@@ -649,8 +649,8 @@ func main0() struct{} {
         y: 2,
     }
     var p2__0 *ref_Point_x = _goml_m_inherent_i_Ref_i_Ref_l_T_r__i_new____T__Point(t10)
-    _goml_m_inherent_i_HashMap_i_H_h92e4b8ba44d2c4c111acc209f0277885_nt_r_____V__i32(m2__0, p1__0, 99)
-    var t11 Option__i32 = _goml_m_inherent_i_HashMap_i_H_hf74f21a0b6b06890f12f275bddb17d70_nt_r_____V__i32(m2__0, p1__0)
+    _goml_m_inherent_i_HashMap_i_H_h0366b68f115378582d319222f4c0055a_nt_r_____V__i32(m2__0, p1__0, 99)
+    var t11 Option__i32 = _goml_m_inherent_i_HashMap_i_H_ha6221e471f54efe7fa14c1dd14a61df7_nt_r_____V__i32(m2__0, p1__0)
     switch t11 != Option__i32(0) {
     case false:
         println__T_string("none")
@@ -747,12 +747,12 @@ func println__T_i32(value__0 int32) struct{} {
     return struct{}{}
 }
 
-func _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_new____K__Key____V__i32() *hashmap_Key_int32_x {
+func _goml_m_inherent_i_HashMap_i_H_hf682f16fd316637dff2ca715af6e7b42___Key____V__i32() *hashmap_Key_int32_x {
     var t0 *hashmap_Key_int32_x = hashmap_new__HashMap_3Key_5int32()
     return t0
 }
 
-func _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_set____K__Key____V__i32(self__0 *hashmap_Key_int32_x, key__0 Key, value__0 int32) struct{} {
+func _goml_m_inherent_i_HashMap_i_H_h915e14b20545da34afb16ffe34ebf508___Key____V__i32(self__0 *hashmap_Key_int32_x, key__0 Key, value__0 int32) struct{} {
     hashmap_set__HashMap_3Key_5int32(self__0, key__0, value__0)
     return struct{}{}
 }
@@ -765,12 +765,12 @@ func println__T_isize(value__0 int) struct{} {
     return struct{}{}
 }
 
-func _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_len____K__Key____V__i32(self__0 *hashmap_Key_int32_x) int {
+func _goml_m_inherent_i_HashMap_i_H_h2e3f422399915927d0bc6934c7d13c3c___Key____V__i32(self__0 *hashmap_Key_int32_x) int {
     var t0 int = hashmap_len__HashMap_3Key_5int32(self__0)
     return t0
 }
 
-func _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_get____K__Key____V__i32(self__0 *hashmap_Key_int32_x, key__0 Key) Option__i32 {
+func _goml_m_inherent_i_HashMap_i_H_h91c2eeafd3c06db61e22857d7f2ec13d___Key____V__i32(self__0 *hashmap_Key_int32_x, key__0 Key) Option__i32 {
     var t0 Option__i32 = hashmap_get__HashMap_3Key_5int32(self__0, key__0)
     return t0
 }
@@ -783,17 +783,17 @@ func println__T_bool(value__0 bool) struct{} {
     return struct{}{}
 }
 
-func _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_contains____K__Key____V__i32(self__0 *hashmap_Key_int32_x, key__0 Key) bool {
+func _goml_m_inherent_i_HashMap_i_H_h0b4345f7607680f900856a740f91e58e___Key____V__i32(self__0 *hashmap_Key_int32_x, key__0 Key) bool {
     var t0 bool = hashmap_contains__HashMap_3Key_5int32(self__0, key__0)
     return t0
 }
 
-func _goml_m_inherent_i_HashMap_i_HashMap_l_K_c_V_r__i_remove____K__Key____V__i32(self__0 *hashmap_Key_int32_x, key__0 Key) struct{} {
+func _goml_m_inherent_i_HashMap_i_H_he891f667b273f98ec6e0d1dd0a9828af___Key____V__i32(self__0 *hashmap_Key_int32_x, key__0 Key) struct{} {
     hashmap_remove__HashMap_3Key_5int32(self__0, key__0)
     return struct{}{}
 }
 
-func _goml_m_inherent_i_HashMap_i_H_h32f703bdb7b587c4ce71a39164c77ac4_nt_r_____V__i32() *hashmap_Ref_5Point_int32_x {
+func _goml_m_inherent_i_HashMap_i_H_hb018e2bfedf377be6adcbdf248fd69fc_nt_r_____V__i32() *hashmap_Ref_5Point_int32_x {
     var t0 *hashmap_Ref_5Point_int32_x = hashmap_new__HashMap_10Ref_5Point_5int32()
     return t0
 }
@@ -803,12 +803,12 @@ func _goml_m_inherent_i_Ref_i_Ref_l_T_r__i_new____T__Point(value__0 Point) *ref_
     return t0
 }
 
-func _goml_m_inherent_i_HashMap_i_H_h92e4b8ba44d2c4c111acc209f0277885_nt_r_____V__i32(self__0 *hashmap_Ref_5Point_int32_x, key__0 *ref_Point_x, value__0 int32) struct{} {
+func _goml_m_inherent_i_HashMap_i_H_h0366b68f115378582d319222f4c0055a_nt_r_____V__i32(self__0 *hashmap_Ref_5Point_int32_x, key__0 *ref_Point_x, value__0 int32) struct{} {
     hashmap_set__HashMap_10Ref_5Point_5int32(self__0, key__0, value__0)
     return struct{}{}
 }
 
-func _goml_m_inherent_i_HashMap_i_H_hf74f21a0b6b06890f12f275bddb17d70_nt_r_____V__i32(self__0 *hashmap_Ref_5Point_int32_x, key__0 *ref_Point_x) Option__i32 {
+func _goml_m_inherent_i_HashMap_i_H_ha6221e471f54efe7fa14c1dd14a61df7_nt_r_____V__i32(self__0 *hashmap_Ref_5Point_int32_x, key__0 *ref_Point_x) Option__i32 {
     var t0 Option__i32 = hashmap_get__HashMap_10Ref_5Point_5int32(self__0, key__0)
     return t0
 }

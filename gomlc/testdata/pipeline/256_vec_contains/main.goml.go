@@ -96,13 +96,13 @@ func main0() struct{} {
         storage.vector.items = storage.values[0:len(storage.values)]
         return &storage.vector
     }(t0)
-    var t1 bool = _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_contains____T__isize(values__0, 2)
+    var t1 bool = _goml_m_inherent_i_Vec_i_Vec_l_h15ebd1150b1d7395b8f7a200fd567439__r_____T__isize(values__0, 2)
     var t2 string
     var inline20 string = _goml_runtime_core_bool_to_string(t1)
     t2 = inline20
     var inline18 string = _goml_m_trait__impl_i_ToString_i_string_i_to__string(t2)
     _goml_runtime_core_string_println(inline18)
-    var t3 bool = _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_contains____T__isize(values__0, 9)
+    var t3 bool = _goml_m_inherent_i_Vec_i_Vec_l_h15ebd1150b1d7395b8f7a200fd567439__r_____T__isize(values__0, 9)
     var t4 string
     var inline17 string = _goml_runtime_core_bool_to_string(t3)
     t4 = inline17
@@ -118,7 +118,7 @@ func main0() struct{} {
         storage.vector.items = storage.values[0:len(storage.values)]
         return &storage.vector
     }(t5)
-    var t6 bool = _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_contains____T__string(names__0, "beta")
+    var t6 bool = _goml_m_inherent_i_Vec_i_Vec_l_h9278ce154e4b45ce8eb711707eaf2278_r_____T__string(names__0, "beta")
     var t7 string
     var inline14 string = _goml_runtime_core_bool_to_string(t6)
     t7 = inline14
@@ -142,7 +142,7 @@ func main0() struct{} {
         left: 1,
         right: 2,
     }
-    var t11 bool = _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_contains____T__Pair(pairs__0, t10)
+    var t11 bool = _goml_m_inherent_i_Vec_i_Vec_l_hd535c188423d8faa911963b473878d22_q_r_____T__Pair(pairs__0, t10)
     var t12 string
     var inline11 string = _goml_runtime_core_bool_to_string(t11)
     t12 = inline11
@@ -150,7 +150,7 @@ func main0() struct{} {
     _goml_runtime_core_string_println(inline9)
     var t13 bool
     var inline7 int = 3
-    var inline8 bool = _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_contains____T__isize(values__0, inline7)
+    var inline8 bool = _goml_m_inherent_i_Vec_i_Vec_l_h15ebd1150b1d7395b8f7a200fd567439__r_____T__isize(values__0, inline7)
     t13 = inline8
     var t14 string
     var inline6 string = _goml_runtime_core_bool_to_string(t13)
@@ -160,7 +160,7 @@ func main0() struct{} {
     var empty__0 *_goml_vec_string
     var inline3 *_goml_vec_string = vec_new__Vec_6string()
     empty__0 = inline3
-    var t15 bool = _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_contains____T__string(empty__0, "x")
+    var t15 bool = _goml_m_inherent_i_Vec_i_Vec_l_h9278ce154e4b45ce8eb711707eaf2278_r_____T__string(empty__0, "x")
     var t16 string
     var inline2 string = _goml_runtime_core_bool_to_string(t15)
     t16 = inline2
@@ -174,7 +174,7 @@ func _goml_m_trait__impl_i_PartialEq_i_isize_i_eq(self__0 int, other__0 int) boo
     return t0
 }
 
-func _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_contains____T__isize(self__0 *_goml_vec_int, expected__0 int) bool {
+func _goml_m_inherent_i_Vec_i_Vec_l_h15ebd1150b1d7395b8f7a200fd567439__r_____T__isize(self__0 *_goml_vec_int, expected__0 int) bool {
     var index__0 int = 0
     Loop_loop0:
     for {
@@ -202,7 +202,7 @@ func _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_contains____T__isize(self__0 *_goml_v
     return false
 }
 
-func _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_contains____T__string(self__0 *_goml_vec_string, expected__0 string) bool {
+func _goml_m_inherent_i_Vec_i_Vec_l_h9278ce154e4b45ce8eb711707eaf2278_r_____T__string(self__0 *_goml_vec_string, expected__0 string) bool {
     var index__0 int = 0
     Loop_loop0:
     for {
@@ -230,7 +230,7 @@ func _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_contains____T__string(self__0 *_goml_
     return false
 }
 
-func _goml_m_inherent_i_Vec_i_Vec_l_T_r__i_contains____T__Pair(self__0 *_goml_vec_Pair, expected__0 Pair) bool {
+func _goml_m_inherent_i_Vec_i_Vec_l_hd535c188423d8faa911963b473878d22_q_r_____T__Pair(self__0 *_goml_vec_Pair, expected__0 Pair) bool {
     var index__0 int = 0
     Loop_loop0:
     for {
