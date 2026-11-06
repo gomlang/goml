@@ -566,9 +566,9 @@ fn absurd(value: Never) -> i32 {
 }
 ```
 
-Exhaustive analysis ignores enumeration variants with no value for the payload type and also identifies purely recursive enumerations with no base variant. For example, `enum MaybeNever { Empty, Filled(Never) }` requires only an `Empty` arm; `enum Loop { Next(Loop) }` has no constructible value.
+Exhaustive analysis ignores enumeration variants with no value for the payload type and also identifies purely recursive enumerations with no base variant. For example, `enum MaybeNever { Empty, Filled(Never) }` requires only an `Empty` arm; `enum Loop { Next(Loop) }` has no constructible value. This also applies when recursive calls change type arguments, such as `enum Endless[T] { Next(Endless[Vec[T]]) }`.
 
-Branches with normal guards do not provide exhaustive coverage because guard may be false; subsequent unguarded branches are usually required. String and floating-point literals cannot enumerate the entire type, and `_` is also usually required when matching these types. In floating-point patterns, `-0.0` and `0.0` are regarded as the same value.
+Branches with normal guards do not provide exhaustive coverage because guard may be false; subsequent unguarded branches are usually required. String and floating-point literals cannot enumerate the entire type, and `_` is also usually required when matching these types. In floating-point patterns, `-0.0` and `0.0` are regarded as the same value. A named constant whose value is unavailable to coverage analysis does not disable exhaustiveness checking; add a wildcard arm when the remaining patterns cannot prove full coverage.
 
 There are no `ref` or `ref mut` patterns. `mut name` is supported for individual bindings, `dyn Trait` values support variable, wildcard, alias (`name @ _`), and or-patterns composed of these bindings, but cannot be destructured.
 

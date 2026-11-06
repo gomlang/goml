@@ -2,12 +2,13 @@ package checker;
 
 use module::diagnostic::{DiagnosticSeverity, Diagnostic};
 use module::ctir;
+use module::consts;
 use module::hir;
 use std::cmp;
 use std::collections;
 use std::num;
 use std::text;
-use module::tast::{Arm, ArrayPatRest, Block, Callable, Constant, Constructor, DependencyEnvironment, EnumInfo, EnumVariantInfo, Expr, File, ImplBlock, Item, MatchCoverageInfo, Pat, Primitive, StructInfo, Type, TypeSubst, enum_variant_field_types, expr_type, pat_type, prune, resolve_type, short_name, substitute_type, symbolic_array, write_type};
+use module::tast::{Arm, ArrayPatRest, Block, Callable, Constant, Constructor, DependencyEnvironment, EnumInfo, EnumVariantInfo, Expr, File, ImplBlock, Item, MatchCoverageInfo, Pat, Primitive, StructInfo, Type, TypeSubst, any_child_type, enum_variant_field_types, expr_type, pat_type, prune, resolve_type, short_name, substitute_type, symbolic_array, write_type};
 
 struct CoverageConstructor {
     key: string,
@@ -833,11 +834,71 @@ fn coverage_constructor_inhabited_at(
     true
 }
 
+fn coverage_type_is_parametric(ctx: CoverageContext, ty: Type, visiting: Vec[string]) -> bool {
+    match prune(ty) {
+        Projection { .. } => false,
+        Con { name } => {
+            if visiting.contains(name) {
+                return true
+            }
+            let next = copied_names(visiting);
+            next.push(name);
+            if let Some(domain) = coverage_domain(ctx, ty) {
+                for constructor in domain {
+                    for field in constructor.fields {
+                        if !coverage_type_is_parametric(ctx, field, next) {
+                            return false
+                        }
+                    }
+                }
+            }
+            true
+        },
+        other => !any_child_type(other, |child| !coverage_type_is_parametric(ctx, child, visiting)),
+    }
+}
+
+fn coverage_inhabitation_type(ctx: CoverageContext, ty: Type, visiting: Vec[string], depth: isize) -> Type {
+    if let App { ty: Con { name }, args } = prune(ty) {
+        if !coverage_type_is_parametric(ctx, Type::Con { name }, Vec::new()) {
+            return ty
+        }
+        let parameters = match coverage_find_enum(ctx, name) {
+            Some(info) => info.generics,
+            None => match coverage_find_struct(ctx, name) {
+                Some(info) => info.generics,
+                None => match builtin_source_enum_info(name) {
+                    Some(info) => info.generics,
+                    None => return ty,
+                },
+            },
+        };
+        if parameters.len() != args.len() {
+            return ty
+        }
+        let abstract_args: Vec[Type] = Vec::new();
+        for index in 0..args.len() {
+            abstract_args.push(
+                if consts::parameter_name(parameters[index]).is_some() {
+                    args[index]
+                } else if coverage_type_inhabited_at(ctx, args[index], visiting, depth + 1) {
+                    Type::Unit
+                } else {
+                    Type::Never
+                },
+            )
+        }
+        Type::App { ty: Type::Con { name }, args: abstract_args }
+    } else {
+        ty
+    }
+}
+
 fn coverage_type_inhabited_at(ctx: CoverageContext, ty: Type, visiting: Vec[string], depth: isize) -> bool {
     if depth >= 128 {
         true
     } else {
-        let key = coverage_type_key(ty);
+        let key = coverage_type_key(coverage_inhabitation_type(ctx, ty, visiting, depth));
         if visiting.contains(key) {
             false
         } else {
@@ -1850,9 +1911,7 @@ fn match_coverage_diagnostics(
         return diagnostics
     }
     let arms = resolve_finalized_arms(arms, module, dependencies);
-    if match_arms_have_constants(arms) {
-        return diagnostics
-    }
+    let unresolved_constants = match_arms_have_constants(arms);
     let analysis_arms: Vec[Arm] = Vec::new();
     for index in 0..arms.len() {
         let arm = arms[index];
@@ -1868,7 +1927,11 @@ fn match_coverage_diagnostics(
             },
         )
     }
-    let useful_arms = match_useful_arms(context, analysis_arms);
+    let useful_arms = if unresolved_constants {
+        Vec::new()
+    } else {
+        match_useful_arms(context, analysis_arms)
+    };
     let mut invalid_coverage_seen = false;
     for index in 0..useful_arms.len() {
         if invalid_coverage_seen || !(useful_arms[index]) {
