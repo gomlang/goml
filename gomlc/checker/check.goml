@@ -4055,20 +4055,21 @@ fn check_index_expr(ctx: Checker, base_source: hir::Expr, index_source: hir::Exp
     } else if hir_expr_always_exits_loop_control(index_source) {
         Expr::Index { base, index: check_expr(ctx, index_source, Option::None), ty: Type::Never }
     } else {
-        let parts = match prune(expr_type(base)) {
-            Array { len: _, elem } | VecType { elem } | Slice { elem } | MutSlice { elem } => {
-                (Type::Int, elem)
-            },
-            value if symbolic_array(value).is_some() => {
-                let parts = symbolic_array(value).unwrap_or((Type::Error, Type::Error));
-                (Type::Int, parts.1)
-            },
-            HashMap { key, value } => (
-                key,
-                nominal_type(ctx.builtin, ctx.builtin.option.name, one_type(value)),
-            ),
-            String => (Type::Int, Type::Char),
-            _ => {
+        let parts = match index_operand_types(ctx, expr_type(base)) {
+            Some(parts) => parts,
+            None => if is_unbound_any_type(expr_type(base)) {
+                let index_ty = fresh_type(ctx.inference.counter, VarKind::Any);
+                let result_ty = fresh_type(ctx.inference.counter, VarKind::Any);
+                ctx.inference.index_constraints.push(
+                    IndexConstraint {
+                        receiver: expr_type(base),
+                        index_ty,
+                        result_ty,
+                        span: ctx.current_span.get(),
+                    },
+                );
+                (index_ty, result_ty)
+            } else {
                 push_diagnostic(ctx, "indexable value required");
                 (Type::Error, Type::Error)
             },
@@ -4134,6 +4135,8 @@ fn validate_assignment_slice_path(ctx: Checker, value: Expr, span: ast::Span) ->
             "cannot assign through Slice indexing; Slice is read-only",
             Some(span),
         )
+    } else if !ctx.inference.index_constraints.is_empty() {
+        ctx.inference.index_assignment_constraints.push(IndexAssignmentConstraint { value, span });
     }
 }
 
@@ -4431,13 +4434,13 @@ fn check_for_expr(
     }
     let item = into_iterator_item_type(ctx, source_ty);
     let typed_pat = check_pattern(ctx, pat, item);
-    if pattern_is_irrefutable(coverage_context(ctx), typed_pat) {} else {
-        push_diagnostic_at(
-            ctx,
-            "Refutable pattern is not allowed in for loop; use match instead",
-            Some(pat_span),
-        )
-    }
+    require_pattern_refutability(
+        ctx,
+        typed_pat,
+        false,
+        "Refutable pattern is not allowed in for loop; use match instead",
+        pat_span,
+    );
     ctx.loop_depth.set(ctx.loop_depth.get() + 1);
     push_loop_result(ctx, LoopResult { label, result_ty: Option::None, has_break: Ref::new(false) });
     let body = check_expr(ctx, body_source, Option::None);
@@ -5871,15 +5874,15 @@ fn check_stmt(ctx: Checker, value: hir::Stmt) -> Stmt {
             let pattern_diagnostic_count = ctx.diagnostics.len();
             let pattern = check_pattern(ctx, pat, normalize_type(ctx, pattern_ty));
             let valid_pattern = ctx.diagnostics.len() == pattern_diagnostic_count;
-            let irrefutable = simple_pattern
-                || pattern_is_irrefutable(coverage_context(ctx), pattern);
             match else_branch {
                 Some(source_else) => {
-                    if valid_pattern && irrefutable {
-                        push_diagnostic_at(
+                    if valid_pattern {
+                        require_pattern_refutability(
                             ctx,
+                            pattern,
+                            true,
                             "`let else` requires a refutable pattern",
-                            Some(pat.span),
+                            pat.span,
                         )
                     }
                     let syntactically_exits = hir_expr_always_exits_loop_control(source_else);
@@ -5908,11 +5911,13 @@ fn check_stmt(ctx: Checker, value: hir::Stmt) -> Stmt {
                     }
                 },
                 None => {
-                    if !valid_pattern || irrefutable {} else {
-                        push_diagnostic_at(
+                    if valid_pattern && !simple_pattern {
+                        require_pattern_refutability(
                             ctx,
+                            pattern,
+                            false,
                             "Refutable pattern is not allowed in let binding; use match instead",
-                            Some(pat.span),
+                            pat.span,
                         )
                     }
                     Let { is_mut, pat: pattern, value: expression }
