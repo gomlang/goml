@@ -881,6 +881,8 @@ go || {
 };
 ```
 
+The expected callback signature `() -> ()` can infer an unknown operand or a generic function value.
+
 Don't write `go work();`; that evaluates `work()` first, while `go` requires a value of type `() -> ()`. Write `go || work();` instead.
 
 `go` is a detached, unstructured escape hatch. Its lifetime is not tied to the caller, it does not return a task handle, and its failures are not propagated. Use `std::task` when the caller must wait for child work or coordinate cancellation.
