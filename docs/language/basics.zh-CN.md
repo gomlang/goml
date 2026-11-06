@@ -736,7 +736,7 @@ let result = loop {
 };
 ```
 
-指向同一 `loop` 的所有 `break` 值必须类型兼容。`break;` 提供 `()`，不能与其他 break 值类型混用。没有指向自身的 `break` 的 `loop` 类型为 `never`，不会继续到后续表达式。无标签 `break` 和 `continue` 指向最近的循环。
+指向同一 `loop` 的所有 `break` 值必须类型兼容。`break;` 提供 `()`，不能与其他 break 值类型混用。值类型为 `never` 的 `break` 会在退出目标循环之前发散。没有其他指向自身的 `break` 的 `loop` 类型为 `never`，不会继续到后续表达式。无标签 `break` 和 `continue` 指向最近的循环。
 
 <a id="for"></a>
 
