@@ -304,7 +304,7 @@ let value: isize = number.get();
 
 关联类型绑定必须引用该约束或唯一父 trait 声明的类型。每个约束内，同一名称只能绑定一次。若多个父 trait 声明同名关联类型，应在声明它的 trait 上指定绑定，例如 `impl Child + A[Item = i32] + B[Item = string]`。
 
-分派仍是静态的，并参与单态化；`impl Trait` 不创建 trait 对象，也不要求约束 dyn 安全。需要 trait 对象时，请显式转换为 `as dyn Trait`。`impl Trait` 只支持作为顶层函数或固有方法的完整返回类型。不能出现在参数、类型别名、局部类型标注、`Option[impl Trait]` 这样的嵌套返回类型或 trait 方法声明中。
+当 blanket 实现的要求可由公开约束和关联类型绑定证明时，也可以调用该实现的方法。分派仍是静态的，并参与单态化；`impl Trait` 不创建 trait 对象，也不要求约束 dyn 安全。需要 trait 对象时，请显式转换为 `as dyn Trait`。`impl Trait` 只支持作为顶层函数或固有方法的完整返回类型。不能出现在参数、类型别名、局部类型标注、`Option[impl Trait]` 这样的嵌套返回类型或 trait 方法声明中。
 
 不透明约束当前接受位置类型实参和关联类型绑定，不接受 `impl Fixed[4]` 这样的整数常量实参。
 
@@ -937,7 +937,7 @@ fn finish(value: dyn Consumer[string] + Close) -> string {
 }
 ```
 
-父 trait 方法仍可用。 只要 trait 实参匹配，dyn 类型也满足其主 trait、附加 trait 和父 trait 对应的泛型约束。泛型代码中的调用仍使用动态分派。不同组成 trait 提供同名方法时，使用 UFCS 选择 trait，例如 `A::render(value)` 或 `B::render(value)`。泛型 trait 使用 `Consumer::[string]::consume(value, "hello")`。
+父 trait 方法仍可用。 只要 trait 实参匹配，dyn 类型也满足其主 trait、附加 trait 和父 trait 对应的泛型约束。泛型代码中的调用仍使用动态分派。当对象公开的约束满足 blanket 实现的要求时，也可以调用该实现提供的方法。不同组成 trait 提供同名方法时，使用 UFCS 选择 trait，例如 `A::render(value)` 或 `B::render(value)`。泛型 trait 使用 `Consumer::[string]::consume(value, "hello")`。
 
 约束顺序不改变对象类型：`dyn A + B` 与 `dyn B + A` 兼容。重复 trait 名会被拒绝，即使泛型实参不同。父 trait 路径对同一 trait 的泛型实参必须一致。子 trait 方法优先于从父 trait 继承的方法；无关同名方法需要 UFCS。
 
