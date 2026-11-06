@@ -230,6 +230,8 @@ let counts = HashMap::from_array([("a", 1), ("b", 2)]);
 let value: Option[i32] = counts.get("a");
 ```
 
+当每个元素都满足键类型的 trait 要求时，数组和元组也满足这些要求，包括具名元素类型上手写或派生的实现。该规则也适用于嵌套数组和元组。trait 特化检查递归要求时，最多允许 4096 个证明步骤或类型节点以及 128 层嵌套目标；超过限制会产生诊断。
+
 `HashMap::from_array([(key, value), ...])` 从条目数组创建映射。先从左到右求值整个数组，再按数组顺序插入键值对。后面的重复键覆盖先前条目。空映射使用 `HashMap::new()`。直接数组字面量调用根据条目数预分配构建存储。数组长度由函数类型固定时，该关联函数是普通一等值。
 
 常用方法：`new`、`from_array`、`get`、`set`、`insert`、`get_or_insert_with`、`update`、`remove`、`remove_value`、`entry`、`len`、`contains` 和 `entries`。`insert` 返回旧值，`update` 仅键存在时应用 `(V) -> V` 闭包，`remove_value` 返回移除值。`entries()` 返回快照 `Vec[(K, V)]`。

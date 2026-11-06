@@ -230,6 +230,8 @@ let counts = HashMap::from_array([("a", 1), ("b", 2)]);
 let value: Option[i32] = counts.get("a");
 ```
 
+Arrays and tuples satisfy the key traits when every element does, including user-written and derived implementations on named element types. This rule also applies to nested arrays and tuples. Trait specialization checks recursive obligations with limits of 4096 proof steps or type nodes and 128 nested goals; exceeding a limit produces a diagnostic.
+
 `HashMap::from_array([(key, value), ...])` creates a map from an entries array. It first evaluates the complete array from left to right, then inserts its pairs in array order. Later duplicate keys overwrite earlier entries. Use `HashMap::new()` for an empty map. Direct array-literal calls preallocate their build storage from the entry count. The associated function is an ordinary first-class value when its array length is fixed by a function type.
 
 Commonly used methods: `new`, `from_array`, `get`, `set`, `insert`, `get_or_insert_with`, `update`, `remove`, `remove_value`, `entry`, `len`, `contains`, and `entries`. `insert` returns the previous value, `update` applies a `(V) -> V` closure only when the key exists, and `remove_value` returns the removed value. `entries()` returns a snapshot `Vec[(K, V)]`.

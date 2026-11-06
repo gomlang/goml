@@ -1,0 +1,167 @@
+package mono;
+
+use module::core;
+use module::tast;
+
+fn trait_proof_type_size_allowed(for_ty: core::Type, reference: core::TraitRef) -> bool {
+    let pending = Vec::from_array([for_ty]);
+    for argument in reference.args {
+        pending.push(argument);
+    }
+    let mut count = 0;
+    while let Some(value) = pending.pop() {
+        count += 1;
+        if count > 4096 {
+            return false
+        }
+        match value {
+            Tuple { items } => for item in items {
+                pending.push(item);
+            },
+            App { ty, args } => {
+                pending.push(ty);
+                for argument in args {
+                    pending.push(argument);
+                }
+            },
+            External { args, .. } => for argument in args {
+                pending.push(argument);
+            },
+            Array { elem, .. } | Slice { elem } | MutSlice { elem } | VecType { elem } | GoPointer {
+                elem,
+            } | RefType { elem } | Channel { elem, .. } => pending.push(elem),
+            GoFunction { signature } => pending.push(signature),
+            HashMap { key, value } | GoMap { key, value } => {
+                pending.push(key);
+                pending.push(value);
+            },
+            Func { params, ret_ty } => {
+                pending.push(ret_ty);
+                for parameter in params {
+                    pending.push(parameter);
+                }
+            },
+            Projection { for_ty, trait_ref, .. } => {
+                pending.push(for_ty);
+                if let Some(reference) = trait_ref {
+                    for argument in reference.args {
+                        pending.push(argument);
+                    }
+                }
+            },
+            Dyn { args, associated_types, additional_bounds, .. } => {
+                for argument in args {
+                    pending.push(argument);
+                }
+                for associated in associated_types {
+                    pending.push(associated.1);
+                }
+                for bound in additional_bounds {
+                    for argument in bound.args {
+                        pending.push(argument);
+                    }
+                    for associated in bound.associated_types {
+                        pending.push(associated.1);
+                    }
+                }
+            },
+            _ => (),
+        }
+    }
+    true
+}
+
+fn enter_trait_search_goal(
+    ctx: SpecializeCtx,
+    goals: Vec[(tast::Type, tast::TraitRef)],
+    for_ty: core::Type,
+    reference: core::TraitRef,
+) -> bool {
+    if ctx.trait_goals.is_empty() && ctx.trait_selection_goals.is_empty() {
+        ctx.trait_steps.set(0);
+    }
+    if ctx.trait_goals.len() + ctx.trait_selection_goals.len() >= 128
+        || ctx.trait_steps.get() >= 4096
+        || !trait_proof_type_size_allowed(for_ty, reference) {
+        set_specialization_error(
+            ctx,
+            "Trait proof exceeds the 4096-step/node or 128-level specialization limit",
+        );
+        return false
+    }
+    let goal = (core::type_to_tast(for_ty), core::trait_ref_to_tast(reference));
+    if trait_proof_goal_active(goals, goal) {
+        return false
+    }
+    ctx.trait_steps.set(ctx.trait_steps.get() + 1);
+    goals.push(goal);
+    true
+}
+
+fn trait_predicate_satisfied(
+    ctx: SpecializeCtx,
+    for_ty: core::Type,
+    reference: core::TraitRef,
+    bindings: Vec[TypeBinding],
+) -> bool {
+    if !enter_trait_search_goal(ctx, ctx.trait_goals, for_ty, reference) {
+        return false
+    }
+    let result = builtin_trait_satisfied(ctx, for_ty, reference)
+        || matching_trait_selections(ctx, for_ty, reference, bindings).len() == 1;
+    ctx.trait_goals.truncate(ctx.trait_goals.len() - 1);
+    result
+}
+
+fn trait_proof_types_identical(left: tast::Type, right: tast::Type) -> bool {
+    if !tast::types_equal(left, right) {
+        return false
+    }
+    if let (Projection { trait_ref: first, .. }, Projection { trait_ref: second, .. }) = (
+        left,
+        right,
+    ) {
+        match (first, second) {
+            (Some(first), Some(second)) => if first.name != second.name {
+                return false
+            },
+            (None, None) => (),
+            _ => return false,
+        }
+    }
+    let first = Vec::new();
+    let second = Vec::new();
+    tast::for_each_child_type(left, |child| first.push(child));
+    tast::for_each_child_type(right, |child| second.push(child));
+    if first.len() != second.len() {
+        return false
+    }
+    for index in 0..first.len() {
+        if !trait_proof_types_identical(first[index], second[index]) {
+            return false
+        }
+    }
+    true
+}
+
+fn trait_proof_goal_active(
+    goals: Vec[(tast::Type, tast::TraitRef)],
+    goal: (tast::Type, tast::TraitRef),
+) -> bool {
+    for previous in goals {
+        if previous.1.name != goal.1.name || previous.1.args.len() != goal.1.args.len()
+            || !trait_proof_types_identical(previous.0, goal.0) {
+            continue
+        }
+        let mut same = true;
+        for index in 0..previous.1.args.len() {
+            if !trait_proof_types_identical(previous.1.args[index], goal.1.args[index]) {
+                same = false;
+            }
+        }
+        if same {
+            return true
+        }
+    }
+    false
+}
