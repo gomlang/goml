@@ -869,7 +869,7 @@ fn capacity[T: Capacity]() -> usize {
 }
 ```
 
-Initializers support literals, constant paths, unary and binary operations, casts, and composite constant construction. They cannot perform ordinary function or method calls or access runtime locals. A generic implementation can use its const parameters in the initializer. Non-generic inherent integer constants can also supply array lengths. Associated constant patterns and trait-associated constants in length expressions are not supported. Traits with associated constants cannot be used as `dyn` traits.
+Initializers support literals, constant paths, unary and binary operations, casts, and composite constant construction. They cannot perform ordinary function or method calls or access runtime locals. A generic implementation can use its const parameters in the initializer. Non-generic inherent integer constants can also supply array lengths. Associated constant patterns and trait-associated constants in length expressions are not supported. Traits with associated constants cannot be used as `dyn` traits. Constant dependencies are checked after resolving aliases and concrete owner arguments, across all files in a package and through imported generic constant dependencies; cyclic dependencies are rejected, while finite dependency chains have no cycle-depth cutoff. Trait-qualified access such as `Capacity::LIMIT` requires context that determines `Self`; use a concrete owner when the constant type does not determine it.
 
 <a id="dyn-trait"></a>
 

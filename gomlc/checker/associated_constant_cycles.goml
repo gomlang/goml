@@ -1,0 +1,445 @@
+package checker;
+
+use module::diagnostic::{Diagnostic};
+use module::hir;
+use module::ast;
+use module::tast::{AssociatedConstantDependencies, Block, ComptimeCapability, Callable, DependencyEnvironment, Expr, File, Function, TraitRef, Type, TypePredicate, TypeSubst, builtin_contract, find_substitution, map_block_exprs, map_child_exprs, map_child_types, resolve_type, substitute_type, type_text, types_equal};
+
+struct ConstantDeclaration {
+    function: Function,
+    owner: Option[Type],
+    trait_ref: Option[TraitRef],
+    generics: Vec[string],
+    predicates: Vec[TypePredicate],
+    calls: Vec[Callable],
+}
+
+struct ConstantInstance {
+    declaration: isize,
+    bindings: Vec[TypeSubst],
+}
+
+fn constant_calls(value: Expr, calls: Vec[Callable]) -> Expr {
+    if let Callable { callable, .. } = value {
+        calls.push(callable)
+    }
+    map_child_exprs(value, |child| constant_calls(child, calls))
+}
+
+fn constant_match_type(pattern: Type, value: Type, generics: Vec[string], bindings: Vec[TypeSubst]) -> bool {
+    let pattern = resolve_type(pattern);
+    let value = resolve_type(value);
+    if let Param { name } = pattern {
+        if generics.contains(name) {
+            if let Some(previous) = find_substitution(bindings, name) {
+                return types_equal(previous, value)
+            }
+            bindings.push(TypeSubst { name, ty: value });
+            return true
+        }
+    }
+    let left = Vec::new();
+    let right = Vec::new();
+    let left_shape = map_child_types(
+        pattern,
+        |child| {
+            left.push(child);
+            Type::Unit
+        },
+    );
+    let right_shape = map_child_types(
+        value,
+        |child| {
+            right.push(child);
+            Type::Unit
+        },
+    );
+    if !types_equal(left_shape, right_shape) || left.len() != right.len() {
+        return false
+    }
+    for index in 0..left.len() {
+        if !constant_match_type(left[index], right[index], generics, bindings) {
+            return false
+        }
+    }
+    true
+}
+
+fn constant_instance_index(instances: Vec[ConstantInstance], value: ConstantInstance) -> isize {
+    for index in 0..instances.len() {
+        let other = instances[index];
+        if other.declaration != value.declaration || other.bindings.len() != value.bindings.len() {
+            continue
+        }
+        let mut same = true;
+        for binding in value.bindings {
+            match find_substitution(other.bindings, binding.name) {
+                Some(ty) => if !projection_search_types_equal(ty, binding.ty) {
+                    same = false;
+                },
+                None => {
+                    same = false;
+                },
+            }
+        }
+        if same {
+            return index
+        }
+    }
+    instances.push(value);
+    instances.len() - 1
+}
+
+fn constant_substitution_allowed(value: Type, bindings: Vec[TypeSubst]) -> bool {
+    let names = Vec::new();
+    let arguments = Vec::new();
+    for binding in bindings {
+        names.push(binding.name);
+        arguments.push(binding.ty)
+    }
+    type_requirement_substitution_allowed(value, names, arguments)
+}
+
+fn constant_predicates_allowed(predicates: Vec[TypePredicate], bindings: Vec[TypeSubst]) -> bool {
+    for predicate in predicates {
+        let values = Vec::new();
+        match predicate {
+            GoComparable(ty) | GoFunction(ty) | ConstValid { ty, .. } => values.push(ty),
+            Equality { lhs, rhs } => {
+                values.push(lhs);
+                values.push(rhs)
+            },
+            Trait { for_ty, trait_ref } => {
+                values.push(for_ty);
+                for argument in trait_ref.args {
+                    values.push(argument)
+                }
+            },
+        }
+        for value in values {
+            if !constant_substitution_allowed(value, bindings) {
+                return false
+            }
+        }
+    }
+    true
+}
+
+fn constant_callable_allowed(callable: Callable, bindings: Vec[TypeSubst]) -> bool {
+    let values = Vec::new();
+    match callable {
+        MethodInstance { callable, args } => {
+            if !constant_callable_allowed(callable, bindings) {
+                return false
+            }
+            for argument in args {
+                values.push(argument)
+            }
+        },
+        InherentMethod { receiver_ty, .. } => values.push(receiver_ty),
+        TraitMethod { for_ty, trait_ref, .. } => {
+            values.push(for_ty);
+            for argument in trait_ref.args {
+                values.push(argument)
+            }
+        },
+        FunctionInstance { bindings: arguments, .. } => for argument in arguments {
+            values.push(argument.1)
+        },
+        _ => (),
+    }
+    for value in values {
+        if !constant_substitution_allowed(value, bindings) {
+            return false
+        }
+    }
+    true
+}
+
+fn constant_call_targets(
+    ctx: Checker,
+    declarations: Vec[ConstantDeclaration],
+    callable: Callable,
+    substitutions: Vec[TypeSubst],
+) -> Result[Vec[ConstantInstance], string] {
+    if !constant_callable_allowed(callable, substitutions) {
+        return Err("associated constant dependency expansion exceeds compiler limit")
+    }
+    let result = Vec::new();
+    if let MethodInstance { callable, .. } = callable {
+        return constant_call_targets(ctx, declarations, callable, substitutions)
+    }
+    for index in 0..declarations.len() {
+        let declaration = declarations[index];
+        let bindings = Vec::new();
+        let matched = match callable {
+            Function(name) => declaration.owner.is_none() && declaration.function.name == name,
+            FunctionInstance { name, bindings: arguments } => {
+                for argument in arguments {
+                    bindings.push(
+                        TypeSubst {
+                            name: argument.0,
+                            ty: substitute_type(argument.1, substitutions),
+                        },
+                    )
+                }
+                declaration.owner.is_none() && declaration.function.name == name
+            },
+            InherentMethod { receiver_ty, method_name } => match declaration.owner {
+                Some(owner) => declaration.trait_ref.is_none()
+                    && declaration.function.name == method_name
+                    && constant_match_type(
+                        owner,
+                        substitute_type(receiver_ty, substitutions),
+                        declaration.generics,
+                        bindings,
+                    ),
+                None => false,
+            },
+            TraitMethod { for_ty, trait_ref, method_name, .. } => match (
+                declaration.owner,
+                declaration.trait_ref,
+            ) {
+                (Some(owner), Some(reference)) => {
+                    let mut matches = declaration.function.name == method_name
+                        && reference.name == trait_ref.name
+                        && reference.args.len() == trait_ref.args.len()
+                        && constant_match_type(
+                            owner,
+                            substitute_type(for_ty, substitutions),
+                            declaration.generics,
+                            bindings,
+                        );
+                    if matches {
+                        for argument in 0..reference.args.len() {
+                            if !constant_match_type(
+                                reference.args[argument],
+                                substitute_type(trait_ref.args[argument], substitutions),
+                                declaration.generics,
+                                bindings,
+                            ) {
+                                matches = false;
+                            }
+                        }
+                    }
+                    matches
+                },
+                _ => false,
+            },
+            _ => false,
+        };
+        if matched && !constant_predicates_allowed(declaration.predicates, bindings) {
+            return Err("associated constant dependency expansion exceeds compiler limit")
+        }
+        if matched
+            && method_predicates_satisfied(
+                ctx,
+                substitute_predicates(declaration.predicates, bindings),
+            ) {
+            result.push(ConstantInstance { declaration: index, bindings })
+        }
+    }
+    Ok(result)
+}
+
+fn constant_cycle_from(ctx: Checker, declarations: Vec[ConstantDeclaration], root: ConstantInstance) -> Option[
+    string,
+] {
+    let instances = Vec::from_array([root]);
+    let active = Vec::from_array([0]);
+    let positions = Vec::from_array([0]);
+    let finished: Vec[isize] = Vec::new();
+    let edges: Vec[Option[Vec[ConstantInstance]]] = Vec::new();
+    while !active.is_empty() {
+        let depth = active.len() - 1;
+        let index = active[depth];
+        let instance = instances[index];
+        let declaration = declarations[instance.declaration];
+        while edges.len() <= index {
+            edges.push(None)
+        }
+        let targets = match edges[index] {
+            Some(targets) => targets,
+            None => {
+                if !constant_predicates_allowed(declaration.predicates, instance.bindings) {
+                    return Some("associated constant dependency expansion exceeds compiler limit")
+                }
+                let context = function_context(
+                    ctx,
+                    declaration.function.ret_ty,
+                    declaration.owner,
+                    declaration.generics,
+                    substitute_predicates(declaration.predicates, instance.bindings),
+                    false,
+                    false,
+                    false,
+                    declaration.function.comptime,
+                );
+                let targets = Vec::new();
+                for call in declaration.calls {
+                    match constant_call_targets(context, declarations, call, instance.bindings) {
+                        Ok(values) => for target in values {
+                            targets.push(target)
+                        },
+                        Err(message) => return Some(message),
+                    }
+                }
+                edges[index] = Some(targets);
+                targets
+            },
+        };
+        if positions[depth] >= targets.len() {
+            finished.push(index);
+            let _ = active.pop();
+            let _ = positions.pop();
+            continue
+        }
+        let next = constant_instance_index(instances, targets[positions[depth]]);
+        positions[depth] += 1;
+        if active.contains(next) {
+            return Some("cyclic associated constant")
+        }
+        if !finished.contains(next) {
+            if instances.len() > 10000 {
+                return Some("associated constant dependency expansion exceeds compiler limit")
+            }
+            active.push(next);
+            positions.push(0)
+        }
+    }
+    None
+}
+
+fn imported_constant_declaration(value: AssociatedConstantDependencies) -> ConstantDeclaration {
+    ConstantDeclaration {
+        function: Function {
+            name_span: ast::Span { start: 0, end: 0 },
+            visibility: ast::Visibility::Private,
+            name: value.name,
+            comptime: ComptimeCapability::RuntimeOnly,
+            derive_export_name: None,
+            source_path: "",
+            start: 0,
+            end: 0,
+            comptime_origins: Vec::new(),
+            generics: value.generics,
+            predicates: value.predicates,
+            params: Vec::new(),
+            ret_ty: Type::Unit,
+            body: Block { stmts: Vec::new(), tail: None },
+        },
+        owner: value.owner,
+        trait_ref: value.trait_ref,
+        generics: value.generics,
+        predicates: value.predicates,
+        calls: value.calls,
+    }
+}
+
+fn associated_constant_cycle_diagnostics(
+    file: File,
+    sources: Vec[hir::File],
+    environments: Vec[DependencyEnvironment],
+) -> Vec[Diagnostic] {
+    let diagnostics = Vec::new();
+    if sources.is_empty() {
+        return diagnostics
+    }
+    let declarations = Vec::new();
+    for item in file.items {
+        let (functions, owner, trait_ref, generics, predicates) = match item {
+            Function(function) => (
+                Vec::from_array([function]),
+                Option::None,
+                Option::None,
+                function.generics,
+                function.predicates,
+            ),
+            ImplBlock(block) => (
+                block.methods,
+                Option::Some(block.for_type),
+                block.trait_ref,
+                block.generics,
+                block.predicates,
+            ),
+        };
+        for function in functions {
+            if !function.name.contains("$associated_const:") {
+                continue
+            }
+            let calls = Vec::new();
+            let _ = map_block_exprs(function.body, |expr| constant_calls(expr, calls));
+            declarations.push(
+                ConstantDeclaration { function, owner, trait_ref, generics, predicates, calls },
+            )
+        }
+    }
+    let mut has_root = false;
+    for declaration in declarations {
+        if declaration.owner.is_some() {
+            has_root = true;
+        }
+    }
+    if !has_root {
+        return diagnostics
+    }
+    let local_count = declarations.len();
+    for environment in environments {
+        for value in environment.associated_constants {
+            declarations.push(imported_constant_declaration(value))
+        }
+    }
+    let Ok(builtin) = builtin_contract() else {
+        return diagnostics
+    };
+    let ctx = collect_environment_with_external_aliases(sources[0], true, builtin, Vec::new());
+    for index in 1..sources.len() {
+        append_package_environment(
+            ctx,
+            package_environment_with_external_aliases(sources[index], true, builtin, Vec::new()),
+        )
+    }
+    for environment in environments {
+        append_dependency_environment(ctx, environment)
+    }
+    append_builtin_source_impls(ctx);
+    for index in 0..ctx.traits.len() {
+        ctx.traits.set(index, resolve_trait_info_signature(ctx, ctx.traits[index]))
+    }
+    for index in 0..ctx.impls.len() {
+        ctx.impls.set(index, resolve_impl_info_signature(ctx, ctx.impls[index]))
+    }
+    for index in 0..local_count {
+        let declaration = declarations[index];
+        let Some(owner) = declaration.owner else {
+            continue
+        };
+        let bindings = Vec::new();
+        for name in declaration.generics {
+            bindings.push(TypeSubst { name, ty: Type::Param { name } })
+        }
+        if let Some(message) = constant_cycle_from(
+            ctx,
+            declarations,
+            ConstantInstance { declaration: index, bindings },
+        ) {
+            let name = declaration.function.name;
+            let owner_name = type_text(owner);
+            let prefix = ctx.package_name + "::";
+            let owner_name = if owner_name.starts_with(prefix) {
+                owner_name.byte_slice(prefix.byte_len(), owner_name.byte_len())
+            } else {
+                owner_name
+            };
+            diagnostics.push(
+                new_diagnostic(
+                    TYPER_STAGE,
+                    message + " " + owner_name + "::" + name.byte_slice(18, name.byte_len()),
+                    declaration.function.source_path,
+                    Some(declaration.function.name_span),
+                ),
+            )
+        }
+    }
+    diagnostics
+}
