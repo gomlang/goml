@@ -112,7 +112,7 @@ func main0() struct{} {
     var t2 string
     var inline2 float64 = 0
     switch inline2 {
-    case -0:
+    case 0:
         t2 = "zero"
     default:
         t2 = "other"
