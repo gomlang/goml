@@ -1,5 +1,8 @@
 package query;
 
+use module::ast;
+use module::hir;
+use module::parser;
 use std::fs;
 use std::path;
 use std::testing;
@@ -79,6 +82,36 @@ fn module_visibility_query_rejects_public_reexports_and_signature_leaks() -> () 
 }
 
 #[test]
+fn module_visibility_diagnostics_follow_source_edits_in_shared_context() -> () {
+    let root = module_visibility_fixture("cached_source_edits");
+    let filename = root + "/library/main.goml";
+    let source = "package library; use module::model; pub fn leak(value: model::State) -> () {}";
+    write_query_fixture(filename, source);
+    let context = analysis_context();
+    for (visibility, expected) in Vec::from_array(
+        [("pub(module)", true), ("pub", false), ("pub(module)", true)],
+    ) {
+        write_query_fixture(
+            root + "/library/model/main.goml",
+            "package model; " + visibility + " struct State {}",
+        );
+        let analysis = analyze_with_context(context, filename, source, Vec::new());
+        let mut found = false;
+        for diagnostic in diagnostics(analysis) {
+            if diagnostic.message
+                == "Public API visibility::library::leak exposes module-private item visibility::library::model::State" {
+                found = true;
+            }
+        }
+        testing::assert_eq(found, expected);
+        if !expected {
+            assert_no_diagnostics(analysis)
+        }
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn module_visibility_documentation_hides_internal_declarations_by_default() -> () {
     let root = doc_fixture("module_visibility");
     write_query_fixture(
@@ -137,4 +170,92 @@ fn module_visibility_checks_each_inherent_specialization_separately() -> () {
     write_query_fixture(sibling_path, internal_source);
     assert_no_diagnostics(analyze(sibling_path, internal_source));
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn module_visibility_name_index_preserves_alias_and_duplicate_precedence() -> () {
+    let source = "package model; pub fn duplicate() -> () {} pub(module) fn duplicate() -> () {} pub(module) fn hidden() -> () {} pub fn visible() -> () {}";
+    let symbols = build_symbol_index_from_sources(
+        Vec::from_array([SourceFile { path: "model.goml", source, package_name: "model" }]),
+    ).symbols;
+    let lowered = hir::lower(ast::lower(parser::parse(source)), "model.goml");
+    let file = hir::File {
+        package_name: "model",
+        module_reexports: Vec::from_array(
+            [("Internal", "model::visible"), ("visible", "model::hidden")],
+        ),
+        public_reexports: Vec::from_array(
+            [
+                ("Alias", "model::hidden"),
+                ("Chain", "model::Alias"),
+                ("Repeated", "model::hidden"),
+                ("Repeated", "model::visible"),
+                ("CycleA", "model::CycleB"),
+                ("CycleB", "model::CycleA"),
+                ("Self", "model::Self"),
+            ],
+        ),
+        ..testing::expect_some(lowered.hir, "lower visibility declarations"),
+    };
+    let index = query_module_visibility_index(symbols, Vec::from_array([file]));
+    for name in["hidden", "Alias", "Chain", "Internal", "CycleA"] {
+        testing::assert(query_module_only_name(index, "model::" + name));
+    }
+    for name in["visible", "duplicate", "Repeated", "Self", "Missing"] {
+        testing::assert(!query_module_only_name(index, "model::" + name));
+    }
+}
+
+#[test]
+fn dependency_visibility_cache_tracks_source_edits_and_module_access() -> () {
+    let root = module_visibility_fixture("dependency_cached_source_edits");
+    write_query_fixture(root + "/library/model/extra.goml", "package model; pub struct Other {}");
+    let internal_path = root + "/library/main.goml";
+    let internal_source = "package main; use module::model; fn main() -> () { let _ = model::State {}; }";
+    write_query_fixture(internal_path, internal_source);
+    let external_path = root + "/consumer/main.goml";
+    let external_source = "package main; use visibility::library::model; fn main() -> () { let _ = model::State {}; }";
+    write_query_fixture(external_path, external_source);
+    let offset = testing::expect_some(last_substring(external_source, "model::State"), "State use")
+        + "model::".byte_len();
+    let context = analysis_context();
+    for (visibility, visible) in[("pub(module)", false), ("pub", true), ("pub(module)", false)] {
+        write_query_fixture(
+            root + "/library/model/main.goml",
+            "package model; " + visibility + " struct State {}",
+        );
+        assert_no_diagnostics(
+            analyze_with_context(context, internal_path, internal_source, Vec::new()),
+        );
+        let external = analyze_with_context(context, external_path, external_source, Vec::new());
+        testing::assert_eq(diagnostics(external).is_empty(), visible);
+        let candidates = completions(external, offset);
+        testing::assert_eq(has_completion(candidates, "State"), visible);
+        testing::assert(has_completion(candidates, "Other"));
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn dependency_visibility_index_combines_duplicates_and_preserves_missing_names() -> () {
+    let source = "package model; fn private_only() -> () {} pub(module) fn module_only() -> () {} pub fn public_only() -> () {} fn mixed() -> () {} pub fn mixed() -> () {} pub fn reversed() -> () {} fn reversed() -> () {} fn internal() -> () {} pub(module) fn internal() -> () {}";
+    let symbols = build_symbol_index_from_sources(
+        Vec::from_array([SourceFile { path: "model.goml", source, package_name: "model" }]),
+    ).symbols;
+    for allow_module in[false, true] {
+        let indexed = dependency_symbol_visibility(symbols, allow_module);
+        for (name, expected) in[
+            ("private_only", false),
+            ("module_only", allow_module),
+            ("public_only", true),
+            ("mixed", true),
+            ("reversed", true),
+            ("internal", allow_module),
+            ("missing", true),
+        ] {
+            let name = "model::" + name;
+            testing::assert_eq(indexed.get(name).unwrap_or(true), expected);
+            testing::assert_eq(dependency_symbol_visible(symbols, name, allow_module), expected);
+        }
+    }
 }
