@@ -358,6 +358,8 @@ let number: i32 = identity(1);
 let text: string = identity("text");
 ```
 
+trait 约束也可以确定类型实参。如果调用要求 `T: Tag[A]`，而调用方具有 `T: Tag[i32]` 约束，且 `i32` 是唯一匹配的实参，就会推断出 `A = i32`。如果 `Tag[i32]` 和 `Tag[bool]` 都匹配，请显式指定类型实参，或通过另一个实参或结果类型约束 `A`。
+
 需要显式指定时，使用 GoML turbofish：
 
 ```goml

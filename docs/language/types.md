@@ -358,6 +358,8 @@ let number: i32 = identity(1);
 let text: string = identity("text");
 ```
 
+A trait bound can also determine a type argument. When a call requires `T: Tag[A]` and the caller has `T: Tag[i32]`, the call infers `A = i32` if that is the only matching argument. If both `Tag[i32]` and `Tag[bool]` match, supply the type arguments explicitly or constrain `A` through another argument or the result type.
+
 Use GoML turbofish when explicit specification is required:
 
 ```goml
