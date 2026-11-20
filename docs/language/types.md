@@ -255,7 +255,7 @@ fn success(value: i32) -> Result[i32, string] {
 }
 ```
 
-Annotations, function parameters, return types, and enclosing constructor payloads can provide this context. It works for unit, tuple-like, and struct-like variants, including public variants from imported enums and enums reached through a type alias. An expected constructor function type uses its return type to select the enum. Ordinary name resolution takes precedence; an existing local value or struct is not replaced with an enum constructor. A unique variant declared in the current package remains usable without expected type information. When neither ordinary name resolution nor the expected type selects a variant, qualify it with `Enum::Variant`.
+Annotations, function parameters, return types, and enclosing constructor payloads can provide this context. In comparisons such as `value == Empty` and `Empty != value`, the enum type of either operand supplies context for the other operand’s constructor. It works for unit, tuple-like, and struct-like variants, including public variants from imported enums and enums reached through a type alias. An expected constructor function type uses its return type to select the enum. Ordinary name resolution takes precedence; an existing local value or struct is not replaced with an enum constructor. A unique variant declared in the current package remains usable without expected type information. When neither ordinary name resolution nor the expected type selects a variant, qualify it with `Enum::Variant`.
 
 Structural variants use field constructs and field patterns:
 
