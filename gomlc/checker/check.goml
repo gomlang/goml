@@ -1496,7 +1496,7 @@ fn check_byte_string_expr(
         )
     }
     if let Some(ty) = expected {
-        let ty = normalize_type(ctx, ty);
+        let ty = normalize_type(ctx, contextual_break_hint(ctx, ty));
         if symbolic_array(ty).is_some() {
             return check_array_expr(ctx, items, expected)
         }
@@ -1592,17 +1592,31 @@ fn check_closure_expr(
         typed_params.push(ClosureParam { name: local_name(param.name), ty });
         param_types.push(ty)
     }
+    let ty = Type::Func { params: param_types, ret_ty };
+    if ctx.unreachable_break_hint.is_some() {
+        if let Some(expected) = expected {
+            if is_unbound_any_type(expected) {
+                let hint = contextual_break_hint(ctx, expected);
+                hint_expression_type(ctx, ty, expected);
+                if let Func { params: inputs, .. } = prune(hint) {
+                    if inputs.len() == param_types.len() {
+                        for index in 0..inputs.len() {
+                            ctx.inference.unreachable_break_hints.push(
+                                (param_types[index], inputs[index]),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
     let typed_body = check_expr(closure_ctx, body, Option::Some(ret_ty));
     if let (Var(_), Never) = (prune(ret_ty), prune(expr_type(typed_body))) {
         if !closure_has_value_return(closure_ctx, typed_body) {
             expect_type(ctx, ret_ty, Type::Unit)
         }
     }
-    Closure {
-        params: typed_params,
-        body: typed_body,
-        ty: Type::Func { params: param_types, ret_ty },
-    }
+    Closure { params: typed_params, body: typed_body, ty }
 }
 
 fn callable_parts(ctx: Checker, value: Type, arity: isize) -> (Vec[Type], Type) {
@@ -4605,6 +4619,39 @@ fn check_while_expr(
     }
 }
 
+fn hint_unreachable_break_type(ctx: Checker, break_ty: Type, expected: Type) -> bool {
+    if !contains_unbound_type_variable(break_ty) || contains_unbound_type_variable(expected) {
+        return false
+    }
+    let literals: Vec[NumericLiteralConstraint] = Vec::new();
+    for constraint in ctx.inference.numeric_literal_constraints {
+        if let Var(variable) = prune(constraint.ty) {
+            if occurs(variable, break_ty) {
+                literals.push(constraint)
+            }
+        }
+    }
+    let probe = Checker {
+        diagnostics: Vec::new(),
+        inference: InferenceContext { numeric_literal_constraints: literals, ..ctx.inference },
+        ..ctx,
+    };
+    resolve_numeric_literal_constraints(probe);
+    if probe.diagnostics.is_empty() && !contains_unbound_any_variable(break_ty) {
+        return false
+    }
+    probe.diagnostics.clear();
+    let snapshot = deferred_dependency_snapshot(ctx, Vec::from_array([break_ty, expected]));
+    expect_type(probe, break_ty, expected);
+    resolve_numeric_literal_constraints(probe);
+    if !probe.diagnostics.is_empty() {
+        snapshot.restore();
+        false
+    } else {
+        snapshot.changed()
+    }
+}
+
 fn check_loop_expr(
     ctx: Checker,
     label: Option[string],
@@ -4614,11 +4661,7 @@ fn check_loop_expr(
     let result_ty = propagated_expected(expected).unwrap_or_else(
         || fresh_type(ctx.inference.counter, VarKind::Any),
     );
-    let values = LoopBreakValues {
-        ty: result_ty,
-        has_value: Ref::new(false),
-        unreachable_unit: Ref::new(None),
-    };
+    let values = LoopBreakValues { ty: result_ty, unreachable: Ref::new(None) };
     let has_break = Ref::new(false);
     let loop_result = LoopResult { label, values: Some(values), has_break: Some(has_break) };
     ctx.loop_depth.set(ctx.loop_depth.get() + 1);
@@ -4626,9 +4669,11 @@ fn check_loop_expr(
     let body = check_expr(ctx, body_source, Option::Some(Type::Unit));
     let _ = ctx.loop_results.pop();
     ctx.loop_depth.set(ctx.loop_depth.get() - 1);
-    if values.has_value.get() {
-        if let Some(span) = values.unreachable_unit.get() {
-            expect_type_at(ctx, Type::Unit, result_ty, Some(span))
+    if let Some((dead_ty, span)) = values.unreachable.get() {
+        if has_break.get() {
+            expect_type_at(ctx, dead_ty, result_ty, span)
+        } else {
+            ctx.inference.unreachable_break_hints.push((dead_ty, result_ty))
         }
     }
     Loop {
@@ -4689,16 +4734,29 @@ fn check_break_expr(ctx: Checker, label: Option[string], source: Option[hir::Exp
         let target = target.unwrap_or(0);
         let current = ctx.loop_results[ctx.loop_results.len() - 1 - target];
         let value = match current.values {
-            Some(values) => match source {
-                Some(expr) => Option::Some(check_expr(ctx, expr, Some(values.ty))),
-                None => {
-                    if current.has_break.is_some() {
-                        expect_type(ctx, Type::Unit, values.ty)
-                    } else if values.unreachable_unit.get().is_none() {
-                        values.unreachable_unit.set(ctx.current_span.get())
-                    }
-                    Option::None
-                },
+            Some(values) => {
+                let (operand_ctx, expected) = if current.has_break.is_some() {
+                    (ctx, values.ty)
+                } else {
+                    let (ty, _) = values.unreachable.get().unwrap_or_else(
+                        || {
+                            let entry = (
+                                fresh_type(ctx.inference.counter, VarKind::Any),
+                                ctx.current_span.get(),
+                            );
+                            values.unreachable.set(Some(entry));
+                            entry
+                        },
+                    );
+                    (Checker { unreachable_break_hint: Some((ty, values.ty)), ..ctx }, ty)
+                };
+                match source {
+                    Some(expr) => Option::Some(check_expr(operand_ctx, expr, Some(expected))),
+                    None => {
+                        expect_type(ctx, Type::Unit, expected);
+                        Option::None
+                    },
+                }
             },
             None => match source {
                 Some(expr) => {
@@ -4711,11 +4769,6 @@ fn check_break_expr(ctx: Checker, label: Option[string], source: Option[hir::Exp
         if !value.map(|expr| tast_expr_never(ctx, expr)).unwrap_or(false) {
             if let Some(has_break) = current.has_break {
                 has_break.set(true)
-            }
-            if value.is_some() {
-                if let Some(values) = current.values {
-                    values.has_value.set(true)
-                }
             }
         }
         Break { target, value, ty: Type::Never }

@@ -738,7 +738,7 @@ let result = loop {
 };
 ```
 
-All `break` values targeting the same `loop` must have compatible types. `break;` supplies `()`, so it cannot be mixed with other break value types. A `break` whose value has type `never` diverges before it can exit its target loop. A `loop` with no other `break` targeting it has type `never` and does not continue to the following expression. A bare `break;` following a control-flow exit in the same block does not make the loop return `()`. Unlabeled `break` and `continue` target the nearest loop.
+All `break` values targeting the same `loop` must have compatible types. `break;` supplies `()`, so it cannot be mixed with other break value types. A `break` whose value has type `never` diverges before it can exit its target loop. A `loop` with no reachable, normally evaluated `break` targeting it has type `never` and does not continue to the following expression. Unreachable `break` values still undergo type checking and must agree with each other and with reachable `break` values for the same loop. Unlabeled `break` and `continue` target the nearest loop.
 
 <a id="for"></a>
 
