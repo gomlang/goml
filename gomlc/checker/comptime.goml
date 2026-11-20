@@ -912,6 +912,19 @@ fn lower_ct_for(ctx: CtLowerContext, pattern: Pat, iterator: Expr, body: Expr) -
             Err("comptime for only supports fixed arrays and builtin ranges")
         },
         other => match resolve_type(expr_type(other)) {
+            Type::Never => {
+                let source = lower_ct_expr(ctx, other)?;
+                let _ = lower_ct_for_body(ctx, target, body)?;
+                Ok(
+                    ctir::CtExprKind::Block(
+                        ctir::CtBlock {
+                            statements: Vec::new(),
+                            tail: Some(source),
+                            origin: ctx.origin,
+                        },
+                    ),
+                )
+            },
             Type::Array { len: _, elem: _ } => Ok(
                 ForArray {
                     target,
@@ -945,6 +958,11 @@ fn lower_ct_array_repeat(ctx: CtLowerContext, args: Vec[Expr], ty: Type) -> Resu
     ctir::CtExprKind,
     string,
 ] {
+    if let Type::Never = resolve_type(ty) {
+        if let Some(block) = ct_diverging_inputs(ctx, lower_ct_exprs(ctx, args)?) {
+            return Ok(block)
+        }
+    }
     let Array { len, .. } = resolve_type(ty) else {
         return Err("comptime array repetition requires a fixed length")
     };
@@ -983,6 +1001,59 @@ fn lower_ct_array_repeat(ctx: CtLowerContext, args: Vec[Expr], ty: Type) -> Resu
     )
 }
 
+fn ct_diverging_inputs(ctx: CtLowerContext, inputs: Vec[ctir::CtExpr]) -> Option[ctir::CtExprKind] {
+    for item in inputs {
+        if let Never = item.ty {
+            let statements: Vec[ctir::CtStmt] = Vec::new();
+            for input in inputs {
+                statements.push(ctir::CtStmt::Expr(input))
+            }
+            return Some(
+                ctir::CtExprKind::Block(
+                    ctir::CtBlock { statements, tail: None, origin: ctx.origin },
+                ),
+            )
+        }
+    }
+    None
+}
+
+fn finish_ct_expr(ctx: CtLowerContext, kind: ctir::CtExprKind, ty: ctir::CtType) -> ctir::CtExpr {
+    let kind = if let Never = ty {
+        let inputs = match kind {
+            Tuple(values) | Array(values) | Call { args: values, .. } | Buffer { args: values, .. } => values,
+            CompileError(value) | Return(Some(value)) | Break { value: Some(value), .. } | Field {
+                value,
+                ..,
+            } | Cast { value, .. } | Unary { value, .. } | Dynamic { value, .. } | If {
+                condition: value,
+                ..,
+            } | While { condition: value, .. } | Match { value, .. } | ForArray { value, .. } => Vec::from_array(
+                [value],
+            ),
+            ForRange { start, end, .. } | Index { value: start, index: end } => Vec::from_array(
+                [start, end],
+            ),
+            Binary { op, left, right } => match op {
+                And | Or => Vec::from_array([left]),
+                _ => Vec::from_array([left, right]),
+            },
+            Invoke { function, args } | Dispatch { receiver: function, args, .. } => {
+                let inputs = Vec::from_array([function]);
+                for arg in args {
+                    inputs.push(arg)
+                }
+                inputs
+            },
+            _ => Vec::new(),
+        };
+        ct_diverging_inputs(ctx, inputs).unwrap_or(kind)
+    } else {
+        kind
+    };
+    ctir::CtExpr { kind, ty: lowered_expr_type(ctx, kind, ty), origin: next_expr_origin(ctx) }
+}
+
 fn lower_ct_expr(ctx: CtLowerContext, value: Expr) -> Result[ctir::CtExpr, string] {
     let ty = lower_ct_type(ctx, expr_type(value))?;
     let kind = match value {
@@ -1001,19 +1072,23 @@ fn lower_ct_expr(ctx: CtLowerContext, value: Expr) -> Result[ctir::CtExpr, strin
         },
         Constr { constructor, args, ty: source_ty } => {
             let fields = lower_ct_exprs(ctx, args)?;
-            match constructor.tag {
-                Some(variant) => match lower_ct_type(ctx, source_ty)? {
-                    ctir::CtType::Enum { name, variants: _ } => {
-                        ctir::CtExprKind::Enum { name, variant, fields }
+            if let Some(block) = ct_diverging_inputs(ctx, fields) {
+                block
+            } else {
+                match constructor.tag {
+                    Some(variant) => match lower_ct_type(ctx, source_ty)? {
+                        ctir::CtType::Enum { name, variants: _ } => {
+                            ctir::CtExprKind::Enum { name, variant, fields }
+                        },
+                        _ => return Err("comptime enum constructor has a non-enum type"),
                     },
-                    _ => return Err("comptime enum constructor has a non-enum type"),
-                },
-                None => match lower_ct_type(ctx, source_ty)? {
-                    ctir::CtType::Struct { name, fields: _ } => {
-                        ctir::CtExprKind::Struct { name, fields }
+                    None => match lower_ct_type(ctx, source_ty)? {
+                        ctir::CtType::Struct { name, fields: _ } => {
+                            ctir::CtExprKind::Struct { name, fields }
+                        },
+                        _ => return Err("comptime constructor is unsupported"),
                     },
-                    _ => return Err("comptime constructor is unsupported"),
-                },
+                }
             }
         },
         Tuple { items, ty: _ } => ctir::CtExprKind::Tuple(lower_ct_exprs(ctx, items)?),
@@ -1124,26 +1199,28 @@ fn lower_ct_expr(ctx: CtLowerContext, value: Expr) -> Result[ctir::CtExpr, strin
                 InherentMethod { receiver_ty, method_name } => {
                     if let Some(target) = ct_method_target(ctx, receiver_ty, None, method_name) {
                         return Ok(
-                            ctir::CtExpr {
-                                kind: ctir::CtExprKind::Call {
-                                    target,
-                                    args: lower_ct_exprs(ctx, args)?,
-                                },
-                                ty: lower_ct_type(ctx, ty)?,
-                                origin: next_expr_origin(ctx),
-                            },
+                            finish_ct_expr(
+                                ctx,
+                                ctir::CtExprKind::Call { target, args: lower_ct_exprs(ctx, args)? },
+                                lower_ct_type(ctx, ty)?,
+                            ),
                         )
                     }
-                    if let Ok(Buffer { .. }) = lower_ct_type(ctx, receiver_ty) {
+                    if let Ok(Buffer { kind, .. }) = lower_ct_type(ctx, receiver_ty) {
+                        if !ctfe::buffer_operation_available(kind, method_name) {
+                            return Err(
+                                "unsupported comptime buffer operation `" + method_name + "`",
+                            )
+                        }
                         return Ok(
-                            ctir::CtExpr {
-                                kind: ctir::CtExprKind::Buffer {
+                            finish_ct_expr(
+                                ctx,
+                                ctir::CtExprKind::Buffer {
                                     operation: method_name,
                                     args: lower_ct_exprs(ctx, args)?,
                                 },
-                                ty: lower_ct_type(ctx, ty)?,
-                                origin: next_expr_origin(ctx),
-                            },
+                                lower_ct_type(ctx, ty)?,
+                            ),
                         )
                     }
                     match builtin_numeric_conversion_target(receiver_ty, method_name) {
@@ -1184,12 +1261,13 @@ fn lower_ct_expr(ctx: CtLowerContext, value: Expr) -> Result[ctir::CtExpr, strin
                     if args.is_empty() {
                         return Err("comptime dynamic call is missing its receiver")
                     }
+                    let receiver = lower_ct_expr(ctx, args[0])?;
                     let arguments = Vec::new();
                     for index in 1..args.len() {
                         arguments.push(lower_ct_expr(ctx, args[index])?)
                     }
                     Dispatch {
-                        receiver: lower_ct_expr(ctx, args[0])?,
+                        receiver,
                         method: ct_dynamic_method_key(dispatch_name, method_name),
                         args: arguments,
                     }
@@ -1210,27 +1288,31 @@ fn lower_ct_expr(ctx: CtLowerContext, value: Expr) -> Result[ctir::CtExpr, strin
             ctir::CtExprKind::Field { value: lower_ct_expr(ctx, tuple)?, index }
         },
         Field { expr, field_name, ty: _ } => {
-            let source_ty = lower_ct_type(ctx, expr_type(expr))?;
-            let index = match source_ty {
-                ctir::CtType::Struct { name, fields: _ } => {
-                    let Some(definition) = find_ct_struct(ctx.file, name) else {
-                        return Err("comptime struct field metadata is missing")
-                    };
-                    let mut found = -1;
-                    for field_index in 0..definition.fields.len() {
-                        if definition.fields[field_index].0 == field_name {
-                            found = field_index;
+            let source = lower_ct_expr(ctx, expr)?;
+            if let Some(block) = ct_diverging_inputs(ctx, Vec::from_array([source])) {
+                block
+            } else {
+                let index = match source.ty {
+                    ctir::CtType::Struct { name, fields: _ } => {
+                        let Some(definition) = find_ct_struct(ctx.file, name) else {
+                            return Err("comptime struct field metadata is missing")
+                        };
+                        let mut found = -1;
+                        for field_index in 0..definition.fields.len() {
+                            if definition.fields[field_index].0 == field_name {
+                                found = field_index;
+                            }
                         }
-                    }
-                    if found < 0 {
-                        return Err("comptime struct field is missing")
-                    } else {
-                        found
-                    }
-                },
-                _ => return Err("comptime field access requires a struct value"),
-            };
-            ctir::CtExprKind::Field { value: lower_ct_expr(ctx, expr)?, index }
+                        if found < 0 {
+                            return Err("comptime struct field is missing")
+                        } else {
+                            found
+                        }
+                    },
+                    _ => return Err("comptime field access requires a struct value"),
+                };
+                ctir::CtExprKind::Field { value: source, index }
+            }
         },
         Index { base, index, ty: _ } => {
             let value = lower_ct_expr(ctx, base)?;
@@ -1260,8 +1342,7 @@ fn lower_ct_expr(ctx: CtLowerContext, value: Expr) -> Result[ctir::CtExpr, strin
         },
         ToDyn { for_ty, expr, ty, .. } => lower_ct_dynamic(ctx, ty, for_ty, expr)?,
     };
-    let ty = lowered_expr_type(ctx, kind, ty);
-    Ok(ctir::CtExpr { kind, ty, origin: next_expr_origin(ctx) })
+    Ok(finish_ct_expr(ctx, kind, ty))
 }
 
 fn lower_ct_stmt(ctx: CtLowerContext, value: Stmt) -> Result[ctir::CtStmt, string] {
@@ -1282,8 +1363,12 @@ fn lower_ct_stmt(ctx: CtLowerContext, value: Stmt) -> Result[ctir::CtStmt, strin
                 let Some(slot) = find_local_slot(ctx, name) else {
                     return Err("comptime assignment target is not a local variable")
                 };
+                let right = lower_ct_expr(ctx, value)?;
+                if let Never = right.ty {
+                    return Ok(ctir::CtStmt::Expr(right))
+                }
                 let lowered = match op {
-                    Plain => lower_ct_expr(ctx, value)?,
+                    Plain => right,
                     Compound(op) => ctir::CtExpr {
                         kind: ctir::CtExprKind::Binary {
                             op: lower_binary_op(op),
@@ -1292,7 +1377,7 @@ fn lower_ct_stmt(ctx: CtLowerContext, value: Stmt) -> Result[ctir::CtStmt, strin
                                 ty: lower_ct_type(ctx, ty)?,
                                 origin: ctx.origin,
                             },
-                            right: lower_ct_expr(ctx, value)?,
+                            right,
                         },
                         ty: lower_ct_type(ctx, ty)?,
                         origin: ctx.origin,
